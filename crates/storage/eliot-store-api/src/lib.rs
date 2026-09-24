@@ -821,10 +821,8 @@ pub enum NamedReadOperation {
     GetMailbox,
     GetAuditRange,
     ResolveWriteReceipt,
-    /// CURRENT authority revocation history (issue #686). Known-but-
-    /// unsupported until a store-owned slice activates its catalogue row
-    /// with proven handlers; the typed parameters and payload contract
-    /// (`revocation_history`) are already closed.
+    /// CURRENT authority revocation history (issue #686), served from the
+    /// durable store ledger and used by the production owner-feed restore gate.
     GetAuthorityRevocationHistory,
     /// Canonical notification-state read (issue #1780).
     GetNotificationState,
@@ -866,9 +864,8 @@ pub enum NamedMutationOperation {
     /// the snapshot as opaque bytes and only arbitrates `owner/canonical`.
     RecordFinishEvidence,
     AppendAuditEvent,
-    /// Durable authority-revocation record (issue #686). Known-but-
-    /// unsupported until a store-owned slice activates its catalogue row
-    /// with proven handlers; the typed parameters are already closed.
+    /// Durable authority-revocation record (issue #686), written through the
+    /// closed Governor→Kernel→store transition path.
     RecordAuthorityRevocation,
     /// Named canonical erasure/disposition transaction (issue #1712).
     ///

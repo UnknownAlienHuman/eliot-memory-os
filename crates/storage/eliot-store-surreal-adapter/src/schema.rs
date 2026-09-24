@@ -507,6 +507,11 @@ pub(crate) const TX_FINISH_OWNER: &str = "LET $finish_existing = (SELECT VALUE {
 /// fence, and outer revision are provider-arbitrated.
 pub(crate) const TX_CANONICAL_OWNER: &str = "LET $canonical_existing = (SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision } FROM ONLY type::record($canonical_owner_table, $canonical_owner_id)); IF type::is_object($canonical_existing) { LET $canonical_owner_cas = (UPDATE type::record($canonical_owner_table, $canonical_owner_id) CONTENT $canonical_owner_record WHERE state_fence = $canonical_expected_state_fence AND revision = $canonical_expected_revision RETURN AFTER); IF array::len($canonical_owner_cas ?? []) != 1 { THROW 'canonical_owner_cas_conflict'; }; } ELSE { IF $canonical_expected_revision != 0 { THROW 'canonical_owner_create_conflict'; }; LET $canonical_owner_create = (CREATE type::record($canonical_owner_table, $canonical_owner_id) CONTENT $canonical_owner_record RETURN AFTER); IF array::len($canonical_owner_create ?? []) != 1 { THROW 'canonical_owner_create_conflict'; }; };";
 
+/// Fenced immutable upsert of one durable authority-revocation record. The
+/// payload is the exact typed record admitted by the store boundary; the
+/// adapter only arbitrates its stable closure key and fence.
+pub(crate) const TX_AUTHORITY_REVOCATION: &str = "LET $revocation_existing = (SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision } FROM ONLY type::record($revocation_owner_table, $revocation_owner_id)); IF type::is_object($revocation_existing) { IF $revocation_existing.state_fence != $revocation_expected_state_fence OR $revocation_existing.revision != $revocation_expected_revision { THROW 'revocation_record_conflict'; }; } ELSE { IF $revocation_expected_revision != 0 { THROW 'revocation_record_create_conflict'; }; CREATE type::record($revocation_owner_table, $revocation_owner_id) CONTENT $revocation_owner_record; };";
+
 /// Renders an indexed transaction template for the given binding index.
 pub(crate) fn indexed(template: &str, index: usize) -> String {
     template.replace("{i}", &index.to_string())

@@ -12,11 +12,11 @@
 //! `crates/storage/eliot-store-surreal-adapter/tests/epistemic_revision.rs::real_position_cas_exact_replay_and_receipt_readback`
 //! (re-run on this base as the real-Surreal proof) and against the reference
 //! handler by `crates/storage/eliot-store-memory/src/epistemic_tests.rs`.
-//! This file proves the daemon half with the same closed types: the 20-entry
-//! catalogue (11 reads + 8 mutations + genesis), the CEP `position` selector,
-//! the `ApplyEpistemicRevision` closed payload requirement (admitted) versus
-//! `RecordAuthorityRevocation` (still unactivated), the `IdentityConflict`
-//! without-second-revision disposition, and the exact daemon wiring types
+//! This file proves the daemon half with the same closed types: the 35-entry
+//! catalogue (18 reads + 16 mutations + genesis), the CEP `position` selector,
+//! the `ApplyEpistemicRevision` closed payload requirement, the activated
+//! `RecordAuthorityRevocation` schema, the `IdentityConflict` without-second-
+//! revision disposition, and the exact daemon wiring types
 //! (`KernelContextReadClient: CanonicalReadClient`,
 //! `DaemonComposition::epistemic_composition` borrowing canonical +
 //! activation + `DaemonKernelClient` + reads + readiness).
@@ -68,22 +68,17 @@ fn test_fence() -> TestResult<eliot_store_api::StateFence> {
 #[test]
 fn catalogue_activates_position_read_and_revision_write() -> TestResult {
     let entries = generated_operation_manifests().map_err(|error| format!("catalogue: {error}"))?;
-    // Denominator bound to the producer declaration tables in
-    // `crates/storage/eliot-store-api/src/operation_catalogue.rs`: 11
-    // activated reads + 8 activated mutations (the eighth mutation is
-    // `ApplyNotificationState` and the eleventh read is
-    // `GetNotificationState`, both admitted by #1780 with handler, schema,
-    // and consumer triple; the seventh mutation remains `ApplyErasure`,
-    // admitted by #1712/PR #1987; the store owner's own count tests in
-    // `crates/storage/eliot-store-api/tests/operation_manifest_catalogue.rs`
-    // already assert 20) + the genesis bootstrap entry. Exact equality: a
-    // silent add or drop must fail here, never pass on a bound.
-    assert_eq!(entries.len(), 20, "11 reads + 8 mutations + genesis");
+    // Denominator bound to the producer declaration table: 18 activated reads
+    // + 16 activated mutations + the genesis bootstrap entry. Exact equality
+    // prevents a silent add or drop from passing on a bound.
+    assert_eq!(entries.len(), 35, "18 reads + 16 mutations + genesis");
     let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
     assert!(names.contains(&"GetCurrentEpistemicPosition"));
     assert!(names.contains(&"ApplyEpistemicRevision"));
     assert!(names.contains(&"UpdateTaskState"));
     assert!(names.contains(&"GetEvidencePack"));
+    assert!(names.contains(&"GetAuthorityRevocationHistory"));
+    assert!(names.contains(&"RecordAuthorityRevocation"));
     // The admitted catalogue growth since the 18-entry bound is exactly the
     // #1780 notification pair — bound here so a different silent add still
     // fails on the count above.
@@ -156,7 +151,7 @@ fn position_read_requires_its_closed_selector() -> TestResult {
 }
 
 #[test]
-fn revision_write_is_admitted_while_revocation_stays_unactivated() -> TestResult {
+fn revision_and_revocation_writes_are_admitted_with_closed_payloads() -> TestResult {
     let entries = generated_operation_manifests().map_err(|error| format!("catalogue: {error}"))?;
     let set_digest =
         operation_manifest_set_digest(&entries).map_err(|error| format!("digest: {error}"))?;
@@ -213,20 +208,24 @@ fn revision_write_is_admitted_while_revocation_stays_unactivated() -> TestResult
 
     let mut revocation = empty_revision.clone();
     revocation.transition_class = eliot_store_api::TransitionClass::RecoverySchema;
+    revocation.requested_effect_ceiling = eliot_store_api::EffectClass::ReversibleMutation;
     revocation.named_operations = vec![eliot_store_api::NamedMutationRequest {
         operation: NamedMutationOperation::RecordAuthorityRevocation,
-        parameters: BTreeMap::new(),
+        parameters: BTreeMap::from([
+            ("origin_ref".to_owned(), json!("root:alpha")),
+            ("closure_id".to_owned(), json!("closure:one")),
+            ("closure_revision".to_owned(), json!("1")),
+            ("affected_digest".to_owned(), json!("a".repeat(64))),
+            ("affected_count".to_owned(), json!("1")),
+            ("invalidation_reason".to_owned(), json!("SOURCE_REVOKED")),
+            ("fence_digest".to_owned(), json!("b".repeat(64))),
+        ]),
     }];
-    // Rebind after mutation: the catalogue check runs `validate()` first,
-    // so stale digests would fail as a digest mismatch instead of reaching
-    // the still-unactivated-operation assertion below.
     eliot_store_api::bind_issue18_digests(&mut revocation)
         .map_err(|error| format!("issue-18 digests: {error}"))?;
-    assert_eq!(
-        revocation.validate_against_catalogue(&entries),
-        Err(StoreError::UnknownOperation),
-        "still-unactivated revocation has no catalogue entry"
-    );
+    revocation
+        .validate_against_catalogue(&entries)
+        .map_err(|error| format!("activated revocation catalogue: {error}"))?;
     Ok(())
 }
 

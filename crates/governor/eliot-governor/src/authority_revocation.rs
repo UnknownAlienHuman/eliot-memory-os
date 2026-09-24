@@ -29,15 +29,12 @@
 //! [`CompositionError::Provider`]; every other deterministic admission
 //! refusal is [`CompositionError::Owner`].
 //!
-//! Honest gaps: `RecordAuthorityRevocation` and
-//! `GetAuthorityRevocationHistory` are known-but-unsupported at the store
-//! catalogue gate until a store-owned slice activates their rows with
-//! proven handlers (see `operation_catalogue`). The envelope therefore
-//! binds the generated catalogue set digest so it passes that gate
-//! unchanged once the row exists; until then commits fail closed with
-//! `UnknownOperation`, never as silent success. The `scope:governor`
-//! ordering-head expectation mirrors the operator/recovery precedent (the
-//! store enforces the live sequence).
+//! The store catalogue now admits both operations. The envelope binds the
+//! generated catalogue set digest; the store handler preserves the typed
+//! record in the durable recovery-owner ledger, and the history read serves
+//! that ledger to the production owner-feed restore gate. The
+//! `scope:governor` ordering-head expectation mirrors the operator/recovery
+//! precedent (the store enforces the live sequence).
 
 use std::collections::BTreeMap;
 

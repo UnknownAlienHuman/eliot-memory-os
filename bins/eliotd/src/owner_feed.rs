@@ -186,7 +186,7 @@ impl OwnerFeedTrigger {
 /// with the typed reason when the pass degraded: the daemon continues and
 /// retries on a later pass, and no partial publish is ever claimed.
 pub async fn maintain_owner_feed(
-    composition: &DaemonComposition,
+    composition: &mut DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
     trigger: &mut OwnerFeedTrigger,
 ) -> Result<Option<u64>, CompositionError> {

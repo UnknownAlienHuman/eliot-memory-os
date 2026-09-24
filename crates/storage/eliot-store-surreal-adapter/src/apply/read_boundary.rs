@@ -18,9 +18,10 @@ use crate::schema;
 use eliot_store_api::{
     CanonicalValidationSnapshot, EVIDENCE_PACK_MAX_RECORDS, ExactJsonBytes, NamedReadOperation,
     NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingScopeId,
-    PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, RevisionHead, RevisionKey, ScopeId,
-    ScopeRevisionView, StateFence, StoreError, WriteReceipt, WriteReceiptStatus,
-    generated_operation_manifests, named_mutation_operation_name,
+    PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, REVOCATION_HISTORY_MAX_RECORDS,
+    REVOCATION_HISTORY_PAYLOAD_VERSION, RecordedRevocation, RevisionHead, RevisionKey,
+    RevocationHistoryPayload, ScopeId, ScopeRevisionView, StateFence, StoreError, WriteReceipt,
+    WriteReceiptStatus, generated_operation_manifests, named_mutation_operation_name,
 };
 
 use super::{
@@ -381,6 +382,9 @@ async fn named_read_payload(
         NamedReadOperation::GetAuditRange => {
             audit_range_payload(db, &adapter.config, query, state_fence).await
         }
+        NamedReadOperation::GetAuthorityRevocationHistory => {
+            revocation_history_payload(db, &adapter.config, query, state_fence).await
+        }
         other => Err(AdapterError::NamedOperationUnavailable {
             operation: format!("{other:?}"),
         }),
@@ -643,6 +647,98 @@ async fn read_erasure_suppression(
     Ok(ErasureSuppression::Known(suppressed_pairs(
         &intents, &outcomes,
     )))
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RevocationOwnerRow {
+    namespace: String,
+    #[serde(rename = "key")]
+    _key: String,
+    payload: Vec<u8>,
+}
+
+/// Reads the bounded current authority-revocation ledger from the durable
+/// recovery-owner table. The table is store-owned; this handler only decodes
+/// the exact typed record and applies the request's origin/bound.
+async fn revocation_history_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    let origin_ref = query
+        .parameters
+        .get("origin_ref")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "missing required parameter",
+        })?;
+    if origin_ref.trim().is_empty() || origin_ref.chars().any(char::is_control) {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "origin_ref must be a non-blank string",
+        }
+        .into());
+    }
+    let max_records = query
+        .parameters
+        .get("max_records")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "missing required parameter",
+        })?
+        .parse::<u32>()
+        .map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "max_records must be a positive decimal bound",
+        })?;
+    if max_records == 0 || max_records > REVOCATION_HISTORY_MAX_RECORDS {
+        return Err(StoreError::PayloadTooLarge.into());
+    }
+    if query.scope_id.as_ref().map(ScopeId::as_str) != Some("governor") {
+        return Err(StoreError::ManifestMismatch.into());
+    }
+    let mut bindings = Map::new();
+    bindings.insert(
+        "revocation_namespace".to_owned(),
+        json!("authority-revocation"),
+    );
+    let mut response = client::query(
+        db,
+        config,
+        "read.authority_revocation_history",
+        "SELECT VALUE { namespace: namespace, key: key, payload: payload } FROM recovery_owner WHERE namespace = $revocation_namespace;",
+        bindings,
+    )
+    .await?;
+    if !response.take_errors().is_empty() {
+        return Err(AdapterError::Store(StoreError::Serialization(
+            "authority revocation history query failed".to_owned(),
+        )));
+    }
+    let rows = take_vec::<RevocationOwnerRow>(&mut response, 0)?;
+    let mut closures = rows
+        .into_iter()
+        .filter(|row| row.namespace == "authority-revocation")
+        .filter_map(|row| serde_json::from_slice::<RecordedRevocation>(&row.payload).ok())
+        .filter(|closure| closure.root_ref == origin_ref)
+        .collect::<Vec<_>>();
+    closures.sort_by(|left, right| left.closure_id.cmp(&right.closure_id));
+    let source_revision = closures.iter().map(|row| row.revision).max().unwrap_or(1);
+    closures.truncate(max_records as usize);
+    let payload = RevocationHistoryPayload {
+        version: REVOCATION_HISTORY_PAYLOAD_VERSION,
+        origin_ref: origin_ref.to_owned(),
+        source_revision,
+        closures,
+    };
+    payload.validate().map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(StoreError::FenceMismatch.into());
+    }
+    to_value(&payload)
 }
 
 /// Reads all persisted capture-evidence rows through the closed SELECT.

@@ -184,6 +184,18 @@ pub struct ContestedEffectAnnotation {
     pub reopened: bool,
 }
 
+/// Current semantic claim whose support can be challenged by a revocation.
+/// The claim is an overlay; its historical admission record is never changed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevocationDependentClaim {
+    /// Stable justification, plan, answer, or pending-effect identity.
+    pub id: String,
+    /// Semantic class retained for operator/rebuild projections.
+    pub kind: String,
+    /// Exact material supports for the claim.
+    pub support_refs: BTreeSet<String>,
+}
+
 /// Pure idempotency and lease admission registry.
 ///
 /// The admission ledger (`authorized_by_idempotency`) is append-only history:
@@ -195,6 +207,7 @@ pub struct EffectAuthorizer {
     authorized_by_idempotency: BTreeMap<String, AuthorizedEffect>,
     contest_state: BTreeMap<String, DependentEffectState>,
     contest_annotations: Vec<ContestedEffectAnnotation>,
+    current_claims: BTreeMap<String, RevocationDependentClaim>,
 }
 
 pub const EFFECT_AUTHORIZER_RECOVERY_SCHEMA: &str = "eliot.authority.effect-authorizer-recovery";
@@ -346,6 +359,7 @@ impl EffectAuthorizer {
             // from clean inputs per I12.20), never resurrected from backup.
             contest_state: BTreeMap::new(),
             contest_annotations: Vec::new(),
+            current_claims: BTreeMap::new(),
         })
     }
 
@@ -471,6 +485,91 @@ impl EffectAuthorizer {
                 }
             };
             self.contest_state.insert(key.clone(), state);
+            self.contest_annotations.push(ContestedEffectAnnotation {
+                idempotency_key: key,
+                revoked_roots: merged,
+                reopened,
+            });
+            changed += 1;
+        }
+        changed
+    }
+
+    /// Registers one current justification/plan/answer claim for a future
+    /// revocation pass. The registry is an overlay; no historical record is
+    /// rewritten and an identical registration is idempotent.
+    pub fn register_current_claim(
+        &mut self,
+        claim: RevocationDependentClaim,
+    ) -> Result<(), AuthorityError> {
+        validate_text(&claim.id, "claim.id")?;
+        validate_text(&claim.kind, "claim.kind")?;
+        for support in &claim.support_refs {
+            validate_text(support, "claim.support_ref")?;
+        }
+        if let Some(existing) = self.current_claims.get(&claim.id)
+            && existing != &claim
+        {
+            return Err(AuthorityError::IdentityConflict);
+        }
+        self.current_claims.insert(claim.id.clone(), claim);
+        Ok(())
+    }
+
+    /// Returns the current claim overlays in stable identity order.
+    #[must_use]
+    pub fn current_claims(&self) -> Vec<RevocationDependentClaim> {
+        self.current_claims.values().cloned().collect()
+    }
+
+    /// Contests current justification/plan/answer claims by explicit support
+    /// membership. The append-only annotation has a `claim:` namespace so it
+    /// cannot overwrite pending-effect history.
+    pub fn contest_current_claims(&mut self, revoked_roots: &BTreeSet<String>) -> usize {
+        if revoked_roots.is_empty() {
+            return 0;
+        }
+        let challenged = self
+            .current_claims
+            .values()
+            .filter_map(|claim| {
+                let matched = claim
+                    .support_refs
+                    .intersection(revoked_roots)
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                (!matched.is_empty()).then_some((claim.id.clone(), matched))
+            })
+            .collect::<Vec<_>>();
+        let mut changed = 0;
+        for (id, matched) in challenged {
+            let key = format!("claim:{id}");
+            let previous = self
+                .contest_state
+                .get(&key)
+                .and_then(|state| state.revoked_roots().cloned());
+            let merged = previous.clone().map_or(matched.clone(), |roots| {
+                roots.union(&matched).cloned().collect()
+            });
+            if previous
+                .as_ref()
+                .is_some_and(|roots| roots.is_superset(&matched))
+            {
+                continue;
+            }
+            let reopened = self.contest_state.contains_key(&key);
+            self.contest_state.insert(
+                key.clone(),
+                if reopened {
+                    DependentEffectState::Reopened {
+                        revoked_roots: merged.clone(),
+                    }
+                } else {
+                    DependentEffectState::Contestable {
+                        revoked_roots: merged.clone(),
+                    }
+                },
+            );
             self.contest_annotations.push(ContestedEffectAnnotation {
                 idempotency_key: key,
                 revoked_roots: merged,

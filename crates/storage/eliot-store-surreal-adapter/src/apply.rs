@@ -1889,12 +1889,10 @@ mod admitted_operation_gate_tests {
         }
     }
 
-    /// Issue #686: the revocation-record mutation is known-but-unsupported
-    /// until a store-owned slice activates its catalogue row with proven
-    /// handlers. The closed name spelling holds and the pre-stage gate
-    /// refuses it with typed `UnknownOperation` — never silent success.
+    /// Issue #686: the activated revocation-record mutation passes the
+    /// pre-stage gate with its closed seven-field payload.
     #[test]
-    fn revocation_record_mutation_fails_closed_until_store_activation() {
+    fn revocation_record_mutation_passes_the_activated_gate() {
         use eliot_store_api::{named_mutation_operation_by_name, named_mutation_operation_name};
         assert_eq!(
             named_mutation_operation_name(NamedMutationOperation::RecordAuthorityRevocation),
@@ -1919,18 +1917,13 @@ mod admitted_operation_gate_tests {
             EffectClass::ReversibleMutation,
             vec![revocation_operation()],
         );
-        assert_eq!(
-            validate_transition(&context, &pending),
-            Err(AdapterError::Store(StoreError::UnknownOperation))
-        );
+        assert!(validate_transition(&context, &pending).is_ok());
     }
 
-    /// Issue #686: the revocation-history read is known-but-unsupported
-    /// until a store-owned slice activates its catalogue row with a proven
-    /// handler. The closed name spelling holds and the read gate refuses it
-    /// with typed `UnknownOperation` — never a successful empty view.
+    /// Issue #686: the activated revocation-history read passes its closed
+    /// catalogue gate with the exact origin and bounded record count.
     #[test]
-    fn revocation_history_read_fails_closed_until_store_activation() {
+    fn revocation_history_read_passes_the_activated_gate() {
         use eliot_store_api::{
             NamedReadOperation, ReadConsistency, ScopeId, named_read_operation_by_name,
             named_read_operation_name,
@@ -1955,10 +1948,7 @@ mod admitted_operation_gate_tests {
                 ("max_records".to_owned(), json!("8")),
             ]),
         };
-        assert_eq!(
-            query.validate_against_catalogue(&entries),
-            Err(StoreError::UnknownOperation)
-        );
+        assert!(query.validate_against_catalogue(&entries).is_ok());
     }
 
     fn erasure_operation() -> eliot_store_api::NamedMutationRequest {

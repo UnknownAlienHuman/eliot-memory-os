@@ -71,7 +71,7 @@ fn evidence_pack_params() -> BTreeMap<String, Value> {
 #[test]
 fn activated_typed_reads_pass_catalogue_validation() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 26);
+    assert_eq!(entries.len(), 35);
 
     // The closed name mapping is the single owner for code, manifests, wire.
     for operation in [
@@ -546,7 +546,7 @@ fn approved_capture_plan_passes_and_stale_digest_fails_manifest_mismatch() {
 #[test]
 fn capture_observation_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 26);
+    assert_eq!(entries.len(), 35);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved owner-shaped subject params pass catalogue validation.
@@ -593,7 +593,7 @@ fn capture_observation_passes_whole_path() {
 #[test]
 fn append_audit_event_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 26);
+    assert_eq!(entries.len(), 35);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved receipt-bound audit params pass catalogue validation without bypass.
@@ -604,7 +604,7 @@ fn append_audit_event_passes_whole_path() {
 #[test]
 fn apply_lifecycle_policy_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 26);
+    assert_eq!(entries.len(), 35);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved lifecycle-policy params pass catalogue validation without bypass.
@@ -615,7 +615,7 @@ fn apply_lifecycle_policy_passes_whole_path() {
 #[test]
 fn reconcile_recovery_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 26);
+    assert_eq!(entries.len(), 35);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved problem-leg recovery params pass catalogue validation without bypass.
@@ -662,7 +662,7 @@ fn reconcile_recovery_passes_whole_path() {
 #[test]
 fn update_task_state_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 26);
+    assert_eq!(entries.len(), 35);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved task-control params pass catalogue validation without bypass.
@@ -694,26 +694,27 @@ fn update_task_state_passes_whole_path() {
 }
 
 #[test]
-fn still_unactivated_mutation_is_refused() {
+fn authority_revocation_mutation_is_activated_with_its_closed_payload() {
     let entries = generated_operation_manifests().unwrap();
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
-
-    // A still-unadmitted mutation has no catalogue entry and fails closed.
-    // T11.2 activates both UpdateTaskState and ApplyEpistemicRevision, so the
-    // remaining unactivated mutation is RecordAuthorityRevocation.
     let mut plan = mutation_plan(&set_digest);
     plan.transition_class = TransitionClass::RecoverySchema;
+    plan.requested_effect_ceiling = EffectClass::ReversibleMutation;
     plan.named_operations = vec![NamedMutationRequest {
         operation: NamedMutationOperation::RecordAuthorityRevocation,
-        parameters: BTreeMap::new(),
+        parameters: BTreeMap::from([
+            ("origin_ref".to_owned(), json!("root:alpha")),
+            ("closure_id".to_owned(), json!("closure:one")),
+            ("closure_revision".to_owned(), json!("1")),
+            ("affected_digest".to_owned(), json!("a".repeat(64))),
+            ("affected_count".to_owned(), json!("1")),
+            ("invalidation_reason".to_owned(), json!("SOURCE_REVOKED")),
+            ("fence_digest".to_owned(), json!("b".repeat(64))),
+        ]),
     }];
-    // Re-derive the bound digests after the plan mutation so the catalogue
-    // gate (not a stale binding) decides the outcome.
     eliot_store_api::bind_issue18_digests(&mut plan).unwrap();
-    assert_eq!(
-        plan.validate_against_catalogue(&entries),
-        Err(StoreError::UnknownOperation)
-    );
+    plan.validate_against_catalogue(&entries)
+        .expect("activated authority-revocation operation");
 }
 
 #[test]

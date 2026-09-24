@@ -43,6 +43,26 @@ use crate::{
     decode_revocation_history_evidence, revocation_history_read_request,
 };
 
+/// Result of one owner-feed synchronization, including the exact live
+/// revocation evidence consumed by the production fan-out.
+#[derive(Clone, Debug)]
+pub struct OwnerFeedSync {
+    /// Revision proven by Kernel readback.
+    pub revision: u64,
+    /// CURRENT history decoded from the canonical read.
+    pub history: eliot_authority::RevocationHistoryEvidence,
+}
+
+/// A read-and-restored owner feed that has not yet been published. The
+/// production Governor applies its derivative invalidation fan-out to this
+/// value before `publish_owner_feed` makes the restored owner observable.
+pub struct PreparedOwnerFeed {
+    /// Restored provider carrying the explicit current history.
+    pub provider: OwnerClosureProvider,
+    /// Exact history read from the canonical store.
+    pub history: eliot_authority::RevocationHistoryEvidence,
+}
+
 /// Kernel publish endpoint for owner bundles, implemented by the daemon
 /// runtime (O1) against the front-door operations.
 ///
@@ -112,6 +132,36 @@ pub async fn publish_owner_feed<P: OwnerPublishPort + ?Sized>(
     Ok(acknowledged)
 }
 
+/// Reads and restores one owner feed without publishing it yet.
+///
+/// Keeping this phase separate is causal: the production Governor can apply
+/// revocation fan-out to the restored provider and its current effects,
+/// context, cache, and rebuild owners before the Kernel can observe a newly
+/// published owner bundle.
+pub async fn prepare_owner_feed<R: CanonicalReadClient + ?Sized>(
+    reads: &R,
+    snapshot: AuthorityOwnerSnapshot,
+    state_fence: &StateFence,
+    origin_ref: &str,
+    max_records: u32,
+    expected_revision: u64,
+) -> Result<PreparedOwnerFeed, CompositionError> {
+    let request = revocation_history_read_request(state_fence, origin_ref, max_records)?;
+    let response = reads
+        .execute_named(request)
+        .await
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    let history = decode_revocation_history_evidence(&response, state_fence)?;
+    if history.source_revision != expected_revision {
+        return Err(CompositionError::Recovery(format!(
+            "owner feed observed revision {} disagrees with expected {expected_revision}; trigger is stale",
+            history.source_revision
+        )));
+    }
+    let provider = OwnerClosureProvider::restore(snapshot, Some(history.clone()), state_fence)?;
+    Ok(PreparedOwnerFeed { provider, history })
+}
+
 /// Runs one complete trigger-driven owner synchronization (`#2100`
 /// admitted caller → publish → recover path).
 ///
@@ -135,19 +185,19 @@ pub async fn synchronize_owner_feed<
     origin_ref: &str,
     max_records: u32,
     expected_revision: u64,
-) -> Result<u64, CompositionError> {
-    let request = revocation_history_read_request(state_fence, origin_ref, max_records)?;
-    let response = reads
-        .execute_named(request)
-        .await
-        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-    let evidence = decode_revocation_history_evidence(&response, state_fence)?;
-    if evidence.source_revision != expected_revision {
-        return Err(CompositionError::Recovery(format!(
-            "owner feed observed revision {} disagrees with expected {expected_revision}; trigger is stale",
-            evidence.source_revision
-        )));
-    }
-    let provider = OwnerClosureProvider::restore(snapshot, Some(evidence), state_fence)?;
-    publish_owner_feed(kernel, &provider, expected_revision).await
+) -> Result<OwnerFeedSync, CompositionError> {
+    let prepared = prepare_owner_feed(
+        reads,
+        snapshot,
+        state_fence,
+        origin_ref,
+        max_records,
+        expected_revision,
+    )
+    .await?;
+    let revision = publish_owner_feed(kernel, &prepared.provider, expected_revision).await?;
+    Ok(OwnerFeedSync {
+        revision,
+        history: prepared.history,
+    })
 }

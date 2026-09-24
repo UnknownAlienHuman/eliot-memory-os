@@ -19,8 +19,14 @@ use crate::controlboard_projection::{
 };
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
-use crate::owner_closure_feed::{OwnerPublishPort, synchronize_owner_feed};
+use crate::owner_closure_feed::{
+    OwnerPublishPort, PreparedOwnerFeed, prepare_owner_feed, publish_owner_feed,
+};
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
+use crate::revocation_workflow::{
+    RevocationClaim, RevocationFanoutInput, RevocationInvalidationLedger, apply_revocation_fanout,
+    revocation_cache_input,
+};
 use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
 use crate::{
@@ -63,6 +69,7 @@ use eliot_maintenance::{
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
+use eliot_problem::RevocationRebuildOrder;
 use eliot_protocol::RequestIdentity;
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
@@ -3098,6 +3105,15 @@ pub struct GovernorComposition<P: ?Sized> {
     /// Exact P-07 presentations retained with their owner snapshots until
     /// exact reconciliation, keyed by [`PresentedAuthorityRequest::ledger_key`].
     authority_presentations: BTreeMap<String, RetainedAuthorityRequest>,
+    /// Volatile exact cache/context/module-profile keys invalidated by the
+    /// production revocation fan-out. Durable history remains in the store.
+    revocation_invalidation_keys: BTreeSet<String>,
+    /// Current revoked lineage retained as a rebuild fence.
+    revoked_lineage: BTreeSet<String>,
+    /// Rebuildable cache/context/module-profile invalidation owner.
+    derivative_invalidation: RevocationInvalidationLedger,
+    /// Typed rebuild orders awaiting a clean-input rebuild owner.
+    scheduled_rebuilds: Vec<RevocationRebuildOrder>,
 }
 
 fn testd_finished_clock(job: &TestJob) -> ClockReading {
@@ -3501,6 +3517,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             service_observations,
             readiness: CompositionReadiness::Ready,
             authority_presentations: BTreeMap::new(),
+            revocation_invalidation_keys: BTreeSet::new(),
+            revoked_lineage: BTreeSet::new(),
+            derivative_invalidation: RevocationInvalidationLedger::default(),
+            scheduled_rebuilds: Vec::new(),
         })
     }
 
@@ -3508,6 +3528,33 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     #[must_use]
     pub const fn owners(&self) -> &GovernorOwners<P> {
         &self.owners
+    }
+
+    /// Returns the exact volatile cache/context/module-profile keys invalidated
+    /// by the live revocation fan-out.
+    #[must_use]
+    pub fn revocation_invalidation_keys(&self) -> &BTreeSet<String> {
+        &self.revocation_invalidation_keys
+    }
+
+    /// Returns the current revoked lineage retained as a rebuild fence.
+    #[must_use]
+    pub fn revoked_lineage(&self) -> &BTreeSet<String> {
+        &self.revoked_lineage
+    }
+
+    /// Returns the rebuildable derivative invalidation ledger.
+    #[must_use]
+    pub const fn derivative_invalidation(&self) -> &RevocationInvalidationLedger {
+        &self.derivative_invalidation
+    }
+
+    /// Returns the typed clean-input rebuild orders scheduled by the live
+    /// revocation workflow. The owner can now durably hand these to its
+    /// maintenance/rebuild scheduler without re-deriving scope.
+    #[must_use]
+    pub fn scheduled_rebuilds(&self) -> &[RevocationRebuildOrder] {
+        &self.scheduled_rebuilds
     }
 
     /// Rehydrates one verifier execution fact from the current Governor task,
@@ -3844,6 +3891,41 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             self.kernel.as_ref(),
             self.readiness,
         )
+    }
+
+    /// Builds and commits one durable `RecordAuthorityRevocation` transition
+    /// through the existing Kernel transition port. The request identity and
+    /// operation identity are supplied by admitted production ingress; this
+    /// method never invents either one. The activated store handler and the
+    /// history read supply the restore gate.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the envelope binds the complete owner-approved revocation record"
+    )]
+    pub async fn record_authority_revocation(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        origin_ref: &str,
+        closure_id: &str,
+        closure_revision: u64,
+        affected_digest: &str,
+        affected_count: u64,
+        invalidation_reason: &str,
+        fence_digest: &str,
+    ) -> Result<WriteReceipt, CompositionError> {
+        let envelope = authority_revocation::authority_revocation_envelope(
+            identity,
+            operation_id,
+            origin_ref,
+            closure_id,
+            closure_revision,
+            affected_digest,
+            affected_count,
+            invalidation_reason,
+            fence_digest,
+        )?;
+        self.commit_canonical(identity, envelope).await
     }
 
     /// Applies one Canonical-admitted transition through the sole retained
@@ -4562,16 +4644,20 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ///
     /// Binds the feed to the live composition snapshot and fence at call
     /// time — never caller-supplied — and runs the full
-    /// read→decode→restore→publish→readback exchange through
-    /// [`synchronize_owner_feed`]. The owning daemon runtime calls this
+    /// read→decode→restore→fan-out→publish→readback exchange through
+    /// [`prepare_owner_feed`] and [`publish_owner_feed`]. The owning daemon runtime calls this
     /// on provider-revision advance and on recovery; a stale trigger
     /// refuses before any publish, and no owner state installs until
     /// the Kernel readback proves the exact published bytes.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the production owner-feed seam keeps read, fan-out, and publish ordering together"
+    )]
     pub async fn synchronize_kernel_owner<
         R: CanonicalReadClient + ?Sized,
         K: OwnerPublishPort + ?Sized,
     >(
-        &self,
+        &mut self,
         reads: &R,
         kernel: &K,
         origin_ref: &str,
@@ -4580,16 +4666,124 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ) -> Result<u64, CompositionError> {
         let snapshot = self.owners.authority.snapshot()?;
         let state_fence = self.snapshot.state_fence();
-        synchronize_owner_feed(
+        let PreparedOwnerFeed { provider, history } = prepare_owner_feed(
             reads,
-            kernel,
             snapshot,
             &state_fence,
             origin_ref,
             max_records,
             expected_revision,
         )
-        .await
+        .await?;
+        let mut graph = Vec::new();
+        let mut affected = BTreeSet::new();
+        for closure in &history.closures {
+            affected.insert(closure.root_ref.clone());
+            for dependent in &closure.dependent_refs {
+                affected.insert(dependent.clone());
+                graph.push(eliot_influence::InfluenceEdge {
+                    source_ref: closure.root_ref.clone(),
+                    dependent_ref: dependent.clone(),
+                });
+            }
+        }
+        // The durable root record carries the root identity and closure
+        // digest; the live Governor grant graph supplies the explicit
+        // root→grant and parent→grant edges needed to recover the complete
+        // production dependency closure without guessing by similarity.
+        let grant_snapshot = self
+            .owners
+            .authority
+            .grants
+            .recovery_snapshot()
+            .map_err(|error| {
+                CompositionError::Owner(format!("grant graph recovery failed: {error}"))
+            })?;
+        for grant in &grant_snapshot.grants {
+            graph.push(eliot_influence::InfluenceEdge {
+                source_ref: grant.authority_root_ref.clone(),
+                dependent_ref: grant.grant_id.clone(),
+            });
+            if let Some(parent) = &grant.parent_grant_id {
+                graph.push(eliot_influence::InfluenceEdge {
+                    source_ref: parent.as_str().to_owned(),
+                    dependent_ref: grant.grant_id.clone(),
+                });
+            }
+        }
+        // Materialize the complete current grant-derived projection before
+        // compiling it. This keeps the compiler input aligned with the
+        // explicit closure instead of silently limiting removal to the root
+        // record carried by the store.
+        for closure in &history.closures {
+            affected.extend(eliot_influence::traverse_dependency_closure(
+                &closure.root_ref,
+                &graph,
+            ));
+        }
+        // Current authority justifications are explicit claims over their
+        // admitted root. Registering them here makes the production fan-out
+        // contest the current projection, while the grant graph remains the
+        // immutable historical decision record.
+        for grant in &grant_snapshot.grants {
+            self.owners.authority.register_revocation_claim(
+                eliot_authority::RevocationDependentClaim {
+                    id: format!("justification:{}", grant.grant_id),
+                    kind: "justification".to_owned(),
+                    support_refs: BTreeSet::from([grant.authority_root_ref.clone()]),
+                },
+            )?;
+        }
+        let (context, recipe) = revocation_cache_input(
+            state_fence.clone(),
+            &format!("revocation:{origin_ref}"),
+            &affected,
+        )?;
+        let plan = self.owners.canonical.read_current_plan(&state_fence)?;
+        let support_refs = affected
+            .iter()
+            .filter(|reference| *reference == &plan.plan_id)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !support_refs.is_empty() {
+            self.owners.authority.register_revocation_claim(
+                eliot_authority::RevocationDependentClaim {
+                    id: format!("plan:{}", plan.plan_id),
+                    kind: "plan".to_owned(),
+                    support_refs,
+                },
+            )?;
+        }
+        let current_claims = self
+            .owners
+            .authority
+            .revocation_claims()
+            .into_iter()
+            .map(|claim| RevocationClaim {
+                id: claim.id,
+                support_refs: claim.support_refs,
+            })
+            .collect();
+        let fanout = apply_revocation_fanout(&RevocationFanoutInput {
+            history: history.clone(),
+            graph,
+            context,
+            recipe,
+            current_claims,
+        })?;
+        self.scheduled_rebuilds
+            .extend(fanout.rebuild_orders.iter().cloned());
+        self.revocation_invalidation_keys
+            .extend(fanout.invalidation_keys().iter().cloned());
+        self.derivative_invalidation
+            .invalidate(fanout.invalidation_keys());
+        let revoked_roots = fanout.affected_refs.clone();
+        self.revoked_lineage.extend(revoked_roots.clone());
+        self.owners
+            .authority
+            .contest_effects_for_revocation(&revoked_roots);
+        let revision = publish_owner_feed(kernel, &provider, expected_revision).await?;
+        Ok(revision)
     }
 
     /// Reads one coherent semantic activation from all required owner records.

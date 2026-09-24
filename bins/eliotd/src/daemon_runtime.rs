@@ -902,8 +902,8 @@ async fn sync_owner_feed(
     composition: &SharedComposition,
     trigger: &mut eliotd::OwnerFeedTrigger,
 ) {
-    let guard = composition.lock().await;
-    match eliotd::maintain_owner_feed(&guard, kernel, trigger).await {
+    let mut guard = composition.lock().await;
+    match eliotd::maintain_owner_feed(&mut guard, kernel, trigger).await {
         Ok(Some(revision)) => {
             tracing::info!(
                 target: "eliotd::diagnostics",

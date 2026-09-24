@@ -3,11 +3,9 @@
 //! The Governor records committed influence revocations through the
 //! `RecordAuthorityRevocation` named mutation and serves the CURRENT
 //! revocation history through the `GetAuthorityRevocationHistory` named
-//! read. Both operations are known-but-unsupported until a store-owned
-//! slice activates their catalogue rows with proven handlers: the typed
-//! parameter contracts and this payload shape are already closed so the
-//! Governor decision edge (envelope construction, evidence decoding) is
-//! exact before activation.
+//! read. Both operations are activated in the generated store catalogue and
+//! are served from the durable recovery-owner ledger; the typed parameter
+//! contracts and payload shape keep the Governor decision edge exact.
 //!
 //! The read payload carries only actually recorded revocations under the
 //! exact response fence — never a synthesized default. An empty `closures`

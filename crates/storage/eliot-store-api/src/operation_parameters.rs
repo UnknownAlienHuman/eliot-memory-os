@@ -44,8 +44,9 @@
 //! idempotency key).
 //! Every other [`NamedReadOperation`](crate::NamedReadOperation) variant and
 //! every other [`NamedMutationOperation`](crate::NamedMutationOperation)
-//! variant stays known-but-unsupported and unadvertised, and no other mutation
-//! has an owner-approved typed schema yet.
+//! variant stays known-but-unsupported and unadvertised. The authority
+//! revocation read and mutation are now activated with their owner-approved
+//! typed schemas.
 //!
 //! This module is the single source of truth for those contracts: the closed
 //! operation-name mapping, the declared parameter list per activated

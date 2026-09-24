@@ -24,7 +24,7 @@ pub use effects::{
     ActionContract, AuthorizedEffect, AuthorizedEffectRecoveryRecord, ContestedEffectAnnotation,
     DependentEffectState, EFFECT_AUTHORIZER_RECOVERY_SCHEMA, EFFECT_AUTHORIZER_RECOVERY_VERSION,
     EffectAuthorizer, EffectAuthorizerRecoverySnapshot, EffectOutcome, EffectReceipt,
-    ProposedEffect,
+    ProposedEffect, RevocationDependentClaim,
 };
 pub use grants::{
     AuthoritySet, CapabilityGrant, CapabilityIntroduction, EffectiveCapabilityPath,

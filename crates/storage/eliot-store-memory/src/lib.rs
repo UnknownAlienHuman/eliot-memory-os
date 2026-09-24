@@ -22,6 +22,7 @@ use eliot_kernel_core::{
     DeliveryChannel, DeliveryState, NotificationDraft, NotificationError, NotificationSeverity,
     NotificationStore, ResolutionAuthorization,
 };
+use eliot_security_contracts::RevocationReason;
 use eliot_store_api::epistemic_revision::{EpistemicCommit, position_key};
 use eliot_store_api::{
     AUTOMATION_QUERY_CURRENT, AUTOMATION_QUERY_FAILURE, AUTOMATION_QUERY_HISTORY,
@@ -34,18 +35,19 @@ use eliot_store_api::{
     OWNER_SNAPSHOT_SCHEMA, OperationId, OperationManifestDigest, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
     PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
-    ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
-    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
-    StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
-    StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
-    bind_issue18_receipt, canonical_json_bytes, canonical_request_hash, decode_automation_mutation,
-    decode_erasure_surfaces, decode_notification_mutation, decode_reactive_mutation,
-    decode_resource_content, generated_operation_manifests, genesis_manifest, genesis_transition,
-    is_genesis_fence, issue_genesis_receipt_envelope, issue_store_receipt_envelope,
-    named_mutation_operation_name, sha256_hex, validate_automation_read_params,
-    validate_genesis_receipt_envelope, validate_reactive_ledger_read_params,
-    validate_resource_snapshot_read_params, validate_store_receipt_envelope,
-    verify_canonical_request_hash,
+    ProjectionStatus, REVOCATION_HISTORY_MAX_RECORDS, REVOCATION_HISTORY_PAYLOAD_VERSION,
+    RecordedRevocation, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission,
+    RevisionDelta, RevisionHead, RevisionHeadExpectation, RevisionKey, RevocationHistoryPayload,
+    ScopeId, ScopeRevisionView, SplitView, StateFence, StoreError, StoreGenesisRequest,
+    StoreHealth, StoreHealthStatus, StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass,
+    WriteReceipt, WriteReceiptStatus, bind_issue18_receipt, canonical_json_bytes,
+    canonical_request_hash, decode_automation_mutation, decode_erasure_surfaces,
+    decode_notification_mutation, decode_reactive_mutation, decode_resource_content,
+    generated_operation_manifests, genesis_manifest, genesis_transition, is_genesis_fence,
+    issue_genesis_receipt_envelope, issue_store_receipt_envelope, named_mutation_operation_name,
+    sha256_hex, validate_automation_read_params, validate_genesis_receipt_envelope,
+    validate_reactive_ledger_read_params, validate_resource_snapshot_read_params,
+    validate_store_receipt_envelope, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 use serde::de::Error as _;
@@ -345,6 +347,7 @@ impl MemoryStore {
         dispatch_apply_experience_state(&mut state, &transition, &mut plan)?;
         dispatch_apply_finish_evidence(&mut state, &transition)?;
         dispatch_apply_finish_decision(&mut state, &transition)?;
+        dispatch_apply_authority_revocation(&mut state, &transition)?;
         let receipt = transaction_receipt(ctx, &transition, idempotency_key, recomputed, &plan)?;
         if let (Some(commit), Some(key)) = (epistemic, epistemic_key) {
             commit.readback(&receipt)?;
@@ -732,6 +735,103 @@ fn dispatch_apply_finish_decision(
         state_fence: transition.state_fence.clone(),
         revision,
         schema: OWNER_SNAPSHOT_SCHEMA.to_owned(),
+        value_digest: sha256_hex(&payload),
+        payload,
+    };
+    record.validate()?;
+    state.recovery_records.insert(key, record);
+    Ok(())
+}
+
+const REVOCATION_OWNER_NAMESPACE: &str = "authority-revocation";
+const REVOCATION_OWNER_SCHEMA: &str = "eliot.store.authority-revocation.v1";
+
+/// Persists the admitted authority-revocation root as an opaque, fenced
+/// recovery record. The store does not interpret the closure; it preserves
+/// the exact typed record for the current history read and restore gate.
+fn dispatch_apply_authority_revocation(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+) -> Result<(), StoreError> {
+    let Some(command) = transition
+        .named_operations
+        .iter()
+        .find(|command| command.operation == NamedMutationOperation::RecordAuthorityRevocation)
+    else {
+        return Ok(());
+    };
+    if transition.transition_class != TransitionClass::RecoverySchema {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let text_param = |name: &str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })
+    };
+    let origin_ref = text_param("origin_ref")?.to_owned();
+    let closure_id = text_param("closure_id")?.to_owned();
+    let closure_revision = text_param("closure_revision")?
+        .parse::<u64>()
+        .map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "closure_revision must be a decimal revision",
+        })?;
+    let _affected_digest = text_param("affected_digest")?.to_owned();
+    let affected_count = text_param("affected_count")?
+        .parse::<usize>()
+        .map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "affected_count must be a decimal count",
+        })?;
+    if affected_count == 0 {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "affected_count must include the revoked origin",
+        });
+    }
+    let invalidation_reason = text_param("invalidation_reason")?;
+    let reason: RevocationReason =
+        serde_json::from_value(Value::String(invalidation_reason.to_owned())).map_err(|_| {
+            StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "invalidation_reason is not a closed revocation reason",
+            }
+        })?;
+    let _fence_digest = text_param("fence_digest")?;
+    let recorded = RecordedRevocation {
+        closure_id: closure_id.clone(),
+        root_ref: origin_ref.clone(),
+        dependent_refs: vec![origin_ref.clone()],
+        invalidation_reason: reason,
+        revision: closure_revision,
+    };
+    recorded.validate()?;
+    let payload = serde_json::to_vec(&recorded)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    if payload.len() > MAX_RECOVERY_RECORD_BYTES {
+        return Err(StoreError::PayloadTooLarge);
+    }
+    let key = RecoveryRecordKey::new(REVOCATION_OWNER_NAMESPACE, &closure_id)?;
+    if let Some(existing) = state.recovery_records.get(&key) {
+        if existing.state_fence != transition.state_fence
+            || existing.payload != payload
+            || existing.value_digest != sha256_hex(&payload)
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+        return Ok(());
+    }
+    let record = RecoveryRecord {
+        namespace: REVOCATION_OWNER_NAMESPACE.to_owned(),
+        key: closure_id,
+        state_fence: transition.state_fence.clone(),
+        revision: closure_revision,
+        schema: REVOCATION_OWNER_SCHEMA.to_owned(),
         value_digest: sha256_hex(&payload),
         payload,
     };
@@ -2170,6 +2270,7 @@ fn validate_transaction_state(
                 command.operation,
                 NamedMutationOperation::RecordFinishDecision
                     | NamedMutationOperation::RecordFinishEvidence
+                    | NamedMutationOperation::RecordAuthorityRevocation
             )
         })
     {
@@ -2589,6 +2690,7 @@ impl MemoryStore {
                 | NamedReadOperation::GetExperienceBankRange
                 | NamedReadOperation::GetAgentFeedbackRange
                 | NamedReadOperation::GetAuditRange
+                | NamedReadOperation::GetAuthorityRevocationHistory
         ) {
             let entries = generated_operation_manifests()?;
             query.validate_against_catalogue(&entries)?;
@@ -2709,6 +2811,10 @@ impl MemoryStore {
                 experience_range_payload(&state, query, &fence, false)
             }
             NamedReadOperation::GetAuditRange => audit_range_payload(&state, query, &fence),
+            NamedReadOperation::GetAuthorityRevocationHistory => {
+                Self::revocation_history_payload(&state, query, &fence)
+                    .map_err(|error| serde_json::Error::custom(error.to_string()))
+            }
             _ => serde_json::to_value(json!({
                 "operation": format!("{:?}", query.operation),
                 "records": state.named_operations.iter().map(|record| &record.operation).collect::<Vec<_>>(),
@@ -2723,6 +2829,70 @@ impl MemoryStore {
         };
         response.validate()?;
         Ok(response)
+    }
+
+    fn revocation_history_payload(
+        state: &MemoryState,
+        query: &NamedReadRequest,
+        fence: &StateFence,
+    ) -> Result<Value, StoreError> {
+        let origin_ref = query
+            .parameters
+            .get("origin_ref")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
+        if origin_ref.trim().is_empty() || origin_ref.chars().any(char::is_control) {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "origin_ref must be a non-blank string",
+            });
+        }
+        let max_records = query
+            .parameters
+            .get("max_records")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?
+            .parse::<u32>()
+            .map_err(|_| StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "max_records must be a positive decimal bound",
+            })?;
+        if max_records == 0 || max_records > REVOCATION_HISTORY_MAX_RECORDS {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        if query.scope_id.as_ref().map(|scope| scope.as_str()) != Some("governor") {
+            return Err(StoreError::ManifestMismatch);
+        }
+        let mut closures = state
+            .recovery_records
+            .iter()
+            .filter(|(key, _)| key.namespace == REVOCATION_OWNER_NAMESPACE)
+            .filter_map(|(_, record)| {
+                serde_json::from_slice::<RecordedRevocation>(&record.payload)
+                    .ok()
+                    .filter(|closure| closure.root_ref == origin_ref)
+            })
+            .collect::<Vec<_>>();
+        closures.sort_by(|left, right| left.closure_id.cmp(&right.closure_id));
+        let source_revision = closures.iter().map(|row| row.revision).max().unwrap_or(1);
+        closures.truncate(max_records as usize);
+        let payload = RevocationHistoryPayload {
+            version: REVOCATION_HISTORY_PAYLOAD_VERSION,
+            origin_ref: origin_ref.to_owned(),
+            source_revision,
+            closures,
+        };
+        payload.validate()?;
+        if query.state_fence != *fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        serde_json::to_value(payload).map_err(|error| StoreError::Serialization(error.to_string()))
     }
 
     /// Builds the versioned exact evidence-pack payload for one request.

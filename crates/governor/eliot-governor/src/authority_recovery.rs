@@ -218,7 +218,30 @@ impl AuthorityOwner {
         })
     }
 
-    /// Returns the exact fence retained by this authority owner.
+    /// Registers a current justification/plan/answer claim in the authority
+    /// owner's revocation overlay.
+    pub fn register_revocation_claim(
+        &mut self,
+        claim: eliot_authority::RevocationDependentClaim,
+    ) -> Result<(), CompositionError> {
+        self.effects
+            .register_current_claim(claim)
+            .map_err(|error| CompositionError::Owner(error.to_string()))
+    }
+
+    /// Returns current claim overlays for the production fan-out caller.
+    #[must_use]
+    pub fn revocation_claims(&self) -> Vec<eliot_authority::RevocationDependentClaim> {
+        self.effects.current_claims()
+    }
+
+    /// Applies current effect and claim contest overlays for a committed
+    /// revocation closure. Historical authorized records remain immutable.
+    pub fn contest_effects_for_revocation(&mut self, revoked_roots: &BTreeSet<String>) -> usize {
+        self.effects.contest_dependent_effects(revoked_roots)
+            + self.effects.contest_current_claims(revoked_roots)
+    }
+
     #[must_use]
     pub const fn state_fence(&self) -> &StateFence {
         &self.state_fence

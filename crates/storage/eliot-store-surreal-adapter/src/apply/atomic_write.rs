@@ -507,6 +507,7 @@ fn build_apply_statements(
     append_experience_statements(&mut sql, &mut bindings, experience)?;
     append_finish_evidence_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_owner_statement(&mut sql, &mut bindings, transition)?;
+    append_authority_revocation_statement(&mut sql, &mut bindings, transition)?;
 
     sql.push_str(schema::TX_CREATE_RECEIPT);
     bindings.insert(
@@ -735,6 +736,111 @@ fn append_finish_owner_statement(
     // prevents a future caller from silently dropping the required parameter
     // while preserving Governor ownership of its interpretation.
     bindings.insert("finish_attempt_id".to_owned(), json!(attempt_id));
+    Ok(())
+}
+
+/// Appends the durable authority-revocation record. The record is an opaque
+/// typed payload in the existing fenced recovery-owner table; no `SurrealQL`
+/// handler interprets influence or derived state.
+fn append_authority_revocation_statement(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let Some(command) = transition.named_operations.iter().find(|command| {
+        command.operation == eliot_store_api::NamedMutationOperation::RecordAuthorityRevocation
+    }) else {
+        return Ok(());
+    };
+    if transition.transition_class != eliot_store_api::TransitionClass::RecoverySchema {
+        return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
+    }
+    let text_param = |name: &'static str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            }))
+    };
+    let origin_ref = text_param("origin_ref")?.to_owned();
+    let closure_id = text_param("closure_id")?.to_owned();
+    let closure_revision = text_param("closure_revision")?
+        .parse::<u64>()
+        .map_err(|_| {
+            AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "closure_revision must be a decimal revision",
+            })
+        })?;
+    let _affected_digest = text_param("affected_digest")?;
+    let affected_count = text_param("affected_count")?
+        .parse::<usize>()
+        .map_err(|_| {
+            AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "affected_count must be a decimal count",
+            })
+        })?;
+    if affected_count == 0 {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "affected_count must include the revoked origin",
+        }));
+    }
+    let reason: eliot_security_contracts::RevocationReason =
+        serde_json::from_value(Value::String(text_param("invalidation_reason")?.to_owned()))
+            .map_err(|_| {
+                AdapterError::Store(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "invalidation_reason is not a closed revocation reason",
+                })
+            })?;
+    let _fence_digest = text_param("fence_digest")?;
+    let recorded = eliot_store_api::RecordedRevocation {
+        closure_id: closure_id.clone(),
+        root_ref: origin_ref.clone(),
+        dependent_refs: vec![origin_ref],
+        invalidation_reason: reason,
+        revision: closure_revision,
+    };
+    recorded.validate().map_err(AdapterError::Store)?;
+    let payload = serde_json::to_vec(&recorded)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    if payload.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
+        return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+    }
+    let key = eliot_store_api::RecoveryRecordKey::new("authority-revocation", &closure_id)
+        .map_err(AdapterError::Store)?;
+    let owner_id = recovery_owner_id(&key)?;
+    let mut record = Map::new();
+    record.insert("namespace".to_owned(), json!(key.namespace));
+    record.insert("key".to_owned(), json!(key.key));
+    record.insert("state_fence".to_owned(), json!(&transition.state_fence));
+    record.insert("revision".to_owned(), json!(1));
+    record.insert(
+        "schema".to_owned(),
+        json!("eliot.store.authority-revocation.v1"),
+    );
+    record.insert("payload".to_owned(), json!(payload));
+    record.insert(
+        "value_digest".to_owned(),
+        json!(eliot_store_api::sha256_hex(&payload)),
+    );
+    sql.push_str(schema::TX_AUTHORITY_REVOCATION);
+    bindings.insert(
+        "revocation_owner_table".to_owned(),
+        json!(schema::table::RECOVERY_OWNER),
+    );
+    bindings.insert("revocation_owner_id".to_owned(), json!(owner_id));
+    bindings.insert(
+        "revocation_expected_state_fence".to_owned(),
+        json!(&transition.state_fence),
+    );
+    bindings.insert("revocation_expected_revision".to_owned(), json!(0));
+    bindings.insert("revocation_owner_record".to_owned(), Value::Object(record));
     Ok(())
 }
 
