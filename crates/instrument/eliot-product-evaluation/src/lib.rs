@@ -9,7 +9,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::{ArtifactId, ClockReading, ContractId, ContractVersion};
+use eliot_contracts::{
+    ArtifactId, ClockReading, ContractId, ContractVersion, StateFence, canonical_json_bytes,
+    sha256_hex,
+};
 use eliot_evaluation_contracts::{
     BudgetEquivalence, BudgetEquivalenceLedger, ComparisonBasis, EvaluationContractError,
     EvaluationReportInput, EvidenceScope, ProductEvaluationPlan, ProductEvidenceStatus,
@@ -25,6 +28,9 @@ pub const CONTRACT_NAME: &str = "eliot.instrument.product-evaluation";
 /// Wire revision of this implementation surface.
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+/// Canonical owner identity used for product-evaluation campaign projections.
+pub const CAMPAIGN_OWNER_ID: &str = "owner:eliot-instrument/product-evaluation";
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ProductEvaluationError {
@@ -53,6 +59,14 @@ pub enum ProductEvaluationError {
     Comparison(String),
     #[error("canonical report serialization failed: {0}")]
     Serialization(String),
+    #[error("campaign publication received an invalid state fence")]
+    InvalidStateFence,
+    #[error("report revision does not bind the exact report body")]
+    ReportRevisionMismatch,
+    #[error("report refers to a different evaluation plan")]
+    ReportPlanMismatch,
+    #[error("holdout policy projection does not bind the exact plan")]
+    HoldoutPlanMismatch,
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), ProductEvaluationError> {
@@ -92,6 +106,307 @@ fn digest<T: Serialize>(value: &T) -> Result<String, ProductEvaluationError> {
             digest.push(HEX_DIGITS[(byte & 0x0f) as usize] as char);
             digest
         }))
+}
+
+/// Typed owner body for the closed product-evaluation source schemas.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProductEvaluationCampaignDocument {
+    /// Exact validated `ProductEvaluationPlan` admitted by the evaluation owner.
+    EvaluatorContract(Box<ProductEvaluationPlan>),
+    /// Policy-only holdout projection derived from the exact plan.
+    EvaluatorHoldout(EvaluatorHoldoutPolicyProjection),
+    /// Exact report produced by [`build_report`].
+    EvaluationResults(Box<ProductEvaluationReport>),
+}
+
+/// Narrow preregistered holdout/contamination policy projection.
+///
+/// This contains policy text only. It makes no claim that holdout records,
+/// sealed answers, or holdout outcomes exist.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluatorHoldoutPolicyProjection {
+    /// Exact `ProductEvaluationPlan` identity.
+    pub plan_id: ContractId,
+    /// Content digest of the exact validated `ProductEvaluationPlan`.
+    pub plan_revision: String,
+    /// Native policy defining the pilot, holdout, and contamination boundary.
+    pub pilot_holdout_and_contamination_boundaries: String,
+    /// Native policy defining leakage and prior-run visibility controls.
+    pub leakage_and_prior_run_visibility_controls: String,
+}
+
+/// Store-neutral, immutable source projection derived from a typed evaluation
+/// owner body. Its identity, revision, owner and digest cannot be caller-set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductEvaluationCampaignPublication {
+    document: ProductEvaluationCampaignDocument,
+    record_id: ContractId,
+    revision: String,
+    recorded_state_fence: StateFence,
+    body_digest: String,
+}
+
+impl ProductEvaluationCampaignPublication {
+    /// Fixed schema tag used by the closed campaign source document.
+    #[must_use]
+    pub const fn schema_tag(&self) -> &'static str {
+        match self.document {
+            ProductEvaluationCampaignDocument::EvaluatorContract(_) => "EVALUATOR_CONTRACT",
+            ProductEvaluationCampaignDocument::EvaluatorHoldout(_) => "EVALUATOR_HOLDOUT",
+            ProductEvaluationCampaignDocument::EvaluationResults(_) => "EVALUATION_RESULTS",
+        }
+    }
+
+    /// Fixed owner identity authorized for this source role.
+    #[must_use]
+    pub const fn owner_id(&self) -> &'static str {
+        CAMPAIGN_OWNER_ID
+    }
+
+    /// Native campaign source role tag for this body.
+    #[must_use]
+    pub const fn role_tag(&self) -> &'static str {
+        match self.document {
+            ProductEvaluationCampaignDocument::EvaluatorContract(_) => "EVALUATOR_CONTRACT",
+            ProductEvaluationCampaignDocument::EvaluatorHoldout(_) => "EVALUATOR_HOLDOUT",
+            ProductEvaluationCampaignDocument::EvaluationResults(_) => "EVALUATION_RESULTS",
+        }
+    }
+
+    /// Exact native contract identity derived from the plan or report.
+    #[must_use]
+    pub const fn record_id(&self) -> &ContractId {
+        &self.record_id
+    }
+
+    /// Exact content-addressed plan revision or native report revision.
+    #[must_use]
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    /// Original state fence supplied by the admitted owner route.
+    #[must_use]
+    pub const fn recorded_state_fence(&self) -> &StateFence {
+        &self.recorded_state_fence
+    }
+
+    /// Closed typed body for independent consumer validation.
+    #[must_use]
+    pub const fn document(&self) -> &ProductEvaluationCampaignDocument {
+        &self.document
+    }
+
+    /// Canonical digest of the exact concrete document body.
+    #[must_use]
+    pub fn body_digest(&self) -> &str {
+        &self.body_digest
+    }
+
+    /// Serialize only the concrete source body, without transport metadata.
+    pub fn body_value(&self) -> Result<serde_json::Value, ProductEvaluationError> {
+        let result = match &self.document {
+            ProductEvaluationCampaignDocument::EvaluatorContract(plan) => {
+                serde_json::to_value(plan)
+            }
+            ProductEvaluationCampaignDocument::EvaluatorHoldout(policy) => {
+                serde_json::to_value(policy)
+            }
+            ProductEvaluationCampaignDocument::EvaluationResults(report) => {
+                serde_json::to_value(report)
+            }
+        };
+        result.map_err(|error| ProductEvaluationError::Serialization(error.to_string()))
+    }
+}
+
+/// Bundle of owner-derived source rows produced alongside one actual report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductEvaluationCampaignPublications {
+    report: ProductEvaluationReport,
+    evaluator_contract: ProductEvaluationCampaignPublication,
+    evaluator_holdout: ProductEvaluationCampaignPublication,
+    evaluation_results: ProductEvaluationCampaignPublication,
+}
+
+/// Exact native product-evaluation inputs for report and source construction.
+pub struct ProductEvaluationCampaignBuildInput<'a> {
+    /// Native report identity selected by the evaluation owner.
+    pub report_id: ContractId,
+    /// Exact product identity used by the owner report.
+    pub product_identity: ProductIdentityRef,
+    /// Current validated owner plan.
+    pub plan: &'a ProductEvaluationPlan,
+    /// Exact captured trial records consumed by comparison.
+    pub trials: &'a [TrialRecord],
+    /// Exact evidence atoms owned by the report producer.
+    pub evidence_atoms: Vec<EvidenceAtom>,
+    /// Exact evidence references owned by the report producer.
+    pub evidence_refs: Vec<ArtifactId>,
+    /// Native evidence disposition for the report.
+    pub status: ProductEvidenceStatus,
+    /// Original admitted state fence for this source publication.
+    pub state_fence: &'a StateFence,
+}
+
+impl ProductEvaluationCampaignPublications {
+    /// Exact report returned by the native report builder.
+    #[must_use]
+    pub const fn report(&self) -> &ProductEvaluationReport {
+        &self.report
+    }
+
+    /// Content-addressed evaluator contract publication for the admitted plan.
+    #[must_use]
+    pub const fn evaluator_contract(&self) -> &ProductEvaluationCampaignPublication {
+        &self.evaluator_contract
+    }
+
+    /// Policy-only holdout publication derived from the admitted plan.
+    #[must_use]
+    pub const fn evaluator_holdout(&self) -> &ProductEvaluationCampaignPublication {
+        &self.evaluator_holdout
+    }
+
+    /// Results publication derived from the exact report builder output.
+    #[must_use]
+    pub const fn evaluation_results(&self) -> &ProductEvaluationCampaignPublication {
+        &self.evaluation_results
+    }
+}
+
+/// Derive a campaign source projection from the exact validated evaluation plan.
+pub fn evaluation_plan_campaign_publication(
+    plan: &ProductEvaluationPlan,
+    state_fence: &StateFence,
+) -> Result<ProductEvaluationCampaignPublication, ProductEvaluationError> {
+    plan.validate()?;
+    validate_publication_fence(state_fence)?;
+    let revision = canonical_digest(plan)?;
+    let document = ProductEvaluationCampaignDocument::EvaluatorContract(Box::new(plan.clone()));
+    let body_digest = canonical_digest(plan)?;
+    Ok(ProductEvaluationCampaignPublication {
+        document,
+        record_id: plan.plan_id.clone(),
+        revision,
+        recorded_state_fence: state_fence.clone(),
+        body_digest,
+    })
+}
+
+/// Derive a policy-only holdout projection from the exact validated plan.
+pub fn evaluation_holdout_policy_campaign_publication(
+    plan: &ProductEvaluationPlan,
+    state_fence: &StateFence,
+) -> Result<ProductEvaluationCampaignPublication, ProductEvaluationError> {
+    plan.validate()?;
+    validate_publication_fence(state_fence)?;
+    let plan_revision = canonical_digest(plan)?;
+    let policy = EvaluatorHoldoutPolicyProjection {
+        plan_id: plan.plan_id.clone(),
+        plan_revision: plan_revision.clone(),
+        pilot_holdout_and_contamination_boundaries: plan
+            .pilot_holdout_and_contamination_boundaries
+            .clone(),
+        leakage_and_prior_run_visibility_controls: plan
+            .leakage_and_prior_run_visibility_controls
+            .clone(),
+    };
+    let body_digest = canonical_digest(&policy)?;
+    Ok(ProductEvaluationCampaignPublication {
+        document: ProductEvaluationCampaignDocument::EvaluatorHoldout(policy),
+        record_id: plan.plan_id.clone(),
+        revision: plan_revision,
+        recorded_state_fence: state_fence.clone(),
+        body_digest,
+    })
+}
+
+impl EvaluatorHoldoutPolicyProjection {
+    /// Validate the policy projection against its exact content-addressed plan.
+    pub fn validate_against(
+        &self,
+        plan: &ProductEvaluationPlan,
+    ) -> Result<(), ProductEvaluationError> {
+        plan.validate()?;
+        if self.plan_id != plan.plan_id
+            || self.plan_revision != canonical_digest(plan)?
+            || self.pilot_holdout_and_contamination_boundaries
+                != plan.pilot_holdout_and_contamination_boundaries
+            || self.leakage_and_prior_run_visibility_controls
+                != plan.leakage_and_prior_run_visibility_controls
+        {
+            return Err(ProductEvaluationError::HoldoutPlanMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Derive a results source projection from an exact plan and native report.
+/// The report's own revision is checked using the same digest rule as
+/// [`build_report`], and its plan reference must match the exact supplied plan.
+fn evaluation_results_campaign_publication(
+    plan: &ProductEvaluationPlan,
+    report: &ProductEvaluationReport,
+    state_fence: &StateFence,
+) -> Result<ProductEvaluationCampaignPublication, ProductEvaluationError> {
+    plan.validate()?;
+    report.validate_content_addressed()?;
+    validate_publication_fence(state_fence)?;
+    if report.plan_ref != plan.plan_id {
+        return Err(ProductEvaluationError::ReportPlanMismatch);
+    }
+    let body_digest = canonical_digest(report)?;
+    Ok(ProductEvaluationCampaignPublication {
+        document: ProductEvaluationCampaignDocument::EvaluationResults(Box::new(report.clone())),
+        record_id: report.report_id.clone(),
+        revision: report.report_revision.clone(),
+        recorded_state_fence: state_fence.clone(),
+        body_digest,
+    })
+}
+
+/// Build the native report and its three exact campaign source publications.
+///
+/// The result publication is created only from the report produced inside this
+/// function, after the actual plan/trials/evidence have passed `build_report`.
+pub fn build_report_with_campaign_publications(
+    input: ProductEvaluationCampaignBuildInput<'_>,
+) -> Result<ProductEvaluationCampaignPublications, ProductEvaluationError> {
+    let evaluator_contract = evaluation_plan_campaign_publication(input.plan, input.state_fence)?;
+    let evaluator_holdout =
+        evaluation_holdout_policy_campaign_publication(input.plan, input.state_fence)?;
+    let report = build_report(
+        input.report_id,
+        input.product_identity,
+        input.plan,
+        input.trials,
+        input.evidence_atoms,
+        input.evidence_refs,
+        input.status,
+    )?;
+    let evaluation_results =
+        evaluation_results_campaign_publication(input.plan, &report, input.state_fence)?;
+    Ok(ProductEvaluationCampaignPublications {
+        report,
+        evaluator_contract,
+        evaluator_holdout,
+        evaluation_results,
+    })
+}
+
+fn validate_publication_fence(state_fence: &StateFence) -> Result<(), ProductEvaluationError> {
+    state_fence
+        .validate()
+        .map_err(|_| ProductEvaluationError::InvalidStateFence)
+}
+
+fn canonical_digest<T: Serialize>(value: &T) -> Result<String, ProductEvaluationError> {
+    let bytes = canonical_json_bytes(value)
+        .map_err(|error| ProductEvaluationError::Serialization(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
 }
 
 /// Exact source anchor for a load-bearing evaluation claim.
@@ -210,6 +525,17 @@ impl ProductEvaluationReport {
             return Err(ProductEvaluationError::InvalidText {
                 field: "report.claim_boundary",
             });
+        }
+        Ok(())
+    }
+
+    /// Validate the report contract and its native builder revision.
+    pub fn validate_content_addressed(&self) -> Result<(), ProductEvaluationError> {
+        self.validate()?;
+        let mut revision_body = self.clone();
+        revision_body.report_revision.clear();
+        if digest(&revision_body)? != self.report_revision {
+            return Err(ProductEvaluationError::ReportRevisionMismatch);
         }
         Ok(())
     }

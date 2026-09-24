@@ -11,10 +11,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_contracts::{ArtifactId, StateFence};
 use eliot_learning_contracts::identity::SourceLineage;
 use eliot_learning_contracts::{
-    CampaignLearningStateView, Completeness, LearningContractError, LearningStateViewRecipe,
+    CampaignHistoryPlanReference, CampaignLearningStateView, CampaignPositionKind,
+    CampaignPositionRef, CampaignSourceResolution, CampaignSourceRevisionRef,
+    CampaignViewRebuildReason, Completeness, LearningContractError, LearningStateViewRecipe,
     MemberProjection, OmissionPolicy, OwnerDisagreement, SlotDisposition, SlotProjection,
     SlotRequirement, SlotSpec, SourceDenominator,
 };
+use eliot_reactive_context_plan::{CampaignIntent, RetrievalPlan};
 
 /// Maximum declared slots accepted by this pure compiler.
 pub const MAX_SLOTS: usize = 256;
@@ -22,6 +25,8 @@ pub const MAX_SLOTS: usize = 256;
 pub const MAX_MEMBERS: usize = 4096;
 /// Maximum explicit references supplied to one compilation.
 pub const MAX_REFERENCES: usize = 256;
+/// Maximum existing campaign retrieval plans retained by one view.
+pub const MAX_HISTORY_PLANS: usize = 64;
 /// Maximum evidence handles supplied across one compilation.
 pub const MAX_EVIDENCE: usize = 16384;
 /// Maximum evidence handles on one slot, member or disagreement.
@@ -33,45 +38,101 @@ pub const MAX_LABEL_BYTES: usize = 8192;
 /// Maximum aggregate input text inspected by this bounded compiler.
 pub const MAX_INPUT_TEXT_BYTES: usize = 1_048_576;
 
-/// Compile exact A-32 owner projections into one immutable candidate view.
+/// One existing compiled campaign-scoped retrieval plan and only the bounded
+/// handles/digests selected through it.
+pub struct CampaignHistoryPlanInput<'a> {
+    /// Validated existing campaign-scoped plan; never caller-authored labels.
+    pub plan: &'a RetrievalPlan,
+    /// Bounded result handles selected under the plan.
+    pub selected_handles: Vec<ArtifactId>,
+    /// Digest of a bounded summary, when returned.
+    pub summary_digest: Option<String>,
+    /// Digests of bounded diffs, when returned.
+    pub diff_digests: Vec<String>,
+    /// Handles of policy-permitted bounded slices.
+    pub policy_slice_handles: Vec<ArtifactId>,
+}
+
+/// Complete pure-compiler input. Owner reads and the runtime clock are
+/// supplied by the authenticated caller; this API performs no I/O.
+#[derive(Clone, Copy)]
+pub struct CampaignLearningStateCompilationInput<'a> {
+    /// Frozen recipe and persisted source-reference manifest.
+    pub recipe: &'a LearningStateViewRecipe,
+    /// Exact A-32 projections for declared recipe slots.
+    pub projections: &'a [SlotProjection],
+    /// Authenticated current task fence used for all named owner reads.
+    pub current_state_fence: &'a StateFence,
+    /// One exact resolution outcome per closed source role.
+    pub source_resolutions: &'a [CampaignSourceResolution],
+    /// Objective, acceptance, evaluator and context artifact handles.
+    pub required_references: &'a [ArtifactId],
+    /// Owner disagreements retained without resolution.
+    pub disagreements: &'a [OwnerDisagreement],
+    /// Progress positions tied to resolved source revisions.
+    pub positions: &'a [CampaignPositionRef],
+    /// Full-content digest of the current frozen anchor owner record.
+    pub frozen_anchor_digest: &'a str,
+    /// Actual existing `RetrievalPlans` and their bounded results.
+    pub history_plans: &'a [CampaignHistoryPlanInput<'a>],
+    /// Runtime clock's generation time in milliseconds.
+    pub generated_at_ms: i64,
+    /// Runtime clock's expiration boundary in milliseconds, if configured.
+    pub expires_at_ms: Option<i64>,
+    /// Typed reason a prior immutable view was rebuilt.
+    pub rebuild_reason: Option<CampaignViewRebuildReason>,
+}
+
+/// Compile exact owner projections and provenance into an immutable view.
 ///
 /// Recipe order and each slot's declared member order remain semantic. The
-/// caller supplies view identity, required references and disagreements exactly;
-/// this function does not derive or replace them. The richer invalidation
-/// metadata described by later architecture sections is deferred because the
-/// current A-32 view has no typed input for it.
+/// owner reads, exact task fence, and runtime timestamp come from the
+/// authenticated caller; this pure function validates but never reads or
+/// fabricates an owner record. Its id is derived from the complete content.
 pub fn compile_campaign_learning_state_view(
-    recipe: &LearningStateViewRecipe,
-    projections: &[SlotProjection],
-    state_fence: &StateFence,
-    required_references: &[ArtifactId],
-    view_id: &ArtifactId,
-    supplied_disagreements: &[OwnerDisagreement],
+    input: CampaignLearningStateCompilationInput<'_>,
 ) -> Result<CampaignLearningStateView, LearningContractError> {
-    bound_input_sizes(
-        recipe,
-        projections,
-        required_references,
-        supplied_disagreements,
-        view_id,
+    validate_compilation_input(&input)?;
+    let compiled = compile_slots(
+        input.recipe,
+        input.projections,
+        input.source_resolutions,
     )?;
-    recipe.validate()?;
-    validate_dependency_graph(recipe)?;
-    state_fence
+    build_compiled_view(&input, compiled)
+}
+
+struct CompiledSlots {
+    slots: Vec<SlotProjection>,
+    omissions: Vec<eliot_learning_contracts::SlotId>,
+    frontier: Vec<eliot_learning_contracts::SlotId>,
+}
+
+fn validate_compilation_input(
+    input: &CampaignLearningStateCompilationInput<'_>,
+) -> Result<(), LearningContractError> {
+    bound_input_sizes(input)?;
+    input.recipe.validate()?;
+    validate_dependency_graph(input.recipe)?;
+    input
+        .current_state_fence
         .validate()
         .map_err(|_| LearningContractError::Foundation)?;
-    if state_fence != &recipe.binding.state_fence {
+    if input.current_state_fence != &input.recipe.binding.state_fence {
         return Err(LearningContractError::ScopeMismatch {
             field: "compile.state_fence",
         });
     }
-    if view_id.as_str().trim().is_empty() {
-        return Err(LearningContractError::Missing { field: "view_id" });
-    }
-    validate_references(required_references)?;
-    validate_disagreements(recipe, supplied_disagreements)?;
-    validate_shared_lineage(projections)?;
+    validate_references(input.required_references)?;
+    validate_disagreements(input.recipe, input.disagreements)?;
+    validate_shared_lineage(input.projections)?;
+    validate_history_plan_inputs(input.recipe, input.current_state_fence, input.history_plans)
+}
 
+fn compile_slots(
+    recipe: &LearningStateViewRecipe,
+    projections: &[SlotProjection],
+    source_resolutions: &[eliot_learning_contracts::CampaignSourceResolution],
+) -> Result<CompiledSlots, LearningContractError> {
     let recipe_by_id: BTreeMap<_, _> = recipe
         .slots
         .iter()
@@ -95,76 +156,184 @@ pub fn compile_campaign_learning_state_view(
         }
         validate_projection_against_spec(projection, spec)?;
     }
+    partition_compiled_slots(recipe, &by_slot, source_resolutions)
+}
 
-    let mut slots = Vec::with_capacity(recipe.slots.len());
-    let mut omissions = Vec::new();
-    let mut frontier = Vec::new();
+fn partition_compiled_slots<'projection>(
+    recipe: &LearningStateViewRecipe,
+    by_slot: &BTreeMap<&'projection str, &'projection SlotProjection>,
+    source_resolutions: &[eliot_learning_contracts::CampaignSourceResolution],
+) -> Result<CompiledSlots, LearningContractError> {
+    let mut compiled = CompiledSlots {
+        slots: Vec::with_capacity(recipe.slots.len()),
+        omissions: Vec::new(),
+        frontier: Vec::new(),
+    };
     for spec in &recipe.slots {
         if let Some(projection) = by_slot.get(spec.slot_id.as_str()) {
-            slots.push(canonical_slot_projection(projection, spec)?);
+            compiled
+                .slots
+                .push(canonical_slot_projection(projection, spec)?);
         } else {
             match (&spec.requirement, recipe.omission_policy) {
                 (SlotRequirement::Optional, OmissionPolicy::RequiredSlots) => {
-                    omissions.push(spec.slot_id.clone());
+                    compiled.omissions.push(spec.slot_id.clone());
                 }
-                (_, OmissionPolicy::ExplicitFrontier) => frontier.push(spec.slot_id.clone()),
-                (SlotRequirement::Required | SlotRequirement::Conditional { .. }, _) => {
-                    return Err(LearningContractError::IncompleteCoverage);
+                (_, OmissionPolicy::ExplicitFrontier) => {
+                    compiled.frontier.push(spec.slot_id.clone());
+                }
+                (
+                    SlotRequirement::Required | SlotRequirement::Conditional { .. },
+                    OmissionPolicy::RequiredSlots,
+                ) => {
+                    let source_resolution = source_resolutions
+                        .iter()
+                        .find(|resolution| resolution.role == spec.source_role)
+                        .ok_or(LearningContractError::IncompleteCoverage)?;
+                    if source_resolution.status
+                        == eliot_learning_contracts::CampaignSourceResolutionStatus::Current
+                    {
+                        return Err(LearningContractError::IncompleteCoverage);
+                    }
+                    compiled.frontier.push(spec.slot_id.clone());
                 }
             }
         }
     }
+    Ok(compiled)
+}
 
-    let completeness = classify_completeness(recipe, &slots, &frontier);
-    let mut references = required_references.to_vec();
-    references.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-
+fn build_compiled_view(
+    input: &CampaignLearningStateCompilationInput<'_>,
+    compiled: CompiledSlots,
+) -> Result<CampaignLearningStateView, LearningContractError> {
+    let recipe = input.recipe;
+    let mut resolutions = input.source_resolutions.to_vec();
+    resolutions.sort_by_key(|resolution| resolution.role);
+    let mut positions = input.positions.to_vec();
+    positions.sort_by_key(|position| position_kind_key(position.kind));
+    let history_plans = canonical_history_references(input.history_plans)?;
+    let mut required_references = input.required_references.to_vec();
+    required_references.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    let declared = u32::try_from(recipe.slots.len()).map_err(|_| LearningContractError::Bound {
+        field: "recipe.slots",
+    })?;
+    let observed =
+        u32::try_from(compiled.slots.len()).map_err(|_| LearningContractError::Bound {
+            field: "view.slots",
+        })?;
     let mut view = CampaignLearningStateView {
-        view_id: view_id.clone(),
+        view_id: ArtifactId::new("pending-campaign-learning-state-view")
+            .map_err(|_| LearningContractError::Foundation)?,
         recipe_id: recipe.recipe_id.clone(),
         campaign_id: recipe.campaign_id.clone(),
         target: recipe.target.clone(),
         binding: recipe.binding.clone(),
         recipe_digest: recipe.canonical_digest.clone(),
-        slots,
-        denominator: SourceDenominator {
-            declared: u32::try_from(recipe.slots.len()).map_err(|_| {
-                LearningContractError::Bound {
-                    field: "recipe.slots",
-                }
-            })?,
-            observed: 0,
+        provenance: eliot_learning_contracts::CampaignLearningStateProvenance {
+            source_resolutions: resolutions,
+            frozen_anchor_digest: input.frozen_anchor_digest.to_owned(),
+            positions,
+            history_plans,
+            generated_at_ms: input.generated_at_ms,
+            expires_at_ms: input.expires_at_ms,
+            rebuild_reason: input.rebuild_reason,
         },
-        completeness,
-        omissions,
-        frontier,
-        owner_disagreements: canonical_disagreements(supplied_disagreements),
-        required_references: references,
+        slots: compiled.slots,
+        denominator: SourceDenominator { declared, observed },
+        completeness: Completeness::Blocked,
+        omissions: compiled.omissions,
+        frontier: compiled.frontier,
+        owner_disagreements: canonical_disagreements(input.disagreements),
+        required_references,
         invalidated: false,
         invalidation_reason: None,
         canonical_digest: String::new(),
     };
-    view.denominator.observed =
-        u32::try_from(view.slots.len()).map_err(|_| LearningContractError::Bound {
-            field: "view.slots",
-        })?;
-    view.seal()?;
+    view.completeness = view.derived_completeness(recipe);
+    view.seal_content_addressed()?;
     view.validate_against(recipe)?;
     Ok(view)
 }
 
-fn bound_input_sizes(
+/// Verify a persisted view against the exact current task fence, named owner
+/// resolutions, compiled history plans, and runtime observation time.
+///
+/// Source-resolution digests are compared to the view's frozen references;
+/// the resolver must compute each digest from the complete current owner
+/// record during its authenticated named read.
+pub fn validate_campaign_learning_state_view_current(
+    view: &CampaignLearningStateView,
     recipe: &LearningStateViewRecipe,
-    projections: &[SlotProjection],
-    required_references: &[ArtifactId],
-    disagreements: &[OwnerDisagreement],
-    view_id: &ArtifactId,
+    current_state_fence: &StateFence,
+    current_source_resolutions: &[CampaignSourceResolution],
+    current_history_plans: &[CampaignHistoryPlanInput<'_>],
+    observed_at_ms: i64,
+) -> Result<(), LearningContractError> {
+    view.validate_against(recipe)?;
+    if observed_at_ms < 0
+        || view.provenance.generated_at_ms > observed_at_ms
+        || view
+            .provenance
+            .expires_at_ms
+            .is_some_and(|expires_at| observed_at_ms >= expires_at)
+    {
+        return Err(LearningContractError::ScopeMismatch {
+            field: "view.runtime_time",
+        });
+    }
+    current_state_fence
+        .validate()
+        .map_err(|_| LearningContractError::Foundation)?;
+    if current_state_fence != &recipe.binding.state_fence
+        || current_state_fence != &view.binding.state_fence
+    {
+        return Err(LearningContractError::ScopeMismatch {
+            field: "view.current_state_fence",
+        });
+    }
+    if view.invalidated
+        || matches!(
+            view.completeness,
+            Completeness::Blocked | Completeness::Stale
+        )
+    {
+        return Err(LearningContractError::IncompleteCoverage);
+    }
+    validate_history_plan_inputs(recipe, current_state_fence, current_history_plans)?;
+    let mut current_resolutions = current_source_resolutions.to_vec();
+    current_resolutions.sort_by_key(|resolution| resolution.role);
+    if current_resolutions != view.provenance.source_resolutions {
+        return Err(LearningContractError::ScopeMismatch {
+            field: "view.current_source_revisions",
+        });
+    }
+    let current_history_references = canonical_history_references(current_history_plans)?;
+    if current_history_references != view.provenance.history_plans
+        || current_history_references.is_empty()
+    {
+        return Err(LearningContractError::ScopeMismatch {
+            field: "view.current_history_plans",
+        });
+    }
+    Ok(())
+}
+
+fn bound_input_sizes(
+    input: &CampaignLearningStateCompilationInput<'_>,
 ) -> Result<(), LearningContractError> {
     let mut budget = InputBudget::default();
-    bound_recipe_input(recipe, &mut budget)?;
-    bound_projection_input(projections, &mut budget)?;
-    bound_reference_input(required_references, view_id, &mut budget)?;
-    bound_disagreement_input(disagreements, &mut budget)
+    bound_recipe_input(input.recipe, &mut budget)?;
+    bound_projection_input(input.projections, &mut budget)?;
+    bound_reference_input(input.required_references, &mut budget)?;
+    bound_disagreement_input(input.disagreements, &mut budget)?;
+    bound_provenance_input(
+        input.source_resolutions,
+        input.positions,
+        input.history_plans,
+        input.frozen_anchor_digest,
+        &mut budget,
+    )
 }
 
 #[derive(Default)]
@@ -286,6 +455,12 @@ fn bound_recipe_input(
             budget.add_text(member.as_str(), "slot.declared_members")?;
         }
     }
+    for requirement in &recipe.source_requirements {
+        budget.add_text(requirement.owner.as_str(), "source_requirement.owner")?;
+        if let Some(reference) = &requirement.expected_reference {
+            bound_source_reference(reference, budget)?;
+        }
+    }
     Ok(())
 }
 
@@ -342,7 +517,6 @@ fn bound_projection_input(
 
 fn bound_reference_input(
     required_references: &[ArtifactId],
-    view_id: &ArtifactId,
     budget: &mut InputBudget,
 ) -> Result<(), LearningContractError> {
     if required_references.len() > MAX_REFERENCES {
@@ -350,11 +524,213 @@ fn bound_reference_input(
             field: "required_references",
         });
     }
-    budget.add_text(view_id.as_str(), "view_id")?;
     for reference in required_references {
         budget.add_text(reference.as_str(), "required_references")?;
     }
     Ok(())
+}
+
+fn bound_source_reference(
+    reference: &CampaignSourceRevisionRef,
+    budget: &mut InputBudget,
+) -> Result<(), LearningContractError> {
+    budget.add_text(reference.owner.as_str(), "source.owner")?;
+    budget.add_text(source_record_id(reference).as_str(), "source.record_id")?;
+    budget.add_text(reference.content_digest.as_str(), "source.content_digest")?;
+    for projection in &reference.slot_projection_digests {
+        budget.add_text(
+            projection.slot_id.as_str(),
+            "source.slot_projection.slot_id",
+        )?;
+        budget.add_text(projection.digest.as_str(), "source.slot_projection.digest")?;
+    }
+    if let eliot_learning_contracts::CampaignOwnerRevision::ResourceSnapshot(value) =
+        &reference.revision
+    {
+        budget.add_text(value, "source.revision")?;
+    }
+    Ok(())
+}
+
+fn bound_provenance_input(
+    resolutions: &[CampaignSourceResolution],
+    positions: &[CampaignPositionRef],
+    history_plans: &[CampaignHistoryPlanInput<'_>],
+    frozen_anchor_digest: &str,
+    budget: &mut InputBudget,
+) -> Result<(), LearningContractError> {
+    if resolutions.len() > eliot_learning_contracts::CampaignSourceRole::all().len()
+        || positions.len() > 5
+        || history_plans.len() > MAX_HISTORY_PLANS
+    {
+        return Err(LearningContractError::Bound {
+            field: "view.provenance",
+        });
+    }
+    budget.add_text(frozen_anchor_digest, "provenance.frozen_anchor_digest")?;
+    for resolution in resolutions {
+        if let Some(reference) = &resolution.reference {
+            bound_source_reference(reference, budget)?;
+        }
+    }
+    for position in positions {
+        budget.add_text(
+            position.source_content_digest.as_str(),
+            "position.source_digest",
+        )?;
+        budget.add_text(position.position_digest.as_str(), "position.digest")?;
+        if let eliot_learning_contracts::CampaignOwnerRevision::ResourceSnapshot(value) =
+            &position.revision
+        {
+            budget.add_text(value, "position.revision")?;
+        }
+    }
+    for history in history_plans {
+        if history.selected_handles.len() > MAX_RECORD_EVIDENCE
+            || history.diff_digests.len() > MAX_RECORD_EVIDENCE
+            || history.policy_slice_handles.len() > MAX_RECORD_EVIDENCE
+        {
+            return Err(LearningContractError::Bound {
+                field: "history_plan.references",
+            });
+        }
+        if let Some(summary_digest) = &history.summary_digest {
+            budget.add_text(summary_digest, "history_plan.summary_digest")?;
+        }
+        for digest in &history.diff_digests {
+            budget.add_text(digest, "history_plan.diff_digest")?;
+        }
+        for handle in history
+            .selected_handles
+            .iter()
+            .chain(&history.policy_slice_handles)
+        {
+            budget.add_text(handle.as_str(), "history_plan.handle")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_history_plan_inputs(
+    recipe: &LearningStateViewRecipe,
+    current_state_fence: &StateFence,
+    history_plans: &[CampaignHistoryPlanInput<'_>],
+) -> Result<(), LearningContractError> {
+    let mut plan_digests = BTreeSet::new();
+    for history in history_plans {
+        history
+            .plan
+            .validate()
+            .map_err(|_| LearningContractError::Foundation)?;
+        let query = history
+            .plan
+            .campaign_experience_query
+            .as_ref()
+            .ok_or(LearningContractError::IncompleteCoverage)?;
+        if query.scope != recipe.campaign_id.as_str()
+            || query.intent == CampaignIntent::None
+            || &query.fence != current_state_fence
+        {
+            return Err(LearningContractError::ScopeMismatch {
+                field: "history_plan.campaign_scope_or_fence",
+            });
+        }
+        if !query.handles.is_empty()
+            && history
+                .selected_handles
+                .iter()
+                .any(|handle| !query.handles.contains(handle))
+        {
+            return Err(LearningContractError::ScopeMismatch {
+                field: "history_plan.selected_handles",
+            });
+        }
+        let selected: BTreeSet<_> = history.selected_handles.iter().cloned().collect();
+        if selected.len() != history.selected_handles.len()
+            || history
+                .policy_slice_handles
+                .iter()
+                .any(|handle| !selected.contains(handle))
+        {
+            return Err(LearningContractError::IncompleteCoverage);
+        }
+        let mut diff_digests = BTreeSet::new();
+        for digest in &history.diff_digests {
+            eliot_learning_contracts::identity::validate_digest(
+                digest,
+                "history_plan.diff_digest",
+            )?;
+            if !diff_digests.insert(digest) {
+                return Err(LearningContractError::Duplicate {
+                    field: "history_plan.diff_digests",
+                });
+            }
+        }
+        if let Some(digest) = &history.summary_digest {
+            eliot_learning_contracts::identity::validate_digest(
+                digest,
+                "history_plan.summary_digest",
+            )?;
+        }
+        let digest = history
+            .plan
+            .canonical_digest()
+            .map_err(|_| LearningContractError::Foundation)?;
+        if !plan_digests.insert(digest) {
+            return Err(LearningContractError::Duplicate {
+                field: "history_plans",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn canonical_history_references(
+    history_plans: &[CampaignHistoryPlanInput<'_>],
+) -> Result<Vec<CampaignHistoryPlanReference>, LearningContractError> {
+    let mut references = Vec::with_capacity(history_plans.len());
+    for history in history_plans {
+        let mut selected_handles = history.selected_handles.clone();
+        selected_handles.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        let mut diff_digests = history.diff_digests.clone();
+        diff_digests.sort();
+        let mut policy_slice_handles = history.policy_slice_handles.clone();
+        policy_slice_handles.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        references.push(CampaignHistoryPlanReference {
+            retrieval_plan_digest: history
+                .plan
+                .canonical_digest()
+                .map_err(|_| LearningContractError::Foundation)?,
+            selected_handles,
+            summary_digest: history.summary_digest.clone(),
+            diff_digests,
+            policy_slice_handles,
+        });
+    }
+    references.sort_by(|left, right| left.retrieval_plan_digest.cmp(&right.retrieval_plan_digest));
+    Ok(references)
+}
+
+fn position_kind_key(kind: CampaignPositionKind) -> u8 {
+    match kind {
+        CampaignPositionKind::Current => 0,
+        CampaignPositionKind::Experience => 1,
+        CampaignPositionKind::Adaptation => 2,
+        CampaignPositionKind::Evaluation => 3,
+        CampaignPositionKind::EconomicsProgress => 4,
+    }
+}
+
+fn source_record_id(reference: &CampaignSourceRevisionRef) -> String {
+    use eliot_learning_contracts::CampaignOwnerRecordId;
+
+    match &reference.record_id {
+        CampaignOwnerRecordId::Artifact(id) => id.as_str().to_owned(),
+        CampaignOwnerRecordId::Contract(id) => id.as_str().to_owned(),
+        CampaignOwnerRecordId::Decision(id) => id.as_str().to_owned(),
+        CampaignOwnerRecordId::Task(id) => id.as_str().to_owned(),
+        CampaignOwnerRecordId::Resource(id) => id.clone(),
+    }
 }
 
 fn bound_disagreement_input(
@@ -593,72 +969,4 @@ fn recipe_slot<'a>(
         .iter()
         .find(|slot| slot.slot_id == *id)
         .ok_or(LearningContractError::ScopeMismatch { field: "slot_id" })
-}
-
-fn classify_completeness(
-    recipe: &LearningStateViewRecipe,
-    slots: &[SlotProjection],
-    frontier: &[eliot_learning_contracts::SlotId],
-) -> Completeness {
-    let mut blocked = false;
-    let mut stale = false;
-    let mut partial = !frontier.is_empty();
-    let mut required_ids = BTreeSet::new();
-    for spec in &recipe.slots {
-        if !matches!(spec.requirement, SlotRequirement::Optional) {
-            required_ids.insert(spec.slot_id.as_str());
-        }
-        if let SlotRequirement::Conditional { depends_on } = &spec.requirement {
-            required_ids.insert(depends_on.as_str());
-        }
-    }
-    for spec in &recipe.slots {
-        if !required_ids.contains(spec.slot_id.as_str()) {
-            continue;
-        }
-        let Some(slot) = slots
-            .iter()
-            .find(|candidate| candidate.slot_id == spec.slot_id)
-        else {
-            partial = true;
-            continue;
-        };
-        match slot.disposition {
-            SlotDisposition::Blocked | SlotDisposition::Unavailable => blocked = true,
-            SlotDisposition::Stale => stale = true,
-            SlotDisposition::Current => {}
-            SlotDisposition::KnownEmpty => {
-                if !slot.evidence.is_empty() && spec.declared_members.is_empty() {
-                    // An explicitly evidenced empty owner projection is ready.
-                } else {
-                    partial = true;
-                }
-            }
-            SlotDisposition::Historical
-            | SlotDisposition::Superseded
-            | SlotDisposition::Unknown
-            | SlotDisposition::Conflicted => partial = true,
-        }
-        for member in &slot.members {
-            match member.disposition {
-                SlotDisposition::Blocked | SlotDisposition::Unavailable => blocked = true,
-                SlotDisposition::Stale => stale = true,
-                SlotDisposition::Current => {}
-                SlotDisposition::Historical
-                | SlotDisposition::Superseded
-                | SlotDisposition::Unknown
-                | SlotDisposition::Conflicted
-                | SlotDisposition::KnownEmpty => partial = true,
-            }
-        }
-    }
-    if blocked {
-        Completeness::Blocked
-    } else if stale {
-        Completeness::Stale
-    } else if partial {
-        Completeness::Partial
-    } else {
-        Completeness::CompleteForDeclaredRecipe
-    }
 }

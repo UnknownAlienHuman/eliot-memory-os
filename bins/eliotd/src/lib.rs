@@ -41,6 +41,7 @@ pub mod agent_fabric;
 pub mod canonical_config_precedence;
 mod capability_admission;
 mod capability_evidence_wiring;
+mod campaign_packet;
 pub mod capability_outcome;
 mod controlboard_adapters;
 mod daemon_config;
@@ -1283,9 +1284,11 @@ impl DaemonComposition {
     ///
     /// The adapter forwards the exact admitted identity, operation identity,
     /// proposal, context, and command to the Governor canonical task path
-    /// and returns only typed results. No policy, admission, or semantic
-    /// rules live here; a duplicate, stale revision, stale fence, or illegal
-    /// transition fails closed in the Governor owner. Publication happens
+    /// and returns only typed results. Its recipe-bearing proposal/command
+    /// methods publish the learning-state recipe atomically in that same
+    /// Task Controller transition. No policy, admission, or semantic rules
+    /// live here; duplicate, stale revision, stale fence, and illegal
+    /// transitions fail closed in the Governor owner. Publication happens
     /// only via the Governor `refresh_from_kernel` at the returned receipt
     /// revision. Callers take a fresh adapter per operation so a Governor
     /// refresh surfaces as an exact-view mismatch instead of silent

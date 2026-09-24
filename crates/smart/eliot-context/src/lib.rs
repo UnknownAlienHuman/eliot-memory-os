@@ -8,16 +8,33 @@
 
 #![forbid(unsafe_code)]
 
+pub mod campaign_publication;
+
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
 };
 
-use eliot_contracts::{
-    ArtifactId, ContractVersion, DecisionId, StateFence, TaskRevision, fences_match_exact,
-};
+use eliot_contracts::{ArtifactId, ContractVersion, DecisionId, StateFence, TaskRevision, fences_match_exact};
 use eliot_cue_contracts::CueKind;
 use eliot_evidence::{Assertability, EpistemicStatus, EvidenceFreshness};
+use eliot_learning_contracts::{
+    CampaignLearningStateView, CampaignOwnerRecordId, CampaignSourceResolution,
+    CampaignSourceResolutionStatus, CampaignSourceRevisionRef, CampaignSourceRole,
+    LearningContractError, LearningStateViewRecipe,
+};
+use eliot_learning_state_view::{
+    CampaignHistoryPlanInput, validate_campaign_learning_state_view_current,
+};
+use eliot_context_contracts::{
+    CapacityLimits as CampaignCapacityLimits, ContextRecipe as CampaignContextRecipe,
+    LossPolicy as CampaignLossPolicy, RepresentationKind as CampaignRepresentationKind,
+    SemanticRole, SessionDeliverySnapshot,
+};
+use crate::campaign_publication::{
+    ContextCampaignRecipeBody, ContextSourceDocument, context_delivery_publication,
+    context_recipe_publication,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -49,6 +66,35 @@ pub enum ContextError {
         /// Current task revision carried by the input.
         task_revision: TaskRevision,
     },
+    /// Context inputs are not bound to the exact task, scope, task revision,
+    /// and fence of the campaign learning view being consumed.
+    #[error("campaign learning view does not bind context input field {field}")]
+    CampaignBindingMismatch { field: &'static str },
+    /// A context input or budget recipe is not the exact content of its
+    /// current owner revision in the campaign view.
+    #[error("campaign source binding is missing, stale, or digest-mismatched for {role:?}")]
+    CampaignSourceMismatch { role: CampaignSourceRole },
+    /// A context atom cites a handle that is not retained by the validated
+    /// campaign view's required references or owner projection evidence.
+    #[error("context atom support is not retained by the campaign learning view")]
+    CampaignSupportMismatch,
+    /// The durable campaign recipe cannot be represented by this bounded
+    /// compiler without weakening its role or loss policy.
+    #[error("campaign context policy is unsupported for semantic role {0:?}")]
+    UnsupportedCampaignPolicy(SemanticRole),
+    /// A non-droppable policy could not be met by the exact route capacity.
+    #[error("campaign context capacity cannot preserve non-droppable material")]
+    NonDroppableCapacity,
+    /// The exact rich campaign context recipe failed its own contract checks.
+    #[error("campaign context recipe is invalid")]
+    InvalidCampaignRecipe,
+    /// A mandatory owner semantic role has no represented candidate.
+    #[error("campaign context delivery has no candidate for required role {0:?}")]
+    MissingCampaignRole(ContextRole),
+    /// The route's exact available capacity cannot be represented by this
+    /// compiler's bounded integer cost unit.
+    #[error("campaign context capacity is outside the supported cost range")]
+    CampaignCapacityOutOfRange,
     /// A semantic identity appears more than once in one admitted set.
     #[error("duplicate semantic identity in {field}")]
     DuplicateIdentity {
@@ -64,6 +110,86 @@ pub enum ContextError {
     /// A revision cannot be advanced.
     #[error("context revision overflow")]
     RevisionOverflow,
+}
+
+/// Failure to compile active context against a recipe-bound campaign learning
+/// view. The learning-view validation error is kept separate from ordinary
+/// context admission failures so callers can distinguish stale owner state
+/// from an invalid context atom or budget recipe.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CampaignContextCompileError {
+    /// The learning view no longer matches its recipe, fence, owner revisions,
+    /// or retained `RetrievalPlan` set.
+    #[error("campaign learning state is not current: {0}")]
+    LearningState(#[from] LearningContractError),
+    /// The ordinary bounded context compiler rejected its inputs.
+    #[error("context compilation failed: {0}")]
+    Context(#[from] ContextError),
+}
+
+/// Exact owner inputs required to compile context against a campaign view.
+#[derive(Clone, Copy)]
+pub struct CampaignLearningStateCompileInput<'a> {
+    /// Current rich `ContextRecipe` and its exact admitted compiler input.
+    pub recipe_body: &'a ContextCampaignRecipeBody,
+    /// Actual prior owner-issued delivery snapshot.
+    pub prior_delivery: &'a SessionDeliverySnapshot,
+    /// Immutable learning-state view selected or compiled for this attempt.
+    pub learning_view: &'a CampaignLearningStateView,
+    /// Exact Task Controller recipe governing the learning-state view.
+    pub learning_recipe: &'a LearningStateViewRecipe,
+    /// Current authenticated owner-read fence.
+    pub current_state_fence: &'a StateFence,
+    /// Fresh exact source resolutions from named owner reads.
+    pub current_source_resolutions: &'a [CampaignSourceResolution],
+    /// Fresh validated retrieval plans from owner records.
+    pub current_history_plans: &'a [CampaignHistoryPlanInput<'a>],
+    /// Current bounded runtime time in Unix milliseconds.
+    pub observed_at_ms: i64,
+}
+
+/// Result of compiling decision-local context against one exact immutable
+/// campaign view. The source view identity and digest remain attached to the
+/// result so a consumer cannot accidentally detach compiled context from the
+/// owner revisions that were validated first.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignCompiledContext {
+    /// Exact validated learning-view identity.
+    pub learning_state_view_id: ArtifactId,
+    /// Canonical digest of that immutable view.
+    pub learning_state_view_digest: String,
+    /// Exact rich owner `ContextRecipe` whose capacity and role policy governed this
+    /// compilation.
+    pub context_recipe_digest: String,
+    /// Exact independent route capacity components retained with the result.
+    pub capacity: CampaignCapacityLimits,
+    /// Lossless semantic-to-compiler role policy projection used at compile.
+    pub role_policy_projection: Vec<CampaignContextRolePolicy>,
+    /// Exact artifact handles retained from the validated learning view.
+    /// These let the downstream Context consumer retrieve the source-backed
+    /// campaign state used to admit this compilation.
+    pub learning_state_handles: Vec<ArtifactId>,
+    /// Bounded decision-local context compiled from already admitted atoms.
+    pub context: CompiledContext,
+}
+
+/// Visible projection from one rich semantic-role loss rule to the narrower
+/// decision-local compiler role. Multiple source roles may share a compiler
+/// role only when their loss policies agree.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignContextRolePolicy {
+    /// Role declared by the canonical Context owner recipe.
+    pub semantic_role: SemanticRole,
+    /// Role consumed by this pure Context Compiler.
+    pub context_role: ContextRole,
+    /// Exact permitted loss policy.
+    pub loss_policy: CampaignLossPolicy,
+    /// Whether the canonical recipe marks the source role as mandatory.
+    pub required: bool,
+    /// Exact allowed representations retained from the owner recipe.
+    pub allowed_representations: Vec<CampaignRepresentationKind>,
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), ContextError> {
@@ -372,6 +498,114 @@ impl ContextCompiler {
         Self::compile_with_revocation(input, recipe, &BTreeSet::new())
     }
 
+    /// Validate the exact campaign learning view and current owner-read set
+    /// before compiling any context from its bound task and scope.
+    ///
+    /// `current_source_resolutions` and `current_history_plans` must be the
+    /// result of authenticated owner reads for `current_state_fence`. The
+    /// learning-state validator checks those records against the recipe and
+    /// prior view. The current `ContextRecipe` row contains the current exact
+    /// compiler input; the separate `ContextDelivery` row contains only the
+    /// prior owner-issued snapshot. Both are checked independently
+    /// before the pure context compiler runs.
+    pub fn compile_with_campaign_learning_state(
+        input: CampaignLearningStateCompileInput<'_>,
+    ) -> Result<CampaignCompiledContext, CampaignContextCompileError> {
+        let context_recipe = &input.recipe_body.recipe;
+        let context_input = &input.recipe_body.compiler_input;
+        validate_campaign_context_binding(
+            context_recipe,
+            context_input,
+            input.learning_view,
+            input.current_state_fence,
+        )?;
+
+        context_recipe
+            .validate()
+            .map_err(|_| ContextError::InvalidCampaignRecipe)?;
+        input.learning_view.validate_against(input.learning_recipe)?;
+        let context_recipe_source = current_campaign_source(
+            input.current_source_resolutions,
+            CampaignSourceRole::ContextRecipe,
+        )?;
+        let context_delivery_source = current_campaign_source(
+            input.current_source_resolutions,
+            CampaignSourceRole::ContextDelivery,
+        )?;
+        let recipe_publication = context_recipe_publication(context_recipe, context_input)
+            .map_err(|_| ContextError::InvalidCampaignRecipe)?;
+        let delivery_publication =
+            context_delivery_publication(context_recipe, input.prior_delivery).map_err(|_| {
+                ContextError::CampaignSourceMismatch {
+                    role: CampaignSourceRole::ContextDelivery,
+                }
+            })?;
+        if !matches!(
+            recipe_publication.document(),
+            ContextSourceDocument::Recipe(source_recipe)
+                if source_recipe.as_ref() == input.recipe_body
+        ) {
+            return Err(ContextError::CampaignSourceMismatch {
+                role: CampaignSourceRole::ContextRecipe,
+            }
+            .into());
+        }
+        if !matches!(
+            delivery_publication.document(),
+            ContextSourceDocument::Delivery(source_delivery)
+                if source_delivery.as_ref() == input.prior_delivery
+        ) {
+            return Err(ContextError::CampaignSourceMismatch {
+                role: CampaignSourceRole::ContextDelivery,
+            }
+            .into());
+        }
+        // The current rich `ContextRecipe`/input and prior-delivery snapshot
+        // were decoded from the exact typed bodies returned by these current
+        // owner reads. Confirm their native identities and original fences
+        // agree with the exact references before compiling.
+        if !campaign_source_matches_publication(
+            context_recipe_source,
+            &recipe_publication,
+        ) || !campaign_source_matches_publication(
+            context_delivery_source,
+            &delivery_publication,
+        ) {
+            return Err(ContextError::CampaignSourceMismatch {
+                role: CampaignSourceRole::ContextDelivery,
+            }
+            .into());
+        }
+        validate_context_support_handles(
+            context_input,
+            input.learning_view,
+            input.current_source_resolutions,
+        )?;
+        validate_campaign_learning_state_view_current(
+            input.learning_view,
+            input.learning_recipe,
+            input.current_state_fence,
+            input.current_source_resolutions,
+            input.current_history_plans,
+            input.observed_at_ms,
+        )?;
+
+        let (compiler_input, compiler_recipe, role_policy_projection) =
+            project_campaign_context_recipe(context_recipe, context_input)?;
+        let context = Self::compile(&compiler_input, &compiler_recipe)?;
+        enforce_campaign_loss_policies(&compiler_input, &context, &role_policy_projection)?;
+        let learning_state_handles = campaign_learning_state_handles(input.learning_view)?;
+        Ok(CampaignCompiledContext {
+            learning_state_view_id: input.learning_view.view_id.clone(),
+            learning_state_view_digest: input.learning_view.canonical_digest.clone(),
+            context_recipe_digest: context_recipe.recipe_sha256.clone(),
+            capacity: context_recipe.capacity,
+            role_policy_projection,
+            learning_state_handles,
+            context,
+        })
+    }
+
     /// Compile a bounded view while treating `revoked_handles` as removed support.
     ///
     /// Behaves exactly like [`compile`](Self::compile) with an empty set.
@@ -527,6 +761,299 @@ impl ContextCompiler {
             .then_with(|| left.risk.cmp(&right.risk).reverse())
             .then_with(|| left.atom_id.cmp(&right.atom_id))
     }
+}
+
+fn project_campaign_context_recipe(
+    recipe: &CampaignContextRecipe,
+    input: &ContextInput,
+) -> Result<(ContextInput, ContextRecipe, Vec<CampaignContextRolePolicy>), ContextError> {
+    recipe
+        .validate()
+        .map_err(|_| ContextError::InvalidCampaignRecipe)?;
+    let available = recipe
+        .capacity
+        .route_capacity
+        .checked_sub(recipe.capacity.fixed_overhead)
+        .and_then(|remaining| remaining.checked_sub(recipe.capacity.output_reserve))
+        .and_then(|remaining| remaining.checked_sub(recipe.capacity.review_reserve))
+        .ok_or(ContextError::InvalidCampaignRecipe)?;
+    let total_cost = u32::try_from(available).map_err(|_| ContextError::CampaignCapacityOutOfRange)?;
+    if total_cost == 0 {
+        return Err(ContextError::CampaignCapacityOutOfRange);
+    }
+
+    let mut role_rules: BTreeMap<ContextRole, (CampaignLossPolicy, bool)> = BTreeMap::new();
+    let mut role_policy_projection = Vec::with_capacity(recipe.role_policies.len());
+    for rule in &recipe.role_policies {
+        let context_role = map_campaign_semantic_role(rule.role);
+        let retained_representation = match rule.loss_policy {
+            CampaignLossPolicy::HandleOnly => CampaignRepresentationKind::Handle,
+            CampaignLossPolicy::NonDroppable
+            | CampaignLossPolicy::Extractive
+            | CampaignLossPolicy::Summarizable => CampaignRepresentationKind::Whole,
+        };
+        if !rule.allowed_representations.contains(&retained_representation) {
+            return Err(ContextError::UnsupportedCampaignPolicy(rule.role));
+        }
+        if let Some((existing_policy, existing_required)) = role_rules.get_mut(&context_role) {
+            if *existing_policy != rule.loss_policy {
+                return Err(ContextError::UnsupportedCampaignPolicy(rule.role));
+            }
+            *existing_required |= rule.required;
+        } else {
+            role_rules.insert(context_role, (rule.loss_policy, rule.required));
+        }
+        role_policy_projection.push(CampaignContextRolePolicy {
+            semantic_role: rule.role,
+            context_role,
+            loss_policy: rule.loss_policy,
+            required: rule.required,
+            allowed_representations: rule.allowed_representations.clone(),
+        });
+    }
+
+    for atom in &input.atoms {
+        if !role_rules.contains_key(&atom.role) {
+            return Err(ContextError::MissingCampaignRole(atom.role));
+        }
+    }
+    let mut compiler_recipe = ContextRecipe {
+        recipe_revision: recipe.decision.recipe_revision,
+        total_cost,
+        role_budgets: Vec::with_capacity(role_rules.len()),
+        required_roles: Vec::new(),
+    };
+    for (role, (loss_policy, required)) in &role_rules {
+        compiler_recipe.role_budgets.push(RoleBudget {
+            role: *role,
+            maximum_cost: if *loss_policy == CampaignLossPolicy::HandleOnly {
+                0
+            } else {
+                total_cost
+            },
+        });
+        if *required {
+            compiler_recipe.required_roles.push(*role);
+            if !input.atoms.iter().any(|atom| atom.role == *role) {
+                return Err(ContextError::MissingCampaignRole(*role));
+            }
+        }
+    }
+    compiler_recipe.validate()?;
+
+    let mut compiler_input = input.clone();
+    for atom in &mut compiler_input.atoms {
+        if role_rules
+            .get(&atom.role)
+            .is_some_and(|(_, required)| *required)
+        {
+            atom.required = true;
+        }
+    }
+    Ok((compiler_input, compiler_recipe, role_policy_projection))
+}
+
+const fn map_campaign_semantic_role(role: SemanticRole) -> ContextRole {
+    match role {
+        SemanticRole::Authority | SemanticRole::Negative | SemanticRole::Security => {
+            ContextRole::Safety
+        }
+        SemanticRole::Goal => ContextRole::Goal,
+        SemanticRole::Scope | SemanticRole::Instruction => ContextRole::Continuity,
+        SemanticRole::Acceptance | SemanticRole::Verifier => ContextRole::DecisionTail,
+        SemanticRole::Source | SemanticRole::Evidence => ContextRole::Evidence,
+        SemanticRole::MaterialUnknown => ContextRole::Unknown,
+        SemanticRole::Optional => ContextRole::Model,
+        SemanticRole::Conflict | SemanticRole::Constraint => ContextRole::Attention,
+    }
+}
+
+fn enforce_campaign_loss_policies(
+    input: &ContextInput,
+    compiled: &CompiledContext,
+    policies: &[CampaignContextRolePolicy],
+) -> Result<(), ContextError> {
+    for policy in policies {
+        let atoms: Vec<_> = input
+            .atoms
+            .iter()
+            .filter(|atom| atom.role == policy.context_role)
+            .collect();
+        for atom in atoms {
+            let decision = compiled
+                .admissions
+                .iter()
+                .find(|decision| decision.atom_id == atom.atom_id)
+                .ok_or(ContextError::CampaignSupportMismatch)?;
+            if policy.loss_policy == CampaignLossPolicy::HandleOnly
+                && decision.disposition == AdmissionDisposition::Included
+            {
+                return Err(ContextError::UnsupportedCampaignPolicy(policy.semantic_role));
+            }
+            match (policy.loss_policy, decision.disposition) {
+                (CampaignLossPolicy::NonDroppable, AdmissionDisposition::Included) => {}
+                (CampaignLossPolicy::NonDroppable, _) => {
+                    return Err(ContextError::NonDroppableCapacity);
+                }
+                (
+                    CampaignLossPolicy::Extractive | CampaignLossPolicy::Summarizable,
+                    AdmissionDisposition::HandleOnly,
+                ) if !policy
+                    .allowed_representations
+                    .contains(&CampaignRepresentationKind::Handle) =>
+                {
+                    return Err(ContextError::UnsupportedCampaignPolicy(policy.semantic_role));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_campaign_context_binding(
+    recipe: &CampaignContextRecipe,
+    input: &ContextInput,
+    learning_view: &CampaignLearningStateView,
+    current_state_fence: &StateFence,
+) -> Result<(), ContextError> {
+    if &input.state_fence != current_state_fence
+        || learning_view.binding.state_fence != *current_state_fence
+    {
+        return Err(ContextError::CampaignBindingMismatch {
+            field: "state_fence",
+        });
+    }
+    if input.scope != learning_view.binding.scope.as_str() {
+        return Err(ContextError::CampaignBindingMismatch { field: "scope" });
+    }
+    if recipe.binding.task_id.as_str() != learning_view.binding.task_id.as_str() {
+        return Err(ContextError::CampaignBindingMismatch { field: "task_id" });
+    }
+    if recipe.binding.scope_id.as_str() != input.scope
+        || recipe.binding.state_fence != *current_state_fence
+    {
+        return Err(ContextError::CampaignBindingMismatch {
+            field: "recipe_binding",
+        });
+    }
+    if input.task_id.as_ref() != Some(&recipe.binding.decision_id) {
+        return Err(ContextError::CampaignBindingMismatch { field: "decision_id" });
+    }
+    if recipe.decision.recipe_revision != input.task_revision {
+        return Err(ContextError::RecipeRevisionMismatch {
+            recipe_revision: recipe.decision.recipe_revision,
+            task_revision: input.task_revision,
+        });
+    }
+    if current_state_fence.task_revision != Some(input.task_revision) {
+        return Err(ContextError::CampaignBindingMismatch {
+            field: "task_revision",
+        });
+    }
+    Ok(())
+}
+
+fn current_campaign_source(
+    resolutions: &[CampaignSourceResolution],
+    role: CampaignSourceRole,
+) -> Result<&CampaignSourceRevisionRef, CampaignContextCompileError> {
+    let mut matches = resolutions.iter().filter(|resolution| resolution.role == role);
+    let resolution = matches
+        .next()
+        .ok_or(ContextError::CampaignSourceMismatch { role })?;
+    if matches.next().is_some()
+        || resolution.status != CampaignSourceResolutionStatus::Current
+        || resolution
+            .reference
+            .as_ref()
+            .is_none_or(|reference| reference.role != role)
+    {
+        return Err(ContextError::CampaignSourceMismatch { role }.into());
+    }
+    resolution
+        .reference
+        .as_ref()
+        .ok_or(ContextError::CampaignSourceMismatch { role }.into())
+}
+
+fn campaign_source_matches_publication(
+    reference: &CampaignSourceRevisionRef,
+    publication: &crate::campaign_publication::ContextSourcePublication,
+) -> bool {
+    reference.owner.as_str() == publication.owner_id()
+        && reference.record_id == *publication.record_id()
+        && reference.revision == *publication.revision()
+        && reference.recorded_state_fence == *publication.recorded_state_fence()
+}
+
+fn campaign_learning_state_handles(
+    view: &CampaignLearningStateView,
+) -> Result<Vec<ArtifactId>, ContextError> {
+    const MAX_HANDLES: usize = 16_384;
+    let mut handles = BTreeSet::new();
+    handles.extend(view.required_references.iter().cloned());
+    for slot in &view.slots {
+        handles.extend(slot.evidence.iter().cloned());
+        for member in &slot.members {
+            handles.extend(member.evidence.iter().cloned());
+        }
+    }
+    for history in &view.provenance.history_plans {
+        handles.extend(history.selected_handles.iter().cloned());
+        handles.extend(history.policy_slice_handles.iter().cloned());
+    }
+    for position in &view.provenance.positions {
+        if let CampaignOwnerRecordId::Artifact(handle) = &position.record_id {
+            handles.insert(handle.clone());
+        }
+    }
+    if handles.len() > MAX_HANDLES {
+        return Err(ContextError::CampaignSupportMismatch);
+    }
+    Ok(handles.into_iter().collect())
+}
+
+fn validate_context_support_handles(
+    input: &ContextInput,
+    view: &CampaignLearningStateView,
+    resolutions: &[CampaignSourceResolution],
+) -> Result<(), ContextError> {
+    let mut retained = BTreeSet::new();
+    retained.extend(
+        view.required_references
+            .iter()
+            .map(ArtifactId::as_str),
+    );
+    for slot in &view.slots {
+        retained.extend(slot.evidence.iter().map(ArtifactId::as_str));
+        for member in &slot.members {
+            retained.extend(member.evidence.iter().map(ArtifactId::as_str));
+        }
+    }
+    for resolution in resolutions {
+        if resolution.status != CampaignSourceResolutionStatus::Current {
+            continue;
+        }
+        if let Some(reference) = &resolution.reference {
+            retained.insert(match &reference.record_id {
+                CampaignOwnerRecordId::Artifact(value) => value.as_str(),
+                CampaignOwnerRecordId::Contract(value) => value.as_str(),
+                CampaignOwnerRecordId::Decision(value) => value.as_str(),
+                CampaignOwnerRecordId::Task(value) => value.as_str(),
+                CampaignOwnerRecordId::Resource(value) => value.as_str(),
+            });
+        }
+    }
+    if input
+        .atoms
+        .iter()
+        .flat_map(|atom| atom.source_handles.iter())
+        .any(|handle| !retained.contains(handle.as_str()))
+    {
+        return Err(ContextError::CampaignSupportMismatch);
+    }
+    Ok(())
 }
 
 /// Admission reason for bounded incomplete-lineage quarantine (I12.20).

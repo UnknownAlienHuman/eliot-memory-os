@@ -32,14 +32,18 @@ use eliot_process::{
 };
 use eliot_protocol::{
     HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt, RequestIdentity,
+    TaskControllerAttempt, TaskControllerInvocation, TaskControllerResultBody,
     host_request_operation_id,
 };
 use eliot_store_api::{
-    CanonicalRequestView, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    OperationIdentity, OrderingHeadExpectation, PreparedTransition, ReadConsistency,
-    RecoveryRecord, RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError,
+    CampaignLearningStateViewLookup, CampaignLearningStateViewRead,
+    CampaignLearningStateViewReadStatus, CampaignSourcePublication,
+    CampaignSourceReadStatus, CampaignSourceRevisionLookup, CanonicalRequestView,
+    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationIdentity,
+    OrderingHeadExpectation, PreparedTransition, ReadConsistency, RecoveryRecord,
+    RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError,
     StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
-    verify_canonical_request_hash,
+    WriteReceiptStatus, verify_canonical_request_hash,
 };
 use serde::{Deserialize, Serialize};
 
@@ -628,6 +632,171 @@ struct StoreApplyOperation {
     transition: PreparedTransition,
     expected_revision_heads: Vec<RevisionHeadExpectation>,
     expected_ordering_heads: Vec<OrderingHeadExpectation>,
+}
+
+fn campaign_source_publications_for_transition(
+    transition: &PreparedTransition,
+    request_id: &eliot_contracts::RequestId,
+) -> Result<Vec<CampaignSourcePublication>, String> {
+    let mut task_operation = None;
+    let mut publications = Vec::new();
+    for operation in &transition.named_operations {
+        if operation.operation != eliot_store_api::NamedMutationOperation::UpdateTaskState {
+            if operation
+                .parameters
+                .contains_key("campaign_source_publications_json")
+            {
+                return Err("campaign source publication must be carried by UpdateTaskState".into());
+            }
+            continue;
+        }
+        if task_operation.is_some() {
+            return Err("campaign publication transition must contain one task update".into());
+        }
+        let task_id = operation
+            .parameters
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "task update lacks its exact task identity".to_owned())?;
+        task_operation = Some(task_id.to_owned());
+        if let Some(value) = operation
+            .parameters
+            .get("campaign_source_publications_json")
+        {
+            publications = serde_json::from_value(value.clone())
+                .map_err(|_| "campaign source publications are not the closed typed list".to_owned())?;
+        }
+    }
+    if publications.is_empty() {
+        return Ok(publications);
+    }
+    let task_id = task_operation
+        .ok_or_else(|| "campaign source publication has no task update".to_owned())?;
+    if transition.transition_class != eliot_store_api::TransitionClass::TaskControl
+        || transition.task_id.as_deref() != Some(task_id.as_str())
+        || transition.state_fence.task_revision.is_none()
+    {
+        return Err("campaign sources require the exact TaskControl task/fence binding".into());
+    }
+    let task_revision = transition
+        .state_fence
+        .task_revision
+        .as_ref()
+        .expect("checked above");
+    let mut has_task_objective = false;
+    let mut has_task_plan = false;
+    for publication in &publications {
+        publication
+            .validate()
+            .map_err(|error| error.to_string())?;
+        let record = &publication.record;
+        if record.recorded_state_fence != transition.state_fence {
+            return Err("published source must carry the exact admitted transition fence".into());
+        }
+        if publication.publisher == eliot_store_api::CampaignSourcePublisher::TaskController {
+            if record.record_id
+                != eliot_store_api::CampaignOwnerRecordId::Task(
+                    eliot_contracts::TaskId::new(task_id.clone())
+                        .map_err(|error| error.to_string())?,
+                )
+                || record.revision
+                    != eliot_store_api::CampaignOwnerRevision::Task(
+                        task_revision.clone(),
+                    )
+            {
+                return Err("Task Controller source identity must match the admitted task revision".into());
+            }
+            match record.role {
+                eliot_store_api::CampaignSourceRole::TaskObjective => {
+                    has_task_objective = true;
+                    let body_task_id = record
+                        .document
+                        .body
+                        .get("task_id")
+                        .and_then(serde_json::Value::as_str);
+                    if body_task_id != Some(task_id.as_str()) {
+                        return Err("TaskObjective document does not bind the exact task".into());
+                    }
+                }
+                eliot_store_api::CampaignSourceRole::TaskPlan => {
+                    has_task_plan = true;
+                    let recipe: eliot_store_api::LearningStateViewRecipe =
+                        serde_json::from_value(record.document.body.clone())
+                            .map_err(|_| "TaskPlan is not the typed learning-state recipe".to_owned())?;
+                    recipe.validate().map_err(|error| error.to_string())?;
+                    if recipe.binding.task_id.as_str() != task_id
+                        || recipe.binding.request_id != *request_id
+                        || recipe.binding.operation_id != transition.identity.operation_id
+                        || recipe.binding.state_fence != transition.state_fence
+                    {
+                        return Err("TaskPlan recipe does not bind the admitted task operation".into());
+                    }
+                    let anchor = recipe
+                        .source_requirements
+                        .iter()
+                        .find(|requirement| {
+                            requirement.role
+                                == eliot_store_api::CampaignSourceRole::TaskPlan
+                        })
+                        .ok_or_else(|| "TaskPlan recipe lacks its authenticated anchor".to_owned())?;
+                    if anchor.owner.as_str()
+                        != eliot_store_api::TASK_CONTROLLER_CAMPAIGN_OWNER_ID
+                        || anchor.source_binding
+                            != eliot_store_api::CampaignSourceBinding::AuthenticatedTaskAnchor
+                        || anchor.expected_reference.is_some()
+                    {
+                        return Err("TaskPlan recipe has an invalid authenticated owner anchor".into());
+                    }
+                    let objective_requirement = recipe
+                        .source_requirements
+                        .iter()
+                        .find(|requirement| {
+                            requirement.role
+                                == eliot_store_api::CampaignSourceRole::TaskObjective
+                        })
+                        .ok_or_else(|| "TaskPlan recipe lacks its TaskObjective source".to_owned())?;
+                    let objective_publication = publications
+                        .iter()
+                        .find(|candidate| {
+                            candidate.publisher
+                                == eliot_store_api::CampaignSourcePublisher::TaskController
+                                && candidate.record.role
+                                    == eliot_store_api::CampaignSourceRole::TaskObjective
+                        })
+                        .ok_or_else(|| "TaskObjective source publication is missing".to_owned())?;
+                    let expected_objective = objective_requirement
+                        .expected_reference
+                        .as_ref()
+                        .ok_or_else(|| "TaskObjective recipe reference is missing".to_owned())?;
+                    if expected_objective.role != eliot_store_api::CampaignSourceRole::TaskObjective
+                        || expected_objective.owner != objective_publication.record.owner_id
+                        || expected_objective.record_id != objective_publication.record.record_id
+                        || expected_objective.revision != objective_publication.record.revision
+                        || expected_objective.content_digest
+                            != objective_publication.record.content_digest
+                        || expected_objective.recorded_state_fence
+                            != objective_publication.record.recorded_state_fence
+                        || expected_objective.slot_projection_digests
+                            != objective_publication.record.slot_projection_digests
+                    {
+                        return Err("TaskPlan reference does not bind the owner-issued TaskObjective row".into());
+                    }
+                }
+                _ => {
+                    return Err("Task Controller transition can publish only objective and plan".into());
+                }
+            }
+        } else if publication.publisher
+            == eliot_store_api::CampaignSourcePublisher::ContextCompiler
+            && record.role == eliot_store_api::CampaignSourceRole::ContextDelivery
+        {
+            return Err("prior ContextDelivery must be read from its exact retained owner row".into());
+        }
+    }
+    if !has_task_objective || !has_task_plan {
+        return Err("Task Controller campaign publication requires TaskObjective and TaskPlan".into());
+    }
+    Ok(publications)
 }
 
 #[derive(Deserialize)]
@@ -2637,6 +2806,34 @@ impl KernelComposition {
         if let Some(rejection) = self.normal_write_admission_response() {
             return Ok(rejection);
         }
+        let campaign_source_publications =
+            match campaign_source_publications_for_transition(
+                &operation.transition,
+                &operation.context.request_id,
+            ) {
+                Ok(publications) => publications,
+                Err(error) => {
+                    return Ok(Self::store_error_response_text("write_receipt", &error));
+                }
+            };
+        let campaign_source_operation_id = operation.transition.identity.operation_id.clone();
+        let campaign_source_request_digest = operation
+            .transition
+            .identity
+            .canonical_request_hash
+            .clone();
+        if !campaign_source_publications.is_empty() {
+            if let Err(error) = self.p07_ors.reserve_campaign_source_publications(
+                &campaign_source_operation_id,
+                &campaign_source_request_digest,
+                &campaign_source_publications,
+            ) {
+                return Ok(Self::store_error_response_text(
+                    "write_receipt",
+                    &error.to_string(),
+                ));
+            }
+        }
         let gateway = self.retained_store_gateway()?;
         match gateway
             .apply(
@@ -2647,7 +2844,36 @@ impl KernelComposition {
             )
             .await
         {
-            Ok(receipt) => Ok(store_apply_response(&receipt)),
+            Ok(receipt) => {
+                if !campaign_source_publications.is_empty() {
+                    if receipt.status == WriteReceiptStatus::Committed {
+                        if let Err(error) = self.p07_ors.commit_campaign_source_publications(
+                            &campaign_source_operation_id,
+                            &campaign_source_request_digest,
+                            &campaign_source_publications,
+                            &receipt,
+                        ) {
+                            // Keep the source reservation. An exact replay of
+                            // this same canonical operation obtains the
+                            // durable receipt and completes ORS reconciliation.
+                            return Ok(Self::store_error_response_text(
+                                "write_receipt",
+                                &error.to_string(),
+                            ));
+                        }
+                    } else if let Err(error) = self.p07_ors.abort_campaign_source_publications(
+                        &campaign_source_operation_id,
+                        &campaign_source_request_digest,
+                        &campaign_source_publications,
+                    ) {
+                        return Ok(Self::store_error_response_text(
+                            "write_receipt",
+                            &error.to_string(),
+                        ));
+                    }
+                }
+                Ok(store_apply_response(&receipt))
+            }
             Err(error) => Ok(Self::store_error_response_text("write_receipt", &error)),
         }
     }
@@ -2678,6 +2904,90 @@ impl KernelComposition {
             ));
         }
         validate_store_session_fence(session, &operation.request.state_fence)?;
+        if operation.request.operation == NamedReadOperation::GetCampaignLearningStateView {
+            let lookup: CampaignLearningStateViewLookup = operation
+                .request
+                .parameters
+                .get("lookup")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .ok_or(TransportError::SessionFenced)?;
+            lookup.validate().map_err(|_| TransportError::SessionFenced)?;
+            let read = match self
+                .p07_ors
+                .load_campaign_learning_state_view(&lookup.view_id)
+            {
+                Ok(Some(publication))
+                    if publication.task_id == lookup.task_id
+                        && publication.scope_id == lookup.scope_id => CampaignLearningStateViewRead {
+                            status: CampaignLearningStateViewReadStatus::Current,
+                            publication: Some(publication),
+                            read_state_fence: operation.request.state_fence.clone(),
+                        },
+                Ok(Some(_)) | Ok(None) => CampaignLearningStateViewRead {
+                    status: CampaignLearningStateViewReadStatus::Missing,
+                    publication: None,
+                    read_state_fence: operation.request.state_fence.clone(),
+                },
+                Err(error) => {
+                    return Ok(Self::store_error_response_text(
+                        "store_named",
+                        &error.to_string(),
+                    ));
+                }
+            };
+            read.validate().map_err(|_| TransportError::SessionFenced)?;
+            let response = NamedReadResponse {
+                operation: NamedReadOperation::GetCampaignLearningStateView,
+                state_fence: operation.request.state_fence,
+                revision_heads: Vec::new(),
+                payload: serde_json::json!({"campaign_learning_state_view": read}),
+            };
+            return Ok(store_named_response(&response));
+        }
+        if operation.request.operation == NamedReadOperation::GetCampaignSourceRevision {
+            if operation.request.scope_id.is_none() {
+                return Err(TransportError::SessionFenced);
+            }
+            let lookup: CampaignSourceRevisionLookup = operation
+                .request
+                .parameters
+                .get("lookup")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .ok_or(TransportError::SessionFenced)?;
+            lookup
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let read = self
+                .p07_ors
+                .load_campaign_source_revision(&lookup, &operation.request.state_fence)
+                .map_err(|_| TransportError::SessionFenced)?;
+            if let Some(source) = &read.source {
+                if source.document.schema
+                    == eliot_store_api::CampaignSourceDocumentSchema::LearningStateViewRecipe
+                {
+                    let recipe_scope = source
+                        .document
+                        .body
+                        .pointer("/binding/scope_id")
+                        .and_then(serde_json::Value::as_str);
+                    if recipe_scope
+                        != operation.request.scope_id.as_ref().map(|scope| scope.as_str())
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                }
+            }
+            read.validate().map_err(|_| TransportError::SessionFenced)?;
+            let response = NamedReadResponse {
+                operation: NamedReadOperation::GetCampaignSourceRevision,
+                state_fence: operation.request.state_fence,
+                revision_heads: Vec::new(),
+                payload: serde_json::json!({"campaign_source_revision": read}),
+            };
+            return Ok(store_named_response(&response));
+        }
         // Authority-history reads are Kernel-owned fence state (`#2100`):
         // serve durable closure-fence history from the retained ORS instead
         // of forwarding to the store bridge. The store catalogue truthfully
