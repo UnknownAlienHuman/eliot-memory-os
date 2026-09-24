@@ -331,6 +331,24 @@ pub struct DaemonStatus {
     pub degraded: bool,
 }
 
+/// Versioned canonical tool view the tool owner supplies for a versioned
+/// Skill install (issue #1882).
+///
+/// Bundles the live tool-owner source, the Skill-owned alias table, and the
+/// Governor-admitted definition version so the composition seam
+/// ([`DaemonComposition::skill_install_package_versioned`]) carries every
+/// owner term explicitly without exceeding the arity lint. The admitted
+/// version must equal the install context's recorded version; drift fails
+/// closed inside the shared handle before any catalogue write.
+pub struct VersionedToolView<'a> {
+    /// Live tool-owner source reporting the definition version it binds.
+    pub source: &'a dyn eliot_skill::CanonicalToolSource,
+    /// Skill-owned alias table resolving provider renames to canonical names.
+    pub aliases: &'a eliot_skill::ToolAliasTable,
+    /// Governor-admitted definition version the install records.
+    pub admitted_definition_version: &'a str,
+}
+
 /// The one production daemon composition. Application scheduling belongs here;
 /// physical process execution and canonical persistence remain outside it.
 pub struct DaemonComposition {
@@ -1160,16 +1178,16 @@ impl DaemonComposition {
     /// closed before the shared handle is touched. The accepted candidate
     /// binds at the Skill boundary. The Skill never hardcodes
     /// the version; the composition never invents a registry. Drivers call
-    /// post-admission with the injector's real inputs.
+    /// post-admission with the injector's real inputs. The versioned tool
+    /// view travels as one [`VersionedToolView`] so the seam keeps every
+    /// owner term explicit within the arity lint.
     pub fn skill_install_package_versioned(
         &self,
         candidate: &eliot_skill::PortableSkillPackageCandidate,
         package: &eliot_skill::SkillPackage,
         inputs: &eliot_skill::MaterializationInputs,
         context: &eliot_skill::CatalogueInstallContext,
-        source: &dyn eliot_skill::CanonicalToolSource,
-        aliases: &eliot_skill::ToolAliasTable,
-        admitted_definition_version: &str,
+        view: VersionedToolView<'_>,
     ) -> Result<String, eliot_skill::SkillError> {
         let admitted = self.governor.kernel_snapshot().state_fence().clone();
         self.check_skill_lifecycle_standing(package, &admitted)?;
@@ -1178,9 +1196,9 @@ impl DaemonComposition {
             package,
             inputs,
             context,
-            source,
-            aliases,
-            admitted_definition_version,
+            view.source,
+            view.aliases,
+            view.admitted_definition_version,
         )
     }
 

@@ -179,7 +179,7 @@ type LatestSkillRows = (Option<(u64, String)>, Option<(u64, String, String, Stri
 /// committed row overall plus the latest row binding the presented digest.
 ///
 /// Both positions advance by commit order (`capture_index`); served order
-/// breaks ties. Every row must carry the exact six lifecycle parameters  -- 
+/// breaks ties. Every row must carry the exact six lifecycle parameters  --
 /// a row missing its base view, or naming another skill, fails closed
 /// rather than deciding currency on a partial claim.
 fn latest_skill_rows(
@@ -245,7 +245,7 @@ fn latest_skill_rows(
 /// order) for the skill. Only the digest bound by that latest row can decide
 /// Accepted or Revoked: a newer row binding a different package digest
 /// supersedes the presented one, resolving Unknown even when an older row
-/// accepted it. Absence of any row for the digest resolves Unknown as well  -- 
+/// accepted it. Absence of any row for the digest resolves Unknown as well  --
 /// never acceptance. A truncated history cannot prove currency and fails
 /// closed: the error refuses the drive rather than installing on a possibly
 /// revoked digest.
