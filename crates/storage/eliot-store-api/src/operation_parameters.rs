@@ -1166,6 +1166,36 @@ pub fn parameter_schema_digest(schema: &[ParameterSchemaField]) -> Result<String
     Ok(sha256_hex(&bytes))
 }
 
+/// Verifies that one owner-approved declaration cannot become a second
+/// payload-encoding owner (issue #10).
+///
+/// Receipt/identifier/control-identity names (every entry of
+/// [`CONTROL_FIELD_DENYLIST`]) may supersede the generic deny-list only as
+/// scalar identity strings ([`ParameterShape::OperationId`] or
+/// [`ParameterShape::Subject`]): a structured shape on such a name would
+/// transport arbitrary payloads outside the
+/// [`ExactJsonBytes`](crate::ExactJsonBytes) authority. Structured
+/// owner-approved shapes stay allowed on non-control names, where their own
+/// closed contract (never the receipt path) owns the bytes. Every future
+/// shape must be classified in the match below before it can travel any
+/// receipt/identifier path; an unclassified shape is a compile error here,
+/// not a silent pass.
+pub fn verify_declaration_holds_no_payload_encoding(
+    declaration: &ParameterDeclaration,
+) -> Result<(), StoreError> {
+    let structured = match declaration.shape {
+        ParameterShape::OperationId | ParameterShape::Subject => false,
+        ParameterShape::EpistemicRevision | ParameterShape::NotificationState => true,
+    };
+    if structured && CONTROL_FIELD_DENYLIST.contains(&declaration.name) {
+        return Err(StoreError::InvalidField {
+            field: "payload.control_field",
+            reason: "receipt/identifier path must not own a payload encoding",
+        });
+    }
+    Ok(())
+}
+
 /// Validates read parameters against the owner-approved typed declaration.
 ///
 /// Membership is exact: an undeclared name fails, with control-denylisted
@@ -1180,6 +1210,7 @@ pub fn validate_typed_read_parameters(
     let declared = declared_read_parameters(operation);
     for (name, value) in parameters {
         if let Some(declaration) = declared.iter().find(|field| field.name == name.as_str()) {
+            verify_declaration_holds_no_payload_encoding(declaration)?;
             check_declared_shape(declaration, value)?;
         } else {
             if CONTROL_FIELD_DENYLIST.contains(&name.as_str()) {
@@ -1217,6 +1248,7 @@ pub fn validate_typed_mutation_parameters(
     let declared = declared_mutation_parameters(operation);
     for (name, value) in parameters {
         if let Some(declaration) = declared.iter().find(|field| field.name == name.as_str()) {
+            verify_declaration_holds_no_payload_encoding(declaration)?;
             check_declared_shape(declaration, value)?;
         } else {
             if CONTROL_FIELD_DENYLIST.contains(&name.as_str()) {
