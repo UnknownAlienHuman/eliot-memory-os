@@ -24,6 +24,8 @@ use eliot_protocol::{
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultAckOutcome,
     AgentActivationResultReconcile,
 };
+use eliot_runtime_contracts::DaemonProgressChannel;
+use eliot_store_api::{StoreHealth, StoreHealthStatus};
 use eliotd::testd_terminal_completion::TestdOwnerDrainOutcome;
 use eliotd::{
     ActivationClaim, DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus,
@@ -353,7 +355,24 @@ pub(super) fn run() -> Result<(), String> {
             .emit();
         }
     }
-    kernel.report_ready().map_err(|error| error.to_string())?;
+    // Issue #88, wave 3: the ready answer carries the once-per-generation
+    // supervision bundle. The per-tick producer below cites it verbatim; the
+    // Kernel re-verifies every echoed field on each submit.
+    let ready_supervision = kernel.report_ready().map_err(|error| error.to_string())?;
+    let session_facts = kernel.owner_session_facts().ok_or_else(|| {
+        "daemon has no validated Kernel session binding for supervision progress".to_owned()
+    })?;
+    let supervision_progress =
+        eliotd::SupervisionProgressProducer::new(eliotd::SupervisionProducerDeps {
+            daemon_artifact_id: format!("eliotd-exe:{}", launch.executable_sha256),
+            daemon_config_digest: launch.config_sha256.clone(),
+            launch_nonce: launch.launch_nonce.clone(),
+            process_pid: std::process::id(),
+            transport_session_evidence: session_facts.session_binding().to_owned(),
+            transport_connection_evidence: session_facts.connection_id().to_owned(),
+            ready: ready_supervision,
+        })
+        .map_err(|error| format!("daemon supervision producer: {error}"))?;
     // The local-read poller below drives Skill pairs through the composition
     // inside its flight future: share it here so the future owns its handle.
     // All pre-loop exclusive uses are complete; shutdown unwraps below.
@@ -393,7 +412,11 @@ pub(super) fn run() -> Result<(), String> {
         Arc::try_unwrap(composition)
             .map_err(|_| "daemon composition shared before run loop".to_owned())?,
     ));
-    let loop_result = runtime.block_on(run_loop(Arc::clone(&kernel), Arc::clone(&composition)));
+    let loop_result = runtime.block_on(run_loop(
+        Arc::clone(&kernel),
+        Arc::clone(&composition),
+        supervision_progress,
+    ));
     // The loop dropped its handle on return, so this unwrap is deterministic;
     // the error arm documents the invariant instead of panicking on it.
     let shutdown_result = Arc::try_unwrap(composition)
@@ -649,6 +672,7 @@ impl LoopCadence {
 async fn run_loop(
     kernel: Arc<DaemonKernelClient>,
     composition: SharedComposition,
+    mut supervision_progress: eliotd::SupervisionProgressProducer,
 ) -> Result<RunLoopExit, String> {
     let mut cadence = LoopCadence::production();
     // Sole owner of activation state. No second owner and no second
@@ -734,7 +758,10 @@ async fn run_loop(
                                 flight = ActivationFlight::Idle;
                                 continue;
                             }
-                            ActivationClaim::Valid(ticket) => *ticket,
+                            ActivationClaim::Valid(ticket) => {
+                                supervision_progress.note_claim();
+                                *ticket
+                            }
                         };
                         let now = unix_ms(SystemTime::now())?;
                         let guard = composition.lock().await;
@@ -749,6 +776,7 @@ async fn run_loop(
                     }
                     ActivationCompletion::Dispatch(dispatch_outcome) => match dispatch_outcome {
                         Ok(()) => {
+                            supervision_progress.note_kernel_applied();
                             flight = ActivationFlight::Idle;
                         }
                         Err(ActivationDispatchError::Hard(error)) => return Err(error),
@@ -765,16 +793,106 @@ async fn run_loop(
                 settle_testd_owner_completion(testd_owner_completion, &mut testd_owner_flight)?;
             }
             _ = cadence.health_heartbeat.tick() => {
-                KernelTransitionPort::health(&*kernel)
-                    .await
-                    .map_err(|error| format!("Kernel health heartbeat: {error}"))?;
-                // #2100: revision-advance trigger for the Kernel P-07 owner
-                // feed. Unchanged providers perform no IO here; an advanced
-                // provider republishes with readback proof.
-                sync_owner_feed(&kernel, &composition, &mut owner_feed).await;
+                run_health_heartbeat_tick(
+                    &kernel,
+                    &composition,
+                    &mut owner_feed,
+                    &mut supervision_progress,
+                    &flight,
+                )
+                .await?;
             }
         }
     }
+}
+
+/// Runs one health-heartbeat tick (Implements #88, wave 3): the Kernel
+/// health poll stays evidence-only, then the same tick submits supervision
+/// progress built from observed work. The poll's Store dimension is reused as
+/// the observation's `store_dependency` evidence, never as renewal authority.
+async fn run_health_heartbeat_tick(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    owner_feed: &mut eliotd::OwnerFeedTrigger,
+    supervision_progress: &mut eliotd::SupervisionProgressProducer,
+    flight: &ActivationFlight,
+) -> Result<(), String> {
+    let health: StoreHealth = KernelTransitionPort::health(kernel.as_ref())
+        .await
+        .map_err(|error| format!("Kernel health heartbeat: {error}"))?;
+    submit_supervision_heartbeat(
+        kernel,
+        supervision_progress,
+        &health,
+        matches!(flight, ActivationFlight::InFlight(_)),
+    )
+    .await?;
+    // #2100: revision-advance trigger for the Kernel P-07 owner feed.
+    // Unchanged providers perform no IO here; an advanced provider
+    // republishes with readback proof.
+    sync_owner_feed(kernel, composition, owner_feed).await;
+    Ok(())
+}
+
+/// Submits per-tick supervision progress from observed work (Implements #88,
+/// wave 3).
+///
+/// One observation per due channel goes out in fixed channel order, adopting
+/// the Kernel answer after each submit so later channels cite the fresh head.
+/// A transport failure retries once with the byte-identical request (exact
+/// replay is idempotent, never a second renewal); typed refusals converge
+/// locally without retry. A refused or failed tick fails the daemon closed
+/// exactly like the health poll it rides with.
+async fn submit_supervision_heartbeat(
+    kernel: &Arc<DaemonKernelClient>,
+    producer: &mut eliotd::SupervisionProgressProducer,
+    health: &StoreHealth,
+    activation_in_flight: bool,
+) -> Result<(), String> {
+    // #740: heartbeat span. Outcomes and refusal codes are named; lease
+    // material, cursors, and digests never enter the sink.
+    let _span = tracing::info_span!("eliotd.supervision_heartbeat").entered();
+    let inputs = eliotd::SupervisionTickInputs {
+        store_ready: health.status == StoreHealthStatus::Ready,
+        activation_in_flight,
+    };
+    let store_dimension = eliotd::store_dependency_dimension(health.status);
+    for channel in [
+        DaemonProgressChannel::Claim,
+        DaemonProgressChannel::Dispatch,
+        DaemonProgressChannel::Apply,
+    ] {
+        if !producer.submit_due(channel) {
+            continue;
+        }
+        let request = producer.build_observation(channel, &inputs, store_dimension)?;
+        let answer = match kernel.submit_supervision_progress(&request).await {
+            Ok(answer) => answer,
+            Err(first_error) => {
+                kernel
+                    .submit_supervision_progress(&request)
+                    .await
+                    .map_err(|error| {
+                        format!("Kernel supervision progress submit: {first_error}; retry: {error}")
+                    })?
+            }
+        };
+        producer.adopt_answer(&answer)?;
+        if let Some(outcome) = answer.outcome {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.supervision_heartbeat_decided",
+                outcome = outcome.as_str(),
+            );
+        } else if let Some(code) = answer.refusal_code.as_deref() {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.supervision_heartbeat_refused",
+                code = code,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Starts the dispatch step for one validated ticket, or idles on
