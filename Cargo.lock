@@ -2489,6 +2489,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-evidence",
  "eliot-memory-projection-contracts",
+ "eliot-observation-contracts",
  "eliot-receipts",
  "schemars",
  "serde",
