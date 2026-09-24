@@ -45,8 +45,12 @@ pub struct StoreSchemaBootstrapCommand {
 /// Authoritative Store-side result of one schema bootstrap attempt.
 ///
 /// The receipt is a complete binding projection, not a generic "success"
-/// boolean. An exact replay after a process restart returns the same values
-/// after the adapter reads and verifies durable `schema_meta` and fence state.
+/// boolean. Beyond the plan identity it carries the exact predecessor pair
+/// the adapter admitted the node against and the compatible bridge range
+/// (issue #1221), so an installation consumer can prove an unbroken ordered
+/// chain instead of trusting a lone target generation. An exact replay after
+/// a process restart returns the same values after the adapter reads and
+/// verifies durable `schema_meta` and fence state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreSchemaBootstrapReceipt {
@@ -58,6 +62,14 @@ pub struct StoreSchemaBootstrapReceipt {
     pub migration_id: String,
     pub migration_checksum_sha256: String,
     pub generation_after: String,
+    /// Predecessor migration identity admitted by the adapter; `None` only
+    /// on the chain-root baseline.
+    pub predecessor_migration_id: Option<String>,
+    /// Predecessor statements digest admitted by the adapter; `None` only
+    /// on the chain-root baseline.
+    pub predecessor_checksum_sha256: Option<String>,
+    /// Bridge identity the applied node is compatible with.
+    pub bridge_range: String,
 }
 
 impl StoreSchemaBootstrapReceipt {
@@ -70,6 +82,23 @@ impl StoreSchemaBootstrapReceipt {
         validate_launch_text(&self.generation_after, "generation_after")?;
         validate_digest(&self.approved_config_hash, "approved_config_hash")?;
         validate_digest(&self.migration_checksum_sha256, "migration_checksum_sha256")?;
+        validate_launch_text(&self.bridge_range, "bridge_range")?;
+        match (
+            &self.predecessor_migration_id,
+            &self.predecessor_checksum_sha256,
+        ) {
+            (None, None) => {}
+            (Some(id), Some(checksum)) => {
+                validate_launch_text(id, "predecessor_migration_id")?;
+                validate_digest(checksum, "predecessor_checksum_sha256")?;
+            }
+            _ => {
+                return Err(
+                    "predecessor_migration_id and predecessor_checksum_sha256 must both be present or both absent"
+                        .to_owned(),
+                );
+            }
+        }
         if self.authority_generation == 0 {
             return Err("authority_generation must be non-zero".to_owned());
         }
@@ -239,6 +268,9 @@ impl StoreSchemaBootstrapBinding {
             migration_id: migration.migration_id.clone(),
             migration_checksum_sha256: migration.checksum_sha256.clone(),
             generation_after: migration.generation_after.as_str().to_owned(),
+            predecessor_migration_id: migration.predecessor_migration_id.clone(),
+            predecessor_checksum_sha256: migration.predecessor_checksum_sha256.clone(),
+            bridge_range: migration.bridge_range.clone(),
         };
         receipt
             .validate()

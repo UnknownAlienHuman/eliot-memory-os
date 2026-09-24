@@ -1,0 +1,1359 @@
+# Machine-readable Store schema/migration inventory (issue #1221, wave A).
+#
+# Every .surql file and embedded DDL body in the repository has exactly one
+# owner, one consumer-or-disposition, one schema generation and one digest.
+# The single executable graph is `MIGRATION_GRAPH` in
+# crates/storage/eliot-store-surreal-adapter/src/schema.rs, admitted only by
+# `is_admitted_migration` in
+# crates/storage/eliot-store-surreal-adapter/src/apply.rs. All other roots are
+# non-executable by the current graph: the root orphan is a retired fixture,
+# legacy bodies belong to `crates/eliot-store` (retirement owner #1189) and
+# dead-code DDL consts belong to their owning slices until admitted.
+#
+# Verification: `sha256` values are full-file/const SHA-256 hex digests
+# recomputed from source at inventory time (base origin/main 1d6b2ce9).
+# Embedded pins are additionally enforced at runtime by `validate_graph_pins`.
+
+schema = "eliot.storage.migration-inventory.v1"
+issue = 1221
+owner_crate = "crates/storage/eliot-store-surreal-adapter"
+graph_authority = "crates/storage/eliot-store-surreal-adapter/src/schema.rs:MIGRATION_GRAPH"
+admission_authority = "crates/storage/eliot-store-surreal-adapter/src/apply.rs:is_admitted_migration"
+receipt_authority = "crates/storage/eliot-store-surreal-adapter/src/readiness.rs:MigrationReceipt"
+bridge_range = "eliot.storage.store-surreal-adapter"
+
+[[graph_node]]
+order = 1
+migration_id = "eliot.store.surreal.schema.v1"
+predecessor_migration_id = ""
+predecessor_checksum_sha256 = ""
+predecessor_generation = ""
+generation_after = "1.0.0"
+statements_sha256 = "783d3207ab39fc0471e32f893302eedd579ae4980ee95f9f883f92a5f7ba705b"
+bridge_range = "eliot.storage.store-surreal-adapter"
+direction = "baseline"
+
+[[graph_node]]
+order = 2
+migration_id = "eliot.store.surreal.schema.v2"
+predecessor_migration_id = "eliot.store.surreal.schema.v1"
+predecessor_checksum_sha256 = "783d3207ab39fc0471e32f893302eedd579ae4980ee95f9f883f92a5f7ba705b"
+predecessor_generation = "1.0.0"
+generation_after = "2.0.0"
+statements_sha256 = "c89ec0d979a9d5f2979cb19fcb3dc199f3be4f82ba356a4f84964c9519a7f42c"
+bridge_range = "eliot.storage.store-surreal-adapter"
+direction = "baseline"
+
+[[graph_node]]
+order = 3
+migration_id = "eliot.store.surreal.schema.v1_to_v2"
+predecessor_migration_id = "eliot.store.surreal.schema.v1"
+predecessor_checksum_sha256 = "783d3207ab39fc0471e32f893302eedd579ae4980ee95f9f883f92a5f7ba705b"
+predecessor_generation = "1.0.0"
+generation_after = "2.0.0"
+statements_sha256 = "0d4be3081a7cc1ebc3b2beefd62b49952648b96e66f7b840dd566cae1d7afb3b"
+bridge_range = "eliot.storage.store-surreal-adapter"
+direction = "forward"
+
+# Embedded DDL bodies (crates/storage/eliot-store-surreal-adapter/src/schema.rs).
+
+[[ddl_body]]
+const = "SCHEMA_DDL"
+sha256 = "783d3207ab39fc0471e32f893302eedd579ae4980ee95f9f883f92a5f7ba705b"
+owner = "crates/storage/eliot-store-surreal-adapter"
+consumer = "graph node eliot.store.surreal.schema.v1 via initial_schema_migration"
+disposition = "executable-by-current-graph"
+generation = "1.0.0"
+
+[[ddl_body]]
+const = "SCHEMA_DDL_V2"
+sha256 = "c89ec0d979a9d5f2979cb19fcb3dc199f3be4f82ba356a4f84964c9519a7f42c"
+owner = "crates/storage/eliot-store-surreal-adapter"
+consumer = "graph node eliot.store.surreal.schema.v2 via v2_baseline_migration"
+disposition = "executable-by-current-graph"
+generation = "2.0.0"
+
+[[ddl_body]]
+const = "SCHEMA_MIGRATION_V1_TO_V2_DDL"
+sha256 = "0d4be3081a7cc1ebc3b2beefd62b49952648b96e66f7b840dd566cae1d7afb3b"
+owner = "crates/storage/eliot-store-surreal-adapter"
+consumer = "graph node eliot.store.surreal.schema.v1_to_v2 via v1_to_v2_migration"
+disposition = "executable-by-current-graph"
+generation = "2.0.0-delta"
+note = "aliases RECOVERY_TABLES_DDL; same bytes, one digest"
+
+[[ddl_body]]
+const = "RECOVERY_TABLES_DDL"
+sha256 = "0d4be3081a7cc1ebc3b2beefd62b49952648b96e66f7b840dd566cae1d7afb3b"
+owner = "crates/storage/eliot-store-surreal-adapter"
+consumer = "same bytes as SCHEMA_MIGRATION_V1_TO_V2_DDL; no separate consumer"
+disposition = "alias-of-executable-delta"
+generation = "2.0.0-delta"
+
+[[ddl_body]]
+const = "SCHEMA_DDL_V3"
+sha256 = "72b45ca1c23f50e0c357cb5faded71cc3a0fc2c1c2883d85ad9645c6a19378d0"
+owner = "crates/storage/eliot-store-surreal-adapter (slice 688-B)"
+consumer = "none; #[allow(dead_code)] checksum-level additivity proof only"
+disposition = "code-fixture-non-executable"
+generation = "3.0.0-unadmitted"
+
+[[ddl_body]]
+const = "ERASURE_TABLES_DDL"
+sha256 = "35a03afcf4796095a22144db3b3f372fa265f06374cd044528f479fd313d03de"
+owner = "crates/storage/eliot-store-surreal-adapter (slice 688-B)"
+consumer = "none; #[allow(dead_code)] additive delta, applied only where slice 688-B proves it"
+disposition = "code-fixture-non-executable"
+generation = "3.0.0-delta-unadmitted"
+
+[[ddl_body]]
+const = "NOTIFICATION_TABLES_DDL"
+sha256 = "bd94b84c8fe8910d0ad2f471994f3ba912947fc12a3826811260bf014b44677a"
+owner = "crates/storage/eliot-store-surreal-adapter (slice #1780)"
+consumer = "none; #[allow(dead_code)] additive delta, applied only where slice #1780 proves it"
+disposition = "code-fixture-non-executable"
+generation = "unadmitted"
+
+[[ddl_body]]
+const = "REACTIVE_TABLES_DDL"
+sha256 = "03f1a0b553938411b5659907c570387bbe4a5cb525a674f5b635cb60dbc27c4c"
+owner = "crates/storage/eliot-store-surreal-adapter (slice #1941 C4)"
+consumer = "none; #[allow(dead_code)] additive delta, applied only where slice #1941 proves it"
+disposition = "code-fixture-non-executable"
+generation = "unadmitted"
+
+[[ddl_body]]
+const = "AUTOMATION_TABLES_DDL"
+sha256 = "a64e73b1735accfb7db972518ca1daf85994a8bb235ffbe5fe441959aa8cda34"
+owner = "crates/storage/eliot-store-surreal-adapter (slice #1779)"
+consumer = "none; #[allow(dead_code)] additive delta, applied only where slice #1779 proves it"
+disposition = "code-fixture-non-executable"
+generation = "unadmitted"
+
+[[ddl_body]]
+const = "EXPERIENCE_TABLES_DDL"
+sha256 = "641e5ddbbd91a93cd56cb3bd1850ac74c35134c707d6898ab51be6288458eb87"
+owner = "crates/storage/eliot-store-surreal-adapter (slice #223)"
+consumer = "none; #[allow(dead_code)] additive delta, applied only where slice #223 proves it"
+disposition = "code-fixture-non-executable"
+generation = "unadmitted"
+
+# Legacy table mapping (AC#4, inventory level P1 per I00-08).
+#
+# The current adapter owns the canonical control plane only (the 23
+# current_table entries below). Legacy domain tables have no current-adapter
+# counterpart: inventing one would invent authority. Their disposition is
+# therefore retire-with-#1189 with an explicit blocking condition (I00-08
+# UNKNOWN blocks deletion until #1189 closes P1-P5); no table is silently
+# omitted. Legacy files declare tables and indexes only (all SCHEMALESS, no
+# DEFINE FIELD); field dispositions follow their table. Indexes follow their
+# table disposition; index counts per source file: 000_schema(src) 22,
+# 000_schema(migrations) 5, 001 9, 002 2, 003 1, 004 4, 005 3, 006 3, 007 5,
+# 008 4, 009 5, 010 0.
+
+[[legacy_table]]
+table = "write_receipt"
+sources = ["crates/eliot-store/migrations/000_schema.surql", "crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "supersede-by-current"
+current_counterpart = "write_receipt (current adapter: keyed by canonical operation identity and idempotency key per I5.27, not write_id/project_sequence)"
+rationale = "only legacy table with a true current counterpart; legacy keying replaced by canonical operation identity"
+
+[[legacy_table]]
+table = "scope_head"
+sources = ["crates/eliot-store/migrations/000_schema.surql", "crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy domain schema; no current-adapter counterpart; deletion blocked until #1189 P1-P5"
+
+[[legacy_table]]
+table = "task_contract"
+sources = ["crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy domain schema; no current-adapter counterpart; deletion blocked until #1189 P1-P5"
+
+[[legacy_table]]
+table = "source_snapshot"
+sources = ["crates/eliot-store/migrations/000_schema.surql", "crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy domain schema; no current-adapter counterpart; deletion blocked until #1189 P1-P5"
+
+[[legacy_table]]
+table = "evidence_atom"
+sources = ["crates/eliot-store/migrations/000_schema.surql", "crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy domain schema; no current-adapter counterpart; deletion blocked until #1189 P1-P5"
+
+[[legacy_table]]
+table = "tool_observation"
+sources = ["crates/eliot-store/migrations/000_schema.surql", "crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy domain schema; no current-adapter counterpart; deletion blocked until #1189 P1-P5"
+
+[[legacy_table]]
+table = "claim_card"
+sources = ["crates/eliot-store/migrations/000_schema.surql", "crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy domain schema; no current-adapter counterpart; deletion blocked until #1189 P1-P5"
+
+[[legacy_table]]
+table = "verification_run"
+sources = ["crates/eliot-store/migrations/000_schema.surql", "crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy domain schema; no current-adapter counterpart; deletion blocked until #1189 P1-P5"
+
+[[legacy_table]]
+table = "failure_fingerprint"
+sources = ["crates/eliot-store/migrations/000_schema.surql", "crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy domain schema; no current-adapter counterpart; deletion blocked until #1189 P1-P5"
+
+[[legacy_table]]
+table = "memory_transition"
+sources = ["crates/eliot-store/migrations/000_schema.surql", "crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy domain schema; no current-adapter counterpart; deletion blocked until #1189 P1-P5"
+
+[[legacy_table]]
+table = "canonical_record"
+sources = ["crates/eliot-store/migrations/000_schema.surql", "crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy domain schema; canonical control plane now uses canonical_event/projection_record/relation_record; data migration, if any, owned by #1189"
+
+[[legacy_table]]
+table = "trace_span"
+sources = ["crates/eliot-store/migrations/000_schema.surql", "crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy domain schema; no current-adapter counterpart; deletion blocked until #1189 P1-P5"
+
+[[legacy_table]]
+table = "context_packet_receipt"
+sources = ["crates/eliot-store/migrations/000_schema.surql", "crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy domain schema; no current-adapter counterpart; deletion blocked until #1189 P1-P5"
+
+[[legacy_table]]
+table = "supports"
+sources = ["crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy relation table; typed relations now live in current relation_record via named operations; data migration, if any, owned by #1189"
+
+[[legacy_table]]
+table = "verified_by"
+sources = ["crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy relation table; see supports"
+
+[[legacy_table]]
+table = "contradicts"
+sources = ["crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy relation table; see supports"
+
+[[legacy_table]]
+table = "supersedes"
+sources = ["crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy relation table; see supports"
+
+[[legacy_table]]
+table = "mentions"
+sources = ["crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy relation table; see supports"
+
+[[legacy_table]]
+table = "belongs_to"
+sources = ["crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy relation table; see supports"
+
+[[legacy_table]]
+table = "produces"
+sources = ["crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy relation table; see supports"
+
+[[legacy_table]]
+table = "invalidated_by"
+sources = ["crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy relation table; see supports"
+
+[[legacy_table]]
+table = "co_change"
+sources = ["crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy relation table; see supports"
+
+[[legacy_table]]
+table = "concept_implemented_by"
+sources = ["crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy relation table; see supports"
+
+[[legacy_table]]
+table = "concept_depends_on"
+sources = ["crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy relation table; see supports"
+
+[[legacy_table]]
+table = "capsule_covers"
+sources = ["crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy relation table; see supports"
+
+[[legacy_table]]
+table = "card_covers"
+sources = ["crates/eliot-store/src/surql/000_schema.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy relation table; see supports"
+
+[[legacy_table]]
+table = "observability_receipt"
+sources = ["crates/eliot-store/src/surql/001_observability.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy observability schema; no current-adapter counterpart; deletion blocked until #1189 P1-P5"
+
+[[legacy_table]]
+table = "memory_influence_trace"
+sources = ["crates/eliot-store/src/surql/001_observability.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy observability schema; see observability_receipt"
+
+[[legacy_table]]
+table = "injection_receipt"
+sources = ["crates/eliot-store/src/surql/001_observability.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy observability schema; see observability_receipt"
+
+[[legacy_table]]
+table = "memory_grant_offer"
+sources = ["crates/eliot-store/src/surql/001_observability.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy observability schema; see observability_receipt"
+
+[[legacy_table]]
+table = "activation_trace"
+sources = ["crates/eliot-store/src/surql/001_observability.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy observability schema; see observability_receipt"
+
+[[legacy_table]]
+table = "prediction_record"
+sources = ["crates/eliot-store/src/surql/001_observability.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy observability schema; see observability_receipt"
+
+[[legacy_table]]
+table = "exam_record"
+sources = ["crates/eliot-store/src/surql/001_observability.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy observability schema; see observability_receipt"
+
+[[legacy_table]]
+table = "cue_index"
+sources = ["crates/eliot-store/src/surql/002_ul_core.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy UL schema; no current-adapter counterpart; deletion blocked until #1189 P1-P5"
+
+[[legacy_table]]
+table = "ul_task_ledger"
+sources = ["crates/eliot-store/src/surql/006_ul_measurement.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy UL schema; see cue_index"
+
+[[legacy_table]]
+table = "ul_dep_reverse_index"
+sources = ["crates/eliot-store/src/surql/007_ul_dependency_activation.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy UL schema; see cue_index"
+
+[[legacy_table]]
+table = "ul_artifact_dirty"
+sources = ["crates/eliot-store/src/surql/007_ul_dependency_activation.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy UL schema; see cue_index"
+
+[[legacy_table]]
+table = "ul_task_experiment"
+sources = ["crates/eliot-store/src/surql/008_ul_token_policy.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy UL schema; see cue_index"
+
+[[legacy_table]]
+table = "ul_ab_counter"
+sources = ["crates/eliot-store/src/surql/008_ul_token_policy.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy UL schema; see cue_index"
+
+[[legacy_table]]
+table = "ul_task_class_policy"
+sources = ["crates/eliot-store/src/surql/008_ul_token_policy.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy UL schema; see cue_index"
+
+[[legacy_table]]
+table = "memory_search_projection"
+sources = ["crates/eliot-store/src/surql/009_memory_search.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy memory-search schema; no current-adapter counterpart; deletion blocked until #1189 P1-P5"
+
+[[legacy_table]]
+table = "memory_search_state"
+sources = ["crates/eliot-store/src/surql/009_memory_search.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy memory-search schema; see memory_search_projection"
+
+[[legacy_table]]
+table = "memory_search_outbox"
+sources = ["crates/eliot-store/src/surql/009_memory_search.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy memory-search schema; see memory_search_projection"
+
+[[legacy_table]]
+table = "cognitive_projection_state"
+sources = ["crates/eliot-store/src/surql/009_memory_search.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy memory-search schema; see memory_search_projection"
+
+[[legacy_table]]
+table = "cognitive_projection_cutover"
+sources = ["crates/eliot-store/src/surql/009_memory_search.surql"]
+disposition = "retire-with-#1189"
+current_counterpart = "none"
+rationale = "legacy memory-search schema; see memory_search_projection"
+
+# Current-adapter tables (the mapping target side; all owned-current).
+
+[[current_table]]
+table = "schema_meta"
+introduced = "1.0.0"
+status = "owned-current"
+
+[[current_table]]
+table = "write_receipt"
+introduced = "1.0.0"
+status = "owned-current"
+
+[[current_table]]
+table = "revision_head"
+introduced = "1.0.0"
+status = "owned-current"
+
+[[current_table]]
+table = "ordering_head"
+introduced = "1.0.0"
+status = "owned-current"
+
+[[current_table]]
+table = "canonical_event"
+introduced = "1.0.0"
+status = "owned-current"
+
+[[current_table]]
+table = "projection_record"
+introduced = "1.0.0"
+status = "owned-current"
+
+[[current_table]]
+table = "relation_record"
+introduced = "1.0.0"
+status = "owned-current"
+
+[[current_table]]
+table = "outbox_event"
+introduced = "1.0.0"
+status = "owned-current"
+
+[[current_table]]
+table = "canonical_fence"
+introduced = "1.0.0"
+status = "owned-current"
+
+[[current_table]]
+table = "recovery_owner"
+introduced = "2.0.0"
+status = "owned-current"
+
+[[current_table]]
+table = "recovery_job"
+introduced = "2.0.0"
+status = "owned-current"
+
+[[current_table]]
+table = "erasure_intent"
+introduced = "unadmitted-3.0.0-delta"
+status = "owned-current-delta-unadmitted"
+
+[[current_table]]
+table = "erasure_outcome"
+introduced = "unadmitted-3.0.0-delta"
+status = "owned-current-delta-unadmitted"
+
+[[current_table]]
+table = "notification_record"
+introduced = "unadmitted"
+status = "owned-current-delta-unadmitted"
+
+[[current_table]]
+table = "reactive_session"
+introduced = "unadmitted"
+status = "owned-current-delta-unadmitted"
+
+[[current_table]]
+table = "resource_snapshot"
+introduced = "unadmitted"
+status = "owned-current-delta-unadmitted"
+
+[[current_table]]
+table = "automation_revision"
+introduced = "unadmitted"
+status = "owned-current-delta-unadmitted"
+
+[[current_table]]
+table = "automation_current"
+introduced = "unadmitted"
+status = "owned-current-delta-unadmitted"
+
+[[current_table]]
+table = "automation_invocation"
+introduced = "unadmitted"
+status = "owned-current-delta-unadmitted"
+
+[[current_table]]
+table = "automation_failure"
+introduced = "unadmitted"
+status = "owned-current-delta-unadmitted"
+
+[[current_table]]
+table = "automation_last_failure"
+introduced = "unadmitted"
+status = "owned-current-delta-unadmitted"
+
+[[current_table]]
+table = "experience_bank"
+introduced = "unadmitted"
+status = "owned-current-delta-unadmitted"
+
+[[current_table]]
+table = "experience_feedback"
+introduced = "unadmitted"
+status = "owned-current-delta-unadmitted"
+
+# Per-file bodies follow (generated from source digests).
+[[surql_file]]  # root orphan fixture (retired by #1258, S2)
+path = "migrations/0001_bootstrap.surql.retired"
+sha256 = "74b455e1579d781de7475a434468a336243ee7806b71c42c0f0c6476e178608b"
+owner = "none-retired"
+consumer = "none; explicit non-executable fixture, expires 2026-12-12 or when waves B/C/D close"
+disposition = "fixture-not-executable"
+generation = "none"
+kind = "orphan-fixture"
+
+[[surql_file]]  # legacy migration entry (retirement owner #1189)
+path = "crates/eliot-store/migrations/000_schema.surql"
+sha256 = "1cb85dec051121978d3303bb62f0caac254112a1b2367e21a156b0b76178b88c"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy MigrationRunner/config migrations_dir (removed only by #1189/#1219)"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+kind = "legacy-migration-entry"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/000_schema.surql"
+sha256 = "1395c5519412686fecd061768181e1a3524618538e219a62f3ee1acef06bf163"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! migration entry (SchemaMigrate*)"
+kind = "legacy-migration-entry"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/001_observability.surql"
+sha256 = "3e08a96fc4410716afddf7f6c30697ea01c53ee2043a272c1c80282fe5fba5c0"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! migration entry (SchemaMigrate*)"
+kind = "legacy-migration-entry"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/002_ul_core.surql"
+sha256 = "93103f762ea33f26d4bb82169109678cfee6677d80938c48e057aa8ab4d69456"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! migration entry (SchemaMigrate*)"
+kind = "legacy-migration-entry"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/003_ul_delivery.surql"
+sha256 = "9eeec5feb49a46d1e5ff85e27ebc7cd0f2eab9fd9c638427b895461f447948a6"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! migration entry (SchemaMigrate*)"
+kind = "legacy-migration-entry"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/004_ul_artifacts.surql"
+sha256 = "ce2983d3931095cc8c240d09b44920394c51bffc21f7493a2b1e0b9d12d26e45"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! migration entry (SchemaMigrate*)"
+kind = "legacy-migration-entry"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/005_ul_pyramid.surql"
+sha256 = "76385caf9856234f8d168a07daf063bd2aeedd2a25b84e93c757f8cd7ce1e59f"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! migration entry (SchemaMigrate*)"
+kind = "legacy-migration-entry"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/006_ul_measurement.surql"
+sha256 = "046e7a3a02c84e2dcfbce811d9043fcb9779fab7a1191e409237274b1eae019f"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! migration entry (SchemaMigrate*)"
+kind = "legacy-migration-entry"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/007_ul_dependency_activation.surql"
+sha256 = "e63853410bf7a883f2e39bac817afbe70c34ed08794183fe91303a8144681b25"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! migration entry (SchemaMigrate*)"
+kind = "legacy-migration-entry"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/008_ul_token_policy.surql"
+sha256 = "582911d4f5484f50bb3a717f1b4b0edf61ec2459dc3c1f53050be1dce7db1b20"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! migration entry (SchemaMigrate*)"
+kind = "legacy-migration-entry"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/009_memory_search.surql"
+sha256 = "cea6fcf36026cae5df3ae36401675b5100f6e253c40ce9c805e293e3a0120c9b"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! migration entry (SchemaMigrate*)"
+kind = "legacy-migration-entry"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/010_memory_search_fts.surql"
+sha256 = "0d28b0032f862f5fae2dd6f071bf4cca4979f012a1f3fadd4380c96b8857046d"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! migration entry (SchemaMigrate*)"
+kind = "legacy-migration-entry"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/apply_observability.surql"
+sha256 = "70186508a2fe25e6659dcb72a9f85388d2c7c9d483999e3b5faec1b484a8160a"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/apply_write_envelope.surql"
+sha256 = "562bfbe70e43184d94f17a2b3b6df5bae606a9d9759764f2c1c695e061f623ba"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/assign_ul_experiment_arm.surql"
+sha256 = "bf19cdd11c3ddcca6dc177e9ade7436e0a185898c7c585375ee6fb585fe6059e"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/blob_reference_scan.surql"
+sha256 = "abfc74fe44962de6c6381f4a22020813b6ad26883b9384e66c0183fee44ad788"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/block_cognitive_projection.surql"
+sha256 = "86feec561619107dd6c229d9ffa08a795aeb455961e14c310a368514fcbe6a6a"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/canonical_record_by_write_id.surql"
+sha256 = "e738d11bc910facd2a56266ded62f9c8d164b073091177df8204769f630a8548"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/canonical_record_page.surql"
+sha256 = "35b44a8f480bc5be4cd7a2b6feba64113b8f7581d67660506749a77dd8b1ad0b"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/canonical_records.surql"
+sha256 = "d4fc9a5c2008cc67b2546fa121349ec3aedbb8abbc970fe117c08226ee0f2e9a"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/canonical_records_by_subject_ref.surql"
+sha256 = "ff41feff52d7967e11758a998ccf0dca663d9933f7a3666af85b003252b9f037"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/canonical_trace_by_trace_ref.surql"
+sha256 = "fb54e79c64bbf19a3dd94fe7186ff16cecf7f84ac9b7f88198a05419e736a372"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/claim_card_by_id.surql"
+sha256 = "5ddf4425b5013f1a0968898241aac0e4ee97071728cfb030988a60e920a4dfa1"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/claim_cognitive_projection_project.surql"
+sha256 = "1eead51f5bbed875455e8f9158a58ace60f7c0c809bb09871e56652c57277009"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/clear_ul_artifact_dirty.surql"
+sha256 = "68250446f227b060c92e6d90c1bcc437755403cd0f597cd9830868a5eef6f6c5"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/compile_packet_l3.surql"
+sha256 = "18b9b909b03ae580bfb6e312557261a947681fad198a4edd1f66af7623065bd6"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/complete_cognitive_projection_through.surql"
+sha256 = "0b6f0c313ae18da3620d4fe09e3ad9302bde69823849f8f5b78525f2c9475847"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/curation_record_page.surql"
+sha256 = "cfa4a53c3af1d2a389789a87fbfefdba7dff924506f231b21b41567a6bb027cb"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/current_state.surql"
+sha256 = "a380050b7a6a88a73f62b91c34e8cb7264e5d9906f06b7eac28df0929302529d"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/cutover_legacy_memory_search_postings.surql"
+sha256 = "ce1d6c1e5f13a0ca370c5be56566e2521c3b2cc940d0a392619cd39cddbf00e4"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/delete_cues_for_record.surql"
+sha256 = "e76728f824c2d2b7ce26a18bc547fa27c539057b3f7a43d75ae8e7498daecc87"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/enqueue_cognitive_projection_intent.surql"
+sha256 = "83fcbfc3c0ab0f3c3e572b127ff0d46c01f8a9a05e9d3191b80244d79fb2a653"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/experience_pattern_revisions_by_id.surql"
+sha256 = "d8b062c4c4ef76e78334ce6c7a855b384af1fed851619a5ccc67908747e58d8f"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/explain_memory_search_fts.surql"
+sha256 = "1cccea477d54b15ddcbad39c974a37e9bfadd0ecda49ce6564a3c1daddc5e7e6"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/fail_cognitive_projection_retryable.surql"
+sha256 = "578c9f99a2c98adf98441f2a2df69c55817409c55d74cc366467e5f084b2b378"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/fetch_atoms_l2.surql"
+sha256 = "fd431d9ada16d5b0752774bcad572e319fe9d0dd24cabcc392a61700441b2bb3"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/fetch_atoms_l2_legacy.surql"
+sha256 = "12346d15b04c24f37434f28f8d9905c0898f15ddbbb26a915ea565d9d9cf8210"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/graph_health.surql"
+sha256 = "48545604fb15ab3a2b61349a85dbf3833c6721665c1b5cd3d98238150ba91efb"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/graph_health_capabilities.surql"
+sha256 = "2e6ff9c42ade0784f2135ba30666c4939a7ba62a09487f7d62e818e2833394e9"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/latest_authority_observations_by_entity.surql"
+sha256 = "ef750a0b4c23f136691cec0eb5e65617a65f1a6b830c61b959c30ec6a10e5728"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_canonical_memory_admission_children.surql"
+sha256 = "94060e316874cfbb5a5ce210c0a8a28ae2a364a0c09caa6928cbe916ec147508"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_canonical_memory_l2.surql"
+sha256 = "6651f390614865fcb55e7d0f561aa2dbd296749275f7632921adf0b921ae76d3"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_canonical_memory_projection_segments.surql"
+sha256 = "929c27939c8bd2424df641b3d7e03dce2c01ce143e8747579b795d7458547410"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_cognitive_projection_backlog.surql"
+sha256 = "c52a7b561d1925043f96e7e79b7fefe205f1bf30d7a0c6397c90e1a0bf9dca61"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_cognitive_projection_family_states.surql"
+sha256 = "1fbb07f08f007e3bacfb3b0545393f5b9194f10758269dbdd29f22c9876f8872"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_cognitive_projection_projects.surql"
+sha256 = "a114ac4809b6875790916c0887c978b7acc73a354ae504665b015e93f85f1801"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_cue_records.surql"
+sha256 = "60b14e8136097d229a038150822456df56935d58137bfcd0d4cafac86b9f077c"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_cue_rows.surql"
+sha256 = "77c2323c7a9f24edde94127024f0d00dddba8a55099bcac62d7f5051b005f297"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_injection_receipts.surql"
+sha256 = "3c2a8a76edfc42ad85b8e1dcfdc4e6e583eda1f3a5b0aae417103a6181efc681"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_memory_search_fts_candidates.surql"
+sha256 = "4562928017ca309b988c94daaf1cafe74552c93c903e05056e9d9af04e05d992"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_predictions.surql"
+sha256 = "f8817078c4db5d078c1993b8e8dcde08adb8bf404a73019c90e97004fd9e1890"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_recall_candidates.surql"
+sha256 = "28cdcec0f4f5f17e144ea5054d156eabbf1406f7950b04f32dee8e978c3e1105"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_ul_activation_graph.surql"
+sha256 = "bd71711749fe1bb3738b155b4f9ce2c5afc1dc99da38be3324db5d0362e4c1b8"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_ul_artifact_dirty.surql"
+sha256 = "a332c203451bf18677864e4db93d8e52a79d0da1c672eed63c63cd2654430cd7"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_ul_artifacts.surql"
+sha256 = "5d12d43c02433a1a3ab49934632e96cdc176aaf3110499a51ca4c6cf309bbb80"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_ul_experiment_assignment.surql"
+sha256 = "bf124acf8072d83f8087d2581273f96a0cdff51fda6e23ac0cc868202e4122a9"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_ul_metrics.surql"
+sha256 = "7cec4fce90b1b132f513b778d1e416217d68b1906aabd481d22bad26a20d7abb"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_ul_readiness.surql"
+sha256 = "59b9340f2e59f711a42b1db5d2eb4f632e8fd5ebdcf371b62c738dd668e5388f"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_ul_reverse_dependents.surql"
+sha256 = "bb42cc12c5c43d3cac589629bd42fc25bf30f6ac3c22a1d0cc8c0ea715c6be7e"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_ul_task_class_ledgers.surql"
+sha256 = "eb4f12415ad39496562b9346167e2880d598cd5b72e18fbd068dfa4c6dd3d8e6"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/load_ul_task_class_policy.surql"
+sha256 = "c1187ff13741844afc4167b577b8fefb94760185f73458603bfc5463bd1c43de"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/memory_grant_offer_by_id.surql"
+sha256 = "613351f0fbfdae9e8d344263c327b2308643fceaa040c7d40020829f2c526d81"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/meta_policy_actions_by_candidate.surql"
+sha256 = "752573ea8dffad90a395620cc1dcdb4c820a3aa6cc4297f9509f4162f660ed05"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/observability_receipt_by_id.surql"
+sha256 = "90cdca8c5c937f95978f39c717b4780c8cf7bda0cb5d6e098351922cc3908d47"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/observability_records_by_kind.surql"
+sha256 = "83f6509d676159f192a78a7c2078cf52a470ac0a02ef940f122a7285ac02356d"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/publish_cognitive_projection_family_state.surql"
+sha256 = "199180555f9a30e0c032113d1de0b4ef95739493aa45776985a4e7258cc2cc20"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/replace_ul_reverse_dependencies.surql"
+sha256 = "8ce000149193b3f051893687880642dadbaa2bb9138d2e4a60376bab28ac777f"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/reset_memory_search_projection.surql"
+sha256 = "684261f6c1acd0ce5d7d028fb9a02ab47f99b9cc4391fe68a539abbc067cda15"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/reset_ul_artifact_dirty_project.surql"
+sha256 = "bac5ac4b8e0ef899748e45e2a671f3d4aac7026859081fde0c0af9707b7a71a4"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/reset_ul_reverse_dependency_project.surql"
+sha256 = "c479ea113d76c3c7bbdac692a5210c4862e017a688c06f2b3fb8fea5e7b47028"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/semantic_records_by_kind.surql"
+sha256 = "c2008f2f16544d1daa44f47976b955b8afd3199249120c4608fc97f8674fda83"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/sleep_candidates.surql"
+sha256 = "1a763b1c910139378ab748240a221dee502d218d1bc4e8cdd9c8dd3b617f2d0f"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/task_contract_by_id.surql"
+sha256 = "2f0701354a08b890c220cb0d921d0a4b8706a6cb59f4402c9f375392b592982c"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/tool_observation_by_id.surql"
+sha256 = "9bbc43a13bef683d9ac62d61ad74b47ee18957208d911011359ec81c8ad13427"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/tool_observation_by_write_id.surql"
+sha256 = "328807831b142550a72d17195d900879424b68758ba39e690754babcaee7775e"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/tool_observations_by_kind.surql"
+sha256 = "83e23cc7a7f0683eed022f191727026fcb189eb4c53c4c707c60cb390a7cd339"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/upsert_cue_rows.surql"
+sha256 = "f66c2197beff33514c400686fa2717db2848bff31ee983d018af623621d10189"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/upsert_memory_search_projection.surql"
+sha256 = "d5f654008902af10f2928cab78d77d7c5a0d0bdbcd4bfd23c95eaabcc55fafd4"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/upsert_ul_artifact_dirty.surql"
+sha256 = "f6ab87a3b6e22ceecf0016755a2b4012b49a7ba9fa4f6ab2d77d05beffcddc1e"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/upsert_ul_experiment_assignment_explicit.surql"
+sha256 = "2b5dfab20e5d7ffab5ef4eca68a44a964222e1eda0a06ab1cc12bcaf075018d8"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/upsert_ul_task_class_policy.surql"
+sha256 = "0297e640fde325e6ccc55282f13262c47b88c411acc086f2b29edee1142232c7"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/upsert_ul_task_ledger.surql"
+sha256 = "14e9b1149d9f564d6ed6396dc5fb40464aafa74aa3383e3edd27fa8fd49d4ddd"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/verification_run_by_id.surql"
+sha256 = "7c6e72854913e839171ff8a4c9259a5febb128ec537d9fd683ee3aaa7683c630"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/write_receipt_by_id.surql"
+sha256 = "fbafd1a7cbf97b072434bace143b88ea5e2764a5be867d172be984c3eba0bc3e"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"
+
+[[surql_file]]
+path = "crates/eliot-store/src/surql/writer_receipts.surql"
+sha256 = "17b0845e2fe31f784beb3707e3ff91f4b917c89fb91120e028f2da37ca20a954"
+owner = "crates/eliot-store (retirement owner #1189)"
+consumer = "legacy NamedSurqlOp::template() include_str! named-operation template"
+kind = "legacy-operation-template"
+disposition = "legacy-non-executable-by-current-graph"
+generation = "legacy-pre-split"

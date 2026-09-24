@@ -91,35 +91,34 @@ use schema_contract::SchemaMigrationIdentity;
 use schema_contract::schema_meta_record;
 use schema_contract::{
     FenceRecord, MigrationPreflight, SchemaMetaRecord, schema_meta_record_for_v1_to_v2,
-    v1_identity, validate_fence_record, validate_schema_meta_record, validate_v1_pin,
+    validate_fence_record, validate_schema_meta_record,
 };
 
+/// Admits exactly the nodes of the single closed migration graph (issue
+/// #1221). Membership requires the graph node to exist for the plan identity
+/// plus an exact match on statements digest pin, target generation and
+/// statement bytes, so changed same-ID bytes, an unknown identity or drifted
+/// graph consts fail before any provider work.
 fn is_admitted_migration(migration: &CompiledMigration) -> bool {
-    if !validate_v1_pin() {
+    if !schema::validate_graph_pins() {
         return false;
     }
-    if migration.migration_id == schema::MIGRATION_ID_V1
-        && migration.checksum_sha256 == schema::SCHEMA_DDL_V1_SHA256
-        && migration.generation_after.as_str() == schema::GENERATION_V1
-        && migration.statements.trim() == schema::SCHEMA_DDL.trim()
+    let Some(node) = schema::graph_node(&migration.migration_id) else {
+        return false;
+    };
+    if migration.checksum_sha256 != node.statements_sha256
+        || migration.generation_after.as_str() != node.generation_after
     {
-        return true;
+        return false;
     }
-    let v2_full = eliot_store_api::sha256_hex(schema::SCHEMA_DDL_V2.as_bytes());
-    if migration.migration_id == schema::MIGRATION_ID_V2
-        && migration.checksum_sha256 == v2_full
-        && migration.generation_after.as_str() == schema::GENERATION_V2
-        && migration.statements.trim() == schema::SCHEMA_DDL_V2.trim()
-    {
-        return true;
+    if migration.migration_id == schema::MIGRATION_ID_V1 {
+        return migration.statements.trim() == schema::SCHEMA_DDL.trim();
     }
-    let v2_delta = eliot_store_api::sha256_hex(schema::SCHEMA_MIGRATION_V1_TO_V2_DDL.as_bytes());
-    if migration.migration_id == schema::MIGRATION_ID_V1_TO_V2
-        && migration.checksum_sha256 == v2_delta
-        && migration.generation_after.as_str() == schema::GENERATION_V2
-        && migration.statements.trim() == schema::SCHEMA_MIGRATION_V1_TO_V2_DDL.trim()
-    {
-        return true;
+    if migration.migration_id == schema::MIGRATION_ID_V2 {
+        return migration.statements.trim() == schema::SCHEMA_DDL_V2.trim();
+    }
+    if migration.migration_id == schema::MIGRATION_ID_V1_TO_V2 {
+        return migration.statements.trim() == schema::SCHEMA_MIGRATION_V1_TO_V2_DDL.trim();
     }
     false
 }
@@ -231,8 +230,18 @@ fn migration_preflight(
         && migration.migration_id == schema::MIGRATION_ID_V1_TO_V2
         && migration.generation_after.as_str() == schema::GENERATION_V2
     {
-        let expected = v1_identity();
-        if record.migration_checksum_sha256 != expected.migration_checksum_sha256 {
+        // The required predecessor triple comes from the single closed-graph
+        // authority (issue #1221), not a second local copy: a recorded v1
+        // generation with different bytes fails before any DDL executes.
+        let Some(node) = schema::graph_node(schema::MIGRATION_ID_V1_TO_V2) else {
+            return Err(AdapterError::Config(
+                "schema migration graph is missing the admitted forward node".to_owned(),
+            ));
+        };
+        if record.migration_checksum_sha256 != node.predecessor_checksum_sha256.unwrap_or_default()
+            || record.migration_id != node.predecessor_migration_id.unwrap_or_default()
+            || record.generation != node.predecessor_generation.unwrap_or_default()
+        {
             return Err(AdapterError::PartialOutcome);
         }
         return Ok(MigrationPreflight::V1ToV2);
@@ -242,11 +251,27 @@ fn migration_preflight(
     ))
 }
 
+/// Builds the durable receipt for an admitted migration, binding the plan
+/// identity to the exact predecessor triple and bridge range from the closed
+/// graph node (issue #1221). Called only after admission or an exact-replay
+/// preflight, so the node always exists; the fallback keeps construction
+/// total without inventing a predecessor.
 fn migration_receipt(migration: &CompiledMigration) -> MigrationReceipt {
+    let node = schema::graph_node(&migration.migration_id);
     MigrationReceipt {
         migration_id: migration.migration_id.clone(),
         checksum_sha256: migration.checksum_sha256.clone(),
         generation_after: migration.generation_after.clone(),
+        predecessor_migration_id: node
+            .and_then(|node| node.predecessor_migration_id)
+            .map(str::to_owned),
+        predecessor_checksum_sha256: node
+            .and_then(|node| node.predecessor_checksum_sha256)
+            .map(str::to_owned),
+        bridge_range: node.map_or_else(
+            || crate::ADAPTER_NAME.to_owned(),
+            |node| node.bridge_range.to_owned(),
+        ),
     }
 }
 

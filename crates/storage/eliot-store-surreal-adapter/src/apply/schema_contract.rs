@@ -52,10 +52,6 @@ pub(super) fn v1_identity() -> SchemaMigrationIdentity {
     }
 }
 
-pub(super) fn validate_v1_pin() -> bool {
-    eliot_store_api::sha256_hex(schema::SCHEMA_DDL.as_bytes()) == schema::SCHEMA_DDL_V1_SHA256
-}
-
 pub(super) fn schema_meta_record(
     migration: &CompiledMigration,
     updated_at: &str,
@@ -170,17 +166,18 @@ pub(super) fn validate_schema_meta_record(record: &SchemaMetaRecord) -> Result<(
         {
             return Err(AdapterError::PartialOutcome);
         }
-        let v2_checksum_full = eliot_store_api::sha256_hex(schema::SCHEMA_DDL_V2.as_bytes());
-        let v2_checksum_delta =
-            eliot_store_api::sha256_hex(schema::SCHEMA_MIGRATION_V1_TO_V2_DDL.as_bytes());
         let last = &record.migrations[1];
         if last.generation != schema::GENERATION_V2 {
             return Err(AdapterError::PartialOutcome);
         }
+        // Checksums come from the pinned closed-graph consts (issue #1221):
+        // admission already recomputed them from source via
+        // `validate_graph_pins`, so metadata validation compares against the
+        // same single authority instead of a second runtime computation.
         if !(last.migration_id == schema::MIGRATION_ID_V2
-            && last.migration_checksum_sha256 == v2_checksum_full
+            && last.migration_checksum_sha256 == schema::SCHEMA_DDL_V2_SHA256
             || last.migration_id == schema::MIGRATION_ID_V1_TO_V2
-                && last.migration_checksum_sha256 == v2_checksum_delta)
+                && last.migration_checksum_sha256 == schema::SCHEMA_MIGRATION_V1_TO_V2_DDL_SHA256)
         {
             return Err(AdapterError::PartialOutcome);
         }

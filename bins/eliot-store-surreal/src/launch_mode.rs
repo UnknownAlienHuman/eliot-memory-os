@@ -79,6 +79,9 @@ pub(super) async fn prepare_launch(mode: LaunchMode) -> Result<Option<StoreLaunc
                     "migration_id": receipt.migration_id,
                     "checksum_sha256": receipt.checksum_sha256,
                     "generation_after": receipt.generation_after.as_str(),
+                    "predecessor_migration_id": receipt.predecessor_migration_id,
+                    "predecessor_checksum_sha256": receipt.predecessor_checksum_sha256,
+                    "bridge_range": receipt.bridge_range,
                 });
                 println!(
                     "{}",

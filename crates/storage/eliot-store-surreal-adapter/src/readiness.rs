@@ -88,11 +88,25 @@ impl CompiledMigration {
 }
 
 /// Durable outcome of one applied migration.
+///
+/// Beyond the plan identity the receipt binds the exact predecessor triple the
+/// node was admitted against and the compatible bridge range (issue #1221):
+/// a receipt names which generation it came from, not only which one it
+/// reached, so rehearsal, cutover and restore can prove an unbroken ordered
+/// chain instead of trusting a lone target generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MigrationReceipt {
     pub migration_id: String,
     pub checksum_sha256: String,
     pub generation_after: SchemaGeneration,
+    /// Predecessor migration identity the node was admitted against;
+    /// `None` only on the chain-root baseline.
+    pub predecessor_migration_id: Option<String>,
+    /// Predecessor statements digest the node was admitted against;
+    /// `None` only on the chain-root baseline.
+    pub predecessor_checksum_sha256: Option<String>,
+    /// Bridge identity the applied node is compatible with.
+    pub bridge_range: String,
 }
 
 #[cfg(test)]

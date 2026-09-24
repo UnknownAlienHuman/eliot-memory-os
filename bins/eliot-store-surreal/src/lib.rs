@@ -50,6 +50,8 @@ use eliot_store_api::{
     StoreMutationDisposition, StoreRecoveryAction, StoreRetryDirective,
 };
 #[cfg(test)]
+use eliot_store_surreal_adapter::ADAPTER_NAME;
+#[cfg(test)]
 use eliot_store_surreal_adapter::SchemaGeneration;
 use eliot_store_surreal_adapter::{
     AdapterError, MigrationReceipt, SemanticReadiness, SurrealStoreAdapter,
@@ -1785,6 +1787,11 @@ mod tests {
             migration_id: migration.migration_id().to_owned(),
             checksum_sha256: migration.checksum_sha256().to_owned(),
             generation_after: migration.generation_after().clone(),
+            // Test config pins generation 1.0.0, whose chain-root baseline
+            // carries no predecessor; the bridge is the sole current adapter.
+            predecessor_migration_id: None,
+            predecessor_checksum_sha256: None,
+            bridge_range: ADAPTER_NAME.to_owned(),
         };
         let receipt = binding
             .receipt(&provider_receipt)

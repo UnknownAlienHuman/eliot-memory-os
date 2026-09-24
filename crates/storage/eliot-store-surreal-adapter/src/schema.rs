@@ -101,6 +101,107 @@ pub(crate) const MIGRATION_ID_V2_TO_V3: &str = "eliot.store.surreal.schema.v2_to
 pub(crate) const GENERATION_V3: &str = "3.0.0";
 pub(crate) const SCHEMA_DDL_V1_SHA256: &str =
     "783d3207ab39fc0471e32f893302eedd579ae4980ee95f9f883f92a5f7ba705b";
+/// Pinned SHA-256 of the exact [`SCHEMA_DDL_V2`] bytes below (issue #1221).
+/// Admission compares the plan digest against this pin; [`validate_graph_pins`]
+/// recomputes it from the const so a source edit fails closed instead of
+/// silently admitting drifted bytes.
+pub(crate) const SCHEMA_DDL_V2_SHA256: &str =
+    "c89ec0d979a9d5f2979cb19fcb3dc199f3be4f82ba356a4f84964c9519a7f42c";
+/// Pinned SHA-256 of the exact additive v1-to-v2 delta bytes
+/// ([`SCHEMA_MIGRATION_V1_TO_V2_DDL`], which aliases [`RECOVERY_TABLES_DDL`]).
+pub(crate) const SCHEMA_MIGRATION_V1_TO_V2_DDL_SHA256: &str =
+    "0d4be3081a7cc1ebc3b2beefd62b49952648b96e66f7b840dd566cae1d7afb3b";
+
+/// Direction of one closed-graph migration node (issue #1221).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MigrationDirection {
+    /// Full baseline applied to an empty database; no predecessor row exists.
+    Baseline,
+    /// Additive delta applied on top of the declared predecessor generation.
+    Forward,
+}
+
+/// One node of the single current Store schema-migration graph (issue #1221).
+///
+/// The adapter admits exactly the nodes of [`MIGRATION_GRAPH`], in order.
+/// Every node binds the migration identity to its predecessor triple, the
+/// target generation, the exact statements digest and the compatible bridge
+/// range, so a wrong predecessor, changed same-ID bytes or an incompatible
+/// bridge fail before any DDL executes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MigrationGraphNode {
+    /// Stable migration identity; the only executable plan names.
+    pub(crate) migration_id: &'static str,
+    /// Required predecessor migration identity (`None` on the chain root).
+    pub(crate) predecessor_migration_id: Option<&'static str>,
+    /// Required predecessor statements digest (`None` on the chain root).
+    pub(crate) predecessor_checksum_sha256: Option<&'static str>,
+    /// Required predecessor generation (`None` on the chain root).
+    pub(crate) predecessor_generation: Option<&'static str>,
+    /// Schema generation the database is at after this node.
+    pub(crate) generation_after: &'static str,
+    /// SHA-256 of the exact statements bytes admitted for this node.
+    pub(crate) statements_sha256: &'static str,
+    /// Bridge identity this node is compatible with (always [`crate::ADAPTER_NAME`]).
+    pub(crate) bridge_range: &'static str,
+    /// Whether the node is an empty-database baseline or a forward delta.
+    pub(crate) direction: MigrationDirection,
+}
+
+/// The single current Store schema-migration graph, in execution order
+/// (issue #1221, causal property). No other migration identity is executable:
+/// root (`migrations/0001_bootstrap.surql.retired`) and legacy
+/// (`crates/eliot-store/migrations`, `crates/eliot-store/src/surql`) roots are
+/// non-executable fixtures inventoried in `migration-inventory.toml`.
+pub(crate) const MIGRATION_GRAPH: &[MigrationGraphNode] = &[
+    MigrationGraphNode {
+        migration_id: MIGRATION_ID_V1,
+        predecessor_migration_id: None,
+        predecessor_checksum_sha256: None,
+        predecessor_generation: None,
+        generation_after: GENERATION_V1,
+        statements_sha256: SCHEMA_DDL_V1_SHA256,
+        bridge_range: crate::ADAPTER_NAME,
+        direction: MigrationDirection::Baseline,
+    },
+    MigrationGraphNode {
+        migration_id: MIGRATION_ID_V2,
+        predecessor_migration_id: Some(MIGRATION_ID_V1),
+        predecessor_checksum_sha256: Some(SCHEMA_DDL_V1_SHA256),
+        predecessor_generation: Some(GENERATION_V1),
+        generation_after: GENERATION_V2,
+        statements_sha256: SCHEMA_DDL_V2_SHA256,
+        bridge_range: crate::ADAPTER_NAME,
+        direction: MigrationDirection::Baseline,
+    },
+    MigrationGraphNode {
+        migration_id: MIGRATION_ID_V1_TO_V2,
+        predecessor_migration_id: Some(MIGRATION_ID_V1),
+        predecessor_checksum_sha256: Some(SCHEMA_DDL_V1_SHA256),
+        predecessor_generation: Some(GENERATION_V1),
+        generation_after: GENERATION_V2,
+        statements_sha256: SCHEMA_MIGRATION_V1_TO_V2_DDL_SHA256,
+        bridge_range: crate::ADAPTER_NAME,
+        direction: MigrationDirection::Forward,
+    },
+];
+
+/// Looks up one closed-graph node by migration identity.
+pub(crate) fn graph_node(migration_id: &str) -> Option<&'static MigrationGraphNode> {
+    MIGRATION_GRAPH
+        .iter()
+        .find(|node| node.migration_id == migration_id)
+}
+
+/// Recomputes every graph body digest from the embedded consts and compares
+/// against the pins. A source edit to any admitted DDL body fails closed here,
+/// before admission, instead of silently changing the executable graph.
+pub(crate) fn validate_graph_pins() -> bool {
+    eliot_store_api::sha256_hex(SCHEMA_DDL.as_bytes()) == SCHEMA_DDL_V1_SHA256
+        && eliot_store_api::sha256_hex(SCHEMA_DDL_V2.as_bytes()) == SCHEMA_DDL_V2_SHA256
+        && eliot_store_api::sha256_hex(SCHEMA_MIGRATION_V1_TO_V2_DDL.as_bytes())
+            == SCHEMA_MIGRATION_V1_TO_V2_DDL_SHA256
+}
 
 /// First-generation schema DDL for the canonical control tables. This is
 /// applied only through an explicit migration; it is never executed implicitly
