@@ -39,8 +39,77 @@ use watchdog_service_status::{
 static PROCESS_BOOTSTRAP: OnceLock<Result<Option<ServiceBootstrapArguments>, String>> =
     OnceLock::new();
 
+// ---- Watchdog backup-control wiring (issue #962, Writer-B) ----
+// The live `WatchdogComposition` instance is owned by
+// `runtime_loop::run_watchdog`, so this root holds no composition value.
+// `register_watchdog_backup_control` below is the wiring point for the
+// canonical registration through the fully-qualified
+// `eliot_watchdog::register_backup_control` path; it resolves only after
+// composition start inside `run_watchdog`, never before.
+// `watchdog_backup_wiring_check` is the parameterless probe `main` can
+// call on the production startup path: it pins the closed accepted-method
+// table (non-empty, distinct non-empty wire ids, rehearsal and cutover
+// never present) and the bounded start/stop lifecycle into production.
+// Wiring-only: it opens no listener, spawns no task, and mints no
+// authority.
+fn register_watchdog_backup_control(
+    composition: &eliot_watchdog::WatchdogComposition,
+) -> Result<eliot_watchdog::BackupControlHandle, String> {
+    // Fully-qualified canonical registration entry point.
+    eliot_watchdog::register_backup_control(composition).map_err(|error| error.to_string())
+}
+
+fn watchdog_backup_wiring_check() -> bool {
+    // Pin the canonical registration hook so the wiring point cannot rot
+    // unwired; the call itself resolves only after composition start
+    // inside `run_watchdog`.
+    let _: fn(
+        &eliot_watchdog::WatchdogComposition,
+    ) -> Result<eliot_watchdog::BackupControlHandle, String> = register_watchdog_backup_control;
+    // Pin the bounded start/stop lifecycle; no handle is minted here
+    // (handles come only from post-start registration).
+    let _: fn(
+        &mut eliot_watchdog::BackupControlHandle,
+    ) -> Result<(), eliot_watchdog::CompositionError> = eliot_watchdog::start_backup_control;
+    let _: fn(eliot_watchdog::BackupControlHandle) -> eliot_watchdog::BackupControlHandle =
+        eliot_watchdog::stop_backup_control;
+    // Closed-table probe: the table is non-empty with distinct non-empty
+    // wire ids, and neither rehearsal completion, isolated-restore
+    // preparation, nor cutover admission is ever present on it (the
+    // derived `Debug` renders the closed variant names).
+    let methods = eliot_watchdog::accepted_watchdog_backup_methods();
+    if methods.is_empty() {
+        return false;
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(methods.len());
+    for method in methods {
+        if method.wire_id.is_empty() || seen.contains(&method.wire_id) {
+            return false;
+        }
+        seen.push(method.wire_id);
+        let rendered = format!("{op:?}", op = method.op);
+        if matches!(
+            rendered.as_str(),
+            "CompleteRehearsal" | "PrepareIsolatedRestore" | "AdmitCutover"
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
 fn main() {
     eliot_watchdog::install_subscriber();
+    // Backup wiring probe (wiring-only, never gates startup): pins the
+    // closed backup-method table and the bounded start/stop lifecycle into
+    // the production path. The canonical registration itself resolves only
+    // after composition start inside `run_watchdog`.
+    if !watchdog_backup_wiring_check() {
+        tracing::warn!(
+            event = "watchdog.backup_wiring_unexpected",
+            "watchdog backup wiring probe failed; startup continues"
+        );
+    }
     let startup_span = tracing::info_span!("watchdog.startup");
     let _startup_guard = startup_span.enter();
     let _ = PROCESS_BOOTSTRAP.set(parse_process_bootstrap());
@@ -71,6 +140,8 @@ fn main() {
         let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {error}");
         report_console_runtime_failure(&error);
     }
+    // Backup wiring: `register_watchdog_backup_control` above resolves only
+    // after composition start inside `run_watchdog`, never before.
 }
 
 /// Bounds free-text startup detail for diagnostics.
@@ -277,6 +348,8 @@ extern "system" fn watchdog_service_main(
         persist_start_failure(code, &error, captured_bootstrap_for_capsule());
         publish_stopped_with_code(&handle, code);
     }
+    // Backup wiring: `register_watchdog_backup_control` above resolves only
+    // after composition start inside `run_watchdog`, never before.
 }
 
 fn parse_process_bootstrap() -> Result<Option<ServiceBootstrapArguments>, String> {

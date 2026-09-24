@@ -317,6 +317,9 @@ impl WatchdogComposition {
             observation = "admitted",
             "watchdog supervision running until shutdown"
         );
+        // Backup control holds no supervised task: bounded cleanup needs no
+        // join here and supervision priority is preserved.
+        crate::backup_control::on_composition_shutdown();
         let WatchdogComposition {
             runtime,
             admission,
@@ -353,8 +356,26 @@ impl WatchdogComposition {
         }
     }
 
+    /// Registers wiring-only Watchdog backup control against this composition.
+    ///
+    /// Delegates to [`crate::backup_control::register_backup_control`]. Backup
+    /// control holds no supervision task: it cannot stall supervision or
+    /// exhaust the Control Reserve.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the composition identity is unexpected.
+    pub fn register_backup_control(
+        &self,
+    ) -> Result<crate::backup_control::BackupControlHandle, CompositionError> {
+        crate::backup_control::register_backup_control(self)
+    }
+
     /// Requests bounded shutdown from an SCM control path.
     pub fn request_shutdown(&self) {
+        // Backup control holds no task to join: shutdown stays bounded and
+        // supervision teardown never waits on backup wiring.
+        crate::backup_control::on_composition_shutdown();
         self.shutdown_requested.store(true, Ordering::Release);
     }
 }
