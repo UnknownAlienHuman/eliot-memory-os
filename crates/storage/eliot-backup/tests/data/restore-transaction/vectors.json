@@ -1,0 +1,28 @@
+{
+  "_comment": "949/restore-transaction frozen expectation vectors. Phase call names use the fake-target vocabulary (prepare/purge/blob/event/receipt/projection/ors/rebuild/verify/finalize). Proof levels use the RestoreEvidenceLevel wire names.",
+  "full_class_phase_calls": [
+    "prepare",
+    "purge",
+    "blob",
+    "blob",
+    "event",
+    "receipt",
+    "projection",
+    "ors",
+    "rebuild",
+    "verify",
+    "finalize"
+  ],
+  "proof_levels": {
+    "full_recovery": "reconciliation_required",
+    "canonical_only_degraded": "isolated_import_complete",
+    "scope_export": "isolated_import_complete"
+  },
+  "journal_truth": {
+    "unknown_reconcile_after_intent": "rollback_required_no_new_operation",
+    "not_applied_reconcile_after_intent": "exact_single_apply_then_continue",
+    "applied_reconcile_after_intent": "adopt_bound_receipt_no_repeat_effect",
+    "receipt_cas_failure_after_effect": "primary_outcome_preserved_retry_completes",
+    "two_coordinators_same_predecessor": "exactly_one_winner_no_duplicate_effect"
+  }
+}
