@@ -1011,7 +1011,9 @@ async fn run_local_read_poll(
     // idempotent leg below, so claimed skill pairs settle exactly like
     // forwarded ones.
     if eliotd::skill_dispatch::is_skill_tool(&tool) {
-        let body = eliotd::skill_dispatch::serve_skill_pair(&guard, &envelope, &tool, &attempt);
+        let body =
+            eliotd::skill_dispatch::serve_skill_pair(&guard, kernel, &envelope, &tool, &attempt)
+                .await;
         return match submit_local_read_result_idempotent(kernel, &body).await? {
             LocalReadSubmitOutcome::Accepted => Ok(LocalReadPollOutcome::Accepted),
             LocalReadSubmitOutcome::Expired => Ok(LocalReadPollOutcome::Expired),

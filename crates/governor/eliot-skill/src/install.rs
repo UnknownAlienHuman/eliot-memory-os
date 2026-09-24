@@ -90,14 +90,15 @@
 // allowed for this module (same precedent as the Skill catalogue module).
 #![allow(clippy::result_large_err)]
 
+use eliot_contracts::StateFence;
 use eliot_skills::{
-    ConflictState, DistractorState, FreshnessState, MaterializationInputs, QuarantineState,
-    SkillPackage,
+    ConflictState, DistractorState, FreshnessState, MaterializationInputs,
+    PortableSkillPackageCandidate, QuarantineState, SkillPackage,
 };
 
 use super::{
     DependencyVersion, SkillBody, SkillCatalogue, SkillCatalogueEntry, SkillError, SkillIndexEntry,
-    SkillRuntimeMetadata, SkillStatus,
+    SkillRegistry, SkillRuntimeMetadata, SkillStatus,
 };
 use crate::KnownTools;
 use serde::{Deserialize, Serialize};
@@ -202,6 +203,159 @@ impl CatalogueInstallContext {
             }
         }
         Ok(())
+    }
+}
+
+/// Binds one presented package materialization to its exact accepted candidate.
+///
+/// Runs the candidate's own validation first (candidate-only shape, accepted
+/// procedure projection, exact behavior/host/asset identity, candidate-id
+/// binding), then the public package↔inputs binding
+/// ([`SkillPackage::validate`](eliot_skills::SkillPackage::validate)), and
+/// finally checks the presented package carries exactly the candidate's
+/// behavior, host profile, and expected package digests. The expected
+/// digests are mandatory: a candidate without them cannot bind, so an
+/// unstamped claim never skips the authority binding — the materializing
+/// producer stamps them with
+/// [`stamp_materialization_digests`](self::stamp_materialization_digests).
+///
+/// Surface-wire failures map to [`SkillError::Surface`]; a behavior, host, or
+/// digest divergence is [`SkillError::InvalidField`] on the candidate field,
+/// so the caller can attribute the mismatch to the wire claim rather than to
+/// catalogue logic.
+///
+/// Staleness is deliberately not refused here: a stale package still binds and
+/// installs under its governed `Stale` disposition through
+/// [`install_package`]. Promotion past `Provisional` stays with the existing
+/// evidence path, and lifecycle proposals stay with the Governor lifecycle
+/// owner.
+pub fn validate_candidate_materialization(
+    candidate: &PortableSkillPackageCandidate,
+    package: &SkillPackage,
+    inputs: &MaterializationInputs,
+) -> Result<(), SkillError> {
+    candidate
+        .validate()
+        .map_err(|error| SkillError::Surface(error.to_string()))?;
+    package
+        .validate(inputs)
+        .map_err(|error| SkillError::Surface(error.to_string()))?;
+    if package.behavior != candidate.behavior {
+        return Err(SkillError::InvalidField {
+            field: "candidate.behavior",
+            reason: "presented package behavior differs from the accepted candidate behavior",
+        });
+    }
+    if package.host != candidate.host {
+        return Err(SkillError::InvalidField {
+            field: "candidate.host",
+            reason: "presented package host differs from the accepted candidate host",
+        });
+    }
+    match &candidate.package_digests {
+        Some(expected) if expected == &package.digests => Ok(()),
+        _ => Err(SkillError::InvalidField {
+            field: "candidate.package_digests",
+            reason: "presented package digests differ from the accepted candidate digests",
+        }),
+    }
+}
+
+/// Stamps the exact materialized package digests onto an accepted candidate.
+///
+/// The materializing producer calls this once it has bound a validated
+/// package to its actual inputs: the package↔inputs binding and the
+/// candidate behavior/host agreement are re-verified here, then the
+/// package's derived digests become the candidate's expected digests, so
+/// every downstream install binds the exact registration, revision, and
+/// digest set — never an unstamped claim. Stamping is idempotent: a
+/// candidate that already carries the same digests validates unchanged.
+/// Overwriting different expected digests is refused rather than
+/// re-stamped, so one candidate identity cannot be rebound to new material.
+pub fn stamp_materialization_digests(
+    candidate: &PortableSkillPackageCandidate,
+    package: &SkillPackage,
+    inputs: &MaterializationInputs,
+) -> Result<PortableSkillPackageCandidate, SkillError> {
+    package
+        .validate(inputs)
+        .map_err(|error| SkillError::Surface(error.to_string()))?;
+    if package.behavior != candidate.behavior {
+        return Err(SkillError::InvalidField {
+            field: "candidate.behavior",
+            reason: "presented package behavior differs from the accepted candidate behavior",
+        });
+    }
+    if package.host != candidate.host {
+        return Err(SkillError::InvalidField {
+            field: "candidate.host",
+            reason: "presented package host differs from the accepted candidate host",
+        });
+    }
+    if let Some(expected) = &candidate.package_digests
+        && expected != &package.digests
+    {
+        return Err(SkillError::InvalidField {
+            field: "candidate.package_digests",
+            reason: "candidate already binds different package digests",
+        });
+    }
+    let mut stamped = candidate.clone();
+    stamped.package_digests = Some(package.digests.clone());
+    stamped
+        .validate()
+        .map_err(|error| SkillError::Surface(error.to_string()))?;
+    Ok(stamped)
+}
+
+/// Checks one install against the recovered Governor Skill lifecycle standing.
+///
+/// The recovered [`SkillRegistry`] is the persistent lifecycle owner: it is
+/// rebuilt from the canonical `Skill` named read at every Governor recovery,
+/// carries the fence-checked lifecycle revision per Skill, and advances only
+/// through canonical promotion commits — never through catalogue writes. An
+/// install consults it open-world: a Skill the registry does not cover yet
+/// installs provisional and the lifecycle follows through propose/promote,
+/// exactly like the promotion gate forwards uncovered Skills. A covered
+/// Skill must stand fence-current under the admitted fence, bind its exact
+/// registration revision, bind its exact material via
+/// `SkillRef.package_digest` (the `package.digests.source_digest` the
+/// install returns), and hold an install-allowed status (`Current` or
+/// `Provisional`). `Stale`, `Suppressed`, `Archived`, and `Quarantined`
+/// views refuse with a typed reason: revocation and supersession recorded
+/// by the lifecycle owner cannot be reinstalled around. Scope and task
+/// agreement stay with the candidate rehydration at the drive boundary;
+/// this gate binds identity, material, fence, and standing.
+pub fn check_lifecycle_standing(
+    registry: &SkillRegistry,
+    skill_id: &str,
+    package: &SkillPackage,
+    admitted_fence: &StateFence,
+) -> Result<(), SkillError> {
+    let Some(view) = registry.view(skill_id) else {
+        return Ok(());
+    };
+    if view.state_fence != *admitted_fence {
+        return Err(SkillError::FenceMismatch);
+    }
+    if view.skill_ref.registration.revision != package.registration.revision {
+        return Err(SkillError::InvalidField {
+            field: "lifecycle.revision",
+            reason: "lifecycle stands for a different package revision",
+        });
+    }
+    if view.skill_ref.package_digest != package.digests.source_digest {
+        return Err(SkillError::IdentityMismatch);
+    }
+    match view.status {
+        SkillStatus::Current | SkillStatus::Provisional => Ok(()),
+        SkillStatus::Stale
+        | SkillStatus::Suppressed
+        | SkillStatus::Archived
+        | SkillStatus::Quarantined => Err(SkillError::InvalidField {
+            field: "lifecycle.status",
+            reason: "lifecycle standing refuses installation; review before reinstall",
+        }),
     }
 }
 
@@ -322,9 +476,17 @@ fn install_status(package: &SkillPackage) -> (SkillStatus, Option<String>) {
     (SkillStatus::Provisional, None)
 }
 
-/// Installs one canonical package source into the catalogue: projects the
+/// Installs one canonical package source into the catalogue: binds the
+/// presented materialization to its exact accepted candidate, projects the
 /// entry, runs the tool-owner existence check at insert, and returns the
 /// installed Skill identity.
+///
+/// The candidate binding runs first, so no package reaches the catalogue
+/// without the exact accepted procedure projection behind it: candidate-only
+/// shape, `Accepted` procedure state, exact behavior/host, and expected
+/// digests when the candidate carries them. A stale package still binds and
+/// installs under its governed `Stale` disposition; promotion stays with the
+/// evidence path.
 ///
 /// Re-installing a revised package replaces the entry wholesale
 /// (immutable-body revision): the catalogue digest changes, so Hotset receipts
@@ -333,15 +495,229 @@ fn install_status(package: &SkillPackage) -> (SkillStatus, Option<String>) {
 /// lifecycle `SkillRef.package_digest` (`package.digests.source_digest`).
 pub fn install_package(
     catalogue: &mut SkillCatalogue,
+    candidate: &PortableSkillPackageCandidate,
     package: &SkillPackage,
     inputs: &MaterializationInputs,
     context: &CatalogueInstallContext,
     tools: &dyn KnownTools,
 ) -> Result<String, SkillError> {
+    validate_candidate_materialization(candidate, package, inputs)?;
     let entry = project_package_to_entry(package, inputs, context)?;
     let skill_id = entry.index.skill_id.clone();
     catalogue.insert(entry, tools)?;
     Ok(skill_id)
+}
+
+/// Test-only fixture for accepted-candidate materialization sets.
+///
+/// One owner for the accepted-procedure receipt shell every install-path test
+/// binds against, so production-path tests never hand-roll competing
+/// candidate shapes. The procedure shell (evidence, verifier, acceptance
+/// receipt, safety closure, inert assets) is fixed; callers supply the
+/// procedure definition and the target profile, and the governed mapper
+/// derives the exact candidate behavior and host the presented package must
+/// carry.
+#[cfg(test)]
+pub(crate) mod candidate_fixture {
+    use eliot_skills::{
+        GovernedProcedureProjection, InertAsset, PortableSkillPackageCandidate,
+        ProcedureDefinition, ProcedureEvidence, ProcedureState, ProcedureVerifier,
+        SafetyPrivacyDisclosure, TargetProfile,
+        project_governed_procedure_to_portable_skill_candidates,
+    };
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn fence() -> eliot_contracts::StateFence {
+        let epoch = eliot_contracts::EpochId::new(
+            eliot_contracts::EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch");
+        eliot_contracts::StateFence::new(epoch, eliot_contracts::ResourceGeneration::genesis())
+    }
+
+    fn acceptance_receipt(
+        procedure_revision: &str,
+        state_fence: eliot_contracts::StateFence,
+    ) -> eliot_skills::ReceiptClaim {
+        use eliot_contracts::{
+            ArtifactId, ClockReading, ContractId, OperationId, ProductId, RequestId, SessionId,
+            SourceId, TaskId, TaskRevision, TransactionSequence,
+        };
+        use eliot_receipts::{
+            ArtifactBinding, AuthorityBinding, CausalBinding, EffectClass, OperationBinding,
+            ProofCeiling, ReceiptCore, ReceiptDisposition, ReceiptEnvelope, ReceiptKind,
+            RequestBinding, SessionBinding, TaskBinding, VerifierBinding, WorkScopeBinding,
+            WorkScopeId,
+        };
+
+        let request_id = RequestId::new("request-1").expect("request id");
+        let task_id = TaskId::new("task-1").expect("task id");
+        let metadata = eliot_receipts::RequestMetadata {
+            request_id: request_id.clone(),
+            session_id: Some(SessionId::new("session-1").expect("session id")),
+            task_id: Some(task_id),
+            product_id: ProductId::new("product-1").expect("product id"),
+            source_id: SourceId::new("source-1").expect("source id"),
+            state_fence: state_fence.clone(),
+            clock: ClockReading {
+                valid_time_ms: Some(10),
+                known_time_ms: Some(11),
+                transaction_sequence: Some(TransactionSequence::genesis()),
+                monotonic_ns: Some(12),
+            },
+        };
+        let verifier_artifact_id = ArtifactId::new("verifier-artifact-1").expect("artifact id");
+        let rollback_artifact_id = ArtifactId::new("rollback-artifact-1").expect("artifact id");
+        let core = ReceiptCore {
+            contract: eliot_receipts::contract_identity().expect("receipt contract"),
+            kind: ReceiptKind::Verification,
+            work_scope: WorkScopeBinding {
+                scope_id: WorkScopeId::new("scope-1").expect("scope id"),
+                product_id: metadata.product_id.clone(),
+                resource_generation: eliot_contracts::ResourceGeneration::genesis(),
+                state_fence: state_fence.clone(),
+            },
+            task: Some(TaskBinding {
+                task_id: TaskId::new("task-1").expect("task id"),
+                task_revision: TaskRevision::genesis(),
+                state_fence: state_fence.clone(),
+            }),
+            session: Some(SessionBinding {
+                session_id: SessionId::new("session-1").expect("session id"),
+                authority_epoch: state_fence.authority_epoch.clone(),
+                state_fence: state_fence.clone(),
+            }),
+            causal: CausalBinding {
+                state_fence: state_fence.clone(),
+                transaction_sequence: TransactionSequence::genesis(),
+                parent_receipt_id: None,
+                predecessor_receipt_ids: Vec::new(),
+            },
+            request: RequestBinding {
+                metadata,
+                state_fence: state_fence.clone(),
+            },
+            operation: OperationBinding {
+                operation_id: OperationId::new("operation-1").expect("operation id"),
+                request_id,
+                idempotency_key: "accept-procedure".to_owned(),
+                operation_kind: "procedure.accept".to_owned(),
+                effect: EffectClass::Read,
+                state_fence: state_fence.clone(),
+            },
+            authority: AuthorityBinding {
+                authority_id: ContractId::new("authority-1").expect("authority id"),
+                authority_owner: "governor.skill".to_owned(),
+                authority_epoch: state_fence.authority_epoch.clone(),
+                state_fence: state_fence.clone(),
+                allowed_effect: EffectClass::Read,
+                proof_ceiling: ProofCeiling::ScopedVerification,
+            },
+            artifacts: vec![
+                ArtifactBinding {
+                    artifact_id: verifier_artifact_id.clone(),
+                    sha256: eliot_receipts::sha256_hex(b"accepted-procedure"),
+                    role: ReceiptKind::Artifact,
+                    source_revision: Some(procedure_revision.to_owned()),
+                },
+                ArtifactBinding {
+                    artifact_id: rollback_artifact_id,
+                    sha256: eliot_receipts::sha256_hex(b"rollback-procedure"),
+                    role: ReceiptKind::Artifact,
+                    source_revision: Some(procedure_revision.to_owned()),
+                },
+            ],
+            verifier: Some(VerifierBinding {
+                verifier_id: ContractId::new("procedure-verifier").expect("verifier id"),
+                verifier_revision: eliot_contracts::ContractVersion::new(1, 0, 0),
+                artifact_ids: vec![verifier_artifact_id],
+                proof_ceiling: ProofCeiling::ScopedVerification,
+                state_fence,
+            }),
+            problem: None,
+            coordination: None,
+            disposition: ReceiptDisposition::Success {
+                proof: ProofCeiling::ScopedVerification,
+            },
+        };
+        let envelope = ReceiptEnvelope::issue(core).expect("accepted receipt");
+        eliot_skills::ReceiptClaim {
+            evidence_ref: "receipt-evidence-1".to_owned(),
+            envelope,
+        }
+    }
+
+    fn procedure_shell(definition: ProcedureDefinition) -> GovernedProcedureProjection {
+        use eliot_skills::GOVERNED_PROCEDURE_PROJECTION_SCHEMA_VERSION;
+
+        let state_fence = fence();
+        let acceptance_receipt = acceptance_receipt("revision-1", state_fence.clone());
+        let mut projection = GovernedProcedureProjection {
+            schema_version: GOVERNED_PROCEDURE_PROJECTION_SCHEMA_VERSION.to_owned(),
+            procedure_id: "procedure-1".to_owned(),
+            procedure_revision: "revision-1".to_owned(),
+            procedure_digest: "0".repeat(64),
+            state: ProcedureState::Accepted,
+            state_fence: state_fence.clone(),
+            work_scope: acceptance_receipt.envelope.core.work_scope.clone(),
+            task: acceptance_receipt
+                .envelope
+                .core
+                .task
+                .clone()
+                .expect("task binding"),
+            acceptance_receipt,
+            definition,
+            evidence: ProcedureEvidence {
+                source_refs: vec!["source-1".to_owned()],
+                receipt_refs: vec!["receipt-evidence-1".to_owned()],
+                applicability_refs: vec!["applicability-1".to_owned()],
+                counterexample_refs: vec!["counterexample-1".to_owned()],
+                negative_trigger_refs: vec!["negative-trigger-1".to_owned()],
+                verifier_artifact_refs: vec!["verifier-artifact-1".to_owned()],
+                rollback_artifact_ref: "rollback-artifact-1".to_owned(),
+            },
+            verifier: ProcedureVerifier {
+                verifier_ref: "procedure-verifier".to_owned(),
+                verifier_revision: "1.0.0".to_owned(),
+                artifact_refs: vec!["verifier-artifact-1".to_owned()],
+            },
+            safety_privacy_disclosure: SafetyPrivacyDisclosure {
+                safety_owner_ref: "safety-owner".to_owned(),
+                safety_evidence_refs: vec!["safety-1".to_owned()],
+                privacy_owner_ref: "privacy-owner".to_owned(),
+                privacy_evidence_refs: vec!["privacy-1".to_owned()],
+                disclosure_owner_ref: "disclosure-owner".to_owned(),
+                disclosure_evidence_refs: vec!["disclosure-1".to_owned()],
+            },
+            assets: vec![InertAsset {
+                asset_ref: "asset-1".to_owned(),
+                sha256: eliot_receipts::sha256_hex(b"asset"),
+                role: "reference".to_owned(),
+                executable: false,
+            }],
+        };
+        projection.procedure_digest = projection.expected_digest().expect("procedure digest");
+        projection
+    }
+
+    /// Maps one caller-supplied definition and target to their exact accepted
+    /// candidate. The target must satisfy the definition's exact requirements;
+    /// unsupported targets have no candidate and fail here, never at install.
+    pub(crate) fn candidate_for(
+        definition: ProcedureDefinition,
+        target: TargetProfile,
+    ) -> PortableSkillPackageCandidate {
+        let projection = project_governed_procedure_to_portable_skill_candidates(
+            &procedure_shell(definition),
+            &[target],
+        )
+        .expect("projection");
+        assert_eq!(projection.candidates.len(), 1);
+        projection.candidates[0].clone()
+    }
 }
 
 #[cfg(test)]
@@ -349,9 +725,10 @@ pub fn install_package(
 mod tests {
     use super::*;
     use eliot_skills::{
-        AdvisoryRuleClaim, CapabilityVersion, DeliveryProjection, DependencyMaterial, HostLimits,
-        HostProfile, LifecycleProposal, SkillBehavior, SkillCounters, SkillInteractionProjection,
-        SkillState, ToolDefinitionMaterial, VersionedRequirement,
+        AdvisoryRuleClaim, CapabilityVersion, DeliveryProjection, DependencyMaterial,
+        LifecycleProposal, PortableSkillPackageCandidate, ProcedureDefinition, SkillBehavior,
+        SkillCounters, SkillInteractionProjection, SkillState, TargetProfile,
+        ToolDefinitionMaterial, VersionedRequirement,
     };
 
     const BODY_DIGEST_SEED: &str = "package-fixture";
@@ -427,6 +804,13 @@ mod tests {
     }
 
     fn fixture_package() -> (SkillPackage, MaterializationInputs) {
+        // The package carries the accepted candidate's own behavior and host:
+        // the mapper derives them from the definition and target below, so
+        // the binding the install path enforces holds by construction here.
+        // Candidate identity is deterministic; the stamped install
+        // candidate comes from `fixture_candidate`.
+        let candidate =
+            candidate_fixture::candidate_for(candidate_definition(), candidate_target());
         let material = inputs();
         let package = SkillPackage {
             registration: eliot_skills::RegistrationIdentity::new(
@@ -436,24 +820,8 @@ mod tests {
             )
             .expect("valid test registration"),
             digests: eliot_skills::PackageDigests::derive(&material).expect("valid test inputs"),
-            host: HostProfile {
-                host: "codex".to_owned(),
-                profile: "default".to_owned(),
-                required_tools: vec![VersionedRequirement {
-                    name: "cargo".to_owned(),
-                    version: "1.89".to_owned(),
-                }],
-                required_capabilities: vec![VersionedRequirement {
-                    name: "rust-test".to_owned(),
-                    version: "1".to_owned(),
-                }],
-                limits: HostLimits {
-                    max_description_chars: 500,
-                    max_actions: 1,
-                    max_expansion_handles: 2,
-                },
-            },
-            behavior: behavior(),
+            host: candidate.host.clone(),
+            behavior: candidate.behavior.clone(),
             counters: SkillCounters::default(),
             state: current_state(),
             lifecycle_proposal: LifecycleProposal::Keep,
@@ -465,6 +833,63 @@ mod tests {
             .validate(&material)
             .expect("fixture package validates");
         (package, material)
+    }
+
+    /// Mirrors [`behavior`] as the accepted procedure definition the install
+    /// fixtures bind against: same trigger, action, obligations, stop and
+    /// exact tool/capability revisions.
+    fn candidate_definition() -> ProcedureDefinition {
+        ProcedureDefinition {
+            name: "bounded Rust verifier".to_owned(),
+            purpose: "verify one bounded Rust change".to_owned(),
+            trigger: "when a bounded Rust verifier is required load this skill".to_owned(),
+            action: "run cargo test".to_owned(),
+            applies_when: vec!["the package is exact".to_owned()],
+            where_not_apply: vec!["the host is unsupported".to_owned()],
+            required_inputs: vec!["the exact package".to_owned()],
+            ordered_steps: vec!["run cargo test".to_owned()],
+            expected_outputs: vec!["test result".to_owned()],
+            stop_conditions: vec!["stop on stale material".to_owned()],
+            required_writebacks: vec!["NONE".to_owned()],
+            escalation: "report PLAN_GAP".to_owned(),
+            challenge: "show exact conflicting identities".to_owned(),
+            rollback_or_recovery: "restore the prior revision".to_owned(),
+            required_tools: vec![VersionedRequirement {
+                name: "cargo".to_owned(),
+                version: "1.89".to_owned(),
+            }],
+            required_capabilities: vec![VersionedRequirement {
+                name: "rust-test".to_owned(),
+                version: "1".to_owned(),
+            }],
+        }
+    }
+
+    fn candidate_target() -> TargetProfile {
+        TargetProfile {
+            target_id: "candidate-target".to_owned(),
+            host: "codex".to_owned(),
+            profile: "default".to_owned(),
+            fingerprint: "1".repeat(64),
+            available_tools: vec![VersionedRequirement {
+                name: "cargo".to_owned(),
+                version: "1.89".to_owned(),
+            }],
+            available_capabilities: vec![VersionedRequirement {
+                name: "rust-test".to_owned(),
+                version: "1".to_owned(),
+            }],
+        }
+    }
+
+    fn fixture_candidate() -> PortableSkillPackageCandidate {
+        // The producer stamps the exact materialized digests: the install
+        // path never sees an unstamped candidate. Identity is
+        // deterministic, so this equals the candidate the package derives
+        // from below.
+        let (package, material) = fixture_package();
+        let raw = candidate_fixture::candidate_for(candidate_definition(), candidate_target());
+        stamp_materialization_digests(&raw, &package, &material).expect("fixture stamps")
     }
 
     fn context() -> CatalogueInstallContext {
@@ -531,8 +956,16 @@ mod tests {
     #[test]
     fn install_checks_tool_existence_and_returns_the_skill_identity() {
         let (package, material) = fixture_package();
+        let candidate = fixture_candidate();
         let mut catalogue = SkillCatalogue::default();
-        let refused = install_package(&mut catalogue, &package, &material, &context(), &EmptyTools);
+        let refused = install_package(
+            &mut catalogue,
+            &candidate,
+            &package,
+            &material,
+            &context(),
+            &EmptyTools,
+        );
         assert!(matches!(
             refused,
             Err(SkillError::InvalidField { field, .. }) if field == "body.tool_refs"
@@ -540,6 +973,7 @@ mod tests {
         assert!(catalogue.is_empty());
         let installed = install_package(
             &mut catalogue,
+            &candidate,
             &package,
             &material,
             &context(),
@@ -625,9 +1059,11 @@ mod tests {
         };
 
         let (package, material) = fixture_package();
+        let candidate = fixture_candidate();
         let mut catalogue = SkillCatalogue::default();
         install_package(
             &mut catalogue,
+            &candidate,
             &package,
             &material,
             &context(),
@@ -728,5 +1164,624 @@ mod tests {
             project_package_to_entry(&package, &material, &overrun),
             Err(SkillError::InvalidField { field, .. }) if field == "context.body_tokens"
         ));
+    }
+    mod candidate_binding {
+        use super::{
+            AdvisoryRuleClaim, DeliveryProjection, DependencyMaterial, DistractorState,
+            FreshnessState, LifecycleProposal, QuarantineState, SkillBehavior, SkillCounters,
+            SkillInteractionProjection, SkillState, ToolDefinitionMaterial, VersionedRequirement,
+        };
+        use super::{CatalogueInstallContext, SkillError, validate_candidate_materialization};
+        use eliot_skills::{
+            GovernedProcedureProjection, InertAsset, ProcedureDefinition, ProcedureEvidence,
+            ProcedureState, ProcedureVerifier, SafetyPrivacyDisclosure, TargetProfile,
+            project_governed_procedure_to_portable_skill_candidates,
+        };
+
+        const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+        fn fence() -> eliot_contracts::StateFence {
+            let epoch = eliot_contracts::EpochId::new(
+                eliot_contracts::EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+                std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
+            )
+            .expect("valid test epoch");
+            eliot_contracts::StateFence::new(epoch, eliot_contracts::ResourceGeneration::genesis())
+        }
+
+        fn acceptance_receipt(
+            procedure_revision: &str,
+            state_fence: eliot_contracts::StateFence,
+        ) -> eliot_skills::ReceiptClaim {
+            use eliot_contracts::{
+                ArtifactId, ClockReading, ContractId, OperationId, ProductId, RequestId, SessionId,
+                SourceId, TaskId, TaskRevision, TransactionSequence,
+            };
+            use eliot_receipts::{
+                ArtifactBinding, AuthorityBinding, CausalBinding, EffectClass, OperationBinding,
+                ProofCeiling, ReceiptCore, ReceiptDisposition, ReceiptEnvelope, ReceiptKind,
+                RequestBinding, SessionBinding, TaskBinding, VerifierBinding, WorkScopeBinding,
+                WorkScopeId,
+            };
+
+            let request_id = RequestId::new("request-1").expect("request id");
+            let task_id = TaskId::new("task-1").expect("task id");
+            let metadata = eliot_receipts::RequestMetadata {
+                request_id: request_id.clone(),
+                session_id: Some(SessionId::new("session-1").expect("session id")),
+                task_id: Some(task_id),
+                product_id: ProductId::new("product-1").expect("product id"),
+                source_id: SourceId::new("source-1").expect("source id"),
+                state_fence: state_fence.clone(),
+                clock: ClockReading {
+                    valid_time_ms: Some(10),
+                    known_time_ms: Some(11),
+                    transaction_sequence: Some(TransactionSequence::genesis()),
+                    monotonic_ns: Some(12),
+                },
+            };
+            let verifier_artifact_id = ArtifactId::new("verifier-artifact-1").expect("artifact id");
+            let rollback_artifact_id = ArtifactId::new("rollback-artifact-1").expect("artifact id");
+            let core = ReceiptCore {
+                contract: eliot_receipts::contract_identity().expect("receipt contract"),
+                kind: ReceiptKind::Verification,
+                work_scope: WorkScopeBinding {
+                    scope_id: WorkScopeId::new("scope-1").expect("scope id"),
+                    product_id: metadata.product_id.clone(),
+                    resource_generation: eliot_contracts::ResourceGeneration::genesis(),
+                    state_fence: state_fence.clone(),
+                },
+                task: Some(TaskBinding {
+                    task_id: TaskId::new("task-1").expect("task id"),
+                    task_revision: TaskRevision::genesis(),
+                    state_fence: state_fence.clone(),
+                }),
+                session: Some(SessionBinding {
+                    session_id: SessionId::new("session-1").expect("session id"),
+                    authority_epoch: state_fence.authority_epoch.clone(),
+                    state_fence: state_fence.clone(),
+                }),
+                causal: CausalBinding {
+                    state_fence: state_fence.clone(),
+                    transaction_sequence: TransactionSequence::genesis(),
+                    parent_receipt_id: None,
+                    predecessor_receipt_ids: Vec::new(),
+                },
+                request: RequestBinding {
+                    metadata,
+                    state_fence: state_fence.clone(),
+                },
+                operation: OperationBinding {
+                    operation_id: OperationId::new("operation-1").expect("operation id"),
+                    request_id,
+                    idempotency_key: "accept-procedure".to_owned(),
+                    operation_kind: "procedure.accept".to_owned(),
+                    effect: EffectClass::Read,
+                    state_fence: state_fence.clone(),
+                },
+                authority: AuthorityBinding {
+                    authority_id: ContractId::new("authority-1").expect("authority id"),
+                    authority_owner: "governor.skill".to_owned(),
+                    authority_epoch: state_fence.authority_epoch.clone(),
+                    state_fence: state_fence.clone(),
+                    allowed_effect: EffectClass::Read,
+                    proof_ceiling: ProofCeiling::ScopedVerification,
+                },
+                artifacts: vec![
+                    ArtifactBinding {
+                        artifact_id: verifier_artifact_id.clone(),
+                        sha256: eliot_receipts::sha256_hex(b"accepted-procedure"),
+                        role: ReceiptKind::Artifact,
+                        source_revision: Some(procedure_revision.to_owned()),
+                    },
+                    ArtifactBinding {
+                        artifact_id: rollback_artifact_id,
+                        sha256: eliot_receipts::sha256_hex(b"rollback-procedure"),
+                        role: ReceiptKind::Artifact,
+                        source_revision: Some(procedure_revision.to_owned()),
+                    },
+                ],
+                verifier: Some(VerifierBinding {
+                    verifier_id: ContractId::new("procedure-verifier").expect("verifier id"),
+                    verifier_revision: eliot_contracts::ContractVersion::new(1, 0, 0),
+                    artifact_ids: vec![verifier_artifact_id],
+                    proof_ceiling: ProofCeiling::ScopedVerification,
+                    state_fence,
+                }),
+                problem: None,
+                coordination: None,
+                disposition: ReceiptDisposition::Success {
+                    proof: ProofCeiling::ScopedVerification,
+                },
+            };
+            let envelope = ReceiptEnvelope::issue(core).expect("accepted receipt");
+            eliot_skills::ReceiptClaim {
+                evidence_ref: "receipt-evidence-1".to_owned(),
+                envelope,
+            }
+        }
+
+        fn definition() -> ProcedureDefinition {
+            ProcedureDefinition {
+                name: "bounded procedure".to_owned(),
+                purpose: "make one bounded change".to_owned(),
+                trigger: "when a bounded change is requested load this skill".to_owned(),
+                action: "apply the reviewed change".to_owned(),
+                applies_when: vec!["scope is exact".to_owned()],
+                where_not_apply: vec!["scope is stale".to_owned()],
+                required_inputs: vec!["reviewed input".to_owned()],
+                ordered_steps: vec!["review".to_owned(), "apply".to_owned()],
+                expected_outputs: vec!["candidate artifact".to_owned()],
+                stop_conditions: vec!["stop on mismatch".to_owned()],
+                required_writebacks: vec!["NONE".to_owned()],
+                escalation: "return the owner challenge".to_owned(),
+                challenge: "show the exact gap".to_owned(),
+                rollback_or_recovery: "restore the prior artifact".to_owned(),
+                required_tools: vec![VersionedRequirement {
+                    name: "reviewer".to_owned(),
+                    version: "1".to_owned(),
+                }],
+                required_capabilities: vec![VersionedRequirement {
+                    name: "review".to_owned(),
+                    version: "1".to_owned(),
+                }],
+            }
+        }
+
+        fn procedure() -> GovernedProcedureProjection {
+            use eliot_skills::GOVERNED_PROCEDURE_PROJECTION_SCHEMA_VERSION;
+
+            let state_fence = fence();
+            let acceptance_receipt = acceptance_receipt("revision-1", state_fence.clone());
+            let mut projection = GovernedProcedureProjection {
+                schema_version: GOVERNED_PROCEDURE_PROJECTION_SCHEMA_VERSION.to_owned(),
+                procedure_id: "procedure-1".to_owned(),
+                procedure_revision: "revision-1".to_owned(),
+                procedure_digest: "0".repeat(64),
+                state: ProcedureState::Accepted,
+                state_fence: state_fence.clone(),
+                work_scope: acceptance_receipt.envelope.core.work_scope.clone(),
+                task: acceptance_receipt
+                    .envelope
+                    .core
+                    .task
+                    .clone()
+                    .expect("task binding"),
+                acceptance_receipt,
+                definition: definition(),
+                evidence: ProcedureEvidence {
+                    source_refs: vec!["source-1".to_owned()],
+                    receipt_refs: vec!["receipt-evidence-1".to_owned()],
+                    applicability_refs: vec!["applicability-1".to_owned()],
+                    counterexample_refs: vec!["counterexample-1".to_owned()],
+                    negative_trigger_refs: vec!["negative-trigger-1".to_owned()],
+                    verifier_artifact_refs: vec!["verifier-artifact-1".to_owned()],
+                    rollback_artifact_ref: "rollback-artifact-1".to_owned(),
+                },
+                verifier: ProcedureVerifier {
+                    verifier_ref: "procedure-verifier".to_owned(),
+                    verifier_revision: "1.0.0".to_owned(),
+                    artifact_refs: vec!["verifier-artifact-1".to_owned()],
+                },
+                safety_privacy_disclosure: SafetyPrivacyDisclosure {
+                    safety_owner_ref: "safety-owner".to_owned(),
+                    safety_evidence_refs: vec!["safety-1".to_owned()],
+                    privacy_owner_ref: "privacy-owner".to_owned(),
+                    privacy_evidence_refs: vec!["privacy-1".to_owned()],
+                    disclosure_owner_ref: "disclosure-owner".to_owned(),
+                    disclosure_evidence_refs: vec!["disclosure-1".to_owned()],
+                },
+                assets: vec![InertAsset {
+                    asset_ref: "asset-1".to_owned(),
+                    sha256: eliot_receipts::sha256_hex(b"asset"),
+                    role: "reference".to_owned(),
+                    executable: false,
+                }],
+            };
+            projection.procedure_digest = projection.expected_digest().expect("procedure digest");
+            projection
+        }
+
+        fn target() -> TargetProfile {
+            TargetProfile {
+                target_id: "candidate-target".to_owned(),
+                host: "rust-host".to_owned(),
+                profile: "safe".to_owned(),
+                fingerprint: "1".repeat(64),
+                available_tools: vec![VersionedRequirement {
+                    name: "reviewer".to_owned(),
+                    version: "1".to_owned(),
+                }],
+                available_capabilities: vec![VersionedRequirement {
+                    name: "review".to_owned(),
+                    version: "1".to_owned(),
+                }],
+            }
+        }
+
+        fn candidate() -> eliot_skills::PortableSkillPackageCandidate {
+            let projection =
+                project_governed_procedure_to_portable_skill_candidates(&procedure(), &[target()])
+                    .expect("projection");
+            assert_eq!(projection.candidates.len(), 1);
+            projection.candidates[0].clone()
+        }
+
+        fn material_for(behavior: &SkillBehavior) -> eliot_skills::MaterializationInputs {
+            eliot_skills::MaterializationInputs {
+                canonical_source_bytes: b"candidate-bound source\n".to_vec(),
+                contract_materialization: behavior.clone(),
+                dependencies: vec![DependencyMaterial {
+                    name: "eliot-evidence".to_owned(),
+                    version: "0.1.0".to_owned(),
+                    contract_digest: "e".repeat(64),
+                }],
+                tool_definitions: vec![ToolDefinitionMaterial {
+                    name: "reviewer".to_owned(),
+                    version: "1".to_owned(),
+                    description: "bounded review tool".to_owned(),
+                    capabilities: vec![eliot_skills::CapabilityVersion {
+                        name: "review".to_owned(),
+                        version: "1".to_owned(),
+                    }],
+                    actions: vec![behavior.action.clone()],
+                }],
+            }
+        }
+
+        fn package_for(
+            candidate: &eliot_skills::PortableSkillPackageCandidate,
+            material: &eliot_skills::MaterializationInputs,
+        ) -> eliot_skills::SkillPackage {
+            let rule_revision = eliot_contracts::Revision::new(1).expect("non-zero test revision");
+            eliot_skills::SkillPackage {
+                registration: eliot_skills::RegistrationIdentity::new(
+                    "skill.candidate",
+                    "1.0.0",
+                    "Candidate skill",
+                )
+                .expect("valid test registration"),
+                digests: eliot_skills::PackageDigests::derive(material).expect("valid test inputs"),
+                host: candidate.host.clone(),
+                behavior: candidate.behavior.clone(),
+                counters: SkillCounters::default(),
+                state: SkillState {
+                    freshness: FreshnessState::Current,
+                    conflict: eliot_skills::ConflictState::None,
+                    distractor: DistractorState::None,
+                    quarantine: QuarantineState::Clear,
+                },
+                lifecycle_proposal: LifecycleProposal::Keep,
+                delivery: DeliveryProjection::default(),
+                interaction: SkillInteractionProjection::default(),
+                rule: AdvisoryRuleClaim {
+                    rule_ref: eliot_rules::RuleRef::new("rule-candidate-1", rule_revision)
+                        .expect("valid test rule ref"),
+                },
+            }
+        }
+
+        #[test]
+        fn accepted_candidate_binds_its_exact_package_materialization() {
+            let candidate = candidate();
+            let material = material_for(&candidate.behavior);
+            let package = package_for(&candidate, &material);
+            package
+                .validate(&material)
+                .expect("fixture package validates");
+            let candidate = crate::stamp_materialization_digests(&candidate, &package, &material)
+                .expect("producer stamps the exact digests");
+            assert_eq!(candidate.package_digests.as_ref(), Some(&package.digests));
+            validate_candidate_materialization(&candidate, &package, &material)
+                .expect("exact candidate material binds");
+        }
+
+        #[test]
+        fn expected_digests_bind_when_the_candidate_carries_them() {
+            let mut candidate = candidate();
+            let material = material_for(&candidate.behavior);
+            let package = package_for(&candidate, &material);
+            candidate.package_digests = Some(package.digests.clone());
+            validate_candidate_materialization(&candidate, &package, &material)
+                .expect("matching expected digests bind");
+
+            let mut drifted = candidate.clone();
+            let mut wrong = package.digests.clone();
+            wrong.source_digest = "0".repeat(64);
+            drifted.package_digests = Some(wrong);
+            assert!(matches!(
+                validate_candidate_materialization(&drifted, &package, &material),
+                Err(SkillError::InvalidField { field, .. })
+                    if field == "candidate.package_digests"
+            ));
+        }
+
+        #[test]
+        fn diverged_behavior_or_host_fails_closed_on_the_candidate_field() {
+            let candidate = candidate();
+
+            let mut behavior = candidate.behavior.clone();
+            behavior.action = "apply a different change".to_owned();
+            let material = material_for(&behavior);
+            let package = package_for(&candidate, &material);
+            // The package still validates against its own inputs; the binding
+            // to the accepted candidate is what refuses it.
+            package
+                .validate(&material)
+                .expect("diverged package validates alone");
+            assert!(matches!(
+                validate_candidate_materialization(&candidate, &package, &material),
+                Err(SkillError::InvalidField { field, .. }) if field == "candidate.behavior"
+            ));
+
+            let material = material_for(&candidate.behavior);
+            let mut package = package_for(&candidate, &material);
+            package.host.profile = "other".to_owned();
+            package.digests =
+                eliot_skills::PackageDigests::derive(&material).expect("re-derived digests");
+            package
+                .validate(&material)
+                .expect("rehosted package validates alone");
+            assert!(matches!(
+                validate_candidate_materialization(&candidate, &package, &material),
+                Err(SkillError::InvalidField { field, .. }) if field == "candidate.host"
+            ));
+        }
+
+        #[test]
+        fn non_candidate_wire_claims_fail_closed_as_surface() {
+            let candidate = candidate();
+            let material = material_for(&candidate.behavior);
+            let package = package_for(&candidate, &material);
+
+            // A procedure that left Accepted no longer binds.
+            let mut stale_procedure = procedure();
+            stale_procedure.state = ProcedureState::Stale;
+            stale_procedure.procedure_digest = stale_procedure
+                .expected_digest()
+                .expect("stale procedure digest");
+            let mut stale_candidate = candidate.clone();
+            stale_candidate.procedure = stale_procedure;
+            assert!(matches!(
+                validate_candidate_materialization(&stale_candidate, &package, &material),
+                Err(SkillError::Surface(_))
+            ));
+
+            // An activated candidate is not a materialization request.
+            let mut activated = candidate.clone();
+            activated.activation_applied = true;
+            assert!(matches!(
+                validate_candidate_materialization(&activated, &package, &material),
+                Err(SkillError::Surface(_))
+            ));
+
+            // A package whose inputs disagree with its digests never binds.
+            let mut drifted_material = material.clone();
+            drifted_material.dependencies[0].version = "9.9.9".to_owned();
+            assert!(matches!(
+                validate_candidate_materialization(&candidate, &package, &drifted_material),
+                Err(SkillError::Surface(_))
+            ));
+        }
+
+        #[test]
+        fn stamp_binds_unstamped_and_refuses_rebinding() {
+            let candidate = candidate();
+            let material = material_for(&candidate.behavior);
+            let package = package_for(&candidate, &material);
+            let stamped = crate::stamp_materialization_digests(&candidate, &package, &material)
+                .expect("stamp");
+            assert_eq!(stamped.package_digests.as_ref(), Some(&package.digests));
+            // Stamping the stamped candidate is idempotent.
+            let restamped = crate::stamp_materialization_digests(&stamped, &package, &material)
+                .expect("idempotent");
+            assert_eq!(restamped.package_digests.as_ref(), Some(&package.digests));
+            // One candidate identity is never rebound to new material.
+            let mut other_material = material.clone();
+            other_material.canonical_source_bytes = b"other source\n".to_vec();
+            let other_package = package_for(&candidate, &other_material);
+            assert_ne!(other_package.digests, package.digests);
+            assert!(matches!(
+                crate::stamp_materialization_digests(&stamped, &other_package, &other_material),
+                Err(SkillError::InvalidField { field, .. })
+                    if field == "candidate.package_digests"
+            ));
+        }
+
+        fn standing_fence() -> eliot_contracts::StateFence {
+            let epoch = eliot_contracts::EpochId::new(
+                eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                    .expect("lineage"),
+                std::num::NonZeroU64::new(1).expect("nonzero"),
+            )
+            .expect("epoch");
+            eliot_contracts::StateFence::new(
+                epoch,
+                eliot_contracts::ResourceGeneration::new(1).expect("generation"),
+            )
+        }
+
+        fn standing_view(
+            fence: &eliot_contracts::StateFence,
+            package: &eliot_skills::SkillPackage,
+            status: crate::SkillStatus,
+        ) -> crate::SkillLifecycleView {
+            crate::SkillLifecycleView {
+                skill_ref: crate::SkillRef::new(
+                    package.registration.skill_id.clone(),
+                    package.registration.revision.clone(),
+                    package.registration.name.clone(),
+                    package.digests.source_digest.clone(),
+                )
+                .expect("skill ref"),
+                scope: crate::SkillScope {
+                    task_scope: "task-scope".to_owned(),
+                    host: "host-1".to_owned(),
+                    route: "route-1".to_owned(),
+                    governance_scope: "gov-1".to_owned(),
+                },
+                applies_when: vec!["when-a".to_owned()],
+                does_not_apply_when: vec!["not-when-a".to_owned()],
+                dependencies: Vec::new(),
+                counters: crate::LifecycleCounters::default(),
+                execution_evidence: Vec::new(),
+                observed_decision_or_verifier_delta: None,
+                false_activation_refs: Vec::new(),
+                interactions: crate::SkillInteractionView::default(),
+                status,
+                stale_or_quarantine_reason: None,
+                proposed_action: crate::LifecycleAction::Keep,
+                review: None,
+                state_fence: fence.clone(),
+                lifecycle_revision: 1,
+            }
+        }
+
+        fn standing_package() -> (
+            eliot_skills::PortableSkillPackageCandidate,
+            eliot_skills::SkillPackage,
+            eliot_skills::MaterializationInputs,
+        ) {
+            let candidate = candidate();
+            let material = material_for(&candidate.behavior);
+            let package = package_for(&candidate, &material);
+            let stamped = crate::stamp_materialization_digests(&candidate, &package, &material)
+                .expect("stamp");
+            (stamped, package, material)
+        }
+
+        #[test]
+        fn lifecycle_gate_allows_uncovered_current_and_provisional() {
+            let (candidate, package, material) = standing_package();
+            let fence = standing_fence();
+            let empty = crate::SkillRegistry::default();
+            crate::check_lifecycle_standing(&empty, "skill.demo", &package, &fence)
+                .expect("uncovered skill installs provisional");
+            for status in [crate::SkillStatus::Current, crate::SkillStatus::Provisional] {
+                let registry =
+                    crate::SkillRegistry::from_snapshot([standing_view(&fence, &package, status)])
+                        .expect("recovered registry");
+                crate::check_lifecycle_standing(&registry, "skill.demo", &package, &fence)
+                    .expect("standing skill installs");
+            }
+            let _ = (candidate, material);
+        }
+
+        #[test]
+        fn lifecycle_gate_refuses_drift_revocation_and_stale_fence() {
+            let (_, package, _) = standing_package();
+            let fence = standing_fence();
+            // A refreshed Governor fences old standing: currency fails first.
+            let drifted_fence = {
+                let epoch = eliot_contracts::EpochId::new(
+                    eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                        .expect("lineage"),
+                    std::num::NonZeroU64::new(2).expect("nonzero"),
+                )
+                .expect("epoch");
+                eliot_contracts::StateFence::new(
+                    epoch,
+                    eliot_contracts::ResourceGeneration::new(2).expect("generation"),
+                )
+            };
+            let current = crate::SkillRegistry::from_snapshot([standing_view(
+                &fence,
+                &package,
+                crate::SkillStatus::Current,
+            )])
+            .expect("recovered registry");
+            assert!(matches!(
+                crate::check_lifecycle_standing(&current, "skill.demo", &package, &drifted_fence),
+                Err(SkillError::FenceMismatch)
+            ));
+            // A package revision the lifecycle never promoted is superseded.
+            let mut revised = package.clone();
+            revised.registration.revision = "2.0.0".to_owned();
+            assert!(matches!(
+                crate::check_lifecycle_standing(&current, "skill.demo", &revised, &fence),
+                Err(SkillError::InvalidField { field, .. }) if field == "lifecycle.revision"
+            ));
+            // Material the lifecycle never bound is a different package.
+            let mut rebound = package.clone();
+            rebound.digests.source_digest = "0".repeat(64);
+            assert!(matches!(
+                crate::check_lifecycle_standing(&current, "skill.demo", &rebound, &fence),
+                Err(SkillError::IdentityMismatch)
+            ));
+            // Revocation and supersession recorded by the lifecycle owner
+            // cannot be reinstalled around.
+            for status in [
+                crate::SkillStatus::Stale,
+                crate::SkillStatus::Suppressed,
+                crate::SkillStatus::Archived,
+                crate::SkillStatus::Quarantined,
+            ] {
+                let held =
+                    crate::SkillRegistry::from_snapshot([standing_view(&fence, &package, status)])
+                        .expect("recovered registry");
+                assert!(matches!(
+                    crate::check_lifecycle_standing(&held, "skill.demo", &package, &fence),
+                    Err(SkillError::InvalidField { field, .. }) if field == "lifecycle.status"
+                ));
+            }
+        }
+
+        #[test]
+        fn bound_materialization_still_installs_under_governor_context() {
+            use super::{SkillCatalogue, install_package};
+            use crate::KnownTools;
+
+            struct FixtureTools;
+
+            impl KnownTools for FixtureTools {
+                fn knows_tool(&self, name: &str) -> bool {
+                    name == "reviewer" || name == "review"
+                }
+            }
+
+            fn install_context() -> CatalogueInstallContext {
+                CatalogueInstallContext {
+                    eligible_routes: vec!["route-1".to_owned()],
+                    eligible_profiles: Vec::new(),
+                    host_version: "host-4.1.0".to_owned(),
+                    profile_version: "profile-2.0.0".to_owned(),
+                    admitted_definition_version: "1.2.0".to_owned(),
+                    index_budget_tokens: 200,
+                    body_budget_tokens: 800,
+                    runtime_budget_tokens: 2000,
+                    index_tokens: 60,
+                    body_tokens: 400,
+                    runtime_tokens: 0,
+                    references: Vec::new(),
+                    scripts: Vec::new(),
+                    assets: Vec::new(),
+                }
+            }
+
+            let candidate = candidate();
+            let material = material_for(&candidate.behavior);
+            let package = package_for(&candidate, &material);
+            // An unstamped candidate never binds: absent expected digests
+            // refuse instead of skipping the authority binding.
+            assert!(matches!(
+                validate_candidate_materialization(&candidate, &package, &material),
+                Err(SkillError::InvalidField { field, .. })
+                    if field == "candidate.package_digests"
+            ));
+            let candidate = crate::stamp_materialization_digests(&candidate, &package, &material)
+                .expect("binding passes before install");
+            let mut catalogue = SkillCatalogue::default();
+            let installed = install_package(
+                &mut catalogue,
+                &candidate,
+                &package,
+                &material,
+                &install_context(),
+                &FixtureTools,
+            )
+            .expect("bound package installs");
+            assert_eq!(installed, "skill.candidate");
+            assert!(catalogue.is_usable("skill.candidate"));
+        }
     }
 }
