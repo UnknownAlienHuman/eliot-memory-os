@@ -20,16 +20,17 @@ use super::{
     AuthorityPreparationError, AuthoritySnapshotBinding, BlobStoreController, BoundCanonicalOwner,
     ContractId, DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId,
     DispatchSnapshotCodec, GenerationRoute, GenerationRouter, GovernorClosureRestore, HealthVector,
-    IpcImplementation, KernelBackupRestore, KernelBuildError, KernelComposition, KernelConfig,
-    KernelDispatchKey, KernelError, KernelPathAdmission, KernelService,
-    KernelStoreRebindProductionBoundary, KernelSupervisionLeaseAuthority, ModuleGeneration,
-    ModuleGenerationState, OperationalRecoveryStore, OrsError, OrsGenerationCoordinator,
-    PROTOCOL_VERSION, PreparedAuthorityMaterial, ProcessAuthorityHandoffDescriptor,
-    ProcessDispatchAuthorityController, ProcessExecutionAuthorityConfig, ProcessExecutionGateway,
-    RedbRecoveryStore, RouteScope, Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy,
-    StartupCoordinator, StateFence, USER_AUTOMATION_KERNEL_CAPABILITY, UserOwnedPathLease,
-    UserOwnedRootLease, WindowsDispatchSnapshotCodec, WindowsPlatform, bind_canonical_owner,
-    is_lower_sha256, owner_bundle_digest, sha256_hex, sha256_json, unix_ms,
+    IpcImplementation, KernelBackupCapture, KernelBackupRestore, KernelBuildError,
+    KernelComposition, KernelConfig, KernelDispatchKey, KernelError, KernelPathAdmission,
+    KernelService, KernelStoreRebindProductionBoundary, KernelSupervisionLeaseAuthority,
+    ModuleGeneration, ModuleGenerationState, OperationalRecoveryStore, OrsError,
+    OrsGenerationCoordinator, PROTOCOL_VERSION, PreparedAuthorityMaterial,
+    ProcessAuthorityHandoffDescriptor, ProcessDispatchAuthorityController,
+    ProcessExecutionAuthorityConfig, ProcessExecutionGateway, RedbRecoveryStore, RouteScope,
+    Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy, StartupCoordinator, StateFence,
+    USER_AUTOMATION_KERNEL_CAPABILITY, UserOwnedPathLease, UserOwnedRootLease,
+    WindowsDispatchSnapshotCodec, WindowsPlatform, bind_canonical_owner, is_lower_sha256,
+    owner_bundle_digest, sha256_hex, sha256_json, unix_ms,
 };
 #[cfg(test)]
 use super::{CanonicalEvidenceProvider, DispatchValidationPort};
@@ -1310,6 +1311,11 @@ impl KernelComposition {
         WatchdogBackupOwnerClient::production()
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         backup_owner_clients::mark_owner_clients_bound();
+        // Issue #959: hold the Kernel-owned cross-owner backup capture
+        // coordinator on the composition. It binds the work root only;
+        // captures consume already-accepted owner evidence per execution,
+        // so no live owner channel is opened here.
+        let backup_capture = KernelBackupCapture::bind(work_root.clone());
         // F-LOG-KERNEL-2 (#899): constructed composition is not ready. The
         // service starts Cold, the daemon is NotLaunched, and no Store
         // gateway is claimed; readiness requires separate Host handoffs.
@@ -1363,6 +1369,7 @@ impl KernelComposition {
             canonical_store_claimed: AtomicBool::new(false),
             blob_store: Mutex::new(blob_store),
             backup_restore,
+            backup_capture,
             #[cfg(windows)]
             canonical_store_gateway: Mutex::new(None),
             #[cfg(windows)]

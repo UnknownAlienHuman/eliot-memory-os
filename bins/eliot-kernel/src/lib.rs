@@ -41,6 +41,8 @@
 
 #[cfg(windows)]
 mod agent_bridge;
+mod backup_capture;
+mod backup_capture_ports;
 mod backup_restore;
 mod backup_restore_ports;
 mod blob_store_controller;
@@ -61,6 +63,14 @@ mod testd_terminal_completion_route;
 /// Public wire-operation name for the authenticated TestD completion route.
 pub use testd_terminal_completion_route::OPERATION as TESTD_TERMINAL_COMPLETION_OPERATION;
 
+pub use backup_capture::{
+    CaptureReport, CaptureRequest, CaptureState, KernelBackupCapture, request_from_ports,
+};
+pub use backup_capture_ports::{
+    CaptureBudgets, CaptureCallerAuth, CapturePorts, FrozenCapturePlan, KernelCaptureError,
+    PublicationPort, PublicationReceipt, PublishedArchive, SnapshotRelation,
+    require_capture_admitted,
+};
 pub use backup_restore::{
     BlobOwnerClient, CanonicalOwnerClient, CutoverQualification, InvalidationKind,
     InvalidationOwnerClient, KernelBackupRestore, KernelRestoreOutcome, OrsOwnerClient,
@@ -519,6 +529,10 @@ pub struct KernelComposition {
     /// effects until the #962 owner-channel turn drives restores through it;
     /// the durable journal is injected per execution, never constructed here.
     backup_restore: KernelBackupRestore,
+    /// Kernel-owned cross-owner backup capture coordinator (issue #959).
+    /// Holds the work root only; every capture consumes already-accepted
+    /// owner evidence and publishes once through the admitted owner port.
+    backup_capture: KernelBackupCapture,
     #[cfg(windows)]
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
     #[cfg(windows)]
@@ -600,6 +614,14 @@ impl KernelComposition {
     #[must_use]
     pub fn backup_restore(&self) -> &KernelBackupRestore {
         &self.backup_restore
+    }
+
+    /// Returns the Kernel-owned cross-owner backup capture coordinator
+    /// (issue #959). Invocation arrives with the #962 owner-channel turn;
+    /// until then the coordinator is held without effects.
+    #[must_use]
+    pub fn backup_capture(&self) -> &KernelBackupCapture {
+        &self.backup_capture
     }
 }
 
