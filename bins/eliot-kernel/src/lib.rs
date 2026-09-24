@@ -456,9 +456,11 @@ const ELIOTD_RECEIPT_PENDING_REASON: &str = "exact launched process receipt publ
 #[cfg(windows)]
 const AGENT_BRIDGE_ACTIVATION_WINDOW_MS: u64 = 30_000;
 #[cfg(windows)]
-/// A daemon claim is retained for a short, bounded interval.  If semantic
-/// resolution fails transiently, the same Kernel-owned ticket becomes
-/// claimable again without allocating a new request or ticket identity.
+/// A daemon claim admission is recorded for a short, bounded interval. The
+/// mark below is a single-admission record, not a retry timer: a ticket whose
+/// claim was already admitted is never re-queued while result-less (#66
+/// C4/A3). Reconsideration requires a retained typed transient result with a
+/// changed-dependency discriminator on the submit path, never the lease clock.
 const AGENT_ACTIVATION_CLAIM_LEASE_MS: u64 = 1_000;
 #[cfg(windows)]
 const ELIOTD_MAX_RECOVERY_ATTEMPTS: u64 = 1;
@@ -671,8 +673,11 @@ struct AgentActivationPendingState {
 struct AgentActivationPending {
     ticket: AgentActivationResolutionTicket,
     request: AgentBridgeActivationRequest,
-    /// Private Kernel claim lease; it is deliberately absent from the wire
-    /// ticket so retries cannot mint or select a caller-owned identity.
+    /// Private Kernel single-admission mark; it is deliberately absent from
+    /// the wire ticket so retries cannot mint or select a caller-owned
+    /// identity. Once set, the ticket is never handed out again while
+    /// result-less (#66 C4/A3): an unanswered ticket rests until the
+    /// Kernel-owned deadline instead of looping the resolver.
     claim_lease_until_unix_ms: Option<u64>,
 }
 
@@ -689,10 +694,10 @@ enum ActivationDecisionDisposition {
 /// Submission phase of one retained v2 semantic result.
 ///
 /// Absence of a record means the ticket is still awaiting its result. A
-/// retained record is never re-queued by claim-lease expiry: the lease only
-/// recycles result-less tickets for transient resolver failure. The sole
+/// retained record is never re-queued by claim admission: admission is not a
+/// semantic delta. A result-less ticket is admitted at most once; the sole
 /// re-queue path for a deferred ticket is a gated superseding submission on
-/// the submit path, never the lease clock.
+/// the submit path, never the admission mark.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AgentActivationResultPhase {
@@ -751,9 +756,13 @@ impl AgentActivationPendingState {
         for _ in 0..queue_len {
             let ticket_id = self.fifo.pop_front()?;
             // A retained semantic result (v2) is terminal-or-deferred
-            // durable state: claim-lease expiry is not a semantic delta and
-            // never re-queues it. Only result-less tickets recycle through
-            // the lease for transient resolver failure.
+            // durable state: admission is not a semantic delta and never
+            // re-queues it. A result-less ticket is admitted at most once:
+            // re-admitting it would repeat the same semantic resolution
+            // against the same owner state without a typed transient result
+            // or changed-dependency discriminator (#66 C4/A3). An unanswered
+            // ticket rests until the Kernel-owned deadline, which projects
+            // result-less expiry instead of looping the resolver.
             if self.results.contains_key(&ticket_id) {
                 continue;
             }
@@ -763,10 +772,7 @@ impl AgentActivationPendingState {
             if activation_deadline_expired(now, entry.ticket.kernel_deadline_unix_ms) {
                 continue;
             }
-            if entry
-                .claim_lease_until_unix_ms
-                .is_some_and(|lease_until| now < lease_until)
-            {
+            if entry.claim_lease_until_unix_ms.is_some() {
                 self.fifo.push_back(ticket_id);
                 continue;
             }

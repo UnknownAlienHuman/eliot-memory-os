@@ -4719,7 +4719,70 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
         match self.read_unique_agent_activation(now) {
             Ok(snapshot) => GovernorActivationOutcome::Resolved(snapshot),
-            Err(error) => classify_activation_error(&error, now),
+            Err(error) => {
+                // #66 A2: an ambiguity finding must name the actual competing
+                // bindings. The unique-read error discards them, so re-read
+                // the live selection here instead of manufacturing handles.
+                let message = error.to_string();
+                if message.contains("AmbiguousActiveBinding")
+                    || message.contains("multiple active work bindings")
+                {
+                    return self.scope_ambiguous_outcome_from_selection(now);
+                }
+                classify_activation_error(&error, now)
+            }
+        }
+    }
+
+    /// Builds the `ScopeAmbiguous` outcome from the exact active-work
+    /// selection (#66 A2).
+    ///
+    /// Each candidate handle names one actual competing work binding
+    /// (`scope:candidate:{work_item_id}`), sorted and deduplicated, bounded by
+    /// `eliot_protocol::MAX_AGENT_ACTIVATION_CANDIDATES` (a truncated
+    /// denominator reports `Partial` coverage instead of claiming `Complete`).
+    /// When the selection cannot supply at least two distinct candidates (a
+    /// lost race between the two reads), the finding is an internal failure
+    /// for this ticket: never a manufactured placeholder pair and never
+    /// downgraded to task selection.
+    fn scope_ambiguous_outcome_from_selection(&self, now: u64) -> GovernorActivationOutcome {
+        let state_fence = self.snapshot.state_fence();
+        let selection = self.owners.coordination.read_active_work_lease_selection(
+            now,
+            state_fence.authority_epoch.clone(),
+            &state_fence,
+        );
+        let Ok(eliot_coordination::ActiveWorkLeaseSelection::Ambiguous { projections }) = selection
+        else {
+            return GovernorActivationOutcome::FailedInternal {
+                failure_handle: "governor.ambiguity-selection-unreadable:recovery".to_owned(),
+            };
+        };
+        let mut handles: Vec<String> = projections
+            .iter()
+            .map(|projection| format!("scope:candidate:{}", projection.work_item.work_item_id))
+            .collect();
+        handles.sort();
+        handles.dedup();
+        let complete = handles.len() <= eliot_protocol::MAX_AGENT_ACTIVATION_CANDIDATES;
+        if !complete {
+            handles.truncate(eliot_protocol::MAX_AGENT_ACTIVATION_CANDIDATES);
+        }
+        if handles.len() < 2 {
+            return GovernorActivationOutcome::FailedInternal {
+                failure_handle: "governor.ambiguity-selection-unreadable:recovery".to_owned(),
+            };
+        }
+        GovernorActivationOutcome::ScopeAmbiguous {
+            selection: GovernorSelectionDirective::new(
+                handles,
+                if complete {
+                    GovernorCandidateCoverage::Complete
+                } else {
+                    GovernorCandidateCoverage::Partial
+                },
+                "governor.scope-ambiguous:recovery",
+            ),
         }
     }
 
@@ -4911,18 +4974,18 @@ fn classify_activation_error(error: &CompositionError, now: u64) -> GovernorActi
             ),
         };
     }
+    // #66 A2: ambiguity without a live selection read carries no candidate
+    // identities, so the string classifier cannot name them. Such an error
+    // reaching this pure function means the selection denominator was lost
+    // between reads; it is an internal failure, never a manufactured
+    // placeholder pair and never task selection. The production resolver
+    // (`resolve_activation_outcome`) names the actual competing bindings from
+    // the live selection before this classifier is consulted.
     if message.contains("AmbiguousActiveBinding")
         || message.contains("multiple active work bindings")
     {
-        return GovernorActivationOutcome::ScopeAmbiguous {
-            selection: GovernorSelectionDirective::new(
-                vec![
-                    "scope:candidate:a".to_owned(),
-                    "scope:candidate:b".to_owned(),
-                ],
-                GovernorCandidateCoverage::Complete,
-                "governor.scope-ambiguous:recovery",
-            ),
+        return GovernorActivationOutcome::FailedInternal {
+            failure_handle: format!("governor.internal:{message}"),
         };
     }
     if message.contains("WorkScope binding is unbound")
