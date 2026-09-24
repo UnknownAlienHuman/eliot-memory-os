@@ -387,6 +387,7 @@ fn submit_chain_curation_success_with_injected_carrier() {
         job_id,
         candidates,
         provenance,
+        product_pulse: None,
     }) = result
     else {
         panic!("injected-carrier chain must route curation, got {result:?}");
@@ -426,6 +427,7 @@ fn submit_chain_curation_success_with_injected_carrier() {
             job_id: job_id.clone(),
             candidates: candidates.clone(),
             provenance: provenance.clone(),
+            product_pulse: None,
         }),
     );
     let line = render_jsonl(&view).expect("chain receipt must render");

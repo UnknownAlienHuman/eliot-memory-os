@@ -14,8 +14,28 @@
 //! returns at dispatch with zero screen work, and a failed screen never
 //! reaches the bundle stage.
 
-use eliot_contracts::{ReceiptId, RequestId};
+use std::collections::BTreeSet;
+
+use eliot_agent_contracts::AgentAttemptId;
+use eliot_contracts::{
+    ArtifactId, OperationId, PolicyRevision, ProductId, ReceiptId, RequestId, SourceId, TaskId,
+    TaskRevision, canonical_json_bytes, sha256_hex,
+};
 use eliot_dreamer_contracts::{ContractViolation, JobClass, ScreenBinding, ScreenState};
+use eliot_dreamer_cycle::{
+    CYCLE_SCHEMA_VERSION, CycleError, CyclePhase, CyclePlan, CyclePolicy, CycleSample,
+    DreamerCycleState, ExpectedArtifact, PendingRequest, PhasePolicyRule, RequestKind,
+    SampleLimits, plan_cycle, sample_cycle,
+};
+use eliot_memory_curation_contracts::{
+    CurationScreenRequest, CurationScreenResult, DenominatorCoverage, Digest, FindingClass,
+    FiniteDenominator, MemberEvidenceRefs, MemberId, MemberPartition, ProfileId, ProtectionClass,
+    QueryId, QueryIdentity, RequestBinding, RuleId, RuleSpec, ScreenLimits, ScreenProfile,
+    SnapshotId, SourceAvailability, SourceIdentity, SourceMember, SourceMemberKind, SourcePage,
+    SourceSnapshot,
+};
+use eliot_memory_curation_screen::{CurationScreenError, screen_memory_curation};
+use eliot_receipts::{EffectClass, ProofCeiling, ReceiptKind, WorkScopeId};
 
 use crate::admitted_material::sha_hex;
 use crate::controller::verify_admitted_binding;
@@ -227,7 +247,435 @@ pub(crate) fn screen_admitted_targets(
     })
 }
 
-/// Maps an owner screen refusal to a typed fail-closed refusal.
+/// Maximum number of handle members carried into one native screen call.
+const MAX_NATIVE_SOURCE_MEMBERS: usize = 64;
+/// Stable owner identity used by the bounded screen's inert cycle request.
+const NATIVE_SCREEN_OWNER: &str = "eliot-memory-curation-screen";
+/// Stable operation identity used by the bounded screen's inert cycle request.
+const NATIVE_SCREEN_OPERATION: &str = "CURATION_SCREEN";
+
+/// A bounded, handle-only source carrier supplied by the current daemon.
+///
+/// The carrier deliberately does not manufacture owner protection evidence or
+/// source content. Missing evidence is therefore represented as `Unknown` by
+/// the native screen, and the resulting Product Pulse records the omission.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BoundedCurationSource;
+
+impl BoundedCurationSource {
+    /// Projects the admitted handle families into one complete bounded native
+    /// source page. This is a carrier construction step only: it performs no
+    /// store read, model/tool invocation, semantic selection, or mutation.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the bounded carrier keeps source, request, and omission validation together"
+    )]
+    pub(crate) fn resolve(
+        binding: &ScreenBinding,
+        admission: &KernelJobAdmission,
+        job: &DreamJobInput,
+    ) -> Result<CurationSourceCarrier, DreamerError> {
+        if job.job_class != JobClass::Curation {
+            return Err(DreamerError::InvalidAdmission("native curation job class"));
+        }
+        let targets = screenable_targets(job);
+        if targets.is_empty() {
+            return Err(DreamerError::InvalidAdmission(
+                "no screenable targets were admitted",
+            ));
+        }
+        if targets.len() > MAX_NATIVE_SOURCE_MEMBERS {
+            return Err(DreamerError::LimitExceeded(
+                "native curation source members",
+            ));
+        }
+
+        let policy_revision = binding
+            .state_fence
+            .policy_revision
+            .unwrap_or_else(PolicyRevision::genesis);
+        let mut native_fence = binding.state_fence.clone();
+        native_fence.policy_revision = Some(policy_revision);
+        let source_scope = WorkScopeId::new(binding.scope_id.clone())
+            .map_err(|_| DreamerError::InvalidAdmission("native source scope"))?;
+        let source_identity = SourceIdentity {
+            product_id: ProductId::new("eliot-dreamer")
+                .map_err(|_| DreamerError::InvalidAdmission("native source product"))?,
+            source_id: SourceId::new(format!("dreamer-source:{}", job.job_id))
+                .map_err(|_| DreamerError::InvalidAdmission("native source id"))?,
+            snapshot_id: SnapshotId::new(format!("{}:native", binding.source_snapshot))
+                .map_err(|_| DreamerError::InvalidAdmission("native snapshot id"))?,
+            query: QueryIdentity {
+                query_id: QueryId::new(format!("{}:screen", binding.request_id.as_str()))
+                    .map_err(|_| DreamerError::InvalidAdmission("native query id"))?,
+                query_digest: Digest::new(sha_hex(&[
+                    "native-query",
+                    binding.request_id.as_str(),
+                    binding.source_snapshot.as_str(),
+                ]))
+                .map_err(|_| DreamerError::InvalidAdmission("native query digest"))?,
+            },
+            revision: binding
+                .source_revision
+                .strip_prefix('r')
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(1),
+            digest: Digest::new(sha_hex(&[
+                "native-source",
+                binding.source_snapshot.as_str(),
+                binding.result_digest.as_str(),
+            ]))
+            .map_err(|_| DreamerError::InvalidAdmission("native source digest"))?,
+            scope: source_scope.clone(),
+            state_fence: native_fence.clone(),
+        };
+
+        let mut member_ids = Vec::with_capacity(targets.len());
+        let mut members = Vec::with_capacity(targets.len());
+        for target in &targets {
+            let member_id = MemberId::new(target.clone())
+                .map_err(|_| DreamerError::InvalidAdmission("native source member"))?;
+            let content_digest = Digest::new(sha_hex(&["bounded-member", target.as_str()]))
+                .map_err(|_| DreamerError::InvalidAdmission("native member digest"))?;
+            members.push(SourceMember {
+                member_id: member_id.clone(),
+                kind: SourceMemberKind::Observation,
+                revision: TaskRevision::genesis(),
+                content_digest,
+                // A handle is not owner-issued provenance. Leaving these
+                // references empty is intentional and produces fail-closed
+                // protection/finding state rather than fabricated authority.
+                evidence: MemberEvidenceRefs::default(),
+            });
+            member_ids.push(member_id);
+        }
+        let total_members = u64::try_from(member_ids.len())
+            .map_err(|_| DreamerError::LimitExceeded("native source denominator"))?;
+        let denominator = FiniteDenominator {
+            // The declared denominator is exact for this carrier page, but the
+            // wider source scope remains explicitly partial until a
+            // Governor-resolved source body/evidence carrier is supplied.
+            coverage: DenominatorCoverage::Partial,
+            total_members,
+            declared_member_ids: member_ids.clone(),
+        };
+        let partition = MemberPartition {
+            changed_targets: member_ids.iter().cloned().collect(),
+            immutable_references: BTreeSet::new(),
+        };
+        let source = SourceSnapshot {
+            identity: source_identity.clone(),
+            denominator: denominator.clone(),
+            partition: partition.clone(),
+            availability: SourceAvailability::Available,
+            members,
+            page: SourcePage {
+                page_number: 0,
+                has_more: false,
+                frontier: Vec::new(),
+            },
+        };
+        let request = CurationScreenRequest {
+            source: source_identity,
+            denominator,
+            partition,
+            binding: RequestBinding {
+                request_id: binding.request_id.clone(),
+                operation_id: OperationId::new(format!(
+                    "{}:memory-curation-screen",
+                    binding.request_id.as_str()
+                ))
+                .map_err(|_| DreamerError::InvalidAdmission("native operation id"))?,
+                task_id: Some(
+                    TaskId::new(binding.task_id.clone())
+                        .map_err(|_| DreamerError::InvalidAdmission("native task id"))?,
+                ),
+                attempt_id: AgentAttemptId::new(admission.attempt_id.clone())
+                    .map_err(|_| DreamerError::InvalidAdmission("native attempt id"))?,
+                scope: source_scope,
+                state_fence: native_fence,
+            },
+            profile: native_screen_profile(policy_revision)?,
+            cursor: None,
+            cancellation_requested: false,
+        };
+        request
+            .validate_snapshot(&source)
+            .map_err(|_| DreamerError::InvalidAdmission("native source binding"))?;
+        Ok(CurationSourceCarrier {
+            request,
+            source,
+            evidence: Vec::new(),
+            omissions: vec![
+                "source_content:not_loaded".to_owned(),
+                "denominator:wider-scope-unobserved".to_owned(),
+                "protection_evidence:not_supplied".to_owned(),
+            ],
+        })
+    }
+}
+
+/// Owned native screen inputs and the explicit carrier omissions.
+pub(crate) struct CurationSourceCarrier {
+    pub(crate) request: CurationScreenRequest,
+    pub(crate) source: SourceSnapshot,
+    pub(crate) evidence: Vec<eliot_memory_curation_contracts::ProtectionEvidence>,
+    pub(crate) omissions: Vec<String>,
+}
+
+/// Native screen result plus the frozen sample and one-cycle plan projections.
+pub(crate) struct NativeCurationRoute {
+    pub(crate) job_id: String,
+    pub(crate) screen: CurationScreenResult,
+    pub(crate) sample: CycleSample,
+    pub(crate) plan: CyclePlan,
+    pub(crate) omissions: Vec<String>,
+}
+
+/// Builds the frozen native screen profile. The profile asks for both
+/// structural rules and every protection class; absent evidence consequently
+/// remains explicitly unknown instead of being treated as clear.
+fn native_screen_profile(policy_revision: PolicyRevision) -> Result<ScreenProfile, DreamerError> {
+    let required = BTreeSet::from([
+        ProtectionClass::CurrentTruth,
+        ProtectionClass::MinorityDissent,
+        ProtectionClass::Counterexample,
+        ProtectionClass::UnresolvedConflict,
+        ProtectionClass::NegativeMemory,
+        ProtectionClass::AuditHistory,
+        ProtectionClass::RetentionErasure,
+        ProtectionClass::ProtectedDependency,
+    ]);
+    let provenance_id = RuleId::new("provenance_gap_v1")
+        .map_err(|_| DreamerError::InvalidAdmission("native provenance rule"))?;
+    let conflict_id = RuleId::new("conflict_ambiguity_v1")
+        .map_err(|_| DreamerError::InvalidAdmission("native conflict rule"))?;
+    let profile_id = ProfileId::new("eliot-dreamer-curation-screen-v1")
+        .map_err(|_| DreamerError::InvalidAdmission("native screen profile"))?;
+    let provenance_rule = RuleSpec {
+        rule_id: provenance_id.clone(),
+        finding_class: FindingClass::ProvenanceGap,
+        precedence: 0,
+        required_protection: required.clone(),
+    };
+    let conflict_rule = RuleSpec {
+        rule_id: conflict_id.clone(),
+        finding_class: FindingClass::ConflictAmbiguity,
+        precedence: 1,
+        required_protection: required,
+    };
+    Ok(ScreenProfile {
+        profile_id,
+        schema_revision: PolicyRevision::genesis(),
+        policy_revision,
+        rules: vec![provenance_rule, conflict_rule],
+        requested_findings: BTreeSet::from([
+            FindingClass::ProvenanceGap,
+            FindingClass::ConflictAmbiguity,
+        ]),
+        precedence: vec![provenance_id, conflict_id],
+        limits: ScreenLimits {
+            max_items: MAX_NATIVE_SOURCE_MEMBERS as u64,
+            max_references: 256,
+            max_bytes: 1_048_576,
+            max_work_units: 100_000,
+            max_output_bytes: 1_048_576,
+            deadline_ms: None,
+            cancellation_grace_ms: None,
+        },
+    })
+}
+
+/// Runs the real native screen and the frozen cycle sample/plan projections.
+pub(crate) fn run_native_screen_route(
+    admission: &KernelJobAdmission,
+    job: &DreamJobInput,
+    binding: &ScreenBinding,
+    carrier: CurationSourceCarrier,
+) -> Result<NativeCurationRoute, DreamerError> {
+    let screen = screen_memory_curation(&carrier.request, &carrier.source, &carrier.evidence)
+        .map_err(|error| native_screen_denied(&error))?;
+    if screen.request.binding.request_id != binding.request_id
+        || screen.request.binding.scope.as_str() != binding.scope_id
+        || screen.request.binding.task_id.as_ref().map(TaskId::as_str)
+            != Some(binding.task_id.as_str())
+    {
+        return Err(DreamerError::InvalidAdmission(
+            "native screen owner binding",
+        ));
+    }
+    let (sample, plan) = frozen_cycle_projection(admission, job, &screen, &carrier.omissions)?;
+    let job_id = crate::admitted_material::admission_of(admission, job)?.canonical_id();
+    Ok(NativeCurationRoute {
+        job_id,
+        screen,
+        sample,
+        plan,
+        omissions: carrier.omissions,
+    })
+}
+
+/// Builds one sealed, read-only cycle state over the admitted job and then
+/// invokes the frozen `sample_cycle` and `plan_cycle` owners. No state is
+/// persisted and no owner request is dispatched; the plan remains inert.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the frozen cycle state, policy, and digest bindings are kept in one auditable constructor"
+)]
+fn frozen_cycle_projection(
+    admission: &KernelJobAdmission,
+    job: &DreamJobInput,
+    screen: &CurationScreenResult,
+    omissions: &[String],
+) -> Result<(CycleSample, CyclePlan), DreamerError> {
+    let admitted = crate::admitted_material::admission_of(admission, job)?;
+    let bundle = crate::admitted_material::bundle_of(admission, job)?;
+    let bundle_bytes = canonical_json_bytes(&bundle)
+        .map_err(|_| DreamerError::InvalidAdmission("frozen cycle bundle digest"))?;
+    let bundle_digest = sha256_hex(&bundle_bytes);
+    let budget_usage = crate::admitted_material::usage_of(&admitted.budget);
+    let job_bytes = canonical_json_bytes(&admitted)
+        .map_err(|_| DreamerError::InvalidAdmission("frozen cycle job digest"))?;
+    let job_digest = sha256_hex(&job_bytes);
+    let deadline_ms = admitted
+        .deadline_ms
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| DreamerError::InvalidAdmission("frozen cycle deadline"))?;
+    let policy_id = ArtifactId::new(admitted.policy_ref.clone())
+        .map_err(|_| DreamerError::InvalidAdmission("frozen cycle policy id"))?;
+    let cycle_id = ArtifactId::new(format!("dreamer-cycle:{}", admitted.canonical_id()))
+        .map_err(|_| DreamerError::InvalidAdmission("frozen cycle id"))?;
+    let request_id = RequestId::new(format!("{}:cycle-screen", admission.request_id))
+        .map_err(|_| DreamerError::InvalidAdmission("frozen cycle request id"))?;
+    let operation_id = OperationId::new(format!("{}:cycle-screen", admission.request_id))
+        .map_err(|_| DreamerError::InvalidAdmission("frozen cycle operation id"))?;
+    let payload_digest = screen.result_digest.as_str().to_owned();
+    let source_product = screen.source.identity.product_id.clone();
+    let source_id = screen.source.identity.source_id.clone();
+    let task_id = admitted.task_id.clone();
+    let scope_id = admitted.scope_id.clone();
+    let state_fence = admitted.state_fence.clone();
+    let pending = PendingRequest {
+        request_id: request_id.clone(),
+        operation_id: operation_id.clone(),
+        idempotency_key: admitted.idempotency_key.clone(),
+        product_id: source_product.clone(),
+        source_id: source_id.clone(),
+        operation_kind: NATIVE_SCREEN_OPERATION.to_owned(),
+        effect: EffectClass::Read,
+        proof_ceiling: ProofCeiling::Observation,
+        owner: NATIVE_SCREEN_OWNER.to_owned(),
+        kind: RequestKind::CurationScreen,
+        phase: CyclePhase::Screened,
+        attempt_id: screen.request.binding.attempt_id.clone(),
+        payload_digest: payload_digest.clone(),
+        bundle_digest: bundle_digest.clone(),
+        job_digest,
+        task_id: task_id.clone(),
+        scope_id: scope_id.clone(),
+        state_fence: state_fence.clone(),
+        predecessor_receipt_id: None,
+        handler_request: None,
+        expected_artifacts: vec![
+            ExpectedArtifact {
+                artifact_id: ArtifactId::new(format!("{}:screen-result", request_id.as_str()))
+                    .map_err(|_| DreamerError::InvalidAdmission("screen result artifact"))?,
+                sha256: payload_digest,
+                role: ReceiptKind::Request,
+                source_revision: Some(screen.source.identity.revision.to_string()),
+            },
+            ExpectedArtifact {
+                artifact_id: ArtifactId::new(format!("{}:bundle", request_id.as_str()))
+                    .map_err(|_| DreamerError::InvalidAdmission("bundle artifact"))?,
+                sha256: bundle_digest.clone(),
+                role: ReceiptKind::Artifact,
+                source_revision: None,
+            },
+        ],
+    };
+    let mut policy = CyclePolicy {
+        schema_version: CYCLE_SCHEMA_VERSION,
+        policy_id: policy_id.clone(),
+        policy_revision: PolicyRevision::genesis(),
+        state_fence: state_fence.clone(),
+        max_pending: 1,
+        max_outcomes: 1,
+        max_requests: 1,
+        max_transitions: 1,
+        max_bytes: 1_048_576,
+        deadline_ms,
+        cancellation_requested: false,
+        canonical_digest: String::new(),
+        phase_rules: vec![PhasePolicyRule {
+            phase: CyclePhase::Screened,
+            owner: NATIVE_SCREEN_OWNER.to_owned(),
+            product_id: source_product,
+            source_id,
+            operation_kind: NATIVE_SCREEN_OPERATION.to_owned(),
+            effect: EffectClass::Read,
+            proof_ceiling: ProofCeiling::Observation,
+        }],
+    };
+    policy.seal().map_err(|error| native_cycle_denied(&error))?;
+    let mut state = DreamerCycleState {
+        schema_version: CYCLE_SCHEMA_VERSION,
+        cycle_id,
+        job: admitted,
+        bundle_digest,
+        policy_id,
+        policy_revision: PolicyRevision::genesis(),
+        policy_digest: policy.canonical_digest.clone(),
+        phase: CyclePhase::BundleValidated,
+        controller_revision: 0,
+        predecessor_digest: None,
+        pending: vec![pending],
+        proposed_requests: Vec::new(),
+        outcomes: Vec::new(),
+        frontier: omissions.to_vec(),
+        budget_usage,
+        cancellation_requested: false,
+        canonical_digest: String::new(),
+    };
+    state.seal().map_err(|error| native_cycle_denied(&error))?;
+    state
+        .validate()
+        .map_err(|error| native_cycle_denied(&error))?;
+    let sample = sample_cycle(&state, &policy, &SampleLimits { max_sampled: 1 })
+        .map_err(|error| native_cycle_denied(&error))?;
+    let plan = plan_cycle(&sample, &state, &policy, Some(0))
+        .map_err(|error| native_cycle_denied(&error))?;
+    Ok((sample, plan))
+}
+
+fn native_screen_denied(error: &CurationScreenError) -> DreamerError {
+    match error {
+        CurationScreenError::Cancelled => DreamerError::InvalidAdmission("native curation screen"),
+        CurationScreenError::Contract(_) => {
+            DreamerError::InvalidAdmission("native curation screen contract")
+        }
+    }
+}
+
+fn native_cycle_denied(error: &CycleError) -> DreamerError {
+    match error {
+        CycleError::BindingMismatch { field, .. } | CycleError::Bound { field, .. } => {
+            DreamerError::InvalidAdmission(field)
+        }
+        CycleError::PhaseViolation(reason) | CycleError::IncompleteOutcome(reason) => {
+            DreamerError::InvalidAdmission(reason)
+        }
+        CycleError::IdentityConflict { .. } => {
+            DreamerError::InvalidAdmission("frozen cycle identity conflict")
+        }
+        CycleError::BudgetBlocked => DreamerError::InvalidAdmission("frozen cycle budget"),
+        CycleError::Contract(_) | CycleError::Receipt(_) | CycleError::Encoding(_) => {
+            DreamerError::InvalidAdmission("frozen cycle contract")
+        }
+    }
+}
+
 ///
 /// Every mapping is [`DreamerError::InvalidAdmission`] (request-rejected code),
 /// never the Kernel-admission code: the admission itself was valid, the screen

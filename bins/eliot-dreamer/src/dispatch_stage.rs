@@ -37,12 +37,11 @@
 //! request-rejected code) or [`DreamerError::UnsupportedJobClass`], never the
 //! Kernel-admission code: the admission itself was valid, the owner inputs
 //! were not. Dynamic payloads (handles, digests, reasons) are dropped in favor
-//! of bounded static field names; nothing secret flows. The Curation leaf
-//! handler runs only behind a Governor-injected carrier: production carries
-//! none (the ten live ports are Governor-injected and absent in-binary), so
-//! production Curation refuses at the carrier check before any generic stage
-//! work; tests inject the [`curation_test_support`] carrier to prove the wired
-//! A-31 path end to end.
+//! of bounded static field names; nothing secret flows. The current daemon's
+//! native Curation route is read-only and candidate-only: it maps the native
+//! screen result without constructing the A-31 handler ports. The historical
+//! A-31 leaf remains available only behind its explicit Governor/test
+//! execution carrier.
 
 use eliot_dreamer_candidate_validation::{
     CandidateValidationOutcome, DreamDraftValidationError, validate_grounded_dream_draft_at,
@@ -64,15 +63,17 @@ use eliot_dreamer_orientation::{
     AdmittedOrientationJob, OrientationError, OrientationPolicy,
     projection::{OrientationPacketCandidate, build_projection},
 };
+use eliot_memory_curation_contracts::MemberDisposition;
 
 use crate::admitted_material::{
     admission_of, bundle_of, orientation_frame_of, preservation_of, usage_of, v1_grounded_of,
     v1_model_of, validation_policy_of,
 };
 use crate::controller::verify_admitted_binding;
+use crate::curation_screen_stage::NativeCurationRoute;
 use crate::{
-    CurationCandidate, DreamJobInput, DreamPacket, DreamResult, DreamerError, Interpretation,
-    KernelJobAdmission, SourceCoverage,
+    CurationCandidate, CurationProductPulse, DreamJobInput, DreamPacket, DreamResult, DreamerError,
+    Interpretation, KernelJobAdmission, SourceCoverage,
 };
 
 /// Terminal fail-closed reason when the A-31 fan-in cannot be invoked: the
@@ -173,12 +174,11 @@ fn dispatch_denied(error: &ContractViolation) -> DreamerError {
 ///
 /// Takes the Kernel admission, the semantic job, the A-20 screen binding
 /// (`Some` for Curation, carried from the screen stage; `None` elsewhere),
-/// the Governor-injected Curation execution carrier (`Some` only where the
-/// Governor injected one; production passes `None`), the closed class, and
-/// the structured A-05 validated candidate (`Some` for every non-Curation
-/// admitted class, carried from the validation stage; `None` for Curation,
-/// which owns its separate carrier, and for refused classes, which never
-/// reach validation). Returns the owner-typed [`DreamResult`].
+/// the optional Governor-injected A-31 execution carrier, the closed class,
+/// and the structured A-05 validated candidate (`Some` for every
+/// non-Curation admitted class, carried from the validation stage; `None` for
+/// Curation, which owns its separate carrier, and for refused classes, which
+/// never reach validation). Returns the owner-typed [`DreamResult`].
 ///
 /// Fail-closed: the admission/job binding is verified first, then the class
 /// parameter is bound against the semantic job, then the exhaustive nine-arm
@@ -636,6 +636,100 @@ pub(crate) fn dispatch_curation(
     map_curation_set(&set)
 }
 
+/// Maps the native screen result onto a candidate-only Curation result.
+///
+/// Only members whose native disposition is exactly `Eligible` become
+/// candidates.  Protected, blocked, unknown, and reference dispositions remain
+/// visible in the typed Product Pulse and provenance but never become a
+/// semantic candidate.  An all-blocked screen is still a valid bounded result:
+/// it is a fail-closed observation, not an invented successful curation.
+pub(crate) fn dispatch_screened_curation(route: NativeCurationRoute) -> DreamResult {
+    let NativeCurationRoute {
+        job_id,
+        screen,
+        sample,
+        plan,
+        omissions,
+    } = route;
+    let mut provenance = Vec::new();
+    for member in &screen.coverage.denominator.declared_member_ids {
+        push_unique(&mut provenance, member.as_str().to_owned());
+    }
+    for finding in &screen.findings {
+        push_unique(
+            &mut provenance,
+            format!("finding:{}", finding.finding_id.as_str()),
+        );
+    }
+    for assessment in &screen.protection {
+        push_unique(
+            &mut provenance,
+            format!(
+                "protection:{}:{:?}",
+                assessment.member_id.as_str(),
+                assessment.decision
+            ),
+        );
+    }
+    for omission in &omissions {
+        push_unique(&mut provenance, omission.clone());
+    }
+    push_unique(
+        &mut provenance,
+        format!("cycle-sample:{}", sample.coverage_digest),
+    );
+    push_unique(&mut provenance, format!("cycle-plan:{}", plan.plan_digest));
+
+    let mut candidates = Vec::new();
+    for member in &screen.coverage.members {
+        if member.disposition != MemberDisposition::Eligible || !member.eligible {
+            continue;
+        }
+        let member_id = member.member_id.as_str();
+        let protection = screen
+            .protection
+            .iter()
+            .find(|assessment| assessment.member_id == member.member_id)
+            .map_or_else(
+                || "unknown".to_owned(),
+                |assessment| format!("{:?}", assessment.decision),
+            );
+        candidates.push(CurationCandidate {
+            candidate_id: member_id.to_owned(),
+            // This is a screening disposition, not a selected semantic kind.
+            kind: "screened_candidate".to_owned(),
+            source_handles: vec![member_id.to_owned()],
+            proposed_transformation:
+                "Native screen retained an eligible reversible candidate; no semantic kind or source mutation was selected."
+                    .to_owned(),
+            uncertainty: format!(
+                "candidate_only; screen_state={:?}; protection={protection}; no semantic kind selected",
+                screen.state
+            ),
+            rollback:
+                "Discard this candidate record; no source mutation was performed.".to_owned(),
+        });
+    }
+    let product_pulse = CurationProductPulse::from_native(
+        &screen,
+        &omissions,
+        &sample.coverage_digest,
+        &plan.plan_digest,
+    );
+    DreamResult::Curation {
+        job_id,
+        candidates,
+        provenance,
+        product_pulse: Some(product_pulse),
+    }
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
 /// Maps one routed A-31 candidate set onto the crate curation result.
 ///
 /// One [`CurationCandidate`] per member with a live candidate disposition and
@@ -691,6 +785,7 @@ fn map_curation_set(set: &CurationCandidateSet) -> Result<DreamResult, DreamerEr
         job_id: set.job_id.clone(),
         candidates,
         provenance,
+        product_pulse: None,
     })
 }
 
@@ -1911,6 +2006,7 @@ mod slice_7_native_owner_tests {
             job_id,
             candidates,
             provenance,
+            product_pulse: None,
         }) = result
         else {
             panic!("injected-carrier curation must route, got {result:?}");
@@ -1957,6 +2053,7 @@ mod slice_7_native_owner_tests {
                 job_id: job_id.clone(),
                 candidates: candidates.clone(),
                 provenance: provenance.clone(),
+                product_pulse: None,
             }),
         );
         let Ok(line) = render_jsonl(&view) else {

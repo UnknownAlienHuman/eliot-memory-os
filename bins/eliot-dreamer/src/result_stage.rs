@@ -148,6 +148,7 @@ mod slice_8_result_tests {
                 rollback: "Discard the candidate.".to_owned(),
             }],
             provenance: vec!["evidence-1".to_owned()],
+            product_pulse: None,
         }
     }
 

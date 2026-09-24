@@ -2,7 +2,8 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use eliot_dreamer::{
-    AuthenticatedKernelJobPort, DreamerError, JobState, JobView, KernelSupervisedComposition,
+    AuthenticatedKernelJobPort, BoundedCurationSource, DreamerError, JobState, JobView,
+    KernelSupervisedComposition, bounded_curation_job_input,
 };
 use serde::Serialize;
 
@@ -34,18 +35,33 @@ fn main() -> ExitCode {
     // A log line can therefore never be mistaken for a receipt. No process is
     // launched and no file is written here.
     let mut output = io::BufWriter::new(io::stdout().lock());
+    // The current daemon supplies the bounded native source carrier before
+    // constructing the supervised service. The carrier is handle-only and
+    // contains no source body, handler port, model/tool route, or authority.
+    // The current claim envelope has no semantic job-class field, so this
+    // entry is intentionally a Curation-only projection; a future
+    // Governor-resolved class/source carrier must replace it before other
+    // Dreamer classes can use this front door.
+    let bounded_source = BoundedCurationSource;
     let port = match AuthenticatedKernelJobPort::connect() {
-        Ok(port) => port,
+        Ok(port) => port.with_bounded_curation_source(&bounded_source),
         Err(error) => {
             write_error_stderr(&error);
             return ExitCode::from(KERNEL_ADMISSION_EXIT);
         }
     };
     // The claim (`LeaseExact` then `Start`) already proved admission. The
-    // supervised loop confirms the live Kernel-proved disposition through
-    // `Status` and projects exactly that: no hardcoded state, no local
-    // terminal invention. Any denial fails closed with exit 78.
+    // semantic carrier is derived only from that claimed identity and is
+    // submitted through the real `KernelJobPort::submit` path; no local
+    // terminal state is invented.
     let admission = port.claimed_admission().clone();
+    let job = match bounded_curation_job_input(&admission) {
+        Ok(job) => job,
+        Err(error) => {
+            write_error_stderr(&error);
+            return ExitCode::from(KERNEL_ADMISSION_EXIT);
+        }
+    };
     let mut service = match KernelSupervisedComposition::connect(port) {
         Ok(service) => service,
         Err(error) => {
@@ -53,7 +69,7 @@ fn main() -> ExitCode {
             return ExitCode::from(KERNEL_ADMISSION_EXIT);
         }
     };
-    match service.status(&admission) {
+    match service.submit(&admission, &job) {
         Ok(view) => {
             if !write_view(&mut output, &view) {
                 write_error_stderr(&DreamerError::InvalidAdmission("result encoding failure"));

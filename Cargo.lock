@@ -1323,6 +1323,7 @@ dependencies = [
 name = "eliot-dreamer"
 version = "0.1.0"
 dependencies = [
+ "eliot-agent-contracts",
  "eliot-cli",
  "eliot-context-contracts",
  "eliot-contracts",
@@ -1335,10 +1336,13 @@ dependencies = [
  "eliot-dreamer-orientation",
  "eliot-dreamer-probe-plan",
  "eliot-dreamer-rival-model",
+ "eliot-memory-curation-contracts",
+ "eliot-memory-curation-screen",
  "eliot-platform",
  "eliot-process",
  "eliot-process-executor",
  "eliot-protocol",
+ "eliot-receipts",
  "serde",
  "serde_json",
  "thiserror",
