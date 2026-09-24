@@ -1,0 +1,85 @@
+{
+  "issue": 974,
+  "affected_manifests": [
+    "bins/eliot-kernel/Cargo.toml",
+    "bins/eliot-watchdog/Cargo.toml",
+    "crates/kernel/eliot-host-control-endpoint/Cargo.toml",
+    "crates/kernel/eliot-host-service/Cargo.toml",
+    "Cargo.toml",
+    "Cargo.lock"
+  ],
+  "dependency_edges": [
+    {
+      "consumer": "eliot-kernel",
+      "dependency": "eliot-backup",
+      "manifest": "bins/eliot-kernel/Cargo.toml",
+      "line": 23,
+      "symbol": "BackupBundle"
+    },
+    {
+      "consumer": "eliot-kernel",
+      "dependency": "eliot-ipc",
+      "manifest": "bins/eliot-kernel/Cargo.toml",
+      "line": 27,
+      "symbol": "TransportError"
+    },
+    {
+      "consumer": "eliot-kernel",
+      "dependency": "eliot-protocol",
+      "manifest": "bins/eliot-kernel/Cargo.toml",
+      "line": 30,
+      "symbol": "Frame"
+    },
+    {
+      "consumer": "eliot-kernel",
+      "dependency": "eliot-store-api",
+      "manifest": "bins/eliot-kernel/Cargo.toml",
+      "line": 37,
+      "symbol": "WriteReceipt"
+    },
+    {
+      "consumer": "eliot-host-control-endpoint",
+      "dependency": "eliot-host-service",
+      "manifest": "crates/kernel/eliot-host-control-endpoint/Cargo.toml",
+      "line": 17,
+      "symbol": "response_matches_request"
+    },
+    {
+      "consumer": "eliot-host-control-endpoint",
+      "dependency": "eliot-ipc",
+      "manifest": "crates/kernel/eliot-host-control-endpoint/Cargo.toml",
+      "line": 18,
+      "symbol": "NamedPipeServer"
+    },
+    {
+      "consumer": "eliot-host-service",
+      "dependency": "eliot-protocol",
+      "manifest": "crates/kernel/eliot-host-service/Cargo.toml",
+      "line": 20,
+      "symbol": "EventEnvelope"
+    },
+    {
+      "consumer": "eliot-backup",
+      "dependency": "eliot-blob-api",
+      "manifest": "crates/storage/eliot-backup/Cargo.toml",
+      "line": 14,
+      "symbol": "BlobLocator"
+    },
+    {
+      "consumer": "eliot-backup",
+      "dependency": "eliot-store-api",
+      "manifest": "crates/storage/eliot-backup/Cargo.toml",
+      "line": 18,
+      "symbol": "WriteReceipt"
+    },
+    {
+      "consumer": "eliot-blob",
+      "dependency": "eliot-blob-api",
+      "manifest": "crates/storage/eliot-blob/Cargo.toml",
+      "line": 10,
+      "symbol": "BlobLocator"
+    }
+  ],
+  "frozen_base": "9cddf1752596faf971e7c718df76da3a9f2dff00",
+  "denominator_digest": "4337e2b6ec6e21733b8edd368c7c4feb51454b21923d73e4dec3891a27bc08ee"
+}
