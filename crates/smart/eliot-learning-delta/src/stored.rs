@@ -12,9 +12,9 @@ use crate::LearningDeltaError;
 
 /// Durable disposition vocabulary for a stored learning delta.
 ///
-/// Disposition vocabulary "LOCAL_UPDATE_ADMITTED | NEXT_PROBE_CHANGED |
-/// REUSABLE_CANDIDATE_OPENED | NO_JUSTIFIED_CHANGE | INCONCLUSIVE |
-/// INVALID_EVIDENCE".
+/// Disposition vocabulary `LOCAL_UPDATE_ADMITTED` | `NEXT_PROBE_CHANGED` |
+/// `REUSABLE_CANDIDATE_OPENED` | `NO_JUSTIFIED_CHANGE` | `INCONCLUSIVE` |
+/// `INVALID_EVIDENCE`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StoredDeltaDisposition {
@@ -47,10 +47,10 @@ pub enum AttemptCloseDisposition {
 impl AttemptCloseDisposition {
     /// Map a close disposition to its same-named stored disposition.
     ///
-    /// NoJustifiedChange -> affirmative NoChange outcome (derive
-    /// phase_build_no_change), Inconclusive -> Failure::Unknown / no
-    /// fabricated Delta, InvalidEvidence -> typed evidence-binding failure
-    /// recorded as close reason (never a Delta).
+    /// `NoJustifiedChange` -> affirmative `NoChange` outcome (derive
+    /// `phase_build_no_change`), `Inconclusive` -> `Failure::Unknown` / no
+    /// fabricated `Delta`, `InvalidEvidence` -> typed evidence-binding failure
+    /// recorded as close reason (never a `Delta`).
     pub const fn as_stored(self) -> StoredDeltaDisposition {
         match self {
             Self::NoJustifiedChange => StoredDeltaDisposition::NoJustifiedChange,
@@ -179,7 +179,7 @@ impl StoredLearningDelta {
     /// Return the canonical lineage a retry must reference.
     ///
     /// The retry's canonical lineage references this durable delta (append
-    /// delta_artifact id to the retry attempt evidence_refs).
+    /// `delta_artifact` id to the retry attempt `evidence_refs`).
     pub fn lineage_for_retry(&self) -> (&ArtifactId, &str) {
         (&self.delta_artifact, self.delta_digest.as_str())
     }
