@@ -79,6 +79,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::learning_store::{
+    LEARNING_PARAM_CURSOR, LEARNING_PARAM_FENCE_DIGEST, LEARNING_PARAM_HANDLE,
+    LEARNING_PARAM_IDEMPOTENCY_KEY, LEARNING_PARAM_MAX_RECORDS, LEARNING_PARAM_RECORD_DIGEST,
+    LEARNING_PARAM_RECORD_JSON, LEARNING_PARAM_RECORD_KIND, LEARNING_PARAM_SCOPE_DIGEST,
+};
 use crate::{
     CONTROL_FIELD_DENYLIST, NamedMutationOperation, NamedReadOperation, OperationId, StoreError,
     canonical_json_bytes, sha256_hex,
@@ -825,6 +830,73 @@ static COMMIT_EXPERIENCE_PARAMETERS: [ParameterDeclaration; 6] = [
     },
 ];
 
+/// Closed commit parameters for the learning-record leg (issue #1868):
+/// the closed record-kind discriminator, the exact record handle, the
+/// verbatim record document, the presented record/scope/fence digests,
+/// and the idempotency key. The kind is bound by the discriminator
+/// parameter over the closed [`LearningRecordKind`](crate::LearningRecordKind)
+/// set, never by a per-kind table.
+static COMMIT_LEARNING_PARAMETERS: [ParameterDeclaration; 7] = [
+    ParameterDeclaration {
+        name: LEARNING_PARAM_RECORD_KIND,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: LEARNING_PARAM_HANDLE,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: LEARNING_PARAM_RECORD_JSON,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: LEARNING_PARAM_RECORD_DIGEST,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: LEARNING_PARAM_SCOPE_DIGEST,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: LEARNING_PARAM_FENCE_DIGEST,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: LEARNING_PARAM_IDEMPOTENCY_KEY,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+
+/// Shared closed selector for the learning-record range read (issue
+/// #1868): the required `max_records` bound as its decimal string, the
+/// optional closed `record_kind` filter, plus the optional opaque
+/// `cursor` continuation selector. Scope arrives through the typed
+/// `scope_id` request field, mirroring `GetEvidencePack`.
+static GET_LEARNING_RANGE_PARAMETERS: [ParameterDeclaration; 3] = [
+    ParameterDeclaration {
+        name: LEARNING_PARAM_MAX_RECORDS,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: LEARNING_PARAM_RECORD_KIND,
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: LEARNING_PARAM_CURSOR,
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+];
+
 /// Owner-approved task-control fields emitted by the Governor task lifecycle
 /// envelope (`crates/governor/eliot-governor/src/task_lifecycle.rs`,
 /// `task_envelope`): the transitioned `task_id`, the admitted `event_id`, the
@@ -880,6 +952,7 @@ pub const fn named_read_operation_name(operation: NamedReadOperation) -> &'stati
         NamedReadOperation::GetUserAutomationState => "GetUserAutomationState",
         NamedReadOperation::GetExperienceBankRange => "GetExperienceBankRange",
         NamedReadOperation::GetAgentFeedbackRange => "GetAgentFeedbackRange",
+        NamedReadOperation::GetLearningRecordRange => "GetLearningRecordRange",
         NamedReadOperation::GetScopeRevisionView => "GetScopeRevisionView",
         NamedReadOperation::GetOrderingHeads => "GetOrderingHeads",
         NamedReadOperation::GetTaskState => "GetTaskState",
@@ -926,6 +999,7 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
         b"GetUserAutomationState" => Some(NamedReadOperation::GetUserAutomationState),
         b"GetExperienceBankRange" => Some(NamedReadOperation::GetExperienceBankRange),
         b"GetAgentFeedbackRange" => Some(NamedReadOperation::GetAgentFeedbackRange),
+        b"GetLearningRecordRange" => Some(NamedReadOperation::GetLearningRecordRange),
         _ => None,
     }
 }
@@ -950,6 +1024,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::ApplyUserAutomationState => "ApplyUserAutomationState",
         NamedMutationOperation::CommitExperienceBank => "CommitExperienceBank",
         NamedMutationOperation::CommitAgentFeedback => "CommitAgentFeedback",
+        NamedMutationOperation::RecordLearningRecord => "RecordLearningRecord",
     }
 }
 
@@ -973,6 +1048,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"ApplyUserAutomationState" => Some(NamedMutationOperation::ApplyUserAutomationState),
         b"CommitExperienceBank" => Some(NamedMutationOperation::CommitExperienceBank),
         b"CommitAgentFeedback" => Some(NamedMutationOperation::CommitAgentFeedback),
+        b"RecordLearningRecord" => Some(NamedMutationOperation::RecordLearningRecord),
         _ => None,
     }
 }
@@ -1003,6 +1079,10 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
 /// decimal `max_records` bound plus the optional opaque `cursor`
 /// continuation selector (issue #223; scope arrives through the typed
 /// `scope_id` request field, mirroring `GetEvidencePack`);
+/// `GetLearningRecordRange` declares the required decimal `max_records`
+/// bound, the optional closed `record_kind` filter, plus the optional
+/// opaque `cursor` continuation selector (issue #1868; scope arrives
+/// through the typed `scope_id` request field, mirroring `GetEvidencePack`);
 /// `GetAuditRange` declares the optional opaque `cursor` continuation
 /// selector (issue #223; absent cursors read from the start);
 /// every other variant declares none, so any supplied parameter fails closed. Variants without a catalogue entry never
@@ -1031,6 +1111,7 @@ pub const fn declared_read_parameters(
         NamedReadOperation::GetExperienceBankRange | NamedReadOperation::GetAgentFeedbackRange => {
             &GET_EXPERIENCE_RANGE_PARAMETERS
         }
+        NamedReadOperation::GetLearningRecordRange => &GET_LEARNING_RANGE_PARAMETERS,
         NamedReadOperation::GetAuditRange => &GET_AUDIT_RANGE_PARAMETERS,
         NamedReadOperation::GetRevisionHeads
         | NamedReadOperation::GetScopeRevisionView
@@ -1083,6 +1164,10 @@ pub const fn declared_read_parameters(
 /// `record_revision` as its decimal string, `scope_digest`,
 /// `fence_digest`, `idempotency_key`; family bound by the operation
 /// variant, digest re-proof at the Governor read edge);
+/// `RecordLearningRecord` declares the seven required commit fields
+/// (`record_kind` over the closed learning-kind set, `handle`,
+/// `record_json`, `record_digest`, `scope_digest`, `fence_digest`,
+/// `idempotency_key`; digest IS the immutable revision identity);
 /// every other variant declares none,
 /// so any supplied parameter fails closed. Variants without a catalogue entry
 /// never reach this table: they fail as [`StoreError::UnknownOperation`] first.
@@ -1109,6 +1194,7 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::ApplyUserAutomationState => &APPLY_USER_AUTOMATION_PARAMETERS,
         NamedMutationOperation::CommitExperienceBank
         | NamedMutationOperation::CommitAgentFeedback => &COMMIT_EXPERIENCE_PARAMETERS,
+        NamedMutationOperation::RecordLearningRecord => &COMMIT_LEARNING_PARAMETERS,
     }
 }
 
