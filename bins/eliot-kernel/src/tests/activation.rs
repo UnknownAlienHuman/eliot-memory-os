@@ -84,7 +84,7 @@ fn activation_test_entry(deadline: u64) -> (String, AgentActivationPending) {
 
 #[cfg(windows)]
 #[test]
-fn activation_claim_lease_retries_transient_resolution_without_duplicate_claim() {
+fn activation_claim_is_single_admission_without_result_less_recycle() {
     let (ticket_id, entry) = activation_test_entry(2_000);
     let mut pending = AgentActivationPendingState::default();
     pending.fifo.push_back(ticket_id.clone());
@@ -93,10 +93,17 @@ fn activation_claim_lease_retries_transient_resolution_without_duplicate_claim()
     let first = pending.claim_at(1).expect("first claim");
     assert_eq!(first.ticket_id, "activation-ticket-test");
     assert!(pending.claim_at(AGENT_ACTIVATION_CLAIM_LEASE_MS).is_none());
-    let retry = pending
-        .claim_at(AGENT_ACTIVATION_CLAIM_LEASE_MS + 1)
-        .expect("claim after lease expiry");
-    assert_eq!(retry, first, "retry reuses the exact Kernel ticket");
+    // #66 C4/A3: a result-less ticket is never re-queued after its single
+    // admission, even after the admission mark passes. Reconsideration
+    // requires a retained typed transient result with a changed-dependency
+    // discriminator on the submit path; an unanswered ticket rests until the
+    // Kernel-owned deadline instead of looping the resolver.
+    assert!(
+        pending
+            .claim_at(AGENT_ACTIVATION_CLAIM_LEASE_MS + 1)
+            .is_none()
+    );
+    assert!(pending.claim_at(1_999).is_none());
 }
 
 #[cfg(windows)]
