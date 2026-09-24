@@ -1,0 +1,9 @@
+{
+  "schema": "eliot.storage.backup-io.restore.v1",
+  "contract": "1.0.0",
+  "members": ["batch-01", "batch-02"],
+  "digests": [
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  ]
+}

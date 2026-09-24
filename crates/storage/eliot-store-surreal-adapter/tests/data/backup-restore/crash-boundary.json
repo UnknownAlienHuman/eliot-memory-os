@@ -1,0 +1,22 @@
+{
+  "cases": [
+    {
+      "name": "clean-commit",
+      "before_commit": false,
+      "after_commit": true,
+      "expect": "committed"
+    },
+    {
+      "name": "replay-commit",
+      "before_commit": true,
+      "after_commit": true,
+      "expect": "committed"
+    },
+    {
+      "name": "conflicting-retry",
+      "before_commit": true,
+      "after_commit": true,
+      "expect": "conflict"
+    }
+  ]
+}

@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 mod apply;
+pub mod backup_restore;
 mod backup_snapshot;
 mod client;
 mod config;
@@ -32,6 +33,14 @@ use std::fmt;
 use std::num::NonZeroUsize;
 
 pub use crate::client::session_pool::{PoolAdmission, PoolOccupancy, SessionRole};
+pub use backup_restore::{
+    MAX_ADMISSION_AGE_MS, MAX_RESTORE_BATCH_MEMBERS, MAX_RESTORE_BYTES, MAX_RESTORE_DURATION_MS,
+    RESTORE_CAPABILITY, RESTORE_SCHEMA_V1, RestoreDenominator, RestoreLedger,
+    SUPPORTED_RESTORE_OPERATIONS, active_store_identity, is_supported_restore_operation,
+    is_suppressed_by_current_purge, new_destination_identity, redact_store_error,
+    shared_restore_ledger, validate_isolated_destination, validate_reference_closure,
+    validate_restore_batch,
+};
 pub use config::{
     ADAPTER_NAME, ClientSetLimits, ConfigError, MAX_CLIENT_SET_SESSIONS_PER_ROLE,
     PINNED_SURREALDB_MAJOR, SchemaGeneration, SchemaGenerationError, SurrealAdapterConfig,

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+mod backup_restore;
 mod json_codec;
 #[cfg(all(test, windows))]
 mod payload_tests;
@@ -18,6 +19,18 @@ mod provider_owner;
 mod rpc_parse;
 mod session;
 pub(crate) mod session_pool;
+/// Fixed isolated-restore operation registration (issue #952).
+///
+/// The closed restore vocabulary lives in [`backup_restore`]; restore
+/// operations are writes, so they are never pool reads. This re-export is the
+/// sole registration point: every fixed restore statement is an adapter-owned
+/// `&'static str` with bound parameters only, and caller text can never become
+/// a statement, table, connection, or credential override.
+pub(crate) use backup_restore::{
+    RESTORE_OPERATION_APPLY, RESTORE_OPERATION_PREPARE, RESTORE_OPERATION_RECONCILE,
+    RESTORE_OPERATION_VALIDATE, fixed_restore_statement, restore_capability,
+    validate_restore_operation,
+};
 pub(crate) use provider_owner::ProviderOwner;
 use session::RpcSession;
 use session_pool::{SessionPool, SessionRole};
