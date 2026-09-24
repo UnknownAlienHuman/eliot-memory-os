@@ -17,6 +17,10 @@ use crate::activation_outcome::{
 use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
+use crate::cue_composition::{
+    CueReadCompositionError, CueReconstruction, CueReconstructionCache,
+    reconstruct_cue_snapshot_from_reads,
+};
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
 use crate::owner_closure_feed::{OwnerPublishPort, synchronize_owner_feed};
@@ -24,8 +28,9 @@ use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
 use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
 use crate::{
-    FinishAttemptError, Governor, GovernorConfig, GovernorFinishAttempt, GovernorState,
-    QueueLimits, STARTUP_ORDER, ServiceId, ServiceObservation,
+    ContextReconstructionRequest, FinishAttemptError, Governor, GovernorConfig,
+    GovernorFinishAttempt, GovernorState, QueueLimits, STARTUP_ORDER, ServiceId,
+    ServiceObservation,
 };
 use eliot_authority::{
     GrantActivationRequest, GrantId, GrantRevocationRequest, GrantStatus,
@@ -39,10 +44,11 @@ use eliot_canonical::{
 use eliot_change_monitor::ChangeMonitor;
 use eliot_config::ConfigPolicySnapshot;
 use eliot_contracts::{
-    ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId,
+    ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId, RequestMetadata,
     ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
 };
 use eliot_coordination::CoordinationOwner;
+use eliot_cue_contracts::{NormalizationProfile, SnapshotId};
 use eliot_diagnostic::{
     CONTRACT_NAME as DIAGNOSTIC_CONTRACT, DiagnosticClassifier, DiagnosticEvent, DiagnosticInput,
     DiagnosticSeverity, DiagnosticStatus,
@@ -64,12 +70,13 @@ use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
 use eliot_protocol::RequestIdentity;
+use eliot_read::ReadApi;
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
     CanonicalReadClient, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
-    ScopeRevisionView, StoreHealth, WriteReceipt,
+    RevisionKey, ScopeId, ScopeRevisionView, StoreHealth, WriteReceipt,
 };
 use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskState};
 use eliot_testd_core::{
@@ -3098,6 +3105,9 @@ pub struct GovernorComposition<P: ?Sized> {
     /// Exact P-07 presentations retained with their owner snapshots until
     /// exact reconciliation, keyed by [`PresentedAuthorityRequest::ledger_key`].
     authority_presentations: BTreeMap<String, RetainedAuthorityRequest>,
+    /// Rebuildable, revision/fence-keyed cue read projection owned by this
+    /// composition. It is not a semantic store and never grants admission.
+    cue_cache: CueReconstructionCache,
 }
 
 fn testd_finished_clock(job: &TestJob) -> ClockReading {
@@ -3501,6 +3511,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             service_observations,
             readiness: CompositionReadiness::Ready,
             authority_presentations: BTreeMap::new(),
+            cue_cache: CueReconstructionCache::new(),
         })
     }
 
@@ -3628,6 +3639,110 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     #[must_use]
     pub fn governor(&self) -> &Governor {
         &self.governor
+    }
+
+    /// Returns the exact current `WorkScope` identity for a cue read.
+    pub fn current_work_scope_id(&self) -> Result<ScopeId, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery("current WorkScope binding is unavailable".to_owned())
+        })?;
+        let snapshot = owner
+            .read_current(&self.snapshot.state_fence())
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        ScopeId::new(snapshot.binding.scope.scope_ref)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Builds a selector-complete startup read request from the current
+    /// canonical plan and exact scope revision head. Missing plan, scope, or
+    /// dependency evidence is a typed recovery refusal; no default selector or
+    /// revision is manufactured.
+    pub fn production_cue_reconstruction_request(
+        &self,
+        scope: ScopeId,
+    ) -> Result<ContextReconstructionRequest, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let plan = self.owners.canonical.read_current_plan(&fence)?;
+        if plan.work_scope_id != scope.as_str() {
+            return Err(CompositionError::Recovery(
+                "current canonical plan does not belong to the requested cue scope".to_owned(),
+            ));
+        }
+        let key = RevisionKey::new(format!("scope:{}", scope.as_str()))
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let mut matching = self
+            .recovery
+            .canonical_scope
+            .revision_heads
+            .iter()
+            .filter(|head| head.key == key);
+        let Some(head) = matching.next() else {
+            return Err(CompositionError::Recovery(
+                "current cue scope revision head is missing".to_owned(),
+            ));
+        };
+        if matching.next().is_some() || head.revision == 0 || head.state_fence != fence {
+            return Err(CompositionError::Recovery(
+                "current cue scope revision head is ambiguous or stale".to_owned(),
+            ));
+        }
+        let request = ContextReconstructionRequest {
+            scope_id: scope,
+            dependency_revisions: BTreeMap::from([(key, head.revision)]),
+            epistemic_position: "current".to_owned(),
+            evidence_subject: "context-reconstruction".to_owned(),
+            evidence_max_records: 1,
+            task_id: plan.task_id.as_str().to_owned(),
+            problem_id: None,
+            projection_selector: plan.plan_id.clone(),
+            capability_skill_id: plan.plan_id,
+            reconstruction_max_records: 1,
+        };
+        request
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        Ok(request)
+    }
+
+    /// Runs the real read-backed cue reconstruction through the supplied
+    /// `ReadService`-compatible facade. The composition owns the bounded cache;
+    /// callers cannot install a second cue state owner.
+    pub async fn reconstruct_cue_snapshot_from_reads<R: ReadApi + ?Sized>(
+        &mut self,
+        reads: &R,
+        ctx: &RequestMetadata,
+        request: &ContextReconstructionRequest,
+        snapshot_id: &SnapshotId,
+        profile: &NormalizationProfile,
+    ) -> Result<CueReconstruction, CueReadCompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CueReadCompositionError::NotReady);
+        }
+        if ctx.state_fence != self.snapshot.state_fence() {
+            return Err(CueReadCompositionError::FenceMismatch);
+        }
+        reconstruct_cue_snapshot_from_reads(
+            reads,
+            ctx,
+            request,
+            snapshot_id,
+            profile,
+            &mut self.cue_cache,
+        )
+        .await
+    }
+
+    /// Returns the number of rebuildable cue projections retained by this
+    /// composition.
+    #[must_use]
+    pub fn cue_reconstruction_cache_len(&self) -> usize {
+        self.cue_cache.len()
     }
 
     /// Compiles the `ControlBoard` read projection over the current owners.
@@ -4234,6 +4349,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         self.owners = owners;
         self.recovery = recovery;
         self.service_observations = service_observations;
+        // A refreshed generation must not retain a derived cue projection from
+        // the previous fence, even if a caller later supplies the same label.
+        self.cue_cache = CueReconstructionCache::new();
         Ok(())
     }
 

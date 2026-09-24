@@ -21,7 +21,9 @@ use eliot_cue_index::rebuild_cue_snapshot;
 use eliot_cue_normalizer::{NormalizationPolicy, normalize_cue};
 use eliot_observation::ObservationAdmissionReceipt;
 
-use crate::{FacadeError, LEGACY_KIND_SPELLINGS, LegacyEliotCuesV1Row};
+use crate::{
+    FacadeError, LEGACY_KIND_SPELLINGS, LegacyEliotCuesV1Row, V1MigrationRejection, V1RowMigration,
+};
 
 /// Decodes one frozen legacy v1 kind spelling to the owner vocabulary.
 ///
@@ -288,14 +290,27 @@ pub fn legacy_row_id_v2_from_fresh_observation(
     observed: &OwnerObservedCue,
     normalized: &NormalizedCue,
 ) -> Result<String, FacadeError> {
-    row.validate()?;
+    row.validate_for_conversion()?;
     let kind = decode_legacy_kind(&row.kind)?;
     let mode_text = row.mode.as_deref().ok_or(FacadeError::MigrationRequired {
         owner: "eliot-cue-normalizer",
         revision: eliot_cue_normalizer::A11_CONTRACT_REVISION,
     })?;
     let mode = decode_legacy_mode(mode_text)?;
-    if observed.kind != kind
+    let revision_text = row.revision.to_string();
+    let revision_matches = observed
+        .source
+        .provenance
+        .revision
+        .as_deref()
+        .is_some_and(|revision| {
+            revision == revision_text
+                || revision.strip_prefix('r') == Some(revision_text.as_str())
+                || revision.strip_prefix("rev-") == Some(revision_text.as_str())
+        });
+    if row.revision == 0
+        || !revision_matches
+        || observed.kind != kind
         || observed.original_value != row.value
         || observed.context.scope_id.as_str() != row.scope
         || observed.source.target.as_str() != row.target
@@ -333,6 +348,162 @@ pub fn legacy_row_id_v2_from_fresh_observation(
         });
     }
     Ok(id)
+}
+
+/// Converts one byte-preserved v1 row only from fresh owner evidence.
+///
+/// The legacy envelope and bytes remain the replay authority. A v2 identity is
+/// issued only when the caller supplies an owner observation and the exact
+/// normalized result for that same observation. Any semantic refusal is
+/// represented as a bounded `V2Rejected` record; malformed input or missing
+/// raw bytes remains a structural facade error.
+#[allow(
+    clippy::too_many_lines,
+    reason = "conversion keeps structural rejection and fresh-evidence checks together"
+)]
+pub fn convert_v1_row(
+    legacy_row_id: &str,
+    row: &LegacyEliotCuesV1Row,
+    legacy_bytes: &[u8],
+    observed: Option<&OwnerObservedCue>,
+    normalized: Option<&NormalizedCue>,
+) -> Result<V1RowMigration, FacadeError> {
+    row.validate_for_conversion()?;
+    if legacy_row_id.trim().is_empty() || legacy_row_id.chars().any(char::is_control) {
+        return Err(FacadeError::EnvelopeInvalid {
+            field: "legacy_row_id",
+        });
+    }
+    if legacy_bytes.is_empty() {
+        return Err(FacadeError::EnvelopeInvalid {
+            field: "legacy_bytes",
+        });
+    }
+    if row.revision == 0 {
+        return crate::reject_v1_row_conversion(
+            legacy_row_id,
+            row,
+            legacy_bytes,
+            V1MigrationRejection::FreshObservationMismatch,
+        );
+    }
+
+    let disposition = match (observed, normalized) {
+        (None, _) | (_, None) => {
+            return crate::reject_v1_row_conversion(
+                legacy_row_id,
+                row,
+                legacy_bytes,
+                V1MigrationRejection::MissingFreshObservation,
+            );
+        }
+        (Some(observed), Some(normalized)) => {
+            let Ok(kind) = decode_legacy_kind(&row.kind) else {
+                return crate::reject_v1_row_conversion(
+                    legacy_row_id,
+                    row,
+                    legacy_bytes,
+                    V1MigrationRejection::UnsupportedLegacyIdentity,
+                );
+            };
+            let Some(mode_text) = row.mode.as_deref() else {
+                return crate::reject_v1_row_conversion(
+                    legacy_row_id,
+                    row,
+                    legacy_bytes,
+                    V1MigrationRejection::MissingNormalizedKey,
+                );
+            };
+            let Ok(mode) = decode_legacy_mode(mode_text) else {
+                return crate::reject_v1_row_conversion(
+                    legacy_row_id,
+                    row,
+                    legacy_bytes,
+                    V1MigrationRejection::UnsupportedLegacyIdentity,
+                );
+            };
+            let source_revision = observed.source.provenance.revision.as_deref();
+            let revision_text = row.revision.to_string();
+            let revision_matches = source_revision.is_some_and(|revision| {
+                revision == revision_text
+                    || revision.strip_prefix('r') == Some(revision_text.as_str())
+                    || revision.strip_prefix("rev-") == Some(revision_text.as_str())
+            });
+            if observed.kind != kind
+                || observed.original_value != row.value
+                || observed.context.scope_id.as_str() != row.scope
+                || observed.source.target.as_str() != row.target
+                || !revision_matches
+                || observed.validate().is_err()
+                || normalized.validate().is_err()
+                || &normalized.observed != observed
+                || !normalized.observed.context.lifecycle.is_active()
+            {
+                return crate::reject_v1_row_conversion(
+                    legacy_row_id,
+                    row,
+                    legacy_bytes,
+                    V1MigrationRejection::FreshObservationMismatch,
+                );
+            }
+            let Some(key) = normalized
+                .comparison_keys
+                .iter()
+                .find(|key| key.match_mode == mode)
+            else {
+                return crate::reject_v1_row_conversion(
+                    legacy_row_id,
+                    row,
+                    legacy_bytes,
+                    V1MigrationRejection::MissingNormalizedKey,
+                );
+            };
+            let Ok(row_id) = eliot_cue_contracts::cue_row_id(
+                &row.scope,
+                kind,
+                mode,
+                &key.key_value,
+                &TargetHandle::new(row.target.clone())?,
+            ) else {
+                return crate::reject_v1_row_conversion(
+                    legacy_row_id,
+                    row,
+                    legacy_bytes,
+                    V1MigrationRejection::MissingNormalizedKey,
+                );
+            };
+            eliot_cue_contracts::ConversionDisposition::V2Converted {
+                legacy_row_id: legacy_row_id.to_owned(),
+                row_id,
+            }
+        }
+    };
+    let record = V1RowMigration {
+        legacy_row_id: legacy_row_id.to_owned(),
+        legacy_bytes: legacy_bytes.to_vec(),
+        disposition,
+    };
+    record.validate()?;
+    Ok(record)
+}
+
+/// Convenience form of [`convert_v1_row`] for a caller that already has both
+/// fresh owner values. The optional form above remains the fail-closed path
+/// for an omitted observation.
+pub fn convert_v1_row_from_fresh_observation(
+    legacy_row_id: &str,
+    row: &LegacyEliotCuesV1Row,
+    legacy_bytes: &[u8],
+    observed: &OwnerObservedCue,
+    normalized: &NormalizedCue,
+) -> Result<V1RowMigration, FacadeError> {
+    convert_v1_row(
+        legacy_row_id,
+        row,
+        legacy_bytes,
+        Some(observed),
+        Some(normalized),
+    )
 }
 
 /// Requests legacy delivery as an inert owner handoff.

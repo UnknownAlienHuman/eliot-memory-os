@@ -45,7 +45,7 @@ fn provenance() -> Provenance {
         capture_route: "unit-test".to_owned(),
         scope: "scope-1".to_owned(),
         raw_handle: None,
-        revision: None,
+        revision: Some("7".to_owned()),
     }
 }
 
@@ -95,7 +95,7 @@ fn key(scope: &str, kind: CueKind, mode: MatchMode, value: &str) -> CueCompariso
 }
 
 fn row(member: SnapshotMember, key: CueComparisonKey) -> ClosedSnapshotRow {
-    ClosedSnapshotRow::new(member, key)
+    ClosedSnapshotRow::new_at_revision(member, key, source(), 7)
 }
 
 fn sealed_snapshot(members: Vec<SnapshotMember>) -> CueSnapshot {
@@ -124,7 +124,7 @@ fn edge(id: &str, from: &str, to: &str) -> RelationEdge {
 }
 
 fn weight(id: &str, milli: u16) -> SnapshotEdgeWeight {
-    SnapshotEdgeWeight::new(RelationEdgeId::new(id).expect("edge id"), milli)
+    SnapshotEdgeWeight::new_at_revision(RelationEdgeId::new(id).expect("edge id"), milli, 7)
 }
 
 fn denominator(

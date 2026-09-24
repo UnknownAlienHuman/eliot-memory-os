@@ -35,16 +35,19 @@
 use std::collections::BTreeMap;
 
 use eliot_context_candidates::ProjectionState;
-use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{RequestMetadata, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_cue_contracts::{
     AdmittedCueBindingProjection, CueProjectionDenominator, CueSnapshotBuildCandidate,
     NormalizationProfile, SnapshotId, WorkScopeId,
 };
+use eliot_read::ReadApi;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::context_inputs::SevenRoleInputs;
+use crate::context_inputs::{
+    ContextInputsError, ContextReconstructionRequest, GovernorContextInputs, SevenRoleInputs,
+};
 
 /// Bound on retained derived cue reconstructions per cache owner.
 ///
@@ -80,6 +83,23 @@ pub enum CueCompositionError {
     /// The store scope identity cannot cross into the cue scope identity.
     #[error("scope identity cannot cross the store/cue boundary: {0}")]
     ScopeMismatch(String),
+}
+
+/// Fail-closed errors at the read-backed Governor cue boundary.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CueReadCompositionError {
+    /// The composition is not ready for a derived read projection.
+    #[error("Governor composition is not ready for cue reconstruction")]
+    NotReady,
+    /// The caller's metadata does not carry the retained composition fence.
+    #[error("cue reconstruction request fence does not match the retained Governor fence")]
+    FenceMismatch,
+    /// The seven-role read closure could not be acquired coherently.
+    #[error("cue context read closure failed: {0}")]
+    Context(#[from] ContextInputsError),
+    /// The read payload could not be safely decoded or built.
+    #[error("cue reconstruction failed: {0}")]
+    Cue(#[from] CueCompositionError),
 }
 
 /// Opaque cache key for one derived cue reconstruction.
@@ -255,6 +275,24 @@ pub fn reconstruct_cue_snapshot(
     })
 }
 
+/// Acquires the seven-role closure through the supplied Governor read facade
+/// and then runs the closed cue owner. The caller owns the `ReadService`; this
+/// function never opens a transport or substitutes a default payload.
+pub async fn reconstruct_cue_snapshot_from_reads<R: ReadApi + ?Sized>(
+    reads: &R,
+    ctx: &RequestMetadata,
+    request: &ContextReconstructionRequest,
+    snapshot_id: &SnapshotId,
+    profile: &NormalizationProfile,
+    cache: &mut CueReconstructionCache,
+) -> Result<CueReconstruction, CueReadCompositionError> {
+    let inputs = GovernorContextInputs::borrow(reads)
+        .reconstruct(ctx, request)
+        .await?;
+    reconstruct_cue_snapshot(&inputs, snapshot_id, profile, cache)
+        .map_err(CueReadCompositionError::from)
+}
+
 /// Canonical shape of one cache-key preimage.
 #[derive(Serialize)]
 struct KeyShape<'a> {
@@ -329,17 +367,80 @@ fn cache_key(
     Ok(CueCacheKey(sha256_hex(&bytes)))
 }
 
+/// Re-validates the one non-array cue payload that may become empty.
+///
+/// The read classifier is the first boundary that may assign
+/// `ProjectionState::KnownEmpty`. This second check prevents a manually
+/// assembled or stale `SevenRoleInputs` value from turning a null, malformed,
+/// unbound, or non-authoritative payload into an empty cue set.
+fn validate_authoritative_empty_projection(
+    inputs: &SevenRoleInputs,
+) -> Result<(), CueCompositionError> {
+    let invalid = |detail: &str| CueCompositionError::UnexpectedPayload(detail.to_owned());
+    let Some(payload) = inputs.cue.payload.as_ref() else {
+        return Err(invalid("known-empty cue role carries no payload"));
+    };
+    if payload.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err(invalid(
+            "known-empty cue payload has an unsupported version",
+        ));
+    }
+    if payload.get("scope_id").and_then(Value::as_str) != Some(inputs.scope_id.as_str()) {
+        return Err(invalid(
+            "known-empty cue payload scope differs from the closure",
+        ));
+    }
+    if payload
+        .get("selector")
+        .and_then(Value::as_str)
+        .is_none_or(|selector| selector.trim().is_empty() || selector.chars().any(char::is_control))
+    {
+        return Err(invalid("known-empty cue payload has no valid selector"));
+    }
+    let Some(records) = payload.get("records").and_then(Value::as_array) else {
+        return Err(invalid("known-empty cue payload has no records array"));
+    };
+    if !records.is_empty() {
+        return Err(invalid("known-empty cue payload contains records"));
+    }
+    let Some(provenance) = payload.get("provenance").and_then(Value::as_object) else {
+        return Err(invalid("known-empty cue payload has no provenance object"));
+    };
+    if provenance.get("truncated").and_then(Value::as_bool) != Some(false)
+        || provenance.get("matched_total").and_then(Value::as_u64) != Some(0)
+        || provenance.get("returned").and_then(Value::as_u64) != Some(0)
+        || provenance
+            .get("max_records")
+            .and_then(Value::as_u64)
+            .is_none_or(|max_records| max_records == 0)
+    {
+        return Err(invalid(
+            "known-empty cue payload lacks authoritative empty provenance",
+        ));
+    }
+    let observed_fence = provenance
+        .get("state_fence")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<StateFence>(value).ok());
+    if observed_fence.as_ref() != Some(&inputs.state_fence) {
+        return Err(invalid(
+            "known-empty cue payload fence differs from the closure",
+        ));
+    }
+    Ok(())
+}
+
 /// Decodes the cue role payload into admitted bindings.
 ///
-/// `KnownEmpty` (explicit null from an authoritative empty lookup) yields
-/// the authoritative empty binding set; `Complete` must carry the closed
-/// JSON array of `AdmittedCueBindingProjection`. Any other disposition fails
-/// closed: degraded or unreadable roles never fold into an index.
+/// `KnownEmpty` is accepted only when the retained payload is the exact
+/// authoritative empty understanding-input envelope; `Complete` must carry the
+/// closed JSON array of `AdmittedCueBindingProjection`. Any other disposition
+/// fails closed: degraded or unreadable roles never fold into an index.
 ///
 /// Integration note: the store's `GetUnderstandingProjectionInputs` read (T11.3
 /// store activation) returns a versioned understanding-inputs envelope
 /// (`{version, selector, scope_id, records, provenance}`), not the
-/// admitted-binding array, so that envelope fails closed here with
+/// admitted-binding array, so a non-empty envelope fails closed here with
 /// [`CueCompositionError::UnexpectedPayload`]. Binding envelope records to
 /// the typed cue families is a follow-up slice; until then only the
 /// authoritative empty builds through this composition.
@@ -347,7 +448,10 @@ fn decoded_bindings(
     inputs: &SevenRoleInputs,
 ) -> Result<Vec<AdmittedCueBindingProjection>, CueCompositionError> {
     let payload = match &inputs.cue.state {
-        ProjectionState::KnownEmpty => return Ok(Vec::new()),
+        ProjectionState::KnownEmpty => {
+            validate_authoritative_empty_projection(inputs)?;
+            return Ok(Vec::new());
+        }
         ProjectionState::Complete => inputs.cue.payload.as_ref().ok_or_else(|| {
             CueCompositionError::UnexpectedPayload(
                 "complete cue role carries no payload".to_owned(),
@@ -620,6 +724,25 @@ mod cue_composition_tests {
         Ok(())
     }
 
+    #[test]
+    fn known_empty_requires_the_authoritative_empty_envelope() -> ProofResult {
+        let mut inputs = role_inputs(ProjectionState::KnownEmpty)?;
+        inputs.cue.payload = Some(Value::Null);
+        let mut cache = CueReconstructionCache::new();
+        let result = reconstruct_cue_snapshot(
+            &inputs,
+            &SnapshotId::new("snapshot-a")?,
+            &test_profile()?,
+            &mut cache,
+        );
+        assert!(matches!(
+            result,
+            Err(CueCompositionError::UnexpectedPayload(_))
+        ));
+        assert!(cache.is_empty());
+        Ok(())
+    }
+
     fn role_inputs(cue_state: ProjectionState) -> ProofResult<SevenRoleInputs> {
         let fence = test_fence()?;
         let heads = ScopeRevisionView {
@@ -642,7 +765,19 @@ mod cue_composition_tests {
             revision_heads: Vec::new(),
         };
         let cue_payload = match &cue_state {
-            ProjectionState::KnownEmpty => Some(Value::Null),
+            ProjectionState::KnownEmpty => Some(serde_json::json!({
+                "version": 1,
+                "scope_id": "scope-a",
+                "selector": "selector-a",
+                "records": [],
+                "provenance": {
+                    "state_fence": fence.clone(),
+                    "truncated": false,
+                    "matched_total": 0,
+                    "returned": 0,
+                    "max_records": 1,
+                },
+            })),
             ProjectionState::Complete => Some(serde_json::json!([])),
             _ => None,
         };

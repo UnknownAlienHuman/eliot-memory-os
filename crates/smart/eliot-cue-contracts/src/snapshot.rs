@@ -268,6 +268,7 @@ impl CueSnapshot {
         crate::version::validate_closed_rows_at_revision(
             &self.members,
             &closure.rows,
+            &self.rebuild.source_denominator,
             self.source_revision,
         )?;
         validate_closed_endpoints(&self.members, &closure.relation_edges)?;
@@ -277,15 +278,14 @@ impl CueSnapshot {
             self.source_revision,
         )?;
         for source in &self.rebuild.source_denominator {
-            if !revision_marker_matches(source.provenance.revision.as_deref(), self.source_revision)
-            {
+            if !crate::version::source_revision_matches(source, self.source_revision) {
                 return Err(CueContractError::Foundation {
                     field: "snapshot.source.revision",
                 });
             }
         }
         for edge in &closure.relation_edges {
-            if !revision_marker_matches(
+            if !crate::version::revision_marker_matches(
                 edge.evidence.provenance.revision.as_deref(),
                 self.source_revision,
             ) {
@@ -573,14 +573,6 @@ impl CueSnapshot {
         }
         Ok(())
     }
-}
-
-fn revision_marker_matches(value: Option<&str>, expected: u64) -> bool {
-    value.is_none_or(|revision| {
-        revision == expected.to_string()
-            || revision == format!("r{expected}")
-            || revision == format!("rev-{expected}")
-    })
 }
 
 fn validate_closed_endpoints(

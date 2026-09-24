@@ -42,7 +42,7 @@ fn provenance() -> Provenance {
         capture_route: "unit".into(),
         scope: "scope-1".into(),
         raw_handle: None,
-        revision: None,
+        revision: Some("1".to_owned()),
     }
 }
 
@@ -581,7 +581,7 @@ fn named_edge(id: &str, from: &str, to: &str, kind: RelationKind) -> RelationEdg
 }
 
 fn edge_weight(edge: &str, milli: u16) -> SnapshotEdgeWeight {
-    SnapshotEdgeWeight::new(RelationEdgeId::new(edge).expect("edge id"), milli)
+    SnapshotEdgeWeight::new_at_revision(RelationEdgeId::new(edge).expect("edge id"), milli, 1)
 }
 
 fn verification_binding() -> VerificationBinding {

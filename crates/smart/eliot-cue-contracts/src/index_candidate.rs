@@ -270,10 +270,7 @@ fn validate_members(
             });
         }
         if snapshot.is_closed()
-            && !revision_marker_matches(
-                source.provenance.revision.as_deref(),
-                snapshot.source_revision,
-            )
+            && !crate::version::source_revision_matches(source, snapshot.source_revision)
         {
             return Err(CueContractError::Foundation {
                 field: "index.source.revision",
@@ -377,10 +374,7 @@ fn validate_retained_projection_row(
     scope_id: &WorkScopeId,
 ) -> Result<(), CueContractError> {
     let source = &projection.normalized.observed.source;
-    if !revision_marker_matches(
-        source.provenance.revision.as_deref(),
-        closure.denominator.source_revision,
-    ) {
+    if !crate::version::source_revision_matches(source, closure.denominator.source_revision) {
         return Err(CueContractError::Foundation {
             field: "index.source.revision",
         });
@@ -398,14 +392,20 @@ fn validate_retained_projection_row(
         .comparison_keys
         .first()
         .ok_or(CueContractError::SnapshotNotRebuildable)?;
-    if row.key.scope != scope_id.as_str()
+    let expected_member = crate::SnapshotMember::new(
+        projection.candidate.canonical.clone(),
+        projection.candidate.target.clone(),
+    );
+    if row.member != expected_member
+        || &row.source != source
+        || row.key.scope != scope_id.as_str()
         || row.key.kind != projection.candidate.canonical.kind
         || row.key.mode != primary.match_mode
         || row.key.normalized_value != primary.key_value
         || row.source_revision != closure.denominator.source_revision
     {
         return Err(CueContractError::Foundation {
-            field: "index.row.key",
+            field: "index.row.source",
         });
     }
     Ok(())
@@ -445,7 +445,7 @@ fn validate_edges(
             });
         }
         if snapshot.is_closed()
-            && !revision_marker_matches(
+            && !crate::version::revision_marker_matches(
                 edge.evidence.provenance.revision.as_deref(),
                 snapshot.source_revision,
             )
@@ -456,14 +456,6 @@ fn validate_edges(
         }
     }
     Ok(())
-}
-
-fn revision_marker_matches(value: Option<&str>, expected: u64) -> bool {
-    value.is_none_or(|revision| {
-        revision == expected.to_string()
-            || revision == format!("r{expected}")
-            || revision == format!("rev-{expected}")
-    })
 }
 
 fn same_edge_set(left: &[RelationEdge], right: &[RelationEdge]) -> bool {

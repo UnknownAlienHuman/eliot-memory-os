@@ -24,7 +24,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CONTRACT_REVISION, CueContractError, RelationEdgeId, SnapshotMember, TargetHandle, bounds,
+    CONTRACT_REVISION, CueContractError, RelationEdgeId, SnapshotMember, SourceHandle,
+    TargetHandle, bounds,
     normalization::{CueKind, MatchMode},
 };
 
@@ -264,19 +265,30 @@ pub struct ClosedSnapshotRow {
     pub member: SnapshotMember,
     /// The exact key the member was admitted under.
     pub key: CueComparisonKey,
+    /// The exact observed source identity admitted for this row.
+    ///
+    /// A closed row is not complete without this join. The source handle is
+    /// retained alongside the member so validation can prove that the row,
+    /// projection, and source denominator all refer to the same observation.
+    pub source: SourceHandle,
     /// Frozen source revision admitted for this row.
-    #[serde(default)]
     pub source_revision: u64,
 }
 
 impl ClosedSnapshotRow {
     /// Constructs one closed row. Call [`Self::validate`] before use.
     #[must_use]
-    pub const fn new(member: SnapshotMember, key: CueComparisonKey) -> Self {
+    pub const fn new(
+        member: SnapshotMember,
+        key: CueComparisonKey,
+        source: SourceHandle,
+        source_revision: u64,
+    ) -> Self {
         Self {
             member,
             key,
-            source_revision: 0,
+            source,
+            source_revision,
         }
     }
 
@@ -285,23 +297,35 @@ impl ClosedSnapshotRow {
     pub const fn new_at_revision(
         member: SnapshotMember,
         key: CueComparisonKey,
+        source: SourceHandle,
         source_revision: u64,
     ) -> Self {
-        Self {
-            member,
-            key,
-            source_revision,
-        }
+        Self::new(member, key, source, source_revision)
     }
 
-    /// Validates both sides and their kind agreement.
+    /// Validates the member, comparison key, source handle, kind agreement,
+    /// and the source revision marker carried by the source itself.
     pub fn validate(&self) -> Result<(), CueContractError> {
         self.member.validate()?;
         self.key.validate()?;
+        self.source.validate()?;
         if self.key.kind != self.member.canonical.kind {
             return Err(CueContractError::Foundation {
                 field: "snapshot.row.kind",
             });
+        }
+        if self.source.provenance.scope != self.key.scope {
+            return Err(CueContractError::Foundation {
+                field: "snapshot.row.source_scope",
+            });
+        }
+        if self.source_revision == 0
+            || !revision_marker_matches(
+                self.source.provenance.revision.as_deref(),
+                self.source_revision,
+            )
+        {
+            return Err(CueContractError::SnapshotNotRebuildable);
         }
         Ok(())
     }
@@ -361,6 +385,33 @@ impl SnapshotEdgeWeight {
     pub fn validate(&self) -> Result<(), CueContractError> {
         bounds::text(self.edge.as_str(), "snapshot.edge_weight.edge")
     }
+}
+
+/// Matches only an explicitly present, exact source-revision marker.
+///
+/// A missing marker is never equivalent to a current revision. The accepted
+/// spellings are the canonical decimal form and the two bounded owner
+/// prefixes used by the evidence contracts (`r` and `rev-`).
+pub(crate) fn revision_marker_matches(value: Option<&str>, expected: u64) -> bool {
+    if expected == 0 {
+        return false;
+    }
+    let Some(value) = value else {
+        return false;
+    };
+    let canonical = expected.to_string();
+    value == canonical
+        || value
+            .strip_prefix('r')
+            .is_some_and(|rest| rest == canonical)
+        || value
+            .strip_prefix("rev-")
+            .is_some_and(|rest| rest == canonical)
+}
+
+/// Returns whether one retained source names exactly the expected revision.
+pub(crate) fn source_revision_matches(source: &SourceHandle, expected: u64) -> bool {
+    revision_marker_matches(source.provenance.revision.as_deref(), expected)
 }
 
 /// Explicit activation limits retained by a closed snapshot.
@@ -503,6 +554,9 @@ impl CueSnapshotClosure {
         for weight in &self.edge_weights {
             weight.validate()?;
         }
+        if self.relation_edges.len() != self.edge_weights.len() {
+            return Err(CueContractError::SnapshotNotRebuildable);
+        }
         if !self.relation_edges.is_empty() && self.fanout.max_depth == 0 {
             return Err(CueContractError::Foundation {
                 field: "snapshot.fanout.edge",
@@ -552,6 +606,11 @@ impl ConversionDisposition {
                 bounds::text(legacy_row_id, "conversion.legacy_row_id")?;
                 if let Self::V2Converted { row_id, .. } = self {
                     bounds::text(row_id, "conversion.row_id")?;
+                    if !row_id.starts_with(ROW_ID_PREFIX) {
+                        return Err(CueContractError::Foundation {
+                            field: "conversion.row_id.namespace",
+                        });
+                    }
                 }
                 Ok(())
             }
@@ -569,6 +628,37 @@ impl ConversionDisposition {
     #[must_use]
     pub const fn is_replay(&self) -> bool {
         matches!(self, Self::V1ReplayPreserved { .. })
+    }
+
+    /// True only when a fresh owner observation produced a v2 identity.
+    #[must_use]
+    pub const fn is_converted(&self) -> bool {
+        matches!(self, Self::V2Converted { .. })
+    }
+
+    /// True only when conversion was explicitly refused.
+    #[must_use]
+    pub const fn is_rejected(&self) -> bool {
+        matches!(self, Self::V2Rejected { .. })
+    }
+
+    /// Returns the v2 identity only for a converted disposition.
+    #[must_use]
+    pub fn v2_row_id(&self) -> Option<&str> {
+        match self {
+            Self::V2Converted { row_id, .. } => Some(row_id),
+            Self::V1ReplayPreserved { .. } | Self::V2Rejected { .. } => None,
+        }
+    }
+
+    /// Returns the preserved legacy identity carried by every disposition.
+    #[must_use]
+    pub fn legacy_row_id(&self) -> &str {
+        match self {
+            Self::V1ReplayPreserved { legacy_row_id }
+            | Self::V2Converted { legacy_row_id, .. }
+            | Self::V2Rejected { legacy_row_id, .. } => legacy_row_id,
+        }
     }
 }
 
@@ -637,12 +727,17 @@ pub(crate) fn validate_closed_rows(
     if rows.len() != members.len() {
         return Err(CueContractError::SnapshotNotRebuildable);
     }
-    let mut coverage = std::collections::BTreeSet::new();
+    let mut coverage = std::collections::BTreeMap::new();
     for member in members {
-        coverage.insert((
+        let key = (
             member.canonical.canonical_cue_id.clone(),
             member.target.clone(),
-        ));
+        );
+        if coverage.insert(key, member).is_some() {
+            return Err(CueContractError::DuplicateIdentity {
+                field: "snapshot.members",
+            });
+        }
     }
     let mut row_ids = Vec::with_capacity(rows.len());
     let mut seen_row_ids = std::collections::BTreeSet::new();
@@ -653,7 +748,13 @@ pub(crate) fn validate_closed_rows(
             row.member.canonical.canonical_cue_id.clone(),
             row.member.target.clone(),
         );
-        if !coverage.remove(&key) {
+        let Some(expected_member) = coverage.remove(&key) else {
+            return Err(CueContractError::SnapshotNotRebuildable);
+        };
+        // The key alone is not a row join. The complete canonical member and
+        // target must be byte-for-byte equal to the snapshot member, otherwise
+        // a caller could retain one member while validating a different row.
+        if &row.member != expected_member {
             return Err(CueContractError::SnapshotNotRebuildable);
         }
         let row_id = row.row_id()?;
@@ -680,17 +781,30 @@ pub(crate) fn validate_closed_rows(
     Ok(row_ids)
 }
 
-/// Closed row join with the source revision frozen into every retained row.
+/// Closed row/source join with the source revision frozen into every retained
+/// row. The source set is part of the proof, rather than an external hint.
 pub(crate) fn validate_closed_rows_at_revision(
     members: &[SnapshotMember],
     rows: &[ClosedSnapshotRow],
+    sources: &[SourceHandle],
     source_revision: u64,
 ) -> Result<Vec<String>, CueContractError> {
     let ids = validate_closed_rows(members, rows)?;
     if source_revision == 0
-        || rows
+        || sources
             .iter()
-            .any(|row| row.source_revision != source_revision)
+            .any(|source| !source_revision_matches(source, source_revision))
+        || rows.iter().any(|row| {
+            row.source_revision != source_revision
+                || !sources.iter().any(|source| source == &row.source)
+                || !source_revision_matches(&row.source, source_revision)
+        })
+    {
+        return Err(CueContractError::SnapshotNotRebuildable);
+    }
+    if sources
+        .iter()
+        .any(|source| !rows.iter().any(|row| row.source == *source))
     {
         return Err(CueContractError::SnapshotNotRebuildable);
     }

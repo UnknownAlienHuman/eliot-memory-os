@@ -3414,6 +3414,7 @@ dependencies = [
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-controlboard",
+ "eliot-cue-contracts",
  "eliot-doctor-core",
  "eliot-dreamer-bundle",
  "eliot-dreamer-candidate-validation",

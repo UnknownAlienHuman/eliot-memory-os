@@ -18,26 +18,33 @@
 #![allow(clippy::expect_used)]
 
 use eliot_cue_contracts::{ProofCeiling, cue_row_id};
-use eliot_cues::{preserve_v1_row, preserve_v1_snapshot};
+use eliot_cues::{
+    V1PreservedRow, preserve_v1_row, preserve_v1_row_bytes, preserve_v1_snapshot,
+    preserve_v1_snapshot_bytes_with_rows,
+};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
 fn v1_replay_preserves_identity_and_reports_ceiling() -> TestResult {
-    let first = preserve_v1_row("cue:0123456789abcdef0123456789abcdef")?;
+    let first_id = "cue:0123456789abcdef0123456789abcdef";
+    let first = preserve_v1_row_bytes(first_id, b"legacy-row-1")?;
     assert!(first.disposition.is_replay());
-    assert_eq!(first.legacy_row_id, "cue:0123456789abcdef0123456789abcdef");
-    let report = preserve_v1_snapshot(&[
-        "cue:0123456789abcdef0123456789abcdef".to_owned(),
-        "cue:fedcba9876543210fedcba9876543210".to_owned(),
-    ])?;
+    assert_eq!(first.legacy_row_id, first_id);
+    let report = preserve_v1_snapshot_bytes_with_rows(
+        "cue:snapshot:legacy",
+        b"legacy-snapshot",
+        &[
+            V1PreservedRow::new(first_id, b"legacy-row-1")?,
+            V1PreservedRow::new("cue:fedcba9876543210fedcba9876543210", b"legacy-row-2")?,
+        ],
+    )?;
     assert_eq!(report.rows.len(), 2);
-    assert_eq!(
-        report.rows[0].legacy_row_id,
-        "cue:0123456789abcdef0123456789abcdef"
-    );
+    assert_eq!(report.rows[0].legacy_row_id, first_id);
     assert!(report.rows[0].disposition.is_replay());
     assert_eq!(report.ceiling, ProofCeiling::CandidateArtifact);
+    assert!(preserve_v1_row(first_id).is_err());
+    assert!(preserve_v1_snapshot(&[first_id.to_owned()]).is_err());
     assert!(preserve_v1_row("").is_err());
     assert!(preserve_v1_snapshot(&[String::new()]).is_err());
     Ok(())
@@ -53,14 +60,17 @@ fn facade_row_id_matches_frozen_owner_function() -> TestResult {
         "usable cue",
         &target,
     )?;
-    let adapted = eliot_cues::legacy_adapter::legacy_row_id_v2(
+    let refusal = eliot_cues::legacy_adapter::legacy_row_id_v2(
         "test",
         "concept",
         "exact",
         "usable cue",
         &target,
-    )?;
-    assert_eq!(adapted, expected);
+    );
+    assert!(matches!(
+        refusal,
+        Err(eliot_cues::FacadeError::MigrationRequired { .. })
+    ));
     assert!(expected.starts_with("cuev2:"));
     Ok(())
 }

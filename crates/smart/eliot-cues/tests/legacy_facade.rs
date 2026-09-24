@@ -29,7 +29,7 @@ use eliot_cue_index::rebuild_cue_snapshot;
 use eliot_cue_normalizer::{NormalizationPolicy, NormalizationRule, PolicyRule, normalize_cue};
 use eliot_cues::{
     FACADE_DISPOSITIONS, LEGACY_KIND_SPELLINGS, LegacyDeliveryHandoff, LegacyEliotCuesV1Row,
-    preserve_v1_row, preserve_v1_snapshot,
+    V1PreservedRow, preserve_v1_row_bytes, preserve_v1_snapshot_bytes_with_rows,
 };
 use eliot_evidence::{
     Assertability, EpistemicStatus, EvidenceAuthority, EvidenceCoverage, EvidenceEnvelope,
@@ -414,7 +414,7 @@ fn activation_request(
 // WORK_UNIT_CASE: 833/1
 #[test]
 fn facade_denominator_covers_every_public_item() {
-    assert_eq!(FACADE_DISPOSITIONS.len(), 20);
+    assert_eq!(FACADE_DISPOSITIONS.len(), 30);
     for (item, disposition, owner) in FACADE_DISPOSITIONS {
         assert!(
             [
@@ -445,7 +445,7 @@ fn every_item_carries_exact_disposition() {
             "no duplicate row for {item}"
         );
     }
-    assert_eq!(adapter_entries, 10);
+    assert_eq!(adapter_entries, 18);
     // Each adapter entry below is invoked by at least one matrix test;
     // the count pins the set so additions stay deliberate.
     let row = LegacyEliotCuesV1Row {
@@ -968,20 +968,39 @@ fn exact_context_preserved_end_to_end() -> TestResult {
 // WORK_UNIT_CASE: 833/21
 #[test]
 fn changed_same_id_payload_conflict() -> TestResult {
-    let target_a = TargetHandle::new("artifact:conflict-a").expect("target");
-    let target_b = TargetHandle::new("artifact:conflict-b").expect("target");
-    let first = eliot_cues::legacy_adapter::legacy_row_id_v2(
-        "scope", "concept", "exact", "shared", &target_a,
+    let state = fence();
+    let (profile, policy) = profile_and_policy(&state);
+    let first_row = LegacyEliotCuesV1Row {
+        mode: Some("exact".to_owned()),
+        ..legacy_row("concept", "shared")
+    };
+    let first_observed = owner_observed(1, "shared", &state);
+    let first_normalized = normalize_cue(&first_observed, &policy, &profile)?;
+    let first = eliot_cues::legacy_adapter::convert_v1_row_from_fresh_observation(
+        "legacy:shared",
+        &first_row,
+        b"raw-shared",
+        &first_observed,
+        &first_normalized.normalized,
     )?;
-    let again = eliot_cues::legacy_adapter::legacy_row_id_v2(
-        "scope", "concept", "exact", "shared", &target_a,
+    assert!(first.disposition.is_converted());
+    let changed_row = LegacyEliotCuesV1Row {
+        mode: Some("exact".to_owned()),
+        ..legacy_row("concept", "changed")
+    };
+    let changed_observed = owner_observed(1, "changed", &state);
+    let changed_normalized = normalize_cue(&changed_observed, &policy, &profile)?;
+    let changed = eliot_cues::legacy_adapter::convert_v1_row_from_fresh_observation(
+        "legacy:changed",
+        &changed_row,
+        b"raw-changed",
+        &changed_observed,
+        &changed_normalized.normalized,
     )?;
-    assert_eq!(first, again);
-    let changed = eliot_cues::legacy_adapter::legacy_row_id_v2(
-        "scope", "concept", "exact", "shared", &target_b,
-    )?;
-    assert_ne!(first, changed);
-    assert!(first.starts_with("cuev2:"));
+    assert_ne!(
+        first.disposition.v2_row_id(),
+        changed.disposition.v2_row_id()
+    );
     Ok(())
 }
 
@@ -1032,17 +1051,22 @@ fn one_call_no_fallback() {
 // WORK_UNIT_CASE: 833/24
 #[test]
 fn deterministic_owner_version_bound_migration_receipt() -> TestResult {
-    let first = preserve_v1_row("cue:0123456789abcdef0123456789abcdef")?;
-    let again = preserve_v1_row("cue:0123456789abcdef0123456789abcdef")?;
+    let legacy_id = "cue:0123456789abcdef0123456789abcdef";
+    let first = preserve_v1_row_bytes(legacy_id, b"raw-row")?;
+    let again = preserve_v1_row_bytes(legacy_id, b"raw-row")?;
     assert_eq!(
         serde_json::to_string(&first).expect("encode"),
         serde_json::to_string(&again).expect("encode")
     );
     assert!(first.disposition.is_replay());
-    let snapshot = preserve_v1_snapshot(&[
-        "cue:0123456789abcdef0123456789abcdef".to_owned(),
-        "cue:fedcba9876543210fedcba9876543210".to_owned(),
-    ])?;
+    let snapshot = preserve_v1_snapshot_bytes_with_rows(
+        "cue:snapshot:legacy",
+        b"raw-snapshot",
+        &[
+            V1PreservedRow::new(legacy_id, b"raw-row")?,
+            V1PreservedRow::new("cue:fedcba9876543210fedcba9876543210", b"raw-row-2")?,
+        ],
+    )?;
     assert_eq!(snapshot.rows.len(), 2);
     assert_eq!(
         snapshot.ceiling,
@@ -1051,10 +1075,34 @@ fn deterministic_owner_version_bound_migration_receipt() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn missing_fresh_observation_emits_typed_v2_rejection() -> TestResult {
+    let row = LegacyEliotCuesV1Row {
+        mode: Some("exact".to_owned()),
+        ..legacy_row("concept", "needs-reobservation")
+    };
+    let rejected = eliot_cues::legacy_adapter::convert_v1_row(
+        "legacy:needs-reobservation",
+        &row,
+        b"raw-legacy-row",
+        None,
+        None,
+    )?;
+    assert!(rejected.disposition.is_rejected());
+    assert_eq!(
+        rejected.disposition,
+        eliot_cue_contracts::ConversionDisposition::V2Rejected {
+            legacy_row_id: "legacy:needs-reobservation".to_owned(),
+            reason: "missing_fresh_observation".to_owned(),
+        }
+    );
+    Ok(())
+}
+
 // WORK_UNIT_CASE: 833/25
 #[test]
 fn no_unmarked_new_facade_consumer() {
-    assert_eq!(FACADE_DISPOSITIONS.len(), 20);
+    assert_eq!(FACADE_DISPOSITIONS.len(), 30);
 }
 
 // WORK_UNIT_CASE: 833/26

@@ -59,7 +59,7 @@ use eliot_read::{LocalReadPort, QueryResult, ReadError};
 use eliot_store_api::{
     CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadRequest,
     NamedReadResponse, REVOCATION_HISTORY_MAX_RECORDS, ReadConsistency, RevisionHead, RevisionKey,
-    ScopeId, StoreError,
+    ScopeId, StoreError, generated_operation_manifests,
 };
 
 use super::{DaemonKernelClient, SERVICE_NAME};
@@ -120,14 +120,11 @@ impl KernelContextReadClient {
     /// Checks the T11.1–T11.3 execute capability before any transport is touched:
     /// `GetEvidencePack` (scope-bound, structurally valid),
     /// `GetCurrentEpistemicPosition` (scope-bound, `ExactFence`, `position`
-    /// Subject required, structurally valid), one of the four task-bound
-    /// reconstruction reads (scope-bound, `ExactFence`, currently no
-    /// parameters: this pre-transport gate is deliberately stricter than the
-    /// store catalogue, which declares bounded exact selectors for these
-    /// reads — parameter-carrying requests fail here until a follow-up
-    /// threads the closed selectors, and parameter-free requests fail
-    /// downstream at the catalogue; either way no unvalidated read crosses),
-    /// or the `#2100` owner-feed `GetAuthorityRevocationHistory`
+    /// Subject required, structurally valid), the four task-bound
+    /// reconstruction reads (scope-bound, `ExactFence`, with their exact
+    /// catalogue-declared selectors), `GetScopeRevisionView` (scope-bound,
+    /// `ExactFence`, no parameters), or the `#2100` owner-feed
+    /// `GetAuthorityRevocationHistory`
     /// (scope-bound, `Eventual`, exactly the catalogue-declared
     /// `origin_ref`/`max_records` selectors).
     fn check_execute_capability(request: &NamedReadRequest) -> Result<(), StoreError> {
@@ -163,6 +160,28 @@ impl KernelContextReadClient {
                     return Err(StoreError::InvalidField {
                         field: "operation.parameters",
                         reason: "GetAuditRange takes no parameters",
+                    });
+                }
+                request.validate()?;
+                Ok(())
+            }
+            NamedReadOperation::GetScopeRevisionView => {
+                if request.scope_id.is_none() {
+                    return Err(StoreError::InvalidField {
+                        field: "scope_id",
+                        reason: "GetScopeRevisionView requires an exact scope",
+                    });
+                }
+                if request.consistency != ReadConsistency::ExactFence {
+                    return Err(StoreError::InvalidField {
+                        field: "operation.consistency",
+                        reason: "GetScopeRevisionView requires ExactFence",
+                    });
+                }
+                if !request.parameters.is_empty() {
+                    return Err(StoreError::InvalidField {
+                        field: "operation.parameter",
+                        reason: "GetScopeRevisionView declares no parameters",
                     });
                 }
                 request.validate()?;
@@ -511,18 +530,11 @@ impl KernelContextReadClient {
                 reason: "reconstruction read requires ExactFence",
             });
         }
-        if request.operation == NamedReadOperation::GetCapabilityEvidenceState
-            && !request.parameters.is_empty()
-        {
+        if request.operation == NamedReadOperation::GetCapabilityEvidenceState {
             Self::check_capability_evidence_selectors(request)?;
-        } else if !request.parameters.is_empty() {
-            return Err(StoreError::InvalidField {
-                field: "operation.parameter",
-                reason: "reconstruction read declares no parameters",
-            });
         }
-        request.validate()?;
-        Ok(())
+        let entries = generated_operation_manifests()?;
+        request.validate_against_catalogue(&entries)
     }
 
     /// Checks the closed `GetCapabilityEvidenceState` selectors before any
@@ -943,12 +955,31 @@ mod tests {
         operation: NamedReadOperation,
         fence: &StateFence,
     ) -> Result<NamedReadRequest, Box<dyn std::error::Error>> {
+        let mut parameters = BTreeMap::new();
+        match operation {
+            NamedReadOperation::GetTaskState => {
+                parameters.insert("task_id".to_owned(), json!("task-demo"));
+                parameters.insert("max_records".to_owned(), json!("8"));
+            }
+            NamedReadOperation::GetAttentionAndProblems => {
+                parameters.insert("max_records".to_owned(), json!("8"));
+            }
+            NamedReadOperation::GetUnderstandingProjectionInputs => {
+                parameters.insert("selector".to_owned(), json!("projection-demo"));
+                parameters.insert("max_records".to_owned(), json!("8"));
+            }
+            NamedReadOperation::GetCapabilityEvidenceState => {
+                parameters.insert("skill_id".to_owned(), json!("skill-demo"));
+                parameters.insert("max_records".to_owned(), json!("8"));
+            }
+            _ => {}
+        }
         Ok(NamedReadRequest {
             operation,
             scope_id: Some(ScopeId::new("governor")?),
             consistency: ReadConsistency::ExactFence,
             state_fence: fence.clone(),
-            parameters: BTreeMap::new(),
+            parameters,
         })
     }
 
@@ -984,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn reconstruction_capability_requires_scope_exact_fence_and_no_parameters()
+    fn reconstruction_capability_requires_scope_exact_fence_and_closed_selectors()
     -> Result<(), Box<dyn std::error::Error>> {
         let fence = test_fence(1)?;
         for operation in [

@@ -168,17 +168,7 @@ pub fn rebuild_cue_snapshot_closed(
     weights: &[SnapshotEdgeWeight],
 ) -> Result<CueSnapshotBuildCandidate, CueContractError> {
     if let Some(retained) = candidate.snapshot.retained_closure() {
-        let supplied_weights = weights
-            .iter()
-            .map(|weight| {
-                SnapshotEdgeWeight::new_at_revision(
-                    weight.edge.clone(),
-                    weight.weight_milli,
-                    retained.denominator.source_revision,
-                )
-            })
-            .collect::<Vec<_>>();
-        if *denominator != retained.denominator || supplied_weights != retained.edge_weights {
+        if *denominator != retained.denominator || weights != retained.edge_weights.as_slice() {
             return Err(CueContractError::SnapshotNotRebuildable);
         }
         return rebuild_cue_snapshot_with_closure(candidate, registry_revision, retained);
@@ -245,24 +235,19 @@ fn bind_weights_at_revision(
     weights: &[SnapshotEdgeWeight],
     source_revision: u64,
 ) -> Result<Vec<SnapshotEdgeWeight>, CueContractError> {
-    if source_revision == 0 {
-        return Err(CueContractError::SnapshotNotRebuildable);
+    if source_revision == 0
+        || weights
+            .iter()
+            .any(|weight| weight.source_revision != source_revision)
+    {
+        return Err(CueContractError::Foundation {
+            field: "index.edge_weight.source_revision",
+        });
     }
-    weights
-        .iter()
-        .map(|weight| {
-            if weight.source_revision != 0 && weight.source_revision != source_revision {
-                return Err(CueContractError::Foundation {
-                    field: "index.edge_weight.source_revision",
-                });
-            }
-            Ok(SnapshotEdgeWeight::new_at_revision(
-                weight.edge.clone(),
-                weight.weight_milli,
-                source_revision,
-            ))
-        })
-        .collect()
+    // Preserve the supplied records byte-for-byte. A missing, stale, or
+    // mismatched revision is a refusal, never an opportunity for the builder
+    // to rewrite policy input into the denominator revision.
+    Ok(weights.to_vec())
 }
 
 fn fanout_for(edge_count: usize) -> CueSnapshotFanout {
@@ -286,13 +271,18 @@ fn join_closed_rows(
 ) -> Result<Vec<ClosedSnapshotRow>, CueContractError> {
     let mut by_member = BTreeMap::new();
     for projection in projections {
-        by_member.insert(
-            (
-                projection.candidate.canonical.canonical_cue_id.clone(),
-                projection.candidate.target.clone(),
-            ),
-            projection,
+        let key = (
+            projection.candidate.canonical.canonical_cue_id.clone(),
+            projection.candidate.target.clone(),
         );
+        if by_member.insert(key, projection).is_some() {
+            return Err(CueContractError::DuplicateIdentity {
+                field: "index.closed_rows.projections",
+            });
+        }
+    }
+    if by_member.len() != members.len() {
+        return Err(CueContractError::SnapshotNotRebuildable);
     }
     let mut rows = Vec::with_capacity(members.len());
     for member in members {
@@ -312,7 +302,12 @@ fn join_closed_rows(
             primary.match_mode,
             primary.key_value.clone(),
         );
-        let row = ClosedSnapshotRow::new_at_revision(member.clone(), comparison, source_revision);
+        let row = ClosedSnapshotRow::new_at_revision(
+            member.clone(),
+            comparison,
+            projection.normalized.observed.source.clone(),
+            source_revision,
+        );
         row.validate()?;
         rows.push(row);
     }
