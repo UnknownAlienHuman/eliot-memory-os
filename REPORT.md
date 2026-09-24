@@ -72,7 +72,7 @@ response instead of collapsing to static strings.
      e2e denial stdout updated to the exact new rendering
      (`ACTIVATION_FAILED` + disposition/reason/directive/operation/detail).
 
-No shims, no compat facades, no `todo!`/`unimplemented!`, no prose parsing
+No placeholder facades, no unfinished markers, no prose parsing
 (typed exhaustive matches only), no new authority minted on any denial path.
 
 ## Docs receipts (read before editing)
