@@ -2,13 +2,14 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use eliot_agent_bridge_core::{
-    AckPhase, ActivationPortOutcome, ActivationPortResult, AgentBridgeCore, AttachBinding,
-    AttachRequest, BlindInterval, BridgeError, ConnectionId, CoverageGap, CoverageInterval,
-    CursorPolicy, DemandId, EventDisposition, EventEnvelope, EventForwardAck, EventForwardStatus,
-    EventPortOutcome, FencingToken, Generation, HostActivationPort, HostEventEnvelope,
-    McpForwardingPort, PrincipalId, ProofCeiling, ProviderFailure, ProviderReadiness,
-    ReconciliationPortOutcome, ReconciliationPortResult, ReconciliationReceiptRef,
-    ReconnectRequest, RequiredProvider, SessionId, TaskId, WorkUnitId,
+    ACTIVATION_DIRECTIVE_RETRY_NEW_TICKET, ACTIVATION_DISPOSITION_FAILED, AckPhase,
+    ActivationDenialReport, ActivationPortOutcome, ActivationPortResult, AgentBridgeCore,
+    AttachBinding, AttachRequest, BlindInterval, BridgeError, ConnectionId, CoverageGap,
+    CoverageInterval, CursorPolicy, DemandId, EventDisposition, EventEnvelope, EventForwardAck,
+    EventForwardStatus, EventPortOutcome, FencingToken, Generation, HostActivationPort,
+    HostEventEnvelope, McpForwardingPort, PrincipalId, ProofCeiling, ProviderFailure,
+    ProviderReadiness, ReconciliationPortOutcome, ReconciliationPortResult,
+    ReconciliationReceiptRef, ReconnectRequest, RequiredProvider, SessionId, TaskId, WorkUnitId,
 };
 use eliot_contracts::{EpochId, EpochLineageId};
 use serde_json::json;
@@ -878,9 +879,16 @@ fn readiness_is_unavailable_until_each_exact_provider_probe_admits_it() {
 fn trusted_activation_and_reconciliation_ports_return_typed_denial_or_plan_gap()
 -> Result<(), Box<dyn std::error::Error>> {
     let denying_host = SequencedHost {
-        outcomes: VecDeque::from([ActivationPortOutcome::Denied {
-            reason_code: "HOST_AUTHENTICATION_DENIED",
-        }]),
+        outcomes: VecDeque::from([ActivationPortOutcome::Denied(
+            ActivationDenialReport::new(
+                "UNKNOWN_OUTCOME",
+                ACTIVATION_DISPOSITION_FAILED,
+                ACTIVATION_DIRECTIVE_RETRY_NEW_TICKET,
+                "denied-demand".to_owned(),
+                None,
+            )
+            .expect("valid test denial report"),
+        )]),
     };
     let mut denied = AgentBridgeCore::new(
         ProviderReadiness::all_admitted(),
@@ -888,10 +896,19 @@ fn trusted_activation_and_reconciliation_ports_return_typed_denial_or_plan_gap()
         None,
         CursorPolicy::new(AckPhase::Durable, AckPhase::Normalized)?,
     );
-    assert!(matches!(
-        denied.attach(managed_request("connection-1")?),
-        Err(BridgeError::ActivationDenied("HOST_AUTHENTICATION_DENIED"))
-    ));
+    let Err(BridgeError::ActivationDenied(report)) =
+        denied.attach(managed_request("connection-1")?)
+    else {
+        return Err("expected typed activation denial".into());
+    };
+    assert_eq!(report.reason_code(), "UNKNOWN_OUTCOME");
+    assert_eq!(report.disposition(), ACTIVATION_DISPOSITION_FAILED);
+    assert_eq!(
+        report.directive_kind(),
+        ACTIVATION_DIRECTIVE_RETRY_NEW_TICKET
+    );
+    assert_eq!(report.operation(), "denied-demand");
+    assert!(report.detail().is_none());
 
     let host = CoalescingHost {
         state: Arc::new(Mutex::new(HostState::default())),

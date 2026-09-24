@@ -523,35 +523,75 @@ pub const ACTIVATION_DIRECTIVE_FENCE_CLOSED: &str = "stale-fence-fail-closed";
 /// I7.20 directive kind for failures: carry the typed failure capsule.
 pub const ACTIVATION_DIRECTIVE_FAILURE_CAPSULE: &str = "failure-capsule";
 
-/// I7.20 activation-denial triple: disposition + exact `reason_code` + directive.
+/// I7.20 agent-facing denial report: disposition + catalogue `reason_code` +
+/// directive plus the exact owner-issued denial detail.
 ///
-/// Every non-success response includes the disposition, the exact `reason_code`,
-/// the applicable Recovery or Conflict Directive, and the same operation
-/// identity when one exists. The bridge surfaces the triple read-only and
-/// fails closed; it never auto-selects among candidates.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ActivationDenialDetails {
+/// Every non-success response includes the disposition, the exact
+/// `reason_code`, the applicable Recovery or Conflict Directive, and the same
+/// operation identity when one exists. The bridge surfaces the report
+/// read-only and fails closed; it never auto-selects among candidates and
+/// never collapses distinct candidate sets, retry bounds, or failure handles
+/// into one static string.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivationDenialReport {
     reason_code: &'static str,
     disposition: &'static str,
     directive_kind: &'static str,
+    operation: String,
+    detail: Option<eliot_protocol::AgentActivationResolutionDisposition>,
 }
 
-impl ActivationDenialDetails {
-    /// Seals one denial triple. All three legs are required; silence and
-    /// generic internal-error prose are not normal control behavior.
-    pub const fn new(
+impl ActivationDenialReport {
+    /// Seals one denial report. All legs are required; silence and generic
+    /// internal-error prose are not normal control behavior. The `detail`
+    /// carries the exact owner-issued typed disposition and is `None` only
+    /// for the Kernel-owned no-result refusal, which has no daemon
+    /// disposition to project. A malformed leg fails as a provider contract
+    /// rejection: the legs arrive from the trusted provider projection, so a
+    /// blank leg means the provider violated its contract.
+    pub fn new(
         reason_code: &'static str,
         disposition: &'static str,
         directive_kind: &'static str,
-    ) -> Self {
-        Self {
+        operation: String,
+        detail: Option<eliot_protocol::AgentActivationResolutionDisposition>,
+    ) -> Result<Self, ProviderFailure> {
+        validate_text(reason_code, "activation_denial.reason_code").map_err(|_| {
+            ProviderFailure::new(
+                "eliot-agent-bridge-core",
+                "activation denial reason must be non-blank",
+            )
+        })?;
+        validate_text(disposition, "activation_denial.disposition").map_err(|_| {
+            ProviderFailure::new(
+                "eliot-agent-bridge-core",
+                "activation denial disposition must be non-blank",
+            )
+        })?;
+        validate_text(directive_kind, "activation_denial.directive_kind").map_err(|_| {
+            ProviderFailure::new(
+                "eliot-agent-bridge-core",
+                "activation denial directive must be non-blank",
+            )
+        })?;
+        validate_text(&operation, "activation_denial.operation").map_err(|_| {
+            ProviderFailure::new(
+                "eliot-agent-bridge-core",
+                "activation denial operation must be non-blank",
+            )
+        })?;
+        Ok(Self {
             reason_code,
             disposition,
             directive_kind,
-        }
+            operation,
+            detail,
+        })
     }
 
-    /// Open versioned registry code; specialized only via bridge-alias mapping.
+    /// Catalogue `reason_code` from the I7.20 reason registry (open layer);
+    /// legacy transport codes arrive already projected to their catalogue
+    /// alias and unknown future codes pass through verbatim.
     pub const fn reason_code(&self) -> &'static str {
         self.reason_code
     }
@@ -565,24 +605,105 @@ impl ActivationDenialDetails {
     pub const fn directive_kind(&self) -> &'static str {
         self.directive_kind
     }
+
+    /// Operation identity (the exact demand) this denial answers.
+    pub fn operation(&self) -> &str {
+        &self.operation
+    }
+
+    /// Exact owner-issued denial detail; `None` only for the Kernel-owned
+    /// no-result refusal.
+    pub const fn detail(&self) -> Option<&eliot_protocol::AgentActivationResolutionDisposition> {
+        self.detail.as_ref()
+    }
+
+    /// Renders the exact agent-facing denial detail: disposition, catalogue
+    /// reason, directive, operation correlation, and the differing
+    /// owner-issued payload (candidate handles plus coverage plus recovery
+    /// handle; retry dependency plus observed revision plus earliest-retry
+    /// bound; observed fence plus recovery handle; or failure handle).
+    /// Two denials with different candidate sets, retry bounds, or failure
+    /// handles render differently; nothing here is reconstructed from reason
+    /// text.
+    pub fn agent_detail(&self) -> String {
+        let payload = match &self.detail {
+            None => "no-typed-result".to_owned(),
+            Some(
+                eliot_protocol::AgentActivationResolutionDisposition::TaskSelectionRequired {
+                    selection,
+                }
+                | eliot_protocol::AgentActivationResolutionDisposition::ScopeSelectionRequired {
+                    selection,
+                }
+                | eliot_protocol::AgentActivationResolutionDisposition::ScopeAmbiguous { selection },
+            ) => {
+                let candidates = serde_json::to_string(&selection.candidate_handles)
+                    .unwrap_or_else(|_| "[]".to_owned());
+                format!(
+                    "candidates={} coverage={:?} recovery={}",
+                    candidates, selection.candidate_coverage, selection.recovery_handle
+                )
+            }
+            Some(eliot_protocol::AgentActivationResolutionDisposition::NotReady {
+                recovery_handle,
+                retry,
+            }) => format!(
+                "recovery={} dependency={} observed_revision={} not_before_unix_ms={}",
+                recovery_handle,
+                retry.dependency_ref,
+                retry.observed_dependency_revision,
+                retry.not_before_unix_ms
+            ),
+            Some(eliot_protocol::AgentActivationResolutionDisposition::StaleFence {
+                recovery_handle,
+                observed_state_fence,
+            }) => match observed_state_fence {
+                Some(fence) => format!("recovery={recovery_handle} observed_fence={fence:?}"),
+                None => format!("recovery={recovery_handle} observed_fence=none"),
+            },
+            Some(eliot_protocol::AgentActivationResolutionDisposition::FailedInternal {
+                failure_handle,
+            }) => format!("failure={failure_handle}"),
+            Some(eliot_protocol::AgentActivationResolutionDisposition::Resolved { .. }) => {
+                "invalid-resolved-in-denial".to_owned()
+            }
+        };
+        format!(
+            "activation denied: disposition={} reason={} directive={} operation={} {}",
+            self.disposition, self.reason_code, self.directive_kind, self.operation, payload
+        )
+    }
+}
+
+impl fmt::Display for ActivationDenialReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.agent_detail())
+    }
 }
 
 /// Trusted activation-port disposition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ActivationPortOutcome {
     Authenticated(ActivationPortResult),
-    Denied {
-        reason_code: &'static str,
+    /// I7.20 detailed denial carrying the disposition, the catalogue
+    /// `reason_code`, and the directive triple plus the exact owner-issued
+    /// denial detail. Fails closed via [`BridgeError::ActivationDenied`];
+    /// the extra legs travel to the agent-facing projection instead of being
+    /// discarded at the port.
+    Denied(ActivationDenialReport),
+    /// No valid terminal result arrived before the ticket deadline. Distinct
+    /// from every typed negative: the Kernel may still hold or expire the
+    /// ticket on its own leg, but this port observed the deadline pass with
+    /// no terminal result.
+    DeadlineExceeded {
+        operation: String,
+        deadline_unix_ms: u64,
     },
-    /// I7.20 detailed denial carrying the disposition + `reason_code` +
-    /// directive triple. Handled identically to [`Self::Denied`] (fail-closed
-    /// via [`BridgeError::ActivationDenied`]); the extra legs are carried for
-    /// agent-facing projection without creating host-specific semantic
-    /// control enums. Kept additive: [`Self::Denied`] remains for compat.
-    DeniedDetailed {
-        reason_code: &'static str,
-        disposition: &'static str,
-        directive_kind: &'static str,
+    /// The transport exchange ended with no terminal result while the ticket
+    /// deadline had not passed, so the outcome is unknown rather than denied:
+    /// never one of the known negatives, never a success, and never authority.
+    UnknownOutcome {
+        operation: String,
     },
 }
 
@@ -1011,10 +1132,20 @@ impl AgentBridgeCore {
         let activation = host.activate(&request)?;
         let grant = match activation {
             ActivationPortOutcome::Authenticated(result) => ActivationGrant::seal(result)?,
-            ActivationPortOutcome::Denied { reason_code }
-            | ActivationPortOutcome::DeniedDetailed { reason_code, .. } => {
-                validate_text(reason_code, "activation_denial.reason_code")?;
-                return Err(BridgeError::ActivationDenied(reason_code));
+            ActivationPortOutcome::Denied(report) => {
+                return Err(BridgeError::ActivationDenied(report));
+            }
+            ActivationPortOutcome::DeadlineExceeded {
+                operation,
+                deadline_unix_ms,
+            } => {
+                return Err(BridgeError::ActivationDeadlineExceeded {
+                    operation,
+                    deadline_unix_ms,
+                });
+            }
+            ActivationPortOutcome::UnknownOutcome { operation } => {
+                return Err(BridgeError::ActivationUnknownOutcome { operation });
             }
         };
         if let Some(current) = &self.active {
@@ -2025,8 +2156,19 @@ pub enum BridgeError {
     Provider(#[from] ProviderFailure),
     #[error("bridge is not attached")]
     NotAttached,
-    #[error("activation denied by the trusted host provider: {0}")]
-    ActivationDenied(&'static str),
+    #[error("activation denied: {0}")]
+    ActivationDenied(ActivationDenialReport),
+    #[error(
+        "activation observed no terminal result before deadline {deadline_unix_ms} for operation {operation}"
+    )]
+    ActivationDeadlineExceeded {
+        operation: String,
+        deadline_unix_ms: u64,
+    },
+    #[error(
+        "activation outcome unknown for operation {operation}: no terminal result, deadline not reached"
+    )]
+    ActivationUnknownOutcome { operation: String },
     #[error("stale session, generation, or state fence")]
     StaleAuthority,
     #[error("EXTERNAL_ATTACH_RECONCILIATION_REQUIRED")]
