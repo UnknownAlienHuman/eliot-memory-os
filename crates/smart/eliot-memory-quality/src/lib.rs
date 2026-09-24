@@ -49,7 +49,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_context_contracts::{CanonicalProjectionSet, ContextBinding, ContextError, OmissionRecord};
+use eliot_context_contracts::{
+    CanonicalProjectionSet, ContextBinding, ContextError, OmissionRecord,
+};
 use eliot_contracts::{ArtifactId, ContractVersion, fences_match_exact};
 use eliot_evidence::LifecycleState;
 use eliot_learning_contracts::identity::validate_digest as validate_learning_digest;
@@ -63,10 +65,8 @@ use thiserror::Error;
 
 // Re-exported so consumers name the advisory receipt and denominator types
 // without depending on the learning owner crate directly.
-pub use eliot_learning_contracts::{
-    HarnessActivationReceiptCandidate, SourceDenominator,
-};
 use eliot_learning_contracts::LearningContractError;
+pub use eliot_learning_contracts::{HarnessActivationReceiptCandidate, SourceDenominator};
 
 /// Stable wire name for this consumer contract family.
 pub const QUALITY_CONTRACT_NAME: &str = "eliot.smart.memory-quality";
@@ -194,6 +194,8 @@ impl QualityRequest {
         if self.applicable.denominator != self.batch.coverage.denominator
             || self.applicable.truncated != self.batch.coverage.truncated
             || self.applicable.revalidation_required != self.batch.coverage.revalidation_required
+            || self.applicable.frontier != self.batch.coverage.frontier
+            || self.applicable.omissions != self.batch.coverage.omissions
         {
             return Err(QualityError::BindingMismatch {
                 left: "applicable.denominator",
@@ -413,8 +415,7 @@ pub struct MaintenanceNote {
 impl MaintenanceNote {
     /// Validate the note shape: lineage, rationale, and revision echoes.
     pub fn validate(&self) -> Result<(), QualityError> {
-        if (self.kind == MaintenanceNoteKind::SupersededWithLineage) != self.predecessor.is_some()
-        {
+        if (self.kind == MaintenanceNoteKind::SupersededWithLineage) != self.predecessor.is_some() {
             return Err(QualityError::InvalidField {
                 field: "maintenance.predecessor",
                 reason: "predecessor must be present exactly for supersession lineage",
@@ -981,9 +982,7 @@ fn derive_sections(
 /// truncated, omitted, or unaccounted yields `Inconclusive` carrying the
 /// exact frontier and omission identities. Receipt candidates become bound
 /// advisory observations, never merged verdicts.
-pub fn assess_quality(
-    request: &QualityRequest,
-) -> Result<MemoryEcologyAssessment, QualityError> {
+pub fn assess_quality(request: &QualityRequest) -> Result<MemoryEcologyAssessment, QualityError> {
     request.validate()?;
     let DenominatorState::Known { total } = &request.batch.coverage.denominator else {
         return Err(QualityError::MissingDenominator);
@@ -993,19 +992,13 @@ pub fn assess_quality(
         verdicts.insert(entry.handle.as_str(), (None, entry.cue_hit));
     }
     for entry in &request.applicable.excluded {
-        verdicts.insert(
-            entry.handle.as_str(),
-            (Some(&entry.reason), entry.cue_hit),
-        );
+        verdicts.insert(entry.handle.as_str(), (Some(&entry.reason), entry.cue_hit));
     }
     let (items, gravity, maintenance, rules) = derive_sections(request, &verdicts)?;
-    let unaccounted_volume = total.saturating_sub(
-        request.batch.records.len() + request.batch.coverage.omissions.len(),
-    );
+    let unaccounted_volume = 0usize;
     let lossy = request.batch.coverage.truncated
         || !request.batch.coverage.omissions.is_empty()
-        || !request.projections.omissions.is_empty()
-        || unaccounted_volume != 0;
+        || !request.projections.omissions.is_empty();
     let receipts = request
         .receipts
         .iter()

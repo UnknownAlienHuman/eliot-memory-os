@@ -161,6 +161,13 @@ impl MemoryProjectionBatch {
                 field: "batch.records",
             });
         }
+        let projected = self.validate_records()?;
+        let omitted = self.validate_omissions(&projected)?;
+        self.validate_frontier(&projected, &omitted)?;
+        self.validate_partition(projected.len(), omitted.len())
+    }
+
+    fn validate_records(&self) -> Result<BTreeSet<String>, MemoryProjectionError> {
         let mut projected = BTreeSet::new();
         for record in &self.records {
             record.validate()?;
@@ -178,6 +185,12 @@ impl MemoryProjectionBatch {
                     reason: "record binding must equal the batch binding",
                 });
             }
+            if record.binding.state_fence != self.binding.state_fence {
+                return Err(MemoryProjectionError::FenceMismatch {
+                    left: "record.binding.state_fence",
+                    right: "batch.binding.state_fence",
+                });
+            }
             if !record
                 .state_fence
                 .is_compatible_with(&self.binding.state_fence)
@@ -188,7 +201,13 @@ impl MemoryProjectionBatch {
                 });
             }
         }
+        Ok(projected)
+    }
 
+    fn validate_omissions(
+        &self,
+        projected: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, MemoryProjectionError> {
         let mut omitted = BTreeSet::new();
         for omission in &self.coverage.omissions {
             let handle = omission.handle.as_str();
@@ -204,7 +223,14 @@ impl MemoryProjectionBatch {
                 });
             }
         }
+        Ok(omitted)
+    }
 
+    fn validate_frontier(
+        &self,
+        projected: &BTreeSet<String>,
+        omitted: &BTreeSet<String>,
+    ) -> Result<(), MemoryProjectionError> {
         let mut deferred = BTreeSet::new();
         for handle in &self.coverage.frontier {
             if !deferred.insert(handle.clone()) {
@@ -219,15 +245,26 @@ impl MemoryProjectionBatch {
                 });
             }
         }
+        if self.coverage.truncated && self.coverage.frontier.is_empty() {
+            return Err(MemoryProjectionError::CoverageMismatch {
+                reason: "truncated coverage must carry a resume frontier",
+            });
+        }
+        if !self.coverage.truncated && !self.coverage.frontier.is_empty() {
+            return Err(MemoryProjectionError::CoverageMismatch {
+                reason: "non-truncated coverage must not carry a frontier",
+            });
+        }
+        Ok(())
+    }
 
-        // A known denominator is an exact partition, not a lower bound. Every
-        // observed identity must be projected, explicitly omitted, or named
-        // in the truncation frontier; a positive unexplained remainder is a
-        // coverage contradiction even when the batch is otherwise bounded.
-        let accounted = self
-            .records
-            .len()
-            .checked_add(self.coverage.omissions.len())
+    fn validate_partition(
+        &self,
+        projected: usize,
+        omitted: usize,
+    ) -> Result<(), MemoryProjectionError> {
+        let accounted = projected
+            .checked_add(omitted)
             .and_then(|volume| volume.checked_add(self.coverage.frontier.len()))
             .ok_or(MemoryProjectionError::CoverageMismatch {
                 reason: "accounted denominator volume overflows",
@@ -239,19 +276,6 @@ impl MemoryProjectionBatch {
                 reason: "known denominator must exactly equal projected, omitted, and deferred volume",
             });
         }
-        // Volume truncation must name where to resume; a frontier without
-        // truncation is unclaimed volume and is rejected.
-        if self.coverage.truncated && self.coverage.frontier.is_empty() {
-            return Err(MemoryProjectionError::CoverageMismatch {
-                reason: "truncated coverage must carry a resume frontier",
-            });
-        }
-        if !self.coverage.truncated && !self.coverage.frontier.is_empty() {
-            return Err(MemoryProjectionError::CoverageMismatch {
-                reason: "non-truncated coverage must not carry a frontier",
-            });
-        }
-        // Truncation or omission always requires revalidation before use.
         let must_revalidate = self.coverage.truncated || !self.coverage.omissions.is_empty();
         if must_revalidate && !self.coverage.revalidation_required {
             return Err(MemoryProjectionError::CoverageMismatch {

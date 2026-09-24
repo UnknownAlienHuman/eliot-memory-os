@@ -287,6 +287,21 @@ fn independently_deserialized_set_cannot_claim_a_short_complete_denominator() {
 }
 
 #[test]
+fn independently_deserialized_unknown_set_fails_closed() {
+    let mut set = evaluate(vec![record("mem-1")]);
+    set.denominator = DenominatorState::Unknown {
+        reason: "read side could not count".to_owned(),
+    };
+    let error = set
+        .validate()
+        .expect_err("an applicability verdict requires a known denominator");
+    assert!(matches!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. }
+    ));
+}
+
+#[test]
 fn truncated_batch_preserves_exact_recovery_state() {
     let mut candidate = request(vec![record("mem-1")]);
     candidate.batch.coverage.denominator = DenominatorState::Known { total: 3 };
@@ -297,6 +312,8 @@ fn truncated_batch_preserves_exact_recovery_state() {
     assert!(set.truncated);
     assert!(set.revalidation_required);
     assert_eq!(set.applicable.len(), 1);
+    assert_eq!(set.frontier, vec!["mem-2", "mem-3"]);
+    assert!(set.omissions.is_empty());
     set.validate()
         .expect("set preserves the incomplete proof ceiling");
 }
@@ -312,6 +329,27 @@ fn truncation_and_revalidation_echo_to_the_set() {
     assert!(set.truncated);
     assert!(set.revalidation_required);
     assert_eq!(set.applicable.len(), 1);
+    assert_eq!(set.frontier, vec!["resume-after-mem-1"]);
+}
+
+#[test]
+fn omitted_recovery_identity_is_preserved_in_the_set() {
+    let mut candidate = request(vec![record("mem-1")]);
+    candidate.batch.coverage.denominator = DenominatorState::Known { total: 2 };
+    candidate
+        .batch
+        .coverage
+        .omissions
+        .push(eliot_memory_projection_contracts::CoverageOmission {
+            handle: aid("mem-2"),
+            reason: "fence-mismatch".to_owned(),
+        });
+    candidate.batch.coverage.revalidation_required = true;
+    let set = evaluate_applicability(&candidate).expect("lossy evaluation");
+    assert_eq!(set.omissions.len(), 1);
+    assert_eq!(set.omissions[0].handle, aid("mem-2"));
+    set.validate()
+        .expect("set preserves omission recovery identity");
 }
 
 #[test]

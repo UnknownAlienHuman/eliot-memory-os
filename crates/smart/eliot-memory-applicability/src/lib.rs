@@ -246,6 +246,8 @@ pub fn evaluate_applicability(
         denominator: request.batch.coverage.denominator.clone(),
         truncated: request.batch.coverage.truncated,
         revalidation_required: request.batch.coverage.revalidation_required,
+        frontier: request.batch.coverage.frontier.clone(),
+        omissions: request.batch.coverage.omissions.clone(),
         cue_hits_considered: request.cue_hits.len(),
     };
     set.validate()?;

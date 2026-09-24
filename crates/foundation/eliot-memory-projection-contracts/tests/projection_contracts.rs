@@ -143,6 +143,22 @@ fn record_fence_mismatch_fails_closed() {
 }
 
 #[test]
+fn nested_record_binding_fence_must_equal_the_batch_fence() {
+    let mut candidate = batch();
+    candidate.records[0].binding.state_fence = fence_other();
+    let error = candidate
+        .validate()
+        .expect_err("nested binding fence drift must fail");
+    assert!(matches!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::FenceMismatch {
+            left: "record.binding.state_fence",
+            right: "batch.binding.state_fence",
+        }
+    ));
+}
+
+#[test]
 fn record_scope_mismatch_fails_closed() {
     let mut candidate = batch();
     candidate.records[0].binding.task_id = TaskId::new("task-other").expect("fixture task");

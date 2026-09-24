@@ -194,6 +194,8 @@ fn set_for(
         denominator: batch.coverage.denominator.clone(),
         truncated: batch.coverage.truncated,
         revalidation_required: batch.coverage.revalidation_required,
+        frontier: batch.coverage.frontier.clone(),
+        omissions: batch.coverage.omissions.clone(),
         cue_hits_considered: cue_hits.len(),
     }
 }
@@ -466,6 +468,7 @@ fn unknown_denominator_fails_closed() {
 #[test]
 fn truncated_coverage_is_inconclusive_with_frontier() {
     let mut batch_value = batch(vec![record("mem-1")]);
+    batch_value.coverage.denominator = DenominatorState::Known { total: 2 };
     batch_value.coverage.truncated = true;
     batch_value.coverage.frontier = vec!["resume-1".to_owned()];
     batch_value.coverage.revalidation_required = true;
@@ -511,7 +514,7 @@ fn batch_omissions_are_carried_with_identities() {
 }
 
 #[test]
-fn undeclared_volume_is_inconclusive_not_silent() {
+fn undeclared_volume_is_rejected_by_the_batch_owner() {
     let batch_value = batch(vec![record("mem-1")]);
     let mut lossy = batch_value;
     lossy.coverage.denominator = DenominatorState::Known { total: 3 };
@@ -522,10 +525,12 @@ fn undeclared_volume_is_inconclusive_not_silent() {
         projections: projections(vec![], vec![]),
         receipts: vec![],
     };
-    let assessment = assess_quality(&candidate).expect("quality assessment");
-    assessment.validate().expect("assessment validates");
-    assert_eq!(assessment.status, CoverageStatus::Inconclusive);
-    assert_eq!(assessment.counter_metrics.unaccounted_volume, 2);
+    assert!(matches!(
+        assess_quality(&candidate),
+        Err(QualityError::Projection(
+            eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. }
+        ))
+    ));
 }
 
 #[test]
