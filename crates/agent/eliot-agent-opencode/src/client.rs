@@ -36,6 +36,8 @@ pub struct OpenCodeRunPolicy {
     max_sse_reconnects: usize,
     max_sse_chunk_bytes: usize,
     sse_limits: SseLimits,
+    executable_fingerprint: Option<String>,
+    environment_allowlist: Vec<String>,
 }
 
 impl OpenCodeRunPolicy {
@@ -57,6 +59,8 @@ impl OpenCodeRunPolicy {
             max_sse_reconnects: 3,
             max_sse_chunk_bytes: 64 * 1024,
             sse_limits: SseLimits::default(),
+            executable_fingerprint: None,
+            environment_allowlist: Vec::new(),
         })
     }
 
@@ -102,6 +106,18 @@ impl OpenCodeRunPolicy {
         self
     }
 
+    #[must_use]
+    pub fn with_executable_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.executable_fingerprint = Some(fingerprint.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_environment_allowlist(mut self, allowlist: Vec<String>) -> Self {
+        self.environment_allowlist = allowlist;
+        self
+    }
+
     fn validate(&self) -> Result<(), OpenCodeRunError> {
         if self.max_events == 0 || self.max_sse_reconnects == 0 || self.max_sse_chunk_bytes == 0 {
             return Err(OpenCodeRunError::InvalidPolicy(
@@ -130,6 +146,24 @@ impl OpenCodeRunPolicy {
         {
             return Err(OpenCodeRunError::InvalidPolicy(
                 "OpenCode workspace identity must be nonblank when supplied".to_owned(),
+            ));
+        }
+        if self
+            .executable_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| fingerprint.trim().is_empty())
+        {
+            return Err(OpenCodeRunError::InvalidPolicy(
+                "OpenCode executable fingerprint must be nonblank when supplied".to_owned(),
+            ));
+        }
+        if self
+            .environment_allowlist
+            .iter()
+            .any(|entry| entry.trim().is_empty())
+        {
+            return Err(OpenCodeRunError::InvalidPolicy(
+                "OpenCode environment allowlist entries must be nonblank".to_owned(),
             ));
         }
         Ok(())
@@ -247,6 +281,7 @@ struct CorrelatedEventState {
     assistant_completed: bool,
     terminal_stop: bool,
     idle_observed: bool,
+    seen_event_ids: BTreeSet<u64>,
 }
 
 impl CorrelatedEventState {
@@ -261,6 +296,7 @@ impl CorrelatedEventState {
             assistant_completed: false,
             terminal_stop: false,
             idle_observed: false,
+            seen_event_ids: BTreeSet::new(),
         }
     }
 
@@ -603,7 +639,11 @@ impl OpenCodeClient {
     /// server, the read-only `plan` agent ceiling, and no server launch,
     /// process control, credential exposure, or finish authority. The
     /// returned seal is candidate-only; unknown outcomes surface as
-    /// [`OpenCodeRunError`] (including `UnknownOutcome`) and never seal.
+    /// [`OpenCodeRunError`] (including `UnknownOutcome`) and never seal. The
+    /// admitted slot is consumed exactly once before dispatch, every other
+    /// live session must be idle before sealing (fail-closed child gate), and
+    /// one terminal observation bound to the sealed candidate is emitted
+    /// without changing the return type.
     pub async fn run_admitted_read_only(
         &self,
         admitted: &AdmittedOpenCodeAttempt,
@@ -613,8 +653,30 @@ impl OpenCodeClient {
     ) -> Result<AdmittedAttemptOutcome, AdmittedAttemptError> {
         admitted.verify(current_fence, runtime_generation)?;
         admitted.verify_request(request)?;
+        let _slot = admitted.consume_one_slot();
         let run = self.run_read_only(request).await?;
+        if let Some(session_id) = &run.session_id {
+            let statuses = self.session_statuses().await.map_err(|error| {
+                OpenCodeRunError::Protocol(format!(
+                    "admitted child-session gate could not list session statuses: {error}"
+                ))
+            })?;
+            let children: Vec<(String, bool)> = statuses
+                .iter()
+                .filter(|(id, _)| id.as_str() != session_id)
+                .map(|(id, status)| {
+                    let is_open = !matches!(status, SessionStatus::Idle { .. });
+                    (id.clone(), is_open)
+                })
+                .collect();
+            crate::ensure_no_open_child_sessions(session_id, &children)?;
+        }
         let candidate = AdmittedAttemptCandidate::seal(admitted, &run)?;
+        let _observation = crate::AdmittedObservation::new(
+            admitted,
+            crate::AdmittedObservationKind::Terminal,
+            candidate.compute_digest()?.to_string(),
+        );
         Ok(AdmittedAttemptOutcome { run, candidate })
     }
 
@@ -710,6 +772,14 @@ impl OpenCodeClient {
                         std::mem::take(&mut events),
                     )
                 })?;
+                let identity = event_identity(&event);
+                if !state.seen_event_ids.insert(identity) {
+                    // Idempotent redelivery: a reconnect replayed an
+                    // already-observed frame. Skip observe() and the
+                    // completion check; the first delivery is already
+                    // retained exactly once below.
+                    continue;
+                }
                 let observed = state.observe(&event);
                 if event_belongs_to_session(&event, session_id)
                     || event.event_type == "server.connected"
@@ -1019,6 +1089,23 @@ impl OpenCodeClient {
             "baseline_diff_count".to_owned(),
             Value::from(prepared.baseline_diff.len()),
         );
+        extra.insert(
+            "executable_fingerprint".to_owned(),
+            self.policy
+                .executable_fingerprint
+                .clone()
+                .map_or(Value::Null, Value::String),
+        );
+        extra.insert(
+            "environment_allowlist".to_owned(),
+            Value::Array(
+                self.policy
+                    .environment_allowlist
+                    .iter()
+                    .map(|entry| Value::String(entry.clone()))
+                    .collect(),
+            ),
+        );
         NoAuthorityRunResult {
             status: RunStatus::Succeeded,
             candidate_only: true,
@@ -1252,6 +1339,20 @@ fn attest_read_only_agent(agents: &[Value]) -> Result<(), OpenCodeRunError> {
         ));
     }
     Ok(())
+}
+
+/// Stable identity hash of one decoded SSE event for duplicate/gap discipline.
+///
+/// Reorder/gap resume reuses the existing Last-Event-ID reconnect path
+/// (`reconnect_event_stream`); this hash only makes redelivery idempotent so a
+/// replayed frame is never delivered to `CorrelatedEventState::observe` twice.
+fn event_identity(event: &OpenCodeEvent) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let canonical = serde_json::to_string(event).unwrap_or_else(|_| event.event_type.clone());
+    let mut hasher = DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn event_belongs_to_session(event: &OpenCodeEvent, session_id: &str) -> bool {
