@@ -10,6 +10,7 @@
 
 use std::{collections::BTreeMap, fmt, io::Read};
 
+use crate::activation_resolution::AgentActivationResolutionDisposition;
 use eliot_agent_contracts::LivePeerMessage;
 use eliot_contracts::{
     ArtifactId, ContractError, ContractIdentity, ContractVersion, EpochId, RequestId,
@@ -133,7 +134,7 @@ pub const AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_VERSION: u16 = 1;
 pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID: &str =
     "eliot.protocol.agent-bridge-activation-response";
 /// Current agent-bridge activation response wire version.
-pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_VERSION: u16 = 1;
+pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_VERSION: u16 = 2;
 /// Stable denial code for a Kernel-owned activation refusal with no typed
 /// daemon semantic result (pre-ticket immediate denial or result-less expiry).
 /// It never stands in for one of the six typed disposition codes below.
@@ -2037,6 +2038,12 @@ impl AgentBridgeAuthenticatedBinding {
 /// is Kernel-owned and is used only when no daemon disposition exists at all
 /// (pre-ticket immediate denial or result-less expiry); it never collapses two
 /// distinct dispositions into one code.
+///
+/// These wire codes are the Kernel↔bridge transport vocabulary, not the
+/// agent-facing reason catalogue: the bridge projects each code to its exact
+/// `I07-20-agent-facing-error-contract.md` catalogue `reason_code` (e.g.
+/// `SCOPE_AMBIGUOUS` → `AMBIGUOUS_RESULT`, `STALE_FENCE` → `STALE_STATE_FENCE`)
+/// at the agent face and never invents catalogue membership for them here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AgentBridgeActivationDenialCode {
@@ -2082,9 +2089,21 @@ pub enum AgentBridgeActivationDisposition {
         binding: Box<AgentBridgeAuthenticatedBinding>,
     },
     /// Typed fail-closed outcome with no semantic binding.
+    ///
+    /// Carries the denial code plus the exact owner-issued denial detail:
+    /// candidate/recovery handles for selection outcomes, the retry directive
+    /// (dependency revision plus earliest-retry bound) for `NOT_READY`, the
+    /// observed fence plus recovery handle for `STALE_FENCE`, and the failure
+    /// handle for `FAILED_INTERNAL`. `detail` is `None` only for the
+    /// Kernel-owned `SemanticResolutionUnavailable` refusal, which has no
+    /// daemon disposition to project; a typed disposition is never dropped
+    /// into a code-only denial.
     Denied {
         /// Stable denial code.
         reason_code: AgentBridgeActivationDenialCode,
+        /// Exact owner-issued denial detail; absent only when no daemon
+        /// disposition exists at all.
+        detail: Option<AgentActivationResolutionDisposition>,
     },
 }
 
@@ -2092,7 +2111,46 @@ impl AgentBridgeActivationDisposition {
     fn validate(&self) -> Result<(), ProtocolError> {
         match self {
             Self::Authenticated { binding } => binding.validate(),
-            Self::Denied { .. } => Ok(()),
+            Self::Denied {
+                reason_code,
+                detail,
+            } => match detail {
+                None => {
+                    if *reason_code
+                        != AgentBridgeActivationDenialCode::SemanticResolutionUnavailable
+                    {
+                        return Err(ProtocolError::InvalidField {
+                            field: "agent_bridge_activation_response.denial",
+                            reason: "a detail-less denial carries no daemon disposition and must keep the Kernel-owned code",
+                        });
+                    }
+                    Ok(())
+                }
+                Some(AgentActivationResolutionDisposition::Resolved { .. }) => {
+                    Err(ProtocolError::InvalidField {
+                        field: "agent_bridge_activation_response.denial",
+                        reason: "a Resolved disposition never projects a denial",
+                    })
+                }
+                Some(_) => {
+                    if *reason_code
+                        == AgentBridgeActivationDenialCode::SemanticResolutionUnavailable
+                    {
+                        return Err(ProtocolError::InvalidField {
+                            field: "agent_bridge_activation_response.denial",
+                            reason: "a typed daemon disposition never carries the Kernel-owned no-result code",
+                        });
+                    }
+                    let Some(detail) = detail else {
+                        return Err(ProtocolError::InvalidField {
+                            field: "agent_bridge_activation_response.denial",
+                            reason: "typed denial detail vanished during validation",
+                        });
+                    };
+                    detail.validate()?;
+                    Ok(())
+                }
+            },
         }
     }
 }
@@ -2121,11 +2179,14 @@ impl AgentBridgeActivationResponse {
 
     /// Constructs the fail-closed denial response for one exact request: either
     /// a Kernel-owned refusal with no daemon disposition (pre-ticket immediate
-    /// denial or result-less expiry) or the typed projection of one daemon
-    /// non-`Resolved` disposition supplied by the caller.
+    /// denial or result-less expiry, `detail` is `None`) or the typed
+    /// projection of one daemon non-`Resolved` disposition supplied by the
+    /// caller (the exact owner-issued detail travels verbatim; it is never
+    /// reduced to the code alone).
     pub fn denied(
         request: &AgentBridgeActivationRequest,
         reason_code: AgentBridgeActivationDenialCode,
+        detail: Option<AgentActivationResolutionDisposition>,
     ) -> Result<Self, ProtocolError> {
         request.validate()?;
         Self {
@@ -2133,10 +2194,17 @@ impl AgentBridgeActivationResponse {
             wire_version: Self::CONTRACT_VERSION,
             request_id: request.request_identity.request.metadata.request_id.clone(),
             request_sha256: request.request_sha256.clone(),
-            disposition: AgentBridgeActivationDisposition::Denied { reason_code },
+            disposition: AgentBridgeActivationDisposition::Denied {
+                reason_code,
+                detail,
+            },
             response_sha256: String::new(),
         }
         .with_computed_digest()
+        .and_then(|response| {
+            response.validate()?;
+            Ok(response)
+        })
     }
 
     /// Returns canonical bytes covered by `response_sha256`.
@@ -4092,6 +4160,7 @@ mod tests {
         let response = AgentBridgeActivationResponse::denied(
             &request,
             AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+            None,
         )?;
 
         response.validate()?;

@@ -1404,7 +1404,9 @@ impl KernelComposition {
     /// fallback arm, so the compiler rejects any silent coercion: only an
     /// exact valid `Resolved` binding creates a Session, and every
     /// non-`Resolved` disposition receives an immediate typed denial carrying
-    /// its own exact denial code, creating no Session, authority, capability,
+    /// its own exact denial code plus the full owner-issued denial detail
+    /// (candidate/recovery handles, retry directive, observed fence, or
+    /// failure handle), creating no Session, authority, capability,
     /// or Finish state. The exact disposition remains retained in the Kernel
     /// record and the daemon-facing acknowledgement; mapping is decided by
     /// these typed arms alone and never by human detail or log text.
@@ -1429,7 +1431,8 @@ impl KernelComposition {
         // future disposition breaks compilation instead of silently
         // coercing. All six non-success dispositions share the bridge
         // outcome below: an immediate typed denial carrying the exact
-        // per-disposition code, with no Session, authority, capability, or
+        // per-disposition code plus the full owner-issued denial detail,
+        // with no Session, authority, capability, or
         // Finish. Their exact typed content stays retained in the Kernel
         // record and the daemon-facing acknowledgement; mapping is decided
         // by these typed arms alone.
@@ -1445,7 +1448,13 @@ impl KernelComposition {
             | AgentActivationResolutionDisposition::FailedInternal { .. } => {
                 let reason_code = Self::activation_denial_code_for_disposition(&result.disposition)
                     .ok_or(TransportError::SessionFenced)?;
-                self.denied_result_response_frame(connection_id, original, pending, reason_code)
+                self.denied_result_response_frame(
+                    connection_id,
+                    original,
+                    pending,
+                    reason_code,
+                    Some(result.disposition.clone()),
+                )
             }
         }
     }
@@ -1527,9 +1536,12 @@ impl KernelComposition {
                 self.revoke_agent_bridge_under_transition(connection_id, &mut pending)?;
                 let reason_code = Self::activation_denial_code_for_disposition(&result.disposition)
                     .ok_or(TransportError::SessionFenced)?;
-                let response =
-                    AgentBridgeActivationResponse::denied(&pending_entry.request, reason_code)
-                        .map_err(|_| TransportError::SessionFenced)?;
+                let response = AgentBridgeActivationResponse::denied(
+                    &pending_entry.request,
+                    reason_code,
+                    Some(result.disposition.clone()),
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
                 response
                     .validate_request(&pending_entry.request)
                     .map_err(|_| TransportError::SessionFenced)?;
@@ -1690,8 +1702,9 @@ impl KernelComposition {
     }
 
     /// Returns the immediate typed denial for one non-`Resolved` result,
-    /// carrying the exact per-disposition denial code supplied by the caller.
-    /// No Session, authority, capability, or Finish state is created on any
+    /// carrying the exact per-disposition denial code plus the full
+    /// owner-issued denial detail supplied by the caller. No Session,
+    /// authority, capability, or Finish state is created on any
     /// path through this function; the bridge leg is only marked complete.
     #[cfg(windows)]
     fn denied_result_response_frame(
@@ -1700,8 +1713,9 @@ impl KernelComposition {
         original: &Frame,
         pending: &AgentActivationPending,
         reason_code: AgentBridgeActivationDenialCode,
+        detail: Option<AgentActivationResolutionDisposition>,
     ) -> Result<Frame, TransportError> {
-        let response = AgentBridgeActivationResponse::denied(&pending.request, reason_code)
+        let response = AgentBridgeActivationResponse::denied(&pending.request, reason_code, detail)
             .map_err(|_| TransportError::SessionFenced)?;
         response
             .validate_request(&pending.request)
@@ -1929,6 +1943,7 @@ impl KernelComposition {
         let response = AgentBridgeActivationResponse::denied(
             &request,
             AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+            None,
         )
         .map_err(|_| TransportError::SessionFenced)?;
         let reply = Frame {
@@ -2038,6 +2053,7 @@ impl KernelComposition {
                 let response = AgentBridgeActivationResponse::denied(
                     &request,
                     AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+                    None,
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
                 response
