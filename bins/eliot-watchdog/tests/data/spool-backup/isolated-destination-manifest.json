@@ -1,0 +1,11 @@
+{
+  "schema": "watchdog_spool_backup_isolated_destination.v1",
+  "description": "955/T10-T11 isolated restore destination differs from source and active; old evidence grants no authority.",
+  "installation": "installation-7",
+  "watchdog_generation": 9,
+  "source_installation": "installation-7",
+  "dest_installation": "installation-7-isolated-restore",
+  "active_installation": "installation-7",
+  "admitted": true,
+  "grants_active_authority": false
+}

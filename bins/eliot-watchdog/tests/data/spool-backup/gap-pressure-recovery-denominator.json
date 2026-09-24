@@ -1,0 +1,20 @@
+{
+  "schema": "watchdog_spool_backup_denominator.v1",
+  "description": "955/T4-T5 exact retained denominator with Gap/Pressure/Recovery members in scope; complete is false. No payload bytes.",
+  "installation": "installation-7",
+  "watchdog_generation": 9,
+  "denominator": {
+    "retained_members": ["rec-0037", "rec-0038", "rec-0039", "rec-0040", "rec-0041"],
+    "gap_members": ["rec-0039"],
+    "pressure_members": ["rec-0039"],
+    "recovery_members": ["rec-0041"],
+    "complete": false
+  },
+  "records_in_order": [
+    { "record_id": "rec-0037", "kind": "heartbeat", "sequence": 37 },
+    { "record_id": "rec-0038", "kind": "heartbeat", "sequence": 38 },
+    { "record_id": "rec-0039", "kind": "gap_spool_pressure", "sequence": 39 },
+    { "record_id": "rec-0040", "kind": "heartbeat", "sequence": 40 },
+    { "record_id": "rec-0041", "kind": "recovery", "sequence": 41 }
+  ]
+}

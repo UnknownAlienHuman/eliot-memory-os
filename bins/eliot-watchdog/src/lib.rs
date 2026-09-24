@@ -89,11 +89,17 @@ use watchdog_publication_readback::{
 pub use watchdog_spool::export_driver::{
     WatchdogEntryView, WatchdogExportSink, export_once, watchdog_entry_views, watchog_entry_views,
 };
+pub use watchdog_spool::{
+    CaptureFenceParams, SpoolAppendOutcome, SpoolCoverageDenominator, SpoolFenceEntryKind,
+    SpoolImportReplayDisposition, SpoolImportReplayLedger, SpoolMarkerDetail, SpoolObservedDigest,
+    SpoolRestoreDisposition, SpoolRestoreStep, WatchdogSpoolBackupLimits, WatchdogSpoolEntry,
+    WatchdogSpoolExportLimits, WatchdogSpoolFence, WatchdogSpoolHeader, WatchdogSpoolPayload,
+    WatchdogSpoolSnapshotPage, acceptance_allowed, capture_fence, check_page_continuation,
+    read_page, reconcile_restore, validate_isolated_destination, validate_restore_chain,
+    verify_page_digest,
+};
 pub(crate) use watchdog_spool::{
     SPOOL_EXPORT_CURSOR_SCHEMA_VERSION, WatchdogSpool, watchdog_spool_path,
-};
-pub use watchdog_spool::{
-    SpoolAppendOutcome, WatchdogSpoolEntry, WatchdogSpoolExportLimits, WatchdogSpoolPayload,
 };
 
 #[cfg(test)]
@@ -112,8 +118,8 @@ impl WatchdogSpool {
 
 #[cfg(test)]
 pub(crate) use watchdog_spool::{
-    SPOOL_HIGH_WATER_KEY, SPOOL_HIGH_WATER_TABLE, SPOOL_SCHEMA_VERSION, SPOOL_TABLE,
-    WatchdogSpoolHeader, encode_entry, encode_high_water, validate_header,
+    SPOOL_HIGH_WATER_KEY, SPOOL_HIGH_WATER_TABLE, SPOOL_SCHEMA_VERSION, SPOOL_TABLE, encode_entry,
+    encode_high_water, validate_header,
 };
 
 #[cfg(test)]
@@ -146,7 +152,9 @@ pub use self_admission::{
 };
 use watchdog_admission::validate_runtime_binding;
 pub use watchdog_admission::{FileWatchdogAdmission, WatchdogRuntimeBinding};
-pub use watchdog_composition::{WatchdogAuthorityState, WatchdogComposition, WatchdogReadiness};
+pub use watchdog_composition::{
+    WatchdogAuthorityState, WatchdogBackupPort, WatchdogComposition, WatchdogReadiness,
+};
 pub use watchdog_config::WatchdogConfig;
 pub use watchdog_fallback_envelope::{
     WatchdogFallbackMintError, WatchdogFallbackMintInputs, mint_watchdog_fallback_envelope,

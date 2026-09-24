@@ -9,18 +9,24 @@ use std::time::Duration;
 use eliot_runtime::{ChildClass, Runtime, ShutdownOutcome, SupervisionStrategy, TaskFailure};
 
 use crate::CompositionError;
-use crate::heartbeat_transport::HeartbeatTransport;
 use crate::HostObservationSource;
 use crate::HostObservationState;
 use crate::KernelWatchdogPort;
 use crate::LiveHostObservationSource;
 use crate::PROTOCOL_VERSION;
 use crate::SERVICE_NAME;
+use crate::SpoolError;
 use crate::WatchdogAdmissionSource;
 use crate::WatchdogConfig;
 use crate::admission_gap_reason;
+use crate::heartbeat_transport::HeartbeatTransport;
 use crate::kernel_gap_reason;
 use crate::report_gap_nonfatal;
+use crate::watchdog_spool::WatchdogSpool;
+use crate::watchdog_spool::backup::{
+    CaptureFenceParams, SpoolRestoreDisposition, SpoolRestoreStep, WatchdogSpoolBackupLimits,
+    WatchdogSpoolFence, WatchdogSpoolSnapshotPage,
+};
 
 mod authority_state;
 
@@ -268,7 +274,13 @@ impl WatchdogComposition {
         let snapshot = self.authority_state.load();
         let (service_instance_guid, host_challenge_nonce, watchdog_readiness_sequence) =
             self.heartbeat.as_ref().map_or_else(
-                || (String::new(), String::new(), crate::heartbeat_transport::FENCE_SEQUENCE),
+                || {
+                    (
+                        String::new(),
+                        String::new(),
+                        crate::heartbeat_transport::FENCE_SEQUENCE,
+                    )
+                },
                 |transport| {
                     let (service_instance_guid, host_challenge_nonce) = transport.echo_identity();
                     (
@@ -387,5 +399,113 @@ async fn wait_for_shutdown(shutdown_requested: Arc<AtomicBool>) -> bool {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Narrow admitted backup control port over the owner-held spool.
+///
+/// The caller must be the admitted backup role (`BackupRole::SpoolOwner` per
+/// #954). Role authentication happens above this port: this crate carries no
+/// `eliot-protocol` dependency, so this type takes no role argument and mints
+/// no authority.
+///
+/// Every method runs OUTSIDE the heartbeat tick with finite limits, so backup
+/// work can never block Control Reserve through unbounded work. Captures are
+/// read-only owner transactions; isolated imports target only the externally
+/// admitted isolated installation and never reuse the active lease, heartbeat
+/// readiness, supervision authority, or kernel/watchdog epochs. This port
+/// performs no SCM, restart, cutover, authority, lease, epoch, or transport
+/// work, and changes nothing on the start/readiness/heartbeat paths.
+pub struct WatchdogBackupPort {
+    spool: Arc<WatchdogSpool>,
+    limits: WatchdogSpoolBackupLimits,
+}
+
+impl WatchdogBackupPort {
+    /// Binds the admitted port to the composition's spool owner handle with
+    /// finite page limits.
+    ///
+    /// The spool handle is the same owner the supervision path appends
+    /// through; no second database handle is opened and no global state is
+    /// introduced. `limits` bounds every later [`Self::read_page`] call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when `limits` is unbounded, unprogressable, or
+    /// above its hard ceilings.
+    ///
+    /// The final backup composition (#945 follow-up) is the designated
+    /// production caller that binds the owner spool handle; until that wiring
+    /// lands this constructor is crate-reachable staging, not dead logic.
+    #[allow(
+        dead_code,
+        reason = "constructed by the #945 final backup composition wiring"
+    )]
+    pub(crate) fn new(
+        spool: Arc<WatchdogSpool>,
+        limits: WatchdogSpoolBackupLimits,
+    ) -> Result<Self, SpoolError> {
+        limits.validate()?;
+        Ok(Self { spool, limits })
+    }
+
+    /// Captures one bounded coherent fence through the spool owner.
+    ///
+    /// Thin delegation to `WatchdogSpool::snapshot_backup`: one bounded read
+    /// transaction over header, high-water, and retained entries. The
+    /// requester bound in `params` must be the admitted backup role.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the admitted bindings, limits, or retained
+    /// evidence fail validation.
+    pub fn snapshot(
+        &self,
+        params: CaptureFenceParams,
+        limits: WatchdogSpoolBackupLimits,
+    ) -> Result<WatchdogSpoolFence, SpoolError> {
+        self.spool.snapshot_backup(params, limits)
+    }
+
+    /// Reads one finite page of a captured fence.
+    ///
+    /// Thin delegation to `backup::read_page`, bounded by the limits fixed at
+    /// [`Self::new`]. Continuation binds the one fence digest; drift fails
+    /// closed instead of returning partial coverage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the page runs past the retained window or
+    /// the cumulative bound.
+    pub fn read_page(
+        &self,
+        fence: &WatchdogSpoolFence,
+        page_index: u64,
+    ) -> Result<WatchdogSpoolSnapshotPage, SpoolError> {
+        crate::watchdog_spool::backup::read_page(fence, page_index, &self.limits)
+    }
+
+    /// Imports bounded restore steps into the isolated destination only.
+    ///
+    /// Thin delegation to `WatchdogSpool::import_backup_isolated`. `dest`
+    /// must differ from both `source` and the active installation; old signed
+    /// observations stay historical evidence under their exact source
+    /// identity and grant no active supervision, heartbeat, lease, or epoch
+    /// authority. A repeated byte-identical import appends nothing; unknown
+    /// reconciliation stays visible and blocks acceptance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the destination is not isolated, the step
+    /// chain breaks, content conflicts, or reconciliation is unknown.
+    pub fn import_isolated(
+        &self,
+        source: &str,
+        dest: &str,
+        active: &str,
+        steps: &[SpoolRestoreStep],
+    ) -> Result<SpoolRestoreDisposition, SpoolError> {
+        self.spool
+            .import_backup_isolated(source, dest, active, steps)
     }
 }

@@ -20,6 +20,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTran
 
 use crate::{SERVICE_NAME, SpoolError, WatchdogRuntimeBinding, current_unix_ms};
 
+pub(crate) mod backup;
 mod codec;
 pub mod export_driver;
 /// Spool-local intent records (I8.1 `problem_intent` / `incident_intent`).
@@ -30,12 +31,20 @@ pub mod export_driver;
 /// reconciliation.
 pub(crate) mod intent;
 
-pub use codec::{WatchdogSpoolEntry, WatchdogSpoolPayload};
-pub(crate) use codec::{WatchdogSpoolHeader, encode_entry, encode_high_water, validate_header};
+pub use backup::{
+    CaptureFenceParams, SpoolCoverageDenominator, SpoolFenceEntryKind,
+    SpoolImportReplayDisposition, SpoolImportReplayLedger, SpoolMarkerDetail, SpoolObservedDigest,
+    SpoolRestoreDisposition, SpoolRestoreStep, WatchdogSpoolBackupLimits, WatchdogSpoolFence,
+    WatchdogSpoolSnapshotPage, acceptance_allowed, capture_fence, check_page_continuation,
+    read_page, reconcile_restore, validate_isolated_destination, validate_restore_chain,
+    verify_page_digest,
+};
+pub use codec::{WatchdogSpoolEntry, WatchdogSpoolHeader, WatchdogSpoolPayload};
 use codec::{
     collect_entries, decode_header, decode_high_water, encode_header, read_high_water,
     validate_high_water,
 };
+pub(crate) use codec::{encode_entry, encode_high_water, validate_header};
 
 pub(crate) const SPOOL_SCHEMA_VERSION: u16 = 1;
 pub(crate) const SPOOL_HEADER_KEY: u64 = 0;
@@ -90,6 +99,16 @@ pub(crate) const SPOOL_EXPORT_CURSOR_TABLE: TableDefinition<u64, &[u8]> =
 /// `installation-7`. The cap keeps the single-key cursor row tiny and fails
 /// closed on corrupt oversized values instead of growing it without bound.
 pub(crate) const SPOOL_EXPORT_CURSOR_IDENTITY_MAX: usize = 1024;
+/// Stable reason marker for quarantined isolated-restore evidence.
+///
+/// Each imported restore step is appended through the existing append path as
+/// a `Recovery` record whose reason is this marker followed by the exact
+/// source installation, stable operation identity, and step index, with the
+/// step digest as the corrupt digest. The fixed framing lets a repeated import
+/// recognise its own quarantined rows (duplicate, append nothing) and reject
+/// changed content under the same operation identity, without touching lease,
+/// heartbeat, authority, or epoch state.
+const BACKUP_IMPORT_REASON_MARKER: &str = "isolated-restore historical evidence";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SpoolAppendOutcome {
@@ -222,6 +241,203 @@ impl WatchdogSpool {
             .ok_or_else(|| SpoolError::Corrupt("high-water metadata is missing".to_owned()))?;
         validate_high_water(&header, &entries, high_water)?;
         Ok(entries)
+    }
+
+    /// Captures an immutable bounded backup fence over the retained spool.
+    ///
+    /// Validates `limits` before any spool read so no unbounded buffer is
+    /// ever collected, then opens one bounded coherent read transaction over
+    /// the header, high-water, and entries (mirroring [`readback`](Self::readback)),
+    /// decodes and validates through the existing codec validators, and
+    /// delegates fence construction to [`backup::capture_fence`]. The result
+    /// is an immutable data handle carrying digests and redacted receipts
+    /// only: no live redb file is opened or copied, and no lease, heartbeat,
+    /// supervision authority, epoch, restart, deletion, or cutover state is
+    /// touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the limits window is unbounded or
+    /// over-ceiling, the spool header or high-water is missing or invalid, or
+    /// any retained entry is expired, missing, duplicated, conflicting, or
+    /// malformed.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "955 owner-method contract takes the capture bindings by value; the fence builder borrows them"
+    )]
+    pub fn snapshot_backup(
+        &self,
+        params: backup::CaptureFenceParams,
+        limits: WatchdogSpoolBackupLimits,
+    ) -> Result<WatchdogSpoolFence, SpoolError> {
+        limits.validate()?;
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let table = match read.open_table(SPOOL_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(SpoolError::Corrupt(
+                    "watchdog spool backup capture covers no retained entries; a bare record vector is not a fence"
+                        .to_owned(),
+                ));
+            }
+            Err(error) => return Err(SpoolError::Database(error.to_string())),
+        };
+        let header = table
+            .get(SPOOL_HEADER_KEY)
+            .map_err(|error| SpoolError::Database(error.to_string()))?
+            .ok_or_else(|| SpoolError::Corrupt("spool header is missing".to_owned()))?;
+        let header = decode_header(header.value())?;
+        let entries = collect_entries(&table)?;
+        validate_header(&header, &entries)?;
+        let high_water = read.open_table(SPOOL_HIGH_WATER_TABLE).map_err(|error| {
+            SpoolError::Corrupt(format!("high-water metadata is unavailable: {error}"))
+        })?;
+        let high_water = read_high_water(&high_water)?
+            .ok_or_else(|| SpoolError::Corrupt("high-water metadata is missing".to_owned()))?;
+        validate_high_water(&header, &entries, high_water)?;
+        backup::capture_fence(&header, &entries, high_water, &params)
+    }
+
+    /// Imports an isolated-restore step chain as quarantined historical evidence.
+    ///
+    /// Gates the destination through [`backup::validate_isolated_destination`]
+    /// (destination must differ from both the source and the active
+    /// installation) and the chain through [`backup::validate_restore_chain`],
+    /// rooted at the admitted preparation digest carried as the first step's
+    /// predecessor. Each accepted step is appended through the existing
+    /// [`append`](Self::append) path as a `Recovery` record naming the exact
+    /// source installation with the step digest as evidence; such records
+    /// grant no lease, heartbeat, supervision authority, or epoch, and keep
+    /// the coverage denominator incomplete until reconciled. Idempotency
+    /// follows [`backup::SpoolImportReplayLedger`] semantics plus the durable
+    /// quarantine framing: a byte-identical repeat observes `Duplicate` and
+    /// appends nothing, while changed content under an observed operation
+    /// identity fails closed as [`SpoolError::Corrupt`]. At most one bounded
+    /// step per [`backup::BACKUP_MAX_WORK_UNITS`] work unit is admitted, each
+    /// appended in its own bounded write transaction; no restart, deletion,
+    /// overwrite, or cutover is performed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the destination is not isolated, the step
+    /// chain is empty, malformed, non-consecutive, or unlinked, the bounded
+    /// step count is exceeded, or any step conflicts with already quarantined
+    /// evidence.
+    pub fn import_backup_isolated(
+        &self,
+        source_installation: &str,
+        dest_installation: &str,
+        active_installation: &str,
+        steps: &[backup::SpoolRestoreStep],
+    ) -> Result<backup::SpoolRestoreDisposition, SpoolError> {
+        backup::validate_isolated_destination(
+            source_installation,
+            dest_installation,
+            active_installation,
+        )?;
+        let step_count = u64::try_from(steps.len()).map_err(|_| {
+            SpoolError::Corrupt(
+                "watchdog spool backup import exceeds the bounded step counter".to_owned(),
+            )
+        })?;
+        if step_count > backup::BACKUP_MAX_WORK_UNITS {
+            return Err(SpoolError::Corrupt(
+                "watchdog spool backup import exceeds the bounded work ceiling".to_owned(),
+            ));
+        }
+        let prepare_digest = steps
+            .first()
+            .map_or("", |step| step.predecessor_digest.as_str());
+        backup::validate_restore_chain(prepare_digest, steps)?;
+        let retained = self.readback()?;
+        let mut quarantined: Vec<(String, String)> = Vec::new();
+        for entry in &retained {
+            if let WatchdogSpoolPayload::Recovery {
+                reason,
+                corrupt_digest,
+                ..
+            } = &entry.payload
+                && reason.starts_with(BACKUP_IMPORT_REASON_MARKER)
+            {
+                quarantined.push((reason.clone(), corrupt_digest.clone()));
+            }
+        }
+        let observed_at_ms = current_unix_ms()?.max(1);
+        let mut ledger = backup::SpoolImportReplayLedger::new();
+        let mut disposition = backup::SpoolRestoreDisposition::Duplicate;
+        for step in steps {
+            match ledger.observe(&step.operation_id, &step.step_digest)? {
+                backup::SpoolImportReplayDisposition::Duplicate => continue,
+                backup::SpoolImportReplayDisposition::Accepted => {}
+            }
+            let reason = Self::backup_import_reason(
+                source_installation,
+                &step.operation_id,
+                step.step_index,
+            );
+            if let Some((_, known_digest)) = quarantined.iter().find(|(known, _)| known == &reason)
+            {
+                if known_digest != &step.step_digest {
+                    return Err(SpoolError::Corrupt(
+                        "watchdog spool backup replay identity conflicts with changed content"
+                            .to_owned(),
+                    ));
+                }
+                continue;
+            }
+            let operation_prefix =
+                Self::backup_import_operation_prefix(source_installation, &step.operation_id);
+            if quarantined
+                .iter()
+                .any(|(known, _)| known.starts_with(&operation_prefix) && known != &reason)
+            {
+                return Err(SpoolError::Corrupt(
+                    "watchdog spool backup replay identity conflicts with changed content"
+                        .to_owned(),
+                ));
+            }
+            self.append(
+                observed_at_ms,
+                WatchdogSpoolPayload::Recovery {
+                    service: SERVICE_NAME.to_owned(),
+                    reason: reason.clone(),
+                    corrupt_sequence: None,
+                    corrupt_digest: step.step_digest.clone(),
+                },
+            )?;
+            quarantined.push((reason, step.step_digest.clone()));
+            disposition = backup::SpoolRestoreDisposition::Accepted;
+        }
+        Ok(disposition)
+    }
+
+    /// Builds the exact quarantine reason for one imported restore step.
+    ///
+    /// The framing binds the fixed marker, the exact source installation, the
+    /// stable operation identity, and the step index; all inputs are already
+    /// validated (non-blank, control-free, bounded) so the reason always
+    /// satisfies the backup text bound.
+    fn backup_import_reason(
+        source_installation: &str,
+        operation_id: &str,
+        step_index: u64,
+    ) -> String {
+        format!(
+            "{BACKUP_IMPORT_REASON_MARKER} from {source_installation} operation {operation_id} step {step_index}"
+        )
+    }
+
+    /// Builds the quarantine reason prefix for one import operation identity.
+    ///
+    /// Any retained quarantined reason with this prefix but a different full
+    /// reason is changed content under the same operation identity.
+    fn backup_import_operation_prefix(source_installation: &str, operation_id: &str) -> String {
+        format!(
+            "{BACKUP_IMPORT_REASON_MARKER} from {source_installation} operation {operation_id} step "
+        )
     }
 
     pub(crate) fn initialize_or_recover(&self) -> Result<(), SpoolError> {
