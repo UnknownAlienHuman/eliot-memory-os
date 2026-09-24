@@ -343,6 +343,11 @@ impl MemoryStore {
         // receipt's outbox references include the appended experience outbox
         // intents. Rows, receipt, and outbox still commit atomically below.
         dispatch_apply_experience_state(&mut state, &transition, &mut plan)?;
+        // Issue #1868: admitted learning-record legs execute here, beside
+        // the experience legs and before the receipt is built, so the
+        // receipt's outbox references include the appended learning outbox
+        // intents. Rows, receipt, and outbox still commit atomically below.
+        dispatch_apply_learning_state(&mut state, &transition, &mut plan)?;
         dispatch_apply_finish_evidence(&mut state, &transition)?;
         dispatch_apply_finish_decision(&mut state, &transition)?;
         let receipt = transaction_receipt(ctx, &transition, idempotency_key, recomputed, &plan)?;
@@ -1348,6 +1353,102 @@ fn dispatch_apply_experience_state(
     Ok(())
 }
 
+/// Joins one learning row address. Collision-free by the same
+/// control-character argument as the experience contour: the record kind
+/// is a closed wire spelling, the handle may not contain `\x1f` per the
+/// wire contract (control characters are rejected), and the digest is a
+/// fixed 64 lowercase hex SHA-256, so key order is stable and the joined
+/// triple is unambiguous.
+fn learning_row_key(record_kind: &str, handle: &str, record_digest: &str) -> String {
+    format!("{record_kind}\x1f{handle}\x1f{record_digest}")
+}
+
+/// Executes admitted learning-record legs on already-locked state
+/// (issue #1868, I12.24).
+///
+/// Runs beside [`dispatch_apply_experience_state`] under the same lock as
+/// the receipt commit: one identity, one receipt, recoverable replay
+/// without duplicate work. Rows are immutable and create-only per joined
+/// `(record_kind, handle, record_digest)` key (a new digest is a new row,
+/// never an in-place rewrite; divergent rewrites fail closed; identical
+/// replays converge); the presented digests travel on the row for
+/// readback binding. Each command appends one outbox intent bound to the
+/// resulting row bytes, so rows and their outbox intents commit
+/// atomically via [`commit_transaction`]. The dispatch writes ONLY the
+/// learning table: owner records are never rewritten, and durability
+/// never implies effectiveness (admission stays Governor-owned).
+/// Non-learning transitions are a no-op here.
+fn dispatch_apply_learning_state(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+    plan: &mut TransactionPlan,
+) -> Result<(), StoreError> {
+    let has_learning_op = transition
+        .named_operations
+        .iter()
+        .any(|command| command.operation == NamedMutationOperation::RecordLearningRecord);
+    if !has_learning_op {
+        return Ok(());
+    }
+    if transition.transition_class != TransitionClass::CaptureCandidate {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let operation_key = transition.identity.operation_id.to_string();
+    let mut learning_index = 0_usize;
+    for command in &transition.named_operations {
+        if command.operation != NamedMutationOperation::RecordLearningRecord {
+            continue;
+        }
+        let decoded =
+            eliot_store_api::decode_learning_mutation(command.operation, &command.parameters)?;
+        let record_kind = decoded.record_kind.as_str().to_owned();
+        let key = learning_row_key(&record_kind, &decoded.handle, &decoded.record_digest);
+        let row_json = serde_json::to_value(&decoded.record_json)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        match state.learning_record_rows.get(&key) {
+            Some(existing) if existing.record_json != decoded.record_json => {
+                return Err(StoreError::IdentityConflict);
+            }
+            Some(_) => {}
+            None => {
+                state.learning_record_rows.insert(
+                    key,
+                    LearningRecordRow {
+                        record_kind,
+                        handle: decoded.handle.clone(),
+                        record_digest: decoded.record_digest.clone(),
+                        record_json: decoded.record_json.clone(),
+                        state_fence: transition.state_fence.clone(),
+                        scope_id: transition.scope_id.to_string(),
+                        task_id: transition.task_id.clone(),
+                    },
+                );
+            }
+        }
+        let payload_digest = sha256_hex(
+            &canonical_json_bytes(&row_json)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        );
+        let sequence = plan.next_outbox_sequence;
+        plan.next_outbox_sequence =
+            checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
+        let outbox = OutboxIntent {
+            outbox_id: OutboxId::new(format!("outbox-{operation_key}-learning-{learning_index}"))?,
+            operation_id: transition.identity.operation_id.clone(),
+            sequence,
+            payload_digest,
+            state_fence: transition.state_fence.clone(),
+            arrival_fence: format!("arrival-{operation_key}"),
+            claim_fence: None,
+            state: OutboxState::Arrived,
+        };
+        outbox.validate()?;
+        plan.outbox_records.push(outbox);
+        learning_index = learning_index.saturating_add(1);
+    }
+    Ok(())
+}
+
 /// Applies one decoded leg against the shared record model and returns the
 /// resulting canonical record JSON for outbox binding.
 ///
@@ -1793,6 +1894,110 @@ fn experience_range_payload(
         }
         .payload(fence),
     )
+}
+
+/// Builds the same-fence, same-scope learning range payload (issue #1868,
+/// I12.24).
+///
+/// Mirrors [`experience_range_payload`]: rows project in key order
+/// (record kind, then handle, then digest) with verbatim record documents
+/// plus presented digests, reusing the shared [`ExperienceRangePage`]
+/// projector (`records` / `matched_total` / `truncated` / `next_cursor` /
+/// `state_fence`); rows past the bound set `truncated` with
+/// `matched_total` counting only returned records, never a guess at the
+/// remainder. Zero matches are an exact empty result, not an error. The
+/// optional closed `record_kind` filter narrows to one kind; absent it
+/// reads every kind. An over-bound `max_records` refuses with
+/// [`StoreError::PayloadTooLarge`] instead of returning a successful
+/// over-bound view, mirroring the bounded cognitive-read siblings; rows
+/// are never silently truncated as success.
+fn learning_range_payload(
+    state: &MemoryState,
+    query: &NamedReadRequest,
+    fence: &StateFence,
+) -> Result<Value, StoreError> {
+    if let Some(bound_raw) = query
+        .parameters
+        .get(eliot_store_api::LEARNING_PARAM_MAX_RECORDS)
+        .and_then(Value::as_str)
+        && let Ok(bound) = bound_raw.parse::<u16>()
+        && bound > eliot_store_api::MAX_LEARNING_PAGE_RECORDS
+    {
+        return Err(StoreError::PayloadTooLarge);
+    }
+    let decoded = eliot_store_api::decode_learning_read(query.operation, &query.parameters)?;
+    let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
+        field: "scope_id",
+        reason: "learning range read requires scope_id",
+    })?;
+    let limit = usize::from(decoded.max_records.max(1));
+    let heads: Vec<(String, u64)> = state
+        .revision_heads
+        .values()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    let start: Option<u64> = match query
+        .parameters
+        .get(eliot_store_api::LEARNING_PARAM_CURSOR)
+        .and_then(Value::as_str)
+    {
+        None => None,
+        Some(cursor) => Some(eliot_store_api::audit_cursor_parse(cursor, fence, &heads)?),
+    };
+    let mut records = Vec::new();
+    let mut truncated = false;
+    let mut ordinal: u64 = 0;
+    for row in state.learning_record_rows.values() {
+        if row.state_fence != *fence || row.scope_id != scope_id.as_str() {
+            continue;
+        }
+        if decoded
+            .record_kind
+            .is_some_and(|kind| row.record_kind != kind.as_str())
+        {
+            continue;
+        }
+        ordinal = ordinal.saturating_add(1);
+        if start.is_some_and(|start| ordinal <= start) {
+            continue;
+        }
+        if records.len() > limit {
+            truncated = true;
+            break;
+        }
+        records.push(json!({
+            "record_kind": row.record_kind,
+            "handle": row.handle,
+            "record_digest": row.record_digest,
+            "record_json": row.record_json,
+        }));
+    }
+    if records.len() > limit {
+        records.pop();
+        truncated = true;
+    }
+    let matched_total = records.len();
+    let next_cursor = if truncated {
+        Some(eliot_store_api::audit_cursor_issue(
+            fence,
+            &heads,
+            start
+                .unwrap_or(0)
+                .saturating_add(u64::try_from(matched_total).unwrap_or(u64::MAX)),
+        )?)
+    } else {
+        None
+    };
+    serde_json::to_value(
+        eliot_store_api::ExperienceRangePage {
+            records,
+            matched_total,
+            truncated,
+            next_cursor,
+        }
+        .payload(fence),
+    )
+    .map_err(|error| StoreError::Serialization(error.to_string()))
 }
 
 /// Builds the same-fence audit-range payload (issue #223).
@@ -2573,6 +2778,9 @@ impl MemoryStore {
     /// closed query discriminator and exact selectors. Issue #223 adds
     /// `GetExperienceBankRange` and `GetAgentFeedbackRange` with the
     /// `max_records` bound, scope-addressed through the request envelope.
+    /// Issue #1868 adds `GetLearningRecordRange` with the `max_records`
+    /// bound, the optional closed `record_kind` filter, and the optional
+    /// `cursor` selector, scope-addressed through the request envelope.
     fn enforce_catalogue_gate(query: &NamedReadRequest) -> Result<(), StoreError> {
         if matches!(
             query.operation,
@@ -2588,6 +2796,7 @@ impl MemoryStore {
                 | NamedReadOperation::GetUserAutomationState
                 | NamedReadOperation::GetExperienceBankRange
                 | NamedReadOperation::GetAgentFeedbackRange
+                | NamedReadOperation::GetLearningRecordRange
                 | NamedReadOperation::GetAuditRange
         ) {
             let entries = generated_operation_manifests()?;
@@ -2707,6 +2916,13 @@ impl MemoryStore {
             }
             NamedReadOperation::GetAgentFeedbackRange => {
                 experience_range_payload(&state, query, &fence, false)
+            }
+            NamedReadOperation::GetLearningRecordRange => {
+                match learning_range_payload(&state, query, &fence) {
+                    Ok(value) => Ok(value),
+                    Err(StoreError::PayloadTooLarge) => return Err(StoreError::PayloadTooLarge),
+                    Err(error) => Err(serde_json::Error::custom(error.to_string())),
+                }
             }
             NamedReadOperation::GetAuditRange => audit_range_payload(&state, query, &fence),
             _ => serde_json::to_value(json!({
@@ -3561,6 +3777,24 @@ struct ExperienceFeedbackRow {
     task_id: Option<String>,
 }
 
+/// One immutable learning-record row: the verbatim Governor-admitted
+/// record document for one closed record kind + handle with its presented
+/// digest as the immutable revision identity, plus the admission fence
+/// and task-binding provenance (issue #1868, I12.24). Rows are
+/// create-only keyed by the joined `(record_kind, handle, record_digest)`
+/// triple; divergent rewrites fail closed and identical replays converge.
+/// Durability never implies effectiveness: admission stays Governor-owned.
+#[derive(Clone, Debug, PartialEq)]
+struct LearningRecordRow {
+    record_kind: String,
+    handle: String,
+    record_digest: String,
+    record_json: String,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
 /// One immutable automation revision row: the verbatim Kernel-owned
 /// revision document for one automation + revision with its admission
 /// fence and task-binding provenance (issue #1779).
@@ -3683,6 +3917,13 @@ struct MemoryState {
     /// Immutable agent-feedback rows keyed by joined `(handle, revision)`
     /// (issue #223). Same durable rule as the bank rows.
     experience_feedback_rows: BTreeMap<String, ExperienceFeedbackRow>,
+    /// Immutable learning-record rows keyed by joined
+    /// `(record_kind, handle, record_digest)` (issue #1868, I12.24).
+    /// Verbatim Governor-admitted record documents with presented digests
+    /// as immutable revision identities, driven only through the closed
+    /// learning leg under the held transaction lock; divergent rewrites
+    /// fail closed.
+    learning_record_rows: BTreeMap<String, LearningRecordRow>,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 }
@@ -3718,6 +3959,7 @@ impl PartialEq for MemoryState {
             && self.automation_last_failure == other.automation_last_failure
             && self.experience_bank_rows == other.experience_bank_rows
             && self.experience_feedback_rows == other.experience_feedback_rows
+            && self.learning_record_rows == other.learning_record_rows
             && self.next_commit_sequence == other.next_commit_sequence
             && self.next_outbox_sequence == other.next_outbox_sequence
             && self.notifications.iter().collect::<Vec<_>>()
@@ -3753,6 +3995,7 @@ impl Default for MemoryState {
             automation_last_failure: BTreeMap::new(),
             experience_bank_rows: BTreeMap::new(),
             experience_feedback_rows: BTreeMap::new(),
+            learning_record_rows: BTreeMap::new(),
             next_commit_sequence: 1,
             next_outbox_sequence: 1,
         }
