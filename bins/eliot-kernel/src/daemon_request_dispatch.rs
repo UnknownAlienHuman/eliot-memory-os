@@ -1338,6 +1338,10 @@ impl KernelComposition {
     /// with the daemon session is rejected before opening the owner channel.
     /// Runtime owner failures remain typed projections so an uncertain send
     /// can be reconciled by its original operation identity.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "issue #18 audited gateway dispatch; staged extraction follows"
+    )]
     async fn user_automation_runtime_operation(
         &self,
         session: &Session,
@@ -1508,6 +1512,10 @@ impl KernelComposition {
     /// Kernel session, while the immutable revision and current pointer come
     /// from the generation-routed canonical Store owner. No caller-supplied
     /// preflight, invocation, or Host authority is accepted here.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "issue #18 audited gateway dispatch; staged extraction follows"
+    )]
     async fn user_automation_owner_trigger_operation(
         &self,
         session: &Session,
