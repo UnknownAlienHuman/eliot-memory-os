@@ -161,10 +161,12 @@ pub use wire::{
     CAPABILITY_ERASURE_INTENT, CAPABILITY_HEALTH, CAPABILITY_INITIALIZE_GENESIS,
     CAPABILITY_NAMED_READ, CAPABILITY_ORDERING_HEADS, CAPABILITY_READINESS, CAPABILITY_RECEIPT,
     CAPABILITY_RECOVERY, CAPABILITY_RESERVED_WRITE, CAPABILITY_REVISION_HEADS,
-    CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS, ErasureSurfaceRequest, ReadinessReceipt,
-    ReadinessStatus, StoreRequest, StoreResponse, StoreWireError, decode_request_frame,
-    decode_request_frame_with_authority, decode_response_frame, dreamer_job_capability,
-    request_frame, request_frame_with_payload_authority, response_frame,
+    CAPABILITY_STORE_BACKUP, CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS, ErasureSurfaceRequest,
+    ReadinessReceipt, ReadinessStatus, StoreBackupOperation, StoreBackupRequest,
+    StoreBackupResponse, StoreBackupStatus, StoreBackupStatusOutcome, StoreRequest, StoreResponse,
+    StoreWireError, decode_request_frame, decode_request_frame_with_authority,
+    decode_response_frame, dreamer_job_capability, request_frame,
+    request_frame_with_payload_authority, response_frame,
 };
 
 mod operation_catalogue;

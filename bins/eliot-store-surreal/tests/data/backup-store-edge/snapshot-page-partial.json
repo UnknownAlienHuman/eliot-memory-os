@@ -1,0 +1,37 @@
+{
+  "handle": {
+    "consistency_point": "cp-975-1",
+    "snapshot_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "operation_id": "op-975-begin-1",
+    "idempotency_key": "idem-975-begin-1"
+  },
+  "cursor": {
+    "handle_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "page_index": 0,
+    "cumulative_members": 1,
+    "cumulative_bytes": 128
+  },
+  "members": [
+    {
+      "member_id": "member-975-1",
+      "member_type": "RECORD",
+      "content_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "residency": {
+        "domain": "INLINE_CANONICAL",
+        "residency_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "byte_count": 128
+      },
+      "reference_digest": null
+    }
+  ],
+  "cumulative_bytes": 128,
+  "cumulative_work": 4,
+  "is_last": false,
+  "predecessor_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+  "next_cursor": {
+    "handle_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "page_index": 1,
+    "cumulative_members": 2,
+    "cumulative_bytes": 384
+  }
+}
