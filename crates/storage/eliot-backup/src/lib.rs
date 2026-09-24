@@ -165,35 +165,13 @@ impl BackupClass {
     }
 }
 
-/// Event interval captured by one consistent export fence.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EventRange {
-    pub first_sequence: Option<u64>,
-    pub last_sequence: Option<u64>,
-    pub count: u64,
-}
-
-impl EventRange {
-    pub fn validate(&self) -> Result<(), BackupError> {
-        match (self.first_sequence, self.last_sequence, self.count) {
-            (None, None, 0) => Ok(()),
-            (Some(first), Some(last), count) if first <= last && count > 0 => {
-                if last.saturating_sub(first).saturating_add(1) < count {
-                    return Err(BackupError::InvalidField {
-                        field: "event_range.count",
-                        reason: "cannot exceed the declared sequence interval",
-                    });
-                }
-                Ok(())
-            }
-            _ => Err(BackupError::InvalidField {
-                field: "event_range",
-                reason: "empty and non-empty ranges must use matching bounds",
-            }),
-        }
-    }
-}
+/// Canonical ECXF event interval captured by one consistent export fence.
+///
+/// The type is owned solely by `eliot-ecxf` (issue #862): `eliot-backup`
+/// consumes the interchange contract and keeps no second range definition or
+/// validator. The reexport keeps existing `eliot_backup::EventRange` paths
+/// compiling against the single owner with identical wire bytes.
+pub use eliot_ecxf::EventRange;
 
 /// The coherent logical boundary of an ECXF export.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -221,7 +199,12 @@ impl ExportFence {
         if !self.consistent {
             return Err(BackupError::InconsistentBoundary);
         }
-        self.event_range.validate()?;
+        self.event_range.validate().map_err(|error| match error {
+            eliot_ecxf::EcxfError::InvalidField { field, reason } => {
+                BackupError::InvalidField { field, reason }
+            }
+            error => BackupError::Foundation(error.to_string()),
+        })?;
         unique(
             self.revision_heads.iter().map(|head| head.key.clone()),
             "revision_heads",
