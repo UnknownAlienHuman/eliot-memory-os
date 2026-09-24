@@ -162,7 +162,6 @@ struct PutFailure<'a> {
     temp_owned: bool,
     stage: StorageExhaustedStage,
     attempted_bytes: Option<u64>,
-    effect: StorageExhaustedEffect,
     error: std::io::Error,
 }
 
@@ -171,7 +170,7 @@ impl BlobStore {
         let root = PathBuf::from(&config.root);
         let storage_identity = storage_identity(&root);
         if let Err(error) = std::fs::create_dir_all(&root) {
-            if error.kind() == std::io::ErrorKind::StorageFull {
+            if is_storage_capacity(&error) {
                 return Err(storage_exhausted(
                     StorageExhaustedDetails {
                         operation: "blob.open",
@@ -179,7 +178,7 @@ impl BlobStore {
                         storage_identity,
                         local_attempt_id: None,
                         attempted_bytes: None,
-                        effect: StorageExhaustedEffect::AttemptedNoPublication,
+                        effect: legacy_stage_effect(StorageExhaustedStage::RootCreate),
                         cleanup: StorageCleanup::NotAttempted,
                     },
                     error,
@@ -189,7 +188,7 @@ impl BlobStore {
         }
         let canonical_root = match std::fs::canonicalize(&root) {
             Ok(root) => root,
-            Err(error) if error.kind() == std::io::ErrorKind::StorageFull => {
+            Err(error) if is_storage_capacity(&error) => {
                 return Err(storage_exhausted(
                     StorageExhaustedDetails {
                         operation: "blob.open",
@@ -197,7 +196,7 @@ impl BlobStore {
                         storage_identity,
                         local_attempt_id: None,
                         attempted_bytes: None,
-                        effect: StorageExhaustedEffect::AttemptedNoPublication,
+                        effect: legacy_stage_effect(StorageExhaustedStage::RootCanonicalize),
                         cleanup: StorageCleanup::NotAttempted,
                     },
                     error,
@@ -249,7 +248,6 @@ impl BlobStore {
                     temp_owned: false,
                     stage: StorageExhaustedStage::TempCreate,
                     attempted_bytes: None,
-                    effect: StorageExhaustedEffect::AttemptedNoPublication,
                     error,
                 });
             }
@@ -264,7 +262,6 @@ impl BlobStore {
                 temp_owned: true,
                 stage: StorageExhaustedStage::PayloadWrite,
                 attempted_bytes: Some(blob.size_bytes),
-                effect: StorageExhaustedEffect::StagedUnknown,
                 error,
             });
         }
@@ -278,7 +275,6 @@ impl BlobStore {
                 temp_owned: true,
                 stage: StorageExhaustedStage::PayloadSync,
                 attempted_bytes: Some(blob.size_bytes),
-                effect: StorageExhaustedEffect::StagedUnknown,
                 error,
             });
         }
@@ -292,7 +288,6 @@ impl BlobStore {
                 temp_owned: true,
                 stage: StorageExhaustedStage::Rename,
                 attempted_bytes: Some(blob.size_bytes),
-                effect: StorageExhaustedEffect::PossiblePublication,
                 error,
             });
         }
@@ -307,7 +302,7 @@ impl BlobStore {
         let Err(error) = std::fs::create_dir_all(parent) else {
             return Ok(());
         };
-        if error.kind() == std::io::ErrorKind::StorageFull {
+        if is_storage_capacity(&error) {
             return Err(storage_exhausted(
                 StorageExhaustedDetails {
                     operation: "blob.put_bytes",
@@ -315,7 +310,7 @@ impl BlobStore {
                     storage_identity: storage_identity(&self.root),
                     local_attempt_id: None,
                     attempted_bytes: None,
-                    effect: StorageExhaustedEffect::AttemptedNoPublication,
+                    effect: legacy_stage_effect(StorageExhaustedStage::ParentCreate),
                     cleanup: StorageCleanup::NotAttempted,
                 },
                 error,
@@ -325,8 +320,7 @@ impl BlobStore {
     }
 
     fn handle_put_failure(&self, failure: PutFailure<'_>) -> Result<BlobRef, StoreError> {
-        let is_capacity = failure.error.kind() == std::io::ErrorKind::StorageFull;
-        if is_capacity {
+        if is_storage_capacity(&failure.error) {
             let cleanup = if failure.temp_owned {
                 match std::fs::remove_file(failure.temp_path) {
                     Ok(()) => StorageCleanup::Removed,
@@ -347,7 +341,7 @@ impl BlobStore {
                     storage_identity: storage_identity(&self.root),
                     local_attempt_id: Some(failure.attempt_id.to_owned()),
                     attempted_bytes: failure.attempted_bytes,
-                    effect: failure.effect,
+                    effect: legacy_stage_effect(failure.stage),
                     cleanup,
                 },
                 failure.error,
@@ -727,6 +721,65 @@ fn native_namespace() -> &'static str {
     std::env::consts::OS
 }
 
+/// POSIX capacity errno observed through the legacy local write path.
+/// Numeric precedent (read-only): `crates/storage/eliot-blob/src/lib.rs`
+/// pins the same value for the current provider; the legacy donor keeps its
+/// own namespaced copy under #876 and never depends on that crate.
+#[cfg(unix)]
+const LEGACY_POSIX_ENOSPC: i32 = 28;
+
+/// Windows capacity codes observed through the legacy local write path:
+/// `ERROR_DISK_FULL` (112) and `ERROR_HANDLE_DISK_FULL` (39).
+#[cfg(windows)]
+const LEGACY_WINDOWS_CAPACITY_CODES: &[i32] = &[112, 39];
+
+/// Raw capacity codes owned by this target's platform namespace. The table is
+/// empty off unix/windows so unknown toolchains stay generic instead of
+/// guessing a foreign-platform integer collision as a full volume.
+#[cfg(unix)]
+const LEGACY_NATIVE_CAPACITY_CODES: &[i32] = &[LEGACY_POSIX_ENOSPC];
+#[cfg(windows)]
+const LEGACY_NATIVE_CAPACITY_CODES: &[i32] = LEGACY_WINDOWS_CAPACITY_CODES;
+#[cfg(not(any(unix, windows)))]
+const LEGACY_NATIVE_CAPACITY_CODES: &[i32] = &[];
+
+/// Classifies a native I/O failure observed by the legacy local write path.
+///
+/// True only for the pinned `std::io::ErrorKind::StorageFull` or a raw OS code
+/// owned by this target's platform namespace. A foreign-platform integer
+/// collision (POSIX 28 on Windows, Windows 112/39 on unix), permission,
+/// read-only, file-too-large, out-of-memory, quota, unknown-code or
+/// already-erased (`None`) evidence stays generic. The predicate never parses
+/// diagnostic text: a message mentioning ENOSPC or a capacity code does not
+/// classify. Legacy-local seam owned by #876; not a cross-project contract.
+#[must_use]
+pub fn is_storage_capacity(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::StorageFull {
+        return true;
+    }
+    match error.raw_os_error() {
+        Some(code) => LEGACY_NATIVE_CAPACITY_CODES.contains(&code),
+        None => false,
+    }
+}
+
+/// Frozen legacy stage → publication-evidence table (I2.6/I5.12/I14.21).
+/// Admission and not-attempted states never reach this table: every stage here
+/// names an attempted OS operation. Legacy-local seam owned by #876.
+#[must_use]
+pub fn legacy_stage_effect(stage: StorageExhaustedStage) -> StorageExhaustedEffect {
+    match stage {
+        StorageExhaustedStage::RootCreate
+        | StorageExhaustedStage::RootCanonicalize
+        | StorageExhaustedStage::ParentCreate
+        | StorageExhaustedStage::TempCreate => StorageExhaustedEffect::AttemptedNoPublication,
+        StorageExhaustedStage::PayloadWrite | StorageExhaustedStage::PayloadSync => {
+            StorageExhaustedEffect::StagedUnknown
+        }
+        StorageExhaustedStage::Rename => StorageExhaustedEffect::PossiblePublication,
+    }
+}
+
 fn storage_identity(root: &Path) -> String {
     format!(
         "root-blake3:{}",
@@ -735,7 +788,7 @@ fn storage_identity(root: &Path) -> String {
 }
 
 fn storage_exhausted(details: StorageExhaustedDetails, error: std::io::Error) -> StoreError {
-    StoreError::StorageExhausted(Box::new(StorageExhausted {
+    StorageExhausted {
         operation: details.operation,
         stage: details.stage,
         storage_identity: details.storage_identity,
@@ -745,7 +798,8 @@ fn storage_exhausted(details: StorageExhaustedDetails, error: std::io::Error) ->
         retry: StorageExhaustedRetry::CapacityRevalidationRequired,
         cleanup: details.cleanup,
         cause: StorageIoCause::new(error, native_namespace()),
-    }))
+    }
+    .into()
 }
 
 fn bounded_label<'a>(value: &'a str, label: &str, max_bytes: usize) -> Result<&'a str, StoreError> {
@@ -1054,7 +1108,6 @@ mod tests {
             temp_owned: true,
             stage: StorageExhaustedStage::PayloadWrite,
             attempted_bytes: Some(7),
-            effect: StorageExhaustedEffect::StagedUnknown,
             error,
         });
         let Err(StoreError::StorageExhausted(error)) = result else {
@@ -1101,7 +1154,6 @@ mod tests {
             temp_owned: false,
             stage: StorageExhaustedStage::TempCreate,
             attempted_bytes: None,
-            effect: StorageExhaustedEffect::AttemptedNoPublication,
             error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "native detail"),
         });
         let Err(StoreError::Io(error)) = result else {
@@ -1120,7 +1172,6 @@ mod tests {
                     temp_owned: false,
                     stage: StorageExhaustedStage::TempCreate,
                     attempted_bytes: None,
-                    effect: StorageExhaustedEffect::AttemptedNoPublication,
                     error: std::io::Error::from_raw_os_error(code),
                 })
             };
@@ -1164,7 +1215,6 @@ mod tests {
             temp_owned: false,
             stage: StorageExhaustedStage::TempCreate,
             attempted_bytes: None,
-            effect: StorageExhaustedEffect::AttemptedNoPublication,
             error: std::io::Error::new(std::io::ErrorKind::StorageFull, "capacity detail"),
         });
         let Err(StoreError::StorageExhausted(error)) = result else {
@@ -1184,7 +1234,6 @@ mod tests {
             temp_owned: true,
             stage: StorageExhaustedStage::PayloadWrite,
             attempted_bytes: Some(blob.size_bytes),
-            effect: StorageExhaustedEffect::StagedUnknown,
             error: std::io::Error::new(std::io::ErrorKind::StorageFull, "primary capacity"),
         });
         let Err(StoreError::StorageExhausted(error)) = result else {

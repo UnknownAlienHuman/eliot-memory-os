@@ -1,0 +1,245 @@
+[
+  {
+    "id": "pinned-kind-no-code",
+    "platform": "any",
+    "kind": "StorageFull",
+    "code": null,
+    "message": null,
+    "expect_capacity": true,
+    "note": "Pinned ErrorKind::StorageFull with erased OS code still classifies as capacity."
+  },
+  {
+    "id": "pinned-kind-spoof-text",
+    "platform": "any",
+    "kind": "StorageFull",
+    "code": null,
+    "message": "permission denied while opening staging file",
+    "expect_capacity": true,
+    "note": "Pinned kind rules over misleading diagnostic text; production never parses messages."
+  },
+  {
+    "id": "posix-enospc",
+    "platform": "linux",
+    "kind": null,
+    "code": 28,
+    "message": null,
+    "expect_capacity": true,
+    "note": "POSIX ENOSPC under its native unix namespace."
+  },
+  {
+    "id": "windows-disk-full",
+    "platform": "windows",
+    "kind": null,
+    "code": 112,
+    "message": null,
+    "expect_capacity": true,
+    "note": "Win32 ERROR_DISK_FULL under its native windows namespace."
+  },
+  {
+    "id": "windows-handle-disk-full",
+    "platform": "windows",
+    "kind": null,
+    "code": 39,
+    "message": null,
+    "expect_capacity": true,
+    "note": "Win32 ERROR_HANDLE_DISK_FULL under its native windows namespace."
+  },
+  {
+    "id": "foreign-28-on-windows",
+    "platform": "windows",
+    "kind": null,
+    "code": 28,
+    "message": null,
+    "expect_capacity": false,
+    "note": "POSIX ENOSPC value on Windows is a foreign integer collision, not capacity."
+  },
+  {
+    "id": "foreign-112-on-linux",
+    "platform": "linux",
+    "kind": null,
+    "code": 112,
+    "message": null,
+    "expect_capacity": false,
+    "note": "Windows ERROR_DISK_FULL value on Linux is a foreign integer collision, not capacity."
+  },
+  {
+    "id": "foreign-39-on-linux",
+    "platform": "linux",
+    "kind": null,
+    "code": 39,
+    "message": null,
+    "expect_capacity": false,
+    "note": "Windows ERROR_HANDLE_DISK_FULL value on Linux is a foreign integer collision, not capacity."
+  },
+  {
+    "id": "permission-denied-kind",
+    "platform": "any",
+    "kind": "PermissionDenied",
+    "code": null,
+    "message": null,
+    "expect_capacity": false,
+    "note": "Permission failure stays in the generic I/O family."
+  },
+  {
+    "id": "permission-raw-eacces",
+    "platform": "linux",
+    "kind": null,
+    "code": 13,
+    "message": null,
+    "expect_capacity": false,
+    "note": "Linux EACCES is permission evidence, not capacity evidence."
+  },
+  {
+    "id": "access-denied-raw-windows",
+    "platform": "windows",
+    "kind": null,
+    "code": 5,
+    "message": null,
+    "expect_capacity": false,
+    "note": "Win32 ERROR_ACCESS_DENIED is permission evidence, not capacity evidence."
+  },
+  {
+    "id": "read-only-kind",
+    "platform": "any",
+    "kind": "ReadOnlyFilesystem",
+    "code": null,
+    "message": null,
+    "expect_capacity": false,
+    "note": "Read-only filesystem stays in the generic I/O family."
+  },
+  {
+    "id": "read-only-raw-erofs",
+    "platform": "linux",
+    "kind": null,
+    "code": 30,
+    "message": null,
+    "expect_capacity": false,
+    "note": "Linux EROFS is read-only evidence, not capacity evidence."
+  },
+  {
+    "id": "file-too-large-kind",
+    "platform": "any",
+    "kind": "FileTooLarge",
+    "code": null,
+    "message": null,
+    "expect_capacity": false,
+    "note": "File-too-large stays in the generic I/O family."
+  },
+  {
+    "id": "file-too-large-raw-efbig",
+    "platform": "linux",
+    "kind": null,
+    "code": 27,
+    "message": null,
+    "expect_capacity": false,
+    "note": "Linux EFBIG is limit evidence, not capacity evidence."
+  },
+  {
+    "id": "out-of-memory-kind",
+    "platform": "any",
+    "kind": "OutOfMemory",
+    "code": null,
+    "message": null,
+    "expect_capacity": false,
+    "note": "Out-of-memory stays in the generic I/O family."
+  },
+  {
+    "id": "out-of-memory-raw-enomem",
+    "platform": "linux",
+    "kind": null,
+    "code": 12,
+    "message": null,
+    "expect_capacity": false,
+    "note": "Linux ENOMEM is memory evidence, not capacity evidence."
+  },
+  {
+    "id": "quota-exceeded-kind",
+    "platform": "any",
+    "kind": "QuotaExceeded",
+    "code": null,
+    "message": null,
+    "expect_capacity": false,
+    "note": "Quota policy is not a full volume."
+  },
+  {
+    "id": "quota-raw-edquot",
+    "platform": "linux",
+    "kind": null,
+    "code": 122,
+    "message": null,
+    "expect_capacity": false,
+    "note": "Linux EDQUOT is quota evidence, not capacity evidence."
+  },
+  {
+    "id": "other-kind",
+    "platform": "any",
+    "kind": "Other",
+    "code": null,
+    "message": "transport reset by peer",
+    "expect_capacity": false,
+    "note": "Unrelated transport failure stays generic."
+  },
+  {
+    "id": "interrupted-kind",
+    "platform": "any",
+    "kind": "Interrupted",
+    "code": null,
+    "message": null,
+    "expect_capacity": false,
+    "note": "Interrupted operation stays generic."
+  },
+  {
+    "id": "not-found-kind",
+    "platform": "any",
+    "kind": "NotFound",
+    "code": null,
+    "message": null,
+    "expect_capacity": false,
+    "note": "Missing path stays generic."
+  },
+  {
+    "id": "already-exists-kind",
+    "platform": "any",
+    "kind": "AlreadyExists",
+    "code": null,
+    "message": null,
+    "expect_capacity": false,
+    "note": "Staging collision stays generic."
+  },
+  {
+    "id": "invalid-data-kind",
+    "platform": "any",
+    "kind": "InvalidData",
+    "code": null,
+    "message": null,
+    "expect_capacity": false,
+    "note": "Corruption evidence stays generic and never becomes capacity."
+  },
+  {
+    "id": "unknown-raw-code",
+    "platform": "any",
+    "kind": null,
+    "code": 9999,
+    "message": null,
+    "expect_capacity": false,
+    "note": "Unpinned code with erased kind stays generic I/O."
+  },
+  {
+    "id": "spoof-enospc-text",
+    "platform": "any",
+    "kind": "Other",
+    "code": null,
+    "message": "ENOSPC errno 28 disk full while staging blob",
+    "expect_capacity": false,
+    "note": "Diagnostic text mentioning ENOSPC must not reconstruct a lost code."
+  },
+  {
+    "id": "spoof-windows-code-text",
+    "platform": "any",
+    "kind": "InvalidData",
+    "code": null,
+    "message": "windows ERROR_DISK_FULL 112 in driver message",
+    "expect_capacity": false,
+    "note": "Diagnostic text mentioning a Windows capacity code must not classify."
+  }
+]
