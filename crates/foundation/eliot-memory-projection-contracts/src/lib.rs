@@ -20,22 +20,26 @@ mod error;
 mod record;
 mod selection;
 mod set;
+mod workflow_view;
 
 pub use batch::{
     CoverageOmission, DenominatorState, MAX_BATCH_FRONTIER, MAX_BATCH_OMISSIONS,
     MEMORY_PROJECTION_MAX_RECORDS, MemoryProjectionBatch, ProjectionCoverage,
 };
 pub use error::MemoryProjectionError;
-pub use selection::{
-    MemoryQueryIntent, MemorySelectionPolicy, MemorySelectionTrace, SelectionCoverage,
-    SelectionDisposition, SelectionEntry, SelectionError, select,
-};
 pub use record::{
     CueTrigger, FreshnessState, MAX_APPLICABILITY_LIMITS, MAX_CUE_TRIGGERS, MAX_PRECONDITIONS,
     MAX_RECORD_ROLES, MAX_SCOPE_CHARS, MemoryFreshness, MemoryKind, MemoryProjectionRecord,
     MemoryRole, MemoryScopeBinding, NegativeTrigger, Precondition,
 };
+pub use selection::{
+    MemoryQueryIntent, MemorySelectionPolicy, MemorySelectionTrace, SelectionCoverage,
+    SelectionDisposition, SelectionEntry, SelectionError, select,
+};
 pub use set::{ApplicableMemory, ApplicableMemorySet, ExcludedMemory, ExclusionReason};
+pub use workflow_view::{
+    MAX_WORKFLOW_ENTRIES, MAX_WORKFLOW_GAPS, WorkflowIdempotency, WorkflowStateView,
+};
 
 /// Stable wire name for this contract family.
 pub const CONTRACT_NAME: &str = "eliot.foundation.memory-projection-contracts";

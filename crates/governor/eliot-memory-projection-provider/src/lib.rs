@@ -19,6 +19,9 @@
 
 #![forbid(unsafe_code)]
 
+mod continuity;
+pub use continuity::{admit_continuity_for_projection, admit_workflow_view_for_projection};
+
 use eliot_contracts::{ArtifactId, SessionId, SourceId, StateFence, TaskId};
 use eliot_evidence::{Assertability, EpistemicStatus, LifecycleState, Provenance};
 use eliot_memory_projection_contracts::{
