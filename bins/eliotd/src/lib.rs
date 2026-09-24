@@ -693,10 +693,14 @@ impl DaemonComposition {
         // observability. No `?`, no propagation, return path unchanged.
         {
             let _closure_span = tracing::info_span!("eliotd.finish_closure_assessment").entered();
-            let debt_pending = closure_debt_pending(true);
+            // Honest assessment from receipt fields (Governor-owned semantics):
+            // debt pends while no closing disposition is bound to this finish.
+            let debt_pending = closure_debt_pending(decision.closure_authority_ref.is_none());
             tracing::info!(
                 decision_id = %decision.decision_id,
                 debt_pending,
+                has_closure_authority = decision.closure_authority_ref.is_some(),
+                unresolved_descendants = decision.unresolved_descendant_refs.len(),
                 "campaign closure assessment: honest finish while learning closure completes asynchronously; owner/review condition from Governor policy"
             );
         }
