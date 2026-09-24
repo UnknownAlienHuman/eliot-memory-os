@@ -1002,6 +1002,21 @@ async fn run_local_read_poll(
     let Some((envelope, tool, attempt)) = pair else {
         return Ok(LocalReadPollOutcome::IdleBackoff);
     };
+    // #1862: campaign packet compilation is a local daemon integration over
+    // authenticated named owner reads. It runs on the reachable poll path and
+    // settles through the same attempt-bound result leg as local Skill work.
+    if eliotd::campaign_packet::is_campaign_packet_tool(&tool) {
+        let body = eliotd::campaign_packet::serve_campaign_packet_pair(
+            kernel, &envelope, &tool, &attempt,
+        )
+        .await
+        .map_err(|error| format!("daemon campaign packet compilation: {error}"))?;
+        return match submit_local_read_result_idempotent(kernel, &body).await? {
+            LocalReadSubmitOutcome::Accepted => Ok(LocalReadPollOutcome::Accepted),
+            LocalReadSubmitOutcome::Expired => Ok(LocalReadPollOutcome::Expired),
+            LocalReadSubmitOutcome::StaleAttempt => Ok(LocalReadPollOutcome::StaleAttempt),
+        };
+    }
     let guard = composition.lock().await;
     // #1882: Skill pairs serve locally through the composition Skill driver
     // instead of forwarding on the Kernel `local_read` leg (which serves

@@ -57,7 +57,7 @@ use eliot_protocol::{
     HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
     host_request_operation_id,
 };
-use eliot_store_api::{EVIDENCE_PACK_MAX_RECORDS, ScopeId};
+use eliot_store_api::{CampaignLearningStateViewPublication, EVIDENCE_PACK_MAX_RECORDS, ScopeId};
 
 /// Prefix of the deterministic opaque operation handle derived by
 /// [`host_request_operation_id`]. A parent operation reference carries the
@@ -1442,6 +1442,7 @@ impl KernelComposition {
                 })
                 .and_then(|candidate| candidate.local_read_envelope.clone())
         };
+        validate_campaign_view_result(&stored, queued_envelope.as_ref(), &body.response)?;
         if let Some(envelope) = queued_envelope {
             if !session
                 .authority_epoch
@@ -1477,6 +1478,40 @@ impl KernelComposition {
         self.retire_local_read_pair_under_transition(&body.operation_id, &body.request_sha256);
         Ok(LocalReadSubmitDisposition::Persisted(Box::new(persisted)))
     }
+}
+
+/// Accepts a generated campaign view only as part of the exact admitted
+/// `eliot.packet` result that produced it. This binding is checked before the
+/// result and view are atomically retained by ORS.
+fn validate_campaign_view_result(
+    stored: &HostRequestRecord,
+    envelope: Option<&HostRequestEnvelope>,
+    response: &serde_json::Value,
+) -> Result<(), TransportError> {
+    let Some(value) = response.get("campaign_learning_state_view") else {
+        return Ok(());
+    };
+    if stored.capability_ref.as_str() != "eliot.packet" {
+        return Err(TransportError::SessionFenced);
+    }
+    let envelope = envelope.ok_or(TransportError::SessionFenced)?;
+    let publication: CampaignLearningStateViewPublication =
+        serde_json::from_value(value.clone()).map_err(|_| TransportError::SessionFenced)?;
+    publication
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    if envelope.identity.task_id.as_deref() != Some(publication.task_id.as_str())
+        || envelope.identity.work_scope_id.as_deref() != Some(publication.scope_id.as_str())
+        || envelope.state_fence != publication.state_fence
+        || stored.task_ref.as_ref().map(OpaqueLabel::as_str)
+            != Some(publication.task_id.as_str())
+        || stored.scope_ref.as_ref().map(OpaqueLabel::as_str)
+            != Some(publication.scope_id.as_str())
+        || stored.fence_digest != sha256_json(&publication.state_fence)
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
 }
 
 /// Builds the Kernel-observed bridge process binding from retained state.

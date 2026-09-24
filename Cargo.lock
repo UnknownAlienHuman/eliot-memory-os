@@ -1061,9 +1061,13 @@ dependencies = [
 name = "eliot-context"
 version = "0.1.0"
 dependencies = [
+ "eliot-context-contracts",
  "eliot-contracts",
  "eliot-cue-contracts",
  "eliot-evidence",
+ "eliot-learning-contracts",
+ "eliot-learning-state-view",
+ "eliot-protocol",
  "schemars",
  "serde",
  "serde_json",
@@ -1910,6 +1914,7 @@ dependencies = [
  "eliot-instrument-nextest",
  "eliot-integration-coverage",
  "eliot-kernel-core",
+ "eliot-learning-contracts",
  "eliot-maintenance",
  "eliot-mcp",
  "eliot-module-registry",
@@ -2354,6 +2359,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-evidence",
  "eliot-learning-contracts",
+ "eliot-reactive-context-plan",
 ]
 
 [[package]]
@@ -3052,6 +3058,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-epistemic-contracts",
  "eliot-evidence",
+ "eliot-learning-contracts",
  "eliot-protocol",
  "eliot-receipts",
  "eliot-security-contracts",
@@ -3401,6 +3408,7 @@ dependencies = [
  "eliot-authority",
  "eliot-cognitive-quality",
  "eliot-config",
+ "eliot-context",
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-controlboard",
@@ -3421,6 +3429,7 @@ dependencies = [
  "eliot-kernel-core",
  "eliot-kernel-service",
  "eliot-learning-contracts",
+ "eliot-learning-state-view",
  "eliot-maintenance",
  "eliot-memory-quality",
  "eliot-observability",
