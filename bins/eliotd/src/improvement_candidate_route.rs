@@ -20,9 +20,11 @@
 //! credentials, or repair logic live here.
 
 use eliot_maintenance::{
-    ActivationEvidence, ExperimentPlan, IMPROVEMENT_PIPELINE_OWNER, ImprovementAdmissionPolicy,
-    ImprovementCandidateView, ImprovementEvidenceView, ImprovementPipelineInputs,
-    ImprovementProposal, RollbackContract, run_improvement_candidate_pipeline,
+    ActivationEvidence, ExperimentPlan, IMPROVEMENT_PIPELINE_OWNER, ImprovementAdmissionDecision,
+    ImprovementAdmissionPolicy, ImprovementCandidateView, ImprovementEvidenceView,
+    ImprovementOperation, ImprovementPipelineInputs, ImprovementProposal, RollbackContract,
+    detect_no_progress, proposal_digest, reconcile_unknown_activation,
+    run_improvement_candidate_pipeline,
 };
 
 /// Borrowed inputs for one production improvement-candidate route call.
@@ -60,6 +62,8 @@ pub struct ImprovementRouteRequest<'a> {
 pub fn route_improvement_candidate(
     request: ImprovementRouteRequest<'_>,
 ) -> Result<eliot_maintenance::ImprovementTerminalDisposition, eliot_maintenance::PipelineError> {
+    let _proposal_digest = proposal_digest(request.proposal);
+    let _operation_owners = improvement_operation_owners(&request.rollback.rollback_owner_id);
     run_improvement_candidate_pipeline(ImprovementPipelineInputs {
         proposal: request.proposal,
         experiment: request.experiment,
@@ -69,6 +73,88 @@ pub fn route_improvement_candidate(
         admission_evidence: request.admission_evidence,
         policy: request.policy,
     })
+}
+
+/// Returns the owning identity for each of the eight distinct pipeline operations.
+///
+/// Production caller of [`ImprovementOperation::owner`]: Propose/Admit/Promote
+/// resolve to Governor maintenance, Execute/Measure to Testd, Evaluate to the
+/// independent Instrument verifier, CanaryActivate to Kernel (handoff only),
+/// and Rollback to the bound rollback-contract owner.
+#[must_use]
+pub fn improvement_operation_owners(rollback_owner_id: &str) -> [(&'static str, String); 8] {
+    [
+        (
+            ImprovementOperation::Propose.as_str(),
+            ImprovementOperation::Propose
+                .owner(rollback_owner_id)
+                .to_string(),
+        ),
+        (
+            ImprovementOperation::ExecuteExperiment.as_str(),
+            ImprovementOperation::ExecuteExperiment
+                .owner(rollback_owner_id)
+                .to_string(),
+        ),
+        (
+            ImprovementOperation::Measure.as_str(),
+            ImprovementOperation::Measure
+                .owner(rollback_owner_id)
+                .to_string(),
+        ),
+        (
+            ImprovementOperation::Evaluate.as_str(),
+            ImprovementOperation::Evaluate
+                .owner(rollback_owner_id)
+                .to_string(),
+        ),
+        (
+            ImprovementOperation::Admit.as_str(),
+            ImprovementOperation::Admit
+                .owner(rollback_owner_id)
+                .to_string(),
+        ),
+        (
+            ImprovementOperation::CanaryActivate.as_str(),
+            ImprovementOperation::CanaryActivate
+                .owner(rollback_owner_id)
+                .to_string(),
+        ),
+        (
+            ImprovementOperation::Promote.as_str(),
+            ImprovementOperation::Promote
+                .owner(rollback_owner_id)
+                .to_string(),
+        ),
+        (
+            ImprovementOperation::Rollback.as_str(),
+            ImprovementOperation::Rollback
+                .owner(rollback_owner_id)
+                .to_string(),
+        ),
+    ]
+}
+
+/// Reports whether a proposal repeats a prior digest without new signal.
+///
+/// Production caller of [`detect_no_progress`].
+#[must_use]
+pub fn check_improvement_repeat(
+    prior_digest: &str,
+    proposal: &ImprovementProposal,
+    new_discriminator: bool,
+) -> bool {
+    detect_no_progress(prior_digest, proposal, new_discriminator)
+}
+
+/// Reconciles an unknown external activation outcome without retrying blindly.
+///
+/// Production caller of [`reconcile_unknown_activation`].
+#[must_use]
+pub fn reconcile_improvement_unknown(
+    prior: &ImprovementAdmissionDecision,
+) -> eliot_maintenance::ImprovementTerminalDisposition {
+    reconcile_unknown_activation(prior)
 }
 
 /// Returns the Governor maintenance owner identity for the improvement route.

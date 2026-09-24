@@ -395,6 +395,17 @@ pub(super) fn run() -> Result<(), String> {
     // explicit disposition for each. The returned ledger — not control flow —
     // decides what this generation observed.
     let bindings = bind_declared_startup_capabilities(&kernel, &mut composition);
+    // #1145: root the Governor-owned improvement candidate route in the
+    // production daemon: report the pipeline owner at startup (diagnostics
+    // only). The candidate → experiment → evaluation → admission path itself
+    // runs through `eliotd::govern_improvement_candidate` on live requests;
+    // this reference keeps the owner identity observable without adding
+    // policy semantics to the composition root.
+    tracing::info!(
+        target: "eliotd::diagnostics",
+        event = "eliotd.improvement_pipeline_owner",
+        owner = eliotd::governed_improvement_pipeline_owner(),
+    );
     // #2560: the retained ledger answers no readiness question. This projection
     // derives the required set from the composition's own live owners and keeps
     // core control readiness separate from optional capability availability, so
