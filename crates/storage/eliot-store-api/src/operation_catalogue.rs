@@ -272,7 +272,7 @@ struct ActivatedReadDescriptor {
 /// consumer-side per I12-26, mirroring the `GetMailbox` split where the
 /// Governor facade requires a caller scope while catalogue rows stay
 /// scope-free).
-const ACTIVATED_READS: [ActivatedReadDescriptor; 18] = [
+const ACTIVATED_READS: [ActivatedReadDescriptor; 19] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -363,11 +363,16 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 18] = [
         requires_scope_id: true,
         scope_kind: SCOPE_KIND_SCOPE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetCampaignLearningStateView,
+        requires_scope_id: true,
+        scope_kind: SCOPE_KIND_SCOPE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 18] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 19] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -387,6 +392,7 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 18] {
         ACTIVATED_READS[15].operation,
         ACTIVATED_READS[16].operation,
         ACTIVATED_READS[17].operation,
+        ACTIVATED_READS[18].operation,
     ]
 }
 
