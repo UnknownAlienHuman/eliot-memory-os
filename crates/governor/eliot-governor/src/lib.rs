@@ -102,7 +102,7 @@ pub use learning_admission::{
 };
 pub use learning_delta_integration::{
     admission_claim_for_delta, delta_delivery_allowed, derive_delta_at_boundary,
-    issue_delta_admission, retry_lineage_for_delta, verify_delta_delivery,
+    issue_delta_admission, retry_lineage_for_delta, store_derived_delta, verify_delta_delivery,
 };
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,

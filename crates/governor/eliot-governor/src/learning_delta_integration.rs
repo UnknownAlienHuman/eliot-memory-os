@@ -10,11 +10,13 @@
 //! (`read_file`/`grep`) are not consequential and never derive (line 181).
 
 use eliot_contracts::{ArtifactId, StateFence};
-use eliot_learning_contracts::{AttemptLearningOutcome, CampaignLearningStateView};
+use eliot_learning_contracts::{
+    AgentAttemptId, AttemptLearningOutcome, CampaignId, CampaignLearningStateView, OverlayId,
+};
 use eliot_learning_delta::{
-    AdmissionReceipt, AttemptEvidence, ConsequentialBoundary, DerivationContext, DerivationPolicy,
-    LearningDeltaError, RefinerDraft, StoredLearningDelta, delivery_allowed,
-    derive_attempt_learning_outcome,
+    AdmissionReceipt, AttemptCloseDisposition, AttemptEvidence, ConsequentialBoundary,
+    DerivationContext, DerivationPolicy, LearningDeltaError, RefinerDraft, StoredDeltaDisposition,
+    StoredLearningDelta, delivery_allowed, derive_attempt_learning_outcome,
 };
 
 use crate::Governor;
@@ -43,6 +45,66 @@ pub fn derive_delta_at_boundary(
         None => Err(LearningDeltaError::NonConsequential),
         Some(_) => derive_attempt_learning_outcome(state_view, evidence, context, draft, policy),
     }
+}
+
+/// Build the validated durable stored record for a derived outcome.
+///
+/// W5 caller: every stored delta names its campaign, attempt, `StateFence`,
+/// actor/route/overlay/artifact identity and disposition, enforced by
+/// [`StoredLearningDelta::validate`]. A fresh `Delta` candidate is proposed
+/// (`NEXT_PROBE_CHANGED`) and carries no admission receipt; a `NoChange`
+/// outcome closes honestly as `NO_JUSTIFIED_CHANGE` via
+/// [`AttemptCloseDisposition::as_stored`] instead of fabricating a behavioral
+/// delta (W7). The optional prior id/digest preserves the explicit retry
+/// relation (W4/A1).
+#[allow(clippy::too_many_arguments)]
+pub fn store_derived_delta(
+    outcome: &AttemptLearningOutcome,
+    campaign_id: CampaignId,
+    attempt_id: AgentAttemptId,
+    fence: StateFence,
+    actor_id: &str,
+    route_id: &str,
+    overlay_id: OverlayId,
+    prior: Option<(&ArtifactId, &str)>,
+) -> Result<StoredLearningDelta, LearningDeltaError> {
+    let (delta_artifact, delta_digest, disposition) = match outcome {
+        AttemptLearningOutcome::Delta(candidate) => (
+            candidate.delta_id.clone(),
+            candidate.canonical_digest.clone(),
+            StoredDeltaDisposition::NextProbeChanged,
+        ),
+        AttemptLearningOutcome::NoChange(disposition) => {
+            // A close carries no candidate: bind the record to the lead
+            // affirmative-evidence handle and the sealed no-change digest.
+            let lead = disposition.affirmative_evidence.first().ok_or(
+                LearningDeltaError::InvalidInput {
+                    field: "stored.close_evidence",
+                },
+            )?;
+            (
+                lead.clone(),
+                disposition.canonical_digest.clone(),
+                AttemptCloseDisposition::NoJustifiedChange.as_stored(),
+            )
+        }
+    };
+    let record = StoredLearningDelta {
+        campaign_id,
+        attempt_id,
+        state_fence: fence,
+        actor_id: actor_id.to_owned(),
+        route_id: route_id.to_owned(),
+        overlay_id,
+        delta_artifact,
+        delta_digest,
+        prior_delta_id: prior.map(|(id, _)| id.clone()),
+        prior_delta_digest: prior.map(|(_, digest)| digest.to_owned()),
+        disposition,
+        admission_receipt_id: None,
+    };
+    record.validate()?;
+    Ok(record)
 }
 
 /// Build the Governor admission claim bound to one stored delta.
