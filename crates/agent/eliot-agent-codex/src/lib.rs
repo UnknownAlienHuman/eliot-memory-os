@@ -1627,10 +1627,11 @@ pub fn translate_result(
     } else {
         (ResultDisposition::Partial, input.unknown_reason)
     };
-    let zero_digest: LowercaseSha256 = serde_json::from_value(serde_json::Value::String(
-        "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
-    ))
-    .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?;
+    // The request commitment is the bound start request preserved verbatim:
+    // a substituted digest fails `validate_against` below, so two different
+    // start requests can never report the same commitment.
+    let request_digest = PhysicalRouteObservationReceipt::bound_request_digest(binding)
+        .map_err(CodexAdapterError::Contract)?;
     // Binding-gated physical observation: UNOBSERVED with explicit reason,
     // never observed=requested. Cancelled carries observed cancellation;
     // all other outcomes stay UNKNOWN_OUTCOME with a quarantine recovery
@@ -1671,7 +1672,7 @@ pub fn translate_result(
         route_state: RouteObservationState::Unobserved,
         diverged_fields: Vec::new(),
         execution_outcome,
-        request_digest: zero_digest,
+        request_digest,
         translation_digest: None,
         raw_evidence_digest: None,
         raw_evidence_ref: None,

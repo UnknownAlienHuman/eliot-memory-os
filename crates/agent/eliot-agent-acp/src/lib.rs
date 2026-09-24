@@ -1346,6 +1346,10 @@ impl AcpResultEnvelope {
             cost_microunits: None,
             quota: QuotaKnowledge::Unknown,
         };
+        // The request commitment is the bound start request preserved
+        // verbatim: a substituted digest fails `validate_against` below.
+        let request_digest = PhysicalRouteObservationReceipt::bound_request_digest(binding)
+            .map_err(AcpAdapterError::ContractValidation)?;
         let zero: LowercaseSha256 = serde_json::from_value(Value::String(
             "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
         ))
@@ -1370,7 +1374,7 @@ impl AcpResultEnvelope {
             route_state: RouteObservationState::Unobserved,
             diverged_fields: Vec::new(),
             execution_outcome,
-            request_digest: zero.clone(),
+            request_digest,
             translation_digest: None,
             raw_evidence_digest: None,
             raw_evidence_ref: None,

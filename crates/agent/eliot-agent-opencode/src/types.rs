@@ -933,6 +933,9 @@ impl OpenCodeWireRouteReceipt {
     ///   from the wire, then classified via `route_divergence_fields`
     ///   (`Matched` only when field-complete equal, else `Diverged` with the
     ///   exact difference set and a quarantine `recovery_ref`).
+    /// - `request_digest` preserves the bound start-request commitment
+    ///   verbatim (never a re-hash of the wire bytes and never a zero
+    ///   placeholder); `validate_against` rejects any substituted value.
     /// - Session/route agreement and admission/binding linkage are enforced
     ///   via [`PhysicalRouteObservationReceipt::validate_against`]; a forged
     ///   binding or mismatched admission rejects.
@@ -1032,13 +1035,13 @@ impl OpenCodeWireRouteReceipt {
                 Some("opencode-diverged-quarantine".to_owned()),
             ),
         };
-        let request_bytes = canonical_json_bytes(&self.requested).map_err(|error| {
-            OpenCodeObservationConversionError::Serialization(error.to_string())
-        })?;
-        let request_digest: LowercaseSha256 =
-            serde_json::from_value(Value::String(sha256_hex(&request_bytes))).map_err(|error| {
-                OpenCodeObservationConversionError::Serialization(error.to_string())
-            })?;
+        // The request commitment is the bound start request preserved
+        // verbatim, never a re-hash of the adapter-local wire bytes: the
+        // wire `requested` value stays observable as `requested_route`, while
+        // `request_digest` identifies the exact launch request the binding
+        // pins. A substituted digest fails `validate_against` below.
+        let request_digest = PhysicalRouteObservationReceipt::bound_request_digest(binding)
+            .map_err(OpenCodeObservationConversionError::Contract)?;
         let mut observation = PhysicalRouteObservationReceipt {
             schema_version: CONTRACT_VERSION.to_owned(),
             attempt_id: binding.attempt_id.clone(),
