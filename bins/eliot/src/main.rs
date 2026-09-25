@@ -15,9 +15,9 @@ use eliot_installation::{
     ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest,
     GenerationPackagePlanInput, GenerationPackagePlanner, InstallationEpoch, InstallationError,
     InstallationProfile, InstallationStage, InstallationStepOutcome, InstallationTransaction,
-    InstallationTransactionStore, PlatformHandle, RedbInstallationRegistry,
-    RedbInstallationTransactionStore, WindowsInstallationCoordinator,
-    parse_installation_transaction_id, registry_projection_pending_ref,
+    InstallationTransactionStore, PlatformHandle, PostBootstrapRejectionClass,
+    RedbInstallationRegistry, RedbInstallationTransactionStore, WindowsInstallationCoordinator,
+    parse_installation_transaction_id, post_bootstrap_rejection_pending_ref,
     require_published_source_bundle_journal, validate_installation_transaction_json,
 };
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
@@ -2918,20 +2918,27 @@ fn run_installation_effect(
     } else if preflight_transaction.profile == InstallationProfile::SystemService {
         match coordinator.drive_until_host_bootstrap(&transaction_id) {
             Ok(InstallationStepOutcome::Applied { .. }) => {
+                // The bootstrap prefix applied, so the Host root and the
+                // CreatedByTransaction service registrations may already
+                // exist. Both readback failures below are reported truthfully:
+                // a missing record cannot be rejected durably because there is
+                // nothing left to reject, and a failed read cannot be rejected
+                // durably because the store is what failed. Neither may claim a
+                // recoverable rollback it did not establish.
                 let current = match coordinator.store().load(&transaction_id) {
                     Ok(Some(transaction)) => transaction,
                     Ok(None) => {
                         write_installation_error(
-                            "INSTALLATION_APPLY_NOT_FOUND",
-                            "transaction disappeared before pending registry projection",
+                            "INSTALLATION_STATE_UNAVAILABLE",
+                            "Host bootstrap applied but the transaction record is gone, so no durable rejection can be persisted: reconcile the installation state before any retry",
                         );
                         return Ok(INVALID_REQUEST_EXIT);
                     }
                     Err(error) => {
                         write_installation_error(
-                            "INSTALLATION_APPLY_ERROR",
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
                             &format!(
-                                "transaction readback before pending projection failed: {error}"
+                                "transaction readback after the applied Host bootstrap prefix failed: {error}: no durable rejection could be persisted, so recovery is required and rollback readiness is unknown"
                             ),
                         );
                         return Ok(INVALID_REQUEST_EXIT);
@@ -2948,13 +2955,16 @@ fn run_installation_effect(
                     Ok(root) => root,
                     Err(error) => {
                         // E3: the retained Host root cannot be reopened after
-                        // the bootstrap prefix applied. Persist the same
-                        // durable typed rejection as E4/E5 so a later
-                        // recover/rollback reaches RolledBack; an unconfirmed
-                        // rejection stays INSTALLATION_APPLY_RECOVERY_REQUIRED.
+                        // the bootstrap prefix applied. Persist a durable typed
+                        // rejection so a later recover/rollback reaches
+                        // RolledBack; the reference names this Host-root-reopen
+                        // failure class, not a registry projection that was
+                        // never attempted. An unconfirmed rejection stays
+                        // INSTALLATION_APPLY_RECOVERY_REQUIRED.
                         return Ok(report_post_bootstrap_failure(
                             &mut coordinator,
                             &transaction_id,
+                            PostBootstrapRejectionClass::HostRootReopen,
                             &format!("retained Host root could not be reopened: {error}"),
                         ));
                     }
@@ -2971,6 +2981,7 @@ fn run_installation_effect(
                         return Ok(report_post_bootstrap_failure(
                             &mut coordinator,
                             &transaction_id,
+                            PostBootstrapRejectionClass::RegistryProjection,
                             &format!("pending registry could not be opened: {error}"),
                         ));
                     }
@@ -2984,6 +2995,7 @@ fn run_installation_effect(
                         return Ok(report_post_bootstrap_failure(
                             &mut coordinator,
                             &transaction_id,
+                            PostBootstrapRejectionClass::RegistryProjection,
                             &format!("pending registry preflight failed: {error}"),
                         ));
                     }
@@ -3004,12 +3016,30 @@ fn run_installation_effect(
                             current.stage() == InstallationStage::Registering
                                 && !current.has_activation_projection_intent()
                         }
-                        Ok(None) | Err(_) => false,
+                        // A FAILED store read proves nothing about the stage. It
+                        // is not "not Registering": the outcome is unknown, so
+                        // it is reported as unconfirmed instead of falling
+                        // through to a plain apply error that would imply a
+                        // durable rejection this path never established.
+                        Err(read_error) => {
+                            write_installation_error(
+                                "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                                &format!(
+                                    "pending registry projection failed: {error}; the stage readback that decides whether a durable rejection is still admissible also failed ({read_error}): recovery is required and rollback readiness is unknown"
+                                ),
+                            );
+                            return Ok(INVALID_REQUEST_EXIT);
+                        }
+                        // A successful read showing no record is not
+                        // Registering either; the existing reconcile/terminal
+                        // disposition applies.
+                        Ok(None) => false,
                     };
                     if still_registering {
                         return Ok(report_post_bootstrap_failure(
                             &mut coordinator,
                             &transaction_id,
+                            PostBootstrapRejectionClass::RegistryProjection,
                             &format!("pending registry projection failed: {error}"),
                         ));
                     }
@@ -3819,6 +3849,12 @@ fn write_installation_error_with_reference(code: &str, detail: &str, reference: 
 /// projection staging: `E3`/`E4`/`E5` and the still-`Registering` branch of
 /// `E6`).
 ///
+/// `class` is the typed failure class, not a display string: it selects the
+/// durable typed rejection reference through
+/// [`post_bootstrap_rejection_pending_ref`], so the persisted
+/// `pending_external_changes` entry names the failure that actually occurred
+/// instead of a sibling failure mode.
+///
 /// The coordinator-owned durable typed rejection is always attempted and its
 /// result is never discarded: success keeps the existing
 /// `INSTALLATION_APPLY_ERROR` with a recoverable-rollback note (the stored
@@ -3829,16 +3865,18 @@ fn write_installation_error_with_reference(code: &str, detail: &str, reference: 
 /// (`UNKNOWN_OUTCOME/ROLLBACK_REQUIRED` until read-back reconciliation), never
 /// a plain apply error that would imply durable recovery. The
 /// transaction/fence/owner gates are untouched: a refusal in `Activating` (or
-/// a store CAS failure) surfaces here as unconfirmed, it is never overridden.
+/// with an activation intent) and a failed store load or `compare_and_save`
+/// are all reported here as unconfirmed, never overridden.
 fn report_post_bootstrap_failure<S>(
     coordinator: &mut WindowsInstallationCoordinator<S>,
     transaction_id: &PlatformHandle,
+    class: PostBootstrapRejectionClass,
     detail: &str,
 ) -> i32
 where
     S: InstallationTransactionStore,
 {
-    let pending_ref = match registry_projection_pending_ref(transaction_id) {
+    let pending_ref = match post_bootstrap_rejection_pending_ref(transaction_id, class) {
         Ok(pending_ref) => pending_ref,
         Err(error) => {
             write_installation_error(

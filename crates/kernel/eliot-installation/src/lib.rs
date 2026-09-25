@@ -7086,6 +7086,63 @@ pub fn registry_projection_pending_ref(
 /// its convergence deadline without acknowledgement.
 pub(crate) const SERVICE_START_TIMEOUT_PENDING_REF: &str = "timeout:service-start-convergence";
 
+/// Typed class of the post-bootstrap non-effect failure whose durable
+/// rejection is persisted by
+/// [`WindowsInstallationCoordinator::persist_non_effect_rejection`].
+///
+/// The class is the durable reference's type. It is never collapsed into a
+/// display string or a generic code between the CLI seam and this crate, so
+/// `recover`/`rollback` can tell a retained-Host-root reopen apart from a
+/// registry projection failure instead of reading a sibling's reference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostBootstrapRejectionClass {
+    /// `E3`: the retained per-installation Host root could not be reopened
+    /// after the Host bootstrap prefix applied. No registry projection was
+    /// attempted, so the reference must not name one.
+    HostRootReopen,
+    /// `E4`/`E5` and the still-`Registering` branch of `E6`: the pending
+    /// installation registry could not be opened, read, or projected.
+    RegistryProjection,
+}
+
+impl PostBootstrapRejectionClass {
+    /// Stable durable reference prefix for this failure class. The prefix is
+    /// part of the durable typed reference and never changes meaning.
+    #[must_use]
+    pub const fn pending_ref_prefix(self) -> &'static str {
+        match self {
+            Self::HostRootReopen => "pending:host-root-reopen:",
+            Self::RegistryProjection => "pending:registry-projection:",
+        }
+    }
+}
+
+/// Builds the durable typed rejection reference for one
+/// [`PostBootstrapRejectionClass`] observed after the Host bootstrap prefix.
+///
+/// The reference binds the exact transaction to the class that actually
+/// failed, so a later `recover`/`rollback` promotes through the existing
+/// `Registering → RollbackRequired → RolledBack` gate against a truthful
+/// cause rather than a sibling failure mode's reference.
+pub fn post_bootstrap_rejection_pending_ref(
+    transaction_id: &PlatformHandle,
+    class: PostBootstrapRejectionClass,
+) -> Result<PlatformHandle, InstallationError> {
+    match class {
+        // One reference text per class: the registry-projection reference is
+        // the exact text the existing durable-rejection proof asserts.
+        PostBootstrapRejectionClass::RegistryProjection => {
+            registry_projection_pending_ref(transaction_id)
+        }
+        PostBootstrapRejectionClass::HostRootReopen => PlatformHandle::new(format!(
+            "{}{}",
+            class.pending_ref_prefix(),
+            transaction_id.as_str()
+        ))
+        .map_err(|error| platform_error(&error)),
+    }
+}
+
 /// Coordinates one durable installation transaction without owning platform mechanics.
 pub(crate) struct InstallationCoordinator<P, S> {
     port: P,
@@ -9051,15 +9108,20 @@ where
     }
 
     /// Persists a durable typed rejection for a non-effect failure observed
-    /// after the Host bootstrap prefix (registry projection open/load).
+    /// after the Host bootstrap prefix (retained Host-root reopen, registry
+    /// projection open/load).
     ///
     /// This is the `mark_unknown`-equivalent coordinator-owned CAS seam: it
     /// sets `pending_external_changes=[pending_ref]` and advances
     /// `Registering → RollbackRequired` via [`InstallationTransaction::mark_unknown`]
     /// plus a version-checked `compare_and_save`. It is refused in `Activating`
     /// or when an activation projection intent is present (mirroring
-    /// `mark_unknown`), so `E6` callers must reload and only persist while
-    /// still `Registering`. The `rollback()` gate itself is unchanged.
+    /// `mark_unknown`), so a caller that must reload first may only persist
+    /// while still `Registering`. The `rollback()` gate itself is unchanged.
+    ///
+    /// `pending_ref` is built by [`post_bootstrap_rejection_pending_ref`] from
+    /// the [`PostBootstrapRejectionClass`] that actually failed, so the durable
+    /// reference names the real cause.
     pub fn persist_non_effect_rejection(
         &mut self,
         transaction_id: &PlatformHandle,
@@ -9338,14 +9400,15 @@ where
     }
 
     /// Persists a durable typed rejection for a post-bootstrap non-effect
-    /// failure (registry projection open/load, `E4`/`E5` and the
-    /// still-`Registering` branch of `E6`).
+    /// failure (retained Host-root reopen, registry projection open/load).
     ///
     /// Coordinator-owned `mark_unknown`-equivalent CAS:
     /// `pending_external_changes=[pending_ref]` + `Registering → RollbackRequired`.
     /// Refused in `Activating` or with an activation intent (mirroring
-    /// `mark_unknown`); `E6` must reload first and only call this while still
-    /// `Registering`. The `rollback()` gate is unchanged.
+    /// `mark_unknown`); a caller that must reload first may only persist while
+    /// still `Registering`. The `rollback()` gate is unchanged. Build
+    /// `pending_ref` with [`post_bootstrap_rejection_pending_ref`] so the
+    /// durable reference names the failure class that actually occurred.
     pub fn persist_non_effect_rejection(
         &mut self,
         transaction_id: &PlatformHandle,
