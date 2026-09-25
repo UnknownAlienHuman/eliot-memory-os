@@ -120,6 +120,10 @@ pub use capability_outcome::{
     AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationScope,
     FallbackOutcomeRequest, OutcomeDisposition, OutcomeError, fallback_outcome,
 };
+pub use controlboard_adapters::{
+    CONTROLBOARD_READ_CAPABILITY, ControlBoardReadOutcome, controlboard_result_body,
+    is_controlboard_read_tool, serve_controlboard_view,
+};
 pub use daemon_config::DaemonConfig;
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{DaemonKernelClient, LocalReadSubmitOutcome, OwnerSessionFacts};
@@ -1120,6 +1124,12 @@ impl DaemonComposition {
 
     /// Builds one provider-neutral `ControlBoard` over the current Governor
     /// projection snapshot.
+    ///
+    /// This is the one production composition owner of the `ControlBoard` ports
+    /// (Implements #1187 W1/A1). Its production caller is
+    /// [`serve_controlboard_view`](crate::serve_controlboard_view), which the
+    /// daemon runtime's local-read poller serves for one Kernel-admitted
+    /// claimed pair; no other site builds a board.
     ///
     /// The board reads one immutable snapshot taken here; every port call in
     /// the returned value observes the same revision and fence. Callers take

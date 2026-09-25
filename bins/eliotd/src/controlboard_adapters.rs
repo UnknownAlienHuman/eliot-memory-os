@@ -41,6 +41,17 @@
 //! never touch I/O, so they cannot block the single-thread async reactor. The
 //! current Kernel binding is observed through the composition snapshot, never
 //! through a second client.
+//!
+//! Production edges out of this module (Implements #1187 W1/A1):
+//! [`is_controlboard_read_tool`] routes one Kernel-admitted claimed
+//! `eliot.query` pair naming the broker-owned operator read capability, and
+//! [`serve_controlboard_view`] builds one board over one immutable snapshot
+//! through [`DaemonComposition::controlboard`](super::DaemonComposition::controlboard),
+//! performs exactly one authenticated role-filtered read on it, and binds the
+//! canonical view — or the board's exact typed refusal, including a
+//! `PlanGap` naming the missing owner — into the existing submit-leg result
+//! body. The composition is the single production owner of these ports; no
+//! other caller builds a board.
 
 #![forbid(unsafe_code)]
 
@@ -49,17 +60,21 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use eliot_contracts::{RequestMetadata, SessionId, sha256_hex};
+use eliot_contracts::{RequestMetadata, SessionId, canonical_json_bytes, sha256_hex};
 use eliot_controlboard::{
     AccessBinding, AccessResolverPort, ActionCapability, CanonicalState, CanonicalStatePort,
-    CommandDisposition, CommandReceipt, CommandRequest, ControlBoard, OperatorCommandPort,
-    PortError, PrivacyClass, ProjectionBinding, ProjectionProvider, ProposeSkillRequest,
-    ProviderCompleteness, ReadRequest, Role, SkillLifecyclePort, SwarmProjectionEnvelope,
-    SwarmProjectionPort, ViewRevision,
+    CommandDisposition, CommandReceipt, CommandRequest, ControlBoard, ControlBoardError,
+    ControlBoardView, OperatorCommandPort, PortError, PrivacyClass, ProjectionBinding,
+    ProjectionProvider, ProposeSkillRequest, ProviderCompleteness, ReadRequest, Role,
+    SkillLifecyclePort, SwarmProjectionEnvelope, SwarmProjectionPort, ViewRevision,
 };
 use eliot_governor::ControlBoardGovernorSnapshot;
 use eliot_kernel_core::Notification;
+use eliot_protocol::{
+    HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
+};
 use eliot_skill::{SkillCandidate, SkillError, SkillLifecycleView};
+use serde::{Deserialize, Serialize};
 
 use super::daemon_kernel_client::OwnerSessionFacts;
 
@@ -71,13 +86,12 @@ use super::daemon_kernel_client::OwnerSessionFacts;
 ///
 /// The board shares the caller-retained [`SharedOperatorReplay`] handle, so a
 /// newly created board replays an already-admitted operation instead of
-/// admitting it twice. `admitted` carries owner-issued session bindings for
-/// the access resolver; production passes none (the session owner is
-/// deferred), which keeps the unadmitted typed gap. `notifications` carries
-/// pre-fetched canonical notification records (issue #1780) from an
-/// authenticated `GetNotificationState` read at the snapshot fence;
-/// production passes none until the daemon wires that read, which keeps the
-/// inbox empty rather than fabricated.
+/// admitting it twice. `admitted` carries the owner-issued session bindings
+/// for the access resolver: the daemon's own single live Kernel session is
+/// admitted from the facts the runtime threaded, and every other session stays
+/// unadmitted with the fail-closed typed gap. `notifications` carries the
+/// canonical notification records hydrated at the snapshot fence; an absent
+/// attach keeps the inbox empty rather than fabricated.
 pub(crate) fn controlboard_over_snapshot(
     snapshot: ControlBoardGovernorSnapshot,
     shared: &SharedOperatorReplay,
@@ -85,9 +99,9 @@ pub(crate) fn controlboard_over_snapshot(
     notifications: Vec<Notification>,
 ) -> ControlBoard {
     let snapshot = Arc::new(snapshot);
-    // Production passes no sessions, which cannot fail. An invalid test
-    // admission degrades to the empty resolver so submission stays fail-closed
-    // downstream instead of inventing rights.
+    // The empty admission cannot fail; an invalid admission degrades to the
+    // empty resolver so submission stays fail-closed downstream instead of
+    // inventing rights.
     let access = if admitted.is_empty() {
         GovernorAccessResolver::new(Arc::clone(&snapshot))
     } else {
@@ -109,6 +123,232 @@ pub(crate) fn controlboard_over_snapshot(
         &snapshot,
     ))))
     .with_skill_lifecycle(Box::new(GovernorSkillSnapshot::new(snapshot)))
+}
+
+/// The broker-admitted operator read capability the composed board serves.
+///
+/// Pinned as a wire literal in this runtime root rather than imported:
+/// `crates/surfaces/eliot-user-broker-core/src/lib.rs` (`OPERATOR_CAPABILITIES`)
+/// is the admission owner that issues it and
+/// `crates/meta/eliot-runtime-status/src/controlboard_projection.rs` names it as
+/// the `capability` binding example. The daemon is neither: it routes one
+/// already-admitted claimed pair on the capability identity the Kernel itself
+/// validated, and mints no capability of its own. A third import edge would add
+/// a dependency without changing a byte on the wire or widening any authority.
+pub const CONTROLBOARD_READ_CAPABILITY: &str = "controlboard.read";
+
+/// Routes one claimed pair tool to the composed `ControlBoard` read.
+///
+/// Thin predicate in the same shape as
+/// [`is_skill_tool`](super::skill_dispatch::is_skill_tool): the local-read
+/// poller serves such pairs locally through
+/// [`serve_controlboard_view`] instead of forwarding them on the Kernel
+/// `local_read` leg, which serves store reads only. Anything else keeps the
+/// existing forward path byte-identical.
+#[must_use]
+pub fn is_controlboard_read_tool(tool: &serde_json::Value) -> bool {
+    tool.as_object()
+        .and_then(|object| object.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|name| name == CONTROLBOARD_READ_CAPABILITY)
+}
+
+/// Builds the inert board read intent for one claimed pair.
+///
+/// Every field is a Kernel-issued owner value, never a default, a derived
+/// constant, or anything read from a file, PID, or port:
+///
+/// * `session_id` and `generation` come from the Kernel-issued
+///   [`LocalReadAttempt`] — the admitted session binding and the monotonic
+///   fencing generation that only the current generation may complete;
+/// * `connection_id` and `request_id` come from the admitted
+///   [`HostRequestEnvelope`], the Kernel-created transport correlation and the
+///   exact request identity;
+/// * `credential_binding` is the digest of the exact immutable admission
+///   descriptor and `challenge` is the digest of the exact Kernel-produced
+///   transport admission receipt — the two admission digests the Kernel issued
+///   for this very request, carried as opaque references and never as secret
+///   material.
+///
+/// The attempt's session must be the session the envelope admitted; a mismatch
+/// is refused as an exact typed board error rather than resolved toward
+/// either side. Nothing is pinned to an expected revision or fence: the caller
+/// declared no view, so the read serves the one snapshot taken here.
+pub(crate) fn controlboard_read_intent(
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+) -> Result<ReadRequest, ControlBoardError> {
+    if attempt.fencing_generation == 0 {
+        return Err(ControlBoardError::InvalidField("generation"));
+    }
+    if envelope.identity.session_id.as_deref() != Some(attempt.session_id.as_str()) {
+        return Err(ControlBoardError::Unauthorized);
+    }
+    ReadRequest::new(
+        attempt.session_id.clone(),
+        envelope.connection_id.clone(),
+        envelope.descriptor_sha256.clone(),
+        envelope.peer_admission_receipt_sha256.clone(),
+        envelope.identity.request_id.as_str().to_owned(),
+        attempt.fencing_generation,
+    )
+}
+
+/// One served `ControlBoard` read outcome, exactly as the board produced it.
+///
+/// `View` is the canonical role-filtered [`ControlBoardView`] from the single
+/// snapshot the seam read, encoded 1:1: no row is added, dropped, re-projected,
+/// merged, or health-synthesised, and no hidden-row count, identifier, summary,
+/// or ordering side channel is introduced here. `Refused` reproduces the
+/// board's own exact typed failure verbatim, so a `PLAN_GAP` naming the missing
+/// owner reaches the caller as that same typed refusal instead of an empty
+/// current view. The two shapes are exhaustive and never interchangeable.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ControlBoardReadOutcome {
+    /// The exact role-filtered immutable view at one declared boundary.
+    View {
+        /// The canonical view the board returned, crossed unchanged.
+        view: Box<ControlBoardView>,
+    },
+    /// The board refused the read; its exact typed error text, reproduced
+    /// verbatim from the closed per-variant `Display`.
+    Refused {
+        /// The board's own refusal text, never a re-worded or generic code.
+        detail: String,
+    },
+}
+
+/// Serves one claimed `ControlBoard` read pair and returns its submit-leg result
+/// body.
+///
+/// The production composition owner of the existing `ControlBoard` ports
+/// (Implements #1187 W1/A1): it builds one board over one immutable Governor
+/// projection snapshot through
+/// [`DaemonComposition::controlboard`](super::DaemonComposition::controlboard)
+/// and performs exactly one authenticated, role-filtered read on it. Every
+/// port call in that board observes the same revision and fence, so a Governor
+/// refresh between reads surfaces as an exact-view mismatch rather than silent
+/// divergence.
+///
+/// The read either returns the canonical view under the session owner that
+/// issued the binding, or the exact typed refusal — currently
+/// `PlanGap(AccessResolver)` while the User Broker session owner has issued no
+/// role/privacy/capability binding for an operator session. No default-zero
+/// stub, in-memory stand-in, empty adapter, or success is synthesised on either
+/// branch, and the composition's own failure stays distinct from a board
+/// refusal so a lifecycle gap is never reported as a `ControlBoard` provider gap.
+///
+/// Every claimed pair settles through the existing idempotent submit leg,
+/// including refusals, so a `ControlBoard` read can never poison the poller.
+pub fn serve_controlboard_view(
+    composition: &super::DaemonComposition,
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+) -> HostRequestResultBody {
+    let outcome = controlboard_read_outcome(composition, envelope, attempt);
+    controlboard_result_body(envelope, attempt, &outcome)
+        .unwrap_or_else(|error| controlboard_refusal_body(envelope, attempt, &error.to_string()))
+}
+
+/// Performs exactly one authenticated role-filtered read and returns the
+/// board's own typed result, unchanged.
+fn controlboard_read_outcome(
+    composition: &super::DaemonComposition,
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+) -> ControlBoardReadOutcome {
+    // The composition is the lifecycle observation; a board refusal is the
+    // ControlBoard typed vocabulary. They stay distinct, so a composition that
+    // cannot produce a board at this fence is never reported as a provider gap.
+    let mut controlboard = match composition.controlboard() {
+        Ok(controlboard) => controlboard,
+        Err(error) => {
+            return ControlBoardReadOutcome::Refused {
+                detail: format!("daemon controlboard composition unavailable: {error}"),
+            };
+        }
+    };
+    match controlboard_read_intent(envelope, attempt) {
+        Ok(read) => match controlboard.view(&read) {
+            Ok(view) => ControlBoardReadOutcome::View {
+                view: Box::new(view),
+            },
+            Err(error) => ControlBoardReadOutcome::Refused {
+                detail: error.to_string(),
+            },
+        },
+        Err(error) => ControlBoardReadOutcome::Refused {
+            detail: error.to_string(),
+        },
+    }
+}
+
+/// Binds one `ControlBoard` read outcome into the submit-leg result body.
+///
+/// A local construction failure is reported through the board's own
+/// `Provider` variant, which is the one variant the board already defines for
+/// a detail-only port-level refusal; it is never re-labelled as a `PlanGap`,
+/// a stale view, or a success.
+pub fn controlboard_result_body(
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+    outcome: &ControlBoardReadOutcome,
+) -> Result<HostRequestResultBody, ControlBoardError> {
+    let response = serde_json::to_value(outcome).map_err(|error| {
+        ControlBoardError::Provider(format!("controlboard outcome encoding: {error}"))
+    })?;
+    if !response.is_object() {
+        return Err(ControlBoardError::Provider(
+            "controlboard outcome must encode as a JSON object".to_owned(),
+        ));
+    }
+    let bytes = canonical_json_bytes(&response).map_err(|error| {
+        ControlBoardError::Provider(format!("controlboard outcome digest: {error}"))
+    })?;
+    let body = HostRequestResultBody {
+        wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+        wire_version: HostRequestResultBody::CONTRACT_VERSION,
+        operation_id: attempt.operation_id.clone(),
+        request_sha256: envelope.envelope_sha256.clone(),
+        result_digest: sha256_hex(&bytes),
+        response,
+        attempt: Some(attempt.clone()),
+    };
+    body.validate().map_err(|error| {
+        ControlBoardError::Provider(format!("controlboard result body shape: {error}"))
+    })?;
+    Ok(body)
+}
+
+fn controlboard_refusal_body(
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+    detail: &str,
+) -> HostRequestResultBody {
+    // Last-resort body for local construction failures: the same refused
+    // shape, bounded detail, and digest binding as every other refusal, so a
+    // malformed outcome still settles through the submit leg instead of
+    // dropping the claimed pair.
+    let outcome = ControlBoardReadOutcome::Refused {
+        detail: detail.chars().take(512).collect::<String>(),
+    };
+    controlboard_result_body(envelope, attempt, &outcome).unwrap_or_else(|_| {
+        let response = serde_json::json!({
+            "refused": {
+                "detail": detail.chars().take(512).collect::<String>(),
+            }
+        });
+        HostRequestResultBody {
+            wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+            wire_version: HostRequestResultBody::CONTRACT_VERSION,
+            operation_id: attempt.operation_id.clone(),
+            request_sha256: envelope.envelope_sha256.clone(),
+            result_digest: sha256_hex(response.to_string().as_bytes()),
+            response,
+            attempt: Some(attempt.clone()),
+        }
+    })
 }
 
 /// Rejects bindings that are not current at the snapshot fence and revision.
@@ -170,10 +410,10 @@ pub(crate) struct AdmittedSessionAccess {
     expires_at_unix_ms: u64,
 }
 
-// AUD-C02: composition admission seam for the future session owner (User
-// Broker role issuance is deferred to #23/#1135). Production wiring stays on
-// `new` (empty map) until that owner exists.
-#[allow(dead_code)]
+// AUD-C02: composition admission seam for the session owner (User Broker role
+// issuance is deferred to #23/#1135). Production wiring reaches
+// `from_kernel_owner_facts` through `DaemonComposition::controlboard`, which
+// the daemon's own claimed-pair read path now serves.
 impl AdmittedSessionAccess {
     /// Admits one owner-issued session binding after fail-closed validation.
     /// The full owner-issued fact set travels in one validated step so no
@@ -355,9 +595,9 @@ impl GovernorAccessResolver {
     /// binding is an idempotent replay, while a changed binding under an
     /// already-admitted session id is an identity conflict that mutates
     /// nothing.
-    // AUD-C02: composition admission point for the future session owner;
-    // production wiring stays on `new` (empty map) until that owner exists.
-    #[allow(dead_code)]
+    // AUD-C02: composition admission point for the session owner. Production
+    // wiring reaches this through `DaemonComposition::controlboard`, which the
+    // daemon's own claimed-pair read path now serves.
     pub(crate) fn with_admitted_sessions(
         snapshot: Arc<ControlBoardGovernorSnapshot>,
         admitted: Vec<AdmittedSessionAccess>,
@@ -491,11 +731,10 @@ impl CanonicalStatePort for GovernorCanonicalState {
             items: Vec::new(),
             reviews: Vec::new(),
             provenance: Vec::new(),
-            // Canonical notification records supplied pre-fetched by the
-            // board constructor (issue #1780). The daemon does not yet read
-            // notification state into its snapshot composition, so production
-            // passes none here; an empty supply reads as an empty inbox,
-            // never as resolved or suppressed state.
+            // Canonical notification records hydrated by the daemon runtime
+            // attach (issue #1780) at the board construction site. An attach
+            // that did not bind leaves the vector empty, which reads as an
+            // empty inbox, never as resolved or suppressed state.
             notifications: self.notifications.clone(),
         };
         state
