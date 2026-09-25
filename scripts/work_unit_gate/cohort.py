@@ -19,7 +19,6 @@ import os
 from pathlib import Path
 import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
-import tomllib
 
 from . import contracts as c
 from . import descriptor_runner as dr
@@ -425,38 +424,27 @@ def verify_attempt_paths_exist(desc: c.WorkUnitDescriptor, repo_root: Path) -> N
             raise CohortError(CohortProblem.MISSING_ATTEMPT_SOURCE, f"path does not exist on disk: {r.value}")
 
 
+# Stable redacted #850 rejection codes mapped to cohort problems. Any other
+# code stays a generic malformed-field failure; the code itself is the detail.
+_COHORT_RUNNER_PROBLEMS = {
+    "CLOSED_FIELDS": CohortProblem.UNKNOWN_FIELD,
+    "DESCRIPTOR_FILENAME_MISMATCH": CohortProblem.FILENAME_MISMATCH,
+}
+
+
 def decode_cohort_descriptor(raw: bytes, filename: str) -> dict:
-    """Decode a descriptor TOML with strict unknown field rejection."""
-    if len(raw) > MAX_DESCRIPTOR_BYTES:
-        raise CohortError(CohortProblem.MALFORMED_FIELD, f"descriptor exceeds {MAX_DESCRIPTOR_BYTES} bytes")
+    """Decode a descriptor TOML through the accepted #850 validator.
+
+    Delegates closed-shape validation to descriptor_runner.decode_descriptor
+    so cohort decoding can never drift from the descriptor contract owner.
+    Translates its stable redacted codes to CohortProblem values.
+    """
     try:
-        data = tomllib.loads(raw.decode("utf-8"))
-    except Exception as e:
-        raise CohortError(CohortProblem.MALFORMED_FIELD, f"malformed TOML: {e}") from e
-
-    allowed_top_keys = {
-        "schema_version", "identity", "issue", "unit", "mode", "source_roots",
-        "test_roots", "matrix_cases", "proof_ceiling", "revision", "body_sha256",
-        "matrix_sha256", "require_workspace_member", "requirements", "bounds",
-        "package", "module"
-    }
-    extra_keys = set(data.keys()) - allowed_top_keys
-    if extra_keys:
-        raise CohortError(CohortProblem.UNKNOWN_FIELD, f"unknown fields in descriptor: {sorted(extra_keys)}")
-
-    # Filename match check
-    issue_data = data.get("issue", {})
-    issue_num = issue_data.get("number")
-    if issue_num is not None:
-        expected_filename = f".github/work-units/{issue_num}.toml"
-        norm_filename = filename.replace("\\", "/")
-        if not norm_filename.endswith(expected_filename):
-            raise CohortError(
-                CohortProblem.FILENAME_MISMATCH,
-                f"filename {filename} does not match expected {expected_filename}"
-            )
-
-    return data
+        return dr.decode_descriptor(raw, filename)
+    except dr.RunnerInputError as exc:
+        code = str(exc)
+        problem = _COHORT_RUNNER_PROBLEMS.get(code, CohortProblem.MALFORMED_FIELD)
+        raise CohortError(problem, code) from None
 
 
 def serialize_catalogue_canonical(catalogue: c.CatalogueIntegrityReceipt) -> bytes:
