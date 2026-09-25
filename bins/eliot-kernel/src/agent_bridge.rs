@@ -967,11 +967,12 @@ impl KernelComposition {
     /// Decodes and validates one coherent ORS lifecycle/result snapshot before
     /// Kernel readiness. No live connection, claim, pending entry, or Session is
     /// restored; result-bearing and terminal/reconciling identities are.
+    ///
+    /// The snapshot is validated in two passes because the second pass reads
+    /// the lifecycle projection the first pass publishes: every retained result
+    /// is admitted only when its durable lifecycle phase already agrees with
+    /// it, so an orphaned or cross-phase result can never be rehydrated.
     #[cfg(windows)]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "restart recovery validates lifecycle and result bindings as one coherent ORS snapshot"
-    )]
     pub(super) fn rehydrate_agent_activation_state(
         ors: &eliot_ors::RedbRecoveryStore,
     ) -> Result<AgentActivationPendingState, KernelBuildError> {
@@ -985,164 +986,8 @@ impl KernelComposition {
                 "activation recovery retention bound exceeded".to_owned(),
             ));
         }
-        let mut lifecycle = BTreeMap::new();
-        let mut successor_consumed = BTreeSet::new();
-        for durable in snapshot.lifecycles {
-            if durable.successor_ticket_id.is_some() {
-                successor_consumed.insert(durable.ticket_id.clone());
-            }
-            durable.validate().map_err(|_| {
-                KernelBuildError::Ors("activation lifecycle record is invalid".to_owned())
-            })?;
-            let ticket: AgentActivationResolutionTicket =
-                serde_json::from_str(&durable.ticket_payload).map_err(|_| {
-                    KernelBuildError::Ors(
-                        "activation lifecycle ticket payload is invalid".to_owned(),
-                    )
-                })?;
-            ticket.validate().map_err(|_| {
-                KernelBuildError::Ors("activation lifecycle ticket validation failed".to_owned())
-            })?;
-            let ticket_json = serde_json::to_string(&ticket).map_err(|_| {
-                KernelBuildError::Ors("activation lifecycle ticket encoding failed".to_owned())
-            })?;
-            let fence_digest = sha256_json(&ticket.state_fence).map_err(|_| {
-                KernelBuildError::Ors("activation lifecycle fence digest failed".to_owned())
-            })?;
-            let ticket_successor = ticket.successor_of.as_ref().map(|successor| {
-                eliot_ors::ActivationSuccessorBinding {
-                    predecessor_ticket_id: successor.predecessor_ticket_id.clone(),
-                    predecessor_ticket_sha256: successor.predecessor_ticket_sha256.clone(),
-                    predecessor_result_sha256: successor.predecessor_result_sha256.clone(),
-                    dependency_ref: successor.dependency_ref.clone(),
-                    observed_dependency_revision: successor.observed_dependency_revision.clone(),
-                    not_before_unix_ms: successor.not_before_unix_ms,
-                }
-            });
-            if durable.ticket_id != ticket.ticket_id
-                || durable.ticket_sha256 != ticket.ticket_sha256
-                || durable.activation_request_id != ticket.activation_request_id.as_str()
-                || durable.activation_request_sha256 != ticket.activation_request_sha256
-                || durable.connection_id != ticket.connection_id
-                || durable.state_fence != fence_digest
-                || durable.kernel_deadline_unix_ms != ticket.kernel_deadline_unix_ms
-                || durable.cancellation_id != ticket.cancellation_id
-                || durable.ticket_payload != ticket_json
-                || durable.successor_of != ticket_successor
-                || matches!(
-                    durable.state,
-                    eliot_ors::ActivationLifecycleState::Pending
-                        | eliot_ors::ActivationLifecycleState::Claimed
-                )
-            {
-                return Err(KernelBuildError::Ors(
-                    "activation lifecycle identity validation failed".to_owned(),
-                ));
-            }
-            if lifecycle
-                .insert(
-                    durable.ticket_id.clone(),
-                    AgentActivationLifecycle::from(durable.state),
-                )
-                .is_some()
-            {
-                return Err(KernelBuildError::Ors(
-                    "activation lifecycle ticket identity is duplicated".to_owned(),
-                ));
-            }
-        }
-        let mut results = BTreeMap::new();
-        let mut retention_orders = BTreeSet::new();
-        for retained in snapshot.results {
-            if !retention_orders.insert(retained.retention_order) {
-                return Err(KernelBuildError::Ors(
-                    "activation result retention order is not unique".to_owned(),
-                ));
-            }
-            retained.validate().map_err(|_| {
-                KernelBuildError::Ors("activation result retention record is invalid".to_owned())
-            })?;
-            let ticket: AgentActivationResolutionTicket =
-                serde_json::from_str(&retained.ticket_payload).map_err(|_| {
-                    KernelBuildError::Ors("activation result ticket payload is invalid".to_owned())
-                })?;
-            let result: AgentActivationResolutionResult =
-                serde_json::from_str(&retained.result_payload).map_err(|_| {
-                    KernelBuildError::Ors("activation result payload is invalid".to_owned())
-                })?;
-            ticket.validate().map_err(|_| {
-                KernelBuildError::Ors("activation result ticket validation failed".to_owned())
-            })?;
-            result.validate_against(&ticket).map_err(|_| {
-                KernelBuildError::Ors("activation result binding validation failed".to_owned())
-            })?;
-            let ticket_json = serde_json::to_string(&ticket).map_err(|_| {
-                KernelBuildError::Ors("activation result ticket encoding failed".to_owned())
-            })?;
-            let result_json = serde_json::to_string(&result).map_err(|_| {
-                KernelBuildError::Ors("activation result encoding failed".to_owned())
-            })?;
-            let fence_digest = sha256_json(&ticket.state_fence).map_err(|_| {
-                KernelBuildError::Ors("activation result fence digest failed".to_owned())
-            })?;
-            let phase_matches = match retained.phase {
-                eliot_ors::ActivationResultRetentionPhase::AcceptedTerminal => !matches!(
-                    &result.disposition,
-                    AgentActivationResolutionDisposition::NotReady { .. }
-                ),
-                eliot_ors::ActivationResultRetentionPhase::DeferredNotReady => matches!(
-                    &result.disposition,
-                    AgentActivationResolutionDisposition::NotReady { .. }
-                ),
-            };
-            let lifecycle_matches = matches!(
-                (lifecycle.get(&ticket.ticket_id), retained.phase),
-                (
-                    Some(AgentActivationLifecycle::Accepted),
-                    eliot_ors::ActivationResultRetentionPhase::AcceptedTerminal
-                ) | (
-                    Some(AgentActivationLifecycle::DeferredNotReady),
-                    eliot_ors::ActivationResultRetentionPhase::DeferredNotReady
-                )
-            );
-            if retained.ticket_id != ticket.ticket_id
-                || retained.ticket_sha256 != ticket.ticket_sha256
-                || retained.result_sha256 != result.result_sha256
-                || retained.connection_id != ticket.connection_id
-                || retained.state_fence != fence_digest
-                || retained.ticket_payload != ticket_json
-                || retained.result_payload != result_json
-                || !phase_matches
-                || !lifecycle_matches
-            {
-                return Err(KernelBuildError::Ors(
-                    "activation result retention identity validation failed".to_owned(),
-                ));
-            }
-            if results
-                .insert(
-                    ticket.ticket_id.clone(),
-                    AgentActivationResultRecord {
-                        result,
-                        demand_id: ticket.demand_id.clone(),
-                        phase: match retained.phase {
-                            eliot_ors::ActivationResultRetentionPhase::AcceptedTerminal => {
-                                AgentActivationResultPhase::AcceptedTerminal
-                            }
-                            eliot_ors::ActivationResultRetentionPhase::DeferredNotReady => {
-                                AgentActivationResultPhase::DeferredNotReady
-                            }
-                        },
-                        retention_order: retained.retention_order,
-                    },
-                )
-                .is_some()
-            {
-                return Err(KernelBuildError::Ors(
-                    "activation result retention ticket identity is duplicated".to_owned(),
-                ));
-            }
-        }
+        let (lifecycle, successor_consumed) = rehydrate_activation_lifecycles(snapshot.lifecycles)?;
+        let results = rehydrate_activation_results(snapshot.results, &lifecycle)?;
         Ok(AgentActivationPendingState::from_rehydrated_results(
             results,
             lifecycle,
@@ -1311,10 +1156,13 @@ impl KernelComposition {
         self.submit_agent_activation_result_authenticated(submit, None, None)
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "submission keeps protocol, bridge, deadline, and durable identity checks in one admission transaction"
-    )]
+    /// Admits one typed activation result, authenticated or local.
+    ///
+    /// Submission keeps the protocol, bridge, deadline, and durable identity
+    /// checks in one admission transaction: this entry validates the envelope
+    /// and classifies the ticket as a retained replay or a fresh commit, and
+    /// [`Self::commit_fresh_activation_result`] runs the fresh-commit leg
+    /// under the same held Kernel owner lock.
     pub(super) fn submit_agent_activation_result_authenticated(
         &self,
         submit: AgentActivationResultSubmit,
@@ -1374,8 +1222,41 @@ impl KernelComposition {
         let Some(entry_ticket) = entry_ticket else {
             return Err(TransportError::UnknownRequest);
         };
+        let ack = self.commit_fresh_activation_result(
+            &mut pending,
+            entry.as_ref(),
+            &entry_ticket,
+            &incoming,
+            owner_readback,
+            &ticket_id,
+        )?;
+        drop(pending);
+        self.agent_activation_changed.notify_waiters();
+        Ok(ack)
+    }
+
+    /// Runs the fresh-commit leg of one activation result admission.
+    ///
+    /// The caller still holds the Kernel owner lock across this call, so the
+    /// raw P-04 path cannot pass its own identity check and write a different
+    /// result in between. A ticket with no live bridge entry, a closed
+    /// (cancelled, expired, or reconciling) lifecycle, a mismatched
+    /// cancellation or successor binding, a deadline that already elapsed, or
+    /// an entry that already carries a result is refused here. Only a live
+    /// entry with no retained result reaches the durable write, the owner
+    /// readback publication, the lifecycle publication, and the FIFO retire,
+    /// all still under the held lock.
+    fn commit_fresh_activation_result(
+        &self,
+        pending: &mut std::sync::MutexGuard<'_, AgentActivationPendingState>,
+        entry: Option<&AgentActivationPending>,
+        entry_ticket: &AgentActivationResolutionTicket,
+        incoming: &AgentActivationResolutionResult,
+        owner_readback: Option<AgentActivationOwnerReadback>,
+        ticket_id: &str,
+    ) -> Result<AgentActivationResultAck, TransportError> {
         if matches!(
-            pending.lifecycle(&ticket_id),
+            pending.lifecycle(ticket_id),
             AgentActivationLifecycle::Cancelled
                 | AgentActivationLifecycle::Expired
                 | AgentActivationLifecycle::Reconciling
@@ -1384,7 +1265,6 @@ impl KernelComposition {
         }
         if entry_ticket.cancellation_id
             != entry
-                .as_ref()
                 .ok_or(TransportError::IdentityConflict)?
                 .request
                 .request_identity
@@ -1392,7 +1272,7 @@ impl KernelComposition {
         {
             return Err(TransportError::IdentityConflict);
         }
-        if let Some(successor) = entry.as_ref().and_then(|entry| entry.successor_of.as_ref()) {
+        if let Some(successor) = entry.and_then(|entry| entry.successor_of.as_ref()) {
             let ticket_predecessor = entry_ticket
                 .successor_of
                 .as_ref()
@@ -1409,19 +1289,14 @@ impl KernelComposition {
             {
                 return Err(TransportError::IdentityConflict);
             }
-            Self::successor_result_allowed(
-                &pending,
-                successor,
-                &incoming,
-                &entry_ticket.demand_id,
-            )?;
+            Self::successor_result_allowed(pending, successor, incoming, &entry_ticket.demand_id)?;
         } else if entry_ticket.successor_of.is_some() {
             return Err(TransportError::IdentityConflict);
         }
         incoming
-            .validate_against(&entry_ticket)
+            .validate_against(entry_ticket)
             .map_err(|_| TransportError::SessionFenced)?;
-        self.validate_result_bridge_leg(&entry_ticket)?;
+        self.validate_result_bridge_leg(entry_ticket)?;
         // Deadline expiry with no retained result is the expected race at
         // this boundary. A retained result would have taken the replay path
         // above and survived the deadline; here there is nothing terminal to
@@ -1429,29 +1304,27 @@ impl KernelComposition {
         if activation_deadline_expired(unix_ms(), entry_ticket.kernel_deadline_unix_ms) {
             return Err(TransportError::Timeout);
         }
-        if !pending.entries.contains_key(&ticket_id) || pending.results.contains_key(&ticket_id) {
+        if !pending.entries.contains_key(ticket_id) || pending.results.contains_key(ticket_id) {
             return Err(TransportError::IdentityConflict);
         }
         let phase = Self::result_phase_for_disposition(&incoming.disposition);
-        let ack = AgentActivationResultAck::accepted(&incoming)
+        let ack = AgentActivationResultAck::accepted(incoming)
             .map_err(|_| TransportError::SessionFenced)?;
-        self.retain_activation_result_durably(&mut pending, &entry_ticket, &incoming, phase)?;
-        if let Some(entry) = pending.entries.get_mut(&ticket_id) {
+        self.retain_activation_result_durably(pending, entry_ticket, incoming, phase)?;
+        if let Some(entry) = pending.entries.get_mut(ticket_id) {
             entry.owner_readback = owner_readback;
         } else {
             return Err(TransportError::IdentityConflict);
         }
         pending.mark_lifecycle(
-            &ticket_id,
+            ticket_id,
             if phase == AgentActivationResultPhase::DeferredNotReady {
                 AgentActivationLifecycle::DeferredNotReady
             } else {
                 AgentActivationLifecycle::Accepted
             },
         );
-        pending.fifo.retain(|queued_id| queued_id != &ticket_id);
-        drop(pending);
-        self.agent_activation_changed.notify_waiters();
+        pending.fifo.retain(|queued_id| queued_id != ticket_id);
         Ok(ack)
     }
 
@@ -2519,4 +2392,200 @@ impl KernelComposition {
             Ok(())
         }
     }
+}
+
+/// Rebuilds the durable activation lifecycle projection and the successor
+/// identities those records consume, from one coherent ORS recovery snapshot.
+///
+/// Every durable record must validate, must match the exact ticket it
+/// retained in every identity field, and must not be a live `Pending` or
+/// `Claimed` lifecycle: a live ticket is re-issued by the claim step, never
+/// restored from a previous incarnation. Each ticket identity may appear at
+/// most once, and a record naming a successor ticket marks that predecessor
+/// as already consumed so it can never be re-bound.
+#[cfg(windows)]
+fn rehydrate_activation_lifecycles(
+    durable_lifecycles: Vec<eliot_ors::ActivationLifecycleRecord>,
+) -> Result<(BTreeMap<String, AgentActivationLifecycle>, BTreeSet<String>), KernelBuildError> {
+    let mut lifecycle = BTreeMap::new();
+    let mut successor_consumed = BTreeSet::new();
+    for durable in durable_lifecycles {
+        if durable.successor_ticket_id.is_some() {
+            successor_consumed.insert(durable.ticket_id.clone());
+        }
+        durable.validate().map_err(|_| {
+            KernelBuildError::Ors("activation lifecycle record is invalid".to_owned())
+        })?;
+        let ticket: AgentActivationResolutionTicket = serde_json::from_str(&durable.ticket_payload)
+            .map_err(|_| {
+                KernelBuildError::Ors("activation lifecycle ticket payload is invalid".to_owned())
+            })?;
+        ticket.validate().map_err(|_| {
+            KernelBuildError::Ors("activation lifecycle ticket validation failed".to_owned())
+        })?;
+        let ticket_json = serde_json::to_string(&ticket).map_err(|_| {
+            KernelBuildError::Ors("activation lifecycle ticket encoding failed".to_owned())
+        })?;
+        let fence_digest = sha256_json(&ticket.state_fence).map_err(|_| {
+            KernelBuildError::Ors("activation lifecycle fence digest failed".to_owned())
+        })?;
+        let ticket_successor =
+            ticket
+                .successor_of
+                .as_ref()
+                .map(|successor| eliot_ors::ActivationSuccessorBinding {
+                    predecessor_ticket_id: successor.predecessor_ticket_id.clone(),
+                    predecessor_ticket_sha256: successor.predecessor_ticket_sha256.clone(),
+                    predecessor_result_sha256: successor.predecessor_result_sha256.clone(),
+                    dependency_ref: successor.dependency_ref.clone(),
+                    observed_dependency_revision: successor.observed_dependency_revision.clone(),
+                    not_before_unix_ms: successor.not_before_unix_ms,
+                });
+        if durable.ticket_id != ticket.ticket_id
+            || durable.ticket_sha256 != ticket.ticket_sha256
+            || durable.activation_request_id != ticket.activation_request_id.as_str()
+            || durable.activation_request_sha256 != ticket.activation_request_sha256
+            || durable.connection_id != ticket.connection_id
+            || durable.state_fence != fence_digest
+            || durable.kernel_deadline_unix_ms != ticket.kernel_deadline_unix_ms
+            || durable.cancellation_id != ticket.cancellation_id
+            || durable.ticket_payload != ticket_json
+            || durable.successor_of != ticket_successor
+            || matches!(
+                durable.state,
+                eliot_ors::ActivationLifecycleState::Pending
+                    | eliot_ors::ActivationLifecycleState::Claimed
+            )
+        {
+            return Err(KernelBuildError::Ors(
+                "activation lifecycle identity validation failed".to_owned(),
+            ));
+        }
+        if lifecycle
+            .insert(
+                durable.ticket_id.clone(),
+                AgentActivationLifecycle::from(durable.state),
+            )
+            .is_some()
+        {
+            return Err(KernelBuildError::Ors(
+                "activation lifecycle ticket identity is duplicated".to_owned(),
+            ));
+        }
+    }
+    Ok((lifecycle, successor_consumed))
+}
+
+/// Rebuilds the durable activation result retention projection against the
+/// already-restored lifecycle projection.
+///
+/// A retained result is admitted only when its retention order is unique, the
+/// record matches the exact ticket and result it retained, its retention phase
+/// agrees with the result's own disposition, and the restored lifecycle phase
+/// for that same ticket already agrees with the retention phase. Reading
+/// `lifecycle` is what makes an orphaned or cross-phase result fail closed
+/// instead of being rehydrated on its own.
+#[cfg(windows)]
+fn rehydrate_activation_results(
+    durable_results: Vec<eliot_ors::ActivationResultRetentionRecord>,
+    lifecycle: &BTreeMap<String, AgentActivationLifecycle>,
+) -> Result<BTreeMap<String, AgentActivationResultRecord>, KernelBuildError> {
+    let mut results = BTreeMap::new();
+    let mut retention_orders = BTreeSet::new();
+    for retained in durable_results {
+        if !retention_orders.insert(retained.retention_order) {
+            return Err(KernelBuildError::Ors(
+                "activation result retention order is not unique".to_owned(),
+            ));
+        }
+        let (ticket_id, record) = rehydrate_one_activation_result(retained, lifecycle)?;
+        if results.insert(ticket_id, record).is_some() {
+            return Err(KernelBuildError::Ors(
+                "activation result retention ticket identity is duplicated".to_owned(),
+            ));
+        }
+    }
+    Ok(results)
+}
+
+/// Validates exactly one retained activation result record and returns the
+/// projection Kernel publishes for it, keyed by the ticket identity the
+/// record itself retained.
+#[cfg(windows)]
+fn rehydrate_one_activation_result(
+    retained: eliot_ors::ActivationResultRetentionRecord,
+    lifecycle: &BTreeMap<String, AgentActivationLifecycle>,
+) -> Result<(String, AgentActivationResultRecord), KernelBuildError> {
+    retained.validate().map_err(|_| {
+        KernelBuildError::Ors("activation result retention record is invalid".to_owned())
+    })?;
+    let ticket: AgentActivationResolutionTicket = serde_json::from_str(&retained.ticket_payload)
+        .map_err(|_| {
+            KernelBuildError::Ors("activation result ticket payload is invalid".to_owned())
+        })?;
+    let result: AgentActivationResolutionResult = serde_json::from_str(&retained.result_payload)
+        .map_err(|_| KernelBuildError::Ors("activation result payload is invalid".to_owned()))?;
+    ticket.validate().map_err(|_| {
+        KernelBuildError::Ors("activation result ticket validation failed".to_owned())
+    })?;
+    result.validate_against(&ticket).map_err(|_| {
+        KernelBuildError::Ors("activation result binding validation failed".to_owned())
+    })?;
+    let ticket_json = serde_json::to_string(&ticket).map_err(|_| {
+        KernelBuildError::Ors("activation result ticket encoding failed".to_owned())
+    })?;
+    let result_json = serde_json::to_string(&result)
+        .map_err(|_| KernelBuildError::Ors("activation result encoding failed".to_owned()))?;
+    let fence_digest = sha256_json(&ticket.state_fence)
+        .map_err(|_| KernelBuildError::Ors("activation result fence digest failed".to_owned()))?;
+    let phase_matches = match retained.phase {
+        eliot_ors::ActivationResultRetentionPhase::AcceptedTerminal => !matches!(
+            &result.disposition,
+            AgentActivationResolutionDisposition::NotReady { .. }
+        ),
+        eliot_ors::ActivationResultRetentionPhase::DeferredNotReady => matches!(
+            &result.disposition,
+            AgentActivationResolutionDisposition::NotReady { .. }
+        ),
+    };
+    let lifecycle_matches = matches!(
+        (lifecycle.get(&ticket.ticket_id), retained.phase),
+        (
+            Some(AgentActivationLifecycle::Accepted),
+            eliot_ors::ActivationResultRetentionPhase::AcceptedTerminal
+        ) | (
+            Some(AgentActivationLifecycle::DeferredNotReady),
+            eliot_ors::ActivationResultRetentionPhase::DeferredNotReady
+        )
+    );
+    if retained.ticket_id != ticket.ticket_id
+        || retained.ticket_sha256 != ticket.ticket_sha256
+        || retained.result_sha256 != result.result_sha256
+        || retained.connection_id != ticket.connection_id
+        || retained.state_fence != fence_digest
+        || retained.ticket_payload != ticket_json
+        || retained.result_payload != result_json
+        || !phase_matches
+        || !lifecycle_matches
+    {
+        return Err(KernelBuildError::Ors(
+            "activation result retention identity validation failed".to_owned(),
+        ));
+    }
+    Ok((
+        ticket.ticket_id.clone(),
+        AgentActivationResultRecord {
+            result,
+            demand_id: ticket.demand_id.clone(),
+            phase: match retained.phase {
+                eliot_ors::ActivationResultRetentionPhase::AcceptedTerminal => {
+                    AgentActivationResultPhase::AcceptedTerminal
+                }
+                eliot_ors::ActivationResultRetentionPhase::DeferredNotReady => {
+                    AgentActivationResultPhase::DeferredNotReady
+                }
+            },
+            retention_order: retained.retention_order,
+        },
+    ))
 }

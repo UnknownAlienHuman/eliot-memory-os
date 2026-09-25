@@ -236,12 +236,7 @@ fn start_activation_resolve(
             Ok(now) => now,
             Err(error) => return ActivationCompletion::Resolve(Err(error)),
         };
-        ActivationCompletion::Resolve(resolve_valid_ticket(
-            &guard,
-            kernel_owner,
-            ticket,
-            now,
-        ))
+        ActivationCompletion::Resolve(resolve_valid_ticket(&guard, kernel_owner, ticket, now))
     })
 }
 
@@ -1532,14 +1527,16 @@ fn resolve_valid_ticket(
         &result.disposition,
         AgentActivationResolutionDisposition::Resolved { .. }
     ) {
-        Some(composition.current_activation_owner_readback(now).map_err(
-            |error| {
-                format!(
-                    "daemon activation owner readback ticket {}: {error}",
-                    ticket.ticket_id
-                )
-            },
-        )?)
+        Some(
+            composition
+                .current_activation_owner_readback(now)
+                .map_err(|error| {
+                    format!(
+                        "daemon activation owner readback ticket {}: {error}",
+                        ticket.ticket_id
+                    )
+                })?,
+        )
     } else {
         None
     };

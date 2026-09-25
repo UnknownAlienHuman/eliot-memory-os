@@ -2044,10 +2044,11 @@ impl RedbRecoveryStore {
     /// retention pruning and returns every durable identity evicted by the
     /// same transaction. The returned list is the only safe way for a cache
     /// to mirror the ORS projection; it is never an authority decision.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one ORS write transaction keeps lifecycle identity, successor binding, and capacity pruning atomic"
-    )]
+    ///
+    /// Lifecycle identity, successor binding, and capacity pruning all stay in
+    /// one ORS write transaction: this entry owns that transaction, and the
+    /// private steps below are ordinary calls on the very same
+    /// `WriteTransaction`, so a partially staged ticket is never observable.
     pub fn stage_activation_ticket_with_protection(
         &self,
         record: &ActivationLifecycleRecord,
@@ -2091,22 +2092,67 @@ impl RedbRecoveryStore {
         }
 
         let mut evicted_ticket_ids = Vec::new();
+        let mut lifecycle_rows = Self::read_activation_lifecycle_rows(&write)?;
+        Self::reject_staged_activation_identity_reuse(&lifecycle_rows, record, &key)?;
+        Self::prune_activation_lifecycle_capacity(
+            &write,
+            &mut lifecycle_rows,
+            protected_ticket_ids,
+            &mut evicted_ticket_ids,
+        )?;
+        let order = Self::next_operational_order(&write)?;
+        Self::bind_staged_activation_predecessor(
+            &write,
+            &lifecycle_rows,
+            record,
+            now_unix_ms,
+            order,
+            &key,
+        )?;
+        let mut next = record.clone();
+        next.lifecycle_order = order;
+        next.validate()?;
+        let payload = encode(&next)?;
+        let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        table
+            .insert(key.as_str(), payload.as_str())
+            .map_err(storage)?;
+        drop(table);
+        write.commit().map_err(storage)?;
+        Ok((next, evicted_ticket_ids))
+    }
+
+    /// Reads and validates every durable activation lifecycle row, refusing a
+    /// table whose stored key does not match the ticket identity it holds.
+    pub(super) fn read_activation_lifecycle_rows(
+        write: &redb::WriteTransaction,
+    ) -> Result<Vec<ActivationLifecycleRecord>, OrsError> {
         let mut lifecycle_rows = Vec::new();
-        {
-            let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
-            for entry in table.iter().map_err(storage)? {
-                let (existing_key, value) = entry.map_err(storage)?;
-                let existing: ActivationLifecycleRecord = decode(value.value())?;
-                if existing_key.value() != existing.record_key() {
-                    return Err(OrsError::IntegrityProblem {
-                        record_type: "activation_lifecycle",
-                        reason: "table key does not match ticket identity".to_owned(),
-                    });
-                }
-                existing.validate()?;
-                lifecycle_rows.push(existing);
+        let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        for entry in table.iter().map_err(storage)? {
+            let (existing_key, value) = entry.map_err(storage)?;
+            let existing: ActivationLifecycleRecord = decode(value.value())?;
+            if existing_key.value() != existing.record_key() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_lifecycle",
+                    reason: "table key does not match ticket identity".to_owned(),
+                });
             }
+            existing.validate()?;
+            lifecycle_rows.push(existing);
         }
+        Ok(lifecycle_rows)
+    }
+
+    /// Refuses staging a ticket that reuses an activation request identity, or
+    /// a predecessor ticket/result pair an existing row already bound as a
+    /// successor. One activation request and one predecessor pair admit exactly
+    /// one staged ticket.
+    pub(super) fn reject_staged_activation_identity_reuse(
+        lifecycle_rows: &[ActivationLifecycleRecord],
+        record: &ActivationLifecycleRecord,
+        key: &str,
+    ) -> Result<(), OrsError> {
         if lifecycle_rows.iter().any(|existing| {
             existing.activation_request_id == record.activation_request_id
                 || existing.successor_of.as_ref().is_some_and(|successor| {
@@ -2117,78 +2163,102 @@ impl RedbRecoveryStore {
                     })
                 })
         }) {
-            return Err(OrsError::ActivationLifecycleIdentityConflict { ticket_id: key });
+            return Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: key.to_owned(),
+            });
         }
-        if lifecycle_rows.len() >= crate::MAX_ACTIVATION_LIFECYCLE_RECORDS {
-            let removable = lifecycle_rows
-                .iter()
-                .filter(|existing| {
-                    !protected_ticket_ids.contains(&existing.ticket_id)
-                        && existing.successor_ticket_id.is_none()
-                        && matches!(
-                            existing.state,
-                            ActivationLifecycleState::ResultAccepted
-                                | ActivationLifecycleState::Cancelled
-                                | ActivationLifecycleState::Expired
-                        )
-                })
-                .min_by_key(|existing| existing.lifecycle_order)
-                .cloned();
-            let Some(removable) = removable else {
-                return Err(OrsError::ProjectionLimitExceeded);
-            };
-            {
-                let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
-                table.remove(removable.record_key()).map_err(storage)?;
-            }
-            {
-                let mut table = write
-                    .open_table(ACTIVATION_RESULT_RETENTION)
-                    .map_err(storage)?;
-                table.remove(removable.record_key()).map_err(storage)?;
-            }
-            evicted_ticket_ids.push(removable.ticket_id.clone());
-            lifecycle_rows.retain(|existing| existing.ticket_id != removable.ticket_id);
+        Ok(())
+    }
+
+    /// Makes room for one staged ticket when the lifecycle table is already at
+    /// its bound, evicting exactly one unprotected terminal row that carries no
+    /// successor from both the lifecycle and result-retention tables. A ticket
+    /// with nothing evictable is a refusal, never a silent overflow.
+    pub(super) fn prune_activation_lifecycle_capacity(
+        write: &redb::WriteTransaction,
+        lifecycle_rows: &mut Vec<ActivationLifecycleRecord>,
+        protected_ticket_ids: &BTreeSet<String>,
+        evicted_ticket_ids: &mut Vec<String>,
+    ) -> Result<(), OrsError> {
+        if lifecycle_rows.len() < crate::MAX_ACTIVATION_LIFECYCLE_RECORDS {
+            return Ok(());
         }
-        let order = Self::next_operational_order(&write)?;
-        let mut next = record.clone();
-        next.lifecycle_order = order;
-        if let Some(successor) = &record.successor_of {
-            let predecessor = lifecycle_rows
-                .iter()
-                .find(|existing| existing.ticket_id == successor.predecessor_ticket_id)
-                .ok_or_else(|| OrsError::ActivationLifecycleIdentityConflict {
-                    ticket_id: key.clone(),
-                })?;
-            if predecessor.state != ActivationLifecycleState::DeferredNotReady
-                || predecessor.ticket_sha256 != successor.predecessor_ticket_sha256
-                || predecessor.result_sha256.as_deref()
-                    != Some(successor.predecessor_result_sha256.as_str())
-                || predecessor.successor_ticket_id.is_some()
-                || now_unix_ms < successor.not_before_unix_ms
-            {
-                return Err(OrsError::ActivationLifecycleIdentityConflict { ticket_id: key });
-            }
-            let mut updated_predecessor = predecessor.clone();
-            updated_predecessor.successor_ticket_id = Some(record.ticket_id.clone());
-            updated_predecessor.lifecycle_order = order;
-            updated_predecessor.validate()?;
-            let predecessor_key = updated_predecessor.record_key().to_owned();
-            let payload = encode(&updated_predecessor)?;
+        let removable = lifecycle_rows
+            .iter()
+            .filter(|existing| {
+                !protected_ticket_ids.contains(&existing.ticket_id)
+                    && existing.successor_ticket_id.is_none()
+                    && matches!(
+                        existing.state,
+                        ActivationLifecycleState::ResultAccepted
+                            | ActivationLifecycleState::Cancelled
+                            | ActivationLifecycleState::Expired
+                    )
+            })
+            .min_by_key(|existing| existing.lifecycle_order)
+            .cloned();
+        let Some(removable) = removable else {
+            return Err(OrsError::ProjectionLimitExceeded);
+        };
+        {
             let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
-            table
-                .insert(predecessor_key.as_str(), payload.as_str())
-                .map_err(storage)?;
+            table.remove(removable.record_key()).map_err(storage)?;
         }
-        next.validate()?;
-        let payload = encode(&next)?;
+        {
+            let mut table = write
+                .open_table(ACTIVATION_RESULT_RETENTION)
+                .map_err(storage)?;
+            table.remove(removable.record_key()).map_err(storage)?;
+        }
+        evicted_ticket_ids.push(removable.ticket_id.clone());
+        lifecycle_rows.retain(|existing| existing.ticket_id != removable.ticket_id);
+        Ok(())
+    }
+
+    /// Binds one staged successor ticket to its exact durable predecessor and
+    /// publishes the consumed predecessor, still inside the staging
+    /// transaction. The predecessor must be a deferred, not-yet-consumed row
+    /// whose retained result and ticket digest match the successor binding, and
+    /// whose `not_before` gate has opened.
+    pub(super) fn bind_staged_activation_predecessor(
+        write: &redb::WriteTransaction,
+        lifecycle_rows: &[ActivationLifecycleRecord],
+        record: &ActivationLifecycleRecord,
+        now_unix_ms: u64,
+        order: u64,
+        key: &str,
+    ) -> Result<(), OrsError> {
+        let Some(successor) = &record.successor_of else {
+            return Ok(());
+        };
+        let predecessor = lifecycle_rows
+            .iter()
+            .find(|existing| existing.ticket_id == successor.predecessor_ticket_id)
+            .ok_or_else(|| OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: key.to_owned(),
+            })?;
+        if predecessor.state != ActivationLifecycleState::DeferredNotReady
+            || predecessor.ticket_sha256 != successor.predecessor_ticket_sha256
+            || predecessor.result_sha256.as_deref()
+                != Some(successor.predecessor_result_sha256.as_str())
+            || predecessor.successor_ticket_id.is_some()
+            || now_unix_ms < successor.not_before_unix_ms
+        {
+            return Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: key.to_owned(),
+            });
+        }
+        let mut updated_predecessor = predecessor.clone();
+        updated_predecessor.successor_ticket_id = Some(record.ticket_id.clone());
+        updated_predecessor.lifecycle_order = order;
+        updated_predecessor.validate()?;
+        let predecessor_key = updated_predecessor.record_key().to_owned();
+        let payload = encode(&updated_predecessor)?;
         let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
         table
-            .insert(key.as_str(), payload.as_str())
+            .insert(predecessor_key.as_str(), payload.as_str())
             .map_err(storage)?;
-        drop(table);
-        write.commit().map_err(storage)?;
-        Ok((next, evicted_ticket_ids))
+        Ok(())
     }
 
     /// Claims one pending ticket for the authenticated daemon. An expired
@@ -2311,10 +2381,12 @@ impl RedbRecoveryStore {
 
     /// Commits one result while protecting live Kernel waiters and returns
     /// any bounded-retention identities evicted in the same transaction.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one ORS write transaction keeps result admission, deadline CAS, and lifecycle publication atomic"
-    )]
+    ///
+    /// Result admission, the deadline compare-and-set, lifecycle publication,
+    /// and bounded-retention pruning all stay in one ORS write transaction:
+    /// this entry owns that transaction, and the private steps below are
+    /// ordinary calls on the very same `WriteTransaction`, so a result is never
+    /// retained without its lifecycle publication.
     pub fn commit_activation_result_with_protection(
         &self,
         record: &ActivationResultRetentionRecord,
@@ -2376,21 +2448,7 @@ impl RedbRecoveryStore {
                 .claim_expires_at_unix_ms
                 .is_some_and(|expiry| expiry <= now_unix_ms)
         {
-            let mut reconciling = lifecycle;
-            reconciling.state = ActivationLifecycleState::Reconciling;
-            reconciling.claim_owner = None;
-            reconciling.claim_expires_at_unix_ms = None;
-            reconciling.lifecycle_order = Self::next_operational_order(&write)?;
-            reconciling.terminal_reason =
-                Some("claim lease elapsed before durable result admission".to_owned());
-            reconciling.validate()?;
-            let payload = encode(&reconciling)?;
-            let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
-            table
-                .insert(reconciling.record_key(), payload.as_str())
-                .map_err(storage)?;
-            drop(table);
-            write.commit().map_err(storage)?;
+            Self::reconcile_elapsed_activation_claim(write, lifecycle)?;
             return Err(OrsError::ActivationLifecycleStateConflict {
                 ticket_id: key,
                 state: ActivationLifecycleState::Reconciling,
@@ -2398,53 +2456,139 @@ impl RedbRecoveryStore {
             });
         }
         if now_unix_ms >= lifecycle.kernel_deadline_unix_ms {
-            if lifecycle.result_sha256.is_none()
-                && matches!(
-                    lifecycle.state,
-                    ActivationLifecycleState::Pending | ActivationLifecycleState::Claimed
-                )
-            {
-                let mut expired = lifecycle;
-                expired.state = ActivationLifecycleState::Expired;
-                expired.claim_owner = None;
-                expired.claim_expires_at_unix_ms = None;
-                expired.lifecycle_order = Self::next_operational_order(&write)?;
-                expired.terminal_reason =
-                    Some("deadline elapsed before durable result admission".to_owned());
-                expired.validate()?;
-                let payload = encode(&expired)?;
-                let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
-                table
-                    .insert(expired.record_key(), payload.as_str())
-                    .map_err(storage)?;
-                drop(table);
-                write.commit().map_err(storage)?;
-            }
+            Self::expire_activation_lifecycle_before_result(write, &lifecycle)?;
             return Err(OrsError::ActivationLifecycleExpired { ticket_id: key });
         }
+        Self::require_claimed_activation_for_result(
+            &lifecycle,
+            claim_owner,
+            dependency_observation,
+            now_unix_ms,
+            &key,
+        )?;
+        let (mut retained_rows, mut total_payload_bytes) =
+            Self::read_activation_result_rows(&write)?;
+        let mut lifecycle_rows = Self::read_activation_lifecycle_rows(&write)?;
+        let evicted_ticket_ids = Self::prune_activation_result_capacity(
+            &write,
+            &mut retained_rows,
+            &mut lifecycle_rows,
+            &mut total_payload_bytes,
+            record,
+            protected_ticket_ids,
+            &key,
+        )?;
+        let retained = Self::publish_activation_result_commit(&write, record, lifecycle)?;
+        write.commit().map_err(storage)?;
+        Ok((retained, evicted_ticket_ids))
+    }
+
+    /// Moves one claimed-but-expired-lease lifecycle to durable reconciliation
+    /// before a result can be admitted against it. The caller hands over its
+    /// write transaction: the reconciliation is committed here, and the caller
+    /// returns the refusal without touching that transaction again. A result is
+    /// never admitted against a claim this daemon no longer holds.
+    pub(super) fn reconcile_elapsed_activation_claim(
+        write: redb::WriteTransaction,
+        lifecycle: ActivationLifecycleRecord,
+    ) -> Result<(), OrsError> {
+        let mut reconciling = lifecycle;
+        reconciling.state = ActivationLifecycleState::Reconciling;
+        reconciling.claim_owner = None;
+        reconciling.claim_expires_at_unix_ms = None;
+        reconciling.lifecycle_order = Self::next_operational_order(&write)?;
+        reconciling.terminal_reason =
+            Some("claim lease elapsed before durable result admission".to_owned());
+        reconciling.validate()?;
+        let payload = encode(&reconciling)?;
+        let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        table
+            .insert(reconciling.record_key(), payload.as_str())
+            .map_err(storage)?;
+        drop(table);
+        write.commit().map_err(storage)
+    }
+
+    /// Publishes the durable deadline expiry for a result-less lifecycle. The
+    /// caller hands over its write transaction, because publishing the expiry is
+    /// itself the committed outcome of the refusal. A lifecycle that already
+    /// carries a result, or has already left `Pending`/`Claimed`, is left
+    /// exactly as it is: this returns without touching the transaction, so it
+    /// aborts instead of committing, and the caller still returns the same
+    /// deadline refusal either way.
+    pub(super) fn expire_activation_lifecycle_before_result(
+        write: redb::WriteTransaction,
+        lifecycle: &ActivationLifecycleRecord,
+    ) -> Result<(), OrsError> {
+        if lifecycle.result_sha256.is_some()
+            || !matches!(
+                lifecycle.state,
+                ActivationLifecycleState::Pending | ActivationLifecycleState::Claimed
+            )
+        {
+            return Ok(());
+        }
+        let mut expired = lifecycle.clone();
+        expired.state = ActivationLifecycleState::Expired;
+        expired.claim_owner = None;
+        expired.claim_expires_at_unix_ms = None;
+        expired.lifecycle_order = Self::next_operational_order(&write)?;
+        expired.terminal_reason =
+            Some("deadline elapsed before durable result admission".to_owned());
+        expired.validate()?;
+        let payload = encode(&expired)?;
+        let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        table
+            .insert(expired.record_key(), payload.as_str())
+            .map_err(storage)?;
+        drop(table);
+        write.commit().map_err(storage)
+    }
+
+    /// Requires that the lifecycle is still claimed by exactly this owner, and
+    /// that a successor ticket presents a strictly newer observation of its own
+    /// bound dependency after its `not_before` gate opened. A first-generation
+    /// ticket presents no dependency observation at all.
+    pub(super) fn require_claimed_activation_for_result(
+        lifecycle: &ActivationLifecycleRecord,
+        claim_owner: &str,
+        dependency_observation: Option<(&str, &str)>,
+        now_unix_ms: u64,
+        key: &str,
+    ) -> Result<(), OrsError> {
         if lifecycle.state != ActivationLifecycleState::Claimed
             || lifecycle.claim_owner.as_deref() != Some(claim_owner)
         {
             return Err(OrsError::ActivationLifecycleStateConflict {
-                ticket_id: key,
+                ticket_id: key.to_owned(),
                 state: lifecycle.state,
                 expected: ActivationLifecycleState::Claimed,
             });
         }
         match (lifecycle.successor_of.as_ref(), dependency_observation) {
-            (None, None) => {}
+            (None, None) => Ok(()),
             (Some(predecessor), Some((dependency_ref, observed_revision))) => {
                 if dependency_ref != predecessor.dependency_ref
                     || observed_revision == predecessor.observed_dependency_revision
                     || now_unix_ms < predecessor.not_before_unix_ms
                 {
-                    return Err(OrsError::ActivationLifecycleIdentityConflict { ticket_id: key });
+                    return Err(OrsError::ActivationLifecycleIdentityConflict {
+                        ticket_id: key.to_owned(),
+                    });
                 }
+                Ok(())
             }
-            _ => {
-                return Err(OrsError::ActivationLifecycleIdentityConflict { ticket_id: key });
-            }
+            _ => Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: key.to_owned(),
+            }),
         }
+    }
+
+    /// Reads every durable result-retention row and its exact total payload
+    /// size, refusing a size total that cannot be represented.
+    pub(super) fn read_activation_result_rows(
+        write: &redb::WriteTransaction,
+    ) -> Result<(Vec<ActivationResultRetentionRecord>, usize), OrsError> {
         let mut retained_rows = Vec::new();
         {
             let table = write
@@ -2462,7 +2606,7 @@ impl RedbRecoveryStore {
                 retained_rows.push(existing);
             }
         }
-        let mut total_payload_bytes = retained_rows.iter().try_fold(0usize, |total, row| {
+        let total_payload_bytes = retained_rows.iter().try_fold(0usize, |total, row| {
             total
                 .checked_add(row.payload_bytes())
                 .ok_or_else(|| OrsError::IntegrityProblem {
@@ -2470,16 +2614,23 @@ impl RedbRecoveryStore {
                     reason: "retention payload size overflow".to_owned(),
                 })
         })?;
-        let mut lifecycle_rows: Vec<ActivationLifecycleRecord> = Vec::new();
-        {
-            let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
-            for entry in table.iter().map_err(storage)? {
-                let (_, value) = entry.map_err(storage)?;
-                let lifecycle: ActivationLifecycleRecord = decode(value.value())?;
-                lifecycle.validate()?;
-                lifecycle_rows.push(lifecycle);
-            }
-        }
+        Ok((retained_rows, total_payload_bytes))
+    }
+
+    /// Makes bounded room for one more retained result, evicting the oldest
+    /// unprotected accepted row that carries no successor from both the
+    /// retention and lifecycle tables until the row count and total payload
+    /// bounds both hold. The committed ticket itself is never its own eviction
+    /// candidate, and a table with nothing evictable is a refusal.
+    pub(super) fn prune_activation_result_capacity(
+        write: &redb::WriteTransaction,
+        retained_rows: &mut Vec<ActivationResultRetentionRecord>,
+        lifecycle_rows: &mut Vec<ActivationLifecycleRecord>,
+        total_payload_bytes: &mut usize,
+        record: &ActivationResultRetentionRecord,
+        protected_ticket_ids: &BTreeSet<String>,
+        key: &str,
+    ) -> Result<Vec<String>, OrsError> {
         let mut evicted_ticket_ids = Vec::new();
         while retained_rows.len() >= crate::MAX_ACTIVATION_RESULT_RETENTION_RECORDS
             || total_payload_bytes
@@ -2505,7 +2656,7 @@ impl RedbRecoveryStore {
             else {
                 return Err(OrsError::ProjectionLimitExceeded);
             };
-            total_payload_bytes = total_payload_bytes.saturating_sub(victim.payload_bytes());
+            *total_payload_bytes = total_payload_bytes.saturating_sub(victim.payload_bytes());
             retained_rows.retain(|row| row.ticket_id != removable_ticket_id);
             lifecycle_rows.retain(|row| row.ticket_id != removable_ticket_id);
             {
@@ -2524,7 +2675,18 @@ impl RedbRecoveryStore {
             }
             evicted_ticket_ids.push(removable_ticket_id);
         }
-        let order = Self::next_operational_order(&write)?;
+        Ok(evicted_ticket_ids)
+    }
+
+    /// Publishes the retained result and the advanced lifecycle row in the
+    /// caller's write transaction, allocating one shared operational order so
+    /// the two projections advance as one durable step.
+    pub(super) fn publish_activation_result_commit(
+        write: &redb::WriteTransaction,
+        record: &ActivationResultRetentionRecord,
+        lifecycle: ActivationLifecycleRecord,
+    ) -> Result<ActivationResultRetentionRecord, OrsError> {
+        let order = Self::next_operational_order(write)?;
         let mut retained = record.clone();
         retained.retention_order = order;
         retained.validate()?;
@@ -2559,8 +2721,7 @@ impl RedbRecoveryStore {
                 .insert(next_lifecycle.record_key(), payload.as_str())
                 .map_err(storage)?;
         }
-        write.commit().map_err(storage)?;
-        Ok((retained, evicted_ticket_ids))
+        Ok(retained)
     }
 
     /// Terminalizes one result-less ticket without erasing accepted results.
