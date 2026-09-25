@@ -23,6 +23,9 @@ eliot-bootstrap.workspace = true
 eliot-cognitive-quality = { path = "../../crates/smart/eliot-cognitive-quality", version = "0.1.0" }
 eliot-contracts.workspace = true
 eliot-context.workspace = true
+eliot-context-admission = { path = "../../crates/smart/eliot-context-admission", version = "0.1.0" }
+eliot-context-assembly = { path = "../../crates/smart/eliot-context-assembly", version = "0.1.0" }
+eliot-context-candidates = { path = "../../crates/smart/eliot-context-candidates", version = "0.1.0" }
 eliot-context-contracts.workspace = true
 eliot-config.workspace = true
 eliot-controlboard.workspace = true

@@ -71,12 +71,34 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
-use eliot_governor::{KernelGenerationSnapshotProvider, KernelPortError};
+use eliot_context_admission::admit_context;
+use eliot_context_assembly::{
+    ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, assemble_active_view,
+};
+use eliot_context_candidates::{
+    CANDIDATE_SCHEMA_VERSION, CandidatePolicy, CandidateRequest, OpaqueProjection,
+    PROVIDER_AFFORDANCE, PROVIDER_NEGATIVE_MEMORY, PROVIDER_TASK_FRAME, ProjectionSchema,
+    ProjectionState as CandidateProjectionState, construct_context_candidates,
+};
+use eliot_context_contracts::{
+    AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity, AdmittedContextSet,
+    CONTEXT_CONTRACT_VERSION, ContextError, ContextOutcome, ContextRecipe,
+    DecisionContextIncomplete, MeasurementCompositionProfile, PriorityPolicyIdentity, ProviderId,
+    QualityScorecard, SafetyFloorIdentity, SerializedContextMeasurement, SuppliedOmissionBinding,
+};
+use eliot_contracts::{
+    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence, sha256_hex,
+};
+use eliot_governor::{
+    ContextInputsError, ContextReconstructionRequest, GovernorContextInputs,
+    KernelGenerationSnapshotProvider, KernelPortError, ROLE_AFFORDANCES, ROLE_ATTENTION_CONFLICT,
+    ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE, ROLE_NEGATIVE_MEMORY,
+    ROLE_TASK_FRAME, SevenRoleInputs,
+};
 use eliot_protocol::{
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
 };
-use eliot_read::{LocalReadPort, QueryResult, ReadError};
+use eliot_read::{LocalReadPort, QueryResult, ReadError, ReadService};
 use eliot_store_api::{
     CampaignLearningStateViewLookup, CampaignSourceRevisionLookup, CanonicalReadClient,
     EVIDENCE_PACK_MAX_RECORDS, MAX_EXPERIENCE_PAGE_RECORDS, NamedReadOperation, NamedReadRequest,
@@ -84,6 +106,7 @@ use eliot_store_api::{
     ScopeId, StoreError, validate_experience_read_params,
 };
 use serde_json::Value;
+use thiserror::Error;
 
 use super::{DaemonKernelClient, SERVICE_NAME};
 
@@ -647,6 +670,37 @@ impl KernelContextReadClient {
         Ok(result)
     }
 
+    /// Routes one typed seven-role reconstruction through the Governor input
+    /// owner (#2564 I1).
+    ///
+    /// Production Governor/eliotd owner edge for
+    /// [`GovernorContextInputs::reconstruct`]: composes the Governor
+    /// `ReadService` over a fresh client sharing this client's retained
+    /// authenticated Kernel handle (same pattern as the dreamer orientation
+    /// intake), then acquires the seven roles over one compatible read
+    /// closure for the caller-supplied fence in `ctx` and the closed
+    /// selectors in `request`. The typed request — never a parameter-free
+    /// plan — travels end to end: per-role provider failures become
+    /// per-role dispositions inside [`SevenRoleInputs`], while a bad request,
+    /// a missing closure, or observed source churn fails the whole call as
+    /// [`ContextInputsError`]. The daemon state/packet dispatch invokes this
+    /// edge with the admitted pair's fence, scope, and selectors; this
+    /// function performs no admission decision and no consistency algorithm
+    /// of its own.
+    pub async fn reconstruct_context_inputs(
+        &self,
+        ctx: &RequestMetadata,
+        request: &ContextReconstructionRequest,
+    ) -> Result<SevenRoleInputs, ContextInputsError> {
+        let service = ReadService::new(Self {
+            kernel: Arc::clone(&self.kernel),
+        });
+        // The seven-role acquisition future is large (it holds the whole
+        // read-closure state machine); box it so the daemon poller that
+        // drives this edge never pays that size on its own stack.
+        Box::pin(GovernorContextInputs::borrow(&service).reconstruct(ctx, request)).await
+    }
+
     /// Checks one T11.3 task-bound reconstruction read before any transport.
     ///
     /// All four operations are scope-bound and `ExactFence`: a reconstruction
@@ -1142,6 +1196,327 @@ impl<'a, K: ?Sized, R: ?Sized> ReconstructionReadComposition<'a, K, R> {
     }
 }
 
+/// Fail-closed errors for the daemon packet composition.
+///
+/// Per-role acquisition failures never surface here: they already became
+/// per-role dispositions inside [`SevenRoleInputs`]. These variants cover
+/// only conditions under which no honest compilation can run at all — a
+/// scope/fence mismatch between the reconstructed roles and the compilation
+/// binding, a required role without readable source, a complete role whose
+/// owner conversion does not exist yet, or a typed stage rejection from the
+/// candidate, admission, or assembly owner. Typed stage failures cross
+/// wrapped, never collapsed into strings.
+#[derive(Debug, Error)]
+pub enum PacketCompositionError {
+    /// The reconstructed roles bind a different scope or fence than the
+    /// compilation binding.
+    #[error("packet roles bind a different scope or fence than the compilation request")]
+    BindingMismatch,
+    /// A required role has no readable source; the packet cannot complete
+    /// without it, and a missing required input never becomes a complete
+    /// empty view.
+    #[error("required packet role is unavailable: {role}")]
+    RoleUnavailable {
+        /// Governor role label (`eliot_governor::ROLE_*`).
+        role: &'static str,
+    },
+    /// A complete role cannot be converted because its owner conversion does
+    /// not exist yet. Names the existing owner of the missing conversion;
+    /// generic rows are never auto-admitted as typed candidate inputs.
+    #[error("complete packet role lacks its owner conversion: {role} owned by {owner}")]
+    RoleConversionMissing {
+        /// Governor role label (`eliot_governor::ROLE_*`).
+        role: &'static str,
+        /// Existing owner of the missing projection conversion.
+        owner: &'static str,
+    },
+    /// The candidate owner rejected the compilation.
+    #[error("packet candidate construction failed: {0}")]
+    Candidates(Box<ContextError>),
+    /// The admission owner rejected the candidate set.
+    #[error("packet admission failed: {0}")]
+    Admission(Box<ContextError>),
+    /// The admission owner left explicit gaps instead of a complete set.
+    #[error("packet admission left explicit gaps")]
+    AdmissionIncomplete(Box<DecisionContextIncomplete>),
+    /// The assembly owner rejected the admitted set.
+    #[error("packet assembly failed: {0}")]
+    Assembly(Box<AssemblyError>),
+}
+
+/// Owner-supplied admission closure for one packet compilation.
+///
+/// Every identity here is minted by its owner, never by this composition:
+/// the protected floor, the priority policy, the admission rule, and the
+/// measurement composition profile plus the supplied omissions and
+/// measurements the admission decision must close over. The candidate set
+/// itself always comes from the candidate stage of the same compilation.
+pub struct PacketAdmissionBundle {
+    /// Owner-minted protected floor identity.
+    pub floor: SafetyFloorIdentity,
+    /// Owner-minted priority policy identity.
+    pub priority: PriorityPolicyIdentity,
+    /// Owner-minted admission rule identity.
+    pub rule: AdmissionRuleIdentity,
+    /// Owner-minted measurement composition profile.
+    pub measurement_profile: MeasurementCompositionProfile,
+    /// Caller-supplied omission bindings the decision must close over.
+    pub supplied_omissions: Vec<SuppliedOmissionBinding>,
+    /// Caller-supplied measurements the decision must close over.
+    pub measurements: Vec<AdmissionMeasurement>,
+}
+
+impl KernelContextReadClient {
+    /// Compiles one `eliot.packet` view through the real compiler stages (#2564
+    /// I2: candidate → admission → assembly).
+    ///
+    /// Production Governor/eliotd owner edge for
+    /// [`construct_context_candidates`], [`admit_context`], and
+    /// [`assemble_active_view`]: maps the reconstructed seven roles to the
+    /// candidate stage's typed inputs, admits the resulting candidate set, and
+    /// assembles the admitted view — all in the semantic owner (Governor/eliotd),
+    /// never in Kernel. Kernel keeps mechanical admission and result retention.
+    ///
+    /// Role mapping is disposition-honest, never filler:
+    /// - optional roles (`attention_conflict`, `epistemic_position`,
+    ///   `cue_activation`, `evidence_assurance`) that are not convertible map to
+    ///   `None`, so the mapper reports the slot `Missing` — an optional failure
+    ///   stays scoped;
+    /// - required roles (`task_frame`, `negative_memory`, `affordances`) with an
+    ///   authoritative `KnownEmpty` acquisition compile to empty-member
+    ///   projections bound to the compilation binding, the observed scope-head
+    ///   revision, and the digest of the authoritative empty payload;
+    /// - a required role without readable source fails as
+    ///   [`PacketCompositionError::RoleUnavailable`] — a missing required input
+    ///   never becomes a complete empty view;
+    /// - a `Complete`, `Partial`, or `Stale` role fails as
+    ///   [`PacketCompositionError::RoleConversionMissing`] naming its existing
+    ///   owner, because member ceilings and typed envelopes belong to that
+    ///   owner: generic authority rows are not automatically admitted
+    ///   Cue/negative-memory/capability inputs.
+    ///
+    /// The admission closure (`floor`, `priority`, `rule`, `measurement_profile`,
+    /// omissions, measurements), the `quality` scorecard, the assembly `policy`,
+    /// and the `measure` callback all arrive from their owners: a protected
+    /// floor, reservations, and scorecard evidence are never assembled here
+    /// merely to satisfy the renderer. An explicit admission gap fails as
+    /// [`PacketCompositionError::AdmissionIncomplete`] with the owner's gaps,
+    /// never as a silently cut view. The packet dispatch invokes this edge with
+    /// the admitted pair's binding, recipe, and owner evidence; large output
+    /// cannot pass `policy.max_serialized_bytes`, and genuinely deferred
+    /// compilation uses a durable job, never an unconsumed handle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_context_packet(
+        seven: &SevenRoleInputs,
+        request: &CandidateRequest,
+        recipe: &ContextRecipe,
+        policy: &CandidatePolicy,
+        admission: &PacketAdmissionBundle,
+        quality: QualityScorecard,
+        assembly: &AssemblyPolicy,
+        measure: impl FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
+    ) -> Result<ActiveUnderstandingViewResult, PacketCompositionError> {
+        if seven.scope_id.as_str() != request.binding.scope_id.as_str()
+            || seven.state_fence != request.binding.state_fence
+        {
+            return Err(PacketCompositionError::BindingMismatch);
+        }
+        request
+            .validate()
+            .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
+        recipe
+            .validate()
+            .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
+        policy
+            .validate()
+            .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
+        let scope_revision = observed_scope_revision(seven)?;
+        let task_frame = required_projection(
+            &seven.task_frame,
+            ROLE_TASK_FRAME,
+            PROVIDER_TASK_FRAME,
+            "governor-task-frame",
+            request,
+            &scope_revision,
+        )?;
+        let negative_memory = required_projection(
+            &seven.negative_memory,
+            ROLE_NEGATIVE_MEMORY,
+            PROVIDER_NEGATIVE_MEMORY,
+            "governor-negative-memory",
+            request,
+            &scope_revision,
+        )?;
+        let affordances = required_projection(
+            &seven.affordances,
+            ROLE_AFFORDANCES,
+            PROVIDER_AFFORDANCE,
+            "governor-affordances",
+            request,
+            &scope_revision,
+        )?;
+        let candidates = construct_context_candidates(
+            request,
+            recipe,
+            &task_frame,
+            optional_role(
+                &seven.attention,
+                ROLE_ATTENTION_CONFLICT,
+                "eliot-context-contracts",
+            )?,
+            optional_role(
+                &seven.epistemic,
+                ROLE_EPISTEMIC_POSITION,
+                "eliot-epistemic-contracts",
+            )?,
+            optional_role(&seven.cue, ROLE_CUE_ACTIVATION, "eliot-cue-contracts")?,
+            &negative_memory,
+            optional_role(&seven.evidence, ROLE_EVIDENCE_ASSURANCE, "eliot-evidence")?,
+            &affordances,
+            policy,
+        )
+        .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
+        let input = AdmissionInput {
+            schema_version: CONTEXT_CONTRACT_VERSION,
+            binding: request.binding.clone(),
+            recipe: recipe.clone(),
+            candidates: candidates.set.clone(),
+            learning_tickets: Vec::new(),
+            floor: admission.floor.clone(),
+            priority: admission.priority.clone(),
+            rule: admission.rule.clone(),
+            measurement_profile: admission.measurement_profile.clone(),
+            supplied_omissions: admission.supplied_omissions.clone(),
+            measurements: admission.measurements.clone(),
+        };
+        input
+            .validate()
+            .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+        let admitted = admit_packet_candidates(&input)?;
+        assemble_active_view(&admitted, recipe, quality, assembly, measure)
+            .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))
+    }
+}
+
+/// Admits one packet candidate set through the admission owner with the
+/// input/result join checked.
+///
+/// Runs [`admit_context`] over the caller-built [`AdmissionInput`], proves
+/// the result against that same input
+/// ([`AdmissionResult::validate_for`](eliot_context_contracts::AdmissionInput)),
+/// and returns the admitted set only for an explicit `Complete` outcome. An
+/// `Incomplete` outcome returns the owner's gaps as
+/// [`PacketCompositionError::AdmissionIncomplete`]: a partial floor is typed
+/// incompleteness, never a silently cut view.
+fn admit_packet_candidates(
+    input: &AdmissionInput,
+) -> Result<AdmittedContextSet, PacketCompositionError> {
+    let result =
+        admit_context(input).map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+    result
+        .validate_for(input)
+        .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+    match result.outcome {
+        ContextOutcome::Complete(admitted) => Ok(admitted),
+        ContextOutcome::Incomplete(gaps) => {
+            Err(PacketCompositionError::AdmissionIncomplete(Box::new(gaps)))
+        }
+    }
+}
+
+/// Renders the observed scope-head revision of one acquisition closure.
+///
+/// Returns the `r{revision}` text of the `scope:{scope}` head captured
+/// before acquisition in `heads_before`. The revision value is observed
+/// closure data; only its rendering follows this composition. A closure
+/// without its own scope head cannot bind any projection envelope.
+fn observed_scope_revision(seven: &SevenRoleInputs) -> Result<String, PacketCompositionError> {
+    let wanted = format!("scope:{}", seven.scope_id.as_str());
+    seven
+        .heads_before
+        .revision_heads
+        .iter()
+        .find(|head| head.key.as_str() == wanted)
+        .map(|head| format!("r{}", head.revision))
+        .ok_or(PacketCompositionError::BindingMismatch)
+}
+
+/// Maps one optional role to its candidate-stage input.
+///
+/// Only non-readable acquisitions map to `None` (the mapper reports the slot
+/// `Missing`, keeping the optional failure scoped). A readable acquisition —
+/// `Complete`, `Partial`, or `Stale` — fails as `RoleConversionMissing`
+/// naming its existing owner, because only that owner may interpret the
+/// payload as typed attention/epistemic/cue/evidence members. An
+/// authoritative `KnownEmpty` likewise maps to `None`: the empty typed
+/// projection constructor belongs to the same owner, so absence of that
+/// constructor is absence of supply, never an implicit empty.
+fn optional_role<T>(
+    role: &eliot_governor::RoleAcquisition,
+    label: &'static str,
+    owner: &'static str,
+) -> Result<Option<T>, PacketCompositionError> {
+    match &role.state {
+        CandidateProjectionState::Complete
+        | CandidateProjectionState::Partial { .. }
+        | CandidateProjectionState::Stale { .. } => {
+            Err(PacketCompositionError::RoleConversionMissing { role: label, owner })
+        }
+        CandidateProjectionState::KnownEmpty
+        | CandidateProjectionState::Unavailable { .. }
+        | CandidateProjectionState::Unknown { .. }
+        | CandidateProjectionState::Missing
+        | CandidateProjectionState::Blocked { .. } => Ok(None),
+    }
+}
+
+/// Builds one required opaque projection from an authoritatively empty role.
+///
+/// Only `KnownEmpty` converts: the projection carries zero members under the
+/// compilation binding with the candidate-stage envelope version, the
+/// observed scope-head revision, and the digest of the authoritative empty
+/// payload (`b"null"`, the canonical bytes of the acquired null). A required
+/// role without readable source fails as `RoleUnavailable`; a readable role
+/// fails as `RoleConversionMissing`, because member content and ceilings
+/// belong to the named owner.
+fn required_projection(
+    role: &eliot_governor::RoleAcquisition,
+    label: &'static str,
+    provider: &'static str,
+    owner: &'static str,
+    request: &CandidateRequest,
+    scope_revision: &str,
+) -> Result<OpaqueProjection, PacketCompositionError> {
+    match &role.state {
+        CandidateProjectionState::KnownEmpty => Ok(OpaqueProjection {
+            schema: ProjectionSchema {
+                owner: ProviderId::new(provider)
+                    .map_err(|_| PacketCompositionError::BindingMismatch)?,
+                schema_version: CANDIDATE_SCHEMA_VERSION,
+                source_revision: scope_revision.to_owned(),
+                snapshot_digest: sha256_hex(b"null"),
+            },
+            task_id: request.binding.task_id.clone(),
+            scope_id: request.binding.scope_id.clone(),
+            state_fence: request.binding.state_fence.clone(),
+            state: CandidateProjectionState::KnownEmpty,
+            members: Vec::new(),
+            frontier: Vec::new(),
+        }),
+        CandidateProjectionState::Complete
+        | CandidateProjectionState::Partial { .. }
+        | CandidateProjectionState::Stale { .. } => {
+            Err(PacketCompositionError::RoleConversionMissing { role: label, owner })
+        }
+        CandidateProjectionState::Unavailable { .. }
+        | CandidateProjectionState::Unknown { .. }
+        | CandidateProjectionState::Missing
+        | CandidateProjectionState::Blocked { .. } => {
+            Err(PacketCompositionError::RoleUnavailable { role: label })
+        }
+    }
+}
+
 #[cfg(test)]
 impl KernelContextReadClient {
     /// Test-only entry to the closed capability gate: proves the exact
@@ -1253,18 +1628,66 @@ mod tests {
         })
     }
 
+    /// Builds one closed-selector reconstruction request for the capability
+    /// gate: exactly the catalogue selectors per operation (`task_id` +
+    /// `max_records`, bare `max_records` for the problem-unfiltered
+    /// attention read, `selector` + `max_records`, `skill_id` +
+    /// `max_records`).
+    fn closed_reconstruction_request(
+        operation: NamedReadOperation,
+        fence: &StateFence,
+    ) -> Result<NamedReadRequest, Box<dyn std::error::Error>> {
+        let mut request = reconstruction_request(operation, fence)?;
+        let bound = serde_json::Value::String("8".to_owned());
+        match operation {
+            NamedReadOperation::GetTaskState => {
+                request.parameters.insert(
+                    "task_id".to_owned(),
+                    serde_json::Value::String("task-1".to_owned()),
+                );
+            }
+            NamedReadOperation::GetUnderstandingProjectionInputs => {
+                request.parameters.insert(
+                    "selector".to_owned(),
+                    serde_json::Value::String("selector-1".to_owned()),
+                );
+            }
+            NamedReadOperation::GetCapabilityEvidenceState => {
+                request.parameters.insert(
+                    "skill_id".to_owned(),
+                    serde_json::Value::String("skill-1".to_owned()),
+                );
+            }
+            // `GetAttentionAndProblems` (and any non-role operation) carries
+            // no text selector here: the problem filter stays absent while
+            // `max_records` below still binds the read.
+            _ => {}
+        }
+        if matches!(
+            operation,
+            NamedReadOperation::GetTaskState
+                | NamedReadOperation::GetAttentionAndProblems
+                | NamedReadOperation::GetUnderstandingProjectionInputs
+                | NamedReadOperation::GetCapabilityEvidenceState
+        ) {
+            request.parameters.insert("max_records".to_owned(), bound);
+        }
+        Ok(request)
+    }
+
     #[test]
     fn execute_capability_rejects_truly_unsupported_operations_before_transport()
     -> Result<(), Box<dyn std::error::Error>> {
         let fence = test_fence(1)?;
-        // T11.3 admits the four reconstruction reads; they no longer fail here.
+        // T11.3 admits the four reconstruction reads with their closed
+        // selectors; they no longer fail here.
         for operation in [
             NamedReadOperation::GetTaskState,
             NamedReadOperation::GetAttentionAndProblems,
             NamedReadOperation::GetUnderstandingProjectionInputs,
             NamedReadOperation::GetCapabilityEvidenceState,
         ] {
-            let admitted = reconstruction_request(operation, &fence)?;
+            let admitted = closed_reconstruction_request(operation, &fence)?;
             KernelContextReadClient::check_execute_capability(&admitted)?;
         }
 
@@ -1294,10 +1717,10 @@ mod tests {
             NamedReadOperation::GetUnderstandingProjectionInputs,
             NamedReadOperation::GetCapabilityEvidenceState,
         ] {
-            let request = reconstruction_request(operation, &fence)?;
+            let request = closed_reconstruction_request(operation, &fence)?;
             KernelContextReadClient::check_execute_capability(&request)?;
 
-            let mut unscoped = reconstruction_request(operation, &fence)?;
+            let mut unscoped = closed_reconstruction_request(operation, &fence)?;
             unscoped.scope_id = None;
             assert!(matches!(
                 KernelContextReadClient::check_execute_capability(&unscoped),
@@ -1307,7 +1730,7 @@ mod tests {
                 })
             ));
 
-            let mut eventual = reconstruction_request(operation, &fence)?;
+            let mut eventual = closed_reconstruction_request(operation, &fence)?;
             eventual.consistency = ReadConsistency::Eventual;
             assert!(matches!(
                 KernelContextReadClient::check_execute_capability(&eventual),
@@ -1317,7 +1740,19 @@ mod tests {
                 })
             ));
 
-            let mut with_params = reconstruction_request(operation, &fence)?;
+            // A selector-less reconstruction read fails closed here: the
+            // catalogue declares required selectors, so missing inputs never
+            // travel pre-transport.
+            let bare = reconstruction_request(operation, &fence)?;
+            assert!(matches!(
+                KernelContextReadClient::check_execute_capability(&bare),
+                Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    ..
+                })
+            ));
+
+            let mut with_params = closed_reconstruction_request(operation, &fence)?;
             with_params.parameters.insert(
                 "subject".to_owned(),
                 serde_json::Value::String("smuggled".to_owned()),
