@@ -29,10 +29,11 @@ use thiserror::Error;
 mod pipe_name;
 pub mod reactive_context;
 pub use pipe_name::{
-    ELIOT_PIPE_PREFIX, EliotPipeFamily, EliotPipeName, EliotPipeNameError, EliotPipeSegment,
-    EliotPipeSegmentReason, LegacyEliotPipeName, MAX_PIPE_NAME_BYTES, MAX_PIPE_SEGMENT_BYTES,
-    MAX_PIPE_SUFFIX_BYTES, PIPE_NAME_CONTRACT_NAME, PIPE_NAME_CONTRACT_VERSION,
-    PIPE_NAME_UNICODE_PROFILE, PIPE_NAME_WIRE_REVISION, pipe_name_contract_identity,
+    ELIOT_PIPE_PREFIX, EliotPipeFamily, EliotPipeName, EliotPipeNameError, EliotPipeOwner,
+    EliotPipeSegment, EliotPipeSegmentReason, LegacyEliotPipeName, MAX_PIPE_NAME_BYTES,
+    MAX_PIPE_SEGMENT_BYTES, MAX_PIPE_SUFFIX_BYTES, PIPE_NAME_CONTRACT_NAME,
+    PIPE_NAME_CONTRACT_VERSION, PIPE_NAME_UNICODE_PROFILE, PIPE_NAME_WIRE_REVISION,
+    pipe_name_contract_identity,
 };
 pub use reactive_context::{
     MAX_REACTIVE_CONTEXT_ACK_HISTORY, MAX_REACTIVE_CONTEXT_CONTENT_BYTES,
