@@ -23,7 +23,7 @@
      - `fmt-check`: 131 файл;
      - `check`;
      - **41 жёсткое нарушение архитектурных границ**, например `eliotd` напрямую зависит от 7 Dreamer-крейтов.
-5. **Каждый четвёртый audit-Issue описывает код, которого на main уже нет.** 262 «I*-audit» Issue сгенерированы по инвентарю, без чтения кода. В 65 из 244 проверенных 70% утверждений «X отсутствует» (117 из 167) называют символы или крейты, которые на `main` есть.
+5. **Каждый шестой audit-Issue называет отсутствующим тип, который на main уже есть.** 262 «I*-audit» Issue сгенерированы по инвентарю, без чтения кода. В 41 из 250 открытых audit-Issue раздел «Code today» прямо говорит «инвентарь не находит `X`» о типе, который на `main` определён (59 таких утверждений). Обратный случай встречается не реже: тип есть, но рабочий путь его не вызывает (#1925, #1739).
 6. **Работа идёт вширь, против канонического порядка.** Канон требует: сначала OSP1 и D0/D1, никакого массового роя пишущих агентов до OSP1 (I17.13), при росте активности без роста результата — сокращать объём (I17.1, I17.17). На деле 16 сентября открыто 262 «audit»-Issue сразу по всем главам. Параллельно делаются D3 (Dreamer, cognitive), D4 (backup/restore — 20+ Issue) и D5 (swarm, research).
 7. **Новый стек отрезан от агентов.** Все четыре хоста (Claude Code, Claude Desktop, Codex, OpenCode) запускают **старый** `eliot-governor.exe mcp stdio` из `crates/eliot-app`. Новый `eliot-agent-bridge` → Kernel → `eliotd` не подключён ни к одному хосту. Весь объём новой работы не имеет потребителя.
 8. **Обязательный протокол чтения доков съедает контекст и промахивается.** На любую правку выдаётся 85–150 КБ «обязательного» чтения (23–53 документа). Параметр `--topic` выборку не сужает. Нужный фрагмент в пакет при этом может не попасть: для #204 это I7.20, контракт ошибок для агентов. Сами Issue — ещё 4,7 МБ текста (тела и комментарии) с противоречащими друг другу статусами.
@@ -158,7 +158,7 @@
 - 4,7 МБ текста по открытым Issue — больше, чем Implementation (1 МБ) и Architecture (150 КБ) вместе.
 - В одном Issue по 3–5 «текущих» статусов: аудит v1, аудит v2 от 23.09, прогресс W1/W2, «Код завершён», «Перекрёстная проверка… опровергнуты». Агент не знает, какой из них верный.
 - Чек-листы с доказательствами вида `file.rs:1234` устаревают после следующего мерджа. Отсюда треть опровержений («cited line is a blank line / an error-message literal / unrelated test»).
-- **262 «I*-audit» Issue (16.09) сгенерированы по автоматическому «inventory», без чтения кода.** В разделах «Code today» 167 утверждений вида «не найден `X`» с конкретным идентификатором; **117 из них (70%) называют символы или крейты, которые на `main` есть**. Это 65 Issue: например `InstrumentRunner` и `eliot-testd` в #1813, `RecoveryPayloadEnvelope` в #1925, `KernelExecutionManifest` в #1884, `RouteFingerprint` в #1901 (приложение Д). Агент, который верит такому тексту, строит второй владелец того, что уже есть.
+- **262 «I*-audit» Issue (16.09) сгенерированы по автоматическому «inventory», без чтения кода.** Строгий разбор «Code today» в 250 открытых audit-Issue нашёл 105 прямых утверждений «инвентарь не находит тип `X`». 56 из них (53%) опровергаются кодом: тип на `main` определён. Ещё 3 таких случая найдены вручную, итого 59 утверждений в 41 Issue. Примеры: `InstrumentRunner` и `bins/eliot-testd` в #1813, `RecoveryPayloadEnvelope` в #1925, `KernelExecutionManifest` в #1884, `CapabilityOutcome` в #1961 (приложение Д). Агент, который верит такому тексту, строит второго владельца уже существующего типа. Обратная ошибка — принять наличие типа за готовность: `apply_reserved` в #1925 и исполнитель submit-записей в #1739 есть в коде, но рабочий путь их не вызывает.
 - Устаревшие утверждения в телах Issue. Примеры:
   - #1716: «ECXF без зависимых» — неверно после #2472.
   - PROJECT_MAP: Dreamer-Issue #461/#1098/#1100 «open» — на деле закрыты или являются PR.
@@ -580,22 +580,26 @@ Verify: `cargo test -p <crate> --test <file>` (сейчас: FAIL/PASS/absent)
 
 ### Д. «Code today» в audit-Issue устарел или неверен
 
-Автоматическая проверка: в разделе «Code today» 244 открытых «I*-audit» Issue найдено 167 утверждений вида «инвентарь не находит `X`» с конкретным идентификатором. **117 из них (70%) указывают на символы или крейты, которые на `main` есть** (65 Issue). Часть появилась уже после создания Issue, часть была неверна изначально: Issue сгенерированы по «inventory», без чтения кода. Перед работой по такому Issue раздел «Code today» нужно перепроверить по коду. Примеры:
+Метод: в разделе «Code today» каждого из 250 открытых «I*-audit» Issue берутся предложения с «does not identify / does not establish / provides no / names no». Утверждением об отсутствии считается только идентификатор, который стоит после отрицания и является прямым объектом перечисления. Упоминание вида «`X` есть, но не найден `Y`» или «не доказано, что `X` подключён» утверждением об отсутствии `X` не считается. Затем проверяется определение `pub struct|enum|trait X` на `main`, а спорные случаи разобраны вручную.
 
-| Issue | Заявлено как отсутствующее | На main есть |
+Результат: 105 прямых утверждений «инвентарь не находит тип `X`». **56 из них (53%) опровергаются кодом**, ещё 3 найдены вручную; итого 59 утверждений в 41 Issue. Перед работой по такому Issue раздел «Code today» нужно перепроверить по коду. Обычно не хватает не типа, а его вызова в рабочем пути, поэтому сначала искать вызовы вне тестов. Примеры:
+
+| Issue | Заявлено как ненайденное | Что на `main` |
 |---|---|---|
-| #1813 [I10-audit] Add governed Instrument Plane ownership instead  | `InstrumentProfileResolver`, `InstrumentRunner`, `TestExecutionPlane`, `eliot-testd` | `InstrumentRunner`, `TestExecutionPlane`, `eliot-testd` |
-| #1925 [I5-audit] Implement complete opaque ORS staging and recover | `PreparedTransition`, `RecoveryPayloadEnvelope` | `PreparedTransition`, `RecoveryPayloadEnvelope` |
-| #1875 [I7-audit] Implement durable EventEnvelope replay, persisten | `DeliveryOutcome`, `EventAckReceipt`, `EventEnvelope`, `Frame`, `OperationOutcome` | `DeliveryOutcome`, `EventAckReceipt`, `EventEnvelope`, `Frame`, `OperationOutcome` |
-| #1884 [I1-audit] Persist and enforce immutable KernelExecutionMani | `AuthorityHandoffRecord`, `KernelExecutionManifest`, `ProcessStartReplayRecord` | `AuthorityHandoffRecord`, `KernelExecutionManifest`, `ProcessStartReplayRecord` |
-| #1894 [I2-audit] Generate mandatory contract, context, and test ca | `CrateContextCapsule`, `ModuleContractKit`, `ModuleTestCapsule`, `module.toml` | `CrateContextCapsule`, `ModuleContractKit`, `ModuleTestCapsule` |
-| #1901 [I18-audit] Add host-route acceptance proof for the working  | `RouteFingerprint` | `RouteFingerprint` |
-| #1764 [I21-audit] Add the AllowedReferenceManifest firewall before | `AllowedReferenceManifest`, `eliot-dreamer-research-synthesis`, `eliot-mod-research`, `eliot-research-exchange`, `eliot-research-exchange-api` | `AllowedReferenceManifest`, `eliot-dreamer-research-synthesis`, `eliot-mod-research`, `eliot-research-exchange`, `eliot-research-exchange-api` |
-| #1874 [I5-audit] Add the required active operational-spine mutatio | `WriteReceipt`, `WriteSubmission` | `WriteReceipt` |
-| #1690 [I14-audit] Add durable unknown-commit recovery to canonical | `WriteReceipt` | `WriteReceipt` |
-| #1739 [I7-audit] Implement all eight canonical MCP operations thro | `coordinate`, `finish`, `observe`, `packet`, `state` | `finish`, `observe`, `packet`, `state`, `verify` |
-| #1851 [I17-audit] Make the Windows guardian the sole ProcessExecut | `ProcessExecutor` | `ProcessExecutor` |
-| #1926 [I5-audit] Add Kernel WriteCoordinator reservations and per- | `AdmissionReservation`, `WriteReceipt`, `WriterReservationToken` | `AdmissionReservation`, `WriteReceipt`, `WriterReservationToken` |
+| #1813 Instrument Plane | `InstrumentRunner`, `eliot-testd` | `crates/instrument/eliot-instrument-runner`, `bins/eliot-testd` |
+| #1925 ORS staging | `RecoveryPayloadEnvelope` | тип в `eliot-ors/src/model.rs`; `apply_reserved` → `reserve_for_transition` строит конверт и ставит его в ORS, но `daemon_request_dispatch.rs` вызывает `apply`, а не `apply_reserved` |
+| #1927 PreparedTransition | `PreparedTransition`, admission-decision digest, mutation-plan hash | `eliot-store-api`: `admission_digest`, `mutation_plan_digest`, `operation_manifest_digest`, `transition_class`, `requested_effect_ceiling`; `bind_issue18_digests` |
+| #1961 CapabilityOutcome | `CapabilityOutcome` в `bins/eliotd` | `bins/eliotd/src/capability_outcome.rs` |
+| #1884 Execution manifest | `KernelExecutionManifest` | `crates/governor/eliot-module-registry` |
+| #1875 Event replay | `EventEnvelope`, `EventAckReceipt` | `eliot-protocol`, `eliot-native-worker-core/src/protocol.rs` |
+| #1953 Host state | `HostStateJournal`, `KernelReadyReceipt` | `eliot-host-state/src/journal.rs`, `eliot-kernel-service/src/protocol.rs` |
+| #1790 Cold start | `ColdStartController`, `OnboardingLease`, `OnboardingReadinessReceipt` | `crates/governor/eliot-workscope` |
+| #1851 ProcessExecutor | общий `ProcessExecutor` | трейт в `eliot-process`, `WindowsProcessExecutor` используют 7 бинарников и `eliot-git-bridge`; мимо идёт только legacy `run_registered_cargo_verifier` |
+
+Два близких случая, которые разбор по типам не ловит:
+
+- **#1739.** Мост уже маршрутизирует все восемь операций. Kernel исполняет только local-read (`query`, `packet`); submit-записи для `state`, `observe`, `act`, `verify` и `coordinate` только допускаются и не исполняются.
+- **#2380.** «`ScopeTransition` — zero hits» устарело после #2491: 1017 строк. Но ни одного теста и ни одного вызова вне крейта нет.
 
 ### Е. Пересечения и дубли (один писатель на кластер)
 
