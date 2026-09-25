@@ -209,11 +209,11 @@ pub use learning_store::{
     LearningRecordIdentity, LearningRecordKind, MAX_LEARNING_CURSOR_BYTES,
     MAX_LEARNING_HANDLE_BYTES, MAX_LEARNING_IDEMPOTENCY_BYTES, MAX_LEARNING_PAGE_RECORDS,
     MAX_LEARNING_RECORD_JSON_BYTES, MAX_LEARNING_SCAN_ROWS, decode_learning_mutation,
-    decode_learning_read, learning_cursor_issue, learning_cursor_parse, learning_fence_digest,
-    learning_record_commit_params, learning_record_commit_params_from_identity,
-    learning_record_document_digest, learning_record_mutation_request,
-    learning_record_read_request, learning_record_read_request_page, learning_scope_digest,
-    validate_learning_mutation_params, validate_learning_read_params,
+    decode_learning_read, learning_fence_digest, learning_record_commit_params,
+    learning_record_commit_params_from_identity, learning_record_document_digest,
+    learning_record_mutation_request, learning_record_read_request,
+    learning_record_read_request_page, learning_scope_digest, validate_learning_mutation_params,
+    validate_learning_read_params,
 };
 
 pub use write_admission::{

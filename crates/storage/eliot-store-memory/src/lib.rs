@@ -2024,6 +2024,83 @@ fn experience_range_payload(
 /// [`StoreError::PayloadTooLarge`] instead of returning a successful
 /// over-bound view, mirroring the bounded cognitive-read siblings; rows
 /// are never silently truncated as success.
+/// Issues the private learning-range continuation cursor for this backend.
+///
+/// The cursor is an implementation detail of the dedicated memory read
+/// boundary. It is never a public store-api capability: callers can only
+/// receive it from a completed page, and this backend reparses it against the
+/// exact current binding before resuming.
+fn learning_cursor_issue(
+    fence: &StateFence,
+    heads: &[(String, u64)],
+    scope_id: &str,
+    record_kind: Option<eliot_store_api::LearningRecordKind>,
+    max_records: u16,
+    ordinal: u64,
+) -> Result<String, StoreError> {
+    if max_records == 0 || max_records > eliot_store_api::MAX_LEARNING_PAGE_RECORDS {
+        return Err(StoreError::InvalidField {
+            field: "learning.max_records",
+            reason: "learning cursor page bound is out of range",
+        });
+    }
+    let fence_digest = eliot_store_api::learning_fence_digest(fence)?;
+    let heads_digest = eliot_store_api::experience_store::audit_heads_digest(heads)?;
+    let query_digest = eliot_store_api::sha256_hex(
+        &eliot_store_api::canonical_json_bytes(&(
+            scope_id,
+            record_kind.map(eliot_store_api::LearningRecordKind::as_str),
+        ))
+        .map_err(|error| StoreError::Serialization(error.to_string()))?,
+    );
+    Ok(format!(
+        "learning:{fence_digest}:{heads_digest}:{query_digest}:{ordinal:020}:{max_records}"
+    ))
+}
+
+/// Parses a continuation cursor inside the dedicated memory read boundary.
+fn learning_cursor_parse(
+    cursor: &str,
+    fence: &StateFence,
+    heads: &[(String, u64)],
+    scope_id: &str,
+    record_kind: Option<eliot_store_api::LearningRecordKind>,
+    max_records: u16,
+) -> Result<u64, StoreError> {
+    let invalid = || StoreError::InvalidField {
+        field: "learning.cursor",
+        reason: "learning continuation cursor is malformed, foreign, or stale",
+    };
+    if max_records == 0 || max_records > eliot_store_api::MAX_LEARNING_PAGE_RECORDS {
+        return Err(invalid());
+    }
+    let fence_digest = eliot_store_api::learning_fence_digest(fence).map_err(|_| invalid())?;
+    let heads_digest =
+        eliot_store_api::experience_store::audit_heads_digest(heads).map_err(|_| invalid())?;
+    let query_digest = eliot_store_api::sha256_hex(
+        &eliot_store_api::canonical_json_bytes(&(
+            scope_id,
+            record_kind.map(eliot_store_api::LearningRecordKind::as_str),
+        ))
+        .map_err(|_| invalid())?,
+    );
+    let parts = cursor.split(':').collect::<Vec<_>>();
+    if parts.len() != 6
+        || parts[0] != "learning"
+        || parts[1] != fence_digest
+        || parts[2] != heads_digest
+        || parts[3] != query_digest
+        || parts[5] != max_records.to_string()
+    {
+        return Err(invalid());
+    }
+    let ordinal = parts[4].parse::<u64>().map_err(|_| invalid())?;
+    if parts[4] != format!("{ordinal:020}") {
+        return Err(invalid());
+    }
+    Ok(ordinal)
+}
+
 fn learning_range_payload(
     state: &MemoryState,
     query: &NamedReadRequest,
@@ -2060,7 +2137,7 @@ fn learning_range_payload(
         .collect();
     let start: Option<u64> = match decoded.cursor.as_deref() {
         None => None,
-        Some(cursor) => Some(eliot_store_api::learning_cursor_parse(
+        Some(cursor) => Some(learning_cursor_parse(
             cursor,
             fence,
             &heads,
@@ -2111,7 +2188,7 @@ fn learning_range_payload(
     let matched_total = records.len();
     let total_matched = ordinal;
     let next_cursor = if truncated {
-        Some(eliot_store_api::learning_cursor_issue(
+        Some(learning_cursor_issue(
             fence,
             &heads,
             scope_id.as_str(),
