@@ -608,10 +608,6 @@ pub struct OrsRestoreJournal {
     epoch: EpochIdentity,
     fence_snapshot: StateFenceSnapshot,
     sealed_root: PathBuf,
-    /// Canonical form of the payload root, resolved once at construction. A
-    /// lexical prefix check cannot see a link or junction planted inside the
-    /// root, so every read re-checks the resolved path against this value.
-    sealed_root_canonical: Option<PathBuf>,
     heads: BTreeMap<String, JournalPredecessor>,
 }
 
@@ -664,9 +660,6 @@ impl OrsRestoreJournal {
             writer_fence_digest: fence_snapshot.sha256.clone(),
             epoch,
             fence_snapshot,
-            // The root may not exist yet on a first restore; it is created by
-            // the first seal, and the canonical form is resolved then.
-            sealed_root_canonical: std::fs::canonicalize(&sealed_root).ok(),
             sealed_root,
             heads: BTreeMap::new(),
         })
@@ -726,28 +719,24 @@ impl OrsRestoreJournal {
         &mut self,
         stream: &str,
     ) -> Result<(Option<RestoreJournalRecord>, Option<JournalPredecessor>), BackupError> {
-        let expected = self.binding.stream_binding("", &self.writer_fence_digest);
-        match self
+        let persisted = self
             .store
             .load_restore_journal_binding(stream)
-            .map_err(ors_to_backup)?
-        {
-            // An unbound stream is an exact new stream: the ORS owner reports a
-            // missing binding as absent, not as corruption, so it reads as
-            // empty and the engine's genesis compare-and-swap can bind it.
-            None => return Ok((None, None)),
-            Some(existing) => {
-                // A stream already bound to another source, class, destination,
-                // writer, fence or transaction is refused on READ, not only on
-                // append. Checking it later would let the engine reconcile or
-                // apply a target effect under a foreign binding before the
-                // conflict surfaced.
-                if existing.transaction_id != expected.transaction_id
-                    || !matches_stream(&self.binding, &existing, &self.writer_fence_digest)
-                {
-                    return Err(BackupError::RestoreJournalMismatch);
-                }
-            }
+            .map_err(ors_to_backup)?;
+        // An unbound stream is an exact new stream: the ORS owner reports a
+        // missing binding as absent, not as corruption, so it reads as empty
+        // and the engine's genesis compare-and-swap can bind it.
+        let Some(existing) = persisted else {
+            return Ok((None, None));
+        };
+        // A stream already bound to another source, class, destination, writer
+        // or fence is refused on READ, not only on append. Checking it later
+        // would let the engine reconcile or apply a target effect under a
+        // foreign binding before the conflict surfaced. The transaction is not
+        // compared here: the adapter learns it from the journaled record, so it
+        // is checked against this binding once the record is opened.
+        if !matches_stream(&self.binding, &existing, &self.writer_fence_digest) {
+            return Err(BackupError::RestoreJournalMismatch);
         }
         let (entries, fence_head) = self
             .store
@@ -780,6 +769,12 @@ impl OrsRestoreJournal {
         };
         self.heads.insert(stream.to_owned(), head.clone());
         let record = self.open_bound_sealed(latest)?;
+        // The durable binding's transaction must be the transaction this record
+        // belongs to, so a stream cannot hand one transaction's journal to
+        // another.
+        if record.transaction.transaction_id != existing.transaction_id {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
         Ok((Some(record), Some(head)))
     }
 
@@ -904,11 +899,13 @@ impl OrsRestoreJournal {
         let path = self.sealed_path(&locator)?;
         let resolved =
             std::fs::canonicalize(&path).map_err(|error| BackupError::Target(error.to_string()))?;
-        let root = self
-            .sealed_root_canonical
-            .as_ref()
-            .ok_or(BackupError::RestoreJournalCorrupt)?;
-        if !resolved.starts_with(root) {
+        // The canonical root is resolved at read time, not captured at
+        // construction: on a first restore the root does not exist until the
+        // first seal creates it, so a value stored in the constructor would stay
+        // absent for the whole run and refuse every read.
+        let root = std::fs::canonicalize(&self.sealed_root)
+            .map_err(|error| BackupError::Target(error.to_string()))?;
+        if !resolved.starts_with(&root) {
             return Err(BackupError::RestoreJournalCorrupt);
         }
         let length = resolved
@@ -1185,29 +1182,23 @@ fn check_entry_body_binding(entry: &RestoreJournalEntry) -> Result<(), BackupErr
     let RecoveryPayloadBinding {
         locator,
         payload_sha256,
-        payload_length,
+        ..
     } = read_payload_binding(&envelope)?;
-    if locator != entry.operation.payload_handle
-        || payload_sha256 != entry.payload_sha256
-        || payload_sha256 != entry.operation.body_digest
-    {
+    // The envelope's inner digest is the digest of the SEALED BODY, which is
+    // exactly what the operation committed as its body digest. The entry's own
+    // `payload_sha256` is a different value: the digest of the serialized
+    // envelope, so it must not be compared against the body digest here. The
+    // body length is proved against the file at read time instead.
+    if locator != entry.operation.payload_handle || payload_sha256 != entry.operation.body_digest {
         return Err(BackupError::RestoreJournalMismatch);
-    }
-    let expected =
-        u64::try_from(entry.payload.len()).map_err(|_| BackupError::RestoreJournalCorrupt)?;
-    if payload_length != expected {
-        return Err(BackupError::IntegrityMismatch {
-            subject: "restore journal envelope payload length".to_owned(),
-        });
     }
     Ok(())
 }
 
-/// The three fields this adapter relies on from a sealed envelope.
+/// The fields this adapter relies on from a sealed envelope.
 struct RecoveryPayloadBinding {
     locator: String,
     payload_sha256: String,
-    payload_length: u64,
 }
 
 /// Extracts the sealed-payload binding, refusing any other payload variant.
@@ -1224,7 +1215,6 @@ fn read_payload_binding(
     Ok(RecoveryPayloadBinding {
         locator: locator.as_str().to_owned(),
         payload_sha256: envelope.payload_sha256.clone(),
-        payload_length: envelope.payload_length,
     })
 }
 
