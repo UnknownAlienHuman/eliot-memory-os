@@ -217,6 +217,7 @@ impl KernelGovernorPort for SpyPort {
         Ok(PortProjection {
             kind: ProjectionKind::Projection,
             content: json!({"ok":true}),
+            recall_disposition: None,
             artifacts: Vec::new(),
             proof_ceiling: ProofCeiling::Observation,
             resource: None,
@@ -257,6 +258,7 @@ impl KernelGovernorPort for NoEvidencePort {
         Ok(PortProjection {
             kind: ProjectionKind::Projection,
             content: json!({"unexpected":true}),
+            recall_disposition: None,
             artifacts: Vec::new(),
             proof_ceiling: ProofCeiling::Observation,
             resource: None,

@@ -2448,6 +2448,8 @@ dependencies = [
  "eliot-security-contracts",
  "eliot-skill",
  "eliot-source-assurance",
+ "eliot-store-api",
+ "eliot-types",
  "schemars",
  "serde",
  "serde_json",

@@ -129,7 +129,7 @@ fn contract_request_and_transport_surface_join_to_the_owner() {
 fn canonical_registry_value_answers_version_bound_skill_membership() {
     let registry = canonical_registry().expect("canonical registry builds");
     // The bound version the port reports is the frozen pinned version.
-    assert_eq!(CANONICAL_DEFINITION_VERSION, "1.2.0");
+    assert_eq!(CANONICAL_DEFINITION_VERSION, "1.3.0");
     // Membership is exactly the registry's answer at the bound version.
     for name in CANONICAL_TOOL_NAMES {
         assert!(

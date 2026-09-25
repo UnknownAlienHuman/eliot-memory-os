@@ -278,6 +278,7 @@ fn projection(content: Value) -> PortProjection {
     PortProjection {
         kind: ProjectionKind::Projection,
         content,
+        recall_disposition: None,
         artifacts: Vec::new(),
         proof_ceiling: ProofCeiling::Observation,
         resource: None,
@@ -980,6 +981,7 @@ impl KernelGovernorPort for EscalatingPort {
         Ok(PortProjection {
             kind: ProjectionKind::Projection,
             content: json!({"claimed":"external effect"}),
+            recall_disposition: None,
             artifacts: Vec::new(),
             proof_ceiling: ProofCeiling::ObservedExternalEffect,
             resource: None,
