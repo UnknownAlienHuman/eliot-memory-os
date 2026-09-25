@@ -22,6 +22,7 @@ use eliot_protocol::{
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID, HostRequestEnvelope,
     HostRequestIdentity, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
 };
+use eliot_store_api::EVIDENCE_PACK_MAX_RECORDS;
 use host_request_route::{LocalReadSubmitDisposition, StaleLocalReadReason};
 
 fn tool_digest(tool: &serde_json::Value) -> String {
@@ -109,16 +110,74 @@ fn daemon_session_for_with(
     }
 }
 
+fn evidence_response_for(envelope: &HostRequestEnvelope, revision: u32) -> serde_json::Value {
+    let scope_id = envelope
+        .identity
+        .work_scope_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            envelope
+                .identity
+                .session_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .expect("local-read envelope must carry a trusted scope");
+    let canonical_request_sha256 = eliot_contracts::sha256_hex(
+        &eliot_contracts::canonical_json_bytes(&(
+            envelope.envelope_sha256.clone(),
+            envelope.identity.request_id.as_str().to_owned(),
+            envelope.identity.idempotency_key.clone(),
+        ))
+        .expect("request tuple must canonicalize"),
+    );
+    serde_json::json!({
+        "request_id": envelope.identity.request_id.as_str(),
+        "idempotency_key": envelope.identity.idempotency_key,
+        "canonical_request_sha256": canonical_request_sha256,
+        "kind": "PROJECTION",
+        "canonical_tool_name": "eliot.query",
+        "recall_disposition": "INCOMPLETE_COVERAGE",
+        "content": {
+            "operation": "GetEvidencePack",
+            "subject": "evidence-alpha",
+            "scope_id": scope_id,
+            "evidence_pack": {
+                "version": 1,
+                "subject": "evidence-alpha",
+                "scope_id": scope_id,
+                "records": [{
+                    "capture_index": 0,
+                    "operation": "CaptureObservation",
+                    "parameters": {"subject": "evidence-alpha"}
+                }],
+                "provenance": {
+                    "state_fence": envelope.state_fence,
+                    "matched_total": 1,
+                    "returned": 1,
+                    "max_records": EVIDENCE_PACK_MAX_RECORDS,
+                    "truncated": false
+                }
+            },
+            "revision_heads": [{
+                "key": format!("scope:{scope_id}"),
+                "revision": revision,
+                "state_fence": envelope.state_fence,
+            }]
+        },
+        "artifacts": [],
+        "proof_ceiling": "SCOPED_VERIFICATION",
+        "resource": null,
+        "job": null
+    })
+}
+
 fn result_body_for(
     envelope: &HostRequestEnvelope,
     attempt: Option<LocalReadAttempt>,
 ) -> HostRequestResultBody {
-    let response = serde_json::json!({
-        "operation": "GetEvidencePack",
-        "subject": "evidence-alpha",
-        "evidence_pack": { "subject": "evidence-alpha" },
-        "revision_heads": [{ "key": "scope:kernel-session-1", "revision": 3 }],
-    });
+    let response = evidence_response_for(envelope, 3);
     let digest = {
         let bytes =
             eliot_contracts::canonical_json_bytes(&response).expect("body must canonicalize");
@@ -247,12 +306,7 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
     // A changed body under the same identity, built for the conflict proof
     // after the first completion below.
     let mut conflicting = result_body_for(&envelope, Some(attempt.clone()));
-    conflicting.response = serde_json::json!({
-        "operation": "GetEvidencePack",
-        "subject": "evidence-alpha",
-        "evidence_pack": { "subject": "evidence-alpha" },
-        "revision_heads": [{ "key": "scope:kernel-session-1", "revision": 4 }],
-    });
+    conflicting.response["content"]["revision_heads"][0]["revision"] = serde_json::json!(4);
     conflicting.result_digest = {
         let bytes = eliot_contracts::canonical_json_bytes(&conflicting.response)
             .expect("conflict must canonicalize");
@@ -289,9 +343,17 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
     assert_eq!(stored.result_response.as_ref(), Some(&body.response));
     let receipt =
         eliot_protocol::HostRequestAdmissionReceipt::issue(&envelope).expect("receipt must issue");
-    let replayed = host_request_route::local_read_replay_response(&receipt, &stored, &envelope)
-        .expect("replay must not fail")
-        .expect("resulted row must replay");
+    let selectors = host_request_route::check_local_read_admission(&envelope, &tool)
+        .expect("local-read admission must validate")
+        .expect("the query must retain selectors");
+    let replayed = host_request_route::local_read_replay_response(
+        &receipt,
+        &stored,
+        &envelope,
+        Some(&selectors),
+    )
+    .expect("replay must not fail")
+    .expect("resulted row must replay");
     assert_eq!(
         replayed["value"]["record"]["result_response"], body.response,
         "the replay carries the exact stored body"
@@ -403,12 +465,7 @@ fn body_with_revision(
     revision: u32,
 ) -> HostRequestResultBody {
     let mut body = result_body_for(envelope, Some(attempt));
-    body.response = serde_json::json!({
-        "operation": "GetEvidencePack",
-        "subject": "evidence-alpha",
-        "evidence_pack": { "subject": "evidence-alpha" },
-        "revision_heads": [{ "key": "scope:kernel-session-1", "revision": revision }],
-    });
+    body.response["content"]["revision_heads"][0]["revision"] = serde_json::json!(revision);
     body.result_digest = {
         let bytes =
             eliot_contracts::canonical_json_bytes(&body.response).expect("body must canonicalize");

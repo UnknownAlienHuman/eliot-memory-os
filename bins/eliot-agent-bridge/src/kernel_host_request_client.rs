@@ -28,9 +28,11 @@ use eliot_contracts::{
     canonical_json_bytes, sha256_hex,
 };
 use eliot_mcp::{
-    HostCancellationPortOutcome, HostCancellationRequest, HostInvocationPortOutcome,
-    HostInvocationRequest, HostOperationHandle, KernelHostRequestPort, McpResponse, PortFailure,
-    ToolRequest,
+    EVIDENCE_PACK_MAX_RECORDS, EvidencePackResponseExpectation, HostCancellationPortOutcome,
+    HostCancellationRequest, HostInvocationPortOutcome, HostInvocationRequest, HostOperationHandle,
+    KernelHostRequestPort, McpResponse, PortFailure, ToolRequest, classify_response_failure,
+    requires_evidence_pack_response, validate_evidence_pack_response,
+    validate_mcp_response_for_tool,
 };
 use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, HARD_STRUCTURED_RESPONSE_BYTES,
@@ -923,8 +925,10 @@ fn invalid_result(detail: &str) -> PortFailure {
 ///
 /// Mirrors `host_gateway.rs:406-436` (bounded size, tool binding) plus the
 /// `check_response_binding` semantics (request/idempotency/tool/digest joins
-/// against the exact sent envelope). Any mismatch is a typed rejection, never
-/// a guessed outcome and never a silent admission.
+/// against the exact sent envelope). It also revalidates the response-owned
+/// evidence-pack disposition and request/fence binding before returning a
+/// stored result. Any mismatch is a typed rejection, never a guessed outcome
+/// and never a silent admission.
 fn decode_stored_response(
     record: &AdmittedReplyView,
     request: &HostInvocationRequest,
@@ -949,6 +953,9 @@ fn decode_stored_response(
     if response.canonical_tool_name != request.tool.canonical_name() {
         return Err(invalid_result("tool binding mismatch"));
     }
+    validate_mcp_response_for_tool(&request.tool, &response).map_err(|_| {
+        invalid_result("response does not match the requested tool's evidence contract")
+    })?;
     if response.canonical_request_sha256.len() != 64
         || !response
             .canonical_request_sha256
@@ -965,7 +972,85 @@ fn decode_stored_response(
     if sha256_hex(&bytes) != digest {
         return Err(invalid_result("digest does not bind the exact body"));
     }
+    let negative = classify_response_failure(&response)
+        .map_err(|_| invalid_result("typed negative response is malformed"))?;
+    if requires_evidence_pack_response(&request.tool) {
+        // The local-read request digest is part of the response correlation
+        // for both positive and negative exact-query outcomes. Checking it
+        // only on a positive projection lets a substituted negative body ride
+        // a recomputed result digest.
+        let expected_request_sha256 = sha256_hex(
+            &canonical_json_bytes(&(
+                envelope.envelope_sha256.clone(),
+                envelope.identity.request_id.as_str().to_owned(),
+                envelope.identity.idempotency_key.clone(),
+            ))
+            .map_err(|_| invalid_result("admitted request identity cannot be canonicalized"))?,
+        );
+        if response.canonical_request_sha256 != expected_request_sha256 {
+            return Err(invalid_result("local-read request digest mismatch"));
+        }
+        if negative.is_none() {
+            let ToolRequest::Query(input) = &request.tool else {
+                return Err(invalid_result("exact evidence query type is invalid"));
+            };
+            let subject = input
+                .query
+                .strip_prefix("subject:")
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+                .ok_or_else(|| invalid_result("exact evidence subject is invalid"))?;
+            let scope_id = envelope
+                .identity
+                .work_scope_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    envelope
+                        .identity
+                        .session_id
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                })
+                .ok_or_else(|| invalid_result("admitted evidence scope is missing"))?;
+            let expected_state_fence = serde_json::to_value(&envelope.state_fence)
+                .map_err(|_| invalid_result("admitted State Fence cannot be canonicalized"))?;
+            validate_evidence_pack_response(
+                &response,
+                &EvidencePackResponseExpectation {
+                    request_id: envelope.identity.request_id.as_str().to_owned(),
+                    idempotency_key: envelope.identity.idempotency_key.clone(),
+                    canonical_request_sha256: expected_request_sha256,
+                    subject: subject.to_owned(),
+                    scope_id: scope_id.to_owned(),
+                    max_records: u64::from(EVIDENCE_PACK_MAX_RECORDS),
+                    state_fence: expected_state_fence,
+                },
+            )
+            .map_err(|_| invalid_result("evidence-pack response binding is invalid"))?;
+        }
+    }
     Ok(response)
+}
+
+fn responded_stored_outcome(
+    receipt: &HostRequestAdmissionReceipt,
+    record: &AdmittedReplyView,
+    request: &HostInvocationRequest,
+    envelope: &HostRequestEnvelope,
+) -> Result<HostInvocationPortOutcome, PortFailure> {
+    let response = decode_stored_response(record, request, envelope)?;
+    if let Some(failure) = classify_response_failure(&response)
+        .map_err(|_| invalid_result("typed negative response is malformed"))?
+    {
+        return Err(failure);
+    }
+    let handle =
+        HostOperationHandle::new(receipt.operation_id.clone()).map_err(|_| request_failure())?;
+    Ok(HostInvocationPortOutcome::Responded {
+        operation_handle: handle,
+        response: Box::new(response),
+    })
 }
 
 fn submit_outcome(
@@ -990,21 +1075,13 @@ fn submit_outcome(
         // result without one (or with a forged one) fails closed instead of
         // degrading to a bare admission that would lose the answer.
         HostRequestRecordState::ResultReceived => {
-            let response = decode_stored_response(record, request, envelope)?;
-            Ok(HostInvocationPortOutcome::Responded {
-                operation_handle: handle,
-                response: Box::new(response),
-            })
+            responded_stored_outcome(receipt, record, request, envelope)
         }
         HostRequestRecordState::Expired => Err(PortFailure::DeadlineExceeded),
         HostRequestRecordState::Cancelled => Err(PortFailure::Cancelled),
         HostRequestRecordState::Terminal => {
             if record.result_digest.is_some() {
-                let response = decode_stored_response(record, request, envelope)?;
-                return Ok(HostInvocationPortOutcome::Responded {
-                    operation_handle: handle,
-                    response: Box::new(response),
-                });
+                return responded_stored_outcome(receipt, record, request, envelope);
             }
             Err(PortFailure::TransportBindingRejected {
                 reason: "operation is already terminal; reconcile the exact operation".to_owned(),
@@ -1508,8 +1585,7 @@ mod tests {
             "kind": "PROJECTION",
             "canonical_tool_name": "eliot.state",
             "content": {
-                "operation": "GetEvidencePack",
-                "evidence_pack": {"task": "bounded-state"},
+                "state": "bounded",
                 "revision_heads": [{"key": "scope:scope-1", "revision": 3}],
             },
             "artifacts": [],

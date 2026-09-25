@@ -3159,9 +3159,12 @@ impl KernelComposition {
         // descriptor, or a malformed selector never reaches Gateway IO.
         let selectors = host_request_route::check_local_read_admission(&envelope, &tool)?;
         let (receipt, record) = self.admit_host_request_envelope(&envelope)?;
-        if let Some(replayed) =
-            host_request_route::local_read_replay_response(&receipt, &record, &envelope)?
-        {
+        if let Some(replayed) = host_request_route::local_read_replay_response(
+            &receipt,
+            &record,
+            &envelope,
+            selectors.as_ref(),
+        )? {
             return Ok(replayed);
         }
         let Some(selectors) = selectors else {
@@ -3226,7 +3229,7 @@ impl KernelComposition {
             &selectors.subject,
             selectors.max_records,
             &selectors.intent_mode,
-            response.payload,
+            &response,
         )
         .map_err(|_| TransportError::SessionFenced)?;
         // The sync leg completes through the shared submit gate, never
@@ -3252,7 +3255,13 @@ impl KernelComposition {
                 return Err(TransportError::SessionFenced);
             }
         };
-        if host_request_route::local_read_replay_response(&receipt, &resulted, &envelope)?.is_none()
+        if host_request_route::local_read_replay_response(
+            &receipt,
+            &resulted,
+            &envelope,
+            Some(&selectors),
+        )?
+        .is_none()
         {
             return Err(TransportError::SessionFenced);
         }

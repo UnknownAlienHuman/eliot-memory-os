@@ -37,11 +37,13 @@ use eliot_contracts::{
     StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_mcp::{
-    ApplicationRequest, HostCancellationPortOutcome, HostCancellationRequest,
-    HostInvocationPortOutcome, HostInvocationRequest, HostOperationHandle, KernelGovernorPort,
-    KernelHostRequestPort, MAX_HOST_DEADLINE_PREFERENCE_MS, McpCore, McpResponse, PortFailure,
-    QueryInput, QueryIntent, QueryMode, RequestSecurityContext, ResponseKind, ToolRequest,
-    TransportRequestContext, plan_evidence_pack_query, project_evidence_pack_projection,
+    ApplicationRequest, EvidencePackResponseExpectation, HostCancellationPortOutcome,
+    HostCancellationRequest, HostInvocationPortOutcome, HostInvocationRequest, HostOperationHandle,
+    KernelGovernorPort, KernelHostRequestPort, MAX_HOST_DEADLINE_PREFERENCE_MS, McpCore,
+    McpResponse, PortFailure, QueryInput, QueryIntent, QueryMode, RequestSecurityContext,
+    ResponseKind, ToolRequest, TransportRequestContext, classify_response_failure,
+    plan_evidence_pack_query, project_evidence_pack_projection, validate_evidence_pack_response,
+    validate_mcp_response_for_tool,
 };
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestKind as OrsHostRequestKind,
@@ -56,7 +58,7 @@ use eliot_protocol::{
 };
 use eliot_receipts::{ProofCeiling, RequestBinding, SessionBinding};
 use eliot_security_contracts::{EffectCeiling, InstructionTaint, PrivacyClass};
-use eliot_store_api::EVIDENCE_PACK_MAX_RECORDS;
+use eliot_store_api::{EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadResponse};
 
 use crate::protocol::AgentBridgeAdmissionDescriptor;
 use crate::{KernelService, KernelServiceError, KernelServiceState};
@@ -242,8 +244,9 @@ impl AuthenticatedHostSession {
     ///
     /// Runs the existing evidence-pack planning half
     /// (`plan_evidence_pack_query`) over the explicit `scope_id`/`subject`/
-    /// `max_records` selectors, projects the exact store payload unchanged
-    /// through `project_evidence_pack_projection`, wraps the projection as a
+    /// `max_records` selectors, projects the exact Store response payload
+    /// unchanged through `project_evidence_pack_projection`, preserves the
+    /// Store-observed revision heads beside it, wraps the projection as a
     /// read-only `Projection` response under the `ScopedVerification` ceiling,
     /// and returns the canonical digest binding the exact bounded bytes. The
     /// caller persists the pair with `persist_host_request_result` and serves
@@ -263,13 +266,17 @@ impl AuthenticatedHostSession {
     /// Returns a bounded reason string when the envelope is not an admitted
     /// `eliot.query`, when any selector is blank, malformed, or over-bound,
     /// or when the bounded body cannot be canonicalized.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the local-read response owner keeps selector, fence, projection, and digest joins together"
+    )]
     pub fn build_local_read_result_body(
         envelope: &HostRequestEnvelope,
         scope_id: &str,
         subject: &str,
         max_records: u32,
         intent_mode: &str,
-        store_payload: serde_json::Value,
+        store_response: &NamedReadResponse,
     ) -> Result<(String, serde_json::Value), String> {
         if envelope.identity.capability != "eliot.query" {
             return Err("presented capability is not the admitted local-read query".to_owned());
@@ -294,6 +301,30 @@ impl AuthenticatedHostSession {
         if max_records == 0 || max_records > EVIDENCE_PACK_MAX_RECORDS {
             return Err("max_records must be within the catalogue bound".to_owned());
         }
+        if store_response.operation != NamedReadOperation::GetEvidencePack {
+            return Err("local-read result is not a GetEvidencePack response".to_owned());
+        }
+        store_response
+            .validate()
+            .map_err(|error| format!("local-read result is invalid: {error}"))?;
+        if store_response.state_fence != envelope.state_fence {
+            return Err(
+                "local-read result State Fence does not match the admitted request".to_owned(),
+            );
+        }
+        let store_payload = store_response.payload.clone();
+        let payload_state_fence = store_payload
+            .pointer("/provenance/state_fence")
+            .cloned()
+            .ok_or_else(|| "evidence-pack provenance is missing its State Fence".to_owned())?;
+        let payload_state_fence: StateFence = serde_json::from_value(payload_state_fence)
+            .map_err(|error| format!("evidence-pack State Fence is invalid: {error}"))?;
+        payload_state_fence
+            .validate()
+            .map_err(|error| format!("evidence-pack State Fence is invalid: {error}"))?;
+        if payload_state_fence != envelope.state_fence {
+            return Err("evidence-pack State Fence does not match the admitted request".to_owned());
+        }
         let input = QueryInput {
             intent: QueryIntent {
                 mode,
@@ -307,9 +338,25 @@ impl AuthenticatedHostSession {
         };
         let plan = plan_evidence_pack_query(&input, scope_id, &max_records.to_string())
             .map_err(|error| error.to_string())?;
-        let projection = project_evidence_pack_projection(&plan, store_payload);
+        let projection = project_evidence_pack_projection(&plan, store_payload)
+            .map_err(|error| format!("evidence-pack projection is invalid: {error}"))?;
+        let recall_disposition = projection.recall_disposition.ok_or_else(|| {
+            "evidence-pack projection omitted its response-owner disposition".to_owned()
+        })?;
+        let mut content = projection.content;
+        let content_object = content
+            .as_object_mut()
+            .ok_or_else(|| "evidence-pack projection content must be an object".to_owned())?;
+        content_object.insert(
+            "revision_heads".to_owned(),
+            serde_json::to_value(&store_response.revision_heads)
+                .map_err(|error| format!("revision heads cannot be canonicalized: {error}"))?,
+        );
         let request_id = envelope.identity.request_id.as_str().to_owned();
         let idempotency_key = envelope.identity.idempotency_key.clone();
+        // The local-read contour carries an admitted envelope/tool pair, not
+        // the direct MCP `ApplicationRequest`; bind its distinct request
+        // identity tuple here.
         let canonical_request_sha256 = sha256_hex(
             &canonical_json_bytes(&(
                 envelope.envelope_sha256.clone(),
@@ -321,15 +368,31 @@ impl AuthenticatedHostSession {
         let response = McpResponse {
             request_id,
             idempotency_key,
-            canonical_request_sha256,
+            canonical_request_sha256: canonical_request_sha256.clone(),
             kind: ResponseKind::Projection,
             canonical_tool_name: "eliot.query".to_owned(),
-            content: projection.content,
+            recall_disposition: Some(recall_disposition),
+            content,
             artifacts: Vec::new(),
             proof_ceiling: ProofCeiling::ScopedVerification,
             resource: None,
             job: None,
         };
+        let expected_state_fence = serde_json::to_value(&envelope.state_fence)
+            .map_err(|error| format!("admitted State Fence cannot be canonicalized: {error}"))?;
+        validate_evidence_pack_response(
+            &response,
+            &eliot_mcp::EvidencePackResponseExpectation {
+                request_id: envelope.identity.request_id.as_str().to_owned(),
+                idempotency_key: envelope.identity.idempotency_key.clone(),
+                canonical_request_sha256,
+                subject: subject.to_owned(),
+                scope_id: scope_id.to_owned(),
+                max_records: u64::from(max_records),
+                state_fence: expected_state_fence,
+            },
+        )
+        .map_err(|error| format!("evidence-pack response binding is invalid: {error}"))?;
         let body = serde_json::to_value(&response).map_err(|error| error.to_string())?;
         let encoded = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
         if encoded.len() > HARD_STRUCTURED_RESPONSE_BYTES {
@@ -352,6 +415,60 @@ impl AuthenticatedHostSession {
         .map_err(|error| error.to_string())?;
         Ok((digest, body))
     }
+}
+
+/// Validates one daemon-submitted local-read response before Kernel persistence.
+///
+/// The response owner (MCP/Governor) remains the semantic author. This
+/// mechanical boundary only reuses that owner's typed validator to bind the
+/// submitted body to the exact admitted selectors, request identity, and State
+/// Fence; Kernel does not derive a disposition or interpret candidate records.
+pub fn validate_local_read_result_response(
+    envelope: &HostRequestEnvelope,
+    scope_id: &str,
+    subject: &str,
+    max_records: u32,
+    response: &serde_json::Value,
+) -> Result<(), String> {
+    let response: McpResponse = serde_json::from_value(response.clone())
+        .map_err(|error| format!("local-read result is not an MCP response: {error}"))?;
+    let expected_request_sha256 = sha256_hex(
+        &canonical_json_bytes(&(
+            envelope.envelope_sha256.clone(),
+            envelope.identity.request_id.as_str().to_owned(),
+            envelope.identity.idempotency_key.clone(),
+        ))
+        .map_err(|error| format!("admitted request identity cannot be canonicalized: {error}"))?,
+    );
+    let expected_state_fence = serde_json::to_value(&envelope.state_fence)
+        .map_err(|error| format!("admitted State Fence cannot be canonicalized: {error}"))?;
+    validate_evidence_pack_response(
+        &response,
+        &EvidencePackResponseExpectation {
+            request_id: envelope.identity.request_id.as_str().to_owned(),
+            idempotency_key: envelope.identity.idempotency_key.clone(),
+            canonical_request_sha256: expected_request_sha256,
+            subject: subject.to_owned(),
+            scope_id: scope_id.to_owned(),
+            max_records: u64::from(max_records),
+            state_fence: expected_state_fence,
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Revalidates a stored local-read result against the selectors admitted with
+/// the exact envelope. The selector tuple is supplied by the replay caller;
+/// it is never recovered from the stored response, which is the untrusted
+/// value being checked.
+pub fn validate_local_read_stored_response(
+    envelope: &HostRequestEnvelope,
+    scope_id: &str,
+    subject: &str,
+    max_records: u32,
+    response: &serde_json::Value,
+) -> Result<(), String> {
+    validate_local_read_result_response(envelope, scope_id, subject, max_records, response)
 }
 
 /// Closed Kernel binder implementing [`KernelHostRequestPort`].
@@ -443,17 +560,20 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
         let application = self.build_application(request, envelope, now_ms)?;
         let transport = self.session.transport().clone();
         let response = self.dispatch_once(transport, application)?;
-        let expected_tool = request.tool.canonical_name().to_owned();
-        check_response_binding(
-            &response,
-            envelope.identity.request_id.as_str(),
-            &envelope.identity.idempotency_key,
-            &expected_tool,
-        )?;
-        if let Some(failure) = plan_gap_from_response(&response)? {
+        validate_response_against_envelope(&response, envelope, &request.tool)?;
+        // Classify before durability: a malformed negative body must not become
+        // a terminal stored result. A well-formed typed negative is still the
+        // owner result for this exact operation, so persist it before returning
+        // the failure and preserve the same disposition on replay.
+        let negative = classify_response_failure(&response).map_err(|_| {
+            PortFailure::TransportBindingRejected {
+                reason: "typed negative response does not bind its owner failure".to_owned(),
+            }
+        })?;
+        self.persist_result(envelope, &response)?;
+        if let Some(failure) = negative {
             return Err(failure);
         }
-        self.persist_result(envelope, &response)?;
         let handle =
             HostOperationHandle::new(host_request_operation_id(envelope)).map_err(|_| {
                 PortFailure::TransportBindingRejected {
@@ -476,10 +596,11 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
     /// payload and revision the read owner returned for this envelope without
     /// any re-dispatch. The revision travels inside the bounded content (the
     /// read owner embeds `revision_heads` there); the binder preserves it
-    /// opaquely and never interprets it. Runs after `check_response_binding`
-    /// and the plan-gap check, so only admitted Candidate/Projection answers
-    /// are persisted, in the required order: validate → linkage → admit →
-    /// dispatch → response binding → persist.
+    /// opaquely and never interprets it. Runs after response binding, and
+    /// before the typed negative is surfaced, so both positive and negative
+    /// owner answers are durable under the exact operation identity. The
+    /// required order is validate → linkage → admit → dispatch → response
+    /// binding → persist → surface outcome.
     fn persist_result(
         &self,
         envelope: &HostRequestEnvelope,
@@ -1070,17 +1191,8 @@ fn readback_responded(
             reason: "stored result digest does not bind the stored body".to_owned(),
         });
     }
-    check_response_binding(
-        &response,
-        envelope.identity.request_id.as_str(),
-        &envelope.identity.idempotency_key,
-        request.tool.canonical_name(),
-    )?;
-    if plan_gap_from_response(&response)?.is_some() {
-        return Err(PortFailure::TransportBindingRejected {
-            reason: "stored result does not carry an answerable projection".to_owned(),
-        });
-    }
+    validate_response_against_envelope(&response, envelope, &request.tool)?;
+    reject_negative_response(&response)?;
     let handle = HostOperationHandle::new(host_request_operation_id(envelope)).map_err(|_| {
         PortFailure::TransportBindingRejected {
             reason: "canonical operation handle is invalid".to_owned(),
@@ -1159,11 +1271,29 @@ fn canonical_payload_digest(tool: &ToolRequest) -> Result<String, PortFailure> {
     Ok(sha256_hex(&bytes))
 }
 
+/// Binds a direct MCP response to the Kernel-owned request identity and tool.
+///
+/// The direct MCP digest is the canonical hash of `ApplicationRequest`; it is
+/// intentionally not replaced with the local-read envelope/request tuple. The
+/// latter is checked only by the local-read response owner and replay boundary.
+fn validate_response_against_envelope(
+    response: &McpResponse,
+    envelope: &HostRequestEnvelope,
+    request_tool: &ToolRequest,
+) -> Result<(), PortFailure> {
+    check_response_binding(
+        response,
+        envelope.identity.request_id.as_str(),
+        &envelope.identity.idempotency_key,
+        request_tool,
+    )
+}
+
 fn check_response_binding(
     response: &McpResponse,
     request_id: &str,
     idempotency_key: &str,
-    expected_tool: &str,
+    expected_tool: &ToolRequest,
 ) -> Result<(), PortFailure> {
     if response.request_id != request_id {
         return Err(PortFailure::TransportBindingRejected {
@@ -1175,11 +1305,16 @@ fn check_response_binding(
             reason: "response idempotency binding does not match the admitted key".to_owned(),
         });
     }
-    if response.canonical_tool_name != expected_tool {
+    if response.canonical_tool_name != expected_tool.canonical_name() {
         return Err(PortFailure::TransportBindingRejected {
             reason: "response tool binding does not match the requested tool".to_owned(),
         });
     }
+    validate_mcp_response_for_tool(expected_tool, response).map_err(|_| {
+        PortFailure::TransportBindingRejected {
+            reason: "response does not match the requested tool's evidence contract".to_owned(),
+        }
+    })?;
     if !is_lower_hex64(&response.canonical_request_sha256) {
         return Err(PortFailure::TransportBindingRejected {
             reason: "response digest does not bind the canonical request".to_owned(),
@@ -1188,75 +1323,14 @@ fn check_response_binding(
     Ok(())
 }
 
-fn plan_gap_from_response(response: &McpResponse) -> Result<Option<PortFailure>, PortFailure> {
-    match response.kind {
-        ResponseKind::Candidate | ResponseKind::Projection => Ok(None),
-        ResponseKind::PlanGap => {
-            let (capability, reason) = plan_gap_fields(response)?;
-            Ok(Some(PortFailure::PlanGap {
-                missing_capability: capability,
-                reason,
-            }))
-        }
-        ResponseKind::Unsupported => {
-            let (capability, reason) = unsupported_fields(response)?;
-            Ok(Some(PortFailure::Unsupported { capability, reason }))
-        }
+fn reject_negative_response(response: &McpResponse) -> Result<(), PortFailure> {
+    match classify_response_failure(response) {
+        Ok(Some(failure)) => Err(failure),
+        Ok(None) => Ok(()),
+        Err(_) => Err(PortFailure::TransportBindingRejected {
+            reason: "typed negative response does not bind its owner failure".to_owned(),
+        }),
     }
-}
-
-fn plan_gap_fields(response: &McpResponse) -> Result<(String, String), PortFailure> {
-    let object = response
-        .content
-        .as_object()
-        .ok_or(PortFailure::TransportBindingRejected {
-            reason: "typed gap response does not bind its capability".to_owned(),
-        })?;
-    let capability = object
-        .get("missing_capability")
-        .and_then(|value| value.as_str())
-        .ok_or(PortFailure::TransportBindingRejected {
-            reason: "typed gap response does not bind its capability".to_owned(),
-        })?;
-    let reason = object
-        .get("reason")
-        .and_then(|value| value.as_str())
-        .ok_or(PortFailure::TransportBindingRejected {
-            reason: "typed gap response does not bind its reason".to_owned(),
-        })?;
-    if capability.trim().is_empty() || reason.trim().is_empty() {
-        return Err(PortFailure::TransportBindingRejected {
-            reason: "typed gap response does not bind its capability".to_owned(),
-        });
-    }
-    Ok((capability.to_owned(), reason.to_owned()))
-}
-
-fn unsupported_fields(response: &McpResponse) -> Result<(String, String), PortFailure> {
-    let object = response
-        .content
-        .as_object()
-        .ok_or(PortFailure::TransportBindingRejected {
-            reason: "typed unsupported response does not bind its capability".to_owned(),
-        })?;
-    let capability = object
-        .get("capability")
-        .and_then(|value| value.as_str())
-        .ok_or(PortFailure::TransportBindingRejected {
-            reason: "typed unsupported response does not bind its capability".to_owned(),
-        })?;
-    let reason = object
-        .get("reason")
-        .and_then(|value| value.as_str())
-        .ok_or(PortFailure::TransportBindingRejected {
-            reason: "typed unsupported response does not bind its reason".to_owned(),
-        })?;
-    if capability.trim().is_empty() || reason.trim().is_empty() {
-        return Err(PortFailure::TransportBindingRejected {
-            reason: "typed unsupported response does not bind its capability".to_owned(),
-        });
-    }
-    Ok((capability.to_owned(), reason.to_owned()))
 }
 
 fn is_lower_hex64(value: &str) -> bool {
@@ -1275,6 +1349,7 @@ fn is_lower_hex64(value: &str) -> bool {
 mod local_read_result_tests {
     use super::*;
     use eliot_contracts::{EpochLineageId, ResourceGeneration};
+    use eliot_mcp::EVIDENCE_PACK_PROJECTION_VERSION;
     use serde_json::json;
     use std::num::NonZeroU64;
 
@@ -1354,12 +1429,37 @@ mod local_read_result_tests {
             canonical_request_sha256: "a".repeat(64),
             kind: ResponseKind::Projection,
             canonical_tool_name: "eliot.query".to_owned(),
+            recall_disposition: Some(
+                serde_json::from_value(json!("INCOMPLETE_COVERAGE"))
+                    .expect("fixture disposition must decode"),
+            ),
             content: json!({
                 "operation": "GetEvidencePack",
                 "subject": "evidence-alpha",
                 "scope_id": "scope-1",
-                "evidence_pack": {"subject": "evidence-alpha"},
-                "revision_heads": [{"key": "scope:scope-1", "revision": 3}],
+                "evidence_pack": {
+                    "version": EVIDENCE_PACK_PROJECTION_VERSION,
+                    "subject": "evidence-alpha",
+                    "scope_id": "scope-1",
+                    "records": [{
+                        "capture_index": 0,
+                        "operation": "CaptureObservation",
+                        "parameters": {"subject": "evidence-alpha"},
+                    }],
+                    "provenance": {
+                        "state_fence": test_fence(),
+                        "matched_total": 1,
+                        "returned": 1,
+                        "max_records": 3,
+                        "truncated": false,
+                    },
+                    "recall_disposition": "INCOMPLETE_COVERAGE",
+                },
+                "revision_heads": [{
+                    "key": "scope:scope-1",
+                    "revision": 3,
+                    "state_fence": test_fence(),
+                }],
             }),
             artifacts: Vec::new(),
             proof_ceiling: eliot_receipts::ProofCeiling::ScopedVerification,
@@ -1504,6 +1604,8 @@ mod local_read_result_tests {
 mod local_read_build_tests {
     use super::*;
     use eliot_contracts::{EpochLineageId, ResourceGeneration};
+    use eliot_mcp::EVIDENCE_PACK_PROJECTION_VERSION;
+    use eliot_store_api::{RevisionHead, RevisionKey};
     use serde_json::json;
     use std::num::NonZeroU64;
 
@@ -1582,7 +1684,7 @@ mod local_read_build_tests {
 
     fn evidence_payload() -> serde_json::Value {
         json!({
-            "version": 1,
+            "version": EVIDENCE_PACK_PROJECTION_VERSION,
             "subject": "evidence-alpha",
             "scope_id": "scope-1",
             "records": [
@@ -1593,25 +1695,41 @@ mod local_read_build_tests {
                 },
             ],
             "provenance": {
+                "state_fence": test_fence(),
                 "matched_total": 1,
                 "returned": 1,
                 "max_records": 10,
                 "truncated": false,
             },
+            "recall_disposition": "INCOMPLETE_COVERAGE",
         })
+    }
+
+    fn evidence_store_response(payload: serde_json::Value) -> NamedReadResponse {
+        NamedReadResponse {
+            operation: NamedReadOperation::GetEvidencePack,
+            state_fence: test_fence(),
+            revision_heads: vec![RevisionHead {
+                key: RevisionKey::new("scope:scope-1").expect("valid revision key"),
+                revision: 3,
+                state_fence: test_fence(),
+            }],
+            payload,
+        }
     }
 
     #[test]
     fn build_serves_exact_bounded_body_with_revision() {
         let (request, envelope) = test_query_pair();
         let payload = evidence_payload();
+        let store_response = evidence_store_response(payload.clone());
         let (digest, body) = AuthenticatedHostSession::build_local_read_result_body(
             &envelope,
             "scope-1",
             "evidence-alpha",
             10,
             "verification",
-            payload.clone(),
+            &store_response,
         )
         .expect("admitted query must build its bounded body");
 
@@ -1631,6 +1749,11 @@ mod local_read_build_tests {
         assert_eq!(body["content"]["operation"], json!("GetEvidencePack"));
         assert_eq!(body["content"]["subject"], json!("evidence-alpha"));
         assert_eq!(body["content"]["scope_id"], json!("scope-1"));
+        assert_eq!(
+            body["content"]["revision_heads"],
+            serde_json::to_value(&store_response.revision_heads)
+                .expect("revision heads must serialize")
+        );
         assert_eq!(body["content"]["evidence_pack"], payload);
 
         // The built pair feeds the exact readback without re-dispatch: the
@@ -1651,14 +1774,14 @@ mod local_read_build_tests {
     #[test]
     fn build_is_deterministic_and_rejects_forgery_before_serving() {
         let (_, envelope) = test_query_pair();
-        let payload = evidence_payload();
+        let store_response = evidence_store_response(evidence_payload());
         let first = AuthenticatedHostSession::build_local_read_result_body(
             &envelope,
             "scope-1",
             "evidence-alpha",
             10,
             "verification",
-            payload.clone(),
+            &store_response,
         )
         .expect("first build must succeed");
         let second = AuthenticatedHostSession::build_local_read_result_body(
@@ -1667,7 +1790,7 @@ mod local_read_build_tests {
             "evidence-alpha",
             10,
             "verification",
-            payload,
+            &store_response,
         )
         .expect("second build must succeed");
         assert_eq!(
@@ -1690,7 +1813,7 @@ mod local_read_build_tests {
     #[test]
     fn build_rejects_non_query_and_over_bound_before_serving() {
         let (_, envelope) = test_query_pair();
-        let payload = evidence_payload();
+        let store_response = evidence_store_response(evidence_payload());
         let build =
             |envelope: &HostRequestEnvelope, scope: &str, subject: &str, max: u32, mode: &str| {
                 AuthenticatedHostSession::build_local_read_result_body(
@@ -1699,7 +1822,7 @@ mod local_read_build_tests {
                     subject,
                     max,
                     mode,
-                    payload.clone(),
+                    &store_response,
                 )
             };
 

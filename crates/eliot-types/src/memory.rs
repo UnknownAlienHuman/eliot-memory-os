@@ -901,12 +901,12 @@ pub struct L0CollapsedDuplicateTrace {
 
 /// I7.17 closed canonical recall disposition.
 ///
-/// Exactly nine variants. The value is always derived server-side from
-/// retrieval, scope policy, projection freshness, coverage, and conflict
-/// state (see [`derive_recall_disposition`]); it is never accepted from
-/// bridge or model output, and an agent must never invent
+/// Exactly nine variants. A response owner derives the value from observed
+/// retrieval, scope policy, projection freshness, coverage, and conflict state
+/// (for example through [`derive_recall_disposition`]); it is never accepted
+/// from bridge or model output, and an agent must never invent
 /// [`RecallDisposition::NoUsefulMemory`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RecallDisposition {
     AdmittedStrong,

@@ -3105,6 +3105,7 @@ mod tests {
                 canonical_request_sha256: DIGEST_A.to_owned(),
                 kind,
                 canonical_tool_name: "eliot.state".to_owned(),
+                recall_disposition: None,
                 content,
                 artifacts: Vec::new(),
                 proof_ceiling: ProofCeiling::Observation,
@@ -3295,9 +3296,51 @@ mod tests {
                 canonical_request_sha256: DIGEST_A.to_owned(),
                 kind: ResponseKind::Projection,
                 canonical_tool_name: "eliot.query".to_owned(),
-                content: serde_json::json!({"subject":"evidence-alpha"}),
+                recall_disposition: serde_json::from_value(serde_json::json!(
+                    "INCOMPLETE_COVERAGE"
+                ))
+                .expect("fixture disposition must decode"),
+                content: serde_json::json!({
+                    "operation": "GetEvidencePack",
+                    "subject": "evidence-alpha",
+                    "scope_id": "scope-delivery-1",
+                    "evidence_pack": {
+                        "version": 1,
+                        "subject": "evidence-alpha",
+                        "scope_id": "scope-delivery-1",
+                        "records": [{
+                            "capture_index": 0,
+                            "operation": "CaptureObservation",
+                            "parameters": {"subject": "evidence-alpha"}
+                        }],
+                        "provenance": {
+                            "state_fence": {
+                                "authority_epoch": {
+                                    "lineage_id": TEST_LINEAGE,
+                                    "sequence": 2
+                                },
+                                "resource_generation": 5
+                            },
+                            "matched_total": 1,
+                            "returned": 1,
+                            "max_records": 32,
+                            "truncated": false
+                        }
+                    },
+                    "revision_heads": [{
+                        "key": "scope:scope-delivery-1",
+                        "revision": 1,
+                        "state_fence": {
+                            "authority_epoch": {
+                                "lineage_id": TEST_LINEAGE,
+                                "sequence": 2
+                            },
+                            "resource_generation": 5
+                        }
+                    }]
+                }),
                 artifacts: Vec::new(),
-                proof_ceiling: ProofCeiling::Observation,
+                proof_ceiling: ProofCeiling::ScopedVerification,
                 resource: None,
                 job: None,
             }

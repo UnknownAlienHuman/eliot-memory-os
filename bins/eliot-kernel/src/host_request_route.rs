@@ -45,7 +45,10 @@ use super::{
     Frame, FrameKind, KernelComposition, KernelFrameAction, MessageType, ProtocolPayload, Session,
     TransportError, activation_deadline_expired, sha256_json, status_frame, unix_ms,
 };
-use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
+use eliot_kernel_service::{
+    AgentBridgeAdmissionDescriptor, KernelServiceState, validate_local_read_result_response,
+    validate_local_read_stored_response,
+};
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestKind as OrsHostRequestKind,
     HostRequestRecord, HostRequestState, OpaqueLabel, OperationIdentity, OrsError,
@@ -1264,6 +1267,31 @@ impl KernelComposition {
             .filter(LocalReadAttemptState::is_live))
     }
 
+    fn local_read_pair_under_transition(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+    ) -> Result<Option<(HostRequestEnvelope, serde_json::Value)>, TransportError> {
+        let index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(index
+            .values()
+            .flatten()
+            .find(|candidate| {
+                candidate.operation_id == operation_id
+                    && candidate.request_digest == request_digest
+                    && candidate.local_read_envelope.is_some()
+            })
+            .and_then(|candidate| {
+                candidate
+                    .local_read_envelope
+                    .clone()
+                    .zip(candidate.local_read_tool.clone())
+            }))
+    }
+
     /// Retires one queued local-read pair without failing.
     ///
     /// Called after a result is persisted (submit and sync legs) so later
@@ -1342,6 +1370,20 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        let queued_pair =
+            self.local_read_pair_under_transition(&body.operation_id, &body.request_sha256)?;
+        if let Some((envelope, tool)) = queued_pair.as_ref()
+            && let Some(selectors) = local_read_selectors_from_tool(envelope, tool)?
+        {
+            validate_local_read_result_response(
+                envelope,
+                selectors.scope_id.as_str(),
+                selectors.subject.as_str(),
+                selectors.max_records,
+                &body.response,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
+        }
         // Exact replay is idempotent even across deadline expiry: a retained
         // terminal result never takes the expiry path, and serving it is
         // canonical readback rather than a second completion.
@@ -1372,6 +1414,32 @@ impl KernelComposition {
                             presented_generation: Some(attempt.fencing_generation),
                             current_generation: Some(state.generation),
                             reason: StaleLocalReadReason::OwnerMismatch,
+                        },
+                    ));
+                }
+                let Some((envelope, _)) = queued_pair.as_ref() else {
+                    return Ok(LocalReadSubmitDisposition::StaleAttempt(
+                        StaleLocalReadObservation {
+                            operation_id: body.operation_id.clone(),
+                            request_digest: body.request_sha256.clone(),
+                            presented_attempt_id: Some(attempt.attempt_id.clone()),
+                            presented_generation: Some(attempt.fencing_generation),
+                            current_generation: Some(state.generation),
+                            reason: StaleLocalReadReason::Unclaimed,
+                        },
+                    ));
+                };
+                let expected_attempt =
+                    self.local_read_attempt_capability(envelope, &body.operation_id, &state)?;
+                if attempt != &expected_attempt {
+                    return Ok(LocalReadSubmitDisposition::StaleAttempt(
+                        StaleLocalReadObservation {
+                            operation_id: body.operation_id.clone(),
+                            request_digest: body.request_sha256.clone(),
+                            presented_attempt_id: Some(attempt.attempt_id.clone()),
+                            presented_generation: Some(attempt.fencing_generation),
+                            current_generation: Some(state.generation),
+                            reason: StaleLocalReadReason::Superseded,
                         },
                     ));
                 }
@@ -1428,21 +1496,7 @@ impl KernelComposition {
         if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
             return Err(TransportError::Timeout);
         }
-        let queued_envelope = {
-            let index = self
-                .host_request_connection_index
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            index
-                .values()
-                .flatten()
-                .find(|candidate| {
-                    candidate.operation_id == body.operation_id
-                        && candidate.request_digest == body.request_sha256
-                })
-                .and_then(|candidate| candidate.local_read_envelope.clone())
-        };
-        if let Some(envelope) = queued_envelope {
+        if let Some((envelope, _)) = queued_pair.as_ref() {
             if !session
                 .authority_epoch
                 .is_same_authority(&envelope.state_fence.authority_epoch)
@@ -1939,20 +1993,49 @@ pub(crate) fn check_local_read_admission(
 
 /// Serves an exact replay of a resulted operation without re-dispatch (no IO).
 ///
-/// Returns the admitted response when the durable record already carries both
-/// halves of the digest-bound result pair (validated through
-/// [`HostRequestResultBody`]); `None` for live or half-present rows, which
-/// take the fresh-answer leg instead of serving a partial answer. A forged
-/// pair fails closed instead of serving. Pure: readback performs no dispatch
-/// and no store IO by construction.
+/// Returns the admitted response only when the receipt, durable record, and
+/// bounded body all bind the exact envelope and the stored digest binds the
+/// exact response bytes. `None` is reserved for a live or incomplete row; a
+/// result pair on a non-resulted row is malformed and fails closed. For an
+/// exact query, the selector tuple is supplied from the admitted tool bytes;
+/// it is never recovered from the response being replayed.
 pub(crate) fn local_read_replay_response(
     receipt: &HostRequestAdmissionReceipt,
     record: &HostRequestRecord,
     envelope: &HostRequestEnvelope,
+    selectors: Option<&LocalReadSelectors>,
 ) -> Result<Option<serde_json::Value>, TransportError> {
+    receipt
+        .validate_envelope(envelope)
+        .map_err(|_| TransportError::SessionFenced)?;
+    let expected = requested_host_request_record(envelope)?;
+    if record.operation_id.as_str() != receipt.operation_id
+        || record.operation_id.as_str() != expected.operation_id.as_str()
+        || record.request_digest != envelope.envelope_sha256
+        || record.request_id.as_str() != envelope.identity.request_id.as_str()
+        || !record.same_binding(&expected)
+    {
+        return Err(TransportError::SessionFenced);
+    }
+
+    let carries_result = record.result_digest.is_some() || record.result_response.is_some();
+    if !matches!(
+        record.state,
+        HostRequestState::ResultReceived | HostRequestState::Terminal
+    ) {
+        if carries_result {
+            return Err(TransportError::SessionFenced);
+        }
+        return Ok(None);
+    }
     let (Some(digest), Some(body)) = (&record.result_digest, &record.result_response) else {
         return Ok(None);
     };
+    let canonical =
+        eliot_contracts::canonical_json_bytes(body).map_err(|_| TransportError::SessionFenced)?;
+    if eliot_contracts::sha256_hex(&canonical) != digest.as_str() {
+        return Err(TransportError::SessionFenced);
+    }
     HostRequestResultBody {
         wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
         wire_version: HostRequestResultBody::CONTRACT_VERSION,
@@ -1965,6 +2048,17 @@ pub(crate) fn local_read_replay_response(
     }
     .validate()
     .map_err(|_| TransportError::SessionFenced)?;
+    if envelope.identity.capability == "eliot.query" {
+        let selectors = selectors.ok_or(TransportError::SessionFenced)?;
+        validate_local_read_stored_response(
+            envelope,
+            selectors.scope_id.as_str(),
+            &selectors.subject,
+            selectors.max_records,
+            body,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+    }
     Ok(Some(host_request_admitted_response(receipt, record)))
 }
 
@@ -2428,28 +2522,76 @@ mod invoke_read_tool_tests {
         use eliot_contracts::{canonical_json_bytes, sha256_hex};
         let tool = query_tool();
         let envelope = test_envelope("eliot.query", &tool_digest(&tool));
+        let selectors = local_read_selectors_from_tool(&envelope, &tool)
+            .expect("admitted query must yield selectors")
+            .expect("query is a local read");
         let receipt = HostRequestAdmissionReceipt::issue(&envelope).expect("receipt must issue");
         let mut record = requested_host_request_record(&envelope).expect("record must build");
 
         // A live row takes the fresh leg: no stored body, no replay.
         assert_eq!(
-            local_read_replay_response(&receipt, &record, &envelope)
+            local_read_replay_response(&receipt, &record, &envelope, Some(&selectors))
                 .expect("live row must not fail"),
             None,
             "live operations never serve a stored body"
         );
 
-        // A resulted row serves its exact bounded body with the revision inline.
+        // A resulted row serves its exact bounded MCP response with the
+        // revision inline. The response is complete enough for the owner
+        // validator to bind its subject, scope, bound, request tuple, and
+        // State Fence.
+        let request_digest = sha256_hex(
+            &canonical_json_bytes(&(
+                envelope.envelope_sha256.clone(),
+                envelope.identity.request_id.as_str().to_owned(),
+                envelope.identity.idempotency_key.clone(),
+            ))
+            .expect("request tuple must canonicalize"),
+        );
         let body = serde_json::json!({
-            "operation": "GetEvidencePack",
-            "subject": "evidence-alpha",
-            "evidence_pack": {"subject": "evidence-alpha"},
-            "revision_heads": [{"key": "scope:kernel-session-1", "revision": 3}],
+            "request_id": envelope.identity.request_id.as_str(),
+            "idempotency_key": envelope.identity.idempotency_key,
+            "canonical_request_sha256": request_digest,
+            "kind": "PROJECTION",
+            "canonical_tool_name": "eliot.query",
+            "recall_disposition": "INCOMPLETE_COVERAGE",
+            "content": {
+                "operation": "GetEvidencePack",
+                "subject": "evidence-alpha",
+                "scope_id": "kernel-session-1",
+                "evidence_pack": {
+                    "version": 1,
+                    "subject": "evidence-alpha",
+                    "scope_id": "kernel-session-1",
+                    "records": [{
+                        "capture_index": 0,
+                        "operation": "CaptureObservation",
+                        "parameters": {"subject": "evidence-alpha"}
+                    }],
+                    "provenance": {
+                        "state_fence": envelope.state_fence,
+                        "matched_total": 1,
+                        "returned": 1,
+                        "max_records": EVIDENCE_PACK_MAX_RECORDS,
+                        "truncated": false
+                    }
+                },
+                "revision_heads": [{
+                    "key": "scope:kernel-session-1",
+                    "revision": 3,
+                    "state_fence": envelope.state_fence,
+                }]
+            },
+            "artifacts": [],
+            "proof_ceiling": "SCOPED_VERIFICATION",
+            "resource": null,
+            "job": null
         });
         let digest = sha256_hex(&canonical_json_bytes(&body).expect("body must canonicalize"));
+        record.state = HostRequestState::ResultReceived;
         record.result_digest = Some(digest.clone());
         record.result_response = Some(body.clone());
-        let replayed = local_read_replay_response(&receipt, &record, &envelope)
+        let replayed = local_read_replay_response(&receipt, &record, &envelope, Some(&selectors))
             .expect("resulted row must serve")
             .expect("resulted row must replay");
         assert_eq!(
@@ -2461,7 +2603,7 @@ mod invoke_read_tool_tests {
             replayed["value"]["record"]["result_response"], body,
             "the replay carries the exact stored body"
         );
-        let again = local_read_replay_response(&receipt, &record, &envelope)
+        let again = local_read_replay_response(&receipt, &record, &envelope, Some(&selectors))
             .expect("replay must be repeatable")
             .expect("replay must stay exact");
         assert_eq!(
@@ -2473,7 +2615,7 @@ mod invoke_read_tool_tests {
         let mut forged = record.clone();
         forged.result_digest = Some("0".repeat(64));
         assert_eq!(
-            local_read_replay_response(&receipt, &forged, &envelope),
+            local_read_replay_response(&receipt, &forged, &envelope, Some(&selectors)),
             Err(TransportError::SessionFenced),
             "forged digest must be rejected before serving"
         );
@@ -2482,7 +2624,7 @@ mod invoke_read_tool_tests {
         let mut half = record.clone();
         half.result_response = None;
         assert_eq!(
-            local_read_replay_response(&receipt, &half, &envelope)
+            local_read_replay_response(&receipt, &half, &envelope, Some(&selectors))
                 .expect("half-present pair must not fail"),
             None,
             "a half-present pair takes the fresh leg, never a partial serve"

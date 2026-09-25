@@ -42,10 +42,10 @@
 //! report `Unavailable` distinctly from `KnownEmpty` until the Store-owned
 //! slice (part B/C) activates them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_context_candidates::ProjectionState;
-use eliot_contracts::RequestMetadata;
+use eliot_contracts::{RequestMetadata, StateFence};
 use eliot_read::{
     BranchEnvironmentScope, FreshnessPolicy, NamedParameters, QueryIntent, QueryMode, QueryRequest,
     ReadApi, ReadError, RequiredAssurance, StateRequest, TimeScope,
@@ -557,6 +557,8 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             &response.payload,
             &request.scope_id,
             &request.evidence_subject,
+            &ctx.state_fence,
+            request.evidence_max_records,
         );
         Ok(RoleAcquisition {
             operation: response.operation,
@@ -712,9 +714,16 @@ fn decode_epistemic_payload(
 ///
 /// `KnownEmpty` requires the exact empty result: zero records with an
 /// explicit `truncated: false` and matching totals. A truncated pack is
-/// `Partial`; a payload whose provenance does not describe its records is
-/// `Unknown`. Transport and catalogue failures never reach this function.
-fn classify_evidence_payload(payload: &Value, scope: &ScopeId, subject: &str) -> ProjectionState {
+/// `Partial`; a payload whose provenance does not describe its records or the
+/// admitted `max_records` bound is `Unknown`. Transport and catalogue failures
+/// never reach this function.
+fn classify_evidence_payload(
+    payload: &Value,
+    scope: &ScopeId,
+    subject: &str,
+    expected_fence: &StateFence,
+    expected_max_records: u32,
+) -> ProjectionState {
     let unavailable = |detail: &str| ProjectionState::Unavailable {
         reason: bounded_reason("evidence payload fails its contract", detail),
     };
@@ -727,33 +736,93 @@ fn classify_evidence_payload(payload: &Value, scope: &ScopeId, subject: &str) ->
     if payload.get("scope_id").and_then(Value::as_str) != Some(scope.as_str()) {
         return unavailable("evidence scope mismatch");
     }
+    let Some(fence_value) = payload.pointer("/provenance/state_fence") else {
+        return unavailable("evidence payload has no provenance State Fence");
+    };
+    let Ok(fence) = serde_json::from_value::<StateFence>(fence_value.clone()) else {
+        return unavailable("evidence payload has an invalid provenance State Fence");
+    };
+    if fence.validate().is_err() || fence != *expected_fence {
+        return unavailable("evidence provenance State Fence does not match the request");
+    }
     let Some(records) = payload.get("records").and_then(Value::as_array) else {
         return unavailable("evidence payload has no records array");
     };
-    let provenance = payload.get("provenance");
-    let truncated = provenance
-        .and_then(|provenance| provenance.get("truncated"))
-        .and_then(Value::as_bool);
-    let matched = provenance
-        .and_then(|provenance| provenance.get("matched_total"))
-        .and_then(Value::as_u64);
-    let returned = provenance
-        .and_then(|provenance| provenance.get("returned"))
-        .and_then(Value::as_u64);
+    let Some(provenance) = payload.get("provenance").and_then(Value::as_object) else {
+        return unavailable("evidence payload has no provenance object");
+    };
+    let Some(truncated) = provenance.get("truncated").and_then(Value::as_bool) else {
+        return ProjectionState::Unknown {
+            reason: "evidence provenance has no truncation disposition".to_owned(),
+        };
+    };
+    let Some(matched) = provenance.get("matched_total").and_then(Value::as_u64) else {
+        return ProjectionState::Unknown {
+            reason: "evidence provenance has no matched total".to_owned(),
+        };
+    };
+    let Some(returned) = provenance.get("returned").and_then(Value::as_u64) else {
+        return ProjectionState::Unknown {
+            reason: "evidence provenance has no returned count".to_owned(),
+        };
+    };
+    let Some(max_records) = provenance.get("max_records").and_then(Value::as_u64) else {
+        return ProjectionState::Unknown {
+            reason: "evidence provenance has no max_records bound".to_owned(),
+        };
+    };
+    if max_records == 0 || max_records > u64::from(EVIDENCE_PACK_MAX_RECORDS) {
+        return ProjectionState::Unknown {
+            reason: "evidence provenance max_records is outside the catalogue bound".to_owned(),
+        };
+    }
+    if expected_max_records == 0
+        || expected_max_records > EVIDENCE_PACK_MAX_RECORDS
+        || max_records != u64::from(expected_max_records)
+    {
+        return ProjectionState::Unknown {
+            reason: "evidence provenance max_records does not match the admitted request bound"
+                .to_owned(),
+        };
+    }
+    let mut capture_indices = BTreeSet::new();
+    let records_valid = records.iter().all(|record| {
+        let Some(record) = record.as_object() else {
+            return false;
+        };
+        let Some(capture_index) = record.get("capture_index").and_then(Value::as_u64) else {
+            return false;
+        };
+        record.get("operation").and_then(Value::as_str) == Some("CaptureObservation")
+            && record
+                .get("parameters")
+                .and_then(Value::as_object)
+                .is_some()
+            && record
+                .get("parameters")
+                .and_then(|parameters| parameters.get("subject"))
+                .and_then(Value::as_str)
+                == Some(subject)
+            && capture_indices.insert(capture_index)
+    });
     let count = u64::try_from(records.len()).unwrap_or(u64::MAX);
-    match (truncated, matched, returned) {
-        (Some(false), Some(0), Some(0)) if records.is_empty() => ProjectionState::KnownEmpty,
-        (Some(false), Some(matched), Some(returned))
-            if matched == returned && returned == count =>
-        {
-            ProjectionState::Complete
-        }
-        (Some(true), _, _) => ProjectionState::Partial {
-            reason: "evidence pack truncated at the declared bound".to_owned(),
-        },
-        _ => ProjectionState::Unknown {
+    if !records_valid
+        || returned != matched.min(max_records)
+        || returned != count
+        || truncated != (matched > max_records)
+    {
+        return ProjectionState::Unknown {
             reason: "evidence provenance does not authoritatively describe the records".to_owned(),
-        },
+        };
+    }
+    if truncated {
+        ProjectionState::Partial {
+            reason: "evidence pack truncated at the declared bound".to_owned(),
+        }
+    } else if records.is_empty() {
+        ProjectionState::KnownEmpty
+    } else {
+        ProjectionState::Complete
     }
 }
 
@@ -807,28 +876,45 @@ mod reconstruction_tests {
     #[test]
     fn evidence_classifier_requires_authoritative_emptiness() -> ProofResult {
         let scope = ScopeId::new("scope-a")?;
+        let fence = test_fence()?;
         let empty = serde_json::json!({
             "version": 1,
             "subject": "subject-a",
             "scope_id": "scope-a",
             "records": [],
-            "provenance": {"matched_total": 0, "returned": 0, "truncated": false},
+            "provenance": {
+                "state_fence": fence,
+                "matched_total": 0,
+                "returned": 0,
+                "max_records": 8,
+                "truncated": false,
+            },
         });
         assert_eq!(
-            classify_evidence_payload(&empty, &scope, "subject-a"),
+            classify_evidence_payload(&empty, &scope, "subject-a", &test_fence()?, 8),
             ProjectionState::KnownEmpty
         );
-        // Same zero records, but the truncation flag is authoritative: a
-        // truncated empty page is partial, not empty.
-        let truncated_empty = serde_json::json!({
+        // A bounded first page is partial, while the same page cannot be
+        // presented as authoritative empty coverage.
+        let truncated_page = serde_json::json!({
             "version": 1,
             "subject": "subject-a",
             "scope_id": "scope-a",
-            "records": [],
-            "provenance": {"matched_total": 4, "returned": 0, "truncated": true},
+            "records": [{
+                "capture_index": 0,
+                "operation": "CaptureObservation",
+                "parameters": {"subject": "subject-a"},
+            }],
+            "provenance": {
+                "state_fence": test_fence()?,
+                "matched_total": 4,
+                "returned": 1,
+                "max_records": 1,
+                "truncated": true,
+            },
         });
         assert!(matches!(
-            classify_evidence_payload(&truncated_empty, &scope, "subject-a"),
+            classify_evidence_payload(&truncated_page, &scope, "subject-a", &test_fence()?, 1),
             ProjectionState::Partial { .. }
         ));
         // Records without a describing provenance are unknown, never empty.
@@ -837,9 +923,10 @@ mod reconstruction_tests {
             "subject": "subject-a",
             "scope_id": "scope-a",
             "records": [],
+            "provenance": {"state_fence": test_fence()?},
         });
         assert!(matches!(
-            classify_evidence_payload(&undescribed, &scope, "subject-a"),
+            classify_evidence_payload(&undescribed, &scope, "subject-a", &test_fence()?, 8),
             ProjectionState::Unknown { .. }
         ));
         // A substituted subject fails the contract instead of completing.
@@ -848,10 +935,16 @@ mod reconstruction_tests {
             "subject": "subject-b",
             "scope_id": "scope-a",
             "records": [],
-            "provenance": {"matched_total": 0, "returned": 0, "truncated": false},
+            "provenance": {
+                "state_fence": test_fence()?,
+                "matched_total": 0,
+                "returned": 0,
+                "max_records": 8,
+                "truncated": false,
+            },
         });
         assert!(matches!(
-            classify_evidence_payload(&substituted, &scope, "subject-a"),
+            classify_evidence_payload(&substituted, &scope, "subject-a", &test_fence()?, 8),
             ProjectionState::Unavailable { .. }
         ));
         Ok(())

@@ -8,6 +8,7 @@ use eliot_source_assurance::{
     AdmissionOutcome, AssuranceFinding, OwnerSourceEvidence, SourceAssurance, SourceAssuranceError,
     canonical_digest,
 };
+use eliot_types::RecallDisposition;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -16,7 +17,7 @@ use thiserror::Error;
 
 use crate::{
     ApplicationRequest, ContractViolation, LEGACY_FINISH_INPUT_REJECTED, McpProtocolVersion,
-    QueryInput, QueryMode, ToolRequest, TypedRejection, decode_protected_request_bytes,
+    QueryInput, QueryIntent, QueryMode, ToolRequest, TypedRejection, decode_protected_request_bytes,
     validate_proof_ceiling,
 };
 
@@ -284,15 +285,25 @@ pub trait KernelGovernorPort {
     fn dispatch(&self, request: &ForwardedRequest) -> Result<PortProjection, PortFailure>;
 }
 
+/// Maximum exact evidence-pack record count accepted by this surface.
+pub const EVIDENCE_PACK_MAX_RECORDS: u32 = eliot_store_api::EVIDENCE_PACK_MAX_RECORDS;
+
+/// Version of the opaque Store evidence-pack payload consumed by this surface.
+///
+/// The Store keeps candidate captures opaque; this is the existing payload
+/// shape and does not carry semantic admission or disposition.
+pub const EVIDENCE_PACK_PROJECTION_VERSION: u32 = 1;
+
 /// Closed T11.1 evidence-pack query plan derived from an explicit-intent
 /// `eliot.query`.
 ///
 /// This is the pure planning half of the `KernelGovernorPort::dispatch` seam
 /// for `ToolRequest::Query`: it maps a validated `QueryInput` with explicit
-/// read intent into the store catalogue's closed selectors
-/// (`subject`/`max_records` for `GetEvidencePack`) without importing store
-/// types, so this crate stays transport-only and the store catalogue remains
-/// the authority. Free-text `query` is intent data, never a selector: T11.1
+/// read intent into the Store catalogue's closed selectors
+/// (`subject`/`max_records` for `GetEvidencePack`) without importing Store
+/// operation/request types. The Store catalogue remains the authority; its
+/// shared payload-version constant is used only to validate the returned
+/// evidence pack. Free-text `query` is intent data, never a selector: T11.1
 /// requires the exact form `subject:<exact-subject>`; anything else fails
 /// closed instead of becoming a substring search or a forwarded `query`
 /// parameter.
@@ -384,9 +395,10 @@ pub fn plan_evidence_pack_query(
 /// Kind is always `Projection` (read-only owner state, never a candidate);
 /// proof ceiling is `ScopedVerification` (the strongest ceiling MCP
 /// projections may claim); no `CurrentPosition` claim is expressed. The exact
-/// store payload crosses unchanged under `evidence_pack` with its
-/// subject/scope identity.
-#[must_use]
+/// Store payload crosses unchanged under `evidence_pack` with its
+/// subject/scope identity. The response owner derives the typed disposition
+/// from the available observations; this function never reads admission meaning
+/// from the opaque Store payload.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "payload moves into the JSON projection; clippy cannot see through json!"
@@ -394,19 +406,575 @@ pub fn plan_evidence_pack_query(
 pub fn project_evidence_pack_projection(
     plan: &EvidencePackQueryPlan,
     payload: Value,
-) -> PortProjection {
-    PortProjection {
+) -> Result<PortProjection, BridgeError> {
+    let content = json!({
+        "operation": EvidencePackQueryPlan::operation_name(),
+        "subject": plan.subject,
+        "scope_id": plan.scope_id,
+        "evidence_pack": payload,
+    });
+    let expected_max_records = plan.max_records.parse::<u64>().map_err(|_| {
+        BridgeError::Serialization("evidence-pack plan has an invalid max_records bound".to_owned())
+    })?;
+    let projected_max_records = content
+        .pointer("/evidence_pack/provenance/max_records")
+        .and_then(Value::as_u64);
+    if projected_max_records != Some(expected_max_records) {
+        return Err(BridgeError::Serialization(
+            "evidence_pack max_records does not match the admitted query".to_owned(),
+        ));
+    }
+    let recall_disposition = parse_projected_recall_disposition("eliot.query", &content)?;
+    Ok(PortProjection {
         kind: ProjectionKind::Projection,
-        content: json!({
-            "operation": EvidencePackQueryPlan::operation_name(),
-            "subject": plan.subject,
-            "scope_id": plan.scope_id,
-            "evidence_pack": payload,
-        }),
+        content,
+        recall_disposition,
         artifacts: Vec::new(),
         proof_ceiling: ProofCeiling::ScopedVerification,
         resource: None,
         durable_job: None,
+    })
+}
+
+fn validate_projected_evidence_records(
+    records: &[Value],
+    expected_subject: &str,
+) -> Result<(), BridgeError> {
+    let malformed = |reason: &str| BridgeError::Serialization(reason.to_owned());
+    let mut capture_indices = BTreeSet::new();
+    for record in records {
+        let record = record
+            .as_object()
+            .ok_or_else(|| malformed("evidence_pack records must contain canonical objects"))?;
+        let Some(capture_index) = record.get("capture_index").and_then(Value::as_u64) else {
+            return Err(malformed("evidence_pack record is missing capture_index"));
+        };
+        if !capture_indices.insert(capture_index) {
+            return Err(malformed("evidence_pack capture indices must be unique"));
+        }
+        if record.get("operation").and_then(Value::as_str) != Some("CaptureObservation")
+            || record
+                .get("parameters")
+                .and_then(Value::as_object)
+                .is_none()
+            || record
+                .get("parameters")
+                .and_then(|parameters| parameters.get("subject"))
+                .and_then(Value::as_str)
+                != Some(expected_subject)
+        {
+            return Err(malformed(
+                "evidence_pack record does not match the admitted exact subject",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parses and validates the response-owned disposition on an MCP projection.
+///
+/// The Store payload remains an opaque version-1 candidate-capture pack. This
+/// function validates that shape and derives the P1 result from what the
+/// response owner actually observed. Candidate count is not admission evidence,
+/// so the only honest result on this route is `INCOMPLETE_COVERAGE`.
+pub fn parse_projected_recall_disposition(
+    canonical_tool_name: &str,
+    content: &Value,
+) -> Result<Option<RecallDisposition>, BridgeError> {
+    let malformed = |reason: &str| BridgeError::Serialization(reason.to_owned());
+    let operation = content.get("operation").and_then(Value::as_str);
+    let Some(evidence_pack) = content.get("evidence_pack") else {
+        if operation == Some("GetEvidencePack") {
+            return Err(malformed(
+                "GetEvidencePack projection is missing its evidence_pack payload",
+            ));
+        }
+        return Ok(None);
+    };
+
+    if canonical_tool_name != "eliot.query" {
+        return Err(malformed(
+            "only eliot.query may expose an evidence_pack projection",
+        ));
+    }
+    if operation != Some("GetEvidencePack") {
+        return Err(malformed(
+            "evidence_pack projection must use the GetEvidencePack operation",
+        ));
+    }
+    let subject = content
+        .get("subject")
+        .and_then(Value::as_str)
+        .ok_or_else(|| malformed("evidence_pack projection is missing subject"))?;
+    let scope_id = content
+        .get("scope_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| malformed("evidence_pack projection is missing scope_id"))?;
+    if subject.trim().is_empty()
+        || subject.chars().any(char::is_control)
+        || scope_id.trim().is_empty()
+        || scope_id.chars().any(char::is_control)
+    {
+        return Err(malformed(
+            "evidence_pack projection identity must be exact and non-blank",
+        ));
+    }
+
+    let pack = evidence_pack
+        .as_object()
+        .ok_or_else(|| malformed("evidence_pack must be an object"))?;
+    if pack.get("version").and_then(Value::as_u64)
+        != Some(u64::from(EVIDENCE_PACK_PROJECTION_VERSION))
+    {
+        return Err(malformed("evidence_pack version is unsupported"));
+    }
+    if pack.get("subject").and_then(Value::as_str) != Some(subject)
+        || pack.get("scope_id").and_then(Value::as_str) != Some(scope_id)
+    {
+        return Err(malformed(
+            "evidence_pack identity does not match the admitted query",
+        ));
+    }
+    let records = pack
+        .get("records")
+        .and_then(Value::as_array)
+        .ok_or_else(|| malformed("evidence_pack records must be an array"))?;
+    validate_projected_evidence_records(records, subject)?;
+    let provenance = pack
+        .get("provenance")
+        .and_then(Value::as_object)
+        .ok_or_else(|| malformed("evidence_pack provenance must be an object"))?;
+    validate_projected_state_fence(evidence_pack)?;
+    let matched_total = provenance
+        .get("matched_total")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| malformed("evidence_pack matched_total must be unsigned"))?;
+    let returned_u64 = provenance
+        .get("returned")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| malformed("evidence_pack returned must be unsigned"))?;
+    let max_records = provenance
+        .get("max_records")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| malformed("evidence_pack max_records must be unsigned"))?;
+    let truncated = provenance
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| malformed("evidence_pack truncated must be boolean"))?;
+    let returned = usize::try_from(returned_u64)
+        .map_err(|_| malformed("evidence_pack returned count exceeds usize"))?;
+    if max_records == 0
+        || max_records > u64::from(EVIDENCE_PACK_MAX_RECORDS)
+        || returned_u64 != matched_total.min(max_records)
+        || records.len() != returned
+        || truncated != (matched_total > max_records)
+    {
+        return Err(malformed(
+            "evidence_pack record and provenance counts are inconsistent",
+        ));
+    }
+    // Do not read a disposition from the Store payload, even if an older or
+    // substituted producer added one. The response owner has no admission,
+    // corpus, score, conflict, or selected-tier observation on this route.
+    Ok(Some(RecallDisposition::IncompleteCoverage))
+}
+
+fn validate_projected_state_fence(evidence_pack: &Value) -> Result<(), BridgeError> {
+    let value = evidence_pack
+        .pointer("/provenance/state_fence")
+        .cloned()
+        .ok_or_else(|| {
+            BridgeError::Serialization(
+                "evidence_pack provenance is missing its State Fence".to_owned(),
+            )
+        })?;
+    let fence: eliot_store_api::StateFence = serde_json::from_value(value).map_err(|error| {
+        BridgeError::Serialization(format!("evidence_pack State Fence is invalid: {error}"))
+    })?;
+    fence.validate().map_err(|error| {
+        BridgeError::Serialization(format!("evidence_pack State Fence is invalid: {error}"))
+    })?;
+    Ok(())
+}
+
+fn validate_projected_revision_heads(
+    content: &Value,
+    expected_fence: &eliot_store_api::StateFence,
+) -> Result<(), BridgeError> {
+    let heads = content
+        .get("revision_heads")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            BridgeError::Serialization(
+                "evidence-pack response is missing its revision heads".to_owned(),
+            )
+        })?;
+    let mut keys = BTreeSet::new();
+    for value in heads {
+        let head: eliot_store_api::RevisionHead =
+            serde_json::from_value(value.clone()).map_err(|error| {
+                BridgeError::Serialization(format!(
+                    "evidence-pack revision head is invalid: {error}"
+                ))
+            })?;
+        head.validate().map_err(|error| {
+            BridgeError::Serialization(format!("evidence-pack revision head is invalid: {error}"))
+        })?;
+        if head.state_fence != *expected_fence {
+            return Err(BridgeError::Serialization(
+                "evidence-pack revision head State Fence does not match the request".to_owned(),
+            ));
+        }
+        if !keys.insert(head.key.as_str().to_owned()) {
+            return Err(BridgeError::Serialization(
+                "evidence-pack revision heads must have unique keys".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Classifies a typed negative response for downstream rejection mapping.
+///
+/// Candidate and projection responses are positive answers. Plan-gap and
+/// unsupported responses preserve their typed owner failure instead of being
+/// surfaced as successful responses.
+pub fn classify_response_failure(
+    response: &McpResponse,
+) -> Result<Option<PortFailure>, BridgeError> {
+    let text = |field: &str| {
+        response
+            .content
+            .as_object()
+            .and_then(|object| object.get(field))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))
+            .map(str::to_owned)
+            .ok_or_else(|| BridgeError::Serialization(format!("typed response is missing {field}")))
+    };
+    match response.kind {
+        ResponseKind::Candidate | ResponseKind::Projection => Ok(None),
+        ResponseKind::PlanGap => {
+            if response.recall_disposition.is_some() {
+                return Err(BridgeError::Serialization(
+                    "plan-gap response must not carry a recall disposition".to_owned(),
+                ));
+            }
+            let content = response.content.as_object().ok_or_else(|| {
+                BridgeError::Serialization("plan-gap response content must be an object".to_owned())
+            })?;
+            if content.get("code").and_then(Value::as_str) != Some("PLAN_GAP") {
+                return Err(BridgeError::Serialization(
+                    "plan-gap response code does not match its kind".to_owned(),
+                ));
+            }
+            Ok(Some(PortFailure::PlanGap {
+                missing_capability: text("missing_capability")?,
+                reason: text("reason")?,
+            }))
+        }
+        ResponseKind::Unsupported => {
+            if response.recall_disposition.is_some() {
+                return Err(BridgeError::Serialization(
+                    "unsupported response must not carry a recall disposition".to_owned(),
+                ));
+            }
+            let content = response.content.as_object().ok_or_else(|| {
+                BridgeError::Serialization(
+                    "unsupported response content must be an object".to_owned(),
+                )
+            })?;
+            if content.get("code").and_then(Value::as_str) != Some("UNSUPPORTED") {
+                return Err(BridgeError::Serialization(
+                    "unsupported response code does not match its kind".to_owned(),
+                ));
+            }
+            Ok(Some(PortFailure::Unsupported {
+                capability: text("capability")?,
+                reason: text("reason")?,
+            }))
+        }
+    }
+}
+
+/// Exact request facts that an evidence-pack response must bind at a response
+/// owner or an untrusted replay boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidencePackResponseExpectation {
+    /// Exact response request identity.
+    pub request_id: String,
+    /// Exact response idempotency identity.
+    pub idempotency_key: String,
+    /// Digest defined by the response owner for the admitted request. For a
+    /// local-read envelope this is the envelope/request/idempotency tuple;
+    /// direct MCP requests use their separate application-request hash.
+    pub canonical_request_sha256: String,
+    /// Exact subject selector admitted by the request.
+    pub subject: String,
+    /// Exact trusted scope admitted by the request.
+    pub scope_id: String,
+    /// Exact bounded record count admitted by the request.
+    pub max_records: u64,
+    /// Canonical State Fence expected in the evidence-pack provenance.
+    pub state_fence: Value,
+}
+
+/// Returns whether a tool is the exact subject evidence query that must carry
+/// a disposition and an evidence-pack projection.
+#[must_use]
+pub fn requires_evidence_pack_response(tool: &ToolRequest) -> bool {
+    let ToolRequest::Query(input) = tool else {
+        return false;
+    };
+    if input.exact_resource_uri.is_some() || matches!(input.intent.mode, QueryMode::CurrentPosition)
+    {
+        return false;
+    }
+    input
+        .query
+        .strip_prefix("subject:")
+        .map(str::trim)
+        .is_some_and(|subject| !subject.is_empty() && !subject.chars().any(char::is_control))
+}
+
+fn validate_projection_content_for_tool(
+    tool: &ToolRequest,
+    content: &Value,
+    disposition: Option<RecallDisposition>,
+) -> Result<(), BridgeError> {
+    let parsed = parse_projected_recall_disposition(tool.canonical_name(), content)?;
+    if requires_evidence_pack_response(tool) {
+        let subject = tool.query_subject().ok_or_else(|| {
+            BridgeError::Serialization("exact evidence subject is missing".to_owned())
+        })?;
+        if content.get("subject").and_then(Value::as_str) != Some(subject) {
+            return Err(BridgeError::Serialization(
+                "evidence-pack subject does not match the admitted query".to_owned(),
+            ));
+        }
+        if parsed.is_none() {
+            return Err(BridgeError::Serialization(
+                "exact eliot.query response is missing its evidence pack".to_owned(),
+            ));
+        }
+    } else if parsed.is_some() {
+        return Err(BridgeError::Serialization(
+            "unrelated query response must not expose an evidence pack".to_owned(),
+        ));
+    }
+    if parsed != disposition {
+        return Err(BridgeError::Serialization(
+            "response recall_disposition does not match the response-owner evidence projection"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a decoded MCP response against the exact tool request before a
+/// gateway or bridge replays it.
+pub fn validate_mcp_response_for_tool(
+    tool: &ToolRequest,
+    response: &McpResponse,
+) -> Result<(), BridgeError> {
+    if response.canonical_tool_name != tool.canonical_name() {
+        return Err(BridgeError::Serialization(
+            "response tool does not match the requested tool".to_owned(),
+        ));
+    }
+    if !is_sha256(&response.canonical_request_sha256) {
+        return Err(BridgeError::Serialization(
+            "response canonical request digest is invalid".to_owned(),
+        ));
+    }
+    if matches!(
+        response.kind,
+        ResponseKind::PlanGap | ResponseKind::Unsupported
+    ) {
+        if response.recall_disposition.is_some() {
+            return Err(BridgeError::Serialization(
+                "negative response must not carry a recall disposition".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
+    if requires_evidence_pack_response(tool) {
+        if response.kind != ResponseKind::Projection {
+            return Err(BridgeError::Serialization(
+                "exact evidence response must be a read-only projection".to_owned(),
+            ));
+        }
+        if response.proof_ceiling != ProofCeiling::ScopedVerification
+            || !response.artifacts.is_empty()
+            || response.resource.is_some()
+            || response.job.is_some()
+        {
+            return Err(BridgeError::Serialization(
+                "exact evidence response has an invalid proof or resource envelope".to_owned(),
+            ));
+        }
+    }
+    validate_projection_content_for_tool(tool, &response.content, response.recall_disposition)
+}
+
+/// Joins an exact evidence-pack projection to the direct MCP request.
+///
+/// The direct MCP path has no local-read envelope tuple. It still has an
+/// authenticated source-assurance scope and an owner-resolved State Fence, so
+/// the response owner must bind the exact subject, scope, catalogue bound,
+/// request digest, and fence before the response leaves the core. The bridge
+/// and local-read replay paths repeat the corresponding checks at their
+/// untrusted boundaries.
+fn validate_direct_evidence_pack_response(
+    request: &ForwardedRequest,
+    response: &McpResponse,
+) -> Result<(), BridgeError> {
+    if !requires_evidence_pack_response(&request.request.tool) {
+        return Ok(());
+    }
+    let subject = request.request.tool.query_subject().ok_or_else(|| {
+        BridgeError::Serialization("exact evidence subject is missing".to_owned())
+    })?;
+    let state_fence = serde_json::to_value(&request.active_session_binding.session.state_fence)
+        .map_err(|error| {
+            BridgeError::Serialization(format!(
+                "request State Fence cannot be canonicalized: {error}"
+            ))
+        })?;
+    validate_evidence_pack_response(
+        response,
+        &EvidencePackResponseExpectation {
+            request_id: request.active_session_binding.request_id.clone(),
+            idempotency_key: request.active_session_binding.idempotency_key.clone(),
+            canonical_request_sha256: request.canonical_request_sha256.clone(),
+            subject: subject.to_owned(),
+            scope_id: request
+                .source_assurance
+                .assurance
+                .scope
+                .expected_scope
+                .clone(),
+            max_records: u64::from(EVIDENCE_PACK_MAX_RECORDS),
+            state_fence,
+        },
+    )
+}
+
+/// Validates an exact evidence-pack response and all request/fence joins that
+/// a response owner or replay boundary can know.
+pub fn validate_evidence_pack_response(
+    response: &McpResponse,
+    expected: &EvidencePackResponseExpectation,
+) -> Result<(), BridgeError> {
+    if expected.request_id.trim().is_empty()
+        || expected.request_id.chars().any(char::is_control)
+        || expected.idempotency_key.trim().is_empty()
+        || expected.idempotency_key.chars().any(char::is_control)
+        || expected.subject.trim().is_empty()
+        || expected.subject.chars().any(char::is_control)
+        || expected.scope_id.trim().is_empty()
+        || expected.scope_id.chars().any(char::is_control)
+        || !is_sha256(&expected.canonical_request_sha256)
+    {
+        return Err(BridgeError::Serialization(
+            "evidence-pack response expectation is malformed".to_owned(),
+        ));
+    }
+    let expected_fence: eliot_store_api::StateFence =
+        serde_json::from_value(expected.state_fence.clone()).map_err(|error| {
+            BridgeError::Serialization(format!("expected evidence State Fence is invalid: {error}"))
+        })?;
+    expected_fence.validate().map_err(|error| {
+        BridgeError::Serialization(format!("expected evidence State Fence is invalid: {error}"))
+    })?;
+    validate_mcp_response_for_tool(
+        &ToolRequest::Query(QueryInput {
+            intent: QueryIntent {
+                mode: QueryMode::Verification,
+                time_scope: "response-owner".to_owned(),
+                branch_environment_scope: "response-owner".to_owned(),
+                freshness_policy: "exact captured records only".to_owned(),
+                required_assurance: "response-owner validation".to_owned(),
+            },
+            query: format!("subject:{}", expected.subject),
+            exact_resource_uri: None,
+        }),
+        response,
+    )?;
+    if response.request_id != expected.request_id
+        || response.idempotency_key != expected.idempotency_key
+        || response.canonical_request_sha256 != expected.canonical_request_sha256
+    {
+        return Err(BridgeError::Serialization(
+            "evidence-pack response does not bind the admitted request identity".to_owned(),
+        ));
+    }
+    if response.kind != ResponseKind::Projection {
+        return Err(BridgeError::Serialization(
+            "evidence-pack response must be a read-only projection".to_owned(),
+        ));
+    }
+    if response.proof_ceiling != ProofCeiling::ScopedVerification
+        || !response.artifacts.is_empty()
+        || response.resource.is_some()
+        || response.job.is_some()
+    {
+        return Err(BridgeError::Serialization(
+            "evidence-pack response has an invalid proof or resource envelope".to_owned(),
+        ));
+    }
+    if expected.max_records == 0 || expected.max_records > u64::from(EVIDENCE_PACK_MAX_RECORDS) {
+        return Err(BridgeError::Serialization(
+            "evidence-pack expected max_records is outside the catalogue bound".to_owned(),
+        ));
+    }
+    if response.content.get("subject").and_then(Value::as_str) != Some(expected.subject.as_str())
+        || response.content.get("scope_id").and_then(Value::as_str)
+            != Some(expected.scope_id.as_str())
+        || response.content.get("operation").and_then(Value::as_str) != Some("GetEvidencePack")
+    {
+        return Err(BridgeError::Serialization(
+            "evidence-pack response does not bind the admitted subject and scope".to_owned(),
+        ));
+    }
+    if response
+        .content
+        .pointer("/evidence_pack/provenance/max_records")
+        .and_then(Value::as_u64)
+        != Some(expected.max_records)
+    {
+        return Err(BridgeError::Serialization(
+            "evidence-pack response does not bind max_records".to_owned(),
+        ));
+    }
+    if response
+        .content
+        .pointer("/evidence_pack/provenance/state_fence")
+        != Some(&expected.state_fence)
+    {
+        return Err(BridgeError::Serialization(
+            "evidence-pack response does not bind the admitted State Fence".to_owned(),
+        ));
+    }
+    validate_projected_revision_heads(&response.content, &expected_fence)?;
+    if response.recall_disposition != Some(RecallDisposition::IncompleteCoverage) {
+        return Err(BridgeError::Serialization(
+            "candidate-only evidence must fail closed to INCOMPLETE_COVERAGE".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+impl ToolRequest {
+    fn query_subject(&self) -> Option<&str> {
+        let Self::Query(input) = self else {
+            return None;
+        };
+        input
+            .query
+            .strip_prefix("subject:")
+            .map(str::trim)
+            .filter(|subject| !subject.is_empty() && !subject.chars().any(char::is_control))
     }
 }
 
@@ -574,6 +1142,7 @@ pub fn project_context_reconstruction_projection(
             "scope_id": plan.scope_id,
             "context_reconstruction": payload,
         }),
+        recall_disposition: None,
         artifacts: Vec::new(),
         proof_ceiling: ProofCeiling::ScopedVerification,
         resource: None,
@@ -599,6 +1168,10 @@ pub struct PortProjection {
     pub kind: ProjectionKind,
     /// Structured content.
     pub content: Value,
+    /// Response-owner disposition for an exact evidence-pack projection.
+    /// Other projections omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_disposition: Option<RecallDisposition>,
     /// Exact immutable artifacts referenced by the projection.
     #[serde(default)]
     pub artifacts: Vec<ArtifactBinding>,
@@ -728,6 +1301,10 @@ pub struct McpResponse {
     pub kind: ResponseKind,
     /// Canonical tool name.
     pub canonical_tool_name: String,
+    /// Response-owner closed recall result for an exact evidence-pack query.
+    /// Other projections and all negative responses omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_disposition: Option<RecallDisposition>,
     /// Structured bounded content or a resource pointer.
     pub content: Value,
     /// Immutable artifacts referenced by the content.
@@ -908,6 +1485,12 @@ impl McpCore {
             Err(other) => return Err(BridgeError::Port(other)),
         };
         validate_projection(&forwarded.request.session, &projection)?;
+        validate_projection_content_for_tool(
+            &forwarded.request.tool,
+            &projection.content,
+            projection.recall_disposition,
+        )?;
+        let recall_disposition = projection.recall_disposition;
         let kind = match projection.kind {
             ProjectionKind::Candidate => ResponseKind::Candidate,
             ProjectionKind::Projection => ResponseKind::Projection,
@@ -925,12 +1508,15 @@ impl McpCore {
             canonical_request_sha256: correlation.canonical_request_sha256.clone(),
             kind,
             canonical_tool_name,
+            recall_disposition,
             content: projection.content,
             artifacts: projection.artifacts,
             proof_ceiling: projection.proof_ceiling,
             resource: projection.resource,
             job,
         };
+        validate_mcp_response_for_tool(&forwarded.request.tool, &response)?;
+        validate_direct_evidence_pack_response(&forwarded, &response)?;
         bounded_response(response)
     }
 }
@@ -958,6 +1544,16 @@ impl KernelGovernorPort for NoProviderPort {
     }
 }
 
+fn validate_negative_text(field: &'static str, value: &str) -> Result<(), BridgeError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(BridgeError::invalid(
+            field,
+            "typed negative response text must be non-blank and contain no control characters",
+        ));
+    }
+    Ok(())
+}
+
 fn negative_response(
     request_id: &str,
     idempotency_key: &str,
@@ -969,22 +1565,30 @@ fn negative_response(
         PortFailure::PlanGap {
             missing_capability,
             reason,
-        } => (
-            ResponseKind::PlanGap,
-            json!({
-                "code": "PLAN_GAP",
-                "missing_capability": missing_capability,
-                "reason": reason,
-            }),
-        ),
-        PortFailure::Unsupported { capability, reason } => (
-            ResponseKind::Unsupported,
-            json!({
-                "code": "UNSUPPORTED",
-                "capability": capability,
-                "reason": reason,
-            }),
-        ),
+        } => {
+            validate_negative_text("response.content.missing_capability", &missing_capability)?;
+            validate_negative_text("response.content.reason", &reason)?;
+            (
+                ResponseKind::PlanGap,
+                json!({
+                    "code": "PLAN_GAP",
+                    "missing_capability": missing_capability,
+                    "reason": reason,
+                }),
+            )
+        }
+        PortFailure::Unsupported { capability, reason } => {
+            validate_negative_text("response.content.capability", &capability)?;
+            validate_negative_text("response.content.reason", &reason)?;
+            (
+                ResponseKind::Unsupported,
+                json!({
+                    "code": "UNSUPPORTED",
+                    "capability": capability,
+                    "reason": reason,
+                }),
+            )
+        }
         other => return Err(BridgeError::Port(other)),
     };
     bounded_response(McpResponse {
@@ -993,6 +1597,7 @@ fn negative_response(
         canonical_request_sha256: canonical_request_sha256.to_owned(),
         kind,
         canonical_tool_name: canonical_tool_name.to_owned(),
+        recall_disposition: None,
         content,
         artifacts: Vec::new(),
         proof_ceiling: ProofCeiling::Observation,
@@ -1899,8 +2504,28 @@ mod evidence_pack_query_plan_tests {
             "8",
         )
         .expect("exact selector plans");
-        let payload = json!({"version": 1, "records": []});
-        let projection = project_evidence_pack_projection(&plan, payload.clone());
+        let payload = json!({
+            "version": EVIDENCE_PACK_PROJECTION_VERSION,
+            "subject": "evidence-alpha",
+            "scope_id": "scope-evidence",
+            "records": [],
+            "provenance": {
+                "state_fence": {
+                    "authority_epoch": {
+                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "sequence": 1,
+                    },
+                    "resource_generation": 1,
+                },
+                "matched_total": 0,
+                "returned": 0,
+                "max_records": 8,
+                "truncated": false,
+            },
+            "recall_disposition": "INCOMPLETE_COVERAGE",
+        });
+        let projection = project_evidence_pack_projection(&plan, payload.clone())
+            .expect("opaque evidence pack projects");
         assert_eq!(projection.kind, ProjectionKind::Projection);
         assert_eq!(projection.proof_ceiling, ProofCeiling::ScopedVerification);
         assert!(
