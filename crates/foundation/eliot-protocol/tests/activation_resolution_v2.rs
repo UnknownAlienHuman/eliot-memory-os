@@ -3,9 +3,9 @@ use eliot_protocol::{
     AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_ID, AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_VERSION,
     AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID, AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
     AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
-    AgentActivationResolutionResult, AgentActivationResolutionTicket, AgentActivationResolvedBinding,
-    AgentActivationRetryDirective, AgentActivationSelectionDirective,
-    MAX_AGENT_ACTIVATION_CANDIDATES, ProtocolError,
+    AgentActivationResolutionResult, AgentActivationResolutionTicket,
+    AgentActivationResolvedBinding, AgentActivationRetryDirective,
+    AgentActivationSelectionDirective, MAX_AGENT_ACTIVATION_CANDIDATES, ProtocolError,
 };
 use serde_json::Value;
 
@@ -412,4 +412,3 @@ fn resolved_projection_contains_no_kernel_activation_authority_fields() -> Resul
     }
     Ok(())
 }
-

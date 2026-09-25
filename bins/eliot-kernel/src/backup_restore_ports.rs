@@ -1327,17 +1327,21 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
                 reason: "must be a supported bounded page",
             }
         }
-        OrsError::InvalidTransition
-        | OrsError::ActivationLifecycleStateConflict { .. }
-        | OrsError::ScopeRecoveryRequired
-        | OrsError::UnsafeExpiry => BackupError::RestorePhaseMismatch,
-        // Issue #1115: an activation ticket past its Kernel deadline is refused
-        // before result admission. The deadline is a real, observed refusal of
-        // this step rather than journal corruption, so it maps by cause class
-        // the same way an elapsed supervision-lease ticket does.
+        OrsError::InvalidTransition | OrsError::ScopeRecoveryRequired | OrsError::UnsafeExpiry => {
+            BackupError::RestorePhaseMismatch
+        }
+        // The activation lifecycle vocabulary (#1115) keeps the same per-class
+        // discipline as the supervision-ticket group above: a ticket whose
+        // deadline closed before result admission is a named lifecycle record
+        // that cannot satisfy the request, never a generic target failure, and
+        // a ticket found in the wrong durable state is the same invalid
+        // phase/state transition `InvalidTransition` already reports. They are
+        // deliberately two arms rather than one so an expiry never reads as a
+        // state conflict on this seam.
         OrsError::ActivationLifecycleExpired { .. } => BackupError::IntegrityMismatch {
-            subject: "restore journal activation ticket".to_owned(),
+            subject: "restore journal activation ticket expiry".to_owned(),
         },
+        OrsError::ActivationLifecycleStateConflict { .. } => BackupError::RestorePhaseMismatch,
         OrsError::ActiveExecutableReplacement
         | OrsError::IncompatibleArtifact
         | OrsError::VersionedArtifactConflict
