@@ -52,10 +52,10 @@ use eliot_learning_contracts::{
     TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
 };
 use eliot_store_api::{
-    CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
-    NamedMutationRequest, NamedOperationManifest, OperationManifestDigest, OrderingHeadExpectation,
-    OrderingScopeId, ScopeId, SecurityContext, StoreEvidenceHandles, StoreFailure,
-    StoreFailureDisposition, StoreFailureIdentityContext, StoreMutationDisposition,
+    CONTRACT_VERSION, CampaignSourcePublication, EffectClass, EventProjectionRelationIntents,
+    NamedMutationOperation, NamedMutationRequest, NamedOperationManifest, OperationManifestDigest,
+    OrderingHeadExpectation, OrderingScopeId, ScopeId, SecurityContext, StoreEvidenceHandles,
+    StoreFailure, StoreFailureDisposition, StoreFailureIdentityContext, StoreMutationDisposition,
     StoreReasonCode, StoreRecoveryAction, StoreRetryDirective, TransitionClass, WriteReceipt,
     WriteReceiptStatus,
 };
@@ -67,6 +67,7 @@ use thiserror::Error;
 
 use crate::{
     CanonicalAdmissionOwner, CompositionError, KernelPortError, KernelTransitionPort,
+    campaign_source_publishers::assemble_task_owner_matrix,
     campaign_task_sources::{
         TaskControllerCampaignSources, build_task_controller_campaign_sources,
     },
@@ -261,6 +262,7 @@ fn task_envelope(
     manifest_digest: OperationManifestDigest,
     campaign_recipe: Option<&LearningStateViewRecipe>,
     campaign_sources: Option<&TaskControllerCampaignSources>,
+    campaign_publications: Option<&[CampaignSourcePublication]>,
 ) -> Result<CanonicalWriteEnvelope, TaskLifecycleError> {
     identity
         .validate()
@@ -322,11 +324,30 @@ fn task_envelope(
             ),
         );
     }
-    if let Some(sources) = campaign_sources {
+    if let Some(publications) = campaign_publications {
         parameters.insert(
             "campaign_source_publications_json".to_owned(),
-            serde_json::to_value(&[sources.objective.clone(), sources.plan.clone()])
+            serde_json::to_value(publications)
                 .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
+        );
+        parameters.insert(
+            "campaign_source_matrix_complete".to_owned(),
+            serde_json::Value::String("true".to_owned()),
+        );
+    } else if let Some(sources) = campaign_sources {
+        parameters.insert(
+            "campaign_source_publications_json".to_owned(),
+            serde_json::to_value(&[
+                sources.objective.clone(),
+                sources.plan.clone(),
+                sources.acceptance.clone(),
+                sources.open_items.clone(),
+            ])
+            .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
+        );
+        parameters.insert(
+            "campaign_source_matrix_complete".to_owned(),
+            serde_json::Value::String("false".to_owned()),
         );
     }
     let envelope = CanonicalWriteEnvelope {
@@ -416,6 +437,26 @@ fn validate_campaign_recipe_anchor(
     Ok(())
 }
 
+fn complete_campaign_publications(
+    task_sources: &TaskControllerCampaignSources,
+    owner_publications: Vec<CampaignSourcePublication>,
+) -> Result<Vec<CampaignSourcePublication>, TaskLifecycleError> {
+    assemble_task_owner_matrix(task_sources, owner_publications)
+        .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))
+}
+
+fn complete_campaign_publications_from_builder<F>(
+    task_sources: &TaskControllerCampaignSources,
+    owner_builder: F,
+) -> Result<Vec<CampaignSourcePublication>, TaskLifecycleError>
+where
+    F: FnOnce(&TaskControllerCampaignSources) -> Result<Vec<CampaignSourcePublication>, String>,
+{
+    let owner_publications =
+        owner_builder(task_sources).map_err(TaskLifecycleError::Serialization)?;
+    complete_campaign_publications(task_sources, owner_publications)
+}
+
 impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
     /// Reads the current task record at the admitted fence without promotion.
     pub fn view(
@@ -478,6 +519,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             manifest_digest.clone(),
             None,
             None,
+            None,
         )?;
         self.commit_envelope(identity, operation_id, envelope, manifest_digest)
             .await
@@ -527,12 +569,65 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             manifest_digest.clone(),
             Some(&sources.recipe),
             Some(&sources),
+            None,
         )?;
         self.commit_envelope(identity, operation_id, envelope, manifest_digest)
             .await
     }
 
-    /// Applies one guarded task command and commits it through the canonical path.
+    /// Proposes a task and atomically retains the complete closed owner-role
+    /// publication matrix on the same authenticated `UpdateTaskState` write.
+    /// The owner rows are supplied by their real owner transitions; this
+    /// method only validates their exact bindings and CAS expectations.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn propose_task_with_complete_campaign_sources(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        proposal: TaskProposal,
+        recipe: LearningStateViewRecipe,
+        owner_publications: Vec<CampaignSourcePublication>,
+    ) -> Result<WriteReceipt, TaskLifecycleError> {
+        identity
+            .validate()
+            .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("request_identity")))?;
+        let fence = &identity.request.metadata.state_fence;
+        if &identity.request.state_fence != fence
+            || self.canonical.state_fence() != fence
+            || !fence.is_compatible_with(&proposal.context.state_fence)
+        {
+            return Err(TaskLifecycleError::Owner(TaskError::FenceMismatch));
+        }
+        let mut scratch = self.task.clone();
+        let event = scratch.propose(proposal.clone())?;
+        let record = scratch.task(&proposal.task_id).cloned().ok_or_else(|| {
+            TaskLifecycleError::Serialization(
+                "task record is missing after the admitted proposal".to_owned(),
+            )
+        })?;
+        let manifest_digest = production_manifest_digest()?;
+        let source_heads = self
+            .kernel
+            .campaign_source_heads(&record.task_id, recipe.binding.scope.as_str(), fence)
+            .await?;
+        let sources =
+            build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
+        let publications = complete_campaign_publications(&sources, owner_publications)?;
+        let envelope = task_envelope(
+            identity,
+            operation_id.clone(),
+            &event,
+            &record,
+            1,
+            manifest_digest.clone(),
+            Some(&sources.recipe),
+            Some(&sources),
+            Some(&publications),
+        )?;
+        self.commit_envelope(identity, operation_id, envelope, manifest_digest)
+            .await
+    }
+
     ///
     /// The command is validated against a scratch clone of the single task
     /// owner, including the task-revision compare-and-swap base carried by
@@ -590,6 +685,61 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             manifest_digest.clone(),
             None,
             None,
+            None,
+        )?;
+        self.commit_envelope(identity, operation_id, envelope, manifest_digest)
+            .await
+    }
+
+    /// Proposes a task and lets an owner-bound adapter assemble the complete
+    /// non-Task-Controller publication matrix after the Task Controller rows
+    /// have been built from the admitted transition.
+    pub async fn propose_task_with_complete_campaign_owner_materials<F>(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        proposal: TaskProposal,
+        recipe: LearningStateViewRecipe,
+        owner_builder: F,
+    ) -> Result<WriteReceipt, TaskLifecycleError>
+    where
+        F: FnOnce(&TaskControllerCampaignSources) -> Result<Vec<CampaignSourcePublication>, String>,
+    {
+        identity
+            .validate()
+            .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("request_identity")))?;
+        let fence = &identity.request.metadata.state_fence;
+        if &identity.request.state_fence != fence
+            || self.canonical.state_fence() != fence
+            || !fence.is_compatible_with(&proposal.context.state_fence)
+        {
+            return Err(TaskLifecycleError::Owner(TaskError::FenceMismatch));
+        }
+        let mut scratch = self.task.clone();
+        let event = scratch.propose(proposal.clone())?;
+        let record = scratch.task(&proposal.task_id).cloned().ok_or_else(|| {
+            TaskLifecycleError::Serialization(
+                "task record is missing after the admitted proposal".to_owned(),
+            )
+        })?;
+        let manifest_digest = production_manifest_digest()?;
+        let source_heads = self
+            .kernel
+            .campaign_source_heads(&record.task_id, recipe.binding.scope.as_str(), fence)
+            .await?;
+        let sources =
+            build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
+        let publications = complete_campaign_publications_from_builder(&sources, owner_builder)?;
+        let envelope = task_envelope(
+            identity,
+            operation_id.clone(),
+            &event,
+            &record,
+            1,
+            manifest_digest.clone(),
+            Some(&sources.recipe),
+            Some(&sources),
+            Some(&publications),
         )?;
         self.commit_envelope(identity, operation_id, envelope, manifest_digest)
             .await
@@ -648,12 +798,137 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             manifest_digest.clone(),
             Some(&sources.recipe),
             Some(&sources),
+            None,
         )?;
         self.commit_envelope(identity, operation_id, envelope, manifest_digest)
             .await
     }
 
-    /// Commits one admitted envelope and validates the returned receipt.
+    /// Applies a guarded task command while atomically retaining the complete
+    /// owner-role publication matrix on the same canonical task transition.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_task_with_complete_campaign_sources(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        task_id: TaskId,
+        context: TaskCommandContext,
+        command: TaskCommand,
+        recipe: LearningStateViewRecipe,
+        owner_publications: Vec<CampaignSourcePublication>,
+    ) -> Result<WriteReceipt, TaskLifecycleError> {
+        identity
+            .validate()
+            .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("request_identity")))?;
+        let fence = &identity.request.metadata.state_fence;
+        if &identity.request.state_fence != fence
+            || self.canonical.state_fence() != fence
+            || !fence.is_compatible_with(&context.state_fence)
+        {
+            return Err(TaskLifecycleError::Owner(TaskError::FenceMismatch));
+        }
+        let current = self
+            .task
+            .task(&task_id)
+            .ok_or_else(|| TaskLifecycleError::Owner(TaskError::TaskNotFound(task_id.clone())))?;
+        let expected_revision = context
+            .state_fence
+            .task_revision
+            .map_or(current.revision, TaskRevision::value);
+        let mut scratch = self.task.clone();
+        let event = scratch.apply(task_id.clone(), context, command)?;
+        let record = scratch.task(&task_id).cloned().ok_or_else(|| {
+            TaskLifecycleError::Serialization(
+                "task record is missing after the admitted transition".to_owned(),
+            )
+        })?;
+        let manifest_digest = production_manifest_digest()?;
+        let source_heads = self
+            .kernel
+            .campaign_source_heads(&record.task_id, recipe.binding.scope.as_str(), fence)
+            .await?;
+        let sources =
+            build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
+        let publications = complete_campaign_publications(&sources, owner_publications)?;
+        let envelope = task_envelope(
+            identity,
+            operation_id.clone(),
+            &event,
+            &record,
+            expected_revision,
+            manifest_digest.clone(),
+            Some(&sources.recipe),
+            Some(&sources),
+            Some(&publications),
+        )?;
+        self.commit_envelope(identity, operation_id, envelope, manifest_digest)
+            .await
+    }
+
+    /// Applies a guarded task command and lets an owner-bound adapter assemble
+    /// the complete non-Task-Controller publication matrix after the Task
+    /// Controller rows have been built from the admitted transition.
+    pub async fn apply_task_with_complete_campaign_owner_materials<F>(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        task_id: TaskId,
+        context: TaskCommandContext,
+        command: TaskCommand,
+        recipe: LearningStateViewRecipe,
+        owner_builder: F,
+    ) -> Result<WriteReceipt, TaskLifecycleError>
+    where
+        F: FnOnce(&TaskControllerCampaignSources) -> Result<Vec<CampaignSourcePublication>, String>,
+    {
+        identity
+            .validate()
+            .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("request_identity")))?;
+        let fence = &identity.request.metadata.state_fence;
+        if &identity.request.state_fence != fence
+            || self.canonical.state_fence() != fence
+            || !fence.is_compatible_with(&context.state_fence)
+        {
+            return Err(TaskLifecycleError::Owner(TaskError::FenceMismatch));
+        }
+        let current = self
+            .task
+            .task(&task_id)
+            .ok_or_else(|| TaskLifecycleError::Owner(TaskError::TaskNotFound(task_id.clone())))?;
+        let expected_revision = context
+            .state_fence
+            .task_revision
+            .map_or(current.revision, TaskRevision::value);
+        let mut scratch = self.task.clone();
+        let event = scratch.apply(task_id.clone(), context, command)?;
+        let record = scratch.task(&task_id).cloned().ok_or_else(|| {
+            TaskLifecycleError::Serialization(
+                "task record is missing after the admitted transition".to_owned(),
+            )
+        })?;
+        let manifest_digest = production_manifest_digest()?;
+        let source_heads = self
+            .kernel
+            .campaign_source_heads(&record.task_id, recipe.binding.scope.as_str(), fence)
+            .await?;
+        let sources =
+            build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
+        let publications = complete_campaign_publications_from_builder(&sources, owner_builder)?;
+        let envelope = task_envelope(
+            identity,
+            operation_id.clone(),
+            &event,
+            &record,
+            expected_revision,
+            manifest_digest.clone(),
+            Some(&sources.recipe),
+            Some(&sources),
+            Some(&publications),
+        )?;
+        self.commit_envelope(identity, operation_id, envelope, manifest_digest)
+            .await
+    }
+
     ///
     /// Only [`WriteReceiptStatus::Committed`] succeeds; every other status
     /// stays pending as a typed [`StoreFailure`]. A lost acknowledgement

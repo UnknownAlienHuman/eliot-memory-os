@@ -139,7 +139,8 @@ pub struct EvaluatorHoldoutPolicyProjection {
 
 /// Store-neutral, immutable source projection derived from a typed evaluation
 /// owner body. Its identity, revision, owner and digest cannot be caller-set.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProductEvaluationCampaignPublication {
     document: ProductEvaluationCampaignDocument,
     record_id: ContractId,
@@ -223,7 +224,8 @@ impl ProductEvaluationCampaignPublication {
 }
 
 /// Bundle of owner-derived source rows produced alongside one actual report.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProductEvaluationCampaignPublications {
     report: ProductEvaluationReport,
     evaluator_contract: ProductEvaluationCampaignPublication,
@@ -275,6 +277,87 @@ impl ProductEvaluationCampaignPublications {
     pub const fn evaluation_results(&self) -> &ProductEvaluationCampaignPublication {
         &self.evaluation_results
     }
+
+    /// Validate the complete owner bundle against the exact transition fence.
+    ///
+    /// Every native body, identity, revision, digest, and fence is re-derived
+    /// at this owner boundary; the wire representation is not owner proof.
+    pub fn validate_for_state_fence(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<(), ProductEvaluationError> {
+        validate_publication_fence(state_fence)?;
+        self.report.validate_content_addressed()?;
+        let ProductEvaluationCampaignDocument::EvaluatorContract(plan) =
+            self.evaluator_contract.document()
+        else {
+            return Err(ProductEvaluationError::InvalidText {
+                field: "campaign.evaluation.contract_document",
+            });
+        };
+        plan.validate()?;
+        let plan_revision = canonical_digest(plan)?;
+        validate_campaign_publication_binding(
+            &self.evaluator_contract,
+            &plan.plan_id,
+            &plan_revision,
+            &plan_revision,
+            state_fence,
+        )?;
+        let ProductEvaluationCampaignDocument::EvaluatorHoldout(policy) =
+            self.evaluator_holdout.document()
+        else {
+            return Err(ProductEvaluationError::InvalidText {
+                field: "campaign.evaluation.holdout_document",
+            });
+        };
+        policy.validate_against(plan)?;
+        let policy_digest = canonical_digest(policy)?;
+        validate_campaign_publication_binding(
+            &self.evaluator_holdout,
+            &plan.plan_id,
+            &plan_revision,
+            &policy_digest,
+            state_fence,
+        )?;
+        let ProductEvaluationCampaignDocument::EvaluationResults(report) =
+            self.evaluation_results.document()
+        else {
+            return Err(ProductEvaluationError::InvalidText {
+                field: "campaign.evaluation.results_document",
+            });
+        };
+        if report.as_ref() != &self.report {
+            return Err(ProductEvaluationError::ReportPlanMismatch);
+        }
+        let report_digest = canonical_digest(&self.report)?;
+        validate_campaign_publication_binding(
+            &self.evaluation_results,
+            &self.report.report_id,
+            &self.report.report_revision,
+            &report_digest,
+            state_fence,
+        )
+    }
+}
+
+fn validate_campaign_publication_binding(
+    publication: &ProductEvaluationCampaignPublication,
+    record_id: &ContractId,
+    revision: &str,
+    body_digest: &str,
+    state_fence: &StateFence,
+) -> Result<(), ProductEvaluationError> {
+    if publication.record_id() != record_id
+        || publication.revision() != revision
+        || publication.body_digest() != body_digest
+        || publication.recorded_state_fence() != state_fence
+    {
+        return Err(ProductEvaluationError::InvalidText {
+            field: "campaign.evaluation.publication_binding",
+        });
+    }
+    Ok(())
 }
 
 /// Derive a campaign source projection from the exact validated evaluation plan.

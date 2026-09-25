@@ -43,6 +43,6 @@ pub use task_controller::{
     TASK_CONTROLLER_ATTEMPT_WIRE_ID, TASK_CONTROLLER_ATTEMPT_WIRE_VERSION,
     TASK_CONTROLLER_INVOCATION_WIRE_ID, TASK_CONTROLLER_INVOCATION_WIRE_VERSION,
     TASK_CONTROLLER_RESULT_BODY_WIRE_ID, TASK_CONTROLLER_RESULT_BODY_WIRE_VERSION,
-    TaskControllerAction, TaskControllerAttempt, TaskControllerInvocation,
-    TaskControllerResultBody,
+    TaskControllerAction, TaskControllerAttempt, TaskControllerCampaignOwnerMaterials,
+    TaskControllerInvocation, TaskControllerResultBody,
 };
