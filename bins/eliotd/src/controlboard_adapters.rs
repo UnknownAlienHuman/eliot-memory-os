@@ -194,15 +194,112 @@ pub(crate) fn controlboard_read_intent(
     )
 }
 
+/// The board's closed refusal vocabulary, crossed onto the wire unchanged.
+///
+/// `ControlBoardError` is a `thiserror` type with no serde representation, so a
+/// refusal cannot be serialised as the board's own enum. Carrying only its
+/// `Display` text would collapse a typed failure into a string at this
+/// boundary, and `PLAN_GAP` would then be indistinguishable from
+/// `STALE_VIEW`/`UNAUTHORIZED` to any consumer that has to branch on it. This
+/// enum therefore keeps every refusal variant distinguishable by TYPE while
+/// `detail` keeps the board's own verbatim `Display` as the human-readable
+/// half.
+///
+/// It is a 1:1 cross of the board's existing variants, not a second
+/// vocabulary: no variant is added, renamed, merged or reordered, and no
+/// message text is invented here. The one extra variant,
+/// [`ControlBoardRefusal::CompositionUnavailable`], is the daemon composition's
+/// own lifecycle failure and is deliberately distinct from every board refusal
+/// so a lifecycle gap is never reported as a provider gap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlBoardRefusal {
+    /// A required provider adapter is absent; the detail names it.
+    PlanGap,
+    /// The caller's pinned view revision/fence diverged from the snapshot.
+    StaleView,
+    /// The access binding is stale or expired.
+    StaleAccess,
+    /// The state fence does not match its revision.
+    FenceMismatch,
+    /// The revision must be non-zero.
+    InvalidRevision,
+    /// A request field failed validation; the detail names the field.
+    InvalidField,
+    /// A projection identity is duplicated; the detail carries it.
+    DuplicateId,
+    /// An admitted privacy class is duplicated.
+    DuplicatePrivacyClass,
+    /// An action capability is duplicated.
+    DuplicateCapability,
+    /// A reference is duplicated.
+    DuplicateReference,
+    /// The action binding does not match the canonical action bytes.
+    ActionBindingMismatch,
+    /// The Swarm projection source digest does not match canonical bytes.
+    SwarmSourceDigestMismatch,
+    /// The action target is hidden or missing from the filtered view.
+    HiddenOrMissingTarget,
+    /// The action target has the wrong entity kind.
+    WrongTargetKind,
+    /// The review lifecycle transition is not permitted.
+    InvalidReviewTransition,
+    /// The command receipt binding or fence mismatched.
+    ReceiptBindingMismatch,
+    /// The command receipt exceeds the requested ceiling.
+    ReceiptOverclaim,
+    /// The same operation identity presented changed bytes.
+    IdentityConflict,
+    /// The provider denied the operation.
+    Unauthorized,
+    /// The provider outcome is unknown.
+    UnknownOutcome,
+    /// The provider reported a contract failure; the detail carries it.
+    Provider,
+    /// The daemon composition could not produce a board at this fence. This is
+    /// the daemon's own lifecycle observation, not a board refusal.
+    CompositionUnavailable,
+}
+
+impl ControlBoardRefusal {
+    /// Crosses one board refusal into its wire counterpart, total over the
+    /// board's closed `ControlBoardError` variants.
+    fn from_board_error(error: &ControlBoardError) -> Self {
+        match error {
+            ControlBoardError::PlanGap(_) => Self::PlanGap,
+            ControlBoardError::StaleView => Self::StaleView,
+            ControlBoardError::StaleAccess => Self::StaleAccess,
+            ControlBoardError::FenceMismatch => Self::FenceMismatch,
+            ControlBoardError::InvalidRevision => Self::InvalidRevision,
+            ControlBoardError::InvalidField(_) => Self::InvalidField,
+            ControlBoardError::DuplicateId(_) => Self::DuplicateId,
+            ControlBoardError::DuplicatePrivacyClass => Self::DuplicatePrivacyClass,
+            ControlBoardError::DuplicateCapability => Self::DuplicateCapability,
+            ControlBoardError::DuplicateReference => Self::DuplicateReference,
+            ControlBoardError::ActionBindingMismatch => Self::ActionBindingMismatch,
+            ControlBoardError::SwarmSourceDigestMismatch => Self::SwarmSourceDigestMismatch,
+            ControlBoardError::HiddenOrMissingTarget => Self::HiddenOrMissingTarget,
+            ControlBoardError::WrongTargetKind => Self::WrongTargetKind,
+            ControlBoardError::InvalidReviewTransition => Self::InvalidReviewTransition,
+            ControlBoardError::ReceiptBindingMismatch => Self::ReceiptBindingMismatch,
+            ControlBoardError::ReceiptOverclaim => Self::ReceiptOverclaim,
+            ControlBoardError::IdentityConflict => Self::IdentityConflict,
+            ControlBoardError::Unauthorized => Self::Unauthorized,
+            ControlBoardError::UnknownOutcome => Self::UnknownOutcome,
+            ControlBoardError::Provider(_) => Self::Provider,
+        }
+    }
+}
+
 /// One served `ControlBoard` read outcome, exactly as the board produced it.
 ///
 /// `View` is the canonical role-filtered [`ControlBoardView`] from the single
 /// snapshot the seam read, encoded 1:1: no row is added, dropped, re-projected,
 /// merged, or health-synthesised, and no hidden-row count, identifier, summary,
 /// or ordering side channel is introduced here. `Refused` reproduces the
-/// board's own exact typed failure verbatim, so a `PLAN_GAP` naming the missing
-/// owner reaches the caller as that same typed refusal instead of an empty
-/// current view. The two shapes are exhaustive and never interchangeable.
+/// board's own exact typed failure, so a `PLAN_GAP` naming the missing owner
+/// reaches the caller as that same typed refusal instead of an empty current
+/// view. The two shapes are exhaustive and never interchangeable.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlBoardReadOutcome {
@@ -211,9 +308,10 @@ pub enum ControlBoardReadOutcome {
         /// The canonical view the board returned, crossed unchanged.
         view: Box<ControlBoardView>,
     },
-    /// The board refused the read; its exact typed error text, reproduced
-    /// verbatim from the closed per-variant `Display`.
+    /// The board refused the read.
     Refused {
+        /// Which board refusal this is, kept typed on the wire.
+        refusal: ControlBoardRefusal,
         /// The board's own refusal text, never a re-worded or generic code.
         detail: String,
     },
@@ -265,6 +363,7 @@ fn controlboard_read_outcome(
         Ok(controlboard) => controlboard,
         Err(error) => {
             return ControlBoardReadOutcome::Refused {
+                refusal: ControlBoardRefusal::CompositionUnavailable,
                 detail: format!("daemon controlboard composition unavailable: {error}"),
             };
         }
@@ -275,10 +374,12 @@ fn controlboard_read_outcome(
                 view: Box::new(view),
             },
             Err(error) => ControlBoardReadOutcome::Refused {
+                refusal: ControlBoardRefusal::from_board_error(&error),
                 detail: error.to_string(),
             },
         },
         Err(error) => ControlBoardReadOutcome::Refused {
+            refusal: ControlBoardRefusal::from_board_error(&error),
             detail: error.to_string(),
         },
     }
@@ -329,13 +430,17 @@ fn controlboard_refusal_body(
     // Last-resort body for local construction failures: the same refused
     // shape, bounded detail, and digest binding as every other refusal, so a
     // malformed outcome still settles through the submit leg instead of
-    // dropping the claimed pair.
+    // dropping the claimed pair. The variant is the board's own detail-only
+    // `Provider` refusal, because a local construction failure is exactly what
+    // that variant already means.
     let outcome = ControlBoardReadOutcome::Refused {
+        refusal: ControlBoardRefusal::Provider,
         detail: detail.chars().take(512).collect::<String>(),
     };
     controlboard_result_body(envelope, attempt, &outcome).unwrap_or_else(|_| {
         let response = serde_json::json!({
             "refused": {
+                "refusal": "provider",
                 "detail": detail.chars().take(512).collect::<String>(),
             }
         });
