@@ -81,6 +81,18 @@ const RESTORE_DESTINATION_CLASS: &str = "ISOLATED_RESTORE";
 /// Closed isolation state label stored in the durable fence document.
 const RESTORE_ISOLATION_STATE: &str = "ISOLATED";
 
+/// Ceiling on distinct operation identities the shared projection may track at
+/// once.
+///
+/// The in-process attempt map is keyed by admitted-but-caller-supplied operation
+/// ids and is process-lifetime, so a caller that keeps failing with fresh ids is
+/// refused rather than allowed to grow memory without limit. It reuses the batch
+/// ceiling: one restore batch already bounds the member set of a single
+/// operation, so the projection never needs to track more live operation
+/// identities than that bound. Re-attempting a known identity reuses its slot and
+/// never grows the map.
+const MAX_RESTORE_TRACKED_ATTEMPTS: usize = MAX_RESTORE_BATCH_MEMBERS;
+
 /// Closed per-member disposition of one canonical restore batch.
 ///
 /// The frozen [`CanonicalRestoreBatch`] contract carries exactly one archive
@@ -596,14 +608,20 @@ struct StoredRestoreEntry {
     receipt: RestoreValidationReceipt,
 }
 
-/// One in-flight attempt of an operation identity.
+/// One in-process attempt record of an operation identity.
 ///
 /// It exists only to serialize concurrent same-operation attempts inside this
 /// process and to preserve the *original* failure across bounded, cancelled and
-/// retried attempts. It is never a receipt and never an outcome.
+/// retried attempts. It is never a receipt and never an outcome. A record left
+/// behind by a finished attempt is bounded evidence, not a lock: it never
+/// blocks a retry from reaching the provider's own durable reconciliation
+/// readback, which is the only authority on whether the earlier attempt
+/// committed.
 #[derive(Clone, Debug)]
 struct RestoreAttempt {
     phase: String,
+    /// True only while an attempt of this identity is still running here.
+    in_flight: bool,
     original_failure: Option<RestoreFailureRecord>,
 }
 
@@ -615,7 +633,10 @@ struct RestoreAttempt {
 /// record rows are create-only, so a confirmed receipt is immutable: the cache
 /// may only rescue availability when the provider is temporarily unreachable,
 /// and it never decides whether an operation committed. Every verdict the port
-/// returns is derived from the provider.
+/// returns is derived from the provider. A retained attempt record is likewise
+/// not a gate: it refuses only a genuinely concurrent attempt and is bounded by
+/// [`MAX_RESTORE_TRACKED_ATTEMPTS`], so a failed apply never makes its own
+/// operation identity permanently un-retryable.
 #[derive(Clone, Debug, Default)]
 pub struct RestoreLedger {
     entries: HashMap<String, StoredRestoreEntry>,
@@ -729,31 +750,59 @@ pub fn shared_restore_ledger() -> &'static Mutex<RestoreLedger> {
 ///
 /// The projection lock is taken only for the duration of this map update: it is
 /// never held across a provider await, so a restore can never deadlock against
-/// its own readback. A second in-process attempt of the same operation identity
-/// while one is in flight is refused with retryable unavailability; the durable
-/// readback, not a local guess, decides the answer.
+/// its own readback. A *concurrent* second in-process attempt of the same
+/// operation identity while one is still in flight is refused with retryable
+/// unavailability.
+///
+/// A retained original failure is deliberately **not** a gate. Refusing here
+/// would make a failed apply permanently un-retryable, so the retry instead
+/// falls through to the provider's durable reconciliation readback: that
+/// readback, not a local marker, is the only thing that can honestly say
+/// whether the earlier attempt committed. The original class stays reportable
+/// through [`original_failure`].
+///
+/// The map is bounded by [`MAX_RESTORE_TRACKED_ATTEMPTS`]; a fresh identity
+/// arriving at the ceiling is refused instead of growing the map.
 fn begin_attempt(key: &str, phase: &str) -> Result<(), StoreError> {
     let mut ledger = shared_restore_ledger()
         .lock()
         .map_err(|_| unknown_outcome(key))?;
-    if ledger.attempts.contains_key(key) {
+    if ledger
+        .attempts
+        .get(key)
+        .is_some_and(|attempt| attempt.in_flight)
+    {
         return Err(StoreError::Unavailable);
+    }
+    // A retry of a known identity reuses its own slot: the retained original
+    // failure survives the new attempt, and the map does not grow. Only a key
+    // that is not tracked yet competes for the bounded capacity.
+    let retained = ledger
+        .attempts
+        .get(key)
+        .and_then(|attempt| attempt.original_failure.clone());
+    if retained.is_none() && ledger.attempts.len() >= MAX_RESTORE_TRACKED_ATTEMPTS {
+        return Err(StoreError::PayloadTooLarge);
     }
     ledger.attempts.insert(
         key.to_owned(),
         RestoreAttempt {
             phase: phase.to_owned(),
-            original_failure: None,
+            in_flight: true,
+            original_failure: retained,
         },
     );
     Ok(())
 }
 
-/// Clears the in-flight marker, preserving the first observed failure.
+/// Closes one attempt, preserving the first observed failure.
 ///
-/// A successful attempt clears the marker entirely; a failed one keeps it so a
-/// later bounded, cancelled or retried attempt reports the *original* failure
-/// class rather than a newer one.
+/// A successful attempt is evicted entirely. A failed one is retained only as
+/// bounded evidence of *why* the operation first failed and is marked no longer
+/// in flight, so a retry of the same identity is admitted and reaches the
+/// durable reconciliation readback instead of being permanently refused. The
+/// first observed class wins, so a bounded, cancelled or retried attempt still
+/// reports the original failure rather than a newer one.
 fn end_attempt(key: &str, failure: Option<&StoreError>) {
     let Ok(mut ledger) = shared_restore_ledger().lock() else {
         return;
@@ -765,6 +814,7 @@ fn end_attempt(key: &str, failure: Option<&StoreError>) {
     let Some(attempt) = ledger.attempts.get_mut(key) else {
         return;
     };
+    attempt.in_flight = false;
     if attempt.original_failure.is_some() {
         return;
     }
@@ -1307,10 +1357,48 @@ async fn execute_restore_read(
     let mut response = crate::client::query(transport, config, operation, statement, bindings)
         .await
         .map_err(AdapterError::into_store_error)?;
-    if !response.take_errors().is_empty() {
-        return Err(StoreError::Unavailable);
+    let errors = response.take_errors();
+    if !errors.is_empty() {
+        // A read performs no mutation, so an unclassified provider rejection is
+        // honest unavailability rather than an ambiguous commit — but a typed
+        // rejection keeps its typed code instead of being collapsed into one.
+        return Err(classify_restore_errors(&errors, StoreError::Unavailable));
     }
     Ok(response)
+}
+
+/// Classifies the provider statement errors of one closed restore operation.
+///
+/// The read and write paths share one closed classification, so a typed provider
+/// rejection is never collapsed into a generic code on either lane: a
+/// duplicate/unique-index rejection means a concurrent winner owns the row (an
+/// identity conflict), a lost destination compare-and-set is a revision
+/// conflict, and an absent destination fence refuses the operation. `fallback`
+/// is the fail-closed answer for anything unclassified; it differs per lane
+/// because a read mutated nothing while a write leaves its commit ambiguous.
+fn classify_restore_errors(errors: &[String], fallback: StoreError) -> StoreError {
+    if errors
+        .iter()
+        .any(|error| crate::client::is_restore_duplicate(error))
+    {
+        return StoreError::IdentityConflict;
+    }
+    if errors
+        .iter()
+        .any(|error| crate::client::is_restore_fence_race(error))
+    {
+        return StoreError::RevisionConflict;
+    }
+    if errors
+        .iter()
+        .any(|error| crate::client::is_restore_destination_absent(error))
+    {
+        return StoreError::InvalidField {
+            field: "restore.destination_id",
+            reason: "isolated destination is not prepared",
+        };
+    }
+    fallback
 }
 
 /// Executes one closed restore write operation on the pooled normal-write lane.
@@ -1336,30 +1424,12 @@ async fn execute_restore_write(
     if errors.is_empty() {
         return Ok(());
     }
-    if errors
-        .iter()
-        .any(|error| crate::client::is_restore_duplicate(error))
-    {
-        return Err(StoreError::IdentityConflict);
-    }
-    if errors
-        .iter()
-        .any(|error| crate::client::is_restore_fence_race(error))
-    {
-        return Err(StoreError::RevisionConflict);
-    }
-    if errors
-        .iter()
-        .any(|error| crate::client::is_restore_destination_absent(error))
-    {
-        return Err(StoreError::InvalidField {
-            field: "restore.destination_id",
-            reason: "isolated destination is not prepared",
-        });
-    }
     // Any other statement error leaves the commit outcome ambiguous: the port
     // never reports success, non-application, or a fabricated receipt.
-    Err(StoreError::MissingReceiptEnvelope)
+    Err(classify_restore_errors(
+        &errors,
+        StoreError::MissingReceiptEnvelope,
+    ))
 }
 
 /// Reads one exact registry row, returning `None` only on a positive
@@ -1674,7 +1744,73 @@ fn check_record_binding(
     Ok(())
 }
 
+/// Re-derives completeness and disposition from the per-member durable records a
+/// document actually carries.
+///
+/// The stored scalars are never trusted as the source of the verdict. A
+/// member-set obligation resolves one disposition for the whole set, so an
+/// honest document carries exactly one observed per-member disposition, and the
+/// per-member tally must be exactly the durable denominator. A document whose
+/// members disagree with each other, with the denominator, or that claims
+/// `Complete` beside unresolved members is rejected rather than reported ready.
+fn observed_outcome(
+    document: &RestoreRecordDocument,
+    denominator: &RestoreDenominator,
+) -> Result<(SnapshotCompleteness, StoreMutationDisposition), StoreError> {
+    let mut observed: Option<MemberDisposition> = None;
+    let mut restored = 0_u64;
+    let mut suppressed = 0_u64;
+    let mut unresolved = 0_u64;
+    for member in &document.members {
+        match member.disposition {
+            MemberDisposition::Restored => restored = restored.saturating_add(1),
+            MemberDisposition::Suppressed => suppressed = suppressed.saturating_add(1),
+            MemberDisposition::Unresolved => unresolved = unresolved.saturating_add(1),
+        }
+        if let Some(first) = observed {
+            if first != member.disposition {
+                return Err(StoreError::InvalidReceipt);
+            }
+        } else {
+            observed = Some(member.disposition);
+        }
+    }
+    // The per-member tally is the observation; the denominator only agrees with
+    // it when the record is honest.
+    if restored != denominator.restored
+        || suppressed != denominator.suppressed
+        || unresolved != denominator.unresolved
+    {
+        return Err(StoreError::InvalidReceipt);
+    }
+    match observed {
+        Some(MemberDisposition::Restored) => Ok((
+            SnapshotCompleteness::Complete,
+            StoreMutationDisposition::Committed,
+        )),
+        Some(MemberDisposition::Suppressed) => Ok((
+            SnapshotCompleteness::Complete,
+            StoreMutationDisposition::ProvenNotApplied,
+        )),
+        Some(MemberDisposition::Unresolved) => Ok((
+            SnapshotCompleteness::Partial,
+            StoreMutationDisposition::Partial,
+        )),
+        // A member set is non-empty by admission and its length was already
+        // matched against the denominator, so an empty observation is
+        // manufactured accounting rather than an empty restore.
+        None => Err(StoreError::InvalidReceipt),
+    }
+}
+
 /// Projects the store-neutral receipt from the exact durable record.
+///
+/// Completeness and disposition are **re-derived** from the members the record
+/// actually carries, never copied from its stored scalars: a digest-valid row
+/// claiming `Complete` beside unresolved members would otherwise be propagated
+/// as ready, and the receipt contract enforces only `unresolved == 0` implies
+/// `Complete`, not the converse. The stored values are then cross-checked
+/// against the derivation and any disagreement fails closed.
 fn receipt_from_document(
     document: &RestoreRecordDocument,
     batch: &CanonicalRestoreBatch,
@@ -1687,6 +1823,10 @@ fn receipt_from_document(
     if document.members.len() as u64 != batch.member_count {
         return Err(StoreError::InvalidReceipt);
     }
+    let (completeness, disposition) = observed_outcome(document, &denominator)?;
+    if document.completeness != completeness || document.disposition != disposition {
+        return Err(StoreError::InvalidReceipt);
+    }
     let receipt = RestoreValidationReceipt {
         operation: document.operation.clone(),
         destination: batch.destination.clone(),
@@ -1694,8 +1834,8 @@ fn receipt_from_document(
         resolved_members: denominator.resolved(),
         unresolved_members: denominator.unresolved,
         denominator_members: denominator.total,
-        completeness: document.completeness,
-        disposition: document.disposition,
+        completeness,
+        disposition,
     };
     receipt.validate().map_err(redact_store_error)?;
     Ok(receipt)
@@ -1818,19 +1958,31 @@ fn destination_after_phase(
     })
 }
 
-/// Builds a reconciliation record from a provider-verified receipt.
+/// Builds a reconciliation record from a provider-verified cached receipt.
+///
+/// The cache is keyed by operation id alone, so the entry is **re-verified
+/// against `first`** exactly the way the durable path re-verifies the record: a
+/// cached operation id or canonical request hash that differs from the claim
+/// being reconciled answers a question the caller never asked, so it is an
+/// identity conflict rather than an answer. `outcome` is the classification
+/// already derived from `first` against `second` and is carried through
+/// unchanged, so a computed conflict can never be dropped in favour of the
+/// cached receipt's own verdict. When the entry cannot be shown to belong to
+/// `first`, the only honest answers are this refusal or an unknown outcome.
 fn reconciliation_from_receipt(
     receipt: &RestoreValidationReceipt,
+    first: &OperationIdentity,
     second: &OperationIdentity,
+    outcome: ReconciliationOutcome,
 ) -> Result<BackupOperationReconciliation, StoreError> {
-    let outcome = if receipt.operation.canonical_request_hash == second.canonical_request_hash {
-        ReconciliationOutcome::ReplayIdentity
-    } else {
-        ReconciliationOutcome::IdentityConflict
-    };
+    if receipt.operation.operation_id != first.operation_id
+        || receipt.operation.canonical_request_hash != first.canonical_request_hash
+    {
+        return Err(StoreError::IdentityConflict);
+    }
     let reconciliation = BackupOperationReconciliation {
-        operation: receipt.operation.clone(),
-        first_digest: receipt.operation.canonical_request_hash.clone(),
+        operation: first.clone(),
+        first_digest: first.canonical_request_hash.clone(),
         second_digest: second.canonical_request_hash.clone(),
         outcome,
     };
@@ -2035,8 +2187,14 @@ impl IsolatedRestorePort for SurrealStoreAdapter {
         // No durable record is not proof of non-commit. A cached
         // provider-verified receipt is the only admitted answer, because a
         // confirmed receipt is immutable and create-only.
+        //
+        // The cache is re-verified here rather than trusted: it is keyed by
+        // operation id alone, so an entry cached under a different canonical
+        // request hash would otherwise answer for a claim the caller never
+        // made, and the conflict already computed from `first` against
+        // `second` would be discarded in favour of that entry's own verdict.
         if let Some(receipt) = cached_receipt(&first) {
-            return reconciliation_from_receipt(&receipt, &second);
+            return reconciliation_from_receipt(&receipt, &first, &second, outcome);
         }
         Err(StoreError::MissingReceiptEnvelope)
     }
