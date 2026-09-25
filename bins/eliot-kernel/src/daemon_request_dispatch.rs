@@ -1509,6 +1509,27 @@ impl KernelComposition {
         Ok(())
     }
 
+    /// Revokes daemon-dependent effect admission after the progress route
+    /// reports terminal supervision lease expiry (issue #88, A6).
+    ///
+    /// Uses the same production revocation as the degraded/failed paths:
+    /// removing the promoted agent-bridge profile revokes every pending
+    /// connection from the expired lineage. `ProbeReady` already fails closed
+    /// on the expired marker, so no new admission can be promoted until a
+    /// new admitted generation rebinds and clears the marker. The caller
+    /// retains progress (releasing the runtime lock) before this runs, so
+    /// the bridge locks are taken after, matching the degraded/failed
+    /// order.
+    #[cfg(windows)]
+    fn revoke_supervision_expired_effect_admission(&self) -> Result<(), TransportError> {
+        self.promote_agent_bridge_profile(None)?;
+        observe_daemon_request(
+            "kernel.daemon.supervision_expired_effects_revoked",
+            "success",
+        );
+        Ok(())
+    }
+
     /// Answers a refused renewal with its stable code plus the exact durable
     /// head. A refusal never mints authority and never asserts process death;
     /// terminal lease expiry additionally marks the supervision claim so the
@@ -1617,6 +1638,9 @@ impl KernelComposition {
                     Some(request.observation.clone()),
                     Some(expired),
                 )?;
+                if expired {
+                    self.revoke_supervision_expired_effect_admission()?;
+                }
                 return self.progress_refusal_answer(&lease_id, &error);
             }
             Err(SupervisionProgressRenewalError::Authority(_)) => {
