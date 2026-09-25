@@ -22,12 +22,24 @@
 //! ```
 //!
 //! The only cross-crate backup dependency here is the already-available
-//! [`eliot_protocol::backup`] vocabulary (`BackupOperationKind` plus the
-//! bounded payload ceiling). Everything else — owner tables, peer
-//! expectations, admission domains, replay ledger, timeout kinds — is local
-//! to this file so the Kernel composition root binds actual clients without
-//! touching Host/Watchdog implementations, private databases, or new
-//! auth/transport.
+//! [`eliot_protocol::backup`] vocabulary (`BackupOperationKind`,
+//! `BackupRole`, `BackupStage`, the role/attester projections, the
+//! transport-acknowledgement refusal, and the bounded payload ceiling).
+//! Everything else — peer expectations, admission domains, the byte-replay
+//! ledger, timeout kinds — is local to this file so the Kernel composition
+//! root binds actual clients without touching Host/Watchdog
+//! implementations, private databases, or new auth/transport.
+//!
+//! Role binding (#954): admission here is driven by the protocol's own
+//! role-bound contract, not by a local capability string. Each owner is
+//! bound exactly once to one [`eliot_protocol::backup::BackupRole`], that
+//! role must be an attesting role, the role's capability projection is a
+//! necessary condition for every admitted effect, and a transport
+//! acknowledgement is refused for every acknowledgement phase. The closed
+//! per-owner accepted tables stay as a *narrowing* constraint (they are a
+//! real owner fact from the Host/Watchdog accepted registrations); the
+//! protocol role matrix is a *necessary* condition on top of them, so a
+//! role can never fabricate another role's authority.
 //!
 //! Fail-closed posture: production constructors bind the exact canonical
 //! pipe plus the exact peer expectation. Any fake, no-op, mock, default, or
@@ -42,7 +54,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use eliot_protocol::backup::{BackupOperationKind, MAX_BACKUP_PAYLOAD_BYTES};
+use eliot_protocol::AckPhase;
+use eliot_protocol::backup::{
+    BackupOperationKind, BackupRole, BackupStage, MAX_BACKUP_PAYLOAD_BYTES,
+};
 
 /// Canonical Host backup pipe: the exact Host runtime-control pipe name.
 ///
@@ -148,6 +163,69 @@ pub enum OwnerClientError {
         /// Timeout bound in milliseconds.
         timeout_ms: u64,
     },
+    /// The bound owner's authenticated protocol role does not carry the
+    /// requested capability. Distinct from a fence, identity, operation, or
+    /// bound failure: no authority exists for the request at all.
+    CapabilityDenied,
+    /// A fence, epoch, or admission binding presented by the owner
+    /// diverged from the bound fence. Stale evidence refuses.
+    FenceMismatch,
+    /// An operation identity does not match its typed operation. A request
+    /// can never select an operation it did not bind.
+    OperationMismatch,
+    /// A supplied value diverged from the bound backup identity. The
+    /// bounded field path names the divergence class, never its content.
+    IdentityMismatch {
+        /// Stable field path that diverged from the bound identity.
+        field: &'static str,
+    },
+    /// A supplied value exceeded its bounded wire limit. The bounded field
+    /// path names the limit that was crossed.
+    LimitExceeded {
+        /// Stable field path that crossed its bound.
+        field: &'static str,
+    },
+    /// A required protocol field was absent or malformed. Both field path
+    /// and reason come from the protocol's own bounded vocabulary.
+    ProtocolFieldRejected {
+        /// Stable field path.
+        field: &'static str,
+        /// Stable bounded reason.
+        reason: &'static str,
+    },
+    /// The existing generic protocol envelope owner rejected a mapped
+    /// value. The typed source is preserved, never collapsed to a string.
+    ProtocolEnvelopeRejected {
+        /// Typed protocol envelope refusal.
+        source: eliot_protocol::ProtocolError,
+    },
+    /// A foundation contract rejected an identity, fence, or contract
+    /// value. The typed source is preserved, never collapsed to a string.
+    FoundationContractRejected {
+        /// Typed foundation contract refusal.
+        source: eliot_contracts::ContractError,
+    },
+    /// Canonical serialization of a protocol value failed. The bounded
+    /// reason comes from the serializer and names no archive content.
+    ProtocolSerializationRejected {
+        /// Bounded serializer reason.
+        reason: String,
+    },
+    /// A transport acknowledgement phase was presented where semantic
+    /// backup progress was required. No acknowledgement phase — including
+    /// `DURABLE` and `APPLIED` — establishes capture, restore, or
+    /// reconciliation success. The typed phase is preserved.
+    TransportAckIsNotSuccess {
+        /// The exact acknowledgement phase that was refused.
+        phase: AckPhase,
+    },
+    /// The bound owner's role is not an admitted attester for a lifecycle
+    /// stage its own accepted table can advance. One owner can never attest
+    /// another owner's phase.
+    PhaseNotAttestedByOwner {
+        /// The exact protocol lifecycle stage the owner may not attest.
+        stage: BackupStage,
+    },
 }
 
 impl fmt::Display for OwnerClientError {
@@ -187,6 +265,50 @@ impl fmt::Display for OwnerClientError {
             Self::TimeoutAfterSend { op, timeout_ms } => write!(
                 formatter,
                 "owner send of {op} timed out after send after {timeout_ms}ms: reconcile by identity"
+            ),
+            Self::CapabilityDenied => write!(
+                formatter,
+                "owner protocol role does not carry the requested capability"
+            ),
+            Self::FenceMismatch => {
+                write!(formatter, "owner fence or admission binding mismatch")
+            }
+            Self::OperationMismatch => write!(
+                formatter,
+                "owner operation identity does not match its typed operation"
+            ),
+            Self::IdentityMismatch { field } => {
+                write!(
+                    formatter,
+                    "owner value diverges from the bound identity: {field}"
+                )
+            }
+            Self::LimitExceeded { field } => {
+                write!(formatter, "owner value exceeds its bound: {field}")
+            }
+            Self::ProtocolFieldRejected { field, reason } => {
+                write!(formatter, "owner protocol field refused: {field}: {reason}")
+            }
+            Self::ProtocolEnvelopeRejected { source } => {
+                write!(
+                    formatter,
+                    "owner protocol envelope refused the value: {source}"
+                )
+            }
+            Self::FoundationContractRejected { source } => write!(
+                formatter,
+                "owner foundation contract refused the value: {source}"
+            ),
+            Self::ProtocolSerializationRejected { reason } => {
+                write!(formatter, "owner protocol serialization refused: {reason}")
+            }
+            Self::TransportAckIsNotSuccess { phase } => write!(
+                formatter,
+                "transport acknowledgement {phase} is never backup semantic success"
+            ),
+            Self::PhaseNotAttestedByOwner { stage } => write!(
+                formatter,
+                "owner role is not an admitted attester for lifecycle stage {stage:?}"
             ),
         }
     }
@@ -228,6 +350,78 @@ impl OwnerRole {
             Self::Watchdog => WATCHDOG_SUPPORTED_OPS,
         }
     }
+
+    /// The exact authenticated protocol role this owner channel carries.
+    ///
+    /// This is a closed two-entry table read off the protocol's own role
+    /// tables, never a capability search and never a payload claim. The
+    /// binding is defined exactly once, here:
+    ///
+    /// - Host carries the installation authority. I5.13 gives the Host the
+    ///   installation epoch and activation lineage, and
+    ///   `attesting_roles(CutoverAdmitted)` admits the installation
+    ///   authority alone — the only role whose closed capability projection
+    ///   carries `AdmitCutover` at all. The Host accepted table carries
+    ///   `AdmitCutover`, so the installation authority is the only role that
+    ///   can be the Host channel's authenticated role.
+    /// - Watchdog carries the spool owner. I5.13 binds the unreconciled
+    ///   critical signal/intent spool to a `WatchdogSpoolFence`, so the
+    ///   Watchdog is the spool owner, and
+    ///   `attesting_roles(RestoreStepApplied | Reconciled)` admits the spool
+    ///   owner alongside the store and ORS owners. The Watchdog accepted
+    ///   table carries `ReconcileRestore`, whose establishing stage is
+    ///   `Reconciled`.
+    ///
+    /// The projection is deliberately not widened: an operation the mapped
+    /// role does not carry is refused at effect time even when the owner's
+    /// local accepted table lists it.
+    #[must_use]
+    pub const fn protocol_role(self) -> BackupRole {
+        match self {
+            Self::Host => BackupRole::InstallationAuthority,
+            Self::Watchdog => BackupRole::SpoolOwner,
+        }
+    }
+}
+
+/// Maps one typed [`eliot_protocol::backup::BackupError`] onto the
+/// owner-channel error vocabulary without collapsing any class.
+///
+/// Every protocol refusal class keeps its own owner-channel class: a
+/// capability denial, a fence or admission mismatch, an operation mismatch,
+/// an identity divergence, a replay conflict, a bound violation, a field
+/// rejection, and the two typed transport/contract refusals never merge into
+/// one generic error or into a rendered string. Bounded field paths and
+/// stable reasons are carried through verbatim from the protocol, and the two
+/// typed source errors are carried as typed values.
+#[must_use]
+pub fn map_protocol_backup_error(error: eliot_protocol::backup::BackupError) -> OwnerClientError {
+    match error {
+        eliot_protocol::backup::BackupError::CapabilityDenied => OwnerClientError::CapabilityDenied,
+        eliot_protocol::backup::BackupError::FenceMismatch => OwnerClientError::FenceMismatch,
+        eliot_protocol::backup::BackupError::OperationMismatch => {
+            OwnerClientError::OperationMismatch
+        }
+        eliot_protocol::backup::BackupError::Mismatch { field } => {
+            OwnerClientError::IdentityMismatch { field }
+        }
+        eliot_protocol::backup::BackupError::ReplayConflict => OwnerClientError::ReplayConflict,
+        eliot_protocol::backup::BackupError::LimitExceeded(field) => {
+            OwnerClientError::LimitExceeded { field }
+        }
+        eliot_protocol::backup::BackupError::InvalidField { field, reason } => {
+            OwnerClientError::ProtocolFieldRejected { field, reason }
+        }
+        eliot_protocol::backup::BackupError::Protocol(source) => {
+            OwnerClientError::ProtocolEnvelopeRejected { source }
+        }
+        eliot_protocol::backup::BackupError::Foundation(source) => {
+            OwnerClientError::FoundationContractRejected { source }
+        }
+        eliot_protocol::backup::BackupError::Serialization(reason) => {
+            OwnerClientError::ProtocolSerializationRejected { reason }
+        }
+    }
 }
 
 /// Returns true when the presented pipe text carries a fake, no-op, mock,
@@ -261,8 +455,123 @@ fn looks_fake(pipe: &str) -> bool {
     MARKERS.iter().any(|marker| lowered.contains(marker))
 }
 
+/// The closed lifecycle-stage traversal list of the protocol backup
+/// boundary.
+///
+/// This is a traversal list, never a second definition: every entry is an
+/// [`eliot_protocol::backup::BackupStage`] value, and both the operation a
+/// stage establishes and the roles admitted to attest it are read back out
+/// of the protocol's own `operation_for_phase` and `attesting_roles`
+/// projections. A stage the protocol adds later is simply not traversed
+/// here, which can only narrow the coherence check below, never widen it.
+const BACKUP_LIFECYCLE_STAGES: &[BackupStage] = &[
+    BackupStage::Requested,
+    BackupStage::Captured,
+    BackupStage::Verified,
+    BackupStage::RestorePrepared,
+    BackupStage::RestoreStepApplied,
+    BackupStage::Reconciled,
+    BackupStage::RehearsalComplete,
+    BackupStage::CutoverAdmitted,
+];
+
+/// The closed transport-acknowledgement phase traversal list.
+///
+/// A traversal list of the protocol transport's own `AckPhase` values, used
+/// to prove the acknowledgement refusal below over every phase. A phase the
+/// transport adds later is not traversed here, which can only narrow the
+/// proof, never widen it.
+const TRANSPORT_ACK_PHASES: &[AckPhase] = &[
+    AckPhase::Received,
+    AckPhase::Durable,
+    AckPhase::Normalized,
+    AckPhase::Applied,
+    AckPhase::Rejected,
+    AckPhase::Unknown,
+];
+
+/// Proves, once per owner binding, that a transport acknowledgement is never
+/// backup semantic success at any phase.
+///
+/// The refusal is consumed from the protocol's versioned wire mapping
+/// rather than re-implemented here: `ack_phase_stage` is asked for the
+/// lifecycle stage each acknowledgement phase establishes, and any `Some`
+/// answer refuses the binding. A transport acknowledgement — including
+/// `DURABLE` and `APPLIED` — therefore cannot be promoted to capture,
+/// restore, rehearsal, or reconciliation success on this channel. Semantic
+/// progress requires an owner attestation, never an acknowledgement.
+fn check_transport_ack_refusal() -> Result<(), OwnerClientError> {
+    for phase in TRANSPORT_ACK_PHASES {
+        if eliot_protocol::backup::ack_phase_stage(*phase).is_some() {
+            return Err(OwnerClientError::TransportAckIsNotSuccess { phase: *phase });
+        }
+    }
+    Ok(())
+}
+
+/// Binds one owner to its exact authenticated protocol role and proves the
+/// binding before any client exists.
+///
+/// The role is the closed projection from
+/// [`OwnerRole::protocol_role`], and it must be an attesting role: the
+/// requester and the forensic Host role only request, observe, and query,
+/// so neither may own a channel that admits effects. Then the owner's local
+/// accepted table is checked against the protocol's own role projections:
+/// every table entry the role actually carries must be a stage the role is
+/// an admitted attester for, so a channel can never claim to advance a
+/// lifecycle phase its role may not attest. Table entries the role does not
+/// carry are not fatal here; they refuse individually at effect time.
+fn check_owner_role_admission(role: OwnerRole) -> Result<(), OwnerClientError> {
+    let protocol_role = role.protocol_role();
+    if !protocol_role.is_attesting_role() {
+        // The refusal is expressed in the protocol's own typed refusal class
+        // and mapped once, so the capability denial has exactly one
+        // owner-channel spelling and is never re-implemented here.
+        return Err(map_protocol_backup_error(
+            eliot_protocol::backup::BackupError::CapabilityDenied,
+        ));
+    }
+    for operation in role.supported_ops() {
+        if !protocol_role.permits(*operation) {
+            continue;
+        }
+        for stage in BACKUP_LIFECYCLE_STAGES {
+            if eliot_protocol::backup::operation_for_phase(*stage) != *operation {
+                continue;
+            }
+            if !eliot_protocol::backup::attesting_roles(*stage).contains(&protocol_role) {
+                return Err(OwnerClientError::PhaseNotAttestedByOwner { stage: *stage });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Requires, for one admitted effect, that the owner's authenticated
+/// protocol role is an attesting role and actually carries the operation.
+///
+/// This is the necessary protocol condition for every admitted effect. The
+/// caller's own closed accepted table is a separate, additional narrowing.
+/// The refusal is expressed in the protocol's own typed refusal class and
+/// mapped once through [`map_protocol_backup_error`], so a capability denial
+/// keeps one spelling end to end and is never re-implemented here.
+fn check_role_permits_effect(
+    role: OwnerRole,
+    operation: BackupOperationKind,
+) -> Result<(), OwnerClientError> {
+    let protocol_role = role.protocol_role();
+    if !protocol_role.is_attesting_role() || !protocol_role.permits(operation) {
+        return Err(map_protocol_backup_error(
+            eliot_protocol::backup::BackupError::CapabilityDenied,
+        ));
+    }
+    Ok(())
+}
+
 /// Validates one exact owner binding: canonical pipe plus exact peer, with
-/// fake/no-op markers rejected before any equality check.
+/// fake/no-op markers rejected before any equality check, then the exact
+/// authenticated protocol role binding and the transport-acknowledgement
+/// refusal proved on the same path.
 fn check_binding(role: OwnerRole, pipe: &str, peer: &str) -> Result<(), OwnerClientError> {
     if looks_fake(pipe) {
         return Err(OwnerClientError::FakePipeRejected { detail: "pipe" });
@@ -276,6 +585,8 @@ fn check_binding(role: OwnerRole, pipe: &str, peer: &str) -> Result<(), OwnerCli
     if peer != role.peer() {
         return Err(OwnerClientError::PeerMismatch);
     }
+    check_owner_role_admission(role)?;
+    check_transport_ack_refusal()?;
     Ok(())
 }
 
@@ -371,6 +682,14 @@ impl HostBackupOwnerClient {
     /// Admits exactly one typed effect for a supported operation.
     /// Unsupported operations refuse pre-effect: no admission object can
     /// exist for them.
+    ///
+    /// Admission is role-bound: the operation must also be carried by this
+    /// channel's authenticated protocol role
+    /// ([`OwnerRole::Host`] -> installation authority), and that role must
+    /// be an attesting role. The owner's accepted table and the protocol's
+    /// role matrix are both necessary conditions, so the Host can never
+    /// exercise an operation the installation authority does not carry, and
+    /// a non-attesting role can never produce an effect admission at all.
     pub fn admit_effect(op: BackupOperationKind) -> Result<EffectAdmission, OwnerClientError> {
         if !Self::is_supported(op) {
             return Err(OwnerClientError::UnsupportedOperation { op: op.as_str() });
@@ -378,6 +697,7 @@ impl HostBackupOwnerClient {
         if Self::requires_cutover_admission(op) {
             return Err(OwnerClientError::CutoverAdmissionRequired);
         }
+        check_role_permits_effect(OwnerRole::Host, op)?;
         Ok(EffectAdmission {
             owner: HOST_BACKUP_PEER,
             op: op.as_str(),
@@ -393,6 +713,11 @@ impl HostBackupOwnerClient {
 
     /// Admits the one cutover effect under a cutover-domain admission only.
     /// A prepare-domain admission presented here refuses.
+    ///
+    /// The cutover effect is role-bound exactly like every other admitted
+    /// effect: only the installation authority carries `AdmitCutover`, so a
+    /// different role on this channel could not produce a cutover
+    /// admission even with a valid cutover-domain reference.
     pub fn admit_cutover(admission: &OwnerAdmission) -> Result<EffectAdmission, OwnerClientError> {
         admission.check_domain(AdmissionDomain::Cutover)?;
         if !Self::is_supported(BackupOperationKind::AdmitCutover) {
@@ -400,6 +725,7 @@ impl HostBackupOwnerClient {
                 op: BackupOperationKind::AdmitCutover.as_str(),
             });
         }
+        check_role_permits_effect(OwnerRole::Host, BackupOperationKind::AdmitCutover)?;
         Ok(EffectAdmission {
             owner: HOST_BACKUP_PEER,
             op: BackupOperationKind::AdmitCutover.as_str(),
@@ -499,6 +825,13 @@ impl WatchdogBackupOwnerClient {
 
     /// Admits exactly one typed effect for a supported operation, failing
     /// pre-effect otherwise.
+    ///
+    /// Admission is role-bound: the operation must also be carried by this
+    /// channel's authenticated protocol role
+    /// ([`OwnerRole::Watchdog`] -> spool owner), and that role must be an
+    /// attesting role. The spool owner never carries `AdmitCutover`, so
+    /// cutover authority is structurally unavailable on this channel
+    /// independently of the accepted table.
     pub fn admit_effect(op: BackupOperationKind) -> Result<EffectAdmission, OwnerClientError> {
         if !Self::is_supported(op) {
             return Err(OwnerClientError::UnsupportedOperation { op: op.as_str() });
@@ -508,6 +841,7 @@ impl WatchdogBackupOwnerClient {
         if matches!(op, BackupOperationKind::AdmitCutover) {
             return Err(OwnerClientError::UnsupportedOperation { op: op.as_str() });
         }
+        check_role_permits_effect(OwnerRole::Watchdog, op)?;
         Ok(EffectAdmission {
             owner: WATCHDOG_BACKUP_PEER,
             op: op.as_str(),
@@ -887,10 +1221,12 @@ pub const fn fence_is_fresh(
 }
 
 /// Transport acknowledgement never establishes semantic success — at any
-/// phase. Semantic stages advance only through owner attestations validated
-/// against the bound request identity (see
-/// `eliot_protocol::backup::ack_phase_stage`, which maps every ack phase to
-/// no stage).
+/// phase. The refusal is enforced on the production binding path by
+/// [`check_transport_ack_refusal`], which asks the protocol's versioned
+/// wire mapping `eliot_protocol::backup::ack_phase_stage` for the lifecycle
+/// stage each acknowledgement phase establishes and refuses the binding if
+/// any phase maps to a stage. This predicate states the same contract for
+/// readers of the surface.
 #[must_use]
 pub const fn transport_ack_is_success() -> bool {
     false
