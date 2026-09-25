@@ -165,6 +165,14 @@ impl RuntimeObservedFacts {
 /// Canonical Governor receipt separating the policy-selected requested
 /// route from the runtime-observed execution route (I3.4).
 ///
+/// Disposition (issue #369): daemon-local Governor admission visibility
+/// record, not a second provider-neutral physical-observation owner. The
+/// provider-neutral owner is
+/// `eliot_agent_api::PhysicalRouteObservationReceipt`; this receipt carries
+/// no version, no digests, and no execution binding, and it is consumed only
+/// inside this daemon crate (plus its caller-proof integration test). It
+/// must not gain provider-neutral consumers or a cross-crate import path.
+///
 /// The requested route is the planning/configuration reference. The
 /// observed route is built only from [`RuntimeObservedFacts`]; its
 /// provider/model/billing fields are either evidence-backed values or the

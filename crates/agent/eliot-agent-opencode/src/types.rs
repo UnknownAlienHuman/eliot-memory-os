@@ -755,6 +755,14 @@ pub struct OpenCodeWireRouteReceipt {
 /// `tests/` integration suite). New code uses [`OpenCodeWireRouteReceipt`].
 pub type ActualRouteReceipt = OpenCodeWireRouteReceipt;
 
+/// Factored return shape for the observed-side classification below.
+type ObservedSideClassification = (
+    Option<RouteFingerprint>,
+    RouteObservationState,
+    Vec<String>,
+    Option<String>,
+);
+
 impl<'de> Deserialize<'de> for OpenCodeWireRouteReceipt {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -933,9 +941,112 @@ impl OpenCodeWireRouteReceipt {
     ///   from the wire, then classified via `route_divergence_fields`
     ///   (`Matched` only when field-complete equal, else `Diverged` with the
     ///   exact difference set and a quarantine `recovery_ref`).
+    /// - `request_digest` preserves the bound start-request commitment
+    ///   verbatim (never a re-hash of the wire bytes and never a zero
+    ///   placeholder); `validate_against` rejects any substituted value.
     /// - Session/route agreement and admission/binding linkage are enforced
     ///   via [`PhysicalRouteObservationReceipt::validate_against`]; a forged
     ///   binding or mismatched admission rejects.
+    ///
+    /// Builds the observed side of the canonical observation from the
+    /// wire state: `Unavailable` yields no observed fingerprint with an
+    /// explicit reason, `Observed` rebuilds the fingerprint from the
+    /// requested one with provider/model replaced from the wire and
+    /// classifies it field-complete (`Matched` only on full equality,
+    /// else `Diverged` with the exact difference set).
+    fn observed_side(
+        &self,
+        requested: &RouteFingerprint,
+    ) -> Result<ObservedSideClassification, OpenCodeObservationConversionError> {
+        match self.state {
+            OpenCodeWireRouteState::Unavailable => {
+                let reason = self
+                    .extra
+                    .get("unavailable_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("opencode wire unavailable")
+                    .to_owned();
+                Ok((
+                    None,
+                    RouteObservationState::Unobserved,
+                    Vec::new(),
+                    Some(reason),
+                ))
+            }
+            OpenCodeWireRouteState::Observed => {
+                let observed_wire =
+                    self.observed
+                        .as_ref()
+                        .ok_or(OpenCodeObservationConversionError::Wire(
+                            OpenCodeWireRouteError::ObservedIdentityMissing,
+                        ))?;
+                let mut observed_fp = requested.clone();
+                observed_fp.provider = observed_wire.provider_id.clone();
+                observed_fp.model = observed_wire.model_id.clone();
+                let diverged = route_divergence_fields(requested, &observed_fp);
+                let state = if diverged.is_empty() {
+                    RouteObservationState::Matched
+                } else {
+                    RouteObservationState::Diverged
+                };
+                Ok((Some(observed_fp), state, diverged, None))
+            }
+        }
+    }
+
+    /// Loss handle for unknown wire fields: a non-empty `extra` map stays
+    /// addressable by digest, never dropped silently.
+    fn wire_extra_evidence(
+        &self,
+    ) -> Result<(Option<LowercaseSha256>, Option<String>), OpenCodeObservationConversionError> {
+        if self.extra.is_empty() {
+            return Ok((None, None));
+        }
+        let bytes = canonical_json_bytes(&self.extra).map_err(|error| {
+            OpenCodeObservationConversionError::Serialization(error.to_string())
+        })?;
+        let hex = sha256_hex(&bytes);
+        let digest: LowercaseSha256 =
+            serde_json::from_value(Value::String(hex)).map_err(|error| {
+                OpenCodeObservationConversionError::Serialization(error.to_string())
+            })?;
+        let reference = format!("opencode-wire-extra:{}", digest.as_str());
+        Ok((Some(digest), Some(reference)))
+    }
+
+    /// Execution axis following the route axis without collapsing them:
+    /// unavailable implies unknown outcome with quarantine; observed keeps
+    /// the caller-supplied terminal/cancellation and gains a quarantine
+    /// handle exactly when diverged.
+    fn execution_axis(
+        route_state: RouteObservationState,
+        terminal: ClockReading,
+        cancellation: Option<CancellationState>,
+    ) -> (
+        ExecutionOutcome,
+        ClockReading,
+        Option<CancellationState>,
+        Option<String>,
+    ) {
+        match route_state {
+            RouteObservationState::Unobserved => (
+                ExecutionOutcome::UnknownOutcome,
+                ClockReading::default(),
+                None,
+                Some("opencode-unobserved-recovery".to_owned()),
+            ),
+            RouteObservationState::Matched => {
+                (ExecutionOutcome::Observed, terminal, cancellation, None)
+            }
+            RouteObservationState::Diverged => (
+                ExecutionOutcome::Observed,
+                terminal,
+                cancellation,
+                Some("opencode-diverged-quarantine".to_owned()),
+            ),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn to_physical_observation(
         &self,
@@ -962,83 +1073,23 @@ impl OpenCodeWireRouteReceipt {
         if binding.route != *requested {
             return Err(eliot_agent_api::ContractError::BindingMismatch.into());
         }
-        let (observed_route, route_state, diverged_fields, unobserved_reason) = match self.state {
-            OpenCodeWireRouteState::Unavailable => {
-                let reason = self
-                    .extra
-                    .get("unavailable_reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("opencode wire unavailable")
-                    .to_owned();
-                (
-                    None,
-                    RouteObservationState::Unobserved,
-                    Vec::new(),
-                    Some(reason),
-                )
-            }
-            OpenCodeWireRouteState::Observed => {
-                let observed_wire =
-                    self.observed
-                        .as_ref()
-                        .ok_or(OpenCodeObservationConversionError::Wire(
-                            OpenCodeWireRouteError::ObservedIdentityMissing,
-                        ))?;
-                let mut observed_fp = requested.clone();
-                observed_fp.provider = observed_wire.provider_id.clone();
-                observed_fp.model = observed_wire.model_id.clone();
-                let diverged = route_divergence_fields(requested, &observed_fp);
-                let state = if diverged.is_empty() {
-                    RouteObservationState::Matched
-                } else {
-                    RouteObservationState::Diverged
-                };
-                (Some(observed_fp), state, diverged, None)
-            }
-        };
+        let (observed_route, route_state, diverged_fields, unobserved_reason) =
+            self.observed_side(requested)?;
         // Loss handle: every unknown wire field stays addressable by digest.
-        let (raw_evidence_digest, raw_evidence_ref) = if self.extra.is_empty() {
-            (None, None)
-        } else {
-            let bytes = canonical_json_bytes(&self.extra).map_err(|error| {
-                OpenCodeObservationConversionError::Serialization(error.to_string())
-            })?;
-            let hex = sha256_hex(&bytes);
-            let digest: LowercaseSha256 =
-                serde_json::from_value(Value::String(hex)).map_err(|error| {
-                    OpenCodeObservationConversionError::Serialization(error.to_string())
-                })?;
-            let reference = format!("opencode-wire-extra:{}", digest.as_str());
-            (Some(digest), Some(reference))
-        };
+        let (raw_evidence_digest, raw_evidence_ref) = self.wire_extra_evidence()?;
         // Execution axis follows the route axis without collapsing them:
         // unavailable implies unknown outcome with quarantine; observed keeps
         // the caller-supplied terminal/cancellation and gains a quarantine
         // handle exactly when diverged.
-        let (execution_outcome, terminal, cancellation, recovery_ref) = match route_state {
-            RouteObservationState::Unobserved => (
-                ExecutionOutcome::UnknownOutcome,
-                ClockReading::default(),
-                None,
-                Some("opencode-unobserved-recovery".to_owned()),
-            ),
-            RouteObservationState::Matched => {
-                (ExecutionOutcome::Observed, terminal, cancellation, None)
-            }
-            RouteObservationState::Diverged => (
-                ExecutionOutcome::Observed,
-                terminal,
-                cancellation,
-                Some("opencode-diverged-quarantine".to_owned()),
-            ),
-        };
-        let request_bytes = canonical_json_bytes(&self.requested).map_err(|error| {
-            OpenCodeObservationConversionError::Serialization(error.to_string())
-        })?;
-        let request_digest: LowercaseSha256 =
-            serde_json::from_value(Value::String(sha256_hex(&request_bytes))).map_err(|error| {
-                OpenCodeObservationConversionError::Serialization(error.to_string())
-            })?;
+        let (execution_outcome, terminal, cancellation, recovery_ref) =
+            Self::execution_axis(route_state, terminal, cancellation);
+        // The request commitment is the bound start request preserved
+        // verbatim, never a re-hash of the adapter-local wire bytes: the
+        // wire `requested` value stays observable as `requested_route`, while
+        // `request_digest` identifies the exact launch request the binding
+        // pins. A substituted digest fails `validate_against` below.
+        let request_digest = PhysicalRouteObservationReceipt::bound_request_digest(binding)
+            .map_err(OpenCodeObservationConversionError::Contract)?;
         let mut observation = PhysicalRouteObservationReceipt {
             schema_version: CONTRACT_VERSION.to_owned(),
             attempt_id: binding.attempt_id.clone(),
@@ -2589,7 +2640,13 @@ mod tests {
             observed: Some(model()?),
             provider: Some("opencode-go".to_owned()),
             endpoint: Some("http://127.0.0.1:4096".to_owned()),
-            route_fingerprint: Some("sha256:route".to_owned()),
+            // Production-shaped wire fingerprint (`sha256:<hex>` as minted
+            // by the client): the wire projection carries the observed
+            // locator, never a `sha256:*` label placeholder.
+            route_fingerprint: Some(
+                "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_owned(),
+            ),
             session_id: Some("ses_1".to_owned()),
             directory: Some(r"C:\Scratch".to_owned()),
             server_version: Some("1.4.3".to_owned()),
@@ -2615,7 +2672,7 @@ mod tests {
             "observed": {"providerID": "opencode-go", "modelID": "deepseek-v4-flash"},
             "providerID": "opencode-go",
             "endpointURL": "http://127.0.0.1:4096",
-            "routeFingerprint": "sha256:route",
+            "routeFingerprint": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             "sessionID": "ses_1",
             "cwd": "C:\\Scratch",
             "serverVersion": "1.4.3",
@@ -2779,7 +2836,7 @@ mod tests {
             "requested": {"providerID": "opencode-go", "modelID": "deepseek-v4-flash"},
             "provider": "opencode-go",
             "endpoint": "http://127.0.0.1:4096",
-            "route_fingerprint": "sha256:route",
+            "route_fingerprint": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             "session_id": "ses_1",
             "directory": "C:\\Scratch",
             "server_version": "1.4.3",

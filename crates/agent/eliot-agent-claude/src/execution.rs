@@ -744,9 +744,13 @@ pub fn translate_candidate_result(
     if let Some(handle) = recovery_ref.as_ref() {
         evidence_refs.push(handle.clone());
     }
-    let request_digest = typed_digest(claude_local_digest_256_hex(
-        binding.start_request_sha256.as_bytes(),
-    ))?;
+    // The request commitment is the bound start request preserved verbatim,
+    // never a second hash of its hex text: `validate_against` (via
+    // `validate_for_binding` below) rejects any substituted value, so two
+    // different start requests can never report the same commitment.
+    let request_digest =
+        eliot_agent_api::PhysicalRouteObservationReceipt::bound_request_digest(binding)
+            .map_err(|error| ClaudeSidecarError::BindingMismatch(error.to_string()))?;
     let translation_digest = input
         .terminal
         .as_ref()

@@ -538,7 +538,12 @@ pub struct PhysicalRouteObservationReceipt {
     /// [`route_divergence_fields`] of the two fingerprints.
     pub diverged_fields: Vec<String>,
     pub execution_outcome: ExecutionOutcome,
-    /// Exact admitted request commitment.
+    /// Exact admitted request commitment: the bound
+    /// [`ProviderExecutionBinding::start_request_sha256`] preserved verbatim
+    /// (see [`bound_request_digest`](Self::bound_request_digest)). Adapters
+    /// never substitute a zero placeholder or a re-derived wire hash;
+    /// [`validate_against`](Self::validate_against) rejects any other value,
+    /// so two different start requests can never report the same commitment.
     pub request_digest: LowercaseSha256,
     pub translation_digest: Option<LowercaseSha256>,
     /// Immutable digest-bound raw-evidence linkage: a reference is valid
@@ -584,6 +589,20 @@ impl PhysicalRouteObservationReceipt {
     /// the result in `self_digest` before publishing.
     pub fn compute_digest(&self) -> Result<LowercaseSha256, serde_json::Error> {
         typed_digest(compute_self_digest_hex(self)?)
+    }
+
+    /// Preserves the bound start-request commitment as the observation's
+    /// `request_digest`. The request domain is the exact launch request
+    /// pinned by [`ProviderExecutionBinding::start_request_sha256`]: the
+    /// value is carried over verbatim, never re-hashed, never defaulted.
+    /// A binding whose commitment is malformed fails closed here, before
+    /// any receipt is minted.
+    pub fn bound_request_digest(
+        binding: &ProviderExecutionBinding,
+    ) -> Result<LowercaseSha256, ContractError> {
+        binding.validate_internal()?;
+        typed_digest(binding.start_request_sha256.clone())
+            .map_err(|_| ContractError::BindingMismatch)
     }
 
     /// The usable proof ceiling of any physical observation. Divergence,
@@ -735,7 +754,10 @@ impl PhysicalRouteObservationReceipt {
     /// execution binding: exact attempt/lease/fence/generation agreement,
     /// exact embedded-binding agreement (a same-session observation for the
     /// wrong execution unit fails closed), exact admitted-digest linkage,
-    /// and requested-route agreement with the admitted selected route.
+    /// exact bound start-request commitment (`request_digest` must equal the
+    /// binding's `start_request_sha256`: a substituted valid-form digest or
+    /// a zero placeholder fails here, not at a later intake), and
+    /// requested-route agreement with the admitted selected route.
     /// Capability claims are never validated from the requested side.
     pub fn validate_against(
         &self,
@@ -746,6 +768,9 @@ impl PhysicalRouteObservationReceipt {
         admission.validate()?;
         binding.validate_internal()?;
         if self.binding != *binding {
+            return Err(ContractError::BindingMismatch);
+        }
+        if self.request_digest.as_str() != binding.start_request_sha256 {
             return Err(ContractError::BindingMismatch);
         }
         if self.attempt_id != admission.attempt_id || self.attempt_id != binding.attempt_id {
