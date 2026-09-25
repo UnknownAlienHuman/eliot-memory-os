@@ -392,16 +392,21 @@ fn validate_registered_process_bootstrap()
 /// Bounded stop-aware retry budget for SCM-bootstrap transient
 /// registry-lock contention (s37/#1339). Each validation attempt already
 /// retries inside the single typed reader open
-/// (`inspect_existing_at`/`open_registry_reader_with_retry`); this outer
-/// loop only covers contention that outlasts that window. Six attempts with
-/// the shared `runtime_loop::transient_lock_backoff` schedule (250ms, 500ms,
-/// 1s, 2s, 2s capped between tries), and every retry re-publishes
-/// `SERVICE_START_PENDING` so the SCM start window stays armed. An SCM stop
-/// exits cleanly instead of polling.
+/// (`inspect_existing_at`/`open_registry_reader_with_retry`, at most 1.125s of
+/// backoff); this outer loop only covers contention that outlasts that
+/// window. Six attempts separated by the shared
+/// `runtime_loop::transient_lock_backoff` schedule (500ms, 1s, 2s, 2s, 2s),
+/// so the whole bootstrap budget stays near 14s; every retry re-publishes
+/// `SERVICE_START_PENDING` with the same wait hint as the initial
+/// publication, so the SCM start window stays armed. An SCM stop exits
+/// cleanly instead of polling.
 ///
-/// Six is the repository's existing bounded-contention budget for this exact
-/// redb file (the installer's terminal-reconcile writer open and the Host
-/// registry open), not a value chosen for this call site.
+/// Six attempts is the repository's existing bounded-contention budget for
+/// this exact redb file (the installer's terminal-reconcile writer open and
+/// the Host registry open), not a value chosen for this call site. The
+/// schedule is not a control value either: it comes from
+/// `runtime_loop::transient_lock_backoff`, the one bounded backoff the
+/// non-fatal runtime poll path already uses.
 #[cfg(windows)]
 const BOOTSTRAP_TRANSIENT_RETRY_ATTEMPTS: u32 = 6;
 /// SCM start-pending wait hint re-armed on every bootstrap retry. It repeats
