@@ -4,12 +4,13 @@ use crate::{
     EnvironmentAllowlist, ExecutableFingerprint, HealthResponse, HttpMethod, HttpRequest,
     LoopbackEndpoint, LoopbackHttpClient, LoopbackHttpError, ModelSelection, NoAuthorityRunResult,
     OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE, OpenCodeEvent, OpenCodeWireRouteReceipt,
-    ProviderCatalog, QuotaAvailability, ReadOnlyRunRequest, RunRequestError, RunStatus, Session,
-    SessionDiff, SessionStatus, SessionStatusMap, SseConnection, SseDecodeError, SseDecoder,
-    SseEvent, SseLimits, UnknownFields, UsageAvailability, UsageTelemetry, bound_session_identity,
-    committed_message_id,
+    PhysicalObservationBody, ProviderCatalog, QuotaAvailability, ReadOnlyRunRequest,
+    RunRequestError, RunStatus, Session, SessionDiff, SessionStatus, SessionStatusMap,
+    SseConnection, SseDecodeError, SseDecoder, SseEvent, SseLimits, UnknownFields,
+    UsageAvailability, UsageTelemetry, bound_session_identity, committed_message_id,
 };
-use eliot_contracts::{ResourceGeneration, StateFence};
+use eliot_agent_api::{EventCursor, PhysicalRouteObservationReceipt};
+use eliot_contracts::{ClockReading, ResourceGeneration, StateFence};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
@@ -221,11 +222,17 @@ pub enum OpenCodeRunError {
 /// The wire result carries the SSE observations for downstream normalization
 /// bound to the exact attempt; the seal carries only attempt/admission/result
 /// digests under the candidate-only ceiling — never launch, process, or
-/// finish authority.
+/// finish authority. `physical_route` is the canonical
+/// provider-neutral physical observation converted from the wire receipt at
+/// seal time (issue #228 W5); it is `None` exactly when no convertible
+/// observation exists (no observed terminal time, or a wire/binding mismatch
+/// that fails closed), in which case the retained wire receipt stays the
+/// downstream normalization evidence.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AdmittedAttemptOutcome {
     pub run: NoAuthorityRunResult,
     pub candidate: AdmittedAttemptCandidate,
+    pub physical_route: Option<PhysicalRouteObservationReceipt>,
 }
 
 pub struct OpenCodeClient {
@@ -1500,6 +1507,14 @@ impl OpenCodeClient {
                     .collect(),
             ),
         );
+        // Observed terminal-time evidence for the admitted seal: the
+        // assistant completion timestamp reconciled above. The seal reads it
+        // back to mint the canonical physical observation; runs that never
+        // passed success reconciliation carry no such evidence.
+        extra.insert(
+            "observed_completed_at_ms".to_owned(),
+            Value::from(projection.completed_at_ms),
+        );
         NoAuthorityRunResult {
             status: RunStatus::Succeeded,
             candidate_only: true,
@@ -1539,6 +1554,47 @@ impl OpenCodeClient {
             .join("&");
         Ok(format!("{path}?{encoded}"))
     }
+}
+
+/// Converts one sealed admitted run into its canonical physical route
+/// observation (issue #228 W5).
+///
+/// Terminal-time evidence comes only from the reconciled assistant
+/// completion timestamp (`observed_completed_at_ms` in the run extra); when
+/// absent the run observed no terminal wall time and no `Observed` receipt
+/// can be minted honestly. The causal cursor names the committed
+/// execution-unit message the run reconciled; the sequence marks the single
+/// seal observation. Any conversion failure yields `None` with the wire
+/// receipt retained, never a substituted route.
+fn seal_physical_observation(
+    admitted: &AdmittedOpenCodeAttempt,
+    run: &NoAuthorityRunResult,
+    message_id: &str,
+) -> Option<PhysicalRouteObservationReceipt> {
+    let completed_at_ms = run.extra.get("observed_completed_at_ms")?.as_u64()?;
+    let terminal_ms = i64::try_from(completed_at_ms).ok()?;
+    let terminal = ClockReading {
+        valid_time_ms: Some(terminal_ms),
+        known_time_ms: Some(terminal_ms),
+        transaction_sequence: None,
+        monotonic_ns: None,
+    };
+    let event_cursor = EventCursor::new(format!("opencode-sealed/{message_id}")).ok()?;
+    admitted
+        .observe_physical_route(
+            &run.actual_route,
+            PhysicalObservationBody {
+                usage: run.usage.to_usage_receipt(),
+                started: ClockReading::default(),
+                first_byte: ClockReading::default(),
+                first_semantic: ClockReading::default(),
+                terminal,
+                event_cursor,
+                event_sequence: 1,
+                cancellation: None,
+            },
+        )
+        .ok()
 }
 
 /// Seals one admitted execution into its candidate-only outcome: the
@@ -1626,7 +1682,17 @@ fn seal_admitted_outcome(
         serde_json::to_value(&terminal)
             .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?,
     );
-    Ok(AdmittedAttemptOutcome { run, candidate })
+    // Canonical physical observation (issue #228 W5): convert the sealed
+    // wire receipt through the admitted attempt's exact binding/admission.
+    // A wire/binding mismatch or missing terminal evidence fails closed to
+    // `None`; the retained wire receipt stays the downstream evidence and no
+    // route is ever substituted or synthesized.
+    let physical_route = seal_physical_observation(admitted, &run, message_id);
+    Ok(AdmittedAttemptOutcome {
+        run,
+        candidate,
+        physical_route,
+    })
 }
 
 /// Decodes one `SSE` frame into its `OpenCode` event plus the stable identity
@@ -2060,6 +2126,11 @@ struct MessageProjection {
     observed_model: ModelSelection,
     output: Value,
     usage: Option<UsageTelemetry>,
+    /// Observed assistant completion timestamp (`info/time/completed`, Unix
+    /// milliseconds). Presence is already required for a success projection;
+    /// the value is retained so the admitted seal can mint terminal-time
+    /// evidence without re-reading provider bytes.
+    completed_at_ms: u64,
 }
 
 fn inspect_messages(
@@ -2125,6 +2196,14 @@ fn inspect_messages(
             "assistant message has no completion timestamp".to_owned(),
         ));
     }
+    let completed_at_ms = info
+        .get("time")
+        .and_then(Value::as_object)
+        .and_then(|time| time.get("completed"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            OpenCodeRunError::Protocol("assistant message has no completion timestamp".to_owned())
+        })?;
     let observed_model = attest_message_route(info, requested)?;
 
     let parts = assistant
@@ -2157,6 +2236,7 @@ fn inspect_messages(
         observed_model,
         output,
         usage,
+        completed_at_ms,
     })
 }
 

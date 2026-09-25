@@ -1606,6 +1606,105 @@ impl AcpResultEnvelope {
     }
 }
 
+/// Bound identities for one drained ACP wire result (issue #228 W2/W5).
+///
+/// The live wire pump owns the request it sent: these identities name the
+/// operation/attempt/session that request belongs to, so a provider message
+/// can never mint them. Route/binding/admission agreement is enforced by
+/// [`AcpResultEnvelope::into_agent_result`] after assembly.
+#[derive(Clone, Debug)]
+pub struct AcpWireResultIds {
+    /// ELIOT operation identity the drained message answers.
+    pub operation_id: String,
+    /// Attempt identity the drained message answers.
+    pub attempt_id: AttemptId,
+    /// External session identity, when the bound execution carries one.
+    pub session_id: Option<String>,
+}
+
+/// Production wire-result drain for one received ACP JSON-RPC message (issue
+/// #228 W2/W5): the in-crate production caller that turns live provider
+/// output into a provider-neutral candidate [`AgentResult`].
+///
+/// Mapping (fail-closed, no completion inference):
+/// - `Response` with `result` keeps the result payload and drains through
+///   [`AcpResultEnvelope::assemble_candidate_result`] (terminal provider
+///   output still maps to candidate-only `DegradedNoProof`);
+/// - `Response` with `error` keeps the error payload and drains through
+///   [`AcpResultEnvelope::into_agent_result`] with an explicit
+///   [`AcpResultOutcome::Failed`] reason (sanitized at the adapter boundary);
+/// - `Notification` is non-terminal provider output and drains through
+///   `assemble_candidate_result` to `UnknownOutcome` with its recovery handle;
+/// - `Request` is an inbound call and never a result: rejected.
+///
+/// The translated result feeds
+/// `eliot-agent-coordinator::AgentCoordinator::submit_result` (candidate
+/// intake only, never Finish authority).
+///
+/// # Errors
+///
+/// Returns [`AcpAdapterError`] when the bound identities are blank, the
+/// message is an inbound request, or the route/binding/admission linkage
+/// fails.
+pub fn drain_wire_result(
+    message: &AcpJsonRpcMessage,
+    ids: AcpWireResultIds,
+    route: RouteFingerprint,
+    binding: &ProviderExecutionBinding,
+    admission: &AdmittedRouteReceipt,
+) -> Result<AgentResult, AcpAdapterError> {
+    if ids.operation_id.trim().is_empty() {
+        return Err(AcpAdapterError::InvalidInput("operation_id"));
+    }
+    match message {
+        AcpJsonRpcMessage::Request(_) => Err(AcpAdapterError::InvalidInput(
+            "acp request is never a result",
+        )),
+        AcpJsonRpcMessage::Notification(notification) => AcpResultEnvelope {
+            operation_id: ids.operation_id,
+            attempt_id: ids.attempt_id,
+            session_id: ids.session_id,
+            payload: notification.params.clone(),
+            terminal: false,
+        }
+        .assemble_candidate_result(route, binding, admission),
+        AcpJsonRpcMessage::Response(response) => {
+            if let Some(error) = &response.error {
+                let payload = serde_json::to_value(error)
+                    .map_err(|_| AcpAdapterError::InvalidInput("acp error payload"))?;
+                AcpResultEnvelope {
+                    operation_id: ids.operation_id,
+                    attempt_id: ids.attempt_id,
+                    session_id: ids.session_id,
+                    payload,
+                    terminal: true,
+                }
+                .into_agent_result(
+                    route,
+                    binding,
+                    admission,
+                    AcpResultOutcome::Failed {
+                        reason: error.message.clone(),
+                    },
+                )
+            } else if let Some(result) = &response.result {
+                AcpResultEnvelope {
+                    operation_id: ids.operation_id,
+                    attempt_id: ids.attempt_id,
+                    session_id: ids.session_id,
+                    payload: result.clone(),
+                    terminal: true,
+                }
+                .assemble_candidate_result(route, binding, admission)
+            } else {
+                Err(AcpAdapterError::InvalidInput(
+                    "acp response carries neither result nor error",
+                ))
+            }
+        }
+    }
+}
+
 /// Short result alias.
 pub type AcpResult = AcpResultEnvelope;
 

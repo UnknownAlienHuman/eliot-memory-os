@@ -165,13 +165,16 @@ impl RuntimeObservedFacts {
 /// Canonical Governor receipt separating the policy-selected requested
 /// route from the runtime-observed execution route (I3.4).
 ///
-/// Disposition (issue #369): daemon-local Governor admission visibility
-/// record, not a second provider-neutral physical-observation owner. The
-/// provider-neutral owner is
+/// Disposition (issue #369, rename issue #228 A1): daemon-local Governor
+/// admission visibility record, not a second provider-neutral
+/// physical-observation owner. The provider-neutral owner is
 /// `eliot_agent_api::PhysicalRouteObservationReceipt`; this receipt carries
 /// no version, no digests, and no execution binding, and it is consumed only
 /// inside this daemon crate (plus its caller-proof integration test). It
 /// must not gain provider-neutral consumers or a cross-crate import path.
+/// Renamed from `ActualRouteReceipt` so the provider-neutral
+/// actual-route name has exactly one owner (`eliot-agent-api`); the
+/// serialized shape is unchanged (the type name is not on the wire).
 ///
 /// The requested route is the planning/configuration reference. The
 /// observed route is built only from [`RuntimeObservedFacts`]; its
@@ -179,7 +182,7 @@ impl RuntimeObservedFacts {
 /// explicit [`UNKNOWN_ROUTE_FACT`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ActualRouteReceipt {
+pub struct RouteAdmissionVisibility {
     /// Requested route selected by policy (planning/configuration).
     pub requested_route: RouteFingerprint,
     /// Route actually observed at runtime. Unexposed provider/model/billing
@@ -189,7 +192,7 @@ pub struct ActualRouteReceipt {
     pub evidence_refs: Vec<String>,
 }
 
-impl ActualRouteReceipt {
+impl RouteAdmissionVisibility {
     /// Records one execution attempt's routing evidence: the requested
     /// route plus an observed route built exclusively from runtime
     /// evidence. Observed provider/model/billing default to `unknown`
@@ -351,7 +354,7 @@ impl RouteCapabilityIndex {
 pub struct GovernorRouteAttempt {
     pub attempt_id: AttemptId,
     pub requested_route: RouteFingerprint,
-    pub actual: ActualRouteReceipt,
+    pub actual: RouteAdmissionVisibility,
 }
 
 impl GovernorRouteAttempt {
@@ -360,7 +363,7 @@ impl GovernorRouteAttempt {
     pub fn new(
         attempt_id: AttemptId,
         requested_route: RouteFingerprint,
-        actual: ActualRouteReceipt,
+        actual: RouteAdmissionVisibility,
     ) -> Result<Self, RouteReceiptError> {
         requested_route
             .validate()
@@ -440,7 +443,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let requested = requested_route()?;
         let facts = unexposed_facts()?;
-        let receipt = ActualRouteReceipt::observe(requested.clone(), &facts)?;
+        let receipt = RouteAdmissionVisibility::observe(requested.clone(), &facts)?;
         receipt.validate()?;
         // Requested policy selection is preserved verbatim.
         assert_eq!(receipt.requested_route, requested);
@@ -476,7 +479,7 @@ mod tests {
         facts.provider = Some("observed-provider".to_owned());
         facts.model = Some("observed-model".to_owned());
         facts.auth_billing = Some("observed-billing".to_owned());
-        let receipt = ActualRouteReceipt::observe(requested, &facts)?;
+        let receipt = RouteAdmissionVisibility::observe(requested, &facts)?;
         assert_eq!(receipt.observed_route.provider, "observed-provider");
         assert_eq!(receipt.observed_route.model, "observed-model");
         assert_eq!(receipt.observed_route.auth_billing, "observed-billing");
@@ -530,7 +533,7 @@ mod tests {
         for spelling in ["unknown", "Unknown", "UNKNOWN", "uNkNoWn"] {
             let mut facts = unexposed_facts()?;
             facts.provider = Some(spelling.to_owned());
-            let Err(error) = ActualRouteReceipt::observe(requested.clone(), &facts) else {
+            let Err(error) = RouteAdmissionVisibility::observe(requested.clone(), &facts) else {
                 return Err(format!("reserved marker {spelling:?} was admitted").into());
             };
             assert!(
