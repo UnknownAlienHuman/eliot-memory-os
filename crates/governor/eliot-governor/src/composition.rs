@@ -4825,7 +4825,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// retains the authorization evidence alongside the new binding; persist
     /// the owner with [`Self::install_admitted_work_scope_owner`]. The prior
     /// identity stays preserved inside the receipt; the retained binding, task
-    /// state, and project memory are untouched on any failure.
+    /// state, and project memory are untouched on any failure. Live status:
+    /// reachable from the daemon admit_scope_attach entry; no live attach
+    /// transport calls that entry yet (BLOCKED-BY attach-transport).
     ///
     /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
     #[allow(
