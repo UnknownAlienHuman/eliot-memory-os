@@ -328,10 +328,12 @@ impl KernelComposition {
             // Post-linearization activation cannot reuse the drained
             // generation; the caller re-establishes a fresh generation
             // through the reconcile path.
-            if coordinator_for(&self.work_root)
-                .on_activate_request()
-                .fences_old_authority()
-            {
+            let disposition = coordinator_for(&self.work_root).on_activate_request();
+            observe_control(
+                "kernel.control.drain_disposition_observed",
+                disposition_code(disposition),
+            );
+            if disposition.fences_old_authority() {
                 return Err(TransportError::SessionFenced);
             }
         }
@@ -718,7 +720,22 @@ impl KernelComposition {
     #[must_use]
     pub fn request_shutdown(&self) -> bool {
         let _ = coordinator_for(&self.work_root).request_shutdown();
+        let view = self.activation_operational_view();
+        observe_control(
+            "kernel.control.drain_requested_observed",
+            view.drain_disposition,
+        );
         self.runtime.shutdown_handle().request()
+    }
+}
+
+/// Bounded observation code for one wake-during-drain disposition.
+const fn disposition_code(disposition: DrainWakeDisposition) -> &'static str {
+    match disposition {
+        DrainWakeDisposition::Proceed => "proceed",
+        DrainWakeDisposition::CancelDrain => "cancel-drain",
+        DrainWakeDisposition::QueueNextGeneration => "queue-next-generation",
+        DrainWakeDisposition::RejectStale => "reject-stale",
     }
 }
 

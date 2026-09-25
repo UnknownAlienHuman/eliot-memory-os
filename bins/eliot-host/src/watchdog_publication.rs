@@ -113,6 +113,48 @@ pub(super) fn read_manifest_current_supervision_lease(
     Ok(current)
 }
 
+/// Returns the exact Kernel-signed supervision lease that still owes coverage
+/// for `activation_id`, or `None` when no published lease is live for it.
+///
+/// I1.5 idle-drain gate: "Idle drain starts only when no RuntimeLease remains
+/// and no valid SupervisionLease requires live sensing/containment". This is
+/// the read-only half of the same publisher/decoder pair that commits the
+/// publication, so the census never introduces a second reader of a
+/// Watchdog-owned file, a second signature policy, or a second copy of the
+/// publication schema. Coverage ends honestly at `expires_at_ms`: a lease that
+/// cannot prove renewal stops blocking drain instead of blocking it forever,
+/// while a terminal (`EXPIRED`/`REVOKED`/`CLOSED`) lease never blocked at all.
+#[cfg(windows)]
+pub(super) fn live_supervision_obligation(
+    host_state_root: &Path,
+    installation: &PlatformHandle,
+    activation_id: &PlatformHandle,
+    now_ms: u64,
+) -> Result<Option<PlatformHandle>, HostError> {
+    for observation in scan_host_watchdog_publications(host_state_root)? {
+        let payload = &observation.lease.payload;
+        if payload.installation_id != installation.as_str()
+            || payload.scope_ref != observation.admission.supervision_lease_scope_id
+            || observation.admission.installation_id != payload.installation_id
+            || payload.activation_id != activation_id.as_str()
+        {
+            // A publication bound to a different installation, scope or
+            // activation generation is a stale spool entry, never a live
+            // obligation for this generation.
+            continue;
+        }
+        if payload.state != eliot_runtime_contracts::LeaseState::Active
+            || now_ms >= payload.expires_at_ms
+        {
+            continue;
+        }
+        return PlatformHandle::new(payload.lease_id.clone())
+            .map(Some)
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()));
+    }
+    Ok(None)
+}
+
 #[cfg(windows)]
 pub(super) fn supervision_publication_identity(
     template: &WatchdogAdmissionTemplate,
