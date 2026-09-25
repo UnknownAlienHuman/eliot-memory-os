@@ -9154,6 +9154,15 @@ where
     /// any residual unknown, or any contour outside the timeout shape refuses
     /// with recovery/forward-repair rather than quarantining or dropping the
     /// intent.  This never executes an effect: reconciliation is read-only.
+    ///
+    /// The readback is issued on the `Rollback` leg because that is the only
+    /// leg for which the sealed port admits a stopped service as `Absent`.  An
+    /// unsettled start records no external identity of its own, so the request
+    /// is bound to the identity the transaction durably recorded for the same
+    /// named service on its `RegisterService` effect; see
+    /// `InstallationTransaction::recorded_service_registration_identity`.
+    /// A present or differently-identified service therefore mismatches and
+    /// refuses; the reconciliation can never adopt an unknown process.
     pub(crate) fn reconcile_timeout_starts_for_owner_rollback(
         &mut self,
         transaction: &InstallationTransaction,
@@ -9170,6 +9179,10 @@ where
         }
         let candidates = transaction.recoverable_timeout_start_indexes()?;
         for index in &candidates {
+            let role = match &transaction.installer_effects[*index] {
+                InstallerEffectPlan::StartService { role, .. } => *role,
+                _ => return Err(InstallationError::IdentityConflict),
+            };
             let attempt = match &transaction.effect_progress[*index].state {
                 InstallationEffectProgressState::IntentCommitted { attempt, .. } => *attempt,
                 InstallationEffectProgressState::Unknown { .. } => 1,
@@ -9182,7 +9195,7 @@ where
                 *index,
                 attempt,
                 InstallationEffectAction::Rollback,
-                None,
+                Some(transaction.recorded_service_registration_identity(role)?),
             )?;
             let observed = match self.port.reconcile(&request) {
                 PortOutcome::Known(observed) => {
@@ -9452,9 +9465,12 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
     /// The intent is cleared only after the exact owner acknowledgement, inside
     /// the single transaction-store `compare_and_save`.  A CAS conflict, a
     /// mismatched pending projection, a missing Host owner, or an unknown
-    /// provider result leaves the intent durable and returns an error.  The
-    /// cleared transaction then re-enters the ordinary exact-effect rollback
-    /// loop, so only `CreatedByTransaction` identities are removed.
+    /// provider result leaves the intent durable and returns an error.  A pending
+    /// activation that is not this transaction's exact projection is never
+    /// aborted and instead persists the durable `Quarantined`
+    /// recovery-required disposition, keeping the intent.  The cleared
+    /// transaction then re-enters the ordinary exact-effect rollback loop, so
+    /// only `CreatedByTransaction` identities are removed.
     ///
     /// A13.9 short-lived ownership: the registry writer below is opened fresh
     /// for the abort phase only (one `open_existing_at` with the single typed
@@ -9463,6 +9479,16 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
     /// writer is therefore never retained across the transaction
     /// compare-and-save or across effect execution, so a polling Watchdog
     /// reader is blocked for at most one bounded abort phase.
+    ///
+    /// # Errors
+    /// Returns `IncompleteObservation` past the no-return boundary, after a
+    /// committed activation, or on a non-first install, before any readback;
+    /// `IllegalTransition` for any stage other than `Activating` or
+    /// `RollbackRequired`; and the typed refusal of a failed service-start
+    /// reconciliation, approval derivation, or registry abort.  A pending
+    /// projection owned by another transaction, plan, approval, or registry
+    /// revision does not reach an error return: it returns the durable
+    /// `Quarantined` outcome instead.
     pub fn rollback_with_activation_owner(
         &mut self,
         host_state_root: &Path,
@@ -9530,58 +9556,19 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
         // handle (and its exclusive redb file lock) is dropped before the
         // transaction compare-and-save and the external rollback effects
         // below, so neither can be blocked behind a retained writer.
-        let abort_evidence = {
-            let root = ProtectedRootLease::open_existing(host_state_root)
-                .map_err(|error| InstallationError::Platform(error.to_string()))?;
-            let registry = RedbInstallationRegistry::open_existing_at(root)?.ok_or_else(|| {
-                InstallationError::IncompleteObservation(
-                    "Host activation registry is absent for owner-aware rollback".to_owned(),
-                )
-            })?;
-            let evidence = match registry.read_exact_aborted_activation_ack(
-                host,
-                transaction_id,
-                &transaction.installer_plan_digest,
-                &transaction.candidate_manifest.generation,
-                &manifest_digest,
-                &approval,
-                &activation_intent_digest,
-            )? {
-                Some(evidence) => evidence,
-                None => {
-                    let pending_revision = registry.read_exact_pending_activation_revision(
-                        host,
-                        transaction_id,
-                        &transaction.installer_plan_digest,
-                        &approval,
-                        &activation_intent_digest,
-                    )?;
-                    registry.abort_pending_activation_exact(
-                        host,
-                        pending_revision,
-                        &approval,
-                        &activation_intent_digest,
-                    )?;
-                    registry
-                        .read_exact_aborted_activation_ack(
-                            host,
-                            transaction_id,
-                            &transaction.installer_plan_digest,
-                            &transaction.candidate_manifest.generation,
-                            &manifest_digest,
-                            &approval,
-                            &activation_intent_digest,
-                        )?
-                        .ok_or_else(|| {
-                            InstallationError::IncompleteObservation(
-                                "Host abort returned without the exact durable ABORTED terminal"
-                                    .to_owned(),
-                            )
-                        })?
-                }
-            };
-            drop(registry);
-            evidence
+        let abort_evidence = match abort_activation_evidence(&ActivationAbortRequest {
+            host_state_root,
+            host,
+            transaction_id,
+            transaction: &transaction,
+            manifest_digest: &manifest_digest,
+            approval: &approval,
+            activation_intent_digest: &activation_intent_digest,
+        })? {
+            AbortEvidenceOutcome::Aborted(evidence) => evidence,
+            AbortEvidenceOutcome::ForeignPendingProjection(pending_ref) => {
+                return self.inner.persist_quarantined(transaction, pending_ref);
+            }
         };
         let mut cleared = transaction;
         cleared.prepare_pre_no_return_rollback(abort_evidence, &reconciled_absent)?;
@@ -9607,6 +9594,143 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
             expected_registry_revision,
         )
     }
+}
+
+/// The two non-error dispositions of the owner-aware activation abort (issue
+/// #1325): the exact durable `ABORTED` acknowledgement the intent is cleared
+/// against, or a foreign pending projection the caller must quarantine instead.
+enum AbortEvidenceOutcome {
+    /// The Host registry durably acknowledged this transaction's exact abort.
+    Aborted(PlatformHandle),
+    /// The pending projection is not this transaction's exact projection. The
+    /// carried reference is the reason to persist; the intent is kept and the
+    /// projection is never aborted.
+    ForeignPendingProjection(PlatformHandle),
+}
+
+/// The exact identities one owner-aware activation abort is proved against.
+///
+/// These are the values the activation projection intent, the signed
+/// transaction state, and the retained Host registry must all agree on. They
+/// travel as one value so no call site can pass a fence from one read and a
+/// plan digest from another.
+struct ActivationAbortRequest<'a> {
+    /// The transaction's own candidate-manifest Host root, re-proved by the
+    /// lease before redb is opened.
+    host_state_root: &'a Path,
+    /// The already-open Host owner capability; never minted here.
+    host: &'a HostOwnerEpochCapability,
+    /// The transaction whose activation intent is being retired.
+    transaction_id: &'a PlatformHandle,
+    /// The loaded transaction, borrowed: the caller still owns it and
+    /// performs the durable quarantine write itself, so the intent is retired
+    /// by exactly one owner.
+    transaction: &'a InstallationTransaction,
+    /// Digest of the exact candidate manifest the intent names.
+    manifest_digest: &'a PlatformHandle,
+    /// The approval derived from the retained signed transaction state.
+    approval: &'a InstallationActivationApproval,
+    /// Digest of the exact activation projection intent.
+    activation_intent_digest: &'a PlatformHandle,
+}
+
+/// Acquires the exact durable abort evidence for one activation intent, or names
+/// the foreign pending projection the caller must quarantine.
+///
+/// A13.9 short-lived ownership is kept here rather than at the call site: the
+/// registry writer is opened once for this abort phase and dropped before the
+/// caller's transaction compare-and-save and external rollback effects, so the
+/// exclusive redb writer is never retained across them.
+///
+/// # Errors
+/// The typed refusal of the lease, the registry open, the exact acknowledgement
+/// read, the pending-revision read, the exact abort, or the post-abort
+/// acknowledgement read.
+fn abort_activation_evidence(
+    request: &ActivationAbortRequest<'_>,
+) -> Result<AbortEvidenceOutcome, InstallationError> {
+    let ActivationAbortRequest {
+        host_state_root,
+        host,
+        transaction_id,
+        transaction,
+        manifest_digest,
+        approval,
+        activation_intent_digest,
+    } = *request;
+    let root = ProtectedRootLease::open_existing(host_state_root)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let registry = RedbInstallationRegistry::open_existing_at(root)?.ok_or_else(|| {
+        InstallationError::IncompleteObservation(
+            "Host activation registry is absent for owner-aware rollback".to_owned(),
+        )
+    })?;
+    // The two registry-keyed identities are read out of the borrowed
+    // transaction once, so every read-back below names the same values.
+    let plan_digest = transaction.installer_plan_digest.clone();
+    let generation = transaction.candidate_manifest.generation.clone();
+    let evidence = if let Some(evidence) = registry.read_exact_aborted_activation_ack(
+        host,
+        transaction_id,
+        &plan_digest,
+        &generation,
+        manifest_digest,
+        approval,
+        activation_intent_digest,
+    )? {
+        AbortEvidenceOutcome::Aborted(evidence)
+    } else {
+        // Issue #1325: a pending activation that is not this transaction's
+        // exact projection — another transaction, plan, generation,
+        // approval, or registry revision, or a registry whose Host owner
+        // binding does not match — is never ours to abort. Refusing it
+        // alone would leave the install transaction byte-identical in its
+        // prior stage with the intent still retained, so an operator would
+        // see no on-disk state at all. The caller persists the existing
+        // durable recovery-required disposition instead: the intent is
+        // kept, the projection is untouched, and the exact reason is named
+        // by the pending reference.
+        let pending_revision = match registry.read_exact_pending_activation_revision(
+            host,
+            transaction_id,
+            &plan_digest,
+            approval,
+            activation_intent_digest,
+        ) {
+            Ok(revision) => revision,
+            Err(InstallationError::IdentityConflict) => {
+                let pending_ref = PlatformHandle::new("mismatch:foreign-pending-activation")
+                    .map_err(|error| platform_error(&error))?;
+                return Ok(AbortEvidenceOutcome::ForeignPendingProjection(pending_ref));
+            }
+            Err(error) => return Err(error),
+        };
+        registry.abort_pending_activation_exact(
+            host,
+            pending_revision,
+            approval,
+            activation_intent_digest,
+        )?;
+        AbortEvidenceOutcome::Aborted(
+            registry
+                .read_exact_aborted_activation_ack(
+                    host,
+                    transaction_id,
+                    &plan_digest,
+                    &generation,
+                    manifest_digest,
+                    approval,
+                    activation_intent_digest,
+                )?
+                .ok_or_else(|| {
+                    InstallationError::IncompleteObservation(
+                        "Host abort returned without the exact durable ABORTED terminal".to_owned(),
+                    )
+                })?,
+        )
+    };
+    drop(registry);
+    Ok(evidence)
 }
 
 fn increment_revision(transaction: &mut InstallationTransaction) -> Result<(), InstallationError> {
