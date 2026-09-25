@@ -11,10 +11,11 @@ use std::collections::BTreeSet;
 
 use eliot_contracts::{RequestMetadata, StateFence};
 use eliot_kernel_core::user_automation::{
-    AutomationExecutionReference, UserAutomationConfigurationState, UserAutomationError,
-    UserAutomationFailureProjection, UserAutomationInvocation, UserAutomationPreflightContext,
-    UserAutomationPreflightDecision, UserAutomationPreflightProjection,
-    UserAutomationPreflightReceipt, UserAutomationRevision,
+    AutomationCapabilityProfile, AutomationExecutionReference, AutomationWorkClass,
+    ProviderFingerprintPolicy, UserAutomationConfigurationState, UserAutomationError,
+    UserAutomationExecutionMode, UserAutomationFailureProjection, UserAutomationInvocation,
+    UserAutomationPreflightContext, UserAutomationPreflightDecision,
+    UserAutomationPreflightProjection, UserAutomationPreflightReceipt, UserAutomationRevision,
 };
 use eliot_protocol::dreamer_job::{DurableJobRequest, JobOperation, JobRole};
 use eliot_runtime_contracts::{WakeIntent, WakeIntentState};
@@ -84,6 +85,17 @@ pub enum UserAutomationExecutionError {
 pub struct UserAutomationDurableJobMaterial {
     /// Stable UserAutomation occurrence bound by the owner.
     pub occurrence_id: String,
+    /// Immutable qualified task/script identity the owner admitted.
+    ///
+    /// Deterministic mode is only honoured when this value is carried: a
+    /// generic forwarded job without the qualified identity cannot prove that
+    /// the artifact excludes model-provider access, so it is refused here
+    /// instead of being handed to the Durable Job owner.
+    pub qualified_ref: String,
+    /// Execution mode the material was issued for.
+    pub mode: UserAutomationExecutionMode,
+    /// Capability profile certified by the qualified owner for this material.
+    pub capability_profile: AutomationCapabilityProfile,
     /// Complete owner-issued Durable Job submission request.
     pub request: DurableJobRequest,
 }
@@ -91,6 +103,15 @@ pub struct UserAutomationDurableJobMaterial {
 impl UserAutomationDurableJobMaterial {
     /// Validates the complete owner material against the authenticated
     /// occurrence that is about to be admitted.
+    ///
+    /// The capability profile is the deterministic-mode exclusion proof: a
+    /// material issued for [`UserAutomationExecutionMode::DeterministicProcess`]
+    /// must carry a profile without `model_access`, `provider_access`, or
+    /// `automation_scheduling`, so neither a direct LLM call nor an indirect
+    /// provider route is reachable through the submitted job. A generic
+    /// forwarded `DurableJobRequest` that does not carry the qualified
+    /// identity and a certified profile cannot satisfy this and is refused
+    /// before the Durable Job owner is called.
     pub fn validate_for(
         &self,
         context: &RequestMetadata,
@@ -98,6 +119,7 @@ impl UserAutomationDurableJobMaterial {
         invocation: &UserAutomationInvocation,
     ) -> Result<(), UserAutomationExecutionError> {
         validate_text(&self.occurrence_id, "runtime.durable_job.occurrence_id")?;
+        validate_text(&self.qualified_ref, "runtime.durable_job.qualified_ref")?;
         self.request.validate().map_err(|_| {
             UserAutomationExecutionError::RuntimeResponseMismatch("durable job material shape")
         })?;
@@ -111,6 +133,20 @@ impl UserAutomationDurableJobMaterial {
         if self.occurrence_id != invocation.occurrence_identity()? {
             return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
                 "durable job material occurrence",
+            ));
+        }
+        if self.mode != invocation.mode {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "durable job material mode",
+            ));
+        }
+        if self.mode == UserAutomationExecutionMode::DeterministicProcess
+            && (self.capability_profile.model_access
+                || self.capability_profile.provider_access
+                || self.capability_profile.automation_scheduling)
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "durable job material excludes model-provider access",
             ));
         }
         if self.request.request_identity.request.request.metadata != *context
@@ -132,6 +168,43 @@ impl UserAutomationDurableJobMaterial {
         {
             return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
                 "durable job material principal",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Cross-checks the material against the preflight-approved immutable
+    /// revision before the occurrence joins the existing Durable Job path.
+    ///
+    /// The qualified task/script identity, the execution mode, and the
+    /// capability profile must equal the revision the deterministic preflight
+    /// approved, so a substituted artifact or a widened profile fails closed
+    /// instead of reaching a model/provider route.
+    pub fn validate_for_revision(
+        &self,
+        context: &RequestMetadata,
+        authenticated_principal: &str,
+        invocation: &UserAutomationInvocation,
+        revision: &UserAutomationRevision,
+    ) -> Result<(), UserAutomationExecutionError> {
+        self.validate_for(context, authenticated_principal, invocation)?;
+        if self.mode != revision.mode
+            || self.qualified_ref != revision.task.qualified_ref
+            || self.capability_profile != revision.task.capability_profile
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "durable job material qualified binding",
+            ));
+        }
+        if self.mode == UserAutomationExecutionMode::DeterministicProcess
+            && (revision.work_class == AutomationWorkClass::ModelJobs
+                || !matches!(
+                    revision.provider_policy,
+                    ProviderFingerprintPolicy::DeterministicOnly
+                ))
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "durable job material deterministic revision",
             ));
         }
         Ok(())
@@ -386,10 +459,11 @@ impl UserAutomationRuntimeAdmission {
             ));
         }
         if let Some(material) = &self.durable_job {
-            material.validate_for(
+            material.validate_for_revision(
                 &self.context,
                 &self.authenticated_principal,
                 &self.invocation,
+                &self.revision,
             )?;
         }
         Ok(())

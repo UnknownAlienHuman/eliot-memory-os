@@ -922,6 +922,10 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
         for evidence in process_runtime_control_requests(&mut host, &runtime_queue) {
             idle_drain.note_observable_use(&mut host, &evidence);
         }
+        // One bounded sweep of the authenticated `UserAutomation` owner queue.
+        // The dedicated execution pipe blocks until this drain answers, so it
+        // must run from the service loop rather than from the pipe server.
+        process_user_automation_owner_requests(&host);
         if durable_fence {
             // A degraded branch has fenced the shared authority in the durable
             // state store. Keep the healthy sibling alive, but do not continue
@@ -1087,26 +1091,78 @@ fn process_reactive_context_request(
 
 #[cfg(windows)]
 fn process_user_automation_request(
-    _host: &HostComposition,
+    host: &HostComposition,
     request: &eliot_host::HostRuntimeControlRequest,
 ) -> HostRuntimeControlResponse {
-    // The runtime-control transfer carries the typed UserAutomation carrier
-    // in `request.user_automation` (validated before queueing). Serving it
-    // needs the composed `UserAutomationHostExecutionEndpoint` —
-    // authenticated channel binding plus Durable Job owner plus journal Wake
-    // adapter — which this binary does not retain yet, so no owner effect
-    // is produced here. Preserve that uncertainty on the existing control
-    // response contract, exactly like the reactive-context handler below:
-    // the Kernel reconciles through the typed readback path instead of
-    // assuming execution.
-    HostRuntimeControlResponse::unknown_for(
-        request,
-        eliot_host_service::runtime_control::operation_unknown_ref(
-            &request.operation,
-            "validation",
+    // The runtime-control transfer carries the typed UserAutomation carrier in
+    // `request.user_automation` (validated before queueing). Serving it is the
+    // same owner effect the dedicated execution pipe uses: the bounded
+    // authenticated UserAutomation owner queue is drained through the
+    // composed `UserAutomationHostExecutionEndpoint` (retained Kernel owner
+    // binding, canonical Durable Job owner, and Host journal Wake adapter), so
+    // an admitted occurrence reaches the existing Durable Job/effect/receipt
+    // history instead of being acknowledged without an owner effect.
+    match host.process_user_automation_requests(&host.user_automation_execution_queue()) {
+        // The bounded authenticated owner queue had no admitted entry for this
+        // transfer. The occurrence is still unadmitted, so the response keeps
+        // the uncertainty and the Kernel reconciles through the typed readback
+        // path instead of assuming execution.
+        Ok(0) => HostRuntimeControlResponse::unknown_for(
             request,
+            eliot_host_service::runtime_control::operation_unknown_ref(
+                &request.operation,
+                "no-admitted-owner-entry",
+                request,
+            ),
         ),
-    )
+        // The owner effect itself travels on the authenticated execution
+        // transport, where the admitted Durable Job/effect/receipt history is
+        // written and correlated. This control response therefore reports the
+        // drain honestly instead of claiming an outcome it cannot prove.
+        Ok(_) => HostRuntimeControlResponse::unknown_for(
+            request,
+            eliot_host_service::runtime_control::operation_unknown_ref(
+                &request.operation,
+                "owner-effect-on-execution-transport",
+                request,
+            ),
+        ),
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "eliot-host: UserAutomation owner drain failed: {error}"
+            );
+            HostRuntimeControlResponse::unknown_for(
+                request,
+                eliot_host_service::runtime_control::operation_unknown_ref(
+                    &request.operation,
+                    "owner-unavailable",
+                    request,
+                ),
+            )
+        }
+    }
+}
+
+/// Drains the bounded authenticated `UserAutomation` owner queue.
+///
+/// The dedicated execution pipe enqueues one carrier per admitted intent and
+/// waits for the correlated owner answer, so this drain is the only production
+/// place that runs the composed endpoint. It is a bounded, non-blocking sweep
+/// of an already-authenticated queue: it never starts work, never discovers
+/// occurrences, and never invents authority.
+#[cfg(windows)]
+fn process_user_automation_owner_requests(host: &HostComposition) {
+    let queue = host.user_automation_execution_queue();
+    if queue.lock().map(|queue| queue.is_empty()).unwrap_or(true) {
+        return;
+    }
+    if let Err(error) = host.process_user_automation_requests(&queue) {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "eliot-host: UserAutomation owner queue drain failed: {error}"
+        );
+    }
 }
 
 /// Serves every queued authenticated runtime-control request and returns the

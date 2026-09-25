@@ -165,6 +165,11 @@ pub struct NormalizedSchedule {
 
 impl NormalizedSchedule {
     /// Validates schedule shape without interpreting calendar semantics.
+    ///
+    /// Shape validation deliberately does not read the calendar: the
+    /// owner-normalized occurrence set is the trigger contract, and
+    /// [`Self::validate_normalized_occurrences`] performs the deterministic
+    /// calendar/timezone/DST interpretation over exactly that set.
     pub fn validate(&self) -> Result<(), UserAutomationError> {
         text(&self.expression, "schedule.expression")?;
         text(&self.calendar, "schedule.calendar")?;
@@ -196,6 +201,145 @@ impl NormalizedSchedule {
         }
         Ok(())
     }
+
+    /// Validates the declared timezone identifier without guessing one.
+    ///
+    /// Only the closed canonical forms are admitted: `UTC`, an `Etc/GMT`
+    /// fixed-offset zone, or a canonical `Area/Location` IANA identifier. A
+    /// blank, offset-suffixed, or otherwise shaped zone is refused instead of
+    /// being resolved to a nearest match, because an ambiguous calendar
+    /// phrase is never silently guessed.
+    pub fn validate_timezone(&self) -> Result<(), UserAutomationError> {
+        let zone = self.timezone.trim();
+        if zone != self.timezone || zone.is_empty() {
+            return Err(UserAutomationError::Invalid("schedule.timezone"));
+        }
+        let canonical = zone == "UTC"
+            || zone
+                .strip_prefix("Etc/GMT")
+                .is_some_and(|offset| offset_is_canonical(offset))
+            || (zone.split('/').count() == 2
+                && zone.split('/').all(|segment| {
+                    !segment.is_empty()
+                        && segment
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                }));
+        if !canonical {
+            return Err(UserAutomationError::Invalid("schedule.timezone.canonical"));
+        }
+        Ok(())
+    }
+
+    /// Interprets the owner-normalized occurrence set deterministically.
+    ///
+    /// Each occurrence key is a canonical local wall clock
+    /// (`YYYY-MM-DDTHH:MM:SS`) followed by the exact UTC offset selected by the
+    /// declared timezone, so no time-zone database is required and no offset
+    /// is inferred. The check enforces the property the declared
+    /// [`DstFoldPolicy`]/[`DstGapPolicy`] must leave behind: the normalized set
+    /// is unambiguous, that is, at most one member per local wall clock. A set
+    /// that still carries an unresolved fold (or gap) member fails closed
+    /// instead of being admitted.
+    pub fn validate_normalized_occurrences(&self) -> Result<(), UserAutomationError> {
+        self.validate()?;
+        self.validate_timezone()?;
+        let mut wall_clocks = BTreeSet::new();
+        for occurrence_key in &self.next_occurrences {
+            let wall_clock = occurrence_wall_clock(occurrence_key)?;
+            if !wall_clocks.insert(wall_clock) {
+                return Err(UserAutomationError::Invalid(
+                    "schedule.next_occurrences.dst_ambiguity",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns whether one calendar occurrence belongs to this revision's
+    /// owner-normalized occurrence set.
+    ///
+    /// An occurrence outside the set is not resolved, shifted, or folded into a
+    /// neighbour: the caller fails closed.
+    pub fn contains_occurrence(&self, occurrence_key: &str) -> Result<bool, UserAutomationError> {
+        occurrence_wall_clock(occurrence_key)?;
+        Ok(self
+            .next_occurrences
+            .iter()
+            .any(|key| key == occurrence_key))
+    }
+
+    /// Returns the deterministic successor of one normalized occurrence.
+    ///
+    /// `None` means the occurrence is the last retained member of this
+    /// revision's projection; a caller never invents a later occurrence.
+    pub fn next_occurrence_after(
+        &self,
+        occurrence_key: &str,
+    ) -> Result<Option<String>, UserAutomationError> {
+        occurrence_wall_clock(occurrence_key)?;
+        Ok(self
+            .next_occurrences
+            .iter()
+            .skip_while(|key| key.as_str() != occurrence_key)
+            .nth(1)
+            .cloned())
+    }
+}
+
+/// Length of the canonical local wall clock prefix `YYYY-MM-DDTHH:MM:SS`.
+const OCCURRENCE_WALL_CLOCK_BYTES: usize = 19;
+
+/// Splits one canonical occurrence key into its local wall clock and exact
+/// UTC offset, refusing any spelling that is not canonical.
+fn occurrence_wall_clock(occurrence_key: &str) -> Result<&str, UserAutomationError> {
+    let bytes = occurrence_key.as_bytes();
+    if bytes.len() != OCCURRENCE_WALL_CLOCK_BYTES + 1
+        && bytes.len() != OCCURRENCE_WALL_CLOCK_BYTES + 6
+    {
+        return Err(UserAutomationError::Invalid(
+            "schedule.occurrence_key.shape",
+        ));
+    }
+    if !bytes[..OCCURRENCE_WALL_CLOCK_BYTES]
+        .iter()
+        .enumerate()
+        .all(|(index, byte)| match index {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T',
+            13 | 16 => *byte == b':',
+            _ => byte.is_ascii_digit(),
+        })
+    {
+        return Err(UserAutomationError::Invalid(
+            "schedule.occurrence_key.wall_clock",
+        ));
+    }
+    let offset = &occurrence_key[OCCURRENCE_WALL_CLOCK_BYTES..];
+    if offset != "Z"
+        && !(bytes.len() == OCCURRENCE_WALL_CLOCK_BYTES + 6
+            && (offset.starts_with('+') || offset.starts_with('-'))
+            && offset.as_bytes()[3] == b':'
+            && offset[1..3].bytes().all(|byte| byte.is_ascii_digit())
+            && offset[4..].bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(UserAutomationError::Invalid(
+            "schedule.occurrence_key.offset",
+        ));
+    }
+    Ok(&occurrence_key[..OCCURRENCE_WALL_CLOCK_BYTES])
+}
+
+/// Returns whether a canonical `Etc/GMT` offset suffix is well formed.
+fn offset_is_canonical(offset: &str) -> bool {
+    offset.is_empty()
+        || offset
+            .strip_prefix('+')
+            .or_else(|| offset.strip_prefix('-'))
+            .is_some_and(|hours| {
+                hours.len() == 1
+                    || (hours.len() == 2 && hours.bytes().all(|byte| byte.is_ascii_digit()))
+            })
 }
 
 /// The exact UserAutomation WorkScope projection.
@@ -530,7 +674,7 @@ impl UserAutomationRevision {
         text(&self.owner_principal, "owner_principal")?;
         self.work_scope.validate()?;
         text(&self.natural_language_intent, "natural_language_intent")?;
-        self.schedule.validate()?;
+        self.schedule.validate_normalized_occurrences()?;
         self.task.validate()?;
         list_text(
             &self.portable_skill_package_revision_refs,
@@ -639,6 +783,127 @@ impl UserAutomationRevision {
     #[must_use]
     pub const fn durable_job_operation(&self) -> JobOperationKind {
         JobOperationKind::Submit
+    }
+
+    /// Compiles one owner-normalized calendar occurrence into the immutable
+    /// scheduled trigger of this revision.
+    ///
+    /// The occurrence must be a member of this revision's normalized set. A
+    /// calendar phrase the owner did not normalize is refused here rather than
+    /// resolved, shifted, or folded into a neighbouring occurrence, so a
+    /// duplicate wake or a restart of a different schedule revision can never
+    /// invent a second identity for the same instant.
+    pub fn scheduled_trigger(
+        &self,
+        occurrence_key: &str,
+    ) -> Result<UserAutomationTrigger, UserAutomationError> {
+        self.validate()?;
+        if !self.schedule.contains_occurrence(occurrence_key)? {
+            return Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.unnormalized",
+            ));
+        }
+        let trigger = UserAutomationTrigger::Scheduled {
+            occurrence_key: occurrence_key.to_owned(),
+        };
+        trigger.validate()?;
+        Ok(trigger)
+    }
+
+    /// Builds the revision-bound invocation for one calendar occurrence.
+    ///
+    /// `ScheduledWake` is the origin for the existing scheduler wake and
+    /// `AutomationChild` for an already admitted child. Neither path mints a
+    /// principal: the caller supplies the authenticated principal reference and
+    /// the owner route revalidates it before any effect.
+    pub fn scheduled_invocation(
+        &self,
+        occurrence_key: &str,
+        authenticated_principal: &str,
+        trigger_origin: UserAutomationTriggerOrigin,
+        child_depth: u16,
+    ) -> Result<UserAutomationInvocation, UserAutomationError> {
+        text(authenticated_principal, "principal_ref")?;
+        let trigger = self.scheduled_trigger(occurrence_key)?;
+        let invocation = UserAutomationInvocation {
+            automation_id: self.automation_id.clone(),
+            automation_revision: self.revision.clone(),
+            trigger,
+            mode: self.mode,
+            principal_ref: authenticated_principal.to_owned(),
+            work_scope_ref: self.work_scope.scope_id.clone(),
+            workdir_ref: self.workdir_ref.clone(),
+            trigger_origin,
+            child_depth,
+            provenance: None,
+        };
+        invocation.occurrence_identity_projection()?;
+        Ok(invocation)
+    }
+
+    /// Builds the explicit manual run-now trigger for one Human-issued nonce.
+    ///
+    /// A manual nonce never mutates the normalized schedule: the manual
+    /// occurrence is a distinct trigger kind, so it receives a distinct stable
+    /// identity from any calendar occurrence of the same revision.
+    pub fn manual_trigger(
+        &self,
+        nonce: &str,
+    ) -> Result<UserAutomationTrigger, UserAutomationError> {
+        self.validate()?;
+        text(nonce, "operation.nonce")?;
+        let trigger = UserAutomationTrigger::Manual {
+            nonce: nonce.to_owned(),
+        };
+        trigger.validate()?;
+        Ok(trigger)
+    }
+
+    /// Returns the stable revision-bound occurrence identity for one trigger.
+    pub fn occurrence_identity_for(
+        &self,
+        trigger: &UserAutomationTrigger,
+    ) -> Result<String, UserAutomationError> {
+        self.validate()?;
+        UserAutomationInvocation::occurrence_identity_for(
+            &self.automation_id,
+            &self.revision,
+            trigger,
+        )
+    }
+
+    /// Compiles the bounded next-occurrence projection of this revision into
+    /// immutable revision-bound occurrence identities.
+    ///
+    /// This is the deterministic schedule compiler surface shown to the Human
+    /// before activation and reused by every later admission: the same revision
+    /// always produces the same ordered identities, and a duplicate wake or
+    /// restart resolves to the identity already present in this list.
+    pub fn compile_occurrence_identities(
+        &self,
+    ) -> Result<Vec<AutomationOccurrenceIdentity>, UserAutomationError> {
+        self.validate()?;
+        self.schedule.validate_normalized_occurrences()?;
+        let mut identities = Vec::with_capacity(self.schedule.next_occurrences.len());
+        for occurrence_key in &self.schedule.next_occurrences {
+            let trigger = self.scheduled_trigger(occurrence_key)?;
+            identities.push(AutomationOccurrenceIdentity {
+                automation_id: self.automation_id.clone(),
+                revision: self.revision.clone(),
+                trigger,
+                occurrence_id: self.occurrence_identity_for(&trigger)?,
+            });
+        }
+        Ok(identities)
+    }
+
+    /// Returns the deterministic successor occurrence of this revision.
+    pub fn next_occurrence_after(
+        &self,
+        occurrence_key: &str,
+    ) -> Result<Option<String>, UserAutomationError> {
+        self.validate()?;
+        self.schedule.next_occurrence_after(occurrence_key)
     }
 }
 

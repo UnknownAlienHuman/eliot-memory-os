@@ -25,10 +25,11 @@ use eliot_ors::{
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation};
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, NamedReadRequest,
-    NamedReadResponse, OperationIdentity, OrderingHeadExpectation, PreparedTransition, RequestMeta,
-    ReservedWriteRequest, RevisionHeadExpectation, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, generated_operation_manifests,
-    verify_canonical_request_hash,
+    NamedReadResponse, OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
+    PreparedTransition, RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation,
+    RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, canonical_request_hash,
+    generated_operation_manifests, verify_canonical_request_hash,
 };
 
 use crate::commit_recovery::{
@@ -45,7 +46,8 @@ use crate::store_write_reservation::{
 use crate::{
     CanonicalUserAutomationStore, EbpCanonicalStoreClient, EbpStoreTransport, KernelService,
     StoreClientFault, StoreClientFaultHarness, UserAutomationOwnerLookup,
-    UserAutomationOwnerSnapshot,
+    UserAutomationOwnerSnapshot, UserAutomationService, UserAutomationServiceRequest,
+    UserAutomationStoreRequest, UserAutomationStoreResponse,
 };
 
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
@@ -278,6 +280,88 @@ impl std::fmt::Debug for KernelStoreGateway {
     }
 }
 
+/// Borrowed view of the retained canonical Store client.
+///
+/// [`CanonicalUserAutomationStore`] owns its client, and the production
+/// `EbpCanonicalStoreClient` is deliberately neither cloned nor reconnected
+/// outside the gateway that owns it. This adapter lends that one retained
+/// client to the Store adapter and forwards every canonical operation
+/// verbatim. It owns no client, connection, cache, or state and adds no second
+/// write path: every call lands on the same authenticated generation-routed
+/// client the gateway itself uses.
+pub struct BorrowedCanonicalStoreClient<'a> {
+    client: &'a EbpCanonicalStoreClient<NamedPipeTransport>,
+}
+
+impl<'a> BorrowedCanonicalStoreClient<'a> {
+    /// Borrows the already-composed canonical Store client.
+    #[must_use]
+    pub const fn new(client: &'a EbpCanonicalStoreClient<NamedPipeTransport>) -> Self {
+        Self { client }
+    }
+}
+
+#[allow(async_fn_in_trait)]
+impl CanonicalStoreClient for BorrowedCanonicalStoreClient<'_> {
+    async fn apply_prepared(
+        &self,
+        ctx: &RequestMeta,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<WriteReceipt, StoreError> {
+        self.client
+            .apply_prepared(
+                ctx,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            )
+            .await
+    }
+
+    async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError> {
+        self.client.receipt(operation_id).await
+    }
+
+    async fn revision_heads(
+        &self,
+        keys: Vec<RevisionKey>,
+    ) -> Result<Vec<RevisionHead>, StoreError> {
+        self.client.revision_heads(keys).await
+    }
+
+    async fn validation_snapshot(&self) -> Result<CanonicalValidationSnapshot, StoreError> {
+        self.client.validation_snapshot().await
+    }
+
+    async fn scope_revision_view(
+        &self,
+        scope_id: ScopeId,
+    ) -> Result<ScopeRevisionView, StoreError> {
+        self.client.scope_revision_view(scope_id).await
+    }
+
+    async fn ordering_heads(
+        &self,
+        scopes: Vec<OrderingScopeId>,
+    ) -> Result<Vec<OrderingHead>, StoreError> {
+        self.client.ordering_heads(scopes).await
+    }
+
+    async fn execute_named(
+        &self,
+        query: NamedReadRequest,
+    ) -> Result<NamedReadResponse, StoreError> {
+        self.client.execute_named(query).await
+    }
+
+    async fn health(&self) -> Result<StoreHealth, StoreError> {
+        self.client.health().await
+    }
+}
+
+/// Canonical-store gateway bound to the active Kernel generation route.
 impl KernelStoreGateway {
     /// Constructs the gateway from the Kernel-approved service and Store client.
     #[doc(hidden)]
@@ -934,6 +1018,51 @@ impl KernelStoreGateway {
             response,
         )
         .map_err(|error| error.to_string())
+    }
+
+    /// Executes one authenticated UserAutomation operator operation through
+    /// the existing canonical Store owner.
+    ///
+    /// The caller contributes only the authenticated request metadata, the
+    /// authenticated principal, the operation identity triple, and the closed
+    /// [`UserAutomationOperation`](eliot_kernel_core::UserAutomationOperation).
+    /// The canonical request hash is sealed here over the exact prepared
+    /// transition before dispatch, so a caller can never supply it and the
+    /// Store adapter rebuilds byte-identical bytes deterministically. This is
+    /// the one production path from a Kernel front-door route into
+    /// [`CanonicalUserAutomationStore`]; it adds no second writer.
+    pub async fn execute_user_automation_operation(
+        &self,
+        request: UserAutomationServiceRequest,
+    ) -> Result<UserAutomationStoreResponse, String> {
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(
+            self.store.as_ref(),
+        ));
+        let mut unsealed = request.clone();
+        unsealed.identity.canonical_request_hash = String::new();
+        let unsealed_store_request = UserAutomationStoreRequest {
+            context: unsealed.context.clone(),
+            authenticated_principal: unsealed.authenticated_principal.clone(),
+            identity: unsealed.identity.clone(),
+            intent: unsealed.intent.clone(),
+        };
+        let (transition, _manifest_digest) = store
+            .build_transition(&unsealed_store_request)
+            .await
+            .map_err(|error| error.to_string())?;
+        let view = CanonicalRequestView::from_apply(
+            &unsealed_store_request.context,
+            &transition,
+            &[],
+            &[],
+        );
+        let mut sealed = request;
+        sealed.identity.canonical_request_hash =
+            canonical_request_hash(&view).map_err(|error| error.to_string())?;
+        UserAutomationService::new(&store)
+            .dispatch(sealed)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// Seeds the Store's all-absent genesis state under the active Kernel
