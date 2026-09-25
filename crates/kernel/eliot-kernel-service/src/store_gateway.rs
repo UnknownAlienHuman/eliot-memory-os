@@ -301,7 +301,6 @@ impl<'a> BorrowedCanonicalStoreClient<'a> {
     }
 }
 
-#[allow(async_fn_in_trait)]
 impl CanonicalStoreClient for BorrowedCanonicalStoreClient<'_> {
     async fn apply_prepared(
         &self,

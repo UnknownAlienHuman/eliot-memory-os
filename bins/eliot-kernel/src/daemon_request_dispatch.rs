@@ -2489,6 +2489,34 @@ impl KernelComposition {
             let identities = revision
                 .compile_occurrence_identities()
                 .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+            // Each compiled identity is projected together with the
+            // deterministic successor the same revision compiler resolves. The
+            // Human surface therefore sees the whole next-occurrence chain,
+            // including the terminal occurrence whose successor is `None`,
+            // instead of an unlabelled list it would have to re-derive.
+            let mut occurrences = Vec::with_capacity(identities.len());
+            for identity in &identities {
+                let occurrence_key = match &identity.trigger {
+                    eliot_kernel_core::user_automation::UserAutomationTrigger::Scheduled {
+                        occurrence_key,
+                    } => occurrence_key.as_str(),
+                    eliot_kernel_core::user_automation::UserAutomationTrigger::Manual {
+                        ..
+                    } => {
+                        return Err(UserAutomationRuntimeError::Rejected(
+                            "compiled UserAutomation occurrence is not a calendar occurrence"
+                                .to_owned(),
+                        ));
+                    }
+                };
+                let next_occurrence = revision
+                    .next_occurrence_after(occurrence_key)
+                    .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+                occurrences.push(serde_json::json!({
+                    "identity": identity,
+                    "next_occurrence": next_occurrence,
+                }));
+            }
             projections.push(
                 serde_json::to_value(serde_json::json!({
                     "automation_id": revision.automation_id,
@@ -2500,7 +2528,7 @@ impl KernelComposition {
                     "dst_fold": revision.schedule.dst_fold,
                     "dst_gap": revision.schedule.dst_gap,
                     "configuration_state": revision.configuration_state,
-                    "occurrences": identities,
+                    "occurrences": occurrences,
                 }))
                 .map_err(|error| {
                     UserAutomationRuntimeError::Rejected(format!(
@@ -2565,16 +2593,28 @@ impl KernelComposition {
                 ),
             ));
         }
-        let manual_trigger = eliot_kernel_core::user_automation::UserAutomationTrigger::Manual {
-            nonce: manual_nonce.clone(),
+        // The run-now trigger is compiled by the same immutable revision
+        // compiler that compiles a calendar occurrence, so the explicit manual
+        // nonce is validated against the stored revision and receives a
+        // distinct, stable, revision-bound identity instead of a value built
+        // here beside the schedule. A nonce the revision cannot compile is a
+        // typed rejection, not a second trigger vocabulary.
+        let manual_trigger = match owner.revision.manual_trigger(&manual_nonce) {
+            Ok(trigger) => trigger,
+            Err(error) => {
+                return Ok(Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::Rejected(error.to_string()),
+                ));
+            }
         };
-        let occurrence_id =
-            eliot_kernel_core::user_automation::UserAutomationInvocation::occurrence_identity_for(
-                &owner.revision.automation_id,
-                &owner.revision.revision,
-                &manual_trigger,
-            )
-            .map_err(|_| TransportError::SessionFenced)?;
+        let occurrence_id = match owner.revision.occurrence_identity_for(&manual_trigger) {
+            Ok(occurrence_id) => occurrence_id,
+            Err(error) => {
+                return Ok(Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::Rejected(error.to_string()),
+                ));
+            }
+        };
         let invocation = gateway
             .read_user_automation_invocation(
                 &lookup.state_fence,
