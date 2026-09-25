@@ -2075,7 +2075,6 @@ fn settle_testd_owner_completion(
     }
 }
 
-
 /// Runs one TestD owner drain step through the production finish caller.
 ///
 /// #18 item B: the bounded step is split into phases so the composition guard
