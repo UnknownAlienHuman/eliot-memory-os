@@ -51,8 +51,34 @@
 //!
 //! Design: decode (UTF-8 + case-insensitive legacy-marker scan) -> always
 //! reject when present. No TOML crate, no field structs, no adoption.
+//!
+//! Cutover codes (issue #1858; I19.5 recovery order, I19.10 cutover
+//! criteria): every retained legacy Governor entrypoint refusal carries one
+//! stable machine-readable code from the `LEGACY_GOVERNOR_*` family plus a
+//! redirect receipt naming [`LEGACY_GOVERNOR_CANONICAL_ROUTE`]. The codes are
+//! observational only: refusal stays fail-closed, legacy content is never
+//! adopted, and no legacy entrypoint initializes an independent Governor,
+//! direct store mutation route, local control channel, or alternate launch
+//! journal.
 
 use std::path::Path;
+
+/// Canonical Kernel-governed route named by every legacy-entrypoint
+/// redirect receipt. Production effects stay on the manifest-bound
+/// installation/canary path; typed Governor policy resolves only through
+/// `eliotd::canonical_config_precedence`.
+pub(super) const LEGACY_GOVERNOR_CANONICAL_ROUTE: &str = "eliot setup through the Kernel canonical configuration surface (Host-managed StoreLaunchConfig bound to the installation manifest; Governor operates only as outbound-only eliotd polling Kernel; typed policy resolves only through eliotd::canonical_config_precedence)";
+
+/// Stable machine-readable cutover code: the retired legacy Governor config
+/// file is present and was refused without adoption.
+pub(super) const LEGACY_GOVERNOR_CONFIG_RETIRED: &str = "LEGACY_GOVERNOR_CONFIG_RETIRED";
+/// Stable machine-readable cutover code: the legacy `eliot-governor.exe`
+/// process is running and the operation was refused.
+pub(super) const LEGACY_GOVERNOR_PROCESS_RUNNING: &str = "LEGACY_GOVERNOR_PROCESS_RUNNING";
+/// Stable machine-readable cutover code: the OS legacy probe itself is
+/// unknown, so the operation was refused without inventing a disposition.
+/// The probe detail is preserved, never collapsed into another outcome.
+pub(super) const LEGACY_GOVERNOR_OBSERVATION_UNKNOWN: &str = "LEGACY_GOVERNOR_OBSERVATION_UNKNOWN";
 
 /// Full migration action emitted when legacy config is present. Names the
 /// Kernel canonical surface.

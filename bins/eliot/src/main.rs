@@ -1112,24 +1112,57 @@ fn observe_legacy_governor_config() -> Result<()> {
     // #1687: the legacy Governor file is never adopted as authority. A present
     // file fails closed with the Kernel-surface migration action; an absent
     // file is provisional and lets the canary/install path proceed.
+    // #1858 (I19.5): each legacy-entrypoint refusal additionally emits a
+    // stable machine-readable cutover code with a redirect receipt naming
+    // the canonical Kernel-governed route. The report is observational only:
+    // the returned Err still aborts the operation, so no legacy entrypoint
+    // can initialize an independent Governor, direct store mutation route,
+    // local control channel, or alternate launch journal.
     match observe_current_user_config(INSTALLATION_INPUT_LIMIT) {
         Ok(eliot_platform_windows::LocalAppDataConfigObservation::Absent { .. }) => {
             legacy_governor_config::gate_legacy_config_observation(None)
                 .map_err(|error| anyhow::anyhow!(error))?;
         }
         Ok(eliot_platform_windows::LocalAppDataConfigObservation::Present(read)) => {
-            legacy_governor_config::gate_legacy_config_observation(Some((
+            if let Err(error) = legacy_governor_config::gate_legacy_config_observation(Some((
                 read.path(),
                 read.bytes(),
-            )))
-            .map_err(|error| anyhow::anyhow!(error))?;
+            ))) {
+                write_legacy_governor_cutover_rejection(
+                    legacy_governor_config::LEGACY_GOVERNOR_CONFIG_RETIRED,
+                    &error,
+                );
+                return Err(anyhow::anyhow!(error));
+            }
         }
-        Err(error) => anyhow::bail!("legacy Governor config observation is unknown: {error}"),
+        Err(error) => {
+            let detail = format!("legacy Governor config observation is unknown: {error}");
+            write_legacy_governor_cutover_rejection(
+                legacy_governor_config::LEGACY_GOVERNOR_OBSERVATION_UNKNOWN,
+                &detail,
+            );
+            return Err(anyhow::anyhow!(detail));
+        }
     }
-    classify_legacy_governor_process_state(
-        is_eliot_governor_running().map_err(|error| error.to_string()),
-    )
-    .map_err(|error| anyhow::anyhow!(error))
+    let process_state = is_eliot_governor_running().map_err(|error| error.to_string());
+    match &process_state {
+        Ok(false) => {}
+        Ok(true) => {
+            let detail = "legacy eliot-governor.exe is running";
+            write_legacy_governor_cutover_rejection(
+                legacy_governor_config::LEGACY_GOVERNOR_PROCESS_RUNNING,
+                detail,
+            );
+        }
+        Err(error) => {
+            let detail = format!("legacy Governor process state is unknown: {error}");
+            write_legacy_governor_cutover_rejection(
+                legacy_governor_config::LEGACY_GOVERNOR_OBSERVATION_UNKNOWN,
+                &detail,
+            );
+        }
+    }
+    classify_legacy_governor_process_state(process_state).map_err(|error| anyhow::anyhow!(error))
 }
 
 #[cfg(windows)]
@@ -3751,6 +3784,24 @@ fn write_json_error(code: &str, detail: &str) {
     println!(
         "{}",
         json!({"status": "error", "code": code, "detail": detail})
+    );
+}
+
+/// Structured legacy-entrypoint cutover rejection (#1858, I19.5). Emits the
+/// stable machine-readable cutover code with a redirect receipt naming the
+/// canonical Kernel-governed route. Observational only: callers still return
+/// Err, so the refusal stays fail-closed with no alternate writer.
+#[cfg(windows)]
+fn write_legacy_governor_cutover_rejection(code: &str, detail: &str) {
+    println!(
+        "{}",
+        json!({
+            "status": "ERROR",
+            "code": code,
+            "detail": detail,
+            "canonical_route": legacy_governor_config::LEGACY_GOVERNOR_CANONICAL_ROUTE,
+            "completed": false,
+        })
     );
 }
 
