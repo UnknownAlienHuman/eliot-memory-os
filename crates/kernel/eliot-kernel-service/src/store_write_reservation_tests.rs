@@ -2768,10 +2768,17 @@ mod gateway_cases {
             .await
             .expect("992 EBP handshake");
         let service = Arc::new(Mutex::new(ready_service()));
+        // The route carries the live service's complete epoch tuple; a
+        // sequence-only route could no longer be proven current (#64).
+        let route_epoch = service
+            .lock()
+            .expect("992 service")
+            .authority_epoch()
+            .clone();
         let route = GenerationRoute::new(
             RouteScope::new("store_bridge").expect("992 scope"),
             ResourceGeneration::genesis(),
-            AuthorityEpoch::new(1).expect("992 route epoch"),
+            route_epoch,
         )
         .expect("992 route");
         let gateway = Arc::new(KernelStoreGateway::new(

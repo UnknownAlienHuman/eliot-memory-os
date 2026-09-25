@@ -391,8 +391,15 @@ impl KernelComposition {
         let route = generations
             .route(&scope)
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        // Exact tuple equality is the authorization rule (Implements #64): the
+        // route carries the canonical `EpochId`, so a supervised launch from a
+        // different lineage at the same sequence is not the active daemon
+        // route. The identical rule is already applied to the process receipt
+        // above; this closes the same self-inconsistency on the route side.
         if route.active_generation().value() != launch.generation.value()
-            || route.authority_epoch().value() != launch.authority_epoch.sequence.get()
+            || !route
+                .authority_epoch()
+                .is_same_authority(&launch.authority_epoch)
         {
             return Err(KernelBuildError::Service(
                 "eliotd supervised generation is not the active daemon route".to_owned(),

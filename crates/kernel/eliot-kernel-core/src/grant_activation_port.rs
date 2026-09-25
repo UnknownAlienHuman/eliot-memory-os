@@ -5858,6 +5858,7 @@ fn map_thin_error(error: &KernelError) -> eliot_authority::P07PortError {
     match error {
         KernelError::FenceMismatch
         | KernelError::StaleEpoch { .. }
+        | KernelError::StaleEpochTuple { .. }
         | KernelError::Expired { .. }
         | KernelError::ControlReserveExhausted
         | KernelError::NormalCapacityExhausted { .. }

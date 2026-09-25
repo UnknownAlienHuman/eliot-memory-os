@@ -144,7 +144,6 @@ impl OrsGenerationCoordinator {
             .map(|snapshot| snapshot.record().new_epoch.value())
             .max()
             .ok_or_else(|| "committed cutover projection was empty".to_owned())?;
-        let epoch = AuthorityEpoch::new(epoch_value).map_err(|error| error.to_string())?;
         for snapshot in &snapshots {
             let record = snapshot.record();
             if record.state != GenerationCutoverState::Committed
@@ -154,11 +153,12 @@ impl OrsGenerationCoordinator {
             }
         }
         observe_recovery("kernel.recovery.cutovers_validated", "success");
-        // Lineage-aware bridge (Implements #64): the scalar ORS cutover
-        // contour carries only the sequence; the canonical service epoch keeps
-        // its current lineage and advances to the maximal committed sequence.
-        // Cross-lineage promotion never occurs here; `synchronize` fails
-        // closed on lineage mismatch or regression.
+        // Lineage-aware bridge (Implements #64): the durable ORS cutover record
+        // carries only the sequence, so it can never prove a lineage. The
+        // canonical service epoch keeps its own lineage and advances to the
+        // maximal committed sequence; `synchronize` fails closed on a lineage
+        // mismatch or a regression, and the rebuilt route table is then bound
+        // to that exact tuple rather than to a bare counter.
         let current_lineage = service.authority_epoch().lineage_id.clone();
         let canonical = eliot_contracts::EpochId::new(
             current_lineage,
@@ -169,12 +169,22 @@ impl OrsGenerationCoordinator {
         service
             .synchronize_authority_epoch(canonical)
             .map_err(|error| error.to_string())?;
-        let mut recovered = GenerationRouter::at_epoch(epoch).map_err(|error| error.to_string())?;
+        let active_epoch = service.authority_epoch();
+        let mut recovered = GenerationRouter::at_epoch(active_epoch.clone());
         for snapshot in &snapshots {
             let record = snapshot.record();
+            // A committed record at any other sequence belongs to a superseded
+            // position in the epoch history. Adopting it here would replay a
+            // bare scalar into the current lineage, so it stays historical and
+            // never becomes the active route.
+            if record.state != GenerationCutoverState::Committed
+                || record.new_epoch.value() != active_epoch.sequence.get()
+            {
+                continue;
+            }
             let scope =
                 RouteScope::new(record.route_scope.clone()).map_err(|error| error.to_string())?;
-            let route = GenerationRoute::new(scope, record.new_generation, epoch)
+            let route = GenerationRoute::new(scope, record.new_generation, active_epoch.clone())
                 .map_err(|error| error.to_string())?;
             recovered
                 .register(route)
@@ -219,8 +229,12 @@ impl OrsGenerationCoordinator {
             route_scope: decision.route_scope().as_str().to_owned(),
             old_generation: decision.old_generation(),
             new_generation: decision.new_generation(),
-            old_epoch: decision.old_epoch(),
-            new_epoch: decision.new_epoch(),
+            // The durable ORS record is still a scalar contour (W3 residual,
+            // #64): only the sequence is projected into it, and no
+            // authorization decision reads it back. The lineage-bearing
+            // decision stays in `decision` and in the live route table.
+            old_epoch: durable_epoch_projection(decision.old_epoch())?,
+            new_epoch: durable_epoch_projection(decision.new_epoch())?,
             state: GenerationCutoverState::Armed,
         };
         self.ors
@@ -235,17 +249,11 @@ impl OrsGenerationCoordinator {
             return Err("ORS did not return a committed cutover".to_owned());
         }
         observe_recovery("kernel.recovery.cutover_committed", "success");
-        // Same lineage-aware bridge as `recover`: project the scalar decision
-        // sequence onto the service's current lineage; cross-lineage or
-        // regression fails closed inside `synchronize`.
-        let decision_sequence = decision.new_epoch().value();
-        let decision_lineage = service.authority_epoch().lineage_id.clone();
-        let decision_canonical = eliot_contracts::EpochId::new(
-            decision_lineage,
-            std::num::NonZeroU64::new(decision_sequence)
-                .ok_or_else(|| "cutover epoch must be non-zero".to_owned())?,
-        )
-        .map_err(|error| error.to_string())?;
+        // Same exact-tuple bridge as `recover`: the durable record projected the
+        // canonical decision sequence; the service is then synchronized on the
+        // complete tuple, which fails closed on a cross-lineage target or a
+        // regression. The decision itself is never widened by its sequence.
+        let decision_canonical = decision.new_epoch().clone();
         service
             .synchronize_authority_epoch(decision_canonical)
             .map_err(|error| error.to_string())?;
@@ -254,6 +262,20 @@ impl OrsGenerationCoordinator {
         observe_recovery("kernel.recovery.cutover_applied", "success");
         Ok(())
     }
+}
+
+/// Projects one lineage-aware epoch into the still-scalar durable ORS cutover
+/// record.
+///
+/// This is the only place a canonical epoch is narrowed to a bare counter, and
+/// it exists because [`RuntimeGenerationCutoverRecord`] is a durable contract
+/// that a versioned compatibility decoder (issue #64 W3) has not migrated yet.
+/// The projection is write-only: every read and every authorization decision
+/// in this file uses the complete [`eliot_contracts::EpochId`] tuple, so a
+/// sequence-only record can never decide lineage.
+fn durable_epoch_projection(epoch: &eliot_contracts::EpochId) -> Result<AuthorityEpoch, String> {
+    AuthorityEpoch::new(epoch.sequence.get())
+        .map_err(|error| format!("epoch projection is not representable: {error}"))
 }
 
 /// Older ORS databases predate the optional I14.14 ownership table. An absent
@@ -290,28 +312,29 @@ pub(crate) fn update_handshake_policy(
             }
         }
         policy.module_generation.generation = route.active_generation();
-        // Project the scalar route sequence onto the policy's current lineage
-        // to obtain the canonical fence epoch; the scalar route contour itself
-        // stays untouched for the residual `GenerationRouter`.
-        let policy_lineage = policy
+        // Exact tuple equality (Implements #64): the policy fence adopts the
+        // route's complete `EpochId`. Re-deriving a sequence on the policy's
+        // own lineage is what previously let a route from another lineage be
+        // rewritten into the current one, so a lineage disagreement is now a
+        // terminal policy error instead of a silent rewrite.
+        if policy
             .module_generation
             .state_fence
             .authority_epoch
             .lineage_id
-            .clone();
-        let policy_epoch = eliot_contracts::EpochId::new(
-            policy_lineage,
-            std::num::NonZeroU64::new(route.authority_epoch().value())
-                .ok_or_else(|| "route epoch must be non-zero".to_owned())?,
-        )
-        .map_err(|error| error.to_string())?;
+            != route.authority_epoch().lineage_id
+        {
+            return Err(
+                "Kernel handshake policy epoch lineage disagrees with the route".to_owned(),
+            );
+        }
         policy.module_generation.state_fence =
-            StateFence::new(policy_epoch, route.active_generation());
+            StateFence::new(route.authority_epoch().clone(), route.active_generation());
         policy.config_snapshot = serde_json::json!({
             "service": SERVICE_NAME,
             "protocol": PROTOCOL_VERSION,
             "generation": route.active_generation().value(),
-            "authority_epoch": route.authority_epoch().value(),
+            "authority_epoch": route.authority_epoch(),
         });
         if let Some(artifact_digest) = artifact_digest {
             policy.config_snapshot["artifact_digest"] = artifact_digest;
@@ -356,6 +379,15 @@ mod generation_recovery_diagnostics_tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    fn test_epoch(sequence: u64) -> eliot_contracts::EpochId {
+        eliot_contracts::EpochId::new(
+            eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("test lineage"),
+            std::num::NonZeroU64::new(sequence).expect("test sequence"),
+        )
+        .expect("test epoch")
     }
 
     fn capture(run: impl FnOnce()) -> String {
@@ -462,12 +494,12 @@ mod generation_recovery_diagnostics_tests {
 
         // Projected leg: the daemon route drives generation, fence epoch,
         // and snapshot exactly as before; only fixed names reach the sink.
-        let epoch = AuthorityEpoch::new(7).expect("epoch");
-        let mut router = GenerationRouter::at_epoch(epoch).expect("router");
+        let epoch = test_epoch(7);
+        let mut router = GenerationRouter::at_epoch(epoch.clone());
         let scope = RouteScope::new("daemon").expect("daemon scope");
         let generation = eliot_contracts::ResourceGeneration::new(3).expect("generation");
         router
-            .register(GenerationRoute::new(scope, generation, epoch).expect("route"))
+            .register(GenerationRoute::new(scope, generation, epoch.clone()).expect("route"))
             .expect("register");
         let mut policy = baseline.clone();
         policy.config_snapshot["artifact_digest"] =
@@ -495,7 +527,7 @@ mod generation_recovery_diagnostics_tests {
         );
         assert_eq!(
             policy.config_snapshot["authority_epoch"],
-            serde_json::json!(7u64)
+            serde_json::to_value(&epoch).expect("epoch json")
         );
         assert_eq!(
             policy.config_snapshot["service"],
@@ -516,7 +548,7 @@ mod generation_recovery_diagnostics_tests {
 
         // Absent leg: without a daemon route the policy is byte-identical
         // and the omission — not a projection — is recorded.
-        let empty = GenerationRouter::at_epoch(epoch).expect("empty router");
+        let empty = GenerationRouter::at_epoch(epoch);
         let mut policy = baseline.clone();
         let before = policy.clone();
         let text = capture(|| {

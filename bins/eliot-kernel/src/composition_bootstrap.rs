@@ -15,22 +15,21 @@
 //! Public construction semantics remain on `KernelComposition`; this ordinary
 //! module only houses their implementation.
 use super::{
-    AgentActivationPendingState, ArtifactId, AuthorityDescriptorContour, AuthorityEpoch,
-    AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState,
-    AuthorityPreparationError, AuthoritySnapshotBinding, BlobStoreController, BoundCanonicalOwner,
-    ContractId, DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId,
-    DispatchSnapshotCodec, GenerationRoute, GenerationRouter, GovernorClosureRestore, HealthVector,
-    IpcImplementation, KernelBackupCapture, KernelBackupRestore, KernelBuildError,
-    KernelComposition, KernelConfig, KernelDispatchKey, KernelError, KernelPathAdmission,
-    KernelService, KernelStoreRebindProductionBoundary, KernelSupervisionLeaseAuthority,
-    ModuleGeneration, ModuleGenerationState, OperationalRecoveryStore, OrsError,
-    OrsGenerationCoordinator, PROTOCOL_VERSION, PreparedAuthorityMaterial,
-    ProcessAuthorityHandoffDescriptor, ProcessDispatchAuthorityController,
-    ProcessExecutionAuthorityConfig, ProcessExecutionGateway, RedbRecoveryStore, RouteScope,
-    Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy, StartupCoordinator, StateFence,
-    USER_AUTOMATION_KERNEL_CAPABILITY, UserOwnedPathLease, UserOwnedRootLease,
-    WindowsDispatchSnapshotCodec, WindowsPlatform, bind_canonical_owner, is_lower_sha256,
-    owner_bundle_digest, sha256_hex, sha256_json, unix_ms,
+    AgentActivationPendingState, ArtifactId, AuthorityDescriptorContour, AuthorityHandoffBegin,
+    AuthorityHandoffRecord, AuthorityHandoffState, AuthorityPreparationError,
+    AuthoritySnapshotBinding, BlobStoreController, BoundCanonicalOwner, ContractId,
+    DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId, DispatchSnapshotCodec,
+    GenerationRoute, GenerationRouter, GovernorClosureRestore, HealthVector, IpcImplementation,
+    KernelBackupCapture, KernelBackupRestore, KernelBuildError, KernelComposition, KernelConfig,
+    KernelDispatchKey, KernelError, KernelPathAdmission, KernelService,
+    KernelStoreRebindProductionBoundary, KernelSupervisionLeaseAuthority, ModuleGeneration,
+    ModuleGenerationState, OperationalRecoveryStore, OrsError, OrsGenerationCoordinator,
+    PROTOCOL_VERSION, PreparedAuthorityMaterial, ProcessAuthorityHandoffDescriptor,
+    ProcessDispatchAuthorityController, ProcessExecutionAuthorityConfig, ProcessExecutionGateway,
+    RedbRecoveryStore, RouteScope, Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy,
+    StartupCoordinator, StateFence, USER_AUTOMATION_KERNEL_CAPABILITY, UserOwnedPathLease,
+    UserOwnedRootLease, WindowsDispatchSnapshotCodec, WindowsPlatform, bind_canonical_owner,
+    is_lower_sha256, owner_bundle_digest, sha256_hex, sha256_json, unix_ms,
 };
 #[cfg(test)]
 use super::{CanonicalEvidenceProvider, DispatchValidationPort};
@@ -1065,14 +1064,14 @@ impl KernelComposition {
         // reserved for the explicitly standalone composition, where no Store
         // authority has been injected.
         //
-        // Lineage-aware split (Implements #64): the scalar `GenerationRouter`
-        // residual keeps the exact sequence projection, while canonical
-        // `StateFence`/`KernelService` fencing uses the full `EpochId` tuple.
-        // Cross-lineage same-sequence routes never authorize through the
-        // canonical gate.
-        let (authority_epoch, canonical_epoch, generation) = match store_bootstrap.as_ref() {
+        // Lineage-aware route seed (Implements #64): the Kernel route table is
+        // built from the exact canonical `EpochId` tuple carried by the
+        // Host-approved bootstrap fence. There is no scalar `AuthorityEpoch`
+        // projection left for the route, so a route minted under another
+        // lineage at the same sequence can never be admitted as the active
+        // route.
+        let (canonical_epoch, generation) = match store_bootstrap.as_ref() {
             None => (
-                AuthorityEpoch::genesis(),
                 eliot_contracts::EpochId::new(
                     eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
                         .map_err(|error| KernelBuildError::Service(error.to_string()))?,
@@ -1081,26 +1080,19 @@ impl KernelComposition {
                 .map_err(|error| KernelBuildError::Service(error.to_string()))?,
                 ResourceGeneration::genesis(),
             ),
-            Some(requirement) => {
-                let canonical = requirement.state_fence.authority_epoch.clone();
-                let scalar = AuthorityEpoch::new(canonical.sequence.get())
-                    .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-                (
-                    scalar,
-                    canonical,
-                    requirement.state_fence.resource_generation,
-                )
-            }
+            Some(requirement) => (
+                requirement.state_fence.authority_epoch.clone(),
+                requirement.state_fence.resource_generation,
+            ),
         };
-        let mut generations = GenerationRouter::at_epoch(authority_epoch)
-            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        let mut generations = GenerationRouter::at_epoch(canonical_epoch.clone());
         generations
             .register(
                 GenerationRoute::new(
                     RouteScope::new("daemon")
                         .map_err(|error| KernelBuildError::Core(error.to_string()))?,
                     generation,
-                    authority_epoch,
+                    canonical_epoch.clone(),
                 )
                 .map_err(|error| KernelBuildError::Core(error.to_string()))?,
             )
@@ -1114,27 +1106,29 @@ impl KernelComposition {
                     RouteScope::new("store_bridge")
                         .map_err(|error| KernelBuildError::Core(error.to_string()))?,
                     generation,
-                    authority_epoch,
+                    canonical_epoch.clone(),
                 )
                 .map_err(|error| KernelBuildError::Core(error.to_string()))?,
             )
             .map_err(|error| KernelBuildError::Core(error.to_string()))?;
         // F-LOG-KERNEL-2 (#899): exact route/generation observation. Only the
-        // fixed route names plus numeric epoch/generation are emitted, never
-        // raw bootstrap/launch/descriptor material.
+        // fixed route names plus the lineage-aware epoch tuple and generation
+        // are emitted, never raw bootstrap/launch/descriptor material. The
+        // epoch keeps its lineage: a sequence-only spelling would let two
+        // unrelated lineages share one observation.
         observe_entrypoint_with_detail(
             EntrypointStage::Composition,
             &format!(
-                "kernel.composition.route_registered:daemon:epoch={}:generation={}",
-                authority_epoch.value(),
+                "kernel.composition.route_registered:daemon:epoch={:?}:generation={}",
+                canonical_epoch,
                 generation.value()
             ),
         );
         observe_entrypoint_with_detail(
             EntrypointStage::StoreBootstrap,
             &format!(
-                "kernel.composition.route_registered:store_bridge:epoch={}:generation={}",
-                authority_epoch.value(),
+                "kernel.composition.route_registered:store_bridge:epoch={:?}:generation={}",
+                canonical_epoch,
                 generation.value()
             ),
         );
@@ -1161,11 +1155,24 @@ impl KernelComposition {
         let session_principal_binding = observed_session_principal_binding()?;
         #[cfg(not(windows))]
         let session_principal_binding = "unsupported-non-windows-principal".to_owned();
+        // The published front-door config snapshot carries the COMPLETE typed
+        // epoch tuple, never a bare sequence counter (Implements #64). A
+        // scalar spelling cannot say which lineage authorized the route, so
+        // two unrelated lineages at the same sequence would project one
+        // indistinguishable snapshot. `EpochId` is the same value shape the
+        // sibling projections publish (`health_view::daemon_snapshot` and
+        // `generation_recovery::update_handshake_policy`) and the exact shape
+        // both readers already require: `eliotd`'s
+        // `daemon_kernel_client::KernelSnapshotWire` and the CLI's
+        // `KernelConfigSnapshot` both declare
+        // `authority_epoch: EpochId` under `deny_unknown_fields`, so a bare
+        // number would fail their decode outright. The daemon takes its
+        // binding epoch from the launch handshake, never from this key.
         let mut config_snapshot = serde_json::json!({
             "service": SERVICE_NAME,
             "protocol": PROTOCOL_VERSION,
             "generation": generation.value(),
-            "authority_epoch": authority_epoch.value(),
+            "authority_epoch": canonical_epoch,
             "artifact_digest": kernel_artifact_sha256
                 .as_deref()
                 .unwrap_or("eliot-kernel-standalone"),

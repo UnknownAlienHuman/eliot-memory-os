@@ -32,7 +32,7 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::{
     CapabilityReadiness, CompatibilityEnvelope, DurableCompatibilityState, HealthDimensionKind,
     KernelRuntimeHealthEvidence, NormativePairReceipt, ProcessHealthStatus, ProcessHealthVector,
-    StateMigrationClass, VersionRange, admit_handshake, expected_seal_tag,
+    RouteScope, StateMigrationClass, VersionRange, admit_handshake, expected_seal_tag,
 };
 use eliot_runtime_contracts::{GenerationCutoverState, HealthDimension};
 #[cfg(windows)]
@@ -295,11 +295,34 @@ impl KernelComposition {
     /// Only an ORS record for this authenticated daemon generation and epoch
     /// can complete the carrier's independent cutover state. An empty, stale,
     /// unrelated, or unreadable projection remains explicitly Preparing.
+    ///
+    /// A durable `GenerationCutoverRecord` carries only a bare epoch sequence,
+    /// so it can never establish the lineage of the presented
+    /// `EpochId`. The Kernel's own route table is the lineage-bearing owner of
+    /// a cutover, so it gates first: the record may only corroborate a cutover
+    /// for the exact `(lineage_id, sequence)` tuple the route table currently
+    /// holds. Two lineages at the same sequence are unrelated, and a record
+    /// from a superseded lineage stays historical instead of completing a
+    /// restore that minted a new one.
     fn runtime_cutover_state(
         &self,
         generation: eliot_contracts::ResourceGeneration,
         authority_epoch: &eliot_contracts::EpochId,
     ) -> GenerationCutoverState {
+        let Ok(router) = self.generation_route_snapshot() else {
+            return GenerationCutoverState::Preparing;
+        };
+        let Ok(scope) = RouteScope::new(RUNTIME_HEALTH_ROUTE_SCOPE.to_owned()) else {
+            return GenerationCutoverState::Preparing;
+        };
+        let Ok(route) = router.route(&scope) else {
+            return GenerationCutoverState::Preparing;
+        };
+        if !route.authority_epoch().is_same_authority(authority_epoch)
+            || route.active_generation() != generation
+        {
+            return GenerationCutoverState::Preparing;
+        }
         let Ok(cutovers) = self
             .generation_gateway
             .ors

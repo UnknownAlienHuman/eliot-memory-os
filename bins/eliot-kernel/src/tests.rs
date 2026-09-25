@@ -5662,9 +5662,10 @@ async fn daemon_close_reconciles_by_original_identity_with_ors_readback() {
     let scope = eliot_kernel_core::RouteScope::new("daemon").expect("daemon route scope");
     let route = snapshot.route(&scope).expect("active daemon route");
     assert_eq!(route.active_generation().value(), launch.generation.value());
-    assert_eq!(
-        route.authority_epoch().value(),
-        launch.authority_epoch.sequence.get()
+    assert!(
+        route
+            .authority_epoch()
+            .is_same_authority(&launch.authority_epoch)
     );
     // Unknown keeps identity with bounded drain: a stale receipt is refused
     // without adoption, and its unknown operation reconciles fenced under the

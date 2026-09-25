@@ -97,8 +97,14 @@ impl ActiveGenerationRegistryProjection {
         route: &GenerationRoute,
         state_fence: StateFence,
     ) -> Result<Self, KernelServiceError> {
+        // Exact tuple equality is the authorization rule (Implements #64):
+        // the route carries the canonical `EpochId`, so a restore that minted
+        // a different lineage at the same sequence is unrelated and is refused
+        // here instead of matching on the number.
         if state_fence.resource_generation != route.active_generation()
-            || state_fence.authority_epoch.sequence.get() != route.authority_epoch().value()
+            || !state_fence
+                .authority_epoch
+                .is_same_authority(route.authority_epoch())
         {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "generation_registry.state_fence",
@@ -282,9 +288,10 @@ impl KernelComposition {
 
     /// Reads the active generation projection from the canonical Kernel route.
     ///
-    /// The route's scalar epoch must agree with the live service epoch before
-    /// a lineage-aware fence or fingerprint is returned. A missing route,
-    /// epoch disagreement, or poisoned boundary fails closed.
+    /// The route's lineage-aware epoch must be the exact same tuple as the live
+    /// service epoch before a fence or fingerprint is returned. A missing
+    /// route, cross-lineage epoch, poisoned boundary, or non-exact tuple fails
+    /// closed.
     pub fn active_generation_registry_projection(
         &self,
         route_scope: &str,
@@ -307,7 +314,7 @@ impl KernelComposition {
             .lock()
             .map_err(|_| KernelServiceError::Platform("service lock poisoned".to_owned()))?
             .authority_epoch();
-        if route.authority_epoch().value() != live_epoch.sequence.get() {
+        if !route.authority_epoch().is_same_authority(&live_epoch) {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "generation_registry.authority_epoch",
             });
@@ -625,7 +632,7 @@ mod tests {
         GenerationRoute::new(
             RouteScope::new("daemon").expect("test route scope"),
             ResourceGeneration::new(generation).expect("test generation"),
-            eliot_contracts::AuthorityEpoch::new(4).expect("test route epoch"),
+            test_epoch(4),
         )
         .expect("test route")
     }
