@@ -1379,6 +1379,24 @@ impl EvalBaselineService {
         git_commit: &str,
         approved_by: &str,
     ) -> EvalBaseline {
+        // Retain the run's evaluator identity only on unanimous observation
+        // (issue #1922): `Some` exactly when every case result carries one
+        // identical retained set. Empty, mixed, or partially unretained runs
+        // yield `None` (unknown provenance), which comparison treats as
+        // non-evidence. No inference across differing identities.
+        let mut retained = run.case_results.iter().filter_map(|result| {
+            result.integrity_fingerprints.as_ref()
+        });
+        let first = retained.next();
+        let integrity_fingerprints = match first {
+            Some(set)
+                if !run.case_results.is_empty()
+                    && retained.all(|other| other == set) =>
+            {
+                Some(set.clone())
+            }
+            _ => None,
+        };
         EvalBaseline {
             baseline_id: format!("eval-baseline-{}", WriteId::new_v7()),
             suite_id: suite.eval_suite_id.to_string(),
@@ -1389,6 +1407,7 @@ impl EvalBaselineService {
             overall_status: verdict.status,
             approved_at: OffsetDateTime::now_utc(),
             approved_by: approved_by.to_owned(),
+            integrity_fingerprints,
         }
     }
 }

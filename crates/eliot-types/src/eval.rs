@@ -545,6 +545,13 @@ pub struct EvalBaseline {
     #[serde(with = "time::serde::rfc3339")]
     pub approved_at: OffsetDateTime,
     pub approved_by: String,
+    /// Retained evaluator identity for the run this baseline approves, when
+    /// every contributing case result carries one identical set. `None`
+    /// means unknown provenance (pre-retention baselines, empty or mixed
+    /// runs) and is non-evidence downstream. Additive optional field per
+    /// I5.22: old payloads parse with `None`; no existing field changes.
+    #[serde(default)]
+    pub integrity_fingerprints: Option<EvalIntegrityFingerprintSet>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
