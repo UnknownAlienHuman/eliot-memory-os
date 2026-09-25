@@ -976,8 +976,7 @@ impl DurableHostEventJournal {
             .progress
             .get(stream_id)
             .map_or(0, |progress| progress.last_acked_sequence);
-        while let Ok(page) =
-            self.pending_page_for_reconnect(&scope, after, MAX_PENDING_PAGE_ITEMS)
+        while let Ok(page) = self.pending_page_for_reconnect(&scope, after, MAX_PENDING_PAGE_ITEMS)
         {
             let complete = page.continuation.is_none();
             if let Some(last) = page.items.last() {

@@ -781,7 +781,8 @@ impl KernelMcpForwardingPort {
         })
     }
 
-    /// Records the bridge-owned delivered frontier for one stream after the    /// owner answers a durable phase.
+    /// Records the bridge-owned delivered frontier for one stream after the
+    /// owner answers a durable phase.
     ///
     /// Process-local routing aid for the reconcile consumed frontier (like
     /// the byte-identity replay cache): it dies with this connection, is
