@@ -215,7 +215,7 @@ impl ScipProjectionCache {
                                 target_identity,
                                 Some(artifact.lineage.identity_digest.clone()),
                                 true,
-                            );
+                            )?;
                             return Ok(CachedProjection {
                                 items,
                                 cached: true,
@@ -287,7 +287,7 @@ impl ScipProjectionCache {
                     target_identity,
                     Some(artifact.lineage.identity_digest),
                     false,
-                );
+                )?;
                 Ok(CachedProjection {
                     items,
                     cached: false,
@@ -300,7 +300,7 @@ impl ScipProjectionCache {
                 if evicts_memo(&error) {
                     self.memo.remove(memo_key);
                 }
-                let telemetry = self.telemetry(target_identity, identity.digest().ok(), false);
+                let telemetry = self.telemetry(target_identity, identity.digest().ok(), false)?;
                 Ok(CachedProjection {
                     items,
                     cached: false,
@@ -374,15 +374,22 @@ impl ScipProjectionCache {
         target_identity: &str,
         cache_identity: Option<String>,
         cached: bool,
-    ) -> CacheTelemetry {
-        let telemetry = CacheTelemetry {
-            target_identity: target_identity.to_owned(),
+    ) -> Result<CacheTelemetry, BridgeError> {
+        let counters = self.store.counters();
+        let telemetry = CacheTelemetry::from_cache_measurements(
+            target_identity,
             cache_identity,
-            lock_wait_ms: None,
-            cache_hit: Some(cached),
-        };
+            None,
+            Some(cached),
+            counters.hit_rate(),
+            self.store.last_derive_duration_ms(),
+            self.store.last_warm_duration_ms(),
+            Some(self.store.stored_bytes()),
+            Some(counters.invalidation_count()),
+        )
+        .map_err(|error| BridgeError::ScipDecode(format!("cache telemetry: {error}")))?;
         self.last_telemetry = Some(telemetry.clone());
-        telemetry
+        Ok(telemetry)
     }
 }
 

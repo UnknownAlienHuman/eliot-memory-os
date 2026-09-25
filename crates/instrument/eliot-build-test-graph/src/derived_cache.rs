@@ -255,9 +255,10 @@ pub struct RejectedCacheRecord {
 
 /// Artifact lineage carried by a cache hit.
 ///
-/// The hit carries provenance only: producer, root, schema, and digests.
-/// There is deliberately no test or verifier verdict field; verdicts stay
-/// candidate-bound and a hit can never supply a previous candidate's verdict.
+/// The hit carries provenance only: producer, root (including its ACL and
+/// disposition), schema, and digests. There is deliberately no test or
+/// verifier verdict field; verdicts stay candidate-bound and a hit can never
+/// supply a previous candidate's verdict.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactLineage {
     /// Producer identity that derived the artifact.
@@ -266,12 +267,47 @@ pub struct ArtifactLineage {
     pub producer_generation: u64,
     /// Cache-root identity the artifact was read from.
     pub root_identity: String,
+    /// Digest over the cache-root ACL observed when the artifact was derived.
+    pub root_acl_digest: String,
+    /// Reparse/symlink disposition of the cache root.
+    pub root_disposition: RootDisposition,
     /// Schema revision of the artifact bytes.
     pub schema_revision: String,
     /// Identity digest of the closure that produced the artifact.
     pub identity_digest: String,
     /// Integrity digest of the artifact bytes.
     pub content_digest: String,
+}
+
+impl ArtifactLineage {
+    /// Validates the shape of every lineage element.
+    ///
+    /// This is deliberately a separate check at the hit boundary: copying a
+    /// lineage projection must not make an empty or malformed ACL digest look
+    /// like a reusable cache entry. Authentication remains the trust policy's
+    /// responsibility; this method only validates representation shape.
+    pub fn validate(&self) -> Result<(), GraphError> {
+        for (value, field) in [
+            (&self.root_acl_digest, "root_acl_digest"),
+            (&self.identity_digest, "identity_digest"),
+            (&self.content_digest, "content_digest"),
+        ] {
+            crate::validate_digest_shape(value, field)?;
+        }
+        for (value, field) in [
+            (&self.producer_id, "producer_id"),
+            (&self.root_identity, "root_identity"),
+            (&self.schema_revision, "schema_revision"),
+        ] {
+            crate::validate_text_shape(value, field)?;
+        }
+        // The typed enum has no unchecked variants; keep its admitted set
+        // explicit at the lineage boundary.
+        match self.root_disposition {
+            RootDisposition::Direct | RootDisposition::Symlink | RootDisposition::ReparsePoint => {}
+        }
+        Ok(())
+    }
 }
 
 /// A reusable derived artifact: lineage plus bytes, never verdicts.
@@ -292,6 +328,8 @@ impl CachedArtifact {
                 producer_id: identity.producer_id.clone(),
                 producer_generation: identity.producer_generation,
                 root_identity: identity.root_identity.clone(),
+                root_acl_digest: identity.root_acl_digest.clone(),
+                root_disposition: identity.root_disposition,
                 schema_revision: identity.schema_revision.clone(),
                 identity_digest: identity_digest.to_owned(),
                 content_digest: identity.content_digest.clone(),
@@ -476,6 +514,13 @@ impl CacheCounters {
         }
         Some(self.hits as f64 / total as f64)
     }
+
+    /// Total observed invalidations from rejected entries and capacity
+    /// evictions.
+    #[must_use]
+    pub const fn invalidation_count(&self) -> u64 {
+        self.rejections.saturating_add(self.evictions)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -501,6 +546,7 @@ pub struct DerivedCacheStore {
     sequence: u64,
     stored_bytes: u64,
     last_derive_duration_ms: Option<u64>,
+    last_warm_duration_ms: Option<u64>,
 }
 
 impl DerivedCacheStore {
@@ -521,6 +567,7 @@ impl DerivedCacheStore {
             sequence: 0,
             stored_bytes: 0,
             last_derive_duration_ms: None,
+            last_warm_duration_ms: None,
         }
     }
 
@@ -560,6 +607,12 @@ impl DerivedCacheStore {
         self.last_derive_duration_ms
     }
 
+    /// Wall time of the most recent verified warm cache lookup, if one ran.
+    #[must_use]
+    pub const fn last_warm_duration_ms(&self) -> Option<u64> {
+        self.last_warm_duration_ms
+    }
+
     /// Whether an entry exists under an identity digest.
     #[must_use]
     pub fn contains(&self, identity_digest: &str) -> bool {
@@ -597,6 +650,7 @@ impl DerivedCacheStore {
     /// derivation. Recorded rejections preserve broader valid entries: only
     /// the offending entry is removed, never its neighbors.
     pub fn lookup(&mut self, identity: &DerivedCacheIdentity, trust: &TrustPolicy) -> CacheLookup {
+        let lookup_started = Instant::now();
         if let Err(error) = identity.validate() {
             let record = self.record_rejection(
                 None,
@@ -686,8 +740,36 @@ impl DerivedCacheStore {
                 reason: record.reason.clone(),
             };
         }
+        self.validated_hit(identity, &key, &stored, lookup_started)
+    }
+
+    fn validated_hit(
+        &mut self,
+        identity: &DerivedCacheIdentity,
+        key: &str,
+        stored: &StoredEntry,
+        lookup_started: Instant,
+    ) -> CacheLookup {
+        let artifact = CachedArtifact::fresh(identity, key, stored.bytes.clone());
+        if let Err(error) = artifact.lineage.validate() {
+            self.entries.remove(key);
+            self.stored_bytes = self.stored_bytes.saturating_sub(stored.byte_len);
+            let record = self.record_rejection(
+                Some(key.to_owned()),
+                CacheRejectReason::UnvalidatedIdentity {
+                    detail: error.to_string(),
+                },
+            );
+            self.counters.misses = self.counters.misses.saturating_add(1);
+            return CacheLookup::Miss {
+                reason: record.reason,
+            };
+        }
+        let warm_duration_ms =
+            u64::try_from(lookup_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_warm_duration_ms = Some(warm_duration_ms);
         self.counters.hits = self.counters.hits.saturating_add(1);
-        CacheLookup::Hit(CachedArtifact::fresh(identity, &key, stored.bytes.clone()))
+        CacheLookup::Hit(artifact)
     }
 
     /// Publishes one fresh derivation under its identity.
