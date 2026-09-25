@@ -53,6 +53,13 @@ pub const HOST_EVENT_CONTRACT_VERSION: &str = "eliot-agent-api/host-event-v7";
 /// by this schema. A digest string alone never substitutes for this qualifier
 /// plus the immutable restricted source handle.
 pub const HOST_EVENT_DIGEST_ALGORITHM: &str = "sha256-canonical-json-v1";
+/// Algorithm/version qualifier for digests over exact stored bytes that admit
+/// no canonical JSON form: deterministic redacted projections and undecodable
+/// sources routed to typed quarantine. The bytes hashed are the immutable
+/// stored bytes verbatim (never a reserialization); transport-byte provenance
+/// is preserved separately by the durable ingest record, never collapsed into
+/// the canonical semantic digest.
+pub const HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM: &str = "sha256-raw-bytes-v1";
 /// Maximum length of an opaque text field, in Unicode scalar values.
 pub const MAX_HOST_EVENT_TEXT_CHARS: usize = 1024;
 /// Maximum length of an adapter-sanitized public summary, in Unicode scalar
@@ -131,10 +138,18 @@ impl RestrictedRawSourceHandle {
 }
 
 /// Algorithm/version-qualified canonical digest of one immutable source.
+///
+/// `algorithm` is either [`HOST_EVENT_DIGEST_ALGORITHM`] (sha256 over the
+/// canonical JSON bytes of the decoded source message) or
+/// [`HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM`] (sha256 over the exact stored
+/// bytes, used only for deterministic redacted projections and undecodable
+/// sources routed to typed quarantine). An unqualified or otherwise-qualified
+/// digest never validates.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualifiedSourceDigest {
-    /// Must equal [`HOST_EVENT_DIGEST_ALGORITHM`]; an unqualified or
+    /// Must equal [`HOST_EVENT_DIGEST_ALGORITHM`] or
+    /// [`HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM`]; an unqualified or
     /// differently-qualified digest never validates.
     pub algorithm: String,
     /// Canonical digest of the immutable source bytes.
@@ -144,7 +159,9 @@ pub struct QualifiedSourceDigest {
 impl QualifiedSourceDigest {
     /// Validates the qualifier and the typed digest form.
     pub fn validate(&self) -> Result<(), ContractError> {
-        if self.algorithm != HOST_EVENT_DIGEST_ALGORITHM {
+        if self.algorithm != HOST_EVENT_DIGEST_ALGORITHM
+            && self.algorithm != HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM
+        {
             return Err(ContractError::InvalidDigest {
                 field: "digest_algorithm",
             });
@@ -941,11 +958,15 @@ impl NormalizedHostEventEnvelope {
     /// [`Self::validate_as_session_observation`]); session-lifecycle payloads
     /// cannot ride execution-unit lineage; the lineage binding must equal the
     /// recorded binding exactly (wrong attempt, binding, fence, generation,
-    /// cursor, or parent fails before any mutation); the envelope's #369
+    /// or cursor fails before any mutation); the envelope's #369
     /// route reference must equal the recorded admission digest; and the
     /// recorded binding must agree with the recorded admission on
     /// attempt/lease/fence/generation/route, mirroring the #370
-    /// `validate_for_binding` linkage.
+    /// `validate_for_binding` linkage. Causal-predecessor (parent) agreement
+    /// has no context at this boundary and is enforced where the mutation
+    /// happens instead: the durable ingest journal rejects a staged record
+    /// whose carried predecessors diverge from the envelope's
+    /// `causal_predecessors` before any cursor moves.
     ///
     /// This constructs no route authority (the admission digest is referenced
     /// only), no candidate result (a result reference is digest-checked
