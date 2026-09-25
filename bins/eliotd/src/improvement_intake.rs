@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 use eliot_conformance_contracts::SelfQualityHandoff;
 use eliot_contracts::TaskId;
 use eliot_governor::{LearningAdmissionError, LearningAdmissionRequest};
-use eliot_protocol::RequestIdentity;
 use eliot_improvement::candidate_bounds::{BoundedBacklog, CandidateBoundPolicy};
 use eliot_improvement::{
     BudgetProof, EvidenceSource, ImprovementBrief, ImprovementError, ImprovementSurface,
@@ -31,11 +30,12 @@ use eliot_improvement::{
     SafeBoundary, SourcedEvidence, intake_from_evidence, intake_from_evidence_governed,
     prepare_intake_for_owner, record_owner_decision, sourced_evidence, stamp_outcome_budget,
 };
+use eliot_protocol::RequestIdentity;
 use eliot_self_quality::SelfQualityError;
 use eliot_self_quality::improvement_handoff::sourced_evidence_from_handoff;
 use thiserror::Error;
 
-use super::DaemonComposition;
+use super::{DaemonComposition, DaemonError};
 
 /// Failures of the daemon improvement-intake bridge.
 #[derive(Debug, Error)]
@@ -131,7 +131,10 @@ pub struct GovernedIntakeRejectionReceipt {
 }
 
 impl GovernedIntakeRejectionReceipt {
-    fn from_event(event: &GovernedImprovementIntakeEvent, reason: String) -> Result<Self, IntakeBridgeError> {
+    fn from_event(
+        event: &GovernedImprovementIntakeEvent,
+        reason: String,
+    ) -> Result<Self, IntakeBridgeError> {
         let bytes = eliot_contracts::canonical_json_bytes(event)
             .map_err(|error| IntakeBridgeError::Composition(error.to_string()))?;
         Ok(Self {
@@ -142,8 +145,17 @@ impl GovernedIntakeRejectionReceipt {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct LearningReceiptPersistenceRequest {
+    pub source_identity: RequestIdentity,
+    pub subject_ref: String,
+    pub cause: String,
+    pub transition_digest: String,
+}
+
 const MAX_PENDING_GOVERNED_INTAKES: usize = 64;
 const MAX_RETAINED_INTAKE_REJECTIONS: usize = 64;
+const MAX_PENDING_LEARNING_RECEIPTS: usize = 64;
 
 /// Route one real conformance-diagnosis handoff into the improvement backlog
 /// for crate-internal legacy preparation.
@@ -332,13 +344,75 @@ impl DaemonComposition {
             return Ok(None);
         };
         match self.admit_governed_improvement_event(event.clone()) {
-            Ok(outcome) => Ok(Some(outcome)),
+            Ok(outcome) => {
+                if let (Some(identity), Some(archive)) = (
+                    event.source_identity.as_ref(),
+                    outcome.archived_candidate.as_ref(),
+                ) && let Some(receipt) = self.improvement_backlog.archive_receipts().last()
+                {
+                    self.queue_learning_receipt(LearningReceiptPersistenceRequest {
+                        source_identity: identity.clone(),
+                        subject_ref: archive.candidate_id.clone(),
+                        cause: format!("{:?}", archive.cause).to_ascii_lowercase(),
+                        transition_digest: receipt.transition_digest.clone(),
+                    });
+                }
+                Ok(Some(outcome))
+            }
             Err(error) if permanent_intake_refusal(&error) => {
                 self.retain_intake_rejection(&event, error.to_string())?;
+                if let Some(identity) = event.source_identity.as_ref()
+                    && let Some(receipt) = self.governed_intake_rejections.last()
+                {
+                    self.queue_learning_receipt(LearningReceiptPersistenceRequest {
+                        source_identity: identity.clone(),
+                        subject_ref: receipt
+                            .candidate_subject
+                            .clone()
+                            .unwrap_or_else(|| "intake-event".to_owned()),
+                        cause: "intake_rejected".to_owned(),
+                        transition_digest: receipt.event_digest.clone(),
+                    });
+                }
                 Ok(None)
             }
             Err(error) => {
                 self.pending_governed_improvement_intakes.push_front(event);
+                Err(error)
+            }
+        }
+    }
+
+    fn queue_learning_receipt(&mut self, request: LearningReceiptPersistenceRequest) {
+        if self.pending_learning_receipt_persistence.len() >= MAX_PENDING_LEARNING_RECEIPTS {
+            self.pending_learning_receipt_persistence.remove(0);
+        }
+        self.pending_learning_receipt_persistence.push_back(request);
+    }
+
+    /// Persist one retained learning receipt through the authenticated
+    /// Governor -> Kernel -> Store candidate-capture path.
+    pub async fn persist_pending_learning_receipt_once(&mut self) -> Result<bool, DaemonError> {
+        let Some(request) = self.pending_learning_receipt_persistence.pop_front() else {
+            return Ok(false);
+        };
+        let envelope = self
+            .governor
+            .prepare_learning_archive_transition(
+                &request.source_identity,
+                &request.subject_ref,
+                &request.cause,
+                &request.transition_digest,
+            )
+            .map_err(DaemonError::Composition)?;
+        match self
+            .commit_canonical_and_refresh(&request.source_identity, envelope)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(error) => {
+                self.pending_learning_receipt_persistence
+                    .push_front(request);
                 Err(error)
             }
         }
@@ -371,9 +445,7 @@ impl DaemonComposition {
 
     /// Returns retained permanent-refusal receipts for owner/audit readback.
     #[must_use]
-    pub fn governed_intake_rejection_receipts(
-        &self,
-    ) -> &[GovernedIntakeRejectionReceipt] {
+    pub fn governed_intake_rejection_receipts(&self) -> &[GovernedIntakeRejectionReceipt] {
         &self.governed_intake_rejections
     }
 
@@ -434,19 +506,19 @@ fn permanent_intake_refusal(error: &IntakeBridgeError) -> bool {
             | ImprovementError::UnsafeBoundary
             | ImprovementError::ApplicationClassViolation
             | ImprovementError::MissingBudgetProof,
-        ) => true,
-        IntakeBridgeError::Intake(ImprovementError::BacklogRefused(detail)) => {
-            !detail.contains("active bound exceeded")
-                && !detail.contains("no bound policy")
-                && !detail.contains("full bound")
-        }
-        IntakeBridgeError::Admission(
+        )
+        | IntakeBridgeError::Admission(
             LearningAdmissionError::OwnerEvidenceMismatch(_)
             | LearningAdmissionError::InvalidTargetTask
             | LearningAdmissionError::UnsupportedSchema { .. }
             | LearningAdmissionError::NoInfluenceSubject
             | LearningAdmissionError::InvalidFence,
         ) => true,
+        IntakeBridgeError::Intake(ImprovementError::BacklogRefused(detail)) => {
+            !detail.contains("active bound exceeded")
+                && !detail.contains("no bound policy")
+                && !detail.contains("full bound")
+        }
         _ => false,
     }
 }

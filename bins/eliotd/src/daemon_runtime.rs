@@ -668,6 +668,14 @@ async fn drive_governed_improvement_intake(composition: &SharedComposition) {
             .emit();
         }
     }
+    if let Err(error) = guard.persist_pending_learning_receipt_once().await {
+        let _ = eliotd::diagnostics::ErrorRecord::of(
+            eliotd::diagnostics::OwningComponent::DaemonRuntime,
+            "governed-learning-receipt-persistence",
+            &error.to_string(),
+        )
+        .emit();
+    }
 }
 
 async fn run_loop(
@@ -1032,6 +1040,19 @@ async fn run_local_read_poll(
         return Ok(LocalReadPollOutcome::IdleBackoff);
     };
     let guard = composition.lock().await;
+    // Native governed Context Compiler pairs are served locally through the
+    // owner-bound composition. The Kernel-admitted envelope is rechecked
+    // against the request's task/fence before the composer is called, and the
+    // result settles through the same idempotent submit leg as every other
+    // local-read pair.
+    if eliotd::is_governed_context_tool(&tool) {
+        let body = eliotd::serve_governed_context_pair(&guard, &envelope, &tool, &attempt);
+        return match submit_local_read_result_idempotent(kernel, &body).await? {
+            LocalReadSubmitOutcome::Accepted => Ok(LocalReadPollOutcome::Accepted),
+            LocalReadSubmitOutcome::Expired => Ok(LocalReadPollOutcome::Expired),
+            LocalReadSubmitOutcome::StaleAttempt => Ok(LocalReadPollOutcome::StaleAttempt),
+        };
+    }
     // #1882: Skill pairs serve locally through the composition Skill driver
     // instead of forwarding on the Kernel `local_read` leg (which serves
     // store reads only). Recognition is the shared Skill tool predicate over

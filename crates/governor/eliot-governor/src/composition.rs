@@ -17,19 +17,19 @@ use crate::activation_outcome::{
 use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
+use crate::learning_admission::issue_learning_admission_with_owner_evidence;
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
 use crate::owner_closure_feed::{OwnerPublishPort, synchronize_owner_feed};
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
 use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
-use crate::learning_admission::issue_learning_admission_with_owner_evidence;
 use crate::{
-    FinishAttemptError, Governor, GovernorConfig, GovernorFinishAttempt, GovernorState,
-    LearningAdmissionError, LearningAdmissionOwnerRecord, LearningAdmissionPermit,
-    LearningAdmissionRequest, LearningBoundDecision, LearningOwnerEvidence,
-    CrossTaskAdmissionReceipt, QueueLimits, STARTUP_ORDER, ServiceId, ServiceObservation,
-    VerifiedLearningAdmission, verify_learning_admission,
+    CrossTaskAdmissionReceipt, FinishAttemptError, Governor, GovernorConfig, GovernorFinishAttempt,
+    GovernorState, LearningAdmissionError, LearningAdmissionOwnerRecord, LearningAdmissionPermit,
+    LearningAdmissionRequest, LearningBoundDecision, LearningOwnerEvidence, QueueLimits,
+    STARTUP_ORDER, ServiceId, ServiceObservation, VerifiedLearningAdmission,
+    verify_learning_admission,
 };
 use eliot_authority::{
     GrantActivationRequest, GrantId, GrantRevocationRequest, GrantStatus,
@@ -3775,11 +3775,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let owner = self.learning_admission_owner_record_for_task(&task_id)?;
         let fence = self.snapshot.state_fence();
         let claim = owner.claim_for(request, &fence)?;
-        issue_learning_admission_with_owner_evidence(
-            &self.governor,
-            &claim,
-            owner.owner_evidence(),
-        )
+        issue_learning_admission_with_owner_evidence(&self.governor, &claim, owner.owner_evidence())
     }
 
     /// Issue the distinct cross-task receipt after re-reading the target task's
@@ -3826,7 +3822,102 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         verify_learning_admission(&self.governor, permit, current_fence)
     }
 
-    /// Compiles the `ControlBoard` read projection over the current owners.
+    /// Prepare the canonical owner transition that records one governed
+    /// learning archive receipt. The archive bytes remain owned by the Meta
+    /// candidate registry; this envelope records their immutable digest as a
+    /// candidate observation through the existing Store/Kernel write path.
+    pub fn prepare_learning_archive_transition(
+        &self,
+        identity: &RequestIdentity,
+        archive_ref: &str,
+        cause: &str,
+        transition_digest: &str,
+    ) -> Result<CanonicalWriteEnvelope, CompositionError> {
+        identity
+            .validate()
+            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+        if identity.request.state_fence != self.snapshot.state_fence() {
+            return Err(CompositionError::Provider(
+                "learning archive request fence is not the live Governor fence".to_owned(),
+            ));
+        }
+        for (field, value) in [
+            ("archive_ref", archive_ref),
+            ("cause", cause),
+            ("transition_digest", transition_digest),
+        ] {
+            if value.trim().is_empty() || value.chars().any(char::is_control) {
+                return Err(CompositionError::Owner(format!(
+                    "learning archive {field} is blank or contains controls"
+                )));
+            }
+        }
+        if transition_digest.len() != 64
+            || !transition_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(CompositionError::Owner(
+                "learning archive transition digest is not lowercase SHA-256".to_owned(),
+            ));
+        }
+        let entries = eliot_store_api::generated_operation_manifests()
+            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+        let operation_manifest_digest = eliot_store_api::operation_manifest_set_digest(&entries)
+            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+        let operation_id = OperationId::new(format!("learning-archive-{transition_digest}"))
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        let idempotency_key = format!("{}:learning-archive", identity.idempotency_key);
+        let subject = format!(
+            "learning.archive|archive_ref={archive_ref}|cause={cause}|transition_digest={transition_digest}"
+        );
+        let mut parameters = BTreeMap::new();
+        parameters.insert("subject".to_owned(), serde_json::Value::String(subject));
+        let admission_contract_set_digest = {
+            let bytes = canonical_json_bytes(&(
+                archive_ref,
+                cause,
+                transition_digest,
+                operation_id.as_str(),
+                idempotency_key.as_str(),
+            ))
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+            sha256_hex(&bytes)
+        };
+        let envelope = CanonicalWriteEnvelope {
+            operation_id,
+            request: identity.request.metadata.clone(),
+            idempotency_key,
+            scope_id: eliot_store_api::ScopeId::new("governor")
+                .map_err(|error| CompositionError::Owner(error.to_string()))?,
+            task_id: identity
+                .request
+                .metadata
+                .task_id
+                .as_ref()
+                .map(|task| task.as_str().to_owned()),
+            transition_class: eliot_store_api::TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: eliot_store_api::EffectClass::Candidate,
+            admission_contract_set_digest,
+            operation_manifest_digest,
+            semantic_commands: vec![eliot_store_api::NamedMutationRequest {
+                operation: eliot_store_api::NamedMutationOperation::CaptureObservation,
+                parameters,
+            }],
+            event_projection_relation_intents: eliot_store_api::EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: eliot_store_api::SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+            expected_revision_heads: Vec::new(),
+            expected_ordering_heads: Vec::new(),
+        };
+        envelope.validate().map_err(CompositionError::Canonical)?;
+        Ok(envelope)
+    }
+
     ///
     /// The snapshot is assembled from the live coordination, problem,
     /// observation, task, and read-scope owners at the retained fence, with

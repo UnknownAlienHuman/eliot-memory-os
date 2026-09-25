@@ -343,8 +343,7 @@ impl BoundedBacklog {
             .entries
             .iter()
             .filter(|entry| {
-                entry.candidate.target_surface == surface
-                    && entry.candidate.state.is_experimental()
+                entry.candidate.target_surface == surface && entry.candidate.state.is_experimental()
             })
             .filter_map(|entry| {
                 let cause = if entry.candidate.lifecycle == crate::ImprovementLifecycle::Stale {
@@ -517,6 +516,12 @@ impl BoundedBacklog {
 
         let active = self.active_for(candidate.target_surface).len();
         if active >= policy.max_active {
+            // The production bound path performs the explicit lifecycle
+            // transition before reporting pressure. It still never evicts an
+            // owned/high-value row: only stale, ownerless, or below-floor
+            // entries are archived. The caller may retry after this receipt;
+            // an unchanged full backlog remains `BoundExceeded`.
+            let _ = self.archive_ineligible(candidate.target_surface)?;
             return Err(BoundsError::BoundExceeded {
                 surface: candidate.target_surface,
                 max_active: policy.max_active,

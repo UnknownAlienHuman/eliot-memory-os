@@ -23,6 +23,7 @@ use eliot_governor::{
     FinishDecisionReceipt, GovernorActivationOutcome, GovernorComposition, GovernorLaunchConfig,
     KernelGenerationPort, KernelGenerationSnapshotProvider, QueueLimits,
 };
+use eliot_improvement::candidate_bounds::{CrossTaskAdmission, GovernedOverlay, OverlayState};
 use eliot_improvement::{LearningProduction, PresentedLearning};
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
@@ -162,7 +163,10 @@ pub use freshness_admission::{
     RequestedEffect, ReusableCandidateView, RevisionHead, TaskCompatibility,
     evaluate_freshness_admission, fetch_committed_candidate, normalize_heads,
 };
-pub use governed_context::{NativeComposeError, NativeGovernedCompilation};
+pub use governed_context::{
+    GovernedContextDispatchRequest, NativeComposeError, NativeGovernedCompilation,
+    is_governed_context_tool, serve_governed_context_pair,
+};
 pub use governor_local_read::{
     answer_evidence_query, answer_projection_inputs, forward_admitted_local_read,
     serve_admitted_local_read,
@@ -424,8 +428,12 @@ pub struct DaemonComposition {
     /// Bounded owner receipts for permanently refused intake events. They are
     /// retained for the Kernel/canonical persistence hand-off and are never
     /// mistaken for active candidates.
-    governed_intake_rejections:
-        Vec<improvement_intake::GovernedIntakeRejectionReceipt>,
+    governed_intake_rejections: Vec<improvement_intake::GovernedIntakeRejectionReceipt>,
+    /// Receipts waiting for the existing authenticated Kernel/canonical
+    /// persistence path. The queue is bounded and only owner-issued events
+    /// enter it.
+    pending_learning_receipt_persistence:
+        VecDeque<improvement_intake::LearningReceiptPersistenceRequest>,
 }
 
 impl DaemonComposition {
@@ -492,6 +500,7 @@ impl DaemonComposition {
             improvement_backlog: eliot_improvement::candidate_bounds::BoundedBacklog::default(),
             pending_governed_improvement_intakes: VecDeque::new(),
             governed_intake_rejections: Vec::new(),
+            pending_learning_receipt_persistence: VecDeque::new(),
         })
     }
 
@@ -545,15 +554,208 @@ impl DaemonComposition {
         }
         let permit = presented.verified.permit();
         let fence = self.governor.kernel_snapshot().state_fence();
-        self.governor
+        let verified = self
+            .governor
             .verify_learning_admission_for_owner(permit, &fence)
             .map_err(governed_context::NativeComposeError::Owner)?;
+        let mut presented = presented;
+        let issued_cross_task = if presented.requesting_campaign_id != permit.source_campaign_id()
+            || presented.requesting_task_id != permit.target_task_id()
+        {
+            let receipt = self
+                .governor
+                .issue_cross_task_admission_for_owner(&verified)
+                .map_err(governed_context::NativeComposeError::Owner)?;
+            let issued = CrossTaskAdmission::from_governor_receipt(&receipt);
+            if presented
+                .cross_task_admission
+                .is_some_and(|supplied| !supplied.matches_governor_receipt(&receipt))
+            {
+                return Err(governed_context::NativeComposeError::Owner(
+                    eliot_governor::LearningAdmissionError::OwnerEvidenceMismatch(
+                        "cross_task_admission",
+                    ),
+                ));
+            }
+            Some((receipt, issued))
+        } else {
+            None
+        };
+        presented.cross_task_admission = issued_cross_task.as_ref().map(|(_, admission)| admission);
         governed_context::compose_governed_native_context(
             production, presented, input, recipe, quality, policy, measure,
         )
     }
 
-    /// Commits one Canonical-admitted transition under the exact admitted
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one owner-bound dispatch preserves the complete permit, overlay, backlog, and measurement closure"
+    )]
+    fn dispatch_governed_context_request(
+        &self,
+        request: GovernedContextDispatchRequest,
+    ) -> Result<governed_context::NativeGovernedCompilation, governed_context::NativeComposeError>
+    {
+        let GovernedContextDispatchRequest {
+            admission: requested_admission,
+            candidate_id,
+            closure_ref,
+            binding,
+            atom_id,
+            provider_role,
+            source_id,
+            snapshot_id,
+            source_revision,
+            content,
+            overlay_id: requested_overlay_id,
+            expires_at_unix_secs,
+            measurement_digest,
+            measurement_serializer,
+            input,
+            recipe,
+            quality,
+            policy,
+            requesting_campaign_id,
+            requesting_task_id,
+        } = request;
+        let task_id = eliot_contracts::TaskId::new(requested_admission.target_task_id.clone())
+            .map_err(|_| {
+                governed_context::NativeComposeError::Owner(
+                    eliot_governor::LearningAdmissionError::InvalidTargetTask,
+                )
+            })?;
+        let owner = self
+            .governor
+            .learning_admission_owner_record(&task_id)
+            .map_err(|_| {
+                governed_context::NativeComposeError::Owner(
+                    eliot_governor::LearningAdmissionError::OwnerEvidenceUnavailable(
+                        "owner_projection",
+                    ),
+                )
+            })?;
+        let owner_ref = owner.authority_ref().to_owned();
+        if requested_admission
+            .candidate_id
+            .as_deref()
+            .is_some_and(|bound| bound != candidate_id)
+        {
+            return Err(governed_context::NativeComposeError::Owner(
+                eliot_governor::LearningAdmissionError::OwnerEvidenceMismatch("candidate_subject"),
+            ));
+        }
+        if requested_overlay_id.as_deref() != requested_admission.overlay_id.as_deref() {
+            return Err(governed_context::NativeComposeError::Owner(
+                eliot_governor::LearningAdmissionError::OwnerEvidenceMismatch("overlay_subject"),
+            ));
+        }
+        let mut admission = requested_admission;
+        admission.candidate_id = Some(candidate_id.clone());
+        if binding != input.binding
+            || binding != recipe.binding
+            || binding != quality.binding
+            || admission.target_task_id != binding.task_id.as_str()
+            || requesting_task_id != admission.target_task_id
+        {
+            return Err(governed_context::NativeComposeError::Owner(
+                eliot_governor::LearningAdmissionError::OwnerEvidenceMismatch("context_binding"),
+            ));
+        }
+        let permit = self
+            .governor
+            .issue_learning_admission_for_owner(&admission)
+            .map_err(governed_context::NativeComposeError::Owner)?;
+        let fence = self.governor.kernel_snapshot().state_fence();
+        let verified = self
+            .governor
+            .verify_learning_admission_for_owner(&permit, &fence)
+            .map_err(governed_context::NativeComposeError::Owner)?;
+        let now_unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| governed_context::NativeComposeError::ClockUnavailable)?
+            .as_secs();
+        let overlay = if let Some(overlay_id) = admission.overlay_id.as_deref() {
+            let expires_at = expires_at_unix_secs
+                .ok_or(governed_context::NativeComposeError::Owner(
+                    eliot_governor::LearningAdmissionError::OwnerEvidenceUnavailable(
+                        "overlay_expiry",
+                    ),
+                ))
+                .and_then(|expires| {
+                    eliot_improvement::datetime_from_unix(expires)
+                        .map_err(governed_context::NativeComposeError::Production)
+                })?;
+            Some(GovernedOverlay {
+                overlay_id: overlay_id.to_owned(),
+                campaign_id: permit.source_campaign_id().to_owned(),
+                task_id: permit.target_task_id().to_owned(),
+                fence: permit.fence().clone(),
+                compatible_recipe_ref: owner.owner_evidence().recipe_ref().to_owned(),
+                state: OverlayState::LocalAdmitted,
+                admission_ref: Some(permit.digest().to_owned()),
+                expires_at: Some(expires_at),
+            })
+        } else {
+            if requested_overlay_id.is_some() || expires_at_unix_secs.is_some() {
+                return Err(governed_context::NativeComposeError::Owner(
+                    eliot_governor::LearningAdmissionError::OwnerEvidenceMismatch(
+                        "overlay_subject",
+                    ),
+                ));
+            }
+            None
+        };
+        let production = LearningProduction {
+            backlog: &self.improvement_backlog,
+            candidate_id: &candidate_id,
+            closure_ref: &closure_ref,
+            owner: &owner_ref,
+            binding: &binding,
+            atom_id: &atom_id,
+            provider_role: &provider_role,
+            source_id: &source_id,
+            source_owner: &owner_ref,
+            snapshot_id: &snapshot_id,
+            source_revision: &source_revision,
+            content: &content,
+            overlay_id: admission.overlay_id.as_deref(),
+            expires_at_unix_secs,
+            measurement_digest: &measurement_digest,
+            measurement_serializer: &measurement_serializer,
+            verified: &verified,
+        };
+        let presented = PresentedLearning {
+            governor: self.governor.governor(),
+            verified: &verified,
+            ticket: permit.ticket(),
+            overlay: overlay.as_ref(),
+            backlog: &self.improvement_backlog,
+            cross_task_admission: None,
+            requesting_campaign_id: &requesting_campaign_id,
+            requesting_task_id: &requesting_task_id,
+            now_unix_secs,
+        };
+        let measurement_binding = input.binding.clone();
+        let measurement_capacity = recipe.capacity;
+        let measurement_policy = policy.clone();
+        self.compose_governed_context(
+            production,
+            presented,
+            input,
+            &recipe,
+            quality,
+            &policy,
+            move |payload| {
+                governed_context::measure_governed_context_payload(
+                    payload,
+                    &measurement_binding,
+                    measurement_capacity,
+                    &measurement_policy,
+                )
+            },
+        )
+    }
+
     /// request identity, then publishes the resulting owner change.
     ///
     /// The identity comes from admitted ingress and must agree with the

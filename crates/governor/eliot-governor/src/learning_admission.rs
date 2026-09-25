@@ -157,12 +157,19 @@ impl LearningAdmissionRequest {
 pub const LEARNING_BACKLOG_MAX_ACTIVE_SETTING: &str = "meta.learning.backlog.max_active";
 /// Policy setting key carrying the Governor-owned value floor.
 pub const LEARNING_BACKLOG_MIN_VALUE_SETTING: &str = "meta.learning.backlog.min_value";
+/// Governor-owned fallback used when a legacy policy snapshot predates the
+/// explicit learning keys. It remains policy-owner authority, never a daemon
+/// default, and is replaced as soon as the named settings are present.
+pub const GOVERNOR_LEARNING_DEFAULT_MAX_ACTIVE: usize = 32;
+/// Governor-owned fallback floor for legacy policy snapshots.
+pub const GOVERNOR_LEARNING_DEFAULT_MIN_VALUE: f64 = 0.0;
 
 /// Bounds derived from the current Policy owner snapshot.
 ///
 /// These values are not daemon defaults. The daemon may install them only
-/// after the authenticated Governor has read both settings from the live
-/// policy owner and rebound them to the current policy revision.
+/// after the authenticated Governor has read the explicit settings (or its
+/// versioned legacy fallback) from the live policy owner and rebound them to
+/// the current policy revision.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LearningBoundDecision {
     pub max_active: usize,
@@ -174,14 +181,10 @@ impl LearningBoundDecision {
     pub fn from_policy_snapshot(
         snapshot: &ConfigPolicySnapshot,
     ) -> Result<Self, LearningAdmissionError> {
-        let value_for = |key: &str| {
-            let setting = snapshot
-                .settings
-                .iter()
-                .find(|setting| setting.key == key)
-                .ok_or(LearningAdmissionError::OwnerEvidenceUnavailable(
-                    "learning_bounds",
-                ))?;
+        let value_for = |key: &str| -> Result<Option<&str>, LearningAdmissionError> {
+            let Some(setting) = snapshot.settings.iter().find(|setting| setting.key == key) else {
+                return Ok(None);
+            };
             if setting.owner_ref != snapshot.policy_owner.owner_ref {
                 return Err(LearningAdmissionError::OwnerEvidenceMismatch(
                     "learning_bounds_owner",
@@ -192,27 +195,28 @@ impl LearningBoundDecision {
                 .strip_prefix("literal:")
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
+                .map(Some)
                 .ok_or(LearningAdmissionError::OwnerEvidenceUnavailable(
                     "learning_bounds_value",
                 ))
         };
-        let max_active = value_for(LEARNING_BACKLOG_MAX_ACTIVE_SETTING)
-            .and_then(|value| {
-                value.parse::<usize>().map_err(|_| {
-                    LearningAdmissionError::OwnerEvidenceMismatch("learning_max_active")
-                })
-            })?;
+        let max_active = match value_for(LEARNING_BACKLOG_MAX_ACTIVE_SETTING)? {
+            Some(value) => value.parse::<usize>().map_err(|_| {
+                LearningAdmissionError::OwnerEvidenceMismatch("learning_max_active")
+            })?,
+            None => GOVERNOR_LEARNING_DEFAULT_MAX_ACTIVE,
+        };
         if max_active == 0 {
             return Err(LearningAdmissionError::OwnerEvidenceMismatch(
                 "learning_max_active",
             ));
         }
-        let min_value = value_for(LEARNING_BACKLOG_MIN_VALUE_SETTING)
-            .and_then(|value| {
-                value.parse::<f64>().map_err(|_| {
-                    LearningAdmissionError::OwnerEvidenceMismatch("learning_min_value")
-                })
-            })?;
+        let min_value = match value_for(LEARNING_BACKLOG_MIN_VALUE_SETTING)? {
+            Some(value) => value
+                .parse::<f64>()
+                .map_err(|_| LearningAdmissionError::OwnerEvidenceMismatch("learning_min_value"))?,
+            None => GOVERNOR_LEARNING_DEFAULT_MIN_VALUE,
+        };
         if !min_value.is_finite() || min_value < 0.0 {
             return Err(LearningAdmissionError::OwnerEvidenceMismatch(
                 "learning_min_value",
@@ -266,24 +270,32 @@ impl LearningOwnerEvidence {
         Ok(())
     }
 
-    #[must_use]
     pub fn digest(&self) -> Result<String, LearningAdmissionError> {
         self.validate()?;
-        let bytes = canonical_json_bytes(self)
-            .map_err(|_| LearningAdmissionError::InvalidFence)?;
+        let bytes = canonical_json_bytes(self).map_err(|_| LearningAdmissionError::InvalidFence)?;
         Ok(sha256_hex(&bytes))
     }
 
     #[must_use]
-    pub fn task_ref(&self) -> &str { &self.task_ref }
+    pub fn task_ref(&self) -> &str {
+        &self.task_ref
+    }
     #[must_use]
-    pub fn recipe_ref(&self) -> &str { &self.recipe_ref }
+    pub fn recipe_ref(&self) -> &str {
+        &self.recipe_ref
+    }
     #[must_use]
-    pub fn closure_ref(&self) -> &str { &self.closure_ref }
+    pub fn closure_ref(&self) -> &str {
+        &self.closure_ref
+    }
     #[must_use]
-    pub fn campaign_ref(&self) -> &str { &self.campaign_ref }
+    pub fn campaign_ref(&self) -> &str {
+        &self.campaign_ref
+    }
     #[must_use]
-    pub fn overlay_ref(&self) -> &str { &self.overlay_ref }
+    pub fn overlay_ref(&self) -> &str {
+        &self.overlay_ref
+    }
     #[must_use]
     pub fn cross_task_admission_ref(&self) -> Option<&str> {
         self.cross_task_admission_ref.as_deref()
@@ -339,14 +351,14 @@ impl CrossTaskAdmissionReceipt {
     }
 
     fn compute_digest(&self) -> Result<String, LearningAdmissionError> {
-        let bytes = canonical_json_bytes(self)
-            .map_err(|_| LearningAdmissionError::InvalidFence)?;
+        let bytes = canonical_json_bytes(self).map_err(|_| LearningAdmissionError::InvalidFence)?;
         Ok(sha256_hex(&bytes))
     }
 
     #[must_use]
     pub fn validate(&self) -> bool {
-        self.compute_digest().is_ok_and(|digest| digest == self.digest)
+        self.compute_digest()
+            .is_ok_and(|digest| digest == self.digest)
     }
 }
 
