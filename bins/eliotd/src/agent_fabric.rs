@@ -24,7 +24,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
-use eliot_agent_contracts::RevisionId;
+use eliot_agent_contracts::{
+    ExecutionUpdateProposal, RevisionId, SupersessionLink, SwarmAdmissionId, SwarmExecutionId,
+    SwarmExecutionRevision, SwarmPlanAdmission, SwarmPlanAdmissionDisposition, SwarmPlanDefinition,
+    SwarmPlanDefinitionLifecycle, SwarmPlanView, check_definition_author, check_execution_update,
+    check_owner_join, check_stored_links, check_supersession, join_view,
+};
 use eliot_agent_coordinator::{
     AdmissionId, AdmittedProviderCapability, AgentCoordinator, CandidateId, CoordinatorConfig,
     CoordinatorError, CoordinatorSnapshot, OwnerCurrentness, PlanGap, PresentedClaimMaterial,
@@ -554,6 +559,21 @@ pub enum FabricError {
     /// A second launch was attempted for an already-registered operation.
     #[error("fabric duplicate launch: {0}")]
     DuplicateLaunch(String),
+    /// An execution update attempted to change frozen plan semantics
+    /// (work graph, objective, acceptance, ceilings, stop conditions, wave
+    /// or root). Semantic change needs a new definition revision, never an
+    /// execution update.
+    #[error("fabric semantic drift: {0}")]
+    SemanticDrift(String),
+    /// The presenter is not the current owner lease holder or epoch.
+    #[error("fabric stale owner lease: {0}")]
+    StaleOwnerLease(String),
+    /// The caller attempted another owner's fields.
+    #[error("fabric foreign owner field: {0}")]
+    ForeignOwnerField(String),
+    /// The definition/admission/execution ownership join is broken.
+    #[error("fabric broken ownership link: {0}")]
+    BrokenOwnershipLink(String),
     /// Cancellation was requested but its terminal reconciliation has not been
     /// observed; the two remain distinct.
     #[error("fabric cancellation requested: {0}")]
@@ -572,6 +592,110 @@ pub enum FabricError {
         "fabric restore blocked: snapshot holds a verified provider binding; supply fresh owner material through restore_verified"
     )]
     ProviderEvidenceRequired,
+}
+
+/// Maps a semantic contract rejection onto the fabric vocabulary.
+///
+/// Owner-identity failures keep their typed meaning (`SemanticDrift`,
+/// `StaleOwnerLease`, `ForeignOwnerField`, `BrokenOwnershipLink`); all other
+/// contract failures surface as [`FabricError::Contract`]. The mapping is
+/// total: no contract rejection escapes unclassified.
+fn contract_rejection(error: eliot_agent_contracts::ContractError) -> FabricError {
+    use eliot_agent_contracts::ContractError as ContractRejection;
+    match error {
+        ContractRejection::SemanticDrift(field) => FabricError::SemanticDrift(field.to_owned()),
+        ContractRejection::StaleLease(owner) => FabricError::StaleOwnerLease(owner.to_owned()),
+        ContractRejection::ForeignOwner(field) => FabricError::ForeignOwnerField(field.to_owned()),
+        ContractRejection::BrokenOwnershipLink(link) => {
+            FabricError::BrokenOwnershipLink(link.to_owned())
+        }
+        other => FabricError::Contract(format!("semantic contract: {other}")),
+    }
+}
+
+/// Verifies semantic ownership maps carried by a durable snapshot.
+///
+/// Every stored definition revalidates (shape plus bound digest); every map
+/// key must equal its record identity; every stored execution must satisfy
+/// the structural ownership links against its stored definition and
+/// admission; every supersession link must join its stored prior and
+/// replacement. Legacy snapshots carry no semantic records and pass
+/// trivially. A contradictory image fails closed so torn persistence never
+/// restores authority; live coherence (leases, active dispositions) is
+/// rehydrated independently by the owners after restore, never from saved
+/// labels alone.
+fn verify_snapshot_semantics(snapshot: &FabricSnapshot) -> Result<(), FabricError> {
+    for (key, definition) in &snapshot.semantic_definitions {
+        definition.validate().map_err(contract_rejection)?;
+        if key != definition.definition_id.as_str() {
+            return Err(FabricError::BrokenOwnershipLink(
+                "semantic definition map key does not match record identity".to_owned(),
+            ));
+        }
+    }
+    for (key, admission) in &snapshot.semantic_admissions {
+        admission.validate().map_err(contract_rejection)?;
+        if key != admission.admission_id.as_str() {
+            return Err(FabricError::BrokenOwnershipLink(
+                "semantic admission map key does not match record identity".to_owned(),
+            ));
+        }
+        if !snapshot
+            .semantic_definitions
+            .contains_key(admission.definition_id.as_str())
+        {
+            return Err(FabricError::BrokenOwnershipLink(
+                "semantic admission without stored definition".to_owned(),
+            ));
+        }
+    }
+    for (key, execution) in &snapshot.semantic_executions {
+        execution.validate().map_err(contract_rejection)?;
+        if key != execution.execution_id.as_str() {
+            return Err(FabricError::BrokenOwnershipLink(
+                "semantic execution map key does not match record identity".to_owned(),
+            ));
+        }
+        let definition = snapshot
+            .semantic_definitions
+            .get(execution.definition_id.as_str())
+            .ok_or_else(|| {
+                FabricError::BrokenOwnershipLink(
+                    "semantic execution without stored definition".to_owned(),
+                )
+            })?;
+        let admission = snapshot
+            .semantic_admissions
+            .get(execution.admission_id.as_str())
+            .ok_or_else(|| {
+                FabricError::BrokenOwnershipLink(
+                    "semantic execution without stored admission".to_owned(),
+                )
+            })?;
+        check_stored_links(definition, admission, execution).map_err(contract_rejection)?;
+    }
+    for (key, link) in &snapshot.semantic_supersessions {
+        let next = snapshot.semantic_definitions.get(key).ok_or_else(|| {
+            FabricError::BrokenOwnershipLink(
+                "supersession without stored replacement definition".to_owned(),
+            )
+        })?;
+        let prior = snapshot
+            .semantic_definitions
+            .get(link.prior_definition_id.as_str())
+            .ok_or_else(|| {
+                FabricError::BrokenOwnershipLink(
+                    "supersession without stored prior definition".to_owned(),
+                )
+            })?;
+        if next.supersedes.as_ref() != Some(link) {
+            return Err(FabricError::BrokenOwnershipLink(
+                "supersession link does not match stored replacement".to_owned(),
+            ));
+        }
+        check_supersession(prior, next).map_err(contract_rejection)?;
+    }
+    Ok(())
 }
 
 /// B-MOD model registry seam (#694). The fabric resolves routes only through
@@ -671,6 +795,20 @@ pub struct FabricSnapshot {
     pub attempt_states: BTreeMap<String, AttemptLifecycle>,
     /// Cancellation states by attempt identity.
     pub cancellations: BTreeMap<String, CancellationLifecycle>,
+    /// Validated Task-Controller semantic definitions by definition identity
+    /// (issue #1702). Absent on legacy snapshots; legacy restores proceed
+    /// without semantic bindings exactly as before.
+    #[serde(default)]
+    pub semantic_definitions: BTreeMap<String, SwarmPlanDefinition>,
+    /// Governor semantic admissions by admission identity (issue #1702).
+    #[serde(default)]
+    pub semantic_admissions: BTreeMap<String, SwarmPlanAdmission>,
+    /// Coordinator execution revisions by execution identity (issue #1702).
+    #[serde(default)]
+    pub semantic_executions: BTreeMap<String, SwarmExecutionRevision>,
+    /// Supersession links by replacement definition identity (issue #1702).
+    #[serde(default)]
+    pub semantic_supersessions: BTreeMap<String, SupersessionLink>,
 }
 
 /// Attempt lifecycle tracked by this composition. Terminal states never
@@ -720,6 +858,14 @@ pub struct AgentFabric {
     intent_by_operation: BTreeMap<String, String>,
     attempt_states: BTreeMap<String, AttemptLifecycle>,
     cancellations: BTreeMap<String, CancellationLifecycle>,
+    /// Validated Task-Controller semantic definitions by definition identity.
+    semantic_definitions: BTreeMap<String, SwarmPlanDefinition>,
+    /// Governor semantic admissions by admission identity.
+    semantic_admissions: BTreeMap<String, SwarmPlanAdmission>,
+    /// Coordinator execution revisions by execution identity.
+    semantic_executions: BTreeMap<String, SwarmExecutionRevision>,
+    /// Supersession links by replacement definition identity.
+    semantic_supersessions: BTreeMap<String, SupersessionLink>,
     initialized: bool,
 }
 
@@ -754,6 +900,10 @@ impl AgentFabric {
             intent_by_operation: BTreeMap::new(),
             attempt_states: BTreeMap::new(),
             cancellations: BTreeMap::new(),
+            semantic_definitions: BTreeMap::new(),
+            semantic_admissions: BTreeMap::new(),
+            semantic_executions: BTreeMap::new(),
+            semantic_supersessions: BTreeMap::new(),
             initialized: true,
         };
         fabric.record("coordinator_constructed", "coordinator");
@@ -798,6 +948,10 @@ impl AgentFabric {
             intent_by_operation: BTreeMap::new(),
             attempt_states: BTreeMap::new(),
             cancellations: BTreeMap::new(),
+            semantic_definitions: BTreeMap::new(),
+            semantic_admissions: BTreeMap::new(),
+            semantic_executions: BTreeMap::new(),
+            semantic_supersessions: BTreeMap::new(),
             initialized: true,
         };
         fabric.record("coordinator_constructed_verified", "coordinator");
@@ -1151,6 +1305,399 @@ impl AgentFabric {
             .insert(definition_key, admission_key);
         self.record("admission_committed", receipt.admission_id.as_str());
         Ok(receipt)
+    }
+
+    /// Registers one Task-Controller semantic definition revision (issue
+    /// #1702).
+    ///
+    /// Only the holder of the definition's current Task Controller lease may
+    /// register; a valid payload digest never substitutes for author
+    /// authority. `DRAFT` and `FROZEN` revisions register; superseded or
+    /// cancelled history stays in the records and never re-registers as
+    /// current. Same-identity replay is exact; changed content conflicts.
+    /// Freezing (`DRAFT → FROZEN` with otherwise identical content) replaces
+    /// the stored draft; any other same-identity change is a conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns the semantic contract rejection,
+    /// [`FabricError::StaleOwnerLease`] for a foreign or stale controller, or
+    /// [`FabricError::DefinitionConflict`] for changed content under a live
+    /// identity.
+    pub fn register_semantic_definition(
+        &mut self,
+        definition: SwarmPlanDefinition,
+        controller_holder: &str,
+        controller_epoch: u64,
+    ) -> Result<(), FabricError> {
+        definition.validate().map_err(contract_rejection)?;
+        check_definition_author(&definition, controller_holder, controller_epoch)
+            .map_err(contract_rejection)?;
+        if !matches!(
+            definition.lifecycle,
+            SwarmPlanDefinitionLifecycle::Draft | SwarmPlanDefinitionLifecycle::Frozen
+        ) {
+            return Err(FabricError::BrokenOwnershipLink(
+                "only draft or frozen definitions register as current".to_owned(),
+            ));
+        }
+        let key = definition.definition_id.as_str().to_owned();
+        if let Some(stored) = self.semantic_definitions.get(&key).cloned() {
+            if stored == definition {
+                self.record("semantic_definition_replayed", &key);
+                return Ok(());
+            }
+            if stored.lifecycle == SwarmPlanDefinitionLifecycle::Draft {
+                let mut frozen = stored.clone();
+                frozen.lifecycle = SwarmPlanDefinitionLifecycle::Frozen;
+                if frozen == definition {
+                    self.semantic_definitions.insert(key.clone(), definition);
+                    self.record("semantic_definition_frozen", &key);
+                    return Ok(());
+                }
+            }
+            return Err(FabricError::DefinitionConflict(format!(
+                "semantic definition {key} reused with different bytes"
+            )));
+        }
+        self.semantic_definitions.insert(key.clone(), definition);
+        self.record("semantic_definition_registered", &key);
+        Ok(())
+    }
+
+    /// Binds one Governor semantic admission to its registered frozen
+    /// definition (issue #1702).
+    ///
+    /// Only `FROZEN` definitions may be admitted and only `ADMITTED`
+    /// dispositions bind; admitted ceilings must narrow, never widen, the
+    /// definition. Same-identity replay is exact; a second admission identity
+    /// for one definition conflicts, so a new definition revision always
+    /// yields a distinct admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns the semantic contract rejection,
+    /// [`FabricError::BrokenOwnershipLink`] when the definition is unknown,
+    /// not frozen, or not bound exactly, [`FabricError::SemanticDrift`] when
+    /// admitted ceilings widen the definition, or
+    /// [`FabricError::DefinitionConflict`] for a second admission identity on
+    /// one definition.
+    pub fn bind_semantic_admission(
+        &mut self,
+        admission: SwarmPlanAdmission,
+    ) -> Result<(), FabricError> {
+        admission.validate().map_err(contract_rejection)?;
+        let definition_key = admission.definition_id.as_str().to_owned();
+        let definition = self
+            .semantic_definitions
+            .get(&definition_key)
+            .cloned()
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic definition {definition_key}"))
+            })?;
+        if definition.lifecycle != SwarmPlanDefinitionLifecycle::Frozen {
+            return Err(FabricError::BrokenOwnershipLink(
+                "only frozen definitions may be admitted".to_owned(),
+            ));
+        }
+        if !admission.binds(&definition) {
+            return Err(FabricError::BrokenOwnershipLink(
+                "admission does not bind the exact frozen definition".to_owned(),
+            ));
+        }
+        if admission.disposition != SwarmPlanAdmissionDisposition::Admitted {
+            return Err(FabricError::BrokenOwnershipLink(
+                "only admitted dispositions bind".to_owned(),
+            ));
+        }
+        if !admission
+            .admitted_ceilings
+            .narrowed_from(&definition.ceilings)
+        {
+            return Err(FabricError::SemanticDrift(
+                "admitted ceilings widen the frozen definition".to_owned(),
+            ));
+        }
+        for existing in self.semantic_admissions.values() {
+            if existing.definition_id == admission.definition_id
+                && existing.admission_id != admission.admission_id
+            {
+                return Err(FabricError::DefinitionConflict(format!(
+                    "semantic definition {definition_key} already admitted under a different admission"
+                )));
+            }
+        }
+        let key = admission.admission_id.as_str().to_owned();
+        if let Some(stored) = self.semantic_admissions.get(&key).cloned() {
+            if stored == admission {
+                self.record("semantic_admission_replayed", &key);
+                return Ok(());
+            }
+            return Err(FabricError::DefinitionConflict(format!(
+                "semantic admission {key} reused with different bytes"
+            )));
+        }
+        self.semantic_admissions.insert(key.clone(), admission);
+        self.record("semantic_admission_bound", &key);
+        Ok(())
+    }
+
+    /// Mirrors the Governor disposition of a bound semantic admission (issue
+    /// #1702).
+    ///
+    /// The fabric never originates dispositions: the Governor owner decides
+    /// and this composition only records the transition after validating it
+    /// against the I14.20 admission lifecycle. Mirroring `SUPERSEDED` or
+    /// `CANCELLED` freezes new execution updates under the old admission;
+    /// retained records stay readable history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] for an unknown admission, or the
+    /// semantic contract rejection for an illegal disposition transition.
+    pub fn note_semantic_admission_disposition(
+        &mut self,
+        admission_id: &SwarmAdmissionId,
+        disposition: SwarmPlanAdmissionDisposition,
+    ) -> Result<(), FabricError> {
+        let key = admission_id.as_str().to_owned();
+        let mut admission =
+            self.semantic_admissions.get(&key).cloned().ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic admission {key}"))
+            })?;
+        admission.disposition = admission
+            .disposition
+            .decide(disposition)
+            .map_err(contract_rejection)?;
+        admission.validate().map_err(contract_rejection)?;
+        self.semantic_admissions.insert(key.clone(), admission);
+        self.record("semantic_admission_disposition_noted", &key);
+        Ok(())
+    }
+
+    /// Records one coordinator execution revision against its bound admission
+    /// (issue #1702).
+    ///
+    /// Validates the full ownership join at record time: the definition must
+    /// be registered, the admission bound, and the execution linked to both.
+    /// Same-identity replay is exact; changed content conflicts. Terminal
+    /// states are retained verbatim: history is never rewritten and
+    /// `UNKNOWN_OUTCOME` never becomes a clean failure here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] when the definition or admission is
+    /// unknown, the semantic contract rejection for a broken join, or
+    /// [`FabricError::DefinitionConflict`] for changed content under a live
+    /// execution identity.
+    pub fn record_semantic_execution(
+        &mut self,
+        execution: SwarmExecutionRevision,
+    ) -> Result<(), FabricError> {
+        execution.validate().map_err(contract_rejection)?;
+        let definition_key = execution.definition_id.as_str().to_owned();
+        let definition = self
+            .semantic_definitions
+            .get(&definition_key)
+            .cloned()
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic definition {definition_key}"))
+            })?;
+        let admission_key = execution.admission_id.as_str().to_owned();
+        let admission = self
+            .semantic_admissions
+            .get(&admission_key)
+            .cloned()
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic admission {admission_key}"))
+            })?;
+        check_owner_join(&definition, &admission, &execution).map_err(contract_rejection)?;
+        let key = execution.execution_id.as_str().to_owned();
+        if let Some(stored) = self.semantic_executions.get(&key).cloned() {
+            if stored == execution {
+                self.record("semantic_execution_replayed", &key);
+                return Ok(());
+            }
+            return Err(FabricError::DefinitionConflict(format!(
+                "semantic execution {key} reused with different bytes"
+            )));
+        }
+        self.semantic_executions.insert(key.clone(), execution);
+        self.record("semantic_execution_recorded", &key);
+        Ok(())
+    }
+
+    /// Guards one coordinator execution update against frozen plan semantics
+    /// (issue #1702).
+    ///
+    /// Mechanical updates under the current coordinator lease and the exact
+    /// active admission pass; any attempt to change the work graph,
+    /// objective, acceptance, ceilings, stop conditions, wave or root fails
+    /// with [`FabricError::SemanticDrift`]. Updates against a superseded
+    /// definition fail with [`FabricError::Superseded`]: replacement work
+    /// needs the new definition and its distinct admission. A stale or
+    /// foreign coordinator fails with [`FabricError::StaleOwnerLease`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] when the admission or execution is
+    /// unknown, or the mapped semantic rejection otherwise.
+    pub fn check_semantic_execution_update(
+        &self,
+        admission_id: &SwarmAdmissionId,
+        execution_id: &SwarmExecutionId,
+        update: &ExecutionUpdateProposal,
+        caller_holder: &str,
+        caller_epoch: u64,
+    ) -> Result<(), FabricError> {
+        let admission_key = admission_id.as_str().to_owned();
+        let admission = self
+            .semantic_admissions
+            .get(&admission_key)
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic admission {admission_key}"))
+            })?;
+        let execution_key = execution_id.as_str().to_owned();
+        let execution = self
+            .semantic_executions
+            .get(&execution_key)
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic execution {execution_key}"))
+            })?;
+        let definition_key = admission.definition_id.as_str().to_owned();
+        let definition = self
+            .semantic_definitions
+            .get(&definition_key)
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic definition {definition_key}"))
+            })?;
+        if self
+            .semantic_supersessions
+            .values()
+            .any(|link| link.prior_definition_id.as_str() == definition_key)
+        {
+            return Err(FabricError::Superseded(format!(
+                "semantic definition {definition_key} superseded; update through the replacement admission"
+            )));
+        }
+        check_execution_update(
+            definition,
+            admission,
+            execution,
+            update,
+            caller_holder,
+            caller_epoch,
+        )
+        .map_err(contract_rejection)
+    }
+
+    /// Proposes the replacement of active work with a new definition revision
+    /// (issue #1702).
+    ///
+    /// The proposer must hold the prior definition's current Task Controller
+    /// lease or the replacement's named lease (owner-loss reassignment under
+    /// a newer epoch); anyone else fails with
+    /// [`FabricError::StaleOwnerLease`]. The replacement links the exact
+    /// prior revision with an explicit drain/cancel/supersede disposition and
+    /// carries a distinct identity. Stored history is never mutated: the
+    /// prior frozen record stays verbatim and the link records the
+    /// disposition. The new revision still needs its distinct Governor
+    /// admission ([`AgentFabric::bind_semantic_admission`]) before any
+    /// execution runs under it, and the old admission disposition is mirrored
+    /// through [`AgentFabric::note_semantic_admission_disposition`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the semantic contract rejection, or
+    /// [`FabricError::DefinitionConflict`] when the replacement identity is
+    /// already registered.
+    pub fn supersede_semantic_definition(
+        &mut self,
+        next: SwarmPlanDefinition,
+        controller_holder: &str,
+        controller_epoch: u64,
+    ) -> Result<(), FabricError> {
+        next.validate().map_err(contract_rejection)?;
+        let link = next.supersedes.clone().ok_or_else(|| {
+            FabricError::BrokenOwnershipLink("replacement without supersedes link".to_owned())
+        })?;
+        let prior_key = link.prior_definition_id.as_str().to_owned();
+        let prior = self
+            .semantic_definitions
+            .get(&prior_key)
+            .cloned()
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic definition {prior_key}"))
+            })?;
+        if !prior
+            .controller
+            .authorizes(controller_holder, controller_epoch)
+            && !next
+                .controller
+                .authorizes(controller_holder, controller_epoch)
+        {
+            return Err(FabricError::StaleOwnerLease("task controller".to_owned()));
+        }
+        check_supersession(&prior, &next).map_err(contract_rejection)?;
+        let next_key = next.definition_id.as_str().to_owned();
+        if self.semantic_definitions.contains_key(&next_key) {
+            return Err(FabricError::DefinitionConflict(format!(
+                "replacement semantic definition {next_key} already registered"
+            )));
+        }
+        self.semantic_definitions.insert(next_key.clone(), next);
+        self.semantic_supersessions.insert(next_key.clone(), link);
+        self.record("semantic_definition_superseded", &next_key);
+        Ok(())
+    }
+
+    /// Reads the joined owner state as an explicit non-authoritative view
+    /// (issue #1702).
+    ///
+    /// Built only from validated stored records; joined reads never serve as
+    /// write authorization. Surfaces the pending replacement link, when one
+    /// is proposed, and preserved unknown effects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] when the admission or execution is
+    /// unknown, or the mapped semantic rejection for a broken join.
+    pub fn semantic_join_view(
+        &self,
+        admission_id: &SwarmAdmissionId,
+        execution_id: &SwarmExecutionId,
+        unknown_effects: Vec<String>,
+    ) -> Result<SwarmPlanView, FabricError> {
+        let admission_key = admission_id.as_str().to_owned();
+        let admission = self
+            .semantic_admissions
+            .get(&admission_key)
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic admission {admission_key}"))
+            })?;
+        let execution_key = execution_id.as_str().to_owned();
+        let execution = self
+            .semantic_executions
+            .get(&execution_key)
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic execution {execution_key}"))
+            })?;
+        let definition = self
+            .semantic_definitions
+            .get(execution.definition_id.as_str())
+            .ok_or_else(|| {
+                FabricError::Contract(format!(
+                    "unknown semantic definition {}",
+                    execution.definition_id.as_str()
+                ))
+            })?;
+        let pending = self
+            .semantic_supersessions
+            .values()
+            .find(|link| link.prior_definition_id == definition.definition_id)
+            .cloned();
+        join_view(definition, admission, execution, pending, unknown_effects)
+            .map_err(contract_rejection)
     }
 
     /// Activates launch authority for one admitted attempt after the matching
@@ -1552,6 +2099,10 @@ impl AgentFabric {
             ledger: self.ledger.clone(),
             attempt_states: self.attempt_states.clone(),
             cancellations: self.cancellations.clone(),
+            semantic_definitions: self.semantic_definitions.clone(),
+            semantic_admissions: self.semantic_admissions.clone(),
+            semantic_executions: self.semantic_executions.clone(),
+            semantic_supersessions: self.semantic_supersessions.clone(),
         })
     }
 
@@ -1559,7 +2110,10 @@ impl AgentFabric {
     ///
     /// Definition, admission, lease, and epoch revisions are preserved;
     /// unresolved reservations stay unresolved and no second coordinator is
-    /// created.
+    /// created. Semantic ownership maps (issue #1702) verify strictly before
+    /// any state is adopted: contradictory definition/admission/execution
+    /// links fail closed with [`FabricError::BrokenOwnershipLink`] instead of
+    /// restoring authority.
     ///
     /// A snapshot carrying a verified provider binding is rejected here
     /// with [`FabricError::ProviderEvidenceRequired`]: without freshly
@@ -1572,7 +2126,8 @@ impl AgentFabric {
     ///
     /// Returns [`FabricError::ProviderEvidenceRequired`] when the snapshot
     /// holds a verified provider binding, the coordinator owner restore
-    /// rejection, or a stale-config conflict.
+    /// rejection, a stale-config conflict, or a broken semantic ownership
+    /// link.
     pub fn restore(
         snapshot: FabricSnapshot,
         config: CoordinatorConfig,
@@ -1589,6 +2144,10 @@ impl AgentFabric {
         ) {
             return Err(FabricError::ProviderEvidenceRequired);
         }
+        // Issue #1702: contradictory semantic ownership never restores
+        // authority. Legacy snapshots carry no semantic records and pass
+        // trivially.
+        verify_snapshot_semantics(&snapshot)?;
         let coordinator = AgentCoordinator::restore(
             snapshot.coordinator_snapshot.clone(),
             config.clone(),
@@ -1633,6 +2192,10 @@ impl AgentFabric {
             intent_by_operation,
             attempt_states: snapshot.attempt_states,
             cancellations: snapshot.cancellations,
+            semantic_definitions: snapshot.semantic_definitions,
+            semantic_admissions: snapshot.semantic_admissions,
+            semantic_executions: snapshot.semantic_executions,
+            semantic_supersessions: snapshot.semantic_supersessions,
             initialized: true,
         };
         fabric.record("fabric_restored", "fabric");
@@ -1664,6 +2227,10 @@ impl AgentFabric {
                 "restore config does not match the snapshotted coordinator config".to_owned(),
             ));
         }
+        // Issue #1702: contradictory semantic ownership never restores
+        // authority. Legacy snapshots carry no semantic records and pass
+        // trivially.
+        verify_snapshot_semantics(&snapshot)?;
         let coordinator = AgentCoordinator::restore_with_admitted_provider(
             snapshot.coordinator_snapshot.clone(),
             config.clone(),
@@ -1706,6 +2273,10 @@ impl AgentFabric {
             intent_by_operation,
             attempt_states: snapshot.attempt_states,
             cancellations: snapshot.cancellations,
+            semantic_definitions: snapshot.semantic_definitions,
+            semantic_admissions: snapshot.semantic_admissions,
+            semantic_executions: snapshot.semantic_executions,
+            semantic_supersessions: snapshot.semantic_supersessions,
             initialized: true,
         };
         fabric.record("fabric_restored_verified", "fabric");
