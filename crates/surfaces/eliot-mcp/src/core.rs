@@ -599,6 +599,7 @@ fn validate_projected_state_fence(evidence_pack: &Value) -> Result<(), BridgeErr
 
 fn validate_projected_revision_heads(
     content: &Value,
+    expected_scope_id: &str,
     expected_fence: &eliot_store_api::StateFence,
 ) -> Result<(), BridgeError> {
     let heads = content
@@ -609,7 +610,9 @@ fn validate_projected_revision_heads(
                 "evidence-pack response is missing its revision heads".to_owned(),
             )
         })?;
+    let scope_key = format!("scope:{expected_scope_id}");
     let mut keys = BTreeSet::new();
+    let mut scope_heads = 0usize;
     for value in heads {
         let head: eliot_store_api::RevisionHead =
             serde_json::from_value(value.clone()).map_err(|error| {
@@ -620,16 +623,25 @@ fn validate_projected_revision_heads(
         head.validate().map_err(|error| {
             BridgeError::Serialization(format!("evidence-pack revision head is invalid: {error}"))
         })?;
-        if head.state_fence != *expected_fence {
-            return Err(BridgeError::Serialization(
-                "evidence-pack revision head State Fence does not match the request".to_owned(),
-            ));
-        }
         if !keys.insert(head.key.as_str().to_owned()) {
             return Err(BridgeError::Serialization(
                 "evidence-pack revision heads must have unique keys".to_owned(),
             ));
         }
+        if head.key.as_str() == scope_key {
+            scope_heads += 1;
+            if head.state_fence != *expected_fence {
+                return Err(BridgeError::Serialization(
+                    "evidence-pack scope revision head State Fence does not match the request"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    if scope_heads != 1 {
+        return Err(BridgeError::Serialization(
+            "evidence-pack response must carry exactly one admitted scope revision head".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -796,6 +808,23 @@ pub fn validate_mcp_response_for_tool(
                 "negative response must not carry a recall disposition".to_owned(),
             ));
         }
+        if response.proof_ceiling != ProofCeiling::Observation
+            || !response.artifacts.is_empty()
+            || response.resource.is_some()
+            || response.job.is_some()
+        {
+            return Err(BridgeError::Serialization(
+                "negative response has an invalid proof or resource envelope".to_owned(),
+            ));
+        }
+        classify_response_failure(response)?;
+        let encoded = serde_json::to_vec(response)
+            .map_err(|error| BridgeError::Serialization(error.to_string()))?;
+        if encoded.len() > HARD_STRUCTURED_RESPONSE_BYTES {
+            return Err(BridgeError::Serialization(
+                "negative response exceeds the structured response ceiling".to_owned(),
+            ));
+        }
         return Ok(());
     }
     if requires_evidence_pack_response(tool) {
@@ -956,7 +985,11 @@ pub fn validate_evidence_pack_response(
             "evidence-pack response does not bind the admitted State Fence".to_owned(),
         ));
     }
-    validate_projected_revision_heads(&response.content, &expected_fence)?;
+    validate_projected_revision_heads(
+        &response.content,
+        expected.scope_id.as_str(),
+        &expected_fence,
+    )?;
     if response.recall_disposition != Some(RecallDisposition::IncompleteCoverage) {
         return Err(BridgeError::Serialization(
             "candidate-only evidence must fail closed to INCOMPLETE_COVERAGE".to_owned(),
@@ -2522,7 +2555,6 @@ mod evidence_pack_query_plan_tests {
                 "max_records": 8,
                 "truncated": false,
             },
-            "recall_disposition": "INCOMPLETE_COVERAGE",
         });
         let projection = project_evidence_pack_projection(&plan, payload.clone())
             .expect("opaque evidence pack projects");

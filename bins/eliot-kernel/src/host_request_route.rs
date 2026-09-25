@@ -122,9 +122,9 @@ pub(crate) fn is_host_request_operation(operation: &str) -> bool {
 /// still fences it without a new per-Kernel field (residual: move to a
 /// dedicated `Mutex<LocalReadPendingState>` once the composition root
 /// widens to initialize it; see HANDOFF). `local_read_envelope`/`local_read_tool`
-/// are `Some` only for admitted `eliot.query` invoke-reads whose selectors
-/// validated; ordinary indexed operations carry `None` and are never served
-/// to the daemon poller. `local_read_attempt` is the governed attempt
+/// are `Some` only for admitted `eliot.query` or Skill invoke-reads whose
+/// carrier validation succeeded; ordinary indexed operations carry `None` and
+/// are never served to the daemon poller. `local_read_attempt` is the governed attempt
 /// ownership record for the pair: minted at enqueue as unclaimed
 /// (`generation == 0`), claimed by fencing generation at poll time, and
 /// retired or fenced away on completion, expiry, disconnect, restart, epoch
@@ -410,22 +410,18 @@ impl KernelComposition {
         if envelope.kind != HostRequestKind::Invocation {
             return Err(TransportError::SessionFenced);
         }
-        HostRequestInvokeReadPayload {
-            wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
-            wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
-            envelope: envelope.clone(),
-            tool: tool.clone(),
-        }
-        .validate()
-        .map_err(|_| TransportError::SessionFenced)?;
+        // Rejection-before-ORS: the closed carrier and query selectors are
+        // proved before the durable Requested row is staged. Packet remains
+        // admission-only; Skill carriers are queued for the daemon's local
+        // Skill driver and never enter the Store read leg.
+        let carrier = check_invoke_read_admission(envelope, tool)?;
         let _transition = self.agent_bridge_transition_read()?;
         let (receipt, record) = self.admit_host_request_envelope_under_transition(envelope)?;
-        // Queue admitted `eliot.query` pairs for the outbound-only eliotd
-        // poller (`local_read_claim`, Implements #18). Packet admissions and
-        // malformed selectors never queue; enqueue is best-effort and never
-        // fails admission (the ORS record is already staged above).
+        // Queue admitted query/skill pairs for the outbound-only eliotd
+        // poller (`local_read_claim`, Implements #18). Enqueue is best-effort
+        // after the ORS record is durable and never changes admission.
         if record.result_digest.is_none()
-            && matches!(check_local_read_admission(envelope, tool), Ok(Some(_)))
+            && matches!(carrier, LocalReadCarrier::Query | LocalReadCarrier::Skill)
         {
             let _ = self.enqueue_local_read_pair_under_transition(envelope, tool);
         }
@@ -988,6 +984,12 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
     ) -> Result<(), TransportError> {
+        if !matches!(
+            check_invoke_read_admission(envelope, tool)?,
+            LocalReadCarrier::Query | LocalReadCarrier::Skill
+        ) {
+            return Err(TransportError::SessionFenced);
+        }
         let _admission_owner = self
             .agent_activation_pending
             .lock()
@@ -1068,8 +1070,8 @@ impl KernelComposition {
         Ok(())
     }
 
-    /// Claims the next admitted local-read pair for the daemon poller under
-    /// governed attempt ownership.
+    /// Claims the next admitted query or Skill carrier for the daemon poller
+    /// under governed attempt ownership.
     ///
     /// Deterministic connection-then-fifo order, skipping expired pairs and
     /// non-pairs. The first claim for a pair mints fencing generation 1 with
@@ -1115,7 +1117,10 @@ impl KernelComposition {
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
                     continue;
                 }
-                if envelope.identity.capability != "eliot.query" {
+                if !is_local_read_carrier_capability(&envelope.identity.capability)
+                    || tool.get("name").and_then(serde_json::Value::as_str)
+                        != Some(envelope.identity.capability.as_str())
+                {
                     continue;
                 }
                 if !candidate.local_read_attempt.is_owned_by(session) {
@@ -1373,9 +1378,13 @@ impl KernelComposition {
         let queued_pair =
             self.local_read_pair_under_transition(&body.operation_id, &body.request_sha256)?;
         if let Some((envelope, tool)) = queued_pair.as_ref()
-            && let Some(selectors) = local_read_selectors_from_tool(envelope, tool)?
+            && tool.get("name").and_then(serde_json::Value::as_str) == Some("eliot.query")
         {
-            validate_local_read_result_response(
+            let selectors = local_read_selectors_from_tool(envelope, tool)?
+                .ok_or(TransportError::SessionFenced)?;
+            // Classification happens before persistence; the exact typed body
+            // remains durable and is replayed byte-identically.
+            let _typed_negative = validate_local_read_result_response(
                 envelope,
                 selectors.scope_id.as_str(),
                 selectors.subject.as_str(),
@@ -1892,17 +1901,87 @@ pub(crate) struct LocalReadSelectors {
     pub(crate) intent_mode: String,
 }
 
+/// Closed carrier classes admitted through the invoke-read leg.
+///
+/// `Query` and `Skill` are the only classes placed on the outbound daemon
+/// queue. `Packet` remains admission-only and never claims a daemon leg.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LocalReadCarrier {
+    Query,
+    Skill,
+    Packet,
+}
+
+fn is_skill_carrier_name(name: &str) -> bool {
+    matches!(name, "skill.inject" | "skill.display")
+}
+
+fn is_local_read_carrier_capability(capability: &str) -> bool {
+    capability == "eliot.query" || is_skill_carrier_name(capability)
+}
+
+fn local_read_carrier_from_tool(
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> Result<LocalReadCarrier, TransportError> {
+    let object = tool.as_object().ok_or(TransportError::SessionFenced)?;
+    let name = object
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(TransportError::SessionFenced)?;
+    match name {
+        "eliot.packet" => Ok(LocalReadCarrier::Packet),
+        "eliot.query" => {
+            local_read_selectors_from_tool(envelope, tool)?;
+            Ok(LocalReadCarrier::Query)
+        }
+        "skill.inject" | "skill.display" => {
+            if envelope.identity.capability != name {
+                return Err(TransportError::SessionFenced);
+            }
+            object
+                .get("arguments")
+                .and_then(serde_json::Value::as_object)
+                .ok_or(TransportError::SessionFenced)?;
+            Ok(LocalReadCarrier::Skill)
+        }
+        _ => Err(TransportError::SessionFenced),
+    }
+}
+
+/// Validates the complete invoke-read carrier before ORS admission.
+///
+/// Query selectors are checked here, skill carriers are admitted only under
+/// their exact closed names and a JSON argument object, and packet remains an
+/// admission-only carrier. This keeps malformed or unknown local-read
+/// requests from creating an ORS row.
+pub(crate) fn check_invoke_read_admission(
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> Result<LocalReadCarrier, TransportError> {
+    HostRequestInvokeReadPayload {
+        wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+        wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
+        envelope: envelope.clone(),
+        tool: tool.clone(),
+    }
+    .validate()
+    .map_err(|_| TransportError::SessionFenced)?;
+    local_read_carrier_from_tool(envelope, tool)
+}
+
 /// Derives the closed local-read selectors from one linked envelope+tool pair.
 ///
 /// Returns `Ok(None)` for `eliot.packet` (non-goal: the packet path keeps its
 /// admission-only behaviour and never reaches the read leg). Fails closed as
 /// `SessionFenced` for any other tool name, for a capability mismatch, for a
-/// `CurrentPosition` intent (which never admits `GetEvidencePack`), for a
-/// present `exact_resource_uri` (exact expansion uses the resource path, not
-/// a query), for a non-exact `subject:` selector, and for a missing or blank
-/// trusted scope. Mirrors the `plan_evidence_pack_query` rules field-for-field
-/// without taking an MCP edge; linkage (capability + payload digest) must
-/// already be proven by the caller through [`HostRequestInvokeReadPayload`].
+/// `CurrentPosition` or unknown intent mode (neither admits
+/// `GetEvidencePack`), for a present `exact_resource_uri` (exact expansion
+/// uses the resource path, not a query), for a non-exact `subject:` selector,
+/// and for a missing or blank trusted scope. Mirrors the
+/// `plan_evidence_pack_query` rules field-for-field without taking an MCP
+/// edge; linkage (capability + payload digest) must already be proven by the
+/// caller through [`HostRequestInvokeReadPayload`].
 /// Pure: deriving selectors performs no store IO.
 pub(crate) fn local_read_selectors_from_tool(
     envelope: &HostRequestEnvelope,
@@ -1931,8 +2010,28 @@ pub(crate) fn local_read_selectors_from_tool(
         .get("mode")
         .and_then(serde_json::Value::as_str)
         .ok_or(TransportError::SessionFenced)?;
-    if mode.trim().is_empty() || mode.chars().any(char::is_control) || mode == "current_position" {
+    if !matches!(
+        mode,
+        "historical_reconstruction"
+            | "provenance"
+            | "navigation"
+            | "verification"
+            | "change_impact"
+            | "context_reconstruction"
+    ) {
         return Err(TransportError::SessionFenced);
+    }
+    for field in [
+        "time_scope",
+        "branch_environment_scope",
+        "freshness_policy",
+        "required_assurance",
+    ] {
+        intent
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))
+            .ok_or(TransportError::SessionFenced)?;
     }
     if arguments
         .get("exact_resource_uri")
@@ -1980,15 +2079,11 @@ pub(crate) fn check_local_read_admission(
     envelope: &HostRequestEnvelope,
     tool: &serde_json::Value,
 ) -> Result<Option<LocalReadSelectors>, TransportError> {
-    HostRequestInvokeReadPayload {
-        wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
-        wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
-        envelope: envelope.clone(),
-        tool: tool.clone(),
+    match check_invoke_read_admission(envelope, tool)? {
+        LocalReadCarrier::Query => local_read_selectors_from_tool(envelope, tool),
+        LocalReadCarrier::Packet => Ok(None),
+        LocalReadCarrier::Skill => Err(TransportError::SessionFenced),
     }
-    .validate()
-    .map_err(|_| TransportError::SessionFenced)?;
-    local_read_selectors_from_tool(envelope, tool)
 }
 
 /// Serves an exact replay of a resulted operation without re-dispatch (no IO).
@@ -2050,7 +2145,9 @@ pub(crate) fn local_read_replay_response(
     .map_err(|_| TransportError::SessionFenced)?;
     if envelope.identity.capability == "eliot.query" {
         let selectors = selectors.ok_or(TransportError::SessionFenced)?;
-        validate_local_read_stored_response(
+        // Rows written before the disposition contract do not acquire a
+        // synthetic result here; the current validator rejects them closed.
+        let _typed_negative = validate_local_read_stored_response(
             envelope,
             selectors.scope_id.as_str(),
             &selectors.subject,

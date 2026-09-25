@@ -112,7 +112,9 @@ struct AdmittedConnection {
 /// constructed. `activated_session` keeps the kernel-issued semantic session
 /// captured by the one-shot activation exchange, so invocation envelopes bind
 /// an honest kernel-issued selector instead of host text or a minted
-/// identity. `replay_cache` makes exact host replays byte-identical (the
+/// identity. `activated_work_scope_id` carries the same activation-issued
+/// WorkScope into every host-request envelope. `replay_cache` makes exact host
+/// replays byte-identical (the
 /// kernel deduplicates by envelope digest) and turns a changed payload under
 /// a known correlation into a local `IdempotencyConflict` with no wire
 /// traffic.
@@ -133,6 +135,7 @@ struct KernelTransportOwner {
     activation_used: bool,
     limits: eliot_ipc::TransportLimits,
     activated_session: Option<String>,
+    activated_work_scope_id: Option<String>,
     replay_cache: HashMap<String, ReplayCacheEntry>,
 }
 
@@ -360,6 +363,7 @@ pub fn kernel_ports_with_declaration(
         activation_used: false,
         limits,
         activated_session: None,
+        activated_work_scope_id: None,
         replay_cache: HashMap::new(),
     }));
     let host: Box<dyn HostActivationPort> = Box::new(KernelHostActivationPort {

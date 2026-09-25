@@ -480,6 +480,7 @@ impl KernelTransportOwner {
             eliot_protocol::AgentBridgeActivationDisposition::Authenticated { binding } => {
                 let b = *binding;
                 self.activated_session = Some(b.session_id.clone());
+                self.activated_work_scope_id = Some(b.work_scope_id.clone());
                 let principal_id =
                     PrincipalId::new(b.principal_id).map_err(|_| provider_failure())?;
                 let session_id = SessionId::new(b.session_id).map_err(|_| provider_failure())?;

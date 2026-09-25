@@ -423,13 +423,15 @@ impl AuthenticatedHostSession {
 /// mechanical boundary only reuses that owner's typed validator to bind the
 /// submitted body to the exact admitted selectors, request identity, and State
 /// Fence; Kernel does not derive a disposition or interpret candidate records.
+/// The boolean result is `true` for a valid typed negative response, which the
+/// caller must persist before surfacing as a failure.
 pub fn validate_local_read_result_response(
     envelope: &HostRequestEnvelope,
     scope_id: &str,
     subject: &str,
     max_records: u32,
     response: &serde_json::Value,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let response: McpResponse = serde_json::from_value(response.clone())
         .map_err(|error| format!("local-read result is not an MCP response: {error}"))?;
     let expected_request_sha256 = sha256_hex(
@@ -440,6 +442,33 @@ pub fn validate_local_read_result_response(
         ))
         .map_err(|error| format!("admitted request identity cannot be canonicalized: {error}"))?,
     );
+    if response.request_id != envelope.identity.request_id.as_str()
+        || response.idempotency_key != envelope.identity.idempotency_key
+        || response.canonical_tool_name != "eliot.query"
+        || response.canonical_request_sha256 != expected_request_sha256
+    {
+        return Err("local-read result does not bind the admitted request identity".to_owned());
+    }
+
+    let query_tool = ToolRequest::Query(QueryInput {
+        intent: QueryIntent {
+            mode: QueryMode::Verification,
+            time_scope: "local-read-replay".to_owned(),
+            branch_environment_scope: "local-read-replay".to_owned(),
+            freshness_policy: "exact captured records only".to_owned(),
+            required_assurance: "response-owner validation".to_owned(),
+        },
+        query: format!("subject:{subject}"),
+        exact_resource_uri: None,
+    });
+    let negative = classify_response_failure(&response)
+        .map_err(|error| format!("typed local-read response is invalid: {error}"))?;
+    if negative.is_some() {
+        validate_mcp_response_for_tool(&query_tool, &response)
+            .map_err(|error| format!("typed local-read negative is invalid: {error}"))?;
+        return Ok(true);
+    }
+
     let expected_state_fence = serde_json::to_value(&envelope.state_fence)
         .map_err(|error| format!("admitted State Fence cannot be canonicalized: {error}"))?;
     validate_evidence_pack_response(
@@ -454,20 +483,21 @@ pub fn validate_local_read_result_response(
             state_fence: expected_state_fence,
         },
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    Ok(false)
 }
 
 /// Revalidates a stored local-read result against the selectors admitted with
 /// the exact envelope. The selector tuple is supplied by the replay caller;
 /// it is never recovered from the stored response, which is the untrusted
-/// value being checked.
+/// value being checked. A `true` result is a valid typed negative response.
 pub fn validate_local_read_stored_response(
     envelope: &HostRequestEnvelope,
     scope_id: &str,
     subject: &str,
     max_records: u32,
     response: &serde_json::Value,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     validate_local_read_result_response(envelope, scope_id, subject, max_records, response)
 }
 
@@ -1168,6 +1198,58 @@ fn canonical_result_digest(response: &McpResponse) -> Result<String, PortFailure
     Ok(sha256_hex(&bytes))
 }
 
+fn validate_exact_local_read_readback(
+    response: &McpResponse,
+    envelope: &HostRequestEnvelope,
+    tool: &ToolRequest,
+) -> Result<(), PortFailure> {
+    let ToolRequest::Query(input) = tool else {
+        return Ok(());
+    };
+    if input.exact_resource_uri.is_some() || matches!(input.intent.mode, QueryMode::CurrentPosition)
+    {
+        return Ok(());
+    }
+    let subject = input
+        .query
+        .strip_prefix("subject:")
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+        .ok_or_else(|| PortFailure::TransportBindingRejected {
+            reason: "stored exact evidence response has an invalid subject selector".to_owned(),
+        })?;
+    let scope_id = envelope
+        .identity
+        .work_scope_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            envelope
+                .identity
+                .session_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .ok_or_else(|| PortFailure::TransportBindingRejected {
+            reason: "stored exact evidence response has no admitted scope".to_owned(),
+        })?;
+    let response_value =
+        serde_json::to_value(response).map_err(|error| PortFailure::TransportBindingRejected {
+            reason: format!("stored exact evidence response cannot be encoded: {error}"),
+        })?;
+    let _typed_negative = validate_local_read_result_response(
+        envelope,
+        scope_id,
+        subject,
+        EVIDENCE_PACK_MAX_RECORDS,
+        &response_value,
+    )
+    .map_err(|error| PortFailure::TransportBindingRejected {
+        reason: format!("stored exact evidence response binding is invalid: {error}"),
+    })?;
+    Ok(())
+}
+
 /// Serves one exact stored result without re-dispatch (Implements #18).
 ///
 /// Reconstructs the bounded `McpResponse` from the stored body, rejects a
@@ -1192,6 +1274,7 @@ fn readback_responded(
         });
     }
     validate_response_against_envelope(&response, envelope, &request.tool)?;
+    validate_exact_local_read_readback(&response, envelope, &request.tool)?;
     reject_negative_response(&response)?;
     let handle = HostOperationHandle::new(host_request_operation_id(envelope)).map_err(|_| {
         PortFailure::TransportBindingRejected {
@@ -1422,11 +1505,25 @@ mod local_read_result_tests {
         .expect("envelope must digest")
     }
 
-    fn test_response() -> McpResponse {
+    fn test_response(envelope: &HostRequestEnvelope) -> McpResponse {
+        let scope_id = envelope
+            .identity
+            .work_scope_id
+            .as_deref()
+            .or(envelope.identity.session_id.as_deref())
+            .unwrap_or("kernel-session-1");
+        let request_digest = sha256_hex(
+            &canonical_json_bytes(&(
+                envelope.envelope_sha256.clone(),
+                envelope.identity.request_id.as_str().to_owned(),
+                envelope.identity.idempotency_key.clone(),
+            ))
+            .expect("request tuple must canonicalize"),
+        );
         McpResponse {
-            request_id: "host-request-1".to_owned(),
-            idempotency_key: "host-request-1:invoke".to_owned(),
-            canonical_request_sha256: "a".repeat(64),
+            request_id: envelope.identity.request_id.as_str().to_owned(),
+            idempotency_key: envelope.identity.idempotency_key.clone(),
+            canonical_request_sha256: request_digest,
             kind: ResponseKind::Projection,
             canonical_tool_name: "eliot.query".to_owned(),
             recall_disposition: Some(
@@ -1436,29 +1533,28 @@ mod local_read_result_tests {
             content: json!({
                 "operation": "GetEvidencePack",
                 "subject": "evidence-alpha",
-                "scope_id": "scope-1",
+                "scope_id": scope_id,
                 "evidence_pack": {
                     "version": EVIDENCE_PACK_PROJECTION_VERSION,
                     "subject": "evidence-alpha",
-                    "scope_id": "scope-1",
+                    "scope_id": scope_id,
                     "records": [{
                         "capture_index": 0,
                         "operation": "CaptureObservation",
                         "parameters": {"subject": "evidence-alpha"},
                     }],
                     "provenance": {
-                        "state_fence": test_fence(),
+                        "state_fence": envelope.state_fence.clone(),
                         "matched_total": 1,
                         "returned": 1,
-                        "max_records": 3,
+                        "max_records": EVIDENCE_PACK_MAX_RECORDS,
                         "truncated": false,
                     },
-                    "recall_disposition": "INCOMPLETE_COVERAGE",
                 },
                 "revision_heads": [{
-                    "key": "scope:scope-1",
+                    "key": format!("scope:{scope_id}"),
                     "revision": 3,
-                    "state_fence": test_fence(),
+                    "state_fence": envelope.state_fence.clone(),
                 }],
             }),
             artifacts: Vec::new(),
@@ -1475,7 +1571,7 @@ mod local_read_result_tests {
         request.validate().expect("fixture must validate");
         let envelope = test_envelope(&request);
         envelope.validate().expect("envelope must validate");
-        let response = test_response();
+        let response = test_response(&envelope);
 
         // The digest binds the exact bounded bytes: determinism is the proof.
         let digest = canonical_result_digest(&response).expect("digest must compute");
@@ -1539,7 +1635,10 @@ mod local_read_result_tests {
 
     #[test]
     fn stored_body_serves_only_resulted_states() {
-        let response = test_response();
+        let request: HostInvocationRequest =
+            serde_json::from_str(QUERY_JSON).expect("fixture must deserialize");
+        let envelope = test_envelope(&request);
+        let response = test_response(&envelope);
         let body = serde_json::to_value(&response).expect("response must serialize");
         let digest = canonical_result_digest(&response).expect("digest must compute");
         let label = |value: &str| OpaqueLabel::new(value.to_owned()).expect("valid test label");
@@ -1701,7 +1800,6 @@ mod local_read_build_tests {
                 "max_records": 10,
                 "truncated": false,
             },
-            "recall_disposition": "INCOMPLETE_COVERAGE",
         })
     }
 

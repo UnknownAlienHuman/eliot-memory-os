@@ -442,6 +442,12 @@ fn validate_port_response(
         &response.canonical_tool_name,
         "response.canonical_tool_name",
     )?;
+    if response.canonical_tool_name != expected_tool.canonical_name() {
+        return Err(HostGatewayError::InvalidPortResult {
+            field: "response.canonical_tool_name",
+            reason: "response tool does not match the requested tool",
+        });
+    }
     validate_mcp_response_for_tool(expected_tool, response).map_err(|_| {
         HostGatewayError::InvalidPortResult {
             field: "response.content",

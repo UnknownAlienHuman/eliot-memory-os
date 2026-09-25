@@ -117,6 +117,7 @@ pub(super) struct TransportFacts {
     pub(super) descriptor_sha256: String,
     pub(super) receipt_sha256: String,
     pub(super) session: Option<String>,
+    pub(super) work_scope_id: Option<String>,
 }
 
 /// Exact parent reference resolved from the replay cache for cancel/probe envelopes.
@@ -280,6 +281,7 @@ impl KernelTransportOwner {
             descriptor_sha256: self.admitted.receipt.descriptor_sha256.clone(),
             receipt_sha256: self.admitted.receipt.receipt_sha256.clone(),
             session: self.activated_session.clone(),
+            work_scope_id: self.activated_work_scope_id.clone(),
         }
     }
 
@@ -387,7 +389,7 @@ fn build_invocation_envelope(
         capability: request.tool.canonical_name().to_owned(),
         session_id: Some(session_id.to_owned()),
         task_id: None,
-        work_scope_id: None,
+        work_scope_id: facts.work_scope_id.clone(),
         payload_schema_id: HOST_REQUEST_PAYLOAD_SCHEMA_ID.to_owned(),
         payload_sha256: payload_digest.to_owned(),
     };
@@ -410,7 +412,7 @@ fn build_restore_envelope(
         capability: REACTIVE_RESTORE_CAPABILITY.to_owned(),
         session_id: Some(session_id.to_owned()),
         task_id: None,
-        work_scope_id: None,
+        work_scope_id: facts.work_scope_id.clone(),
         payload_schema_id: REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID.to_owned(),
         payload_sha256: payload_digest.to_owned(),
     };
@@ -442,7 +444,7 @@ fn build_cancellation_envelope(
         capability: parent.capability.clone(),
         session_id: Some(session_id.to_owned()),
         task_id: None,
-        work_scope_id: None,
+        work_scope_id: facts.work_scope_id.clone(),
         payload_schema_id: HOST_REQUEST_PAYLOAD_SCHEMA_ID.to_owned(),
         payload_sha256: parent.payload_digest.clone(),
     };
@@ -469,7 +471,7 @@ fn build_reconciliation_envelope(
         capability: parent.capability.clone(),
         session_id: Some(session_id.to_owned()),
         task_id: None,
-        work_scope_id: None,
+        work_scope_id: facts.work_scope_id.clone(),
         payload_schema_id: HOST_REQUEST_PAYLOAD_SCHEMA_ID.to_owned(),
         payload_sha256: parent.payload_digest.clone(),
     };
@@ -1331,6 +1333,11 @@ impl KernelHostRequestClient {
                 reason: "rehydrate session does not match the live attach session".to_owned(),
             });
         }
+        if envelope.identity.work_scope_id.as_deref() != facts.work_scope_id.as_deref() {
+            return Err(PortFailure::TransportBindingRejected {
+                reason: "rehydrate WorkScope does not match the live attach binding".to_owned(),
+            });
+        }
         if envelope.state_fence != facts.state_fence {
             return Err(PortFailure::FenceMismatch);
         }
@@ -1518,6 +1525,7 @@ mod tests {
             descriptor_sha256: "d".repeat(64),
             receipt_sha256: "e".repeat(64),
             session: Some("kernel-session-1".to_owned()),
+            work_scope_id: Some("scope-1".to_owned()),
         }
     }
 
@@ -1612,7 +1620,7 @@ mod tests {
             Some("kernel-session-1")
         );
         assert!(envelope.identity.task_id.is_none());
-        assert!(envelope.identity.work_scope_id.is_none());
+        assert_eq!(envelope.identity.work_scope_id.as_deref(), Some("scope-1"));
         assert_eq!(
             envelope.identity.idempotency_key,
             format!("{}:invoke", request.correlation_id.as_str())
