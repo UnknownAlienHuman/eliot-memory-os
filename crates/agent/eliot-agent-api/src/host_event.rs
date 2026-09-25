@@ -42,7 +42,9 @@ use crate::{
     ProviderExecutionBinding, ProviderObservationLineage, UsageReceipt,
 };
 use eliot_agent_contracts::AgentAttemptId;
-use eliot_contracts::{ClockReading, LowercaseSha256, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{
+    ClockReading, LowercaseSha256, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
+};
 use eliot_receipts::ProofCeiling;
 
 /// Wire revision of the closed normalized host-event schema. The v6
@@ -72,6 +74,33 @@ pub const MAX_HOST_EVENT_OMITTED_FIELDS: usize = 32;
 pub const MAX_HOST_EVENT_WARNINGS: usize = 16;
 /// Maximum number of causal predecessors carried by one envelope.
 pub const MAX_HOST_EVENT_PREDECESSORS: usize = 8;
+
+/// Substrings that must never appear in a public normalized payload string.
+/// They name restricted source content (secret values, credentials, provider
+/// hidden reasoning) that stays behind the restricted source handle per I7.23.
+/// Normalizers scan every caller-supplied or wire-derived public string with
+/// [`contains_restricted_source_token`] and fail closed before sealing; raw
+/// transport-byte scanning stays with the ingest owners.
+const RESTRICTED_SOURCE_TOKENS: &[&str] = &[
+    "secret",
+    "passwd",
+    "password",
+    "bearer",
+    "hidden_reasoning",
+    "provider_hidden",
+    "api_key",
+];
+
+/// Reports whether public payload text carries restricted source content.
+/// Matched case-insensitively; a match means the text must stay behind the
+/// restricted source handle and never enter the normalized payload.
+#[must_use]
+pub fn contains_restricted_source_token(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    RESTRICTED_SOURCE_TOKENS
+        .iter()
+        .any(|token| lowered.contains(token))
+}
 
 /// Rejects blank, whitespace-only, control-bearing, or over-long opaque text.
 fn validate_text(value: &str, field: &'static str, max_chars: usize) -> Result<(), ContractError> {
@@ -165,6 +194,42 @@ impl QualifiedSourceDigest {
             return Err(ContractError::InvalidDigest {
                 field: "digest_algorithm",
             });
+        }
+        Ok(())
+    }
+
+    /// Recomputes this digest against the canonical JSON bytes of the decoded
+    /// source message and rejects any mismatch. The qualifier must be
+    /// [`HOST_EVENT_DIGEST_ALGORITHM`]: a raw-bytes digest never verifies
+    /// against canonical message bytes, and a canonical digest never verifies
+    /// without recomputation. Normalizers and the durable ingest journal call
+    /// this with the bytes they actually decoded instead of trusting a copied
+    /// digest string.
+    pub fn verify_canonical_message(&self, message: &impl Serialize) -> Result<(), ContractError> {
+        if self.algorithm != HOST_EVENT_DIGEST_ALGORITHM {
+            return Err(ContractError::InvalidDigest {
+                field: "digest_algorithm",
+            });
+        }
+        let canonical = canonical_json_bytes(message).map_err(|_| ContractError::DigestMismatch)?;
+        if sha256_hex(&canonical) != self.digest.as_str() {
+            return Err(ContractError::DigestMismatch);
+        }
+        Ok(())
+    }
+
+    /// Recomputes this digest against exact stored bytes (deterministic
+    /// redacted projections, undecodable sources routed to typed quarantine)
+    /// and rejects any mismatch. The qualifier must be
+    /// [`HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM`].
+    pub fn verify_raw_bytes(&self, bytes: &[u8]) -> Result<(), ContractError> {
+        if self.algorithm != HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM {
+            return Err(ContractError::InvalidDigest {
+                field: "digest_algorithm",
+            });
+        }
+        if sha256_hex(bytes) != self.digest.as_str() {
+            return Err(ContractError::DigestMismatch);
         }
         Ok(())
     }
@@ -478,6 +543,33 @@ pub fn candidate_result_digest_for(
     )))
 }
 
+impl CandidateResultReference {
+    /// Verifies this reference against the exact admitted #370 candidate
+    /// result and its governing #369 admission: the attempt must match the
+    /// result's attempt, the admission digest must match the governing
+    /// admission, and the result digest is recomputed from the result bytes
+    /// instead of trusting the copied string. An arbitrary result digest
+    /// never verifies.
+    pub fn verify_against(
+        &self,
+        result: &crate::AgentResult,
+        admission: &crate::AdmittedRouteReceipt,
+    ) -> Result<(), ContractError> {
+        if self.attempt_id != result.attempt_id {
+            return Err(ContractError::BindingMismatch);
+        }
+        if self.admitted_route_digest != admission.self_digest {
+            return Err(ContractError::BindingMismatch);
+        }
+        let recomputed =
+            candidate_result_digest_for(result).map_err(|_| ContractError::DigestMismatch)?;
+        if recomputed != self.result_digest {
+            return Err(ContractError::DigestMismatch);
+        }
+        Ok(())
+    }
+}
+
 /// Why an unsupported provider event was quarantined instead of normalized.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -612,6 +704,104 @@ impl NormalizedHostEventPayload {
             Self::UnsupportedQuarantined(observation) => observation.validate(),
         }
     }
+
+    /// Returns every public text string carried by this payload: bounded
+    /// summaries, classifier codes, correlation references, and quarantine
+    /// facts. Raw provider content never appears here by construction (counts,
+    /// digests, and enums carry no text), so normalizers sanitize exactly
+    /// these strings against the restricted source before sealing.
+    #[must_use]
+    pub fn public_strings(&self) -> Vec<&str> {
+        match self {
+            Self::AssistantDelta(_)
+            | Self::ReasoningSummary(_)
+            | Self::Usage(_)
+            | Self::CandidateResultAvailable(_)
+            | Self::CancellationObserved(_) => Vec::new(),
+            Self::SessionLifecycle(observation) => {
+                observation.detail_ref.as_deref().into_iter().collect()
+            }
+            Self::ExecutionStarted(observation) => vec![observation.start_ref.as_str()],
+            Self::ToolInvocation(observation) => vec![
+                observation.tool_name.as_str(),
+                observation.invocation_ref.as_str(),
+            ],
+            Self::ToolOutcome(observation) => {
+                let mut strings = vec![
+                    observation.tool_name.as_str(),
+                    observation.invocation_ref.as_str(),
+                ];
+                strings.extend(observation.safe_summary.as_deref());
+                strings
+            }
+            Self::Checkpoint(observation) => vec![observation.checkpoint_ref.as_str()],
+            Self::Warning(observation) => {
+                vec![observation.code.as_str(), observation.summary.as_str()]
+            }
+            Self::Error(observation) => {
+                vec![observation.code.as_str(), observation.safe_summary.as_str()]
+            }
+            Self::ProviderTerminalObserved(observation) => {
+                vec![observation.terminal_ref.as_str()]
+            }
+            Self::UnsupportedQuarantined(observation) => {
+                let mut strings = vec![observation.source_namespace.as_str()];
+                strings.extend(observation.source_version.as_deref());
+                strings.extend(observation.detail_ref.as_deref());
+                strings
+            }
+        }
+    }
+
+    /// Returns the stable closed-payload tag (`payload_kind` wire spelling)
+    /// for this payload. The durable-to-intake conversion preserves it
+    /// explicitly so a payload can never change kind across the boundary.
+    #[must_use]
+    pub const fn payload_type_tag(&self) -> &'static str {
+        match self {
+            Self::SessionLifecycle(_) => "SESSION_LIFECYCLE",
+            Self::ExecutionStarted(_) => "EXECUTION_STARTED",
+            Self::AssistantDelta(_) => "ASSISTANT_DELTA",
+            Self::ReasoningSummary(_) => "REASONING_SUMMARY",
+            Self::ToolInvocation(_) => "TOOL_INVOCATION",
+            Self::ToolOutcome(_) => "TOOL_OUTCOME",
+            Self::Checkpoint(_) => "CHECKPOINT",
+            Self::Usage(_) => "USAGE",
+            Self::Warning(_) => "WARNING",
+            Self::Error(_) => "ERROR",
+            Self::CancellationObserved(_) => "CANCELLATION_OBSERVED",
+            Self::ProviderTerminalObserved(_) => "PROVIDER_TERMINAL_OBSERVED",
+            Self::CandidateResultAvailable(_) => "CANDIDATE_RESULT_AVAILABLE",
+            Self::UnsupportedQuarantined(_) => "UNSUPPORTED_QUARANTINED",
+        }
+    }
+}
+
+/// Derives the stable event identity for one normalized input: `sha256` over
+/// the canonical JSON bytes of the adapter identity/version, the exact
+/// lineage, the sequence, the closed typed payload, and the qualified source
+/// digest. Same input, adapter version, and lineage always derive the same
+/// identity; changing any bound field changes it. The durable-to-intake
+/// conversion carries this derivation alongside the owner-minted `event_id`
+/// so forensic replay can distinguish a re-minted identity from a stable one.
+pub fn stable_event_id_for(
+    adapter_identity: &str,
+    adapter_version: &str,
+    lineage: &ProviderObservationLineage,
+    sequence: u64,
+    payload: &NormalizedHostEventPayload,
+    source_digest: &QualifiedSourceDigest,
+) -> Result<EventId, ContractError> {
+    let canonical = canonical_json_bytes(&(
+        adapter_identity,
+        adapter_version,
+        lineage,
+        sequence,
+        payload,
+        source_digest,
+    ))
+    .map_err(|_| ContractError::DigestMismatch)?;
+    EventId::new(sha256_hex(&canonical))
 }
 
 /// Disposition of unsupported provider fields or versions encountered during
@@ -1053,5 +1243,148 @@ impl NormalizedHostEventEnvelope {
         Ok(HostEventReplayDisposition::Quarantined {
             reason: HostEventQuarantineReason::ConflictingFraming,
         })
+    }
+}
+
+/// Durable-to-intake conversion view for one committed journal record (issues
+/// #371 W7/A27).
+///
+/// The ACP durable journal commits the raw/hash record, the normalized
+/// envelope, and the disposition together; the coordinator intake observes the
+/// envelope plus its sealed receipt. This neutral view is the production edge
+/// between them: the journal mints it only for committed records, and the
+/// coordinator intake consumes it only after re-verifying every preserved
+/// fact. Identity, sequence, producer generation, `StateFence`, causal
+/// predecessors, closed payload kind, delivery class, and acknowledgement
+/// state travel as explicit fields — never re-derived, never dropped — plus
+/// the stable event identity derived from the normalized input and the full
+/// envelope/receipt pair for the intake equality and digest checks.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommittedHostEventIntake {
+    /// Owner-minted event identity, preserved verbatim.
+    pub event_id: EventId,
+    /// Owner-minted resume cursor, preserved verbatim.
+    pub cursor: EventCursor,
+    /// Monotonic sequence, preserved verbatim.
+    pub sequence: u64,
+    /// Producer runtime generation. `Some` exactly for execution-unit lineage.
+    pub runtime_generation: Option<ResourceGeneration>,
+    /// Current `StateFence`. `Some` exactly for execution-unit lineage.
+    pub state_fence: Option<StateFence>,
+    /// Causal predecessor identities, preserved verbatim.
+    pub causal_predecessors: Vec<EventId>,
+    /// Closed payload kind tag (see
+    /// [`NormalizedHostEventPayload::payload_type_tag`]).
+    pub payload_type: String,
+    /// Delivery/coverage disposition, preserved verbatim.
+    pub delivery: HostEventDeliveryDisposition,
+    /// Whether the journal acknowledged this record downstream. Intake never
+    /// advances acknowledgement itself; it observes the recorded requirement.
+    pub acked: bool,
+    /// Stable identity derived from the normalized input (see
+    /// [`stable_event_id_for`]).
+    pub stable_event_identity: EventId,
+    /// Full normalized envelope for the intake equality and digest checks.
+    pub envelope: NormalizedHostEventEnvelope,
+    /// Sealed normalization receipt; must equal `envelope.normalization`.
+    pub receipt: HostEventNormalizationReceipt,
+}
+
+impl CommittedHostEventIntake {
+    /// Builds the intake view for one envelope known committed by the durable
+    /// journal. Rejects a receipt that is not the envelope's sealed receipt
+    /// and an output digest that does not recompute; extracts every preserved
+    /// fact from the envelope instead of re-deriving it.
+    pub fn from_envelope(
+        envelope: &NormalizedHostEventEnvelope,
+        acked: bool,
+    ) -> Result<Self, ContractError> {
+        let receipt = envelope.normalization.clone();
+        let computed = envelope
+            .compute_digest()
+            .map_err(|_| ContractError::DigestMismatch)?;
+        if computed != receipt.output_digest {
+            return Err(ContractError::DigestMismatch);
+        }
+        let (runtime_generation, state_fence) = match &envelope.lineage {
+            ProviderObservationLineage::SessionObservation(_) => (None, None),
+            ProviderObservationLineage::ExecutionUnitObservation(observation) => (
+                Some(observation.binding.runtime_generation),
+                Some(observation.binding.state_fence.clone()),
+            ),
+        };
+        let stable_event_identity = stable_event_id_for(
+            &envelope.producer_adapter_identity,
+            &envelope.adapter_contract_version,
+            &envelope.lineage,
+            envelope.sequence,
+            &envelope.payload,
+            &envelope.raw_source.digest,
+        )?;
+        Ok(Self {
+            event_id: envelope.event_id.clone(),
+            cursor: envelope.cursor.clone(),
+            sequence: envelope.sequence,
+            runtime_generation,
+            state_fence,
+            causal_predecessors: envelope.causal_predecessors.clone(),
+            payload_type: envelope.payload.payload_type_tag().to_owned(),
+            delivery: envelope.delivery,
+            acked,
+            stable_event_identity,
+            envelope: envelope.clone(),
+            receipt,
+        })
+    }
+
+    /// Re-verifies the preserved facts against the carried envelope: receipt
+    /// equality, recomputed output digest, identity/sequence/cursor agreement,
+    /// predecessor/delivery/payload-kind agreement, generation/fence presence
+    /// agreement with the lineage, and stable-identity recomputation. The
+    /// coordinator intake calls this before observing; a view that drifted
+    /// from its envelope fails closed here.
+    pub fn verify(&self) -> Result<(), ContractError> {
+        if self.receipt != self.envelope.normalization {
+            return Err(ContractError::DigestMismatch);
+        }
+        let computed = self
+            .envelope
+            .compute_digest()
+            .map_err(|_| ContractError::DigestMismatch)?;
+        if computed != self.receipt.output_digest {
+            return Err(ContractError::DigestMismatch);
+        }
+        if self.event_id != self.envelope.event_id
+            || self.cursor != self.envelope.cursor
+            || self.sequence != self.envelope.sequence
+            || self.causal_predecessors != self.envelope.causal_predecessors
+            || self.delivery != self.envelope.delivery
+            || self.payload_type != self.envelope.payload.payload_type_tag()
+        {
+            return Err(ContractError::BindingMismatch);
+        }
+        let (generation, fence) = match &self.envelope.lineage {
+            ProviderObservationLineage::SessionObservation(_) => (None, None),
+            ProviderObservationLineage::ExecutionUnitObservation(observation) => (
+                Some(&observation.binding.runtime_generation),
+                Some(&observation.binding.state_fence),
+            ),
+        };
+        if self.runtime_generation.as_ref() != generation || self.state_fence.as_ref() != fence {
+            return Err(ContractError::BindingMismatch);
+        }
+        let stable = stable_event_id_for(
+            &self.envelope.producer_adapter_identity,
+            &self.envelope.adapter_contract_version,
+            &self.envelope.lineage,
+            self.envelope.sequence,
+            &self.envelope.payload,
+            &self.envelope.raw_source.digest,
+        )?;
+        if stable != self.stable_event_identity {
+            return Err(ContractError::DigestMismatch);
+        }
+        Ok(())
     }
 }

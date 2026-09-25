@@ -2,12 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentAttempt, AgentResult, AttemptId, AttemptState, AuthorityEnvelope,
-    CancellationState, CandidateSelectionDisposition, ContinuityKind, ContractError, EffectCeiling,
-    EffectKind, HostEventNormalizationReceipt, HostEventQuarantineReason,
-    HostEventReplayDisposition, MAX_ROUTE_CANDIDATES, NormalizedHostEventEnvelope,
-    PhysicalRouteObservationReceipt, ProviderExecutionBinding, ProviderObservationLineage,
-    RejectedRouteCandidate, ResultDisposition, RouteSelectionCandidate, WorkLeaseId,
-    candidate_digest_for, validate_execution_binding,
+    CancellationState, CandidateSelectionDisposition, CommittedHostEventIntake, ContinuityKind,
+    ContractError, EffectCeiling, EffectKind, HostEventNormalizationReceipt,
+    HostEventQuarantineReason, HostEventReplayDisposition, MAX_ROUTE_CANDIDATES,
+    NormalizedHostEventEnvelope, NormalizedHostEventPayload, PhysicalRouteObservationReceipt,
+    ProviderExecutionBinding, ProviderObservationLineage, RejectedRouteCandidate,
+    ResultDisposition, RouteSelectionCandidate, WorkLeaseId, candidate_digest_for,
+    validate_execution_binding,
 };
 use eliot_agent_contracts::{
     AgentAttemptId, CoordinationEntry, CoordinationMapView, DescendantTerminalState,
@@ -1494,6 +1495,80 @@ impl AgentCoordinator {
         Ok(receipt)
     }
 
+    /// Verifies a `candidate-result-available` reference against the retained
+    /// admitted #370 submission for its attempt: the reference attempt must
+    /// resolve (session-only references carry no attempt authority), the
+    /// attempt must have a recorded result submission with a stored
+    /// admission, and the reference must verify against both (attempt,
+    /// governing admission, and recomputed result digest). A reference
+    /// without recorded linkage is an identity conflict; a reference naming
+    /// a different result than the admitted one is quarantined as
+    /// conflicting payload. Runs before any mutation.
+    fn check_candidate_reference(
+        &self,
+        event: &NormalizedHostEventEnvelope,
+        attempt_id: Option<&AttemptId>,
+    ) -> Result<(), CoordinatorError> {
+        let NormalizedHostEventPayload::CandidateResultAvailable(reference) = &event.payload else {
+            return Ok(());
+        };
+        let attempt = attempt_id.ok_or(CoordinatorError::IdentityConflict(
+            "candidate_result_reference",
+        ))?;
+        let stored_admission = self
+            .attempts
+            .get(attempt)
+            .cloned()
+            .ok_or(CoordinatorError::UnknownAttempt)?
+            .admitted_route
+            .clone()
+            .ok_or(CoordinatorError::IdentityConflict("admitted_route"))?;
+        let admitted = self.candidate_reference_result(attempt)?;
+        reference
+            .verify_against(&admitted, &stored_admission)
+            .map_err(|error| match error {
+                ContractError::BindingMismatch => {
+                    CoordinatorError::IdentityConflict("candidate_result_reference")
+                }
+                ContractError::DigestMismatch => CoordinatorError::HostEventQuarantine(
+                    HostEventQuarantineReason::ConflictingPayload,
+                ),
+                other => CoordinatorError::ProviderContract(other.to_string()),
+            })
+    }
+
+    /// Returns the retained admitted candidate result backing a
+    /// `candidate-result-available` reference: the submission linked to the
+    /// attempt by [`Self::submit_result`], read back from the retained
+    /// `ResultSubmitted` event. A reference for an attempt with no recorded
+    /// submission names no admitted receipt and fails as an identity
+    /// conflict before any mutation.
+    fn candidate_reference_result(
+        &self,
+        attempt: &AttemptId,
+    ) -> Result<AgentResult, CoordinatorError> {
+        let submission_id =
+            self.result_by_attempt
+                .get(attempt)
+                .ok_or(CoordinatorError::IdentityConflict(
+                    "candidate_result_reference",
+                ))?;
+        self.events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                CoordinatorEvent::ResultSubmitted { submission, .. }
+                    if submission.submission_id == *submission_id =>
+                {
+                    Some(submission.result.clone())
+                }
+                _ => None,
+            })
+            .ok_or(CoordinatorError::IdentityConflict(
+                "candidate_result_reference",
+            ))
+    }
+
     /// Observes one closed v7 provider host event under the exact recorded
     /// lineage (issue #371 S7).
     ///
@@ -1552,6 +1627,12 @@ impl AgentCoordinator {
     ///   model 642-650); the accepted observation then records its own
     ///   sequence. Reordered (stale) arrivals therefore stay stale and gaps
     ///   regenerate deterministically on snapshot restore.
+    /// - a `candidate-result-available` reference is verified against the
+    ///   retained admitted #370 submission for its attempt (attempt,
+    ///   governing admission, and recomputed result digest): a reference
+    ///   without recorded linkage is an identity conflict, and a reference
+    ///   naming a different result than the admitted one is quarantined as
+    ///   conflicting payload, both before any mutation.
     ///
     /// Observations never synthesize a candidate result or a Finish: usage,
     /// terminality, results, and completion are untouched here, so a
@@ -1625,6 +1706,9 @@ impl AgentCoordinator {
                 Some(current.attempt_id.clone())
             }
         };
+        // A `candidate-result-available` reference names the exact admitted
+        // #370 receipt by digest (see [`Self::check_candidate_reference`]).
+        self.check_candidate_reference(&event, attempt_id.as_ref())?;
         if let Some(attempt) = &attempt_id {
             let last = self.last_host_sequence.get(attempt).copied().unwrap_or(0);
             if event.sequence <= last {
@@ -1656,6 +1740,26 @@ impl AgentCoordinator {
                 normalization: Box::new(normalization),
             });
         Ok(())
+    }
+
+    /// Observes one committed durable journal record through the neutral
+    /// intake view (issues #371 W7/A27: the journal→intake conversion edge).
+    ///
+    /// Every preserved fact on the view is re-verified against the carried
+    /// envelope (receipt equality, recomputed output digest,
+    /// identity/sequence/cursor/predecessor/delivery/payload-kind/
+    /// generation/fence agreement, stable-identity recomputation) before
+    /// delegating to [`Self::observe_provider_event`]: a view that drifted
+    /// from its envelope rejects here without mutation. Acknowledgement
+    /// state is observed, never advanced: cursor acknowledgement follows
+    /// durable linkage/disposition, not this in-memory return.
+    pub fn observe_committed_intake(
+        &mut self,
+        context: ExecutionContext,
+        intake: CommittedHostEventIntake,
+    ) -> Result<(), CoordinatorError> {
+        intake.verify().map_err(binding_contract)?;
+        self.observe_provider_event(context, intake.envelope, intake.receipt)
     }
 
     pub fn reconcile_unknown_outcome(

@@ -43,12 +43,13 @@
 use std::collections::BTreeMap;
 
 use eliot_agent_api::{
-    ContractError, EventId, HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM,
-    HostEventDeliveryDisposition, HostEventPrivacyClass, LowercaseSha256,
-    NormalizedHostEventEnvelope, ProviderObservationLineage, QualifiedSourceDigest,
+    AdmittedRouteReceipt, CommittedHostEventIntake, ContractError, EventId,
+    HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
+    HostEventPrivacyClass, LowercaseSha256, NormalizedHostEventEnvelope, ProviderExecutionBinding,
+    ProviderObservationLineage, QualifiedSourceDigest,
     host_event::HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM,
 };
-use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_contracts::sha256_hex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -328,6 +329,15 @@ pub struct StageAllowed<'a> {
     /// source-digest algorithm (canonical message digest or raw-bytes
     /// digest for quarantine/redacted inputs).
     pub envelope: NormalizedHostEventEnvelope,
+    /// Recorded #361 provider-execution binding. Required for execution-unit
+    /// lineage (validated against the envelope before any mutation);
+    /// forbidden for session-only lineage, which carries no attempt
+    /// authority.
+    pub binding: Option<&'a ProviderExecutionBinding>,
+    /// Recorded #369 admitted-route receipt. Required for execution-unit
+    /// lineage (the envelope must reference it by digest); forbidden for
+    /// session-only lineage.
+    pub admission: Option<&'a AdmittedRouteReceipt>,
     /// Requested route reference digest, when the lineage carries one.
     pub requested_route_digest: Option<LowercaseSha256>,
     /// Observed actual route reference digest, when one was observed.
@@ -358,6 +368,14 @@ pub struct StageRedacted<'a> {
     /// Normalized envelope binding the deterministic redacted projection with
     /// a non-public privacy class.
     pub envelope: NormalizedHostEventEnvelope,
+    /// Recorded #361 provider-execution binding. Required for execution-unit
+    /// lineage (validated against the envelope before any mutation);
+    /// forbidden for session-only lineage.
+    pub binding: Option<&'a ProviderExecutionBinding>,
+    /// Recorded #369 admitted-route receipt. Required for execution-unit
+    /// lineage (the envelope must reference it by digest); forbidden for
+    /// session-only lineage.
+    pub admission: Option<&'a AdmittedRouteReceipt>,
     /// Requested route reference digest, when the lineage carries one.
     pub requested_route_digest: Option<LowercaseSha256>,
     /// Observed actual route reference digest, when one was observed.
@@ -509,6 +527,33 @@ impl DurableHostEventJournal {
         self.records.get(&(key.stream_id.clone(), key.sequence))
     }
 
+    /// Builds the coordinator-intake conversion view for one committed record
+    /// (issues #371 W7/A27).
+    ///
+    /// Only committed records convert: the raw/hash record, the normalized
+    /// projection, and the disposition must already be durably related, so a
+    /// staged-but-uncommitted record reports [`IngestError::NotCommitted`].
+    /// The view preserves event identity, sequence, producer generation,
+    /// `StateFence`, causal predecessors, closed payload kind, delivery class,
+    /// and acknowledgement state explicitly (see
+    /// [`CommittedHostEventIntake`](eliot_agent_api::CommittedHostEventIntake)),
+    /// plus the stable identity derived from the normalized input. The
+    /// coordinator intake re-verifies every fact before observing.
+    pub fn to_coordinator_intake(
+        &self,
+        key: &EventKey,
+    ) -> Result<CommittedHostEventIntake, IngestError> {
+        let record = self
+            .records
+            .get(&(key.stream_id.clone(), key.sequence))
+            .ok_or(IngestError::UnknownRecord)?;
+        if !record.disposition.committed {
+            return Err(IngestError::NotCommitted);
+        }
+        CommittedHostEventIntake::from_envelope(&record.envelope, record.disposition.acked)
+            .map_err(IngestError::Contract)
+    }
+
     /// Returns every recorded best-effort drop gap for a stream, in record
     /// order. Dropped best-effort observations leave this exact coverage gap
     /// instead of advancing acknowledgement or cursor state.
@@ -555,6 +600,8 @@ impl DurableHostEventJournal {
             transport_hash,
             stored,
             request.envelope,
+            request.binding,
+            request.admission,
             request.requested_route_digest,
             request.actual_route_digest,
             request.predecessors,
@@ -608,6 +655,8 @@ impl DurableHostEventJournal {
             transport_hash,
             stored,
             request.envelope,
+            request.binding,
+            request.admission,
             request.requested_route_digest,
             request.actual_route_digest,
             request.predecessors,
@@ -756,6 +805,8 @@ impl DurableHostEventJournal {
         transport_hash: LowercaseSha256,
         stored: StoredPayload,
         envelope: NormalizedHostEventEnvelope,
+        binding: Option<&ProviderExecutionBinding>,
+        admission: Option<&AdmittedRouteReceipt>,
         requested_route_digest: Option<LowercaseSha256>,
         actual_route_digest: Option<LowercaseSha256>,
         predecessors: Vec<EventId>,
@@ -772,6 +823,13 @@ impl DurableHostEventJournal {
         if predecessors != envelope.causal_predecessors {
             return Err(IngestError::EnvelopeMismatch("predecessors"));
         }
+        Self::check_staging_context(
+            &envelope,
+            binding,
+            admission,
+            requested_route_digest.as_ref(),
+            actual_route_digest.as_ref(),
+        )?;
         Self::check_envelope_linkage(&envelope, sequence, &stored)?;
         let envelope_digest = envelope
             .compute_digest()
@@ -856,6 +914,70 @@ impl DurableHostEventJournal {
         Ok(StageOutcome { key, fresh: true })
     }
 
+    /// Checks the staging lineage context before any mutation: an
+    /// execution-unit envelope must arrive with its recorded #361 binding and
+    /// #369 admission, validated exactly (wrong attempt, binding, fence,
+    /// generation, cursor, or route reference rejects here); a session-only
+    /// envelope must arrive without them, carrying no attempt authority and
+    /// no admission reference. The carried requested/actual route digests must
+    /// anchor the envelope's admission reference (see
+    /// [`Self::check_route_digests`]).
+    fn check_staging_context(
+        envelope: &NormalizedHostEventEnvelope,
+        binding: Option<&ProviderExecutionBinding>,
+        admission: Option<&AdmittedRouteReceipt>,
+        requested_route_digest: Option<&LowercaseSha256>,
+        actual_route_digest: Option<&LowercaseSha256>,
+    ) -> Result<(), IngestError> {
+        match &envelope.lineage {
+            ProviderObservationLineage::SessionObservation(_) => {
+                if binding.is_some() {
+                    return Err(IngestError::InvalidInput("binding/lineage"));
+                }
+                if admission.is_some() {
+                    return Err(IngestError::InvalidInput("admission/lineage"));
+                }
+            }
+            ProviderObservationLineage::ExecutionUnitObservation(_) => {
+                let binding = binding.ok_or(IngestError::InvalidInput("binding/lineage"))?;
+                let admission = admission.ok_or(IngestError::InvalidInput("admission/lineage"))?;
+                envelope
+                    .validate_for_lineage(binding, admission)
+                    .map_err(IngestError::Contract)?;
+            }
+        }
+        Self::check_route_digests(
+            envelope.admitted_route_digest.as_ref(),
+            requested_route_digest,
+            actual_route_digest,
+        )
+    }
+
+    /// Checks that the carried route-reference digests anchor the envelope's
+    /// admission reference: session envelopes (no admission reference) carry
+    /// no route digests; execution envelopes must carry at least one digest
+    /// equal to the admission reference. Divergent route columns reject
+    /// before any mutation.
+    fn check_route_digests(
+        admitted: Option<&LowercaseSha256>,
+        requested: Option<&LowercaseSha256>,
+        actual: Option<&LowercaseSha256>,
+    ) -> Result<(), IngestError> {
+        match admitted {
+            None => {
+                if requested.is_some() || actual.is_some() {
+                    return Err(IngestError::EnvelopeMismatch("route_digest"));
+                }
+            }
+            Some(admitted) => {
+                if requested != Some(admitted) && actual != Some(admitted) {
+                    return Err(IngestError::EnvelopeMismatch("route_digest"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Checks that the envelope binds the stored bytes: schema version,
     /// stream sequence, `raw_source` digest over the stored bytes under its
     /// declared algorithm, and receipt coherence, plus framing validation for
@@ -888,32 +1010,33 @@ impl DurableHostEventJournal {
 
     /// Verifies the envelope source digest against the stored bytes under its
     /// declared algorithm qualifier. Canonical-JSON digests decode the stored
-    /// bytes (bare or single-framed) and canonicalize before hashing, so
-    /// whitespace/key-order variants of one message verify while the digest
-    /// of unrelated bytes fails here before any cursor moves. Raw-bytes
-    /// digests (typed quarantine, deterministic redacted projections) hash
-    /// the stored bytes exactly. The immutable transport hash is preserved
-    /// separately on the durable record either way, never collapsed into the
-    /// semantic digest.
+    /// bytes (bare or single-framed) and recompute over the canonical message
+    /// (see
+    /// [`QualifiedSourceDigest::verify_canonical_message`](eliot_agent_api::QualifiedSourceDigest::verify_canonical_message)),
+    /// so whitespace/key-order variants of one message verify while the
+    /// digest of unrelated bytes fails here before any cursor moves.
+    /// Raw-bytes digests (typed quarantine, deterministic redacted
+    /// projections) recompute over the stored bytes exactly. The immutable
+    /// transport hash is preserved separately on the durable record either
+    /// way, never collapsed into the semantic digest.
     fn check_source_digest(
         digest: &QualifiedSourceDigest,
         stored: &[u8],
     ) -> Result<(), IngestError> {
-        if digest.algorithm != HOST_EVENT_DIGEST_ALGORITHM
-            && digest.algorithm != HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM
-        {
-            return Err(IngestError::EnvelopeMismatch("digest_algorithm"));
-        }
-        let expected_hex = if digest.algorithm == HOST_EVENT_DIGEST_ALGORITHM {
+        if digest.algorithm == HOST_EVENT_DIGEST_ALGORITHM {
             let message = decode_source_message(stored)
                 .map_err(|_| IngestError::EnvelopeMismatch("raw_source"))?;
-            sha256_hex(&canonical_json_bytes(&message).map_err(|_| IngestError::DigestEncoding)?)
-        } else {
-            sha256_hex(stored)
-        };
-        if expected_hex != digest.digest.as_str() {
-            return Err(IngestError::EnvelopeMismatch("raw_source"));
+            digest
+                .verify_canonical_message(&message)
+                .map_err(|_| IngestError::EnvelopeMismatch("raw_source"))?;
+            return Ok(());
         }
-        Ok(())
+        if digest.algorithm == HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM {
+            digest
+                .verify_raw_bytes(stored)
+                .map_err(|_| IngestError::EnvelopeMismatch("raw_source"))?;
+            return Ok(());
+        }
+        Err(IngestError::EnvelopeMismatch("digest_algorithm"))
     }
 }
