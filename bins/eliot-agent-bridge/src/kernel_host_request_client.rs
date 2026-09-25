@@ -919,12 +919,19 @@ fn invalid_result(detail: &str) -> PortFailure {
 }
 
 /// Decodes one stored bounded response and checks it against the admitted
-/// request (Implements #18: local read result).
+/// request (Implements #18: local read result; #2564 item 5: the canonical
+/// request digest binds the actual expected request).
 ///
 /// Mirrors `host_gateway.rs:406-436` (bounded size, tool binding) plus the
 /// `check_response_binding` semantics (request/idempotency/tool/digest joins
 /// against the exact sent envelope). Any mismatch is a typed rejection, never
 /// a guessed outcome and never a silent admission.
+///
+/// The digest check is an equality against the exact expected request
+/// commitment ([`expected_canonical_request_digest`]), never a well-formedness
+/// shape check: a well-formed unrelated digest is insufficient and fails
+/// closed here, so a substituted request identity cannot be adopted as the
+/// admitted answer.
 fn decode_stored_response(
     record: &AdmittedReplyView,
     request: &HostInvocationRequest,
@@ -949,12 +956,8 @@ fn decode_stored_response(
     if response.canonical_tool_name != request.tool.canonical_name() {
         return Err(invalid_result("tool binding mismatch"));
     }
-    if response.canonical_request_sha256.len() != 64
-        || !response
-            .canonical_request_sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
+    let expected_request = expected_canonical_request_digest(envelope)?;
+    if response.canonical_request_sha256 != expected_request {
         return Err(invalid_result("response digest mismatch"));
     }
     let digest = record
@@ -966,6 +969,30 @@ fn decode_stored_response(
         return Err(invalid_result("digest does not bind the exact body"));
     }
     Ok(response)
+}
+
+/// Derives the exact canonical request digest one admitted stored result
+/// must echo (#2564 item 5).
+///
+/// Byte-identical to the producer commitment in
+/// `AuthenticatedHostSession::build_local_read_result_body`
+/// (`crates/kernel/eliot-kernel-service/src/host_request_binding.rs`): the
+/// SHA-256 of the canonical JSON of the `(envelope digest, request id,
+/// idempotency key)` triple. The bridge holds the exact sent envelope, so
+/// this is the actual expected request — computed, never guessed, and never
+/// a shape-only check. The Kernel `local_read` leg is the single production
+/// result producer reachable through this client's frame path, so this one
+/// formula is the complete expected set; no second formula is accepted.
+fn expected_canonical_request_digest(
+    envelope: &HostRequestEnvelope,
+) -> Result<String, PortFailure> {
+    let bytes = canonical_json_bytes(&(
+        envelope.envelope_sha256.clone(),
+        envelope.identity.request_id.as_str().to_owned(),
+        envelope.identity.idempotency_key.clone(),
+    ))
+    .map_err(|_| invalid_result("uncanonicalizable"))?;
+    Ok(sha256_hex(&bytes))
 }
 
 fn submit_outcome(
@@ -1504,7 +1531,8 @@ mod tests {
         let body = serde_json::json!({
             "request_id": envelope.identity.request_id.as_str(),
             "idempotency_key": envelope.identity.idempotency_key,
-            "canonical_request_sha256": "a".repeat(64),
+            "canonical_request_sha256": expected_canonical_request_digest(envelope)
+                .expect("expected request digest must compute"),
             "kind": "PROJECTION",
             "canonical_tool_name": "eliot.state",
             "content": {
