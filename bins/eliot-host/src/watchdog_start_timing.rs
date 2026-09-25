@@ -11,6 +11,18 @@
 //! SCM/service mutation, process start/stop/restart/kill, lifecycle,
 //! reconciliation, self-admission, spool, semantic, canonical, credential, or
 //! authority behavior.
+//!
+//! F-LOG-HOST-4 (#979): non-boundary wait mechanics — `watchdog_start_wait`
+//! and `watchdog_unknown_wait` are pure `Duration` clamps with no owner
+//! state/receipt, error propagation, or terminal decision, so they carry no
+//! diagnostic callsite of their own. The sole production caller is the SCM
+//! start convergence loop in `watchdog_service_start.rs`
+//! (`start_installed_watchdog_with_clock`), which owns the injected-clock
+//! deadline decision and emits the timing observations there (the
+//! `watchdog.start ... expired` phases); `watchdog_start_wait` is
+//! additionally re-exported to `#[cfg(all(test, windows))]` for the existing
+//! exact-clamp unit assertions. Observing a pure clamp would record no owner
+//! fact.
 
 #[cfg(windows)]
 use std::time::{Duration, Instant};
