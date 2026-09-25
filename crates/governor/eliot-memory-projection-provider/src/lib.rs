@@ -197,9 +197,12 @@ impl ProjectionRequest {
                 bound: MAX_INTAKE_CONTINUITY_OBSERVATIONS,
             });
         }
-        // Both families are canonical records the read side observed, and the
-        // batch validator rejects a denominator below the projected plus
-        // omitted volume, so continuity counts here rather than being free.
+        // Both families are canonical records the read side observed, and each
+        // one reaches the batch denominator exactly once: memory observations
+        // become a record, an omission or a frontier handle, and continuity
+        // observations become an omission. So the three coverage lists
+        // together carry this declared total, and continuity is counted here
+        // rather than being free.
         let observed = self.observations.len() + self.continuity.len();
         if self.denominator_total != observed {
             return Err(ProjectionError::DenominatorContradiction {
@@ -219,8 +222,9 @@ impl ProjectionRequest {
 /// continuity observation, or a workflow view outside the batch binding,
 /// fails the read before any record exists, so a refused input can never
 /// contribute to a batch. Admitted continuity is then accounted as one named
-/// omission per observation, which keeps `records.len() + omissions.len()` at
-/// or below the declared denominator. The returned batch is fully validated.
+/// omission per observation, so every observed item lands in exactly one of
+/// records, omissions, or the resume frontier and the three together carry the
+/// declared denominator. The returned batch is fully validated.
 pub fn project_batch(
     request: &ProjectionRequest,
 ) -> Result<MemoryProjectionBatch, ProjectionError> {
