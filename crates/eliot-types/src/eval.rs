@@ -170,7 +170,7 @@ pub enum EvalRunStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-<<<<pub struct EvalIntegrityFingerprintSet {
+pub struct EvalIntegrityFingerprintSet {
     pub harness_fingerprint: String,
     pub evaluator_fingerprint: String,
     pub environment_fingerprint: String,
