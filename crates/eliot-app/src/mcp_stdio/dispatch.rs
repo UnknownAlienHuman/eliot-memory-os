@@ -8,6 +8,7 @@
 //! reaches a handler unscoped" readable as a single fact.
 
 use super::*;
+use eliot_agent_bridge_core::{MAX_AGENT_RECALL_HANDLES, project_recall_for_agent};
 
 #[allow(
     clippy::too_many_lines,
@@ -435,24 +436,36 @@ pub(super) async fn call_tool(
 
     let observation_arguments = arguments.clone();
     let mut dispatch_arguments = arguments;
-    if cognitive_claims.as_ref().is_some_and(|claims| {
-        claims.capability.invocation_role == CognitiveInvocationRole::Target
-            && name == "eliot_recall_l0"
-    }) {
-        dispatch_arguments["limit"] = json!(50);
+    let expected_recall_handles = cognitive_claims.as_ref().and_then(|claims| {
+        (claims.capability.invocation_role == CognitiveInvocationRole::Target
+            && name == "eliot_recall_l0")
+            .then(|| {
+                claims
+                    .capability
+                    .expected_exposure_handles
+                    .iter()
+                    .take(MAX_AGENT_RECALL_HANDLES)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+    });
+    if expected_recall_handles.is_some() {
+        dispatch_arguments["limit"] = json!(MAX_AGENT_RECALL_HANDLES);
     }
-    let dispatched = Box::pin(dispatch_tool(state, context, name, dispatch_arguments)).await;
+    let dispatched = if let Some(expected_handles) = expected_recall_handles.as_deref() {
+        Box::pin(dispatch_tool_with_recall_scope(
+            state,
+            context,
+            name,
+            dispatch_arguments,
+            Some(expected_handles),
+        ))
+        .await
+    } else {
+        Box::pin(dispatch_tool(state, context, name, dispatch_arguments)).await
+    };
     let structured = match dispatched {
         Ok(mut structured) => {
-            if let Some(claims) = cognitive_claims.as_ref()
-                && claims.capability.invocation_role == CognitiveInvocationRole::Target
-                && name == "eliot_recall_l0"
-            {
-                restrict_cognitive_recall(
-                    &mut structured,
-                    &claims.capability.expected_exposure_handles,
-                )?;
-            }
             if let Some(claims) = cognitive_claims.as_ref()
                 && claims.capability.invocation_role == CognitiveInvocationRole::Target
                 && name == "eliot_fetch_l2"
@@ -597,7 +610,13 @@ pub(super) async fn call_tool(
                 // Governor-budgeted cognitive surface. Keep newly planned UL
                 // items pending for a later tool instead of creating a second
                 // app-owned assembler on the packet response.
-                if !admitted_packet_compile {
+                // A recall response carries a server-issued verdict and a
+                // content-addressed delivered trace. Legacy UL attachment
+                // rewrites tool responses after dispatch, so it must not run
+                // on this path; otherwise handles/truncation could change after
+                // the verdict and its rank-trace handle were issued. The
+                // planner observation and ledger path still run above.
+                if !admitted_packet_compile && name != "eliot_recall_l0" {
                     injection_receipts = state
                         .ul
                         .planner
@@ -725,12 +744,110 @@ pub(super) fn string_array_field(value: &Value, field: &str) -> Vec<String> {
         .collect()
 }
 
-#[allow(clippy::large_futures, clippy::too_many_lines)]
+fn bound_recall_response_for_agent(
+    mut response: RecallL0Response,
+    requested_limit: Option<usize>,
+    expected_handles: Option<&[String]>,
+) -> RecallL0Response {
+    let original_count = response.handles.len();
+    let limit = match expected_handles {
+        Some(handles) => handles.len(),
+        None => requested_limit.unwrap_or(response.truncation.limit),
+    }
+    .clamp(1, MAX_AGENT_RECALL_HANDLES);
+    if let Some(expected_handles) = expected_handles {
+        let mut by_handle = response
+            .handles
+            .drain(..)
+            .map(|handle| (handle.handle.clone(), handle))
+            .collect::<HashMap<_, _>>();
+        response.handles = expected_handles
+            .iter()
+            .filter_map(|handle| by_handle.remove(handle))
+            .take(limit)
+            .collect();
+    } else {
+        response.handles.truncate(limit);
+    }
+    if expected_handles.is_none() && original_count > response.handles.len() {
+        response.truncation.truncated = true;
+    }
+    response.truncation.limit = limit;
+    response.truncation.returned = response.handles.len();
+    let returned = response
+        .handles
+        .iter()
+        .map(|handle| handle.handle.as_str())
+        .collect::<HashSet<_>>();
+    response
+        .rank_trace
+        .feature_scores
+        .retain(|score| returned.contains(score.handle.as_str()));
+    response.rank_trace.candidates_returned = response.handles.len();
+    response.rank_trace.no_useful_memory = response.handles.is_empty();
+    response.memory_confidence = eliot_types::MemoryConfidence::from_top_score(
+        response
+            .rank_trace
+            .feature_scores
+            .iter()
+            .map(|score| score.total)
+            .max(),
+    );
+    response
+}
+
+fn project_l0_recall_for_mcp(
+    response: &RecallL0Response,
+    verdict: &eliot_types::ServerRecallVerdict,
+) -> Result<Value> {
+    // The bridge projection is the sole owner of the agent-facing bound. The
+    // response is serialized only for its safe metadata; its raw ranking and
+    // suppression trace is removed before the default MCP result is returned.
+    let projection = project_recall_for_agent(response, verdict, false)
+        .map_err(|error| anyhow::anyhow!("eliot_recall_l0 bounded recall projection: {error}"))?;
+    let mut value = serde_json::to_value(response)?;
+    let object = value
+        .as_object_mut()
+        .context("eliot_recall_l0 response must serialize as an object")?;
+    object.remove("rank_trace");
+    object.insert(
+        "handles".to_owned(),
+        serde_json::to_value(projection.handles)?,
+    );
+    object.insert(
+        "disposition".to_owned(),
+        serde_json::to_value(projection.disposition)?,
+    );
+    object.insert(
+        "receipt".to_owned(),
+        serde_json::to_value(projection.receipt)?,
+    );
+    object.insert(
+        "rank_trace_handle".to_owned(),
+        serde_json::to_value(projection.rank_trace_handle)?,
+    );
+    Ok(value)
+}
+
 pub(super) async fn dispatch_tool(
     state: &McpState,
     context: AuthenticatedRequestContext,
     name: &str,
     arguments: Value,
+) -> Result<Value> {
+    Box::pin(dispatch_tool_with_recall_scope(
+        state, context, name, arguments, None,
+    ))
+    .await
+}
+
+#[allow(clippy::large_futures, clippy::too_many_lines)]
+async fn dispatch_tool_with_recall_scope(
+    state: &McpState,
+    context: AuthenticatedRequestContext,
+    name: &str,
+    arguments: Value,
+    expected_recall_handles: Option<&[String]>,
 ) -> Result<Value> {
     let structured = match name {
         "eliot_cognitive_job_fetch" => {
@@ -850,7 +967,8 @@ pub(super) async fn dispatch_tool(
             // ran under; an absent scope is corpus-wide. Captured before the
             // request below takes ownership of `input.scope`.
             let receipt_scope = input.scope.clone().unwrap_or_default();
-            let mut response = ReadService::new(state.store.clone())
+            let requested_limit = input.limit;
+            let response = ReadService::new(state.store.clone())
                 .recall_l0(&RecallL0Request {
                     project_id: parse_project_id(&input.project_id)?,
                     query: input.query,
@@ -863,78 +981,39 @@ pub(super) async fn dispatch_tool(
                     concept_refs: input.concept_refs,
                 })
                 .await?;
-            // I7.17 (#1940): live-path caller wiring. The server derives one
-            // closed `RecallDisposition` from retrieval facts and mints the
-            // binding receipt plus rank-trace handle BEFORE the agent-facing
-            // limit truncation below, so the receipt counts describe the full
-            // server-side visible/suppressed totals (bridge projection
-            // semantics: handles truncate, receipt counts do not). The
-            // disposition is derived here, never accepted from bridge or model
-            // output. `corpus_empty` stays false: an L0 read observes query
-            // matches, never corpus cardinality — zero matches cannot
-            // distinguish no-match from empty corpus, and the
-            // stale-projection path deliberately clears candidates, so an
-            // emptiness inference would mislabel STALE_PROJECTION as
-            // EMPTY_CORPUS. `conflicted` stays false: the recall pipeline
-            // tracks no conflict-blocking state (contradiction signals are
-            // per-score ranking penalties, never admission blocks), so no
-            // conflict is observed.
+            // I7.17 (#1940): derive the disposition only after the response
+            // has been bounded to the handles that can actually be delivered.
+            // Retrieval coverage is captured before that output bound; a
+            // caller-requested limit is not a claim that the corpus scan was
+            // incomplete. This L0 owner has no authoritative corpus-cardinality
+            // or conflict-blocking observation, so both remain unavailable and
+            // the typed derivation fails closed to INCOMPLETE_COVERAGE rather
+            // than manufacturing false observations.
             let coverage_complete = !response.truncation.truncated;
-            // Server-issued read-fence reference binding this recall to the
-            // exact project revision it read (cf. `packet_revision_fence`: a
-            // MemoryRevision serving as fence); opaque to the agent.
+            // Opaque read-fence token for the retained legacy facade. The
+            // canonical current State Fence remains an owner-supplied residual;
+            // this token is not presented as a new authority source.
             let state_fence = format!(
                 "recall-l0:{}:{}",
                 response.project_id,
                 response.at_revision.value()
             );
-            let verdict = eliot_types::ServerRecallVerdict::issue_for_l0_response(
-                &response,
-                &receipt_scope,
-                &state_fence,
-                false,
-                coverage_complete,
-                false,
-            )
-            .map_err(|error| anyhow::anyhow!("eliot_recall_l0 recall verdict: {error}"))?;
-            let limit = input
-                .limit
-                .unwrap_or(response.truncation.limit)
-                .clamp(1, 50);
-            if response.handles.len() > limit {
-                response.handles.truncate(limit);
-                response.truncation.truncated = true;
-            }
-            response.truncation.limit = limit;
-            response.truncation.returned = response.handles.len();
-            let returned = response
-                .handles
-                .iter()
-                .map(|handle| handle.handle.as_str())
-                .collect::<HashSet<_>>();
-            response
-                .rank_trace
-                .feature_scores
-                .retain(|score| returned.contains(score.handle.as_str()));
-            response.rank_trace.candidates_returned = response.handles.len();
-            response.rank_trace.no_useful_memory = response.handles.is_empty();
-            response.memory_confidence = eliot_types::MemoryConfidence::from_top_score(
-                response
-                    .rank_trace
-                    .feature_scores
-                    .iter()
-                    .map(|score| score.total)
-                    .max(),
-            );
-            // I7.17 (#1940): every live recall response carries the
-            // server-derived verdict beside the recall body: the closed
-            // disposition, the scope/revision/fence binding receipt, and the
-            // rank-trace handle resolving to exactly the delivered ranking.
-            let mut value = serde_json::to_value(response)?;
-            value["disposition"] = serde_json::to_value(verdict.disposition)?;
-            value["receipt"] = serde_json::to_value(&verdict.receipt)?;
-            value["rank_trace_handle"] = serde_json::to_value(&verdict.rank_trace_handle)?;
-            value
+            let response =
+                bound_recall_response_for_agent(response, requested_limit, expected_recall_handles);
+            let verdict =
+                eliot_types::ServerRecallVerdict::issue_for_l0_response_with_observations(
+                    &response,
+                    &receipt_scope,
+                    &state_fence,
+                    None,
+                    coverage_complete,
+                    None,
+                )
+                .map_err(|error| anyhow::anyhow!("eliot_recall_l0 recall verdict: {error}"))?;
+            // The bridge projection validates the server-issued verdict and
+            // supplies the default handles-first view. Its debug expansion is
+            // deliberately disabled for this legacy MCP facade.
+            project_l0_recall_for_mcp(&response, &verdict)?
         }
         "eliot_fetch_l2" => {
             let input: FetchL2ToolInput = serde_json::from_value(arguments)?;

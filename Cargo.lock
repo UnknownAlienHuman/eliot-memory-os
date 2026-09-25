@@ -816,6 +816,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "eliot-agent-bridge-core",
  "eliot-engine",
  "eliot-runtime-contracts",
  "eliot-store",

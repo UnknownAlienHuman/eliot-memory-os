@@ -1229,7 +1229,7 @@ pub(super) fn core_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_recall_l0",
             "Eliot Recall L0",
-            "Search the current multi-kind memory projection by keywords. Scope and lifecycle filtering happen before ranking; lifecycle_audit explicitly exposes audit-only records. Returns at most 12 compact handles plus inspectable integer rank features.",
+            "Search the current multi-kind memory projection by keywords. Scope and lifecycle filtering happen before ranking; lifecycle_audit explicitly exposes audit-only records. Returns bounded top handles, a server disposition and receipt, and rank_trace_handle; full ranking and suppression traces are debug-only.",
             &json_schema(
                 &[
                     ("project_id", "string"),

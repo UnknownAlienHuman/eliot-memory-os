@@ -18,6 +18,7 @@ test-support = ["eliot-windows-ipc/test-support"]
 anyhow.workspace = true
 blake3.workspace = true
 clap.workspace = true
+eliot-agent-bridge-core.workspace = true
 eliot-engine.workspace = true
 eliot-runtime-contracts.workspace = true
 eliot-store.workspace = true
