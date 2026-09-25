@@ -915,9 +915,7 @@ fn terminal_status_from(params: &Value) -> Option<ProviderTerminalStatus> {
         .and_then(|turn| turn.get("status"))
         .and_then(Value::as_str)
     {
-        Some("completed") | Some("success") | Some("done") => {
-            Some(ProviderTerminalStatus::CompletedObserved)
-        }
+        Some("completed" | "success" | "done") => Some(ProviderTerminalStatus::CompletedObserved),
         Some("failed") => Some(ProviderTerminalStatus::FailedObserved),
         _ => None,
     }

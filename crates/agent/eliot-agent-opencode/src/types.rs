@@ -4,14 +4,15 @@ use eliot_agent_api::{
     AdmittedRouteReceipt, AgentAttempt, AgentAttemptId, AssistantDeltaObservation, AttemptState,
     CONTRACT_VERSION, CancellationState, ClockReading, ContractError, ErrorObservation,
     EventCursor, EventId, ExecutionOutcome, HOST_EVENT_CONTRACT_VERSION,
-    HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition, HostEventNormalizationReceipt,
-    HostEventPrivacyClass, LowercaseSha256, NativeSession, NormalizationCoverage,
-    NormalizedHostEventEnvelope, NormalizedHostEventPayload, PhysicalRouteObservationReceipt,
-    ProviderExecutionBinding, ProviderObservationLineage, ProviderTerminalObservation,
-    ProviderTerminalStatus, QualifiedSourceDigest, RawSourceRecord, RestrictedRawSourceHandle,
-    RouteFingerprint, RouteObservationState, SessionLifecycleObservation,
-    SessionLifecycleTransition, UnsupportedDisposition, UnsupportedEventObservation,
-    UnsupportedEventReason, UsageReceipt, WarningObservation, route_divergence_fields,
+    HOST_EVENT_DIGEST_ALGORITHM, HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM,
+    HostEventDeliveryDisposition, HostEventNormalizationReceipt, HostEventPrivacyClass,
+    LowercaseSha256, NativeSession, NormalizationCoverage, NormalizedHostEventEnvelope,
+    NormalizedHostEventPayload, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
+    ProviderObservationLineage, ProviderTerminalObservation, ProviderTerminalStatus,
+    QualifiedSourceDigest, RawSourceRecord, RestrictedRawSourceHandle, RouteFingerprint,
+    RouteObservationState, SessionLifecycleObservation, SessionLifecycleTransition,
+    UnsupportedDisposition, UnsupportedEventObservation, UnsupportedEventReason, UsageReceipt,
+    WarningObservation, contains_restricted_source_token, route_divergence_fields,
 };
 use eliot_contracts::{ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeMap};
@@ -1420,6 +1421,64 @@ pub const OPENCODE_NORMALIZER_VERSION: &str = "eliot-agent-opencode/v1";
 /// provider bytes stay behind the restricted handle; only the qualified digest
 /// enters the envelope.
 pub const OPENCODE_MAX_RAW_SOURCE_BYTES: usize = 1024 * 1024;
+/// Omitted-manifest entry naming wire bytes that could not be decoded into an
+/// [`OpenCodeEvent`]. Undecodable bytes never mint the supplied event: they
+/// seal typed quarantine with the actual omission declared.
+pub const OPENCODE_UNDECODABLE_SOURCE_ENTRY: &str = "opencode.source_event";
+
+/// Effective `OpenCode` normalization source: the qualified digest plus the
+/// decoded wire event when the raw bytes decoded.
+enum BoundOpenCodeSource {
+    /// The raw bytes decoded to an event identical (canonically) to the
+    /// supplied event; the digest covers the decoded canonical bytes.
+    Decoded {
+        digest: QualifiedSourceDigest,
+        event: OpenCodeEvent,
+    },
+    /// The raw bytes did not decode; the digest covers the exact bytes under
+    /// the raw-bytes qualifier and the supplied event is replaced by typed
+    /// quarantine.
+    Undecodable(QualifiedSourceDigest),
+}
+
+/// Binds the `OpenCode` normalization source: the raw bytes must decode to the
+/// supplied wire event (canonical equality, so whitespace/key-order variants
+/// verify), or no receipt is issued. A supplied event paired with unrelated
+/// bytes fails here as mismatched input, never sealed. Undecodable bytes
+/// never mint the supplied event: they bind the exact bytes under the
+/// raw-bytes qualifier for the typed quarantine path.
+fn bind_opencode_source(
+    event: &OpenCodeEvent,
+    raw_source_bytes: &[u8],
+) -> Result<BoundOpenCodeSource, OpenCodeObservationConversionError> {
+    let qualified = |hex: String, algorithm: &str| {
+        serde_json::from_value(Value::String(hex))
+            .map(|digest| QualifiedSourceDigest {
+                algorithm: algorithm.to_owned(),
+                digest,
+            })
+            .map_err(|error| OpenCodeObservationConversionError::Serialization(error.to_string()))
+    };
+    let Ok(decoded) = serde_json::from_slice::<OpenCodeEvent>(raw_source_bytes) else {
+        return Ok(BoundOpenCodeSource::Undecodable(qualified(
+            sha256_hex(raw_source_bytes),
+            HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM,
+        )?));
+    };
+    let decoded_canonical = canonical_json_bytes(&decoded)
+        .map_err(|error| OpenCodeObservationConversionError::Serialization(error.to_string()))?;
+    let supplied_canonical = canonical_json_bytes(event)
+        .map_err(|error| OpenCodeObservationConversionError::Serialization(error.to_string()))?;
+    if decoded_canonical != supplied_canonical {
+        return Err(OpenCodeObservationConversionError::InvalidInput(
+            "raw_source_bytes/event",
+        ));
+    }
+    Ok(BoundOpenCodeSource::Decoded {
+        digest: qualified(sha256_hex(&decoded_canonical), HOST_EVENT_DIGEST_ALGORITHM)?,
+        event: decoded,
+    })
+}
 
 /// Typed OpenCode host-event normalization input (issue #371 T4 S7).
 ///
@@ -1473,12 +1532,16 @@ pub struct OpenCodeHostEventInput<'a> {
 ///
 /// The adapter identity/version (`eliot-agent-opencode` /
 /// [`OPENCODE_NORMALIZER_VERSION`]) is bound by this function, never supplied
-/// by the caller; the input source digest is computed from `raw_source_bytes`
-/// with [`HOST_EVENT_DIGEST_ALGORITHM`]; unknown `extra` fields are declared
-/// loss-visibly in `omitted_fields` (empty exactly when coverage is
-/// `Complete`); and the sealed envelope is validated before return
-/// (execution-unit lineage against the exact binding plus the #369 admission,
-/// session lineage on the session path).
+/// by the caller; the input source digest names the single decoded wire event
+/// (canonical SHA-256 over the decoded bytes, so whitespace/key-order
+/// variants verify), and the supplied event must equal the decoded bytes
+/// canonically before any receipt is issued; undecodable bytes bind the exact
+/// bytes under the raw-bytes qualifier and seal typed quarantine instead of
+/// the supplied event. Unknown `extra` fields are declared loss-visibly in
+/// `omitted_fields` (empty exactly when coverage is `Complete`); every public
+/// string is sanitized before sealing; and the sealed envelope is validated
+/// before return (execution-unit lineage against the exact binding plus the
+/// #369 admission, session lineage on the session path).
 ///
 /// Classification is fail-closed and authority-free: known session wire events
 /// under session lineage become [`NormalizedHostEventPayload::SessionLifecycle`];
@@ -1530,30 +1593,52 @@ pub fn normalize_opencode_event(
             }
         }
     }
-    let input_digest: LowercaseSha256 = serde_json::from_value(Value::String(sha256_hex(
-        input.raw_source_bytes,
-    )))
-    .map_err(|error| OpenCodeObservationConversionError::Serialization(error.to_string()))?;
+    // Source binding before classification (see [`bind_opencode_source`]):
+    // the raw bytes must decode to the supplied wire event, or no receipt is
+    // issued. Undecodable bytes replace the supplied event with typed
+    // quarantine below instead of minting it.
+    let bound_source = bind_opencode_source(input.event, input.raw_source_bytes)?;
+    let (source_event, input_digest) = match &bound_source {
+        BoundOpenCodeSource::Decoded { digest, event } => (event, digest.clone()),
+        BoundOpenCodeSource::Undecodable(digest) => (input.event, digest.clone()),
+    };
     let raw_record = RawSourceRecord {
         handle: input.raw_source_handle.clone(),
-        digest: QualifiedSourceDigest {
-            algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
-            digest: input_digest,
-        },
+        digest: input_digest,
     };
     raw_record
         .validate()
         .map_err(OpenCodeObservationConversionError::Contract)?;
-    let (payload, privacy_class, mut warnings) =
-        classify_opencode_event(input.event, &input.lineage);
+    let (payload, privacy_class, mut warnings) = match &bound_source {
+        BoundOpenCodeSource::Undecodable(_) => (
+            NormalizedHostEventPayload::UnsupportedQuarantined(UnsupportedEventObservation {
+                source_namespace: OPENCODE_NORMALIZER_IDENTITY.to_owned(),
+                source_version: None,
+                reason: UnsupportedEventReason::SourceDecodeFailure,
+                detail_ref: None,
+            }),
+            HostEventPrivacyClass::RestrictedHandleOnly,
+            Vec::new(),
+        ),
+        BoundOpenCodeSource::Decoded { .. } => {
+            classify_opencode_event(source_event, &input.lineage)
+        }
+    };
     // Loss visibility: every unknown wire field stays declared. `extra` keys
     // are never silently dropped; an empty manifest means complete coverage.
-    let mut omitted_source_fields: Vec<String> = input
-        .event
+    // Undecodable bytes additionally declare the withheld source event.
+    let mut omitted_source_fields: Vec<String> = source_event
         .extra
         .keys()
         .map(|key| format!("extra:{key}"))
         .collect();
+    if matches!(bound_source, BoundOpenCodeSource::Undecodable(_))
+        && !omitted_source_fields
+            .iter()
+            .any(|entry| entry == OPENCODE_UNDECODABLE_SOURCE_ENTRY)
+    {
+        omitted_source_fields.push(OPENCODE_UNDECODABLE_SOURCE_ENTRY.to_owned());
+    }
     omitted_source_fields.sort();
     omitted_source_fields.dedup();
     let coverage = if omitted_source_fields.is_empty() {
@@ -1570,11 +1655,25 @@ pub fn normalize_opencode_event(
         warnings.push("opencode.unknown-event-type-quarantined".to_owned());
     }
     let unsupported_disposition = match &payload {
+        NormalizedHostEventPayload::UnsupportedQuarantined(observation)
+            if observation.reason == UnsupportedEventReason::SourceDecodeFailure =>
+        {
+            UnsupportedDisposition::SourceDecodeFailure
+        }
         NormalizedHostEventPayload::UnsupportedQuarantined(_) => {
             UnsupportedDisposition::UnsupportedMethodQuarantined
         }
         _ => UnsupportedDisposition::None,
     };
+    // Public strings are sanitized before sealing: raw provider content stays
+    // behind the restricted handle (I7.23).
+    for text in payload.public_strings() {
+        if contains_restricted_source_token(text) {
+            return Err(OpenCodeObservationConversionError::InvalidInput(
+                "payload/restricted-content",
+            ));
+        }
+    }
     let receipt = HostEventNormalizationReceipt {
         normalizer_identity: OPENCODE_NORMALIZER_IDENTITY.to_owned(),
         normalizer_version: OPENCODE_NORMALIZER_VERSION.to_owned(),
