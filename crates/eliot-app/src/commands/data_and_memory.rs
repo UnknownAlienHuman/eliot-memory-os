@@ -32,27 +32,6 @@ pub async fn run_db_status(config_path: &Path) -> Result<()> {
     }))
 }
 
-pub async fn run_db_smoke(config_path: &Path) -> Result<()> {
-    let config = load_config(config_path)?;
-    let report = SurrealStore::new(config.db.surreal).smoke().await?;
-    let report_path = db_report_path(config_path);
-    if let Some(parent) = report_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&report_path, report.to_markdown())?;
-    write_json(&serde_json::json!({
-        "component": "surrealdb",
-        "status": if report.is_ready() { "ready" } else { "not_ready" },
-        "report_path": report_path,
-        "report": report
-    }))?;
-
-    if !report.is_ready() {
-        bail!("SurrealDB smoke write/read failed");
-    }
-    Ok(())
-}
-
 pub async fn run_db_migrate(config_path: &Path) -> Result<()> {
     let config = load_config(config_path)?;
     let _ = CanonicalStore::new(config.db.surreal.clone())

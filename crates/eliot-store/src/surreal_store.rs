@@ -1,8 +1,7 @@
 use crate::StoreError;
 use crate::surreal_server::SurrealServerSupervisor;
 use eliot_types::{HealthRecord, SurrealServerConfig};
-use serde_json::{Value, json};
-use uuid::Uuid;
+use serde_json::Value;
 
 #[path = "surreal_smoke_report.rs"]
 mod surreal_smoke_report;
@@ -60,51 +59,5 @@ impl SurrealStore {
             status: "applied".to_owned(),
             detail: migration_id.to_owned(),
         })
-    }
-
-    pub async fn smoke(&self) -> Result<SurrealSmokeReport, StoreError> {
-        let server = SurrealServerSupervisor::new(self.config.clone())
-            .start_or_connect()
-            .await?;
-        let server_started = server.started_pid().is_some();
-        let report_result = async {
-            let transport = server.transport()?;
-            let version_value = transport.version().await?;
-            let version = version_string(&version_value);
-
-            let return_raw = transport
-                .query("RETURN 1;", Value::Object(serde_json::Map::new()))
-                .await?;
-            ensure_query_ok("smoke.return", &return_raw)?;
-
-            let record_id = Uuid::new_v4().to_string();
-            let write_read_raw = transport
-                .query(
-                    "LET $id = type::record('eliot_smoke', $record_id); CREATE $id SET transport = 'rpc', created_at = time::now(); SELECT * FROM $id; DELETE $id;",
-                    json!({ "record_id": record_id }),
-                )
-                .await?;
-            ensure_query_ok("smoke.write_read_cleanup", &write_read_raw)?;
-            let write_read_ok = write_read_raw.to_string().contains("rpc");
-
-            Ok::<SurrealSmokeReport, StoreError>(SurrealSmokeReport {
-                server_started,
-                version,
-                checks: SurrealSmokeChecks {
-                    return_query: SmokeCheckStatus::Pass,
-                    write_read: if write_read_ok {
-                        SmokeCheckStatus::Pass
-                    } else {
-                        SmokeCheckStatus::Fail
-                    },
-                    cleanup: SmokeCheckStatus::Pass,
-                },
-            })
-        }
-        .await;
-        let shutdown_result = server.shutdown_if_spawned().await;
-        let report = report_result?;
-        shutdown_result?;
-        Ok(report)
     }
 }
