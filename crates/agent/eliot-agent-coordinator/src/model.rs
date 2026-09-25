@@ -524,16 +524,100 @@ pub struct ProviderExecutionBindingSubmission {
     pub provider_start_receipt_ref: String,
 }
 
+/// Candidate-only result receipt (issue #370 S5). The ceiling is fixed at
+/// construction and on the wire: fields are private so a returned receipt
+/// cannot be mutated into a stronger proof, and deserialization rejects any
+/// ceiling other than `CANDIDATE_ARTIFACT`. No amount of artifacts, evidence
+/// refs, or rationale can raise this receipt above candidate proof.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateResultReceipt {
-    pub submission_id: SubmissionId,
-    pub attempt_id: AttemptId,
-    pub provider_disposition: ResultDisposition,
-    pub proof_ceiling: ProofCeiling,
-    pub actual_route: PhysicalRouteObservationReceipt,
-    pub evidence_refs: Vec<String>,
-    pub proposed_effect_count: usize,
+    submission_id: SubmissionId,
+    attempt_id: AttemptId,
+    provider_disposition: ResultDisposition,
+    #[serde(deserialize_with = "deserialize_candidate_artifact_ceiling")]
+    proof_ceiling: ProofCeiling,
+    actual_route: PhysicalRouteObservationReceipt,
+    evidence_refs: Vec<String>,
+    proposed_effect_count: usize,
+}
+
+/// Rejects any candidate-receipt wire whose ceiling is not exactly
+/// `CANDIDATE_ARTIFACT` (issue #370 W4/A5). Stronger ceilings
+/// (`SCOPED_VERIFICATION`, `OBSERVED_EXTERNAL_EFFECT`) fail closed here
+/// instead of deserializing into a receipt that claims them.
+fn deserialize_candidate_artifact_ceiling<'de, D>(deserializer: D) -> Result<ProofCeiling, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let ceiling = ProofCeiling::deserialize(deserializer)?;
+    if ceiling != ProofCeiling::CandidateArtifact {
+        return Err(serde::de::Error::custom(
+            "candidate result receipt proof ceiling must be CANDIDATE_ARTIFACT",
+        ));
+    }
+    Ok(ceiling)
+}
+
+impl CandidateResultReceipt {
+    /// Builds the sole production receipt shape: the ceiling is always
+    /// [`ProofCeiling::CandidateArtifact`], independent of disposition,
+    /// evidence volume, or rationale. There is no constructor that accepts
+    /// a ceiling.
+    #[must_use]
+    pub fn new(
+        submission_id: SubmissionId,
+        attempt_id: AttemptId,
+        provider_disposition: ResultDisposition,
+        actual_route: PhysicalRouteObservationReceipt,
+        evidence_refs: Vec<String>,
+        proposed_effect_count: usize,
+    ) -> Self {
+        Self {
+            submission_id,
+            attempt_id,
+            provider_disposition,
+            proof_ceiling: ProofCeiling::CandidateArtifact,
+            actual_route,
+            evidence_refs,
+            proposed_effect_count,
+        }
+    }
+
+    #[must_use]
+    pub fn submission_id(&self) -> &SubmissionId {
+        &self.submission_id
+    }
+
+    #[must_use]
+    pub fn attempt_id(&self) -> &AttemptId {
+        &self.attempt_id
+    }
+
+    #[must_use]
+    pub const fn provider_disposition(&self) -> ResultDisposition {
+        self.provider_disposition
+    }
+
+    #[must_use]
+    pub const fn proof_ceiling(&self) -> ProofCeiling {
+        self.proof_ceiling
+    }
+
+    #[must_use]
+    pub fn actual_route(&self) -> &PhysicalRouteObservationReceipt {
+        &self.actual_route
+    }
+
+    #[must_use]
+    pub fn evidence_refs(&self) -> &[String] {
+        &self.evidence_refs
+    }
+
+    #[must_use]
+    pub const fn proposed_effect_count(&self) -> usize {
+        self.proposed_effect_count
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -786,8 +870,25 @@ pub enum CoordinatorError {
     StaleCapacity,
     #[error("persisted provider binding does not match current live provider evidence")]
     StaleProviderBinding,
+    #[error("no stored provider execution binding admits this attempt result")]
+    MissingExecutionBinding,
+    #[error("legacy result wire is rejected without migration: {0:?}")]
+    LegacyResultWire(LegacyResultWireKind),
     #[error("serialization failed: {0}")]
     Serialization(String),
+}
+
+/// Classifies a persisted or presented result wire that predates the
+/// candidate-only contract (issue #370 W24). A legacy wire is rejected with
+/// this typed kind at the snapshot ingress; it is never silently migrated
+/// into candidate success and never flattened into a generic serialization
+/// string.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyResultWireKind {
+    /// A `VERIFIED_COMPLETE` (or completion-alias) disposition literal.
+    VerifiedCompleteDisposition,
+    /// A provider-supplied authoritative `effect_receipts` field.
+    ProviderEffectReceipts,
 }
 
 pub(crate) fn validate_text(value: &str, field: &'static str) -> Result<(), CoordinatorError> {
