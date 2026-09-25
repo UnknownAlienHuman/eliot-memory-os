@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 mod backup_restore;
+mod backup_snapshot;
 mod json_codec;
 #[cfg(all(test, windows))]
 mod payload_tests;
@@ -40,6 +41,19 @@ pub(crate) use backup_restore::{
     RESTORE_SCHEMA_PURGE, RESTORE_SCHEMA_RECORD, fixed_restore_statement,
     is_restore_destination_absent, is_restore_duplicate, is_restore_fence_race, restore_capability,
     validate_restore_operation,
+};
+/// Fixed coherent-snapshot operation registration (issue #951).
+///
+/// The closed snapshot vocabulary lives in [`backup_snapshot`]; the three point
+/// labels live with the capture logic in [`crate::backup_snapshot`]. Snapshot
+/// operations are pure reads, so they are pool reads. This re-export is the
+/// sole registration point: every fixed snapshot statement is an adapter-owned
+/// `&'static str` composed from the single-owner consts in [`crate::schema`]
+/// and [`crate::backup_snapshot`], carries no caller bindings, and caller text
+/// can never become a statement, table, connection, or credential override.
+pub(crate) use backup_snapshot::{
+    SNAPSHOT_MEMBERS_OPERATION, fixed_snapshot_statement, snapshot_capability,
+    validate_snapshot_operation,
 };
 pub(crate) use provider_owner::ProviderOwner;
 use session::RpcSession;
@@ -381,6 +395,7 @@ const POOL_READ_OPERATIONS: &[&str] = &[
     "recovery.snapshot",
     crate::backup_snapshot::SNAPSHOT_BEGIN_OPERATION,
     crate::backup_snapshot::SNAPSHOT_END_OPERATION,
+    SNAPSHOT_MEMBERS_OPERATION,
     crate::backup_snapshot::SNAPSHOT_PAGE_OPERATION,
 ];
 
@@ -651,6 +666,7 @@ mod tests {
                 "recovery.snapshot",
                 "snapshot.begin",
                 "snapshot.end",
+                "snapshot.members",
                 "snapshot.page",
             ]
         );
@@ -683,6 +699,8 @@ mod tests {
             "READ.schema_generation",
             "recovery.anything_new",
             "recovery.snapshot_extra",
+            "snapshot.begin_v2",
+            "snapshot.member",
         ] {
             assert!(
                 !is_pool_read_operation(refused),
