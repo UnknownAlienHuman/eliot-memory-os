@@ -1626,7 +1626,7 @@ fn codex_result_disposition(input: &CodexResultInput) -> (ResultDisposition, Opt
 /// evidence without fabricating wall time.
 fn codex_execution_outcome(
     input: &CodexResultInput,
-    unknown_reason: &Option<String>,
+    unknown_reason: Option<&String>,
 ) -> (ExecutionOutcome, Option<CancellationState>, Option<String>) {
     if input.cancelled {
         (
@@ -1647,7 +1647,7 @@ fn codex_execution_outcome(
             None,
             Some(
                 unknown_reason
-                    .clone()
+                    .cloned()
                     .unwrap_or_else(|| "terminal observation absent".to_owned()),
             ),
         )
@@ -1750,7 +1750,7 @@ pub fn translate_result(
     // all other outcomes stay UNKNOWN_OUTCOME with a quarantine recovery
     // handle, preserving evidence without fabricating wall time.
     let (execution_outcome, cancellation, recovery_ref) =
-        codex_execution_outcome(&input, &unknown_reason);
+        codex_execution_outcome(&input, unknown_reason.as_ref());
     let actual_route = codex_observation_receipt(
         &input,
         binding,

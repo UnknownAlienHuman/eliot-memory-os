@@ -755,6 +755,14 @@ pub struct OpenCodeWireRouteReceipt {
 /// `tests/` integration suite). New code uses [`OpenCodeWireRouteReceipt`].
 pub type ActualRouteReceipt = OpenCodeWireRouteReceipt;
 
+/// Factored return shape for the observed-side classification below.
+type ObservedSideClassification = (
+    Option<RouteFingerprint>,
+    RouteObservationState,
+    Vec<String>,
+    Option<String>,
+);
+
 impl<'de> Deserialize<'de> for OpenCodeWireRouteReceipt {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -939,6 +947,7 @@ impl OpenCodeWireRouteReceipt {
     /// - Session/route agreement and admission/binding linkage are enforced
     ///   via [`PhysicalRouteObservationReceipt::validate_against`]; a forged
     ///   binding or mismatched admission rejects.
+    ///
     /// Builds the observed side of the canonical observation from the
     /// wire state: `Unavailable` yields no observed fingerprint with an
     /// explicit reason, `Observed` rebuilds the fingerprint from the
@@ -948,15 +957,7 @@ impl OpenCodeWireRouteReceipt {
     fn observed_side(
         &self,
         requested: &RouteFingerprint,
-    ) -> Result<
-        (
-            Option<RouteFingerprint>,
-            RouteObservationState,
-            Vec<String>,
-            Option<String>,
-        ),
-        OpenCodeObservationConversionError,
-    > {
+    ) -> Result<ObservedSideClassification, OpenCodeObservationConversionError> {
         match self.state {
             OpenCodeWireRouteState::Unavailable => {
                 let reason = self
