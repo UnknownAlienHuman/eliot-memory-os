@@ -282,7 +282,9 @@ def _run_cmd(runner: Any, root: Path, argv: Sequence[str], timeout: int | None =
     if runner is not None:
         try:
             return runner(root, argv, timeout=timeout)
-        except TypeError:
+        except TypeError as exc:
+            if "unexpected keyword argument 'timeout'" not in str(exc):
+                raise
             return runner(root, argv)
     return _run_fixed(root, argv, timeout=timeout)
 
@@ -475,8 +477,12 @@ def _decode_reason(raw: str) -> str | None:
     return None
 
 
+_STRING_SPAN: Final = re.compile(r'(?:b|c)?r(#{0,16})".*?"\1|(?:b|c)?"(?:\\.|[^"\\])*"', re.DOTALL)
+
+
 def _attribute_flags(raw: str) -> tuple[bool, bool, bool, str | None, str | None]:
-    compact = re.sub(r"\s+", "", raw)
+    code = _STRING_SPAN.sub('""', raw)
+    compact = re.sub(r"\s+", "", code)
     disabled = any(marker in compact for marker in ("disabled_test", "eliot_disabled_test", "test_disabled"))
     is_test = bool(re.search(r"(?:^|[:\[,])(?:test|tokio::test|async_std::test)(?:$|[\],(])", compact)) or disabled
     direct_ignore = bool(re.search(r"(?:^|[:\[,])ignore(?:=|$|[\],(])", compact))
@@ -498,24 +504,61 @@ def _file_module_prefix(target: PackageTarget, path: Path) -> tuple[str, ...]:
     parts = list(relative.with_suffix("").parts)
     if parts and parts[-1] == "mod":
         parts.pop()
+    if src.name not in {"mod.rs", "main.rs", "lib.rs"} and parts and parts[0] == src.stem:
+        parts.pop(0)
     return tuple(part for part in parts if part not in {"lib", "main"})
 
 
-def _candidate_source_files(root: Path, target: PackageTarget) -> list[Path]:
-    files: set[Path] = {target.src_path}
-    manifest = target.manifest_dir
-    for directory in (manifest / "src", manifest / "tests", manifest / "benches", manifest / "examples"):
+_SRC_ROOTED_KINDS: Final = frozenset({"lib", "rlib", "dylib", "cdylib", "staticlib", "bin", "proc-macro"})
+_FILE_ROOTED_KINDS: Final = frozenset({"test", "bench", "example", "custom-build"})
+
+
+def _candidate_source_files(
+    root: Path, target: PackageTarget, exclude: frozenset[Path] = frozenset()
+) -> list[Path]:
+    files: set[Path] = set()
+
+    def admit(path: Path) -> None:
+        resolved = _repo_path(root, path)
+        if resolved in exclude:
+            return
+        files.add(resolved)
+        if len(files) > BOUNDS.max_source_files:
+            raise InventoryError("SOURCE_FILE_LIMIT", "source file denominator exceeds configured bound")
+
+    def admit_tree(directory: Path) -> None:
         if not directory.exists():
-            continue
-        for path in directory.rglob("*.rs"):
-            files.add(_repo_path(root, path))
-            if len(files) > BOUNDS.max_source_files:
-                raise InventoryError("SOURCE_FILE_LIMIT", "source file denominator exceeds configured bound")
+            return
+        for path in sorted(directory.rglob("*.rs")):
+            admit(path)
+
+    admit(target.src_path)
+    kinds = set(target.target_kind.split("+"))
+    if kinds & _SRC_ROOTED_KINDS:
+        admit_tree(target.manifest_dir / "src")
+    elif kinds & _FILE_ROOTED_KINDS:
+        if target.src_path.name in ("main.rs", "mod.rs"):
+            admit_tree(target.src_path.parent)
+        else:
+            admit_tree(target.src_path.parent / target.src_path.stem)
     return sorted(files)
 
 
 def _scan_file(root: Path, target: PackageTarget, path: Path) -> list[SourceTest]:
-    data = _bounded_read(path)
+    try:
+        resolved_root = root.resolve(strict=True)
+        candidate = path if path.is_absolute() else root / path
+        admitted = candidate.resolve(strict=False)
+        admitted.relative_to(resolved_root)
+    except (OSError, ValueError) as exc:
+        raise InventoryError("PATH_ESCAPE", f"path is outside repository root: {path}") from exc
+    if not admitted.is_file():
+        raise InventoryError("SOURCE_NOT_FOUND", f"Rust source is not a readable file: {path}")
+    try:
+        data = _bounded_read(admitted)
+    except OSError as exc:
+        raise InventoryError("SOURCE_READ_FAILED", f"cannot read Rust source: {path}") from exc
+    path = admitted
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -614,23 +657,54 @@ def _scan_file(root: Path, target: PackageTarget, path: Path) -> list[SourceTest
     return results
 
 
-def _requirements(text: str) -> tuple[str, ...]:
-    value = text.casefold()
-    result: set[Requirement] = set()
-    if any(token in value for token in ("surreal", "store", "database", "schema migration", "authenticated db")):
-        result.add(Requirement.STORE)
-    if any(token in value for token in (
+def _phrase_pattern(phrase: str) -> str:
+    words = phrase.split(" ")
+    if len(words) == 1:
+        return r"\b" + re.escape(phrase) + r"\b"
+    return r"\b" + r"\s+".join(re.escape(word) for word in words) + r"\b"
+
+
+_STORE_PATTERNS: Final = tuple(
+    _phrase_pattern(item)
+    for item in ("surreal", "store", "database", "schema migration", "authenticated db")
+) + (r"\bsurreal\w+",)
+_RUNTIME_PATTERNS: Final = tuple(
+    _phrase_pattern(item)
+    for item in (
         "kernel", "governor", "host", "watchdog", "agent bridge",
         "named pipe", "windows pipe", "pipe", "acl", "session",
         "installation", "configuration", "config", "eliot_governor_config", "windows runtime",
-    )):
+    )
+)
+_GIT_PATTERNS: Final = tuple(
+    _phrase_pattern(item) for item in ("git", "repository", "worktree", "commit identity")
+)
+_EXTERNAL_PATTERNS: Final = (
+    _phrase_pattern("personal credential"),
+    _phrase_pattern("external credential"),
+    _phrase_pattern("credential"),
+    _phrase_pattern("paid"),
+    _phrase_pattern("api key"),
+    _phrase_pattern("oauth"),
+    r"\bmanual-only\b",
+    _phrase_pattern("manual only"),
+)
+_STORE_MATCHER: Final = re.compile("|".join(_STORE_PATTERNS))
+_RUNTIME_MATCHER: Final = re.compile("|".join(_RUNTIME_PATTERNS))
+_GIT_MATCHER: Final = re.compile("|".join(_GIT_PATTERNS))
+_EXTERNAL_MATCHER: Final = re.compile("|".join(_EXTERNAL_PATTERNS))
+
+
+def _requirements(text: str) -> tuple[str, ...]:
+    value = text.casefold()
+    result: set[Requirement] = set()
+    if _STORE_MATCHER.search(value):
+        result.add(Requirement.STORE)
+    if _RUNTIME_MATCHER.search(value):
         result.add(Requirement.RUNTIME)
-    if any(token in value for token in ("git", "repository", "worktree", "commit identity")):
+    if _GIT_MATCHER.search(value):
         result.add(Requirement.GIT)
-    if any(token in value for token in (
-        "personal credential", "external credential", "credential",
-        "paid", "api key", "oauth", "manual-only", "manual only",
-    )):
+    if _EXTERNAL_MATCHER.search(value):
         result.add(Requirement.EXTERNAL_CREDENTIALED_MANUAL_ONLY)
     if not result:
         result.add(Requirement.UNKNOWN)
@@ -639,11 +713,15 @@ def _requirements(text: str) -> tuple[str, ...]:
 
 def discover_source(root: Path, targets: Sequence[PackageTarget]) -> list[SourceTest]:
     result: list[SourceTest] = []
-    seen_files: set[tuple[str, Path]] = set()
+    seen_files: set[tuple[str, str, str, Path]] = set()
     total_bytes = 0
+    roots_by_package: dict[str, set[Path]] = {}
     for target in targets:
-        for path in _candidate_source_files(root, target):
-            key = (target.package_id, path)
+        roots_by_package.setdefault(target.package_id, set()).add(target.src_path)
+    for target in targets:
+        exclude = frozenset(roots_by_package.get(target.package_id, set()) - {target.src_path})
+        for path in _candidate_source_files(root, target, exclude=exclude):
+            key = (target.package_id, target.target_kind, target.target_name, path)
             if key in seen_files:
                 continue
             seen_files.add(key)
@@ -722,6 +800,8 @@ def discover_compiled(root: Path, targets: Sequence[PackageTarget], runner: Any 
             root,
             (str(artifact.executable), "--list", "--ignored", "--format", "terse"),
         )
+        if listing.stdout and not listing.stdout.endswith(b"\n"):
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", f"truncated test listing: {artifact.executable}")
         try:
             text = listing.stdout.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -834,7 +914,7 @@ def build_inventory(root: Path, runner: Any = None) -> dict[str, Any]:
         "row_count": len(rows),
         "counts_by_state": dict(sorted(counts.items())),
         "proof_ceiling": "IGNORED_TEST_IDENTITY_AND_ENVIRONMENT_CLASSIFICATION_ONLY",
-        "complete": bool(rows) and all(row.state == RowState.CLASSIFIED.value for row in rows),
+        "complete": all(row.state == RowState.CLASSIFIED.value for row in rows),
     }
     aggregate_input = {"header": header, "rows": denominator}
     header["aggregate_sha256"] = _sha256(_canonical_bytes(aggregate_input))
@@ -962,6 +1042,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     try:
         root = args.repo_root.resolve(strict=True)
+    except OSError:
+        print(
+            json.dumps(
+                {"status": "error", "code": "INVALID_REPOSITORY_ROOT", "detail": "repository root is not accessible"},
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+    try:
         output = _safe_output(root, args.output, overwrite=args.overwrite)
         inventory = build_inventory(root)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -975,6 +1065,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         if hasattr(exc, "owner") and exc.owner:
             payload["owner"] = exc.owner
         print(json.dumps(payload, sort_keys=True), file=sys.stderr)
+        return 2
+    except OSError:
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "code": "OUTPUT_WRITE_FAILED",
+                    "detail": "failed to write inventory output",
+                    "owner": "build-test-graph-owner",
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
         return 2
     print(
         json.dumps(
