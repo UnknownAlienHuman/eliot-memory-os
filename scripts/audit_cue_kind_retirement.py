@@ -766,13 +766,64 @@ def allow_deprecated_files() -> list[str]:
     ]
 
 
-def permissive_lines(relative: str) -> list[str]:
-    needles = ("untagged", "alias", "Other", "Unknown", "_ =>", "impl Default")
+def permissive_lines_in(region: str) -> list[str]:
+    """Permissive escape hatches inside one already-scoped enum region.
+
+    Region-scoped on purpose. The previous whole-file form reported
+    `crates/smart/eliot-cue-contracts/src/normalization.rs:370` - a wildcard arm
+    of a `match` on a `NormalizationOutcome` tuple that returns a typed error,
+    in a file whose `CueKind` enum body contains no escape at all. A
+    file-granularity needle list cannot tell an enum escape from unrelated
+    control flow, and `enum_region_text` already exists precisely to draw that
+    line: "only the enum body counts for permissive-escape detection, never
+    attributes above it or unrelated code below it". A gate built on the
+    unscoped form would have been a false red on a clean tree, which is how a
+    gate gets ignored and then deleted.
+    """
     return [
         line.strip()
-        for line in strip_rust(read_text(relative)).splitlines()
-        if any(needle in line for needle in needles)
+        for line in region.splitlines()
+        if any(needle in line for needle in PERMISSIVE_NEEDLES)
     ]
+
+
+def permissive_enum_escapes() -> list[str]:
+    """Every permissive escape inside either declared kind enum's own body."""
+    escapes: list[str] = []
+    for label, relative, declaration, end_marker in (
+        ("V1", LEGACY_OWNER_FILE, LEGACY_OWNER_DECLARATION, LEGACY_OWNER_END),
+        ("A-10", CURRENT_OWNER_FILE, CURRENT_OWNER_DECLARATION, CURRENT_OWNER_END),
+    ):
+        try:
+            region = enum_region_text(relative, declaration, end_marker)
+        except ValueError:
+            escapes.append(f"{label}: enum region not resolvable in {relative}")
+            continue
+        escapes.extend(f"{label}:{line}" for line in permissive_lines_in(region))
+    return escapes
+
+
+def deprecated_suppression_violations() -> list[str]:
+    """`#[allow(deprecated)]` sites that actually suppress a current-kind use.
+
+    `allow_deprecated_files()` is a candidate finder and is expected to be
+    non-empty: `crates/agent/eliot-agent-acp/src/lib.rs` carries two
+    `#[allow(deprecated)]` attributes, both on `#[test]` functions and neither
+    anywhere near `CueKind`. Treating a non-empty candidate list as a finding
+    would be a false red, so the oracle applies the same adjudication the
+    contract case applies - a window around the attribute must mention the
+    current kind. The candidate finder stays a finder; this is the gate.
+    """
+    violations: list[str] = []
+    for relative in allow_deprecated_files():
+        lines = read_text(relative).splitlines()
+        for index, line in enumerate(lines):
+            if "allow(deprecated" not in line:
+                continue
+            window = "\n".join(lines[max(0, index - 15) : index + 15])
+            if re.search(TOKEN, window):
+                violations.append(f"{relative}:{index + 1}")
+    return violations
 
 
 def enum_region_text(relative: str, declaration: str, end_marker: str) -> str:
@@ -1184,6 +1235,35 @@ def denominator_status() -> ScanVerdict:
 CURRENT_OWNER_NAME = "CueKind"
 CURRENT_OWNER_FILE = "crates/smart/eliot-cue-contracts/src/normalization.rs"
 
+# The retained explicit V1 legacy owner, and the region boundaries used to read
+# each declared kind enum's own body. The A-10 end marker is the enum's closing
+# brace at column 0, which is what keeps attributes above the declaration and
+# unrelated code below it out of the permissive-escape scan.
+LEGACY_OWNER_FILE = "crates/eliot-types/src/ul/cue.rs"
+LEGACY_OWNER_DECLARATION = "pub enum LegacyCueKindV1"
+LEGACY_OWNER_END = "impl LegacyCueKindV1"
+CURRENT_OWNER_DECLARATION = "pub enum CueKind"
+CURRENT_OWNER_END = "\n}\n"
+
+# Escape hatches that would make a closed kind vocabulary open. Shared by the
+# oracle and the contract case so the two cannot drift apart.
+PERMISSIVE_NEEDLES = ("untagged", "alias", "Other", "Unknown", "_ =>", "impl Default")
+
+# Two live owners are legitimate and named, so the gate is a drift check against
+# these exact sets rather than an emptiness check. Emptiness would be wrong in
+# both directions: it would pass a second, illegitimate `pub use` of the bare
+# current kind, and it would fail on the A-13 facade re-export that the issue
+# requires to survive.
+ALLOWED_CURRENT_REEXPORTS = (
+    (
+        "crates/smart/eliot-cues/src/lib.rs",
+        "pub use eliot_cue_contracts::{CueKind, MatchMode};",
+    ),
+)
+# Exactly one live owner branches on historical V1 spelling literals: the named
+# #833 decoder, whose arms construct the A-10 owner.
+ALLOWED_STRING_SWITCH_OWNERS = ("crates/smart/eliot-cues/src/legacy_adapter.rs",)
+
 
 def current_owner_site_violations() -> list[str]:
     """Every current-kind occurrence that is not the single allowed declaration.
@@ -1238,6 +1318,30 @@ def main() -> int:
         findings.append(f"legacy-alias-present: {type_alias_hits()}")
     if eliot_types_consumer_files():
         findings.append(f"eliot-types-consumers: {eliot_types_consumer_files()}")
+    # The four detectors below were implemented and never called: each had
+    # exactly one reference in this file, its own `def`. An implemented check
+    # that nothing invokes is not a weaker check, it is no check, so they are
+    # wired here where a real run can reach them. Two of them are drift checks
+    # against a named legitimate owner rather than emptiness checks, and two
+    # needed their scan narrowed before wiring, because wiring them as written
+    # would have produced a false red on a clean tree and taught everyone to
+    # ignore this script.
+    if list(reexport_lines()) != list(ALLOWED_CURRENT_REEXPORTS):
+        findings.append(
+            f"current-kind-reexport-drift: expected {list(ALLOWED_CURRENT_REEXPORTS)}, "
+            f"found {reexport_lines()}"
+        )
+    if tuple(string_switch_owner_files()) != ALLOWED_STRING_SWITCH_OWNERS:
+        findings.append(
+            f"string-switch-owner-drift: expected {list(ALLOWED_STRING_SWITCH_OWNERS)}, "
+            f"found {string_switch_owner_files()}"
+        )
+    if deprecated_suppression_violations():
+        findings.append(
+            f"current-kind-deprecation-suppression: {deprecated_suppression_violations()}"
+        )
+    if permissive_enum_escapes():
+        findings.append(f"permissive-enum-escape: {permissive_enum_escapes()}")
     verdict = denominator_status()
     # Pass-with-pending (accepted residual): the include-macro incomplete set
     # below is the explicitly admitted boundary. Anything else — a second
