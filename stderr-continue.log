@@ -1,0 +1,679 @@
+[0m
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead . 
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead prompt-continue-1678.txt 
+[0m$ [0mgit status --short --branch; echo ---; git rev-parse HEAD; echo ---; git log --oneline -15; echo ---; git branch --show-current
+## work/slice-1678-1679...origin/main [ahead 3]
+?? prompt-continue-1678.txt
+?? stderr-continue.log
+?? stdout-continue.log
+---
+d1896eb8de5ce296a094f12185f18b895d172a55
+---
+d1896eb8 Merge remote-tracking branch 'origin/main' into work/slice-1678-1679
+f0abfe13 fix: update stale architecture doc paths in contracts and assignments (#2024)
+716755b1 [store/sconc] Bounded in-transaction allocation with contention retry (slice #989) (#2023)
+1479ae85 [kernel/store] Bind Kernel writes to durable ORS reservation (slice #992) (#2022)
+eaf77281 [store/sconc] Carry reserved-write contract through authenticated path (slice #991) (#2021)
+3e1b3dcd [retrieval] Delivery trace-handle binding with exact counts (slice #1949) (#2019)
+da0ab172 [kernel] Versioned capacity-evidence schemas with explicit unknown (slice #1848) (#2020)
+3cc6e663 [store/sconc] Store-neutral write-reservation projection (slice #990) (#2018)
+99407aa6 [agent/swarm] Connect swarm coordination to durable jobs and provider execution (#1127)
+e358cf08 [governor] Canonical attach-once for swarm plan binding (+durable CAS contract, #1126) (#2016)
+aea1f39c [kernel] Doctor launch requires live activation receipt (slice of #1678)
+d82d4fe6 [contracts] I14.4/I14.5 backpressure + commit-status vocab (slice of #1679)
+f74c20e5 [contracts] Dreamer slices #584 (1-12/63) + #610 (1-5/42) (#2015)
+5a5036b5 [store/sconc] Bounded session pool + pure scheduler (slices #987/#988) (#2014)
+e5227403 [store/surreal] Preserve record free text across RPC boundary (slice A of #10) (#2013)
+---
+work/slice-1678-1679
+> build · muse-spark-1.3-contributor
+[0m$ [0mgit log --oneline origin/main..HEAD; echo ===DIFFSTAT===; git diff --stat origin/main...HEAD; echo ===STATUS===; git show --stat HEAD; echo ===COMMITS===; git show --stat aea1f39c; echo ---; git show --stat d82d4fe6
+d1896eb8 Merge remote-tracking branch 'origin/main' into work/slice-1678-1679
+aea1f39c [kernel] Doctor launch requires live activation receipt (slice of #1678)
+d82d4fe6 [contracts] I14.4/I14.5 backpressure + commit-status vocab (slice of #1679)
+===DIFFSTAT===
+ bins/eliot-kernel/src/dispatch_launch.rs           | 149 +++++++++++++++++++++
+ .../foundation/eliot-runtime-contracts/src/lib.rs  | 148 ++++++++++++++++++++
+ 2 files changed, 297 insertions(+)
+===STATUS===
+commit d1896eb8de5ce296a094f12185f18b895d172a55
+Merge: aea1f39c f0abfe13
+Author: d01-temp <d01-temp@example.invalid>
+Date:   Fri Sep 18 20:36:32 2026 -0400
+
+    Merge remote-tracking branch 'origin/main' into work/slice-1678-1679
+
+ Cargo.lock                                         |    1 +
+ bins/eliot-store-surreal/src/lib.rs                |   55 +-
+ bins/eliot-store-surreal/src/request_dispatch.rs   |   16 +
+ .../reserved-write/reserved-write-request.json     |  143 +
+ .../tests/reserved_write_dispatch.rs               |  631 ++++
+ crates/agent/eliot-swarm/Cargo.toml                |    1 +
+ .../eliot-swarm/durable-runtime.contract.toml      |  114 +
+ crates/agent/eliot-swarm/src/durable_dispatch.rs   |  940 ++++++
+ crates/agent/eliot-swarm/src/lib.rs                |   15 +
+ crates/eliot-app/src/mcp_stdio/task_handlers.rs    |    3 +-
+ crates/eliot-engine/src/context.rs                 |    3 +-
+ crates/eliot-engine/src/semantic_memory.rs         |   85 +-
+ crates/eliot-engine/tests/semantic_memory.rs       |  106 +-
+ crates/eliot-types/src/semantic_memory.rs          |   77 +
+ crates/governor/eliot-coordination/src/lib.rs      |    8 +
+ .../src/swarm_plan_attachment.rs                   |  952 ++++++
+ .../eliot-kernel-service/src/capacity_evidence.rs  | 1048 ++++++
+ crates/kernel/eliot-kernel-service/src/lib.rs      |   17 +
+ .../eliot-kernel-service/src/store_client.rs       |  126 +-
+ .../eliot-kernel-service/src/store_exchange.rs     |    9 +-
+ .../eliot-kernel-service/src/store_gateway.rs      |  365 +-
+ .../src/store_receipt_gateway.rs                   |   69 +-
+ .../src/store_write_reservation.rs                 | 1113 ++++++
+ .../src/store_write_reservation_tests.rs           | 3529 ++++++++++++++++++++
+ .../tests/data/reserved-write/receipt.json         |  188 ++
+ .../tests/data/reserved-write/request.json         |  143 +
+ .../tests/data/store_write_reservation.json        |   50 +
+ .../tests/reserved_write_client.rs                 |  819 +++++
+ .../eliot-erasure/runtime-closure.contract.toml    |    4 +-
+ crates/storage/eliot-store-api/src/lib.rs          |   70 +-
+ crates/storage/eliot-store-api/src/wire.rs         |  105 +-
+ .../storage/eliot-store-api/src/write_admission.rs |  752 +++++
+ .../tests/data/reserved-write/legacy-apply.json    |  106 +
+ .../reserved-write/reserved-write-request.json     |  143 +
+ .../tests/data/write_admission.json                |  143 +
+ .../eliot-store-api/tests/reserved_write_wire.rs   |  551 +++
+ .../eliot-store-api/tests/write_admission.rs       | 1205 +++++++
+ .../eliot-store-surreal-adapter/src/apply.rs       | 1023 +++++-
+ .../src/apply/atomic_write.rs                      |  553 ++-
+ .../eliot-store-surreal-adapter/src/error.rs       |   62 +-
+ .../storage/eliot-store-surreal-adapter/src/lib.rs |   50 +
+ .../eliot-store-surreal-adapter/src/plan.rs        |  221 +-
+ .../tests/concurrent_transaction_allocation.rs     | 1460 ++++++++
+ .../data/concurrent_transaction_allocation.json    |   51 +
+ .../assignments/024-research-provider-runtime.toml |    4 +-
+ .../assignments/595-prehandler-validation.toml     |    2 +-
+ .../assignments/011-installed-product-pulse.toml   |    4 +-
+ 47 files changed, 16964 insertions(+), 171 deletions(-)
+===COMMITS===
+commit aea1f39c847867c0e5348f29f3cbe92c3b555ddf
+Author: d01-temp <d01-temp@example.invalid>
+Date:   Fri Sep 18 10:23:41 2026 -0400
+
+    [kernel] Doctor launch requires live activation receipt (slice of #1678)
+    
+    Gates ONE launch path: start_ready_doctor_launch (covering
+    launch_admitted_doctor_attempt and trigger_admitted_doctor_launch) now
+    re-reads the live Kernel activation receipt via the existing
+    KernelService::activation_receipt port and binds it to the prepared
+    epoch/generation before any child effect. Missing or mismatched activation
+    fails closed as DispatchLaunchError::Gate. Admit-time session checks are
+    unchanged. Full saga remainder: reservation staging with full claims,
+    canonical ADMITTED/outbox linkage, activation persistence, crash/retry
+    identity reuse, release/expiry rules, and the testd/native/Dreamer/eliotd
+    paths. No facades; no invented APIs.
+    
+    Docs-read: route sha256:cbfea5bb34131766b6c16a079d3204a230c4865bbfc9243e3969144d224bf3b8
+    read sha256:0eb5ac8c609fe98923dfaca5a09da409852e263ef1e607fdb2eedd247f8b2854
+    matched [generic-source, host-kernel], bundle
+    sha256:e5419c93db9712409268536202169a1541f38827884646c4b4ef64fd340f8717.
+    Attestation: opened and read the verified bundle (repo + bins AGENTS,
+    ARCHITECTURE_CONTRACT, DEPENDENCY_POLICY, READING_PROTOCOL, ACTIVE,
+    A00-* /A02.2/A02.3/A10.4/A12.2/A13.2/A14.8, I00-*/I01-*/I02.17/20,
+    I05.5/I14.14/I16.17/I18) plus normative I14.6/I14.4/I10.15-adjacent sources.
+    
+    Gates: new test doctor_launch_requires_live_activation_receipt passes;
+    revert-proof (gate call removed) fails with ExecutorUnavailable fall-through
+    as required, restored. cargo test -p eliot-kernel: all suites ok (176 lib
+    + integration suites, 0 failed; 5 pre-existing live-image ignores).
+    dispatch_launch all 16 pass. clippy --all-targets shows only the same 15
+    pre-existing errors as unmodified origin/main (dead_code/collapse/lines in
+    control_plane/host_request_route/native_worker_lifecycle_route/notify +
+    local_read_claim); zero new lints. rustfmt clean on touched regions
+    (5 remaining diffs proven pre-existing via stash comparison).
+
+ bins/eliot-kernel/src/dispatch_launch.rs | 149 +++++++++++++++++++++++++++++++
+ 1 file changed, 149 insertions(+)
+---
+commit d82d4fe66c2dd550a6c2e8f9ac89281f2c3590c9
+Author: d01-temp <d01-temp@example.invalid>
+Date:   Fri Sep 18 10:23:33 2026 -0400
+
+    [contracts] I14.4/I14.5 backpressure + commit-status vocab (slice of #1679)
+    
+    Adds BackpressureDisposition (BUSY, STORAGE_BACKPRESSURE, ACCEPTED_PENDING,
+    DB_UNAVAILABLE, BUDGET_EXHAUSTED, STATE_CHURN, CAPABILITY_DEGRADED per I14.4)
+    and RecoveryCommitStatus (NONE/STAGED/COMMITTED/UNKNOWN per I14.5) with
+    frozen wire names, Display, serde round-trip, and fail-closed unknown-value
+    tests in eliot-runtime-contracts. RecoveryDirective keeps its 4-field shape;
+    the full 14-field directive, reserve accounting, control-slot, and admission
+    wiring stay remainder work. No facades; no invented APIs.
+    
+    Docs-read: route sha256:223b562a2c7afa89100d6ba249dca5e3be81542d05fd64436c680b826a0e10ca
+    read sha256:e227b044751c3360f763a3841c669650548042fe6946e1cfaca630a56c10f45b
+    matched [generic-source], bundle
+    sha256:08bedda8b54f66e2135ccf5e9ed11240dfa2b17b72156e7dea0fb5fc1e0df24a.
+    Attestation: opened and read the verified bundle (AGENTS/WORKFLOW/crates +
+    runtime-contracts AGENTS, ARCHITECTURE_CONTRACT, DEPENDENCY_POLICY,
+    READING_PROTOCOL, ACTIVE, A00-01/02/03/04/06, A02-03, A10.4, A14.8,
+    I00-03/04/05/13/14, I02.17/20, I18) plus normative I14.4/I14.5 text directly.
+    
+    Gates: cargo test -p eliot-runtime-contracts 58 passed/0 failed (3 new);
+    revert-proof (BUSY->BUSY_X) fails the wire-name test as required, restored.
+    clippy --all-targets shows only 3 pre-existing expect_used errors in the
+    test_epoch helper (identical on unmodified origin/main); zero new lints.
+    rustfmt clean on touched regions; cargo fmt --all is environmentally broken
+    (Win32 path-too-long, pre-existing).
+
+ .../foundation/eliot-runtime-contracts/src/lib.rs  | 148 +++++++++++++++++++++
+ 1 file changed, 148 insertions(+)
+[0m$ [0mgh issue view 1678 --json title,body,state,labels,comments --jq '{title,state,labels: [.labels[].name], body: .body[:6000]}'; echo =====1679=====; gh issue view 1679 --json title,body,state,labels --jq '{title,state,labels: [.labels[].name], body: .body[:8000]}'
+{"body":"## Documentation\r\n\r\n- [`I14.6`](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-06-durable-work-admission-and-execution-axes.md#i146-durable-work-admission-and-execution-axes) — I14.6. Durable work, admission and execution axes\r\n- [`I14.8`](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-08-fair-and-portfolio-aware-scheduling.md#i148-fair-and-portfolio-aware-scheduling) — I14.8. Fair and portfolio-aware scheduling\r\n- [`I14.20`](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary) — I14.20. Canonical runtime lifecycle vocabulary\r\n\r\n## Contract requires\r\n\r\nAdmission and execution are separate axes. Kernel must stage an inactive `AdmissionReservation` in ORS, record canonical `ADMITTED` plus launch outbox, then activate that exact reservation using the matching canonical admission receipt, unchanged State Fence, and Authority Epoch. A process may launch only from an **active** matching reservation with an activation receipt. A staged reservation may reduce capacity but may not provision, launch, or cause an external effect.\r\n\r\n## Code today\r\n\r\nThe inventory identifies Kernel-local ORS storage for `AdmissionReservation` and launch-related code in `eliot-kernel/src/dispatch_launch.rs` and `src/daemon_process_launch.rs`, plus admission clients in `eliot-native-worker/src/kernel_admission_client.rs` and `eliotd/src/dreamer_admission.rs`. The measured facts establish that Kernel is the sole durable writer and that eliotd polls and claims work under a one-second lease, but they do not establish the required three-step ORS-stage → canonical-admit/outbox → ORS-activate saga or prove that launch is gated by an activation receipt.\r\n\r\n## Consequence\r\n\r\nA launch path cannot be shown to have a durable, fenced authority boundary. Crashes between capacity reservation, canonical admission, and process launch can produce unaccounted capacity claims, launches without canonical authority, duplicate effects, or a durable object that is semantically admitted without an active reservation.\r\n\r\n## Work\r\n\r\nIn `eliot-kernel`, define or complete a single Kernel-owned admission transition that:\r\n  - creates a stable `reservation_id` and proposed attempt ID;\r\n  - stages `AdmissionReservation::STAGED_INACTIVE` in ORS with the full resource, lane, environment, effect, quota, State Fence, and Authority Epoch claims;\r\n  - commits canonical work admission as `ADMITTED` and writes the launch outbox with the canonical admission receipt reference;\r\n  - activates only that reservation identity after validating the canonical receipt, State Fence, and Authority Epoch;\r\n  - persists an activation receipt and requires it in every process/provider launch path;\r\n  - reuses the reservation identity across crash recovery and retry;\r\n  - releases or expires reservations through a receipt, while forbidding cleanup expiry for an active reservation attached to a nonterminal attempt.\r\n  Make `dispatch_launch.rs`, `daemon_process_launch.rs`, and every provider/worker dispatch path reject launch when the reservation is staged, missing, mismatched, released, expired, or reconciling.\r\n\r\n## Acceptance criteria\r\n\r\nA submitted work item visibly progresses through `READY → ADMITTED`, has one persisted reservation first visible as `STAGED_INACTIVE`, then one matching activation receipt, and only then creates a run attempt entering `PROVISIONING`. Restarting Kernel after canonical admission but before activation reuses the same reservation ID and produces no launched process. Attempting to invoke any launch path with only a canonical admission or only an ORS staged reservation is rejected with preserved operation identity and evidence.\r\n\r\n## Scope and owner\r\n\r\n- Owner: `eliot-kernel`\r\n- Severity: blocking\r\n- Kind: unprovable\r\n\r\nTests are minimal by owner order: add only the smallest proof named under acceptance. No test campaigns, no fixture matrices.\r\n\r\n---\r\nFiled by the root controller from a section-by-section conformance audit of I14 (queueing, backpressure and degraded behaviour) against the implementation contract. The audit report is kept at `.swarm/runs/20260912T115840Z/reports/`.","labels":[],"state":"OPEN","title":"[I14-audit] Implement the normative admission reservation saga before any launch"}
+=====1679=====
+{"body":"## Documentation\r\n\r\n- [`I14.2`](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-02-default-queue-profiles.md#i142-default-queue-profiles) — I14.2. Default queue profiles\r\n- [`I14.3`](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-03-control-reserve.md#i143-control-reserve) — I14.3. Control Reserve\r\n- [`I14.4`](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-04-backpressure-responses.md#i144-backpressure-responses) — I14.4. Backpressure responses\r\n- [`I14.5`](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-05-recovery-directive.md#i145-recovery-directive) — I14.5. Recovery Directive\r\n- [`I14.11`](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-11-canonical-store-outage.md#i1411-canonical-store-outage) — I14.11. Canonical store outage\r\n- [`I14.12`](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-12-memory-pressure.md#i1412-memory-pressure) — I14.12. Memory pressure\r\n- [`I14.1`](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-01-work-classes.md#i141-work-classes) — I14.1. Work classes\r\n\r\n## Contract requires\r\n\r\nControl capacity must be independently reserved at every applicable bottleneck: Kernel control channel and runnable task slots, ORS write budget and durable bytes, store transaction slots and pending-write memory, process launch/termination, notifications, CPU and protected memory, pipe bytes, handles/file descriptors, and disk queue capacity. Admission must evaluate the exact exhausted resource vector, preserve control/recovery work, shed or defer normal/background work, and name both exhausted resource and affected work. Every rejection/degradation response must use a defined disposition and include every `RecoveryDirective` field. A preallocated last-resort control slot must record reserve exhaustion or establish a platform/manual-recovery boundary.\r\n\r\n## Code today\r\n\r\nThe repository has control-plane and runtime components in `eliot-kernel/src/control_plane.rs`, `src/daemon_runtime.rs`, `src/canonical_store_runtime.rs`, launch code in `src/dispatch_launch.rs`, and notification functionality in `eliot-notify`. The inventory and measured facts do not identify queue profiles, `runtime.toml` defaults, per-resource reserve accounting, a last-resort control slot, or a uniform `RecoveryDirective` contract.\r\n\r\n## Consequence\r\n\r\nThe implementation cannot prove that cancellation, fencing, safe shutdown, health, critical incident transitions, or recovery remain possible during resource exhaustion. Generic queue-full or transport failures can lead callers to retry unsafe operations, while a saturated normal lane can starve the work needed to restore safety.\r\n\r\n## Work\r\n\r\nIn `eliot-kernel`, implement a centrally owned pressure/admission subsystem with typed resource dimensions at least for CPU task slots, protected memory, ORS operation count/bytes, canonical-store write/transaction capacity, process-control capacity, pipe/message bytes, handles, and disk queue bytes. Add default profile values to `runtime.toml` for all I14.1 pools, including the specified defaults for interactive, verification, canonical writes, background, and reports.\r\n  - Reserve control capacity independently from normal capacity at each relevant resource.\r\n  - Prevent interactive, normal, background, model, and swarm work from borrowing reserved control capacity.\r\n  - Make each admission outcome include the exhausted dimensions, affected work class, whether work was shed/deferred/quarantined, and the next permissible action.\r\n  - Define and serialize all I14.4 dispositions: `BUSY`, `STORAGE_BACKPRESSURE`, `ACCEPTED_PENDING`, `DB_UNAVAILABLE`, `BUDGET_EXHAUSTED`, `STATE_CHURN`, and `CAPABILITY_DEGRADED`.\r\n  - Attach a complete `RecoveryDirective` to each disposition, including commit status, preservation status, retry or poll instruction, forbidden actions, fallback, escalation condition, and resolution state.\r\n  - Preallocate a last-resort Kernel control record/slot outside normal resource accounting. If it cannot be used, transition explicitly to the platform/manual-recovery boundary rather than silently failing.\r\n\r\n## Acceptance criteria\r\n\r\nWhen normal work exhausts ORS durable bytes, a normal submission returns `STORAGE_BACKPRESSURE` with a complete `RecoveryDirective`, while a cancellation/control record can still be persisted through the reserved control capacity. When CPU or handle capacity alone is exhausted, normal/background admission is independently closed and the response names that precise resource; control/recovery admission remains available until its own reserve is exhausted. If the dedicated final control slot is unavailable, the system emits an explicit manual/platform-recovery state rather than reporting ordinary queue pressure.\r\n\r\n## Scope and owner\r\n\r\n- Owner: `eliot-kernel`\r\n- Severity: blocking\r\n- Kind: missing\r\n\r\nTests are minimal by owner order: add only the smallest proof named under acceptance. No test campaigns, no fixture matrices.\r\n\r\n---\r\nFiled by the root controller from a section-by-section conformance audit of I14 (queueing, backpressure and degraded behaviour) against the implementation contract. The audit report is kept at `.swarm/runs/20260912T115840Z/reports/`.","labels":[],"state":"OPEN","title":"[I14-audit] Add multidimensional control reserves and named backpressure dispositions"}
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead T14.md 
+[0m→ [0mRead workstreams 
+[0m$ [0mgit diff origin/main...HEAD -- bins/eliot-kernel/src/dispatch_launch.rs | head -n 300
+echo ====LIB====
+git diff origin/main...HEAD -- crates/foundation/eliot-runtime-contracts/src/lib.rs | head -n 300
+head: The term 'head' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+====LIB====
+head: 
+Line |
+   3 |  . -- crates/foundation/eliot-runtime-contracts/src/lib.rs | head -n 300
+     |                                                              ~~~~
+     | The term 'head' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead .eliot 
+[0m→ [0mRead workstreams/ACTIVE.toml 
+[0m$ [0mgit diff origin/main...HEAD --stat; echo ---LOG---; git log --format='%H %s' origin/main..HEAD
+bins/eliot-kernel/src/dispatch_launch.rs           | 149 +++++++++++++++++++++
+ .../foundation/eliot-runtime-contracts/src/lib.rs  | 148 ++++++++++++++++++++
+ 2 files changed, 297 insertions(+)
+---LOG---
+d1896eb8de5ce296a094f12185f18b895d172a55 Merge remote-tracking branch 'origin/main' into work/slice-1678-1679
+aea1f39c847867c0e5348f29f3cbe92c3b555ddf [kernel] Doctor launch requires live activation receipt (slice of #1678)
+d82d4fe66c2dd550a6c2e8f9ac89281f2c3590c9 [contracts] I14.4/I14.5 backpressure + commit-status vocab (slice of #1679)
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead .eliot/docs-read-receipt-1678.json 
+[0m→ [0mRead .eliot/docs-read-receipt.json 
+[0m$ [0mgit diff origin/main...HEAD -- bins/eliot-kernel/src/dispatch_launch.rs | Select-Object -First 200
+Write-Host "====SECOND FILE===="
+git diff origin/main...HEAD -- crates/foundation/eliot-runtime-contracts/src/lib.rs | Select-Object -First 200
+diff --git a/bins/eliot-kernel/src/dispatch_launch.rs b/bins/eliot-kernel/src/dispatch_launch.rs
+index efaa327e..2a45d11c 100644
+--- a/bins/eliot-kernel/src/dispatch_launch.rs
++++ b/bins/eliot-kernel/src/dispatch_launch.rs
+@@ -1731,6 +1731,45 @@ fn release_launch(contour: &'static ComposedDispatchContour, identity: &str) {
+     }
+ }
+ 
++/// Requires the live Kernel activation receipt for one Doctor launch
++/// (slice of #1678, I14.6/I10.15).
++///
++/// A prepared admission alone never authorizes spawn: the launch boundary
++/// re-reads the live Kernel activation receipt and binds it to the prepared
++/// epoch and generation. A missing receipt, or a receipt that no longer
++/// agrees with the prepared admission (stale epoch, generation cutover,
++/// fence), fails closed before any child effect. Crash/retry reuse, the
++/// canonical `ADMITTED`/outbox linkage, staged-reservation claims, and the
++/// testd/native-worker/Dreamer/`eliotd` launch paths stay remainder work.
++fn require_live_activation_for_doctor_launch(
++    kernel: &KernelComposition,
++    ready: &ReadyDoctorLaunch,
++) -> Result<(), DispatchLaunchError> {
++    let service = kernel
++        .service
++        .lock()
++        .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?;
++    let receipt = service.activation_receipt().ok_or_else(|| {
++        DispatchLaunchError::Gate(
++            "doctor launch requires a live Kernel activation receipt".to_owned(),
++        )
++    })?;
++    if !receipt
++        .authority_epoch
++        .is_same_authority(&ready.authority_epoch)
++    {
++        return Err(DispatchLaunchError::Gate(
++            "doctor launch activation does not match the prepared admission".to_owned(),
++        ));
++    }
++    if receipt.generation.value() != ready.generation.get() {
++        return Err(DispatchLaunchError::Gate(
++            "doctor launch activation does not match the prepared admission".to_owned(),
++        ));
++    }
++    Ok(())
++}
++
+ /// Spawns one prepared Doctor launch through the admitted process gateway.
+ ///
+ /// The child admission carries an empty argv — the attempt material travels
+@@ -1747,6 +1786,7 @@ pub async fn start_ready_doctor_launch(
+     kernel: &KernelComposition,
+     ready: &ReadyDoctorLaunch,
+ ) -> Result<ChildStartOutcome, DispatchLaunchError> {
++    require_live_activation_for_doctor_launch(kernel, ready)?;
+     match spawn_ready_child(
+         kernel,
+         &SpawnInputs {
+@@ -5655,6 +5695,115 @@ mod tests {
+         let _ = std::fs::remove_dir_all(root);
+     }
+ 
++    /// Slice of #1678 (I14.6): the Doctor launch boundary requires the live
++    /// Kernel activation receipt. A prepared admission presented to a Kernel
++    /// without one — or with a receipt that no longer matches the prepared
++    /// epoch/generation — is rejected before any child effect. Removing the
++    /// gate lets the same calls fall through to the executor error instead.
++    #[tokio::test]
++    async fn doctor_launch_requires_live_activation_receipt() {
++        use std::collections::BTreeSet;
++
++        fn ready_for(epoch: &EpochId, generation: Generation) -> ReadyDoctorLaunch {
++            ReadyDoctorLaunch {
++                admission: Box::new(DoctorRepairAdmission {
++                    wire_id: eliot_kernel_service::DOCTOR_REPAIR_WIRE_ID.to_owned(),
++                    wire_version: DoctorRepairAdmission::CONTRACT_VERSION,
++                    attempt_id: "attempt-gate-1".to_owned(),
++                    attempt_digest: "a".repeat(64),
++                    effect_digest: None,
++                    recipe_digest: "b".repeat(64),
++                    manifest_digest: "c".repeat(64),
++                    operation_id: "op-gate-1".to_owned(),
++                    lease_id: "lease-gate-1".to_owned(),
++                    lease_owner: "kernel-recovery".to_owned(),
++                    lease_expires_unix_nanos: 1_750_000_200_000_000_000,
++                    allowed_effects: BTreeSet::new(),
++                    budget_units: 1,
++                    deadline_unix_nanos: 1_750_000_100_000_000_000,
++                    approval_present: false,
++                    cancelled: false,
++                    admitted_at_unix_nanos: 1_750_000_000_000_000_000,
++                    admission_digest: "d".repeat(64),
++                }),
++                nonce: "nonce-gate-1".to_owned(),
++                operation_id: OperationId::new("doctor-1-gate0001").expect("test operation id"),
++                material_path: PathBuf::from("doctor-gate.material.json"),
++                executable: PathBuf::from("eliot-doctor.exe"),
++                executable_sha256: "e".repeat(64),
++                working_directory: PathBuf::from("."),
++                authority_epoch: epoch.clone(),
++                generation,
++            }
++        }
++
++        fn is_activation_gate(error: &DispatchLaunchError) -> bool {
++            matches!(
++                error,
++                DispatchLaunchError::Gate(detail) if detail.contains("activation")
++            )
++        }
++
++        // 1. No activation receipt: a fresh composition rejects before spawn.
++        let cold_root = temp_root("doctor-gate-cold");
++        let cold =
++            KernelComposition::new(KernelConfig::new(&cold_root)).expect("kernel composition");
++        let cold_ready = ready_for(&test_epoch(1), Generation::new(1).expect("test generation"));
++        let Err(cold_error) = start_ready_doctor_launch(&cold, &cold_ready).await else {
++            panic!("doctor launch without an activation receipt must not spawn");
++        };
++        assert!(
++            is_activation_gate(&cold_error),
++            "missing activation must fail at the launch gate, got: {cold_error}"
++        );
++
++        // 2. Live matching activation: the gate passes and the call reaches
++        // the (unconfigured in tests) executor boundary instead.
++        let live_root = temp_root("doctor-gate-live");
++        let live = ready_kernel(&live_root);
++        let live_epoch_value = live_epoch(&live);
++        let live_generation_value = live
++            .service
++            .lock()
++            .expect("service lock")
++            .activation_receipt()
++            .expect("activation receipt")
++            .generation
++            .value();
++        let live_ready = ready_for(
++            &live_epoch_value,
++            Generation::new(live_generation_value).expect("live generation"),
++        );
++        let Err(live_error) = start_ready_doctor_launch(&live, &live_ready).await else {
++            panic!("test contour configures no executor; spawn must fail closed");
++        };
++        assert!(
++            !is_activation_gate(&live_error),
++            "matching activation must pass the launch gate, got: {live_error}"
++        );
++        assert!(
++            matches!(live_error, DispatchLaunchError::ExecutorUnavailable),
++            "matching activation must reach the executor boundary, got: {live_error}"
++        );
++
++        // 3. Stale generation: a receipt that no longer matches the prepared
++        // admission is rejected at the gate.
++        let stale_ready = ready_for(
++            &live_epoch_value,
++            Generation::new(live_generation_value + 1).expect("stale generation"),
++        );
++        let Err(stale_error) = start_ready_doctor_launch(&live, &stale_ready).await else {
++            panic!("doctor launch with a mismatched activation must not spawn");
++        };
++        assert!(
++            is_activation_gate(&stale_error),
++            "mismatched activation must fail at the launch gate, got: {stale_error}"
++        );
++
++        let _ = std::fs::remove_dir_all(cold_root);
++        let _ = std::fs::remove_dir_all(live_root);
++    }
++
+     /// Resolves the real `eliot-native-worker` image beside this test
+     /// executable (the `deps`/`debug` layout cargo produces). The digest
+     /// below binds the exact bytes before any launch step reads them, so
+====SECOND FILE====
+diff --git a/crates/foundation/eliot-runtime-contracts/src/lib.rs b/crates/foundation/eliot-runtime-contracts/src/lib.rs
+index 0f59e770..8789789f 100644
+--- a/crates/foundation/eliot-runtime-contracts/src/lib.rs
++++ b/crates/foundation/eliot-runtime-contracts/src/lib.rs
+@@ -934,6 +934,92 @@ impl RecoveryDirective {
+     }
+ }
+ 
++/// Backpressure dispositions from I14.4.
++///
++/// Every admission rejection or degradation response names exactly one of
++/// these dispositions and attaches a [`RecoveryDirective`]. Wire names are
++/// frozen; an unknown wire value fails closed at deserialization. The full
++/// fourteen-field `RecoveryDirective` shape and the reserve accounting that
++/// produces these responses stay later slices.
++#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
++#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
++pub enum BackpressureDisposition {
++    /// Request not accepted; retry directive.
++    Busy,
++    /// No durable staging available.
++    StorageBackpressure,
++    /// Staged; do not retry, poll operation.
++    AcceptedPending,
++    /// Canonical-sensitive action blocked.
++    DbUnavailable,
++    /// Checkpoint and ask for route/scope/budget decision.
++    BudgetExhausted,
++    /// Packet/read could not stabilize.
++    StateChurn,
++    /// Requested operation unavailable, alternatives shown.
++    CapabilityDegraded,
++}
++
++impl BackpressureDisposition {
++    /// Returns the frozen I14.4 wire name.
++    #[must_use]
++    pub const fn as_str(self) -> &'static str {
++        match self {
++            Self::Busy => "BUSY",
++            Self::StorageBackpressure => "STORAGE_BACKPRESSURE",
++            Self::AcceptedPending => "ACCEPTED_PENDING",
++            Self::DbUnavailable => "DB_UNAVAILABLE",
++            Self::BudgetExhausted => "BUDGET_EXHAUSTED",
++            Self::StateChurn => "STATE_CHURN",
++            Self::CapabilityDegraded => "CAPABILITY_DEGRADED",
++        }
++    }
++}
++
++impl fmt::Display for BackpressureDisposition {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(self.as_str())
++    }
++}
++
++/// Commit status from I14.5 (`RecoveryDirective.commit_status`).
++///
++/// Frozen four-value vocabulary: `none | staged | committed | unknown`.
++/// This enum only freezes the values that disposition responses must use;
++/// the complete fourteen-field `RecoveryDirective` shape stays a later
++/// slice.
++#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
++#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
++pub enum RecoveryCommitStatus {
++    /// No durable commit exists.
++    None,
++    /// Staged but not committed; do not retry blindly, poll or reconcile.
++    Staged,
++    /// Durably committed under its receipt.
++    Committed,
++    /// Commit outcome is unknown; reconcile before acting.
++    Unknown,
++}
++
++impl RecoveryCommitStatus {
++    /// Returns the frozen I14.5 wire name.
++    #[must_use]
++    pub const fn as_str(self) -> &'static str {
++        match self {
++            Self::None => "NONE",
++            Self::Staged => "STAGED",
++            Self::Committed => "COMMITTED",
++            Self::Unknown => "UNKNOWN",
++        }
++    }
++}
++
++impl fmt::Display for RecoveryCommitStatus {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(self.as_str())
++    }
++}
++
+ /// Role-filtered non-semantic recovery inspection surface.
+ #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+@@ -1127,4 +1213,66 @@ mod tests {
+         };
+         assert!(receipt.validate().is_err());
+     }
++
++    #[test]
++    fn backpressure_dispositions_carry_stable_i14_4_wire_names()
++    -> Result<(), Box<dyn std::error::Error>> {
++        let cases = [
++            (BackpressureDisposition::Busy, "BUSY"),
++            (
++                BackpressureDisposition::StorageBackpressure,
++                "STORAGE_BACKPRESSURE",
++            ),
++            (BackpressureDisposition::AcceptedPending, "ACCEPTED_PENDING"),
++            (BackpressureDisposition::DbUnavailable, "DB_UNAVAILABLE"),
++            (BackpressureDisposition::BudgetExhausted, "BUDGET_EXHAUSTED"),
++            (BackpressureDisposition::StateChurn, "STATE_CHURN"),
++            (
++                BackpressureDisposition::CapabilityDegraded,
++                "CAPABILITY_DEGRADED",
++            ),
++        ];
++        assert_eq!(cases.len(), 7, "I14.4 freezes exactly seven dispositions");
++        for (disposition, wire) in cases {
++            assert_eq!(disposition.as_str(), wire);
++            assert_eq!(disposition.to_string(), wire);
++            let encoded = serde_json::to_string(&disposition)?;
++            assert_eq!(encoded, format!("\"{wire}\""));
++            assert_eq!(
++                serde_json::from_str::<BackpressureDisposition>(&encoded)?,
++                disposition
++            );
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn recovery_commit_status_covers_none_staged_committed_unknown()
++    -> Result<(), Box<dyn std::error::Error>> {
++        let cases = [
++            (RecoveryCommitStatus::None, "NONE"),
++            (RecoveryCommitStatus::Staged, "STAGED"),
++            (RecoveryCommitStatus::Committed, "COMMITTED"),
++            (RecoveryCommitStatus::Unknown, "UNKNOWN"),
++        ];
++        for (status, wire) in cases {
++            assert_eq!(status.as_str(), wire);
++            assert_eq!(status.to_string(), wire);
++            let encoded = serde_json::to_string(&status)?;
++            assert_eq!(encoded, format!("\"{wire}\""));
++            assert_eq!(
++                serde_json::from_str::<RecoveryCommitStatus>(&encoded)?,
++                status
++            );
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn unknown_backpressure_and_commit_wire_names_fail_closed() {
++        let unknown_disposition = serde_json::json!("RETRY_LATER");
++        assert!(serde_json::from_value::<BackpressureDisposition>(unknown_disposition).is_err());
++        let unknown_commit = serde_json::json!("partial");
++        assert!(serde_json::from_value::<RecoveryCommitStatus>(unknown_commit).is_err());
++    }
+ }
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead stderr-continue.log 
+[0m→ [0mRead stdout-continue.log 
+[0m→ [0mRead docs/architecture/I14-04-backpressure-responses.md 
+[0m→ [0mRead docs/architecture/I14-05-recovery-directive.md 
+[0m→ [0mRead docs/architecture/I14-06-durable-work-admission-and-execution-axes.md 
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead docs/architecture/I14-03-control-reserve.md 
+[0m→ [0mRead docs/architecture/I14-01-work-classes.md 
+[0m✱ [0mGrep "RecoveryDirective|Backpressure|RecoveryCommitStatus" [90min crates/foundation/eliot-runtime-contracts/src/lib.rs · 34 matches[0m
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead crates/foundation/eliot-runtime-contracts/src/lib.rs [90m[limit=160, offset=860][0m
+[0m✱ [0mGrep "pub async fn start_ready|pub fn launch_admitted|trigger_admitted|daemon_process_launch|ReadyDoctorLaunch|Ready.*Launch" [90min bins/eliot-kernel/src · 42 matches[0m
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead bins/eliot-kernel/src/lib.rs 
+[0m→ [0mRead crates/foundation/eliot-runtime-contracts/AGENTS.md 
+[0m$ [0mpython scripts/docs_read.py --help | Select-Object -First 60
+Write-Host "---AGENTS bins---"
+Get-Content bins/AGENTS.md | Select-Object -First 80
+usage: docs_read.py [-h] {read,self-test} ...
+
+Verify and render every required item from an ELIOT documentation route.
+
+positional arguments:
+  {read,self-test}
+
+options:
+  -h, --help        show this help message and exit
+---AGENTS bins---
+# Runtime composition-root instructions
+
+<!-- eliot-doc-routing:start -->
+## Mandatory documentation routing
+
+Before changing code, configuration, tests, workflows, or normative prose, run
+from the repository root:
+
+```text
+python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+```
+
+Repeat `--path` for every mutable path family, or use `--changed-from
+origin/main` for the complete branch delta, including deletions. Open the
+verified bundle and read every required item before mutation. A route alone is
+navigation, not reading evidence.
+
+Record the route receipt ID, read receipt ID, matched routes, required handles,
+fragment paths and SHA-256 values, verified bundle SHA-256, and explicit reading
+attestation in the work unit or pull request. Optional fragments are loaded only
+when the current decision crosses their stated boundary. A legacy `ELIOT_*`
+compatibility map is never an acceptable read receipt.
+
+If no non-baseline route matches, a required item is stale or missing, or scope
+expands beyond the receipt, stop and rerun or repair the route; silence is not
+permission. See [`../docs/architecture/READING_PROTOCOL.md`](../docs/architecture/READING_PROTOCOL.md).
+<!-- eliot-doc-routing:end -->
+
+
+`bins/*` wires admitted capability cells into processes. A binary name does not
+create lifecycle, state, semantic, canonical-store, repair, provider or
+authority ownership.
+
+## Package documentation index
+
+Every admitted Cargo package below `bins/` is listed in the generated
+[workspace package  documentation index](../docs/code-navigation/PACKAGE_DOCS_INDEX.md).
+The index binds the exact root `Cargo.toml` denominator to logical responsibility
+blocks and canonical documentation handles. Regenerate it with
+`python scripts/code_navigation.py sync-index --root .`; never edit it by hand.
+
+## Mandatory rules
+
+- Start from current `main`, one open issue, one issue-numbered branch, one
+  mutable path owner, and one PR.
+- Read the owning subtree `AGENTS.md`, the executable's Cargo manifest, and its
+  issue before changing the composition root.
+- Keep `main.rs` and adjacent composition modules limited to argument/config
+  decoding, authenticated contract construction, dependency wiring, service or
+  one-shot lifecycle, typed shutdown, and terminal receipt/status projection.
+- Put deterministic state machines, durable state, vendor adapters, protocol
+  semantics, process mechanics, and reusable proof fixtures in their declared
+  first-party owner crates.
+- Do not infer process ownership from PID, name, path, port, current directory,
+  environment variables, or a successful exit.
+- Direct native-process launch in a runtime root is forbidden unless the exact
+  file is recorded as temporary debt in `config/architecture-boundaries.toml`.
+  Debt is unresolved work, not permission to expand the pattern.
+- No production `todo!` or `unimplemented!`.
+- Do not add task, memory, policy, finish, scheduling, canonical write, store,
+  Dreamer, provider, credential, or repair semantics to a composition binary.
+
+## Runtime roots and owners
+
+| Root | Current owner/work item |
+|---|---|
+| `eliot-host` | Host lifecycle and journal boundary, #14 |
+| `eliot-kernel` | fencing, ORS, reserve and generation routing, #15 |
+| `eliotd` | semantic Governor application owner, #18 |
+| `eliot-watchdog` | independent supervision, #16 |
+| `eliot-doctor` | one-shot bounded repair, #17 |
+| `eliot-store-surreal` | closed store bridge; external DB generation remains separate, #19 |
+| `eliot-testd` | typed Instrument execution only, #20 |
+| `eliot-wasm-host` | capability-limited component mechanics, #21 |
+| `eliot-native-worker` | isolated native generation, #22 |
+| `eliot-user-broker` | SID/session-bound launch and resources, #23 |
+| `eliot-mod-research` | governed provider acquisition; candidate-only output, #24 |
+| `eliot-notify`, `eliot-agent-bridge` | thin stateless/near-stateless surfaces, #13 |
+| `eliot` | current operator CLI and installation/runtime-status front door; live proof #11 |
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead bins/eliot-kernel/src/dispatch_launch.rs [90m[limit=120, offset=2500][0m
+[0m✱ [0mGrep "RecoveryDirective" [90min . · 40 matches[0m
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead bins/eliot-kernel/src/dispatch_launch.rs [90m[limit=120, offset=2790][0m
+[0m✱ [0mGrep "runtime_contracts::.*RecoveryDirective|use.*RecoveryDirective" [90min crates · 1 match[0m
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead bins/eliot-kernel/src/dispatch_launch.rs [90m[limit=120, offset=3060][0m
+[0m✱ [0mGrep "RecoveryDirective" [90min crates/foundation/eliot-rules/src/lib.rs · 2 matches[0m
+> build · muse-spark-1.3-contributor
+[0m$ [0mpython scripts/docs_read.py read --path bins/eliot-kernel/src/dispatch_launch.rs --topic "admission reservation activation receipt launch gate" --output .eliot/docs-read-bundle-1678-next.md --receipt-out .eliot/docs-read-receipt-1678-next.json
+Write-Host "---1678 done---"
+python scripts/docs_read.py read --path crates/foundation/eliot-runtime-contracts/src/lib.rs --topic "backpressure disposition and recovery directive commit status" --output .eliot/docs-read-bundle-1679-next.md --receipt-out .eliot/docs-read-receipt-1679-next.json
+Write-Host "---1679 done---"
+DOC_READ: PASS receipt=sha256:0eb5ac8c609fe98923dfaca5a09da409852e263ef1e607fdb2eedd247f8b2854 route=sha256:cbfea5bb34131766b6c16a079d3204a230c4865bbfc9243e3969144d224bf3b8 required=37 bundle_sha256=e5419c93db9712409268536202169a1541f38827884646c4b4ef64fd340f8717
+---1678 done---
+DOC_READ: PASS receipt=sha256:e227b044751c3360f763a3841c669650548042fe6946e1cfaca630a56c10f45b route=sha256:223b562a2c7afa89100d6ba249dca5e3be81542d05fd64436c680b826a0e10ca required=24 bundle_sha256=08bedda8b54f66e2135ccf5e9ed11240dfa2b17b72156e7dea0fb5fc1e0df24a
+---1679 done---
+> build · muse-spark-1.3-contributor
+[0m⚙ [0mexecute {"code":"search({query: \"codebase_memory query\", limit: 30})"} 
+> build · muse-spark-1.3-contributor
+[0m⚙ [0mexecute {"code":"const [a, b, c, d] = await Promise.all([\n  tools.codebase_memory.search_code({pattern: \"require_live_activation_for_doctor_launch\", project: \"eliot-swarm\", limit: 10}),\n  tools.codebase_memory.search_code({pattern: \"BackpressureDisposition\", project: \"eliot-swarm\", limit: 10}),\n  tools.codebase_memory.search_code({pattern: \"RecoveryCommitStatus\", project: \"eliot-swarm\", limit: 10}),\n  tools.codebase_memory.search_code({pattern: \"start_ready_testd_launch\", project: \"eliot-swarm\", limit: 10}),\n]);\nreturn {a_total: a.total_grep_matches ?? a.total ?? null, b_total: b.total_grep_matches ?? b.total ?? null, c_total: c.total_grep_matches ?? c.total ?? null, d_total: d.total_grep_matches ?? d.total ?? null, a, b};\n"} 
+> build · muse-spark-1.3-contributor
+[0m⚙ [0mexecute {"code":"const project = \"C-Development-Rust-projects-eliot-memory-os\";\nconst [a, b, c, d] = await Promise.all([\n  tools.codebase_memory.search_code({pattern: \"require_live_activation_for_doctor_launch\", project, limit: 10}),\n  tools.codebase_memory.search_code({pattern: \"BackpressureDisposition\", project, limit: 10}),\n  tools.codebase_memory.search_code({pattern: \"RecoveryCommitStatus\", project, limit: 10}),\n  tools.codebase_memory.search_code({pattern: \"start_ready_testd_launch\", project, limit: 10}),\n]);\nreturn {a_summary: JSON.stringify(a).slice(0,2000), b_summary: JSON.stringify(b).slice(0,2000), c_summary: JSON.stringify(c).slice(0,2000), d_summary: JSON.stringify(d).slice(0,2000)};\n"} 
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead .eliot/docs-read-receipt-1678-next.json [90m[limit=60][0m
+[0m→ [0mRead .eliot/docs-read-receipt-1679-next.json [90m[limit=40][0m
+[0m→ [0mRead .eliot/docs-read-bundle-1678-next.md [90m[limit=60][0m
+> build · muse-spark-1.3-contributor

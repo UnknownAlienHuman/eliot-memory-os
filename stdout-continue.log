@@ -1,0 +1,5 @@
+Continuing the 1678/1679 audit slice — verifying branch state and open work.
+Found the two slice commits on top of main — now mapping what's left for the full saga.
+Guardrail check flagged a possible scope conflict — resolving before any edits.
+Both launch paths share the same authority binding — scoping the next minimal gates.
+Docs routing and memory queries complete — reading bundles, then fanning out.
