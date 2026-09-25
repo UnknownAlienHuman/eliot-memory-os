@@ -23,12 +23,13 @@ use crate::{SERVICE_NAME, SpoolError, WatchdogRuntimeBinding, current_unix_ms};
 pub(crate) mod backup;
 mod codec;
 pub mod export_driver;
-/// Spool-local intent records (I8.1 `problem_intent` / `incident_intent`).
-/// Case-(b): the shared export kinds are not extended; intents persist as
-/// codec variants and are excluded from export batches until Governor-side
-/// admission lands (the MGR02 handoff), so no Recovery-disposition path can
-/// accept, compact, or terminally dispose of an intent before Governor
-/// reconciliation.
+/// Spool-local intent records (I8.1 `problem_intent` / `incident_intent`) and
+/// the Watchdog-owned deterministic escalation rule that mints them.
+/// The shared owner-neutral export classes stay unextended: intents persist as
+/// codec variants, travel inside their export window under the existing
+/// `Recovery` class, are reconciled through the fenced Kernel
+/// `watchdog-spool-batch-v1` intent route, and are never removed by compaction
+/// so the original Watchdog record stays linked to the Governor's decision.
 pub(crate) mod intent;
 
 pub use backup::{
@@ -93,6 +94,28 @@ pub(crate) const SPOOL_EXPORT_CURSOR_KEY: u64 = 0;
 /// transactional patterns as the header and high-water paths.
 pub(crate) const SPOOL_EXPORT_CURSOR_TABLE: TableDefinition<u64, &[u8]> =
     TableDefinition::new("eliot_watchdog_spool_export_cursor_v1");
+/// Single-key row of the Watchdog-owned deterministic escalation-rule state.
+///
+/// The rule state lives in the same `watchdog.redb` file as the records it
+/// mints, so a restart cannot reset the threshold and silently skip
+/// escalation: only a live Governor admission closes an open episode.
+pub(crate) const SPOOL_INTENT_RULE_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("eliot_watchdog_spool_intent_rule_v1");
+/// Single-key cursor-style key of the rule-state row.
+pub(crate) const SPOOL_INTENT_RULE_KEY: u64 = 0;
+/// Per-record table of durable submit-once reconciliation receipts.
+///
+/// This is the exactly-once ledger for fenced-Kernel intent reconciliation: it
+/// is keyed by the retained Watchdog spool sequence, so one spool record can
+/// never acquire two receipts and a retry after a lost acknowledgement observes
+/// the existing receipt instead of submitting again.
+pub(crate) const SPOOL_INTENT_RECEIPT_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("eliot_watchdog_spool_intent_receipt_v1");
+/// Storage revision of one durable submit-once receipt.
+///
+/// Distinct from the rule-state revision so a future receipt-shape change
+/// refuses to reinterpret an existing ledger instead of mixing generations.
+pub(crate) const INTENT_RECEIPT_SCHEMA_VERSION: u16 = 1;
 /// Maximum accepted length for one persisted cursor identity string.
 ///
 /// Cursor identities are short installer-bound names such as
@@ -823,6 +846,326 @@ impl WatchdogSpool {
             .ok_or_else(|| SpoolError::Corrupt("high-water metadata is missing".to_owned()))
     }
 
+    /// Counts one genuinely observed Governor-unavailability proof and mints a
+    /// spooled intent when the Watchdog-owned deterministic rule reaches a
+    /// configured threshold.
+    ///
+    /// The proof is the only input: it is minted from a real admission-path or
+    /// kernel-supervision rejection, never from a caller-chosen reason, so
+    /// retention pressure and host-identity observations can never mint. The
+    /// rule reads and rewrites its durable counter in `watchdog.redb`, so a
+    /// restart cannot reset the threshold, and only
+    /// [`Self::observe_governor_recovery`] closes an open episode.
+    ///
+    /// Ordering is fail-closed in the safe direction: the intent record is
+    /// appended first and the closed rule state second. A rule-state write
+    /// that fails after a successful append therefore leaves the previous
+    /// counter in place, and the next observed proof mints again rather than
+    /// dropping an escalation. Every minted record is a distinct spool
+    /// sequence, so the Kernel-side exactly-once ledger still admits each of
+    /// them at most once.
+    ///
+    /// The append is the only write: no ORS, canonical, or HostStateJournal
+    /// write is reachable from this path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the rule state or the record fails
+    /// validation, the evidence chain is empty or unbounded, or the spool
+    /// cannot be read or written.
+    pub(crate) fn observe_governor_unavailability(
+        &self,
+        proof: intent::GovernorUnavailability,
+        observation_digest: String,
+        lineage: intent::IntentLineage,
+        observed_at_ms: u64,
+    ) -> Result<intent::GovernorIntentOutcome, SpoolError> {
+        let mut state = self.read_intent_rule_state()?;
+        let observed = state.observe(observation_digest, proof.reason(), observed_at_ms)?;
+        let intent_class = match observed.decision {
+            intent::GovernorIntentDecision::Counting { consecutive } => {
+                self.write_intent_rule_state(&state)?;
+                return Ok(intent::GovernorIntentOutcome::Counting { consecutive });
+            }
+            intent::GovernorIntentDecision::ProblemIntent { .. } => {
+                intent::WatchdogIntentClass::Problem
+            }
+            intent::GovernorIntentDecision::IncidentIntent { .. } => {
+                intent::WatchdogIntentClass::Incident
+            }
+        };
+        if observed.episode_evidence_refs.is_empty() {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent episode carries no evidence reference".to_owned(),
+            ));
+        }
+        let record = match intent_class {
+            intent::WatchdogIntentClass::Problem => intent::ProblemIntentRecord::new(
+                proof,
+                SERVICE_NAME.to_owned(),
+                observed.episode_evidence_refs,
+                lineage,
+                observed_at_ms,
+            )?
+            .to_payload(),
+            intent::WatchdogIntentClass::Incident => intent::IncidentIntentRecord::new(
+                proof,
+                SERVICE_NAME.to_owned(),
+                observed.episode_evidence_refs,
+                lineage,
+                observed_at_ms,
+            )?
+            .to_payload(),
+        };
+        self.append(observed_at_ms, record)?;
+        let sequence = self.high_water_sequence()?;
+        self.write_intent_rule_state(&state)?;
+        let reference = intent::WatchdogIntentRecordRef {
+            sequence,
+            intent_class,
+            observed_at_ms,
+            record_digest: self.intent_record_digest(sequence)?,
+        };
+        tracing::debug!(
+            event = "watchdog.intent_spooled",
+            observation = "stored",
+            sequence = reference.sequence,
+            intent_kind = reference.intent_class.as_str(),
+            "watchdog stored a non-semantic intent record in its own store"
+        );
+        Ok(match intent_class {
+            intent::WatchdogIntentClass::Problem => {
+                intent::GovernorIntentOutcome::ProblemIntent(reference)
+            }
+            intent::WatchdogIntentClass::Incident => {
+                intent::GovernorIntentOutcome::IncidentIntent(reference)
+            }
+        })
+    }
+
+    /// Closes an open deterministic-rule episode after a live Governor
+    /// admission, and returns whether an episode was actually open.
+    ///
+    /// A live admission is the only recovery signal the rule accepts: it never
+    /// resets on a timer, on a restart, or on a caller-chosen reason, and it
+    /// never touches a spooled intent (those stay retained until the fenced
+    /// Kernel route acknowledges them).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the rule state is not canonical, the
+    /// timestamp is uninitialized, or the state cannot be written.
+    pub(crate) fn observe_governor_recovery(&self, observed_at_ms: u64) -> Result<bool, SpoolError> {
+        let mut state = self.read_intent_rule_state()?;
+        let was_open = state.close_episode(observed_at_ms)?;
+        self.write_intent_rule_state(&state)?;
+        Ok(was_open)
+    }
+
+    /// Returns a bounded window of retained Watchdog intents that have no
+    /// submit-once receipt, oldest first.
+    ///
+    /// Read-only: nothing is submitted, reserved, or removed here. Each entry
+    /// carries the exact original record plus the same record and payload
+    /// digests the export batch binds, so the fenced Kernel route can prove the
+    /// presented bytes are the retained Watchdog record, plus the Watchdog's own
+    /// epoch lineage so the durable intent record can be stamped with stable
+    /// observation lineage. An empty result means every retained intent already
+    /// holds a submit-once receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the retained spool, header, or high-water
+    /// fails validation, the window bound is zero, or a stored submit-once
+    /// receipt is not canonical.
+    pub(crate) fn pending_watchdog_intents(
+        &self,
+        limit: usize,
+        epoch_lineage: eliot_contracts::EpochLineageId,
+    ) -> Result<Vec<intent::PendingWatchdogIntent>, SpoolError> {
+        if limit == 0 || limit > intent::INTENT_RECONCILIATION_MAX_SUBMISSIONS {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent reconciliation window is outside its bounded range".to_owned(),
+            ));
+        }
+        let (entries, _high_water, _cursor) = self.read_export_snapshot()?;
+        let submitted = self.read_intent_receipt_sequences()?;
+        let mut pending = Vec::new();
+        for entry in &entries {
+            if pending.len() >= limit {
+                break;
+            }
+            if !intent::is_intent_payload(&entry.payload) || submitted.contains(&entry.sequence) {
+                continue;
+            }
+            let raw = encode_entry(entry)?;
+            let (payload_digest, record_digest) = export_record_digests(entry, &raw);
+            pending.push(intent::PendingWatchdogIntent {
+                record: entry.clone(),
+                intent_class: intent::WatchdogIntentClass::of_payload(&entry.payload)?,
+                record_digest,
+                payload_digest,
+                epoch_lineage: epoch_lineage.clone(),
+            });
+        }
+        Ok(pending)
+    }
+
+    /// Persists the durable submit-once receipt for one reconciled intent.
+    ///
+    /// This is the exactly-once boundary of fenced-Kernel reconciliation. A
+    /// first call for a retained sequence writes the receipt and reports
+    /// [`IntentSubmissionDisposition::Recorded`]. Any later call for the same
+    /// sequence observes [`IntentSubmissionDisposition::AlreadySubmitted`]
+    /// without writing, which is exactly what a retry after a lost
+    /// acknowledgement must see. A repeated call that carries a different
+    /// reconciliation key or a different acknowledgement digest is an identity
+    /// conflict and fails closed instead of overwriting the ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the receipt is not canonical, an existing
+    /// receipt for the same sequence disagrees, or the ledger cannot be
+    /// written.
+    pub(crate) fn record_intent_submission(
+        &self,
+        submission: &intent::WatchdogIntentSubmission,
+    ) -> Result<intent::IntentSubmissionDisposition, SpoolError> {
+        validate_intent_submission_receipt(submission)?;
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let existing = {
+            let table = write
+                .open_table(SPOOL_INTENT_RECEIPT_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            table
+                .get(submission.sequence)
+                .map_err(|error| SpoolError::Database(error.to_string()))?
+                .map(|value| decode_intent_receipt(value.value()))
+                .transpose()?
+        };
+        if let Some(stored) = existing {
+            if stored.idempotency_key != submission.idempotency_key
+                || stored.acknowledgement_digest != submission.acknowledgement_digest
+            {
+                return Err(SpoolError::Corrupt(
+                    "watchdog intent submit-once receipt conflicts with a changed reconciliation identity"
+                        .to_owned(),
+                ));
+            }
+            return Ok(intent::IntentSubmissionDisposition::AlreadySubmitted);
+        }
+        {
+            let mut table = write
+                .open_table(SPOOL_INTENT_RECEIPT_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            table
+                .insert(
+                    submission.sequence,
+                    encode_intent_receipt(submission)?.as_slice(),
+                )
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map(|()| intent::IntentSubmissionDisposition::Recorded)
+            .map_err(|error| SpoolError::Database(error.to_string()))
+    }
+
+    /// Reads the durable deterministic-rule state, or the closed state of a
+    /// spool that has never observed a Governor-unavailability proof.
+    fn read_intent_rule_state(&self) -> Result<intent::GovernorIntentRuleState, SpoolError> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        match read.open_table(SPOOL_INTENT_RULE_TABLE) {
+            Ok(table) => table
+                .get(SPOOL_INTENT_RULE_KEY)
+                .map_err(|error| SpoolError::Database(error.to_string()))?
+                .map(|value| decode_intent_rule_state(value.value()))
+                .transpose()
+                .map(|state| state.unwrap_or_else(intent::GovernorIntentRuleState::fresh)),
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                Ok(intent::GovernorIntentRuleState::fresh())
+            }
+            Err(error) => Err(SpoolError::Database(error.to_string())),
+        }
+    }
+
+    /// Persists one deterministic-rule state inside its own bounded write
+    /// transaction.
+    fn write_intent_rule_state(
+        &self,
+        state: &intent::GovernorIntentRuleState,
+    ) -> Result<(), SpoolError> {
+        state.validate()?;
+        let bytes = encode_intent_rule_state(state)?;
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(SPOOL_INTENT_RULE_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            table
+                .insert(SPOOL_INTENT_RULE_KEY, bytes.as_slice())
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| SpoolError::Database(error.to_string()))
+    }
+
+    /// Reads every retained sequence that already holds a submit-once receipt.
+    fn read_intent_receipt_sequences(&self) -> Result<Vec<u64>, SpoolError> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let table = match read.open_table(SPOOL_INTENT_RECEIPT_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(SpoolError::Database(error.to_string())),
+        };
+        let mut sequences = Vec::new();
+        for item in table
+            .iter()
+            .map_err(|error| SpoolError::Database(error.to_string()))?
+        {
+            let (key, value) = item.map_err(|error| SpoolError::Database(error.to_string()))?;
+            let receipt = decode_intent_receipt(value.value())?;
+            if receipt.sequence != key.value() {
+                return Err(SpoolError::Corrupt(
+                    "watchdog intent submit-once receipt sequence does not match its ledger key"
+                        .to_owned(),
+                ));
+            }
+            sequences.push(receipt.sequence);
+        }
+        Ok(sequences)
+    }
+
+    /// Recomputes the record digest of one retained sequence, so the returned
+    /// intent reference binds exactly what a later export batch binds.
+    fn intent_record_digest(&self, sequence: u64) -> Result<String, SpoolError> {
+        let entries = self.readback()?;
+        let entry = entries
+            .iter()
+            .find(|entry| entry.sequence == sequence)
+            .ok_or_else(|| {
+                SpoolError::Corrupt(
+                    "watchdog intent record is not retained after its append".to_owned(),
+                )
+            })?;
+        let raw = encode_entry(entry)?;
+        let (_, record_digest) = export_record_digests(entry, &raw);
+        Ok(record_digest)
+    }
+
     /// Reads the stored Watchdog-owned export cursor.
     ///
     /// A spool that predates the cursor table (or has no cursor row yet)
@@ -853,11 +1196,11 @@ impl WatchdogSpool {
     /// past the predecessor cursor, capped by both `limits` bounds, and an
     /// empty spool (`acknowledged == high-water`) yields the explicit empty
     /// batch. Spool-local intents (`ProblemIntent`, `IncidentIntent`) are
-    /// never covered: the window stops before the first intent, and when the
-    /// head of the window is itself an intent the export yields the parked
-    /// empty batch (high-water pinned to the acknowledged sequence) so the
-    /// sink is never submitted to and the parked intents stay retained for
-    /// Governor reconciliation. Digest material carries no timestamps, so an
+    /// ordinary covered records: the window continues past them so a retained
+    /// intent can never block later observations from exporting, and
+    /// [`Self::compact_below_cursor`] never removes one, so the original
+    /// Watchdog record stays retained for forensic linkage with whatever the
+    /// Governor later decides. Digest material carries no timestamps, so an
     /// exact retry of the same cursor, high-water, and identities is
     /// digest-equivalent.
     ///
@@ -896,21 +1239,6 @@ impl WatchdogSpool {
             high_water,
             &limits,
         )? {
-            ExportWindow::IntentParked => {
-                // The export frontier is parked at a spool-local intent: no
-                // batch can form past the cursor until Governor-side
-                // admission lands. The parked empty batch pins its
-                // high-water to the acknowledged sequence so the core
-                // empty-batch shape validates (it requires
-                // `acknowledged == high-water`); the live high-water is
-                // untouched, `export_once` short-circuits on
-                // `is_empty_batch` without touching the sink, and the
-                // parked intents stay retained for later reconciliation.
-                let batch =
-                    build_empty_export_batch(predecessor, predecessor.acknowledged_sequence)?;
-                validate_batch(&batch, high_water)?;
-                Ok((batch, Vec::new()))
-            }
             ExportWindow::Ready(selected) => {
                 let (batch, raws) = build_export_batch(predecessor, high_water, &selected)?;
                 validate_batch(&batch, high_water)?;
@@ -1012,7 +1340,9 @@ impl WatchdogSpool {
     /// acknowledged sequence). Only retained entries at or below the
     /// acknowledged sequence are candidates, and a `Gap` or `Recovery`
     /// boundary entry at or above the cursor is never removed: it is retained
-    /// until a later acknowledgement advances past it. Before removing, the
+    /// until a later acknowledgement advances past it. A spool-local intent is
+    /// never removed at any sequence, so the original Watchdog record stays
+    /// retained for forensic linkage after reconciliation. Before removing, the
     /// retained `Gap` and `Recovery` payloads are scanned and removal stops
     /// below the first unresolved marker above the cursor, so compaction can
     /// never cross an unresolved gap. The header high-water marker and
@@ -1203,6 +1533,114 @@ pub(crate) fn watchdog_spool_path(watchdog_state_root: &Path) -> PathBuf {
     watchdog_state_root.join(WATCHDOG_SPOOL_FILE_NAME)
 }
 
+/// Storage encoding of the Watchdog-owned deterministic-rule state row.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WatchdogIntentRuleStateRecord {
+    schema_version: u16,
+    state: intent::GovernorIntentRuleState,
+}
+
+fn encode_intent_rule_state(
+    state: &intent::GovernorIntentRuleState,
+) -> Result<Vec<u8>, SpoolError> {
+    let record = WatchdogIntentRuleStateRecord {
+        schema_version: intent::INTENT_RULE_SCHEMA_VERSION,
+        state: state.clone(),
+    };
+    serde_json::to_vec(&record).map_err(|error| SpoolError::Serialization(error.to_string()))
+}
+
+fn decode_intent_rule_state(bytes: &[u8]) -> Result<intent::GovernorIntentRuleState, SpoolError> {
+    let record: WatchdogIntentRuleStateRecord = serde_json::from_slice(bytes).map_err(|error| {
+        SpoolError::Corrupt(format!("watchdog intent rule state is invalid: {error}"))
+    })?;
+    if record.schema_version != intent::INTENT_RULE_SCHEMA_VERSION
+        || record.state.schema_version != record.schema_version
+    {
+        return Err(SpoolError::Corrupt(
+            "watchdog intent rule state schema is unsupported".to_owned(),
+        ));
+    }
+    record.state.validate()?;
+    Ok(record.state)
+}
+
+/// Storage encoding of one durable submit-once reconciliation receipt.
+///
+/// Mirrors [`intent::WatchdogIntentSubmission`] one to one. The ledger row key
+/// is the retained Watchdog spool sequence, and the sequence is re-checked
+/// against that key on every read, so a receipt can never be relocated onto a
+/// different spool record.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WatchdogIntentReceiptRecord {
+    schema_version: u16,
+    sequence: u64,
+    idempotency_key: String,
+    acknowledgement_digest: String,
+    submitted_at_ms: u64,
+}
+
+fn encode_intent_receipt(
+    submission: &intent::WatchdogIntentSubmission,
+) -> Result<Vec<u8>, SpoolError> {
+    let record = WatchdogIntentReceiptRecord {
+        schema_version: INTENT_RECEIPT_SCHEMA_VERSION,
+        sequence: submission.sequence,
+        idempotency_key: submission.idempotency_key.clone(),
+        acknowledgement_digest: submission.acknowledgement_digest.clone(),
+        submitted_at_ms: submission.submitted_at_ms,
+    };
+    serde_json::to_vec(&record).map_err(|error| SpoolError::Serialization(error.to_string()))
+}
+
+fn decode_intent_receipt(bytes: &[u8]) -> Result<intent::WatchdogIntentSubmission, SpoolError> {
+    let record: WatchdogIntentReceiptRecord = serde_json::from_slice(bytes).map_err(|error| {
+        SpoolError::Corrupt(format!("watchdog intent submit-once receipt is invalid: {error}"))
+    })?;
+    if record.schema_version != INTENT_RECEIPT_SCHEMA_VERSION {
+        return Err(SpoolError::Corrupt(
+            "watchdog intent submit-once receipt schema is unsupported".to_owned(),
+        ));
+    }
+    let submission = intent::WatchdogIntentSubmission {
+        sequence: record.sequence,
+        idempotency_key: record.idempotency_key,
+        acknowledgement_digest: record.acknowledgement_digest,
+        submitted_at_ms: record.submitted_at_ms,
+    };
+    validate_intent_submission_receipt(&submission)?;
+    Ok(submission)
+}
+
+/// Fails closed on a submit-once receipt that is not in canonical form.
+fn validate_intent_submission_receipt(
+    submission: &intent::WatchdogIntentSubmission,
+) -> Result<(), SpoolError> {
+    if submission.sequence == 0 || submission.submitted_at_ms == 0 {
+        return Err(SpoolError::Corrupt(
+            "watchdog intent submit-once receipt carries an unusable sequence or timestamp"
+                .to_owned(),
+        ));
+    }
+    for (value, label) in [
+        (&submission.idempotency_key, "reconciliation key"),
+        (&submission.acknowledgement_digest, "acknowledgement digest"),
+    ] {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(SpoolError::Corrupt(format!(
+                "watchdog intent submit-once receipt {label} is not a lowercase SHA-256 digest"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Storage encoding of the Watchdog-owned export cursor.
 ///
 /// This private record exists only because the owner-neutral core contract
@@ -1363,13 +1801,13 @@ fn store_export_cursor_bytes(write: &WriteTransaction, bytes: &[u8]) -> Result<(
 /// Maps one spool codec payload to its owner-neutral export class.
 ///
 /// Spool-local intents (`ProblemIntent`, `IncidentIntent`) keep the existing
-/// `Recovery` (gap-like) class here for retention/compaction classification
-/// only: the shared `WatchdogSpoolPayloadKind` is intentionally not extended
-/// (out-of-lane exhaustive matches would break; Governor-side kind admission
-/// is the MGR02 handoff). Export never emits intents — the export window
-/// stops before the first intent — so ordering is preserved, the compaction
-/// gap boundary keeps parked intents retained, and no Recovery disposition
-/// path can touch an intent before Governor reconciliation.
+/// `Recovery` (gap-like) class here: the shared `WatchdogSpoolPayloadKind` is
+/// intentionally not extended (out-of-lane exhaustive matches would break).
+/// The class is used for retention and compaction classification only — the
+/// intent's own fenced reconciliation runs through the Kernel
+/// `watchdog-spool-batch-v1` intent route, never through this tag. Compaction
+/// retains every intent regardless of class, so an acknowledged intent is never
+/// removed and stays linked to the Governor's decision.
 fn export_payload_kind(payload: &WatchdogSpoolPayload) -> WatchdogSpoolPayloadKind {
     match payload {
         WatchdogSpoolPayload::Heartbeat { .. } => WatchdogSpoolPayloadKind::Heartbeat,
@@ -1431,23 +1869,21 @@ fn check_acknowledged_cursor_binding(
 
 /// Outcome of the export window selection past the cursor.
 ///
-/// `IntentParked` means the head-of-window record is a spool-local intent:
-/// intents are stored and retained but never exported until Governor-side
-/// admission lands, so no batch can form past the cursor and the caller must
-/// return the parked empty batch instead of submitting anything to the sink.
+/// Only `Ready` exists: the window always forms, and an intent inside it is an
+/// ordinary covered record that the fenced Kernel intent route reconciles.
 enum ExportWindow {
     Ready(Vec<(WatchdogSpoolEntry, Vec<u8>)>),
-    IntentParked,
 }
 /// Selects the consecutive export window past the cursor under both caps.
 ///
 /// The window starts exactly at `acknowledged + 1` and extends through the
 /// smaller of the caller high-water and the item cap, stopping early at the
-/// byte cap — or before the first spool-local intent, which is never exported
-/// until Governor-side admission lands. At least one exportable record is
-/// always selected unless the head of the window is itself an intent (see
-/// [`ExportWindow::IntentParked`]). Any retention hole inside the window
-/// fails closed instead of skipping a sequence.
+/// byte cap. Spool-local intents are ordinary covered records: the fenced
+/// Kernel intent route reconciles them, so the window continues past an intent
+/// instead of parking in front of it forever, and `compaction_plan` retains the
+/// record afterwards for forensic linkage. At least one record is always
+/// selected. Any retention hole inside the window fails closed instead of
+/// skipping a sequence.
 fn select_export_window(
     entries: &[WatchdogSpoolEntry],
     acknowledged: u64,
@@ -1463,7 +1899,6 @@ fn select_export_window(
     let mut selected = Vec::new();
     let mut bytes_total: u64 = 0;
     let mut expected = first_needed;
-    let mut parked_at_intent = false;
     for entry in entries
         .iter()
         .filter(|entry| entry.sequence >= first_needed && entry.sequence <= item_cap_end)
@@ -1473,10 +1908,6 @@ fn select_export_window(
                 "watchdog spool retention no longer covers the export cursor; refusing to skip sequences"
                     .to_owned(),
             ));
-        }
-        if intent::is_intent_payload(&entry.payload) {
-            parked_at_intent = true;
-            break;
         }
         let raw = encode_entry(entry)?;
         if !selected.is_empty()
@@ -1493,9 +1924,6 @@ fn select_export_window(
         selected.push((entry.clone(), raw));
     }
     if selected.is_empty() {
-        if parked_at_intent {
-            return Ok(ExportWindow::IntentParked);
-        }
         return Err(SpoolError::Corrupt(
             "watchdog spool retention no longer covers the export cursor; refusing to skip sequences"
                 .to_owned(),
@@ -1694,7 +2122,11 @@ fn build_empty_export_batch(
 /// is retained until a later acknowledgement advances past it. Removal also
 /// stops below the first unresolved `Gap` or `Recovery` marker above the
 /// cursor; that bound is implied by the candidate ceiling and enforced here
-/// explicitly so compaction can never cross an unresolved gap.
+/// explicitly so compaction can never cross an unresolved gap. A spool-local
+/// intent is never a compaction candidate at any sequence: the original
+/// Watchdog record must stay retained so the fenced Kernel record and the
+/// Governor's later decision stay forensically linked to it, and retention
+/// pressure eviction is the only thing that may ever drop it.
 fn compaction_plan(entries: &[WatchdogSpoolEntry], acknowledged: u64) -> Vec<u64> {
     let first_unresolved = entries
         .iter()
@@ -1709,6 +2141,7 @@ fn compaction_plan(entries: &[WatchdogSpoolEntry], acknowledged: u64) -> Vec<u64
     entries
         .iter()
         .filter(|entry| entry.sequence <= acknowledged)
+        .filter(|entry| !intent::is_intent_payload(&entry.payload))
         .filter(|entry| {
             matches!(
                 export_payload_kind(&entry.payload),

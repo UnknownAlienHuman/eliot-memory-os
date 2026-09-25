@@ -694,6 +694,41 @@ impl KernelComposition {
                 return self.dispatch_host_request_frame(session, frame);
             }
             #[cfg(windows)]
+            if super::host_request_route::is_watchdog_intent_operation(native_operation) {
+                // I8.1 fenced Watchdog intent reconciliation (Implements
+                // #1754). A Watchdog intent is a parentless observation
+                // submission, so it cannot ride the host-request envelope
+                // (every kind that could carry it requires an exact previously
+                // admitted parent) and must not be folded into that predicate;
+                // it is a separate closed entry with the same gate shape.
+                // `Ready` is required: a degraded service must not admit a new
+                // durable intent projection, and the batch is observation intake
+                // rather than a control frame, so no `Degraded` leg exists here.
+                // Peer, correlation, and fence joins mirror the host-request
+                // gate; the typed payload decode, the mechanical batch
+                // envelope validation, and the named intent mutation live in
+                // `dispatch_watchdog_intent_frame`. Stale or unauthenticated
+                // sessions fence and are never granted protected input.
+                if frame.kind != FrameKind::Request || frame.message_type != MessageType::Execute {
+                    return Err(TransportError::SessionFenced);
+                }
+                if self
+                    .service_state()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    != KernelServiceState::Ready
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                session
+                    .peer
+                    .validate()
+                    .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+                if frame.request_id.is_none() || frame.request_identity.is_none() {
+                    return Err(TransportError::SessionFenced);
+                }
+                return self.dispatch_watchdog_intent_frame(session, frame);
+            }
+            #[cfg(windows)]
             if is_wasm_port_grant_operation(native_operation) {
                 // #1780 D3 WASM port-grant issuance rides the same admitted
                 // bridge transport as the host-request route above. Issuance

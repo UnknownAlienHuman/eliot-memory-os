@@ -16,20 +16,33 @@
 //! (`WatchdogSpoolPayloadKind` in `eliot-watchdog-core`, mirrored by the
 //! Governor `WatchdogEntryKind` and consumed exhaustively by the eliotd
 //! adapter) are intentionally NOT extended here — out-of-lane exhaustive
-//! matches without a wildcard would break (see the MGR02 handoff). Intent
-//! records are spool-local types persisted as new `WatchdogSpoolPayload`
-//! variants through the existing spool tables, batch builder, and digests,
-//! and export under the existing `Recovery` (gap-like) class, so ordering,
-//! retention, and the terminal disposition table are unchanged. Governor-side
-//! kind admission and any new named mutation are slice 2 (MGR02 handoff).
+//! matches without a wildcard would break. Intent records are spool-local types
+//! persisted as new `WatchdogSpoolPayload` variants through the existing spool
+//! tables, batch builder, and digests, and export under the existing `Recovery`
+//! (gap-like) class, so ordering and retention are unchanged.
+//!
+//! Reconciliation boundary (#1754): the deterministic escalation rule below is
+//! the production minter for [`GovernorUnavailability`]. Its only production
+//! caller is the crate-private
+//! [`GovernorIntentAdmissionSource`](crate::GovernorIntentAdmissionSource),
+//! which mints only from a genuinely observed admission-path failure and
+//! appends the resulting record through the Watchdog-owned
+//! [`WatchdogSpool::append`](super::WatchdogSpool::append). The fenced Kernel
+//! side is the `watchdog-spool-batch-v1` route admitted by `eliot-kernel`,
+//! whose intent mutation records a pending intent projection keyed by
+//! [`watchdog_intent_reconciliation_idempotency_key`] and never a canonical
+//! Problem or Incident decision.
+
+use eliot_contracts::sha256_hex;
 
 use super::codec::WatchdogSpoolPayload;
 use crate::{GapRecoveryReason, KernelWatchdogError, SERVICE_NAME, SpoolError};
 
-/// True for the spool-local intent payloads, which are stored and retained
-/// but never exported until Governor-side admission lands (see
-/// `super::select_export_window`, which stops the export window before the
-/// first intent instead of emitting it under another class).
+/// True for the spool-local intent payloads, which are stored, retained for
+/// forensic linkage, and exported inside their export window once the fenced
+/// Kernel intent route admits them. `compaction_plan` never removes an intent,
+/// so the original Watchdog record stays linked to whatever the Governor later
+/// decides.
 pub(crate) fn is_intent_payload(payload: &WatchdogSpoolPayload) -> bool {
     matches!(
         payload,
@@ -112,6 +125,7 @@ impl IntentLineage {
             watchdog_epoch,
         })
     }
+
 }
 
 /// Proof that the Governor admission path is unavailable, gating intent append.
@@ -155,8 +169,6 @@ impl GovernorUnavailability {
     ///
     /// Returns [`SpoolError::Corrupt`] when `error` is not one of the exact
     /// lease-failure variants above.
-    // Slice-2 Governor-admission minter: no production caller until the MGR02 handoff lands.
-    #[allow(dead_code)]
     pub(crate) fn from_admission_error(error: &SpoolError) -> Result<Self, SpoolError> {
         let reason = match error {
             SpoolError::LeaseStale(_) => GapRecoveryReason::LeaseStale,
@@ -190,8 +202,6 @@ impl GovernorUnavailability {
     ///
     /// Returns [`SpoolError::Corrupt`] when `error` is not one of the exact
     /// lease-failure variants above.
-    // Slice-2 Governor-admission minter: no production caller until the MGR02 handoff lands.
-    #[allow(dead_code)]
     pub(crate) fn from_kernel_error(error: &KernelWatchdogError) -> Result<Self, SpoolError> {
         let reason = match error {
             KernelWatchdogError::LeaseStale => GapRecoveryReason::LeaseStale,
@@ -388,6 +398,421 @@ impl IncidentIntentRecord {
     }
 }
 
+/// Consecutive observed Governor-unavailability proofs that mint one
+/// `problem_intent`.
+///
+/// Three bounded supervision ticks (or admission probes) with a live
+/// Governor-admission rejection and no intervening live admission is the
+/// configured Problem threshold. The value is a Config Default, not an
+/// invariant: the rule is a pure function of the durable counter below, so
+/// changing it changes only when a future episode mints.
+pub(crate) const PROBLEM_INTENT_OBSERVATION_THRESHOLD: u32 = 3;
+
+/// Consecutive observed Governor-unavailability proofs that mint one
+/// `incident_intent`.
+///
+/// The incident threshold is strictly above the problem threshold, so a
+/// sustained unavailability escalates from a problem intent to an incident
+/// intent instead of minting both for the same episode.
+pub(crate) const INCIDENT_INTENT_OBSERVATION_THRESHOLD: u32 = 9;
+
+const _: () = assert!(PROBLEM_INTENT_OBSERVATION_THRESHOLD >= 2);
+const _: () =
+    assert!(INCIDENT_INTENT_OBSERVATION_THRESHOLD > PROBLEM_INTENT_OBSERVATION_THRESHOLD);
+
+/// Storage revision of the durable deterministic-rule state.
+pub(crate) const INTENT_RULE_SCHEMA_VERSION: u16 = 1;
+
+/// Watchdog-owned intent class of one retained spool record.
+///
+/// The class is an observation label read back from the Watchdog's own
+/// restricted record. It is not a canonical Problem or Incident state: the
+/// Governor performs the canonical transition after it consumes the intent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WatchdogIntentClass {
+    /// `problem_intent` observation.
+    Problem,
+    /// `incident_intent` observation.
+    Incident,
+}
+
+impl WatchdogIntentClass {
+    /// Returns the exact Watchdog record kind name for this class.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Problem => "problem_intent",
+            Self::Incident => "incident_intent",
+        }
+    }
+
+    /// Reads the intent class back from one stored payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Corrupt`] for a non-intent payload.
+    pub(crate) fn of_payload(payload: &WatchdogSpoolPayload) -> Result<Self, SpoolError> {
+        match payload {
+            WatchdogSpoolPayload::ProblemIntent { .. } => Ok(Self::Problem),
+            WatchdogSpoolPayload::IncidentIntent { .. } => Ok(Self::Incident),
+            WatchdogSpoolPayload::Heartbeat { .. }
+            | WatchdogSpoolPayload::Gap { .. }
+            | WatchdogSpoolPayload::Recovery { .. } => Err(SpoolError::Corrupt(
+                "watchdog spool record is not an intent payload".to_owned(),
+            )),
+        }
+    }
+}
+
+/// Deterministic outcome of one observed Governor-unavailability proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GovernorIntentDecision {
+    /// The proof was counted; no configured threshold was reached.
+    Counting { consecutive: u32 },
+    /// The configured Problem threshold was reached exactly: mint a
+    /// `problem_intent` and close the episode.
+    ProblemIntent { consecutive: u32 },
+    /// The configured Incident threshold was reached exactly: mint an
+    /// `incident_intent` and close the episode.
+    IncidentIntent { consecutive: u32 },
+}
+
+/// Classifies the exact consecutive-observation count of one episode.
+///
+/// The match is deliberately exhaustive with no wildcard and compares exact
+/// thresholds only: a stored count that somehow sits *above* the incident
+/// threshold is not a mint decision at all, so a jumped or forged counter can
+/// never produce an intent. Only the exact crossing mints, and the caller
+/// closes the episode afterwards, so one episode mints at most one intent.
+fn classify_governor_intent_threshold(consecutive: u32) -> Result<GovernorIntentDecision, SpoolError> {
+    match consecutive {
+        value if value == PROBLEM_INTENT_OBSERVATION_THRESHOLD => {
+            Ok(GovernorIntentDecision::ProblemIntent { consecutive: value })
+        }
+        value if value == INCIDENT_INTENT_OBSERVATION_THRESHOLD => {
+            Ok(GovernorIntentDecision::IncidentIntent { consecutive: value })
+        }
+        value if value < PROBLEM_INTENT_OBSERVATION_THRESHOLD => {
+            Ok(GovernorIntentDecision::Counting { consecutive: value })
+        }
+        value if value < INCIDENT_INTENT_OBSERVATION_THRESHOLD => {
+            Ok(GovernorIntentDecision::Counting { consecutive: value })
+        }
+        _ => Err(SpoolError::Corrupt(
+            "watchdog intent rule state sits above the configured incident threshold; refusing to mint"
+                .to_owned(),
+        )),
+    }
+}
+
+/// Derives one bounded observation digest for a Governor-unavailability
+/// episode.
+///
+/// The digest covers the exact observed material only: the owning
+/// installation, the Watchdog generation, the closed observation source, the
+/// observed unavailability reason, and the observation timestamp. It is
+/// observation evidence, not a semantic claim, and it never contains project
+/// meaning, task decisions, or canonical state.
+#[must_use]
+pub(crate) fn governor_unavailable_observation_digest(
+    installation_id: &str,
+    watchdog_generation: u64,
+    source: &str,
+    reason: GapRecoveryReason,
+    observed_at_ms: u64,
+) -> String {
+    let reason_code = match reason {
+        GapRecoveryReason::AdmissionUnavailable => "ADMISSION_UNAVAILABLE",
+        GapRecoveryReason::LeaseStale => "LEASE_STALE",
+        GapRecoveryReason::LeaseInvalid => "LEASE_INVALID",
+        GapRecoveryReason::LeaseFenced => "LEASE_FENCED",
+        GapRecoveryReason::HostAbsentOrStopped => "HOST_ABSENT_OR_STOPPED",
+        GapRecoveryReason::HostPidReused => "HOST_PID_REUSED",
+        GapRecoveryReason::HostImageSubstituted => "HOST_IMAGE_SUBSTITUTED",
+        GapRecoveryReason::HostIdentityChanged => "HOST_IDENTITY_CHANGED",
+        GapRecoveryReason::HostUnknown => "HOST_UNKNOWN",
+        GapRecoveryReason::SpoolPressure => "SPOOL_PRESSURE",
+    };
+    let material = format!(
+        "watchdog-governor-unavailable-observation-v1\0{installation_id}\0{watchdog_generation}\0{source}\0{reason_code}\0{observed_at_ms}"
+    );
+    sha256_hex(material.as_bytes())
+}
+
+/// Bounded number of retained intents carried by one fenced reconciliation
+/// pass. The value is the ceiling of the EBP intent-batch payload, so the
+/// Watchdog can never build a batch the fenced Kernel route would reject.
+pub(crate) const INTENT_RECONCILIATION_MAX_SUBMISSIONS: usize = 16;
+
+const _: () = assert!(INTENT_RECONCILIATION_MAX_SUBMISSIONS == 16);
+
+// The Watchdog and the EBP contract must agree on the batch and evidence
+// bounds, or the Watchdog could build a submission the fenced Kernel route
+// rejects. These assertions fail the build on any drift instead of at runtime.
+const _: () = assert!(
+    INTENT_RECONCILIATION_MAX_SUBMISSIONS
+        == eliot_protocol::MAX_WATCHDOG_SPOOL_INTENT_SUBMISSIONS
+);
+const _: () = assert!(MAX_INTENT_EVIDENCE_REFS == eliot_protocol::MAX_WATCHDOG_INTENT_EVIDENCE_REFS);
+
+/// One observed Governor-unavailability proof resolved against the durable
+/// rule, together with the bounded evidence chain of its episode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GovernorIntentObservation {
+    /// Deterministic threshold classification of this proof.
+    pub(crate) decision: GovernorIntentDecision,
+    /// Bounded evidence chain of the episode as of this proof, including this
+    /// observation. A non-minting decision keeps the chain for the eventual
+    /// intent; a minting decision returns it for the record it just mints.
+    pub(crate) episode_evidence_refs: Vec<String>,
+}
+
+/// Durable state of the Watchdog-owned deterministic escalation rule.
+///
+/// Persisted in `watchdog.redb` beside the retained records so a restart
+/// cannot reset the threshold and skip escalation, and so a live Governor
+/// admission is the only thing that closes an open episode. The counter and
+/// its bounded evidence chain are the complete rule input; there is no other
+/// hidden state and no caller-chosen reason.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GovernorIntentRuleState {
+    pub(crate) schema_version: u16,
+    pub(crate) consecutive_unavailable_observations: u32,
+    pub(crate) episode_observation_digests: Vec<String>,
+    pub(crate) last_observed_at_ms: u64,
+    pub(crate) last_reason: GapRecoveryReason,
+    pub(crate) problem_intents_spooled: u64,
+    pub(crate) incident_intents_spooled: u64,
+}
+
+impl GovernorIntentRuleState {
+    /// Returns the closed state of a rule that has never observed a
+    /// Governor-unavailability proof.
+    #[must_use]
+    pub(crate) const fn fresh() -> Self {
+        Self {
+            schema_version: INTENT_RULE_SCHEMA_VERSION,
+            consecutive_unavailable_observations: 0,
+            episode_observation_digests: Vec::new(),
+            last_observed_at_ms: 0,
+            last_reason: GapRecoveryReason::AdmissionUnavailable,
+            problem_intents_spooled: 0,
+            incident_intents_spooled: 0,
+        }
+    }
+
+    /// Fails closed on a stored state that is not in canonical form.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Corrupt`] when the schema drifted, the stored
+    /// counter sits above the configured incident threshold, the evidence
+    /// chain is empty below a nonzero counter or exceeds the bounded frame,
+    /// or any stored digest is not exact SHA-256 hex.
+    pub(crate) fn validate(&self) -> Result<(), SpoolError> {
+        if self.schema_version != INTENT_RULE_SCHEMA_VERSION {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent rule state schema is unsupported".to_owned(),
+            ));
+        }
+        classify_governor_intent_threshold(self.consecutive_unavailable_observations)?;
+        if self.episode_observation_digests.len() > MAX_INTENT_EVIDENCE_REFS
+            || (self.consecutive_unavailable_observations > 0
+                && self.episode_observation_digests.is_empty())
+            || (self.consecutive_unavailable_observations == 0
+                && !self.episode_observation_digests.is_empty())
+        {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent rule evidence chain is not consistent with its counter"
+                    .to_owned(),
+            ));
+        }
+        if !self
+            .episode_observation_digests
+            .iter()
+            .all(|digest| is_sha256_hex_shape(digest))
+        {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent rule evidence chain is not canonical".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Records one observed Governor-unavailability proof and classifies the
+    /// configured threshold.
+    ///
+    /// A minting decision also closes the episode: the counter returns to zero
+    /// and the evidence chain is cleared, so a later sustained episode escalates
+    /// from a fresh problem threshold. A non-minting decision keeps the chain
+    /// so the eventual intent carries the exact evidence of its episode. The
+    /// returned evidence chain is the episode as of this proof, captured
+    /// before the closing reset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Corrupt`] when the stored state is not canonical,
+    /// the observed timestamp is uninitialized, or the evidence chain would
+    /// exceed the bounded frame.
+    pub(crate) fn observe(
+        &mut self,
+        observation_digest: String,
+        reason: GapRecoveryReason,
+        observed_at_ms: u64,
+    ) -> Result<GovernorIntentObservation, SpoolError> {
+        self.validate()?;
+        if observed_at_ms == 0 || !is_sha256_hex_shape(&observation_digest) {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent rule observation is not a usable bounded digest"
+                    .to_owned(),
+            ));
+        }
+        if self.episode_observation_digests.len() >= MAX_INTENT_EVIDENCE_REFS {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent rule evidence chain exceeds the bounded frame".to_owned(),
+            ));
+        }
+        self.consecutive_unavailable_observations =
+            self.consecutive_unavailable_observations.saturating_add(1);
+        self.episode_observation_digests.push(observation_digest);
+        self.last_observed_at_ms = observed_at_ms;
+        self.last_reason = reason;
+        let decision = classify_governor_intent_threshold(self.consecutive_unavailable_observations)?;
+        let episode_evidence_refs = self.episode_evidence_refs();
+        if !matches!(decision, GovernorIntentDecision::Counting { .. }) {
+            match decision {
+                GovernorIntentDecision::ProblemIntent { .. } => {
+                    self.problem_intents_spooled = self.problem_intents_spooled.saturating_add(1);
+                }
+                GovernorIntentDecision::IncidentIntent { .. } => {
+                    self.incident_intents_spooled =
+                        self.incident_intents_spooled.saturating_add(1);
+                }
+                GovernorIntentDecision::Counting { .. } => {}
+            }
+            self.consecutive_unavailable_observations = 0;
+            self.episode_observation_digests.clear();
+        }
+        self.validate()?;
+        Ok(GovernorIntentObservation {
+            decision,
+            episode_evidence_refs,
+        })
+    }
+
+    /// Closes an open episode after a live Governor admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Corrupt`] when the stored state is not canonical
+    /// or the observed timestamp is uninitialized.
+    pub(crate) fn close_episode(&mut self, observed_at_ms: u64) -> Result<bool, SpoolError> {
+        self.validate()?;
+        if observed_at_ms == 0 {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent rule recovery timestamp is uninitialized".to_owned(),
+            ));
+        }
+        let was_open = self.consecutive_unavailable_observations > 0;
+        self.consecutive_unavailable_observations = 0;
+        self.episode_observation_digests.clear();
+        self.last_observed_at_ms = observed_at_ms;
+        self.validate()?;
+        Ok(was_open)
+    }
+
+    /// Returns the bounded evidence chain of the currently open episode.
+    #[must_use]
+    pub(crate) fn episode_evidence_refs(&self) -> Vec<String> {
+        self.episode_observation_digests.clone()
+    }
+}
+
+/// Deterministic outcome of one observed Governor-unavailability proof,
+/// resolved against the retained spool.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum GovernorIntentOutcome {
+    /// The proof was counted below the first configured threshold.
+    Counting { consecutive: u32 },
+    /// A `problem_intent` was spooled in `watchdog.redb`.
+    ProblemIntent(WatchdogIntentRecordRef),
+    /// An `incident_intent` was spooled in `watchdog.redb`.
+    IncidentIntent(WatchdogIntentRecordRef),
+}
+
+/// Watchdog-owned identity of one spooled intent record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WatchdogIntentRecordRef {
+    /// Retained spool sequence of the intent record.
+    pub(crate) sequence: u64,
+    /// Watchdog-owned intent class of the record.
+    pub(crate) intent_class: WatchdogIntentClass,
+    /// Observation timestamp of the record.
+    pub(crate) observed_at_ms: u64,
+    /// Digest over the record identity, used as the fenced Kernel
+    /// reconciliation key input.
+    pub(crate) record_digest: String,
+}
+
+/// One retained Watchdog intent awaiting fenced-Kernel reconciliation.
+///
+/// Carries the exact original record so the submission preserves the original
+/// evidence and lineage and the spool can retain the row for forensic linkage
+/// after the acknowledgement. The digests are the same ones the export batch
+/// binds, so the fenced route can prove the presented bytes are the retained
+/// record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingWatchdogIntent {
+    /// The exact retained original record.
+    pub record: super::WatchdogSpoolEntry,
+    /// Watchdog-owned intent class of the record.
+    pub intent_class: WatchdogIntentClass,
+    /// Digest over the record identity (sequence, schema, timestamp, bytes).
+    pub record_digest: String,
+    /// Digest over the canonical record bytes.
+    pub payload_digest: String,
+    /// The Watchdog's own authority epoch lineage, taken from its retained
+    /// installer-approved runtime binding.
+    ///
+    /// This is observation lineage, not a claim about the Kernel's current
+    /// epoch. The fenced Kernel route stamps the durable intent record with it
+    /// rather than with the presenting Kernel fence, so an exactly-once replay
+    /// survives an epoch rotation instead of turning into an identity conflict
+    /// and a second pending projection.
+    pub epoch_lineage: eliot_contracts::EpochLineageId,
+}
+
+/// One durable submit-once receipt for a reconciled spool record.
+///
+/// The receipt is what makes reconciliation exactly-once per spool record: it
+/// is written only after the fenced Kernel acknowledgement is in hand, and any
+/// later attempt for the same retained sequence observes [`AlreadySubmitted`]
+/// instead of submitting again. The receipt stores the Watchdog-owned
+/// idempotency key the Kernel returned so a forged or drifted key can never be
+/// written under an already-submitted record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WatchdogIntentSubmission {
+    /// Retained spool sequence this receipt closes.
+    pub(crate) sequence: u64,
+    /// Reconciliation key the Kernel acknowledged for this record.
+    pub(crate) idempotency_key: String,
+    /// Digest of the Kernel acknowledgement for this record.
+    pub(crate) acknowledgement_digest: String,
+    /// Owner-clock time the acknowledgement was recorded.
+    pub(crate) submitted_at_ms: u64,
+}
+
+/// Result of persisting one submit-once receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntentSubmissionDisposition {
+    /// This call wrote the first receipt for the record.
+    Recorded,
+    /// A receipt already existed for the record: nothing was written and no
+    /// second submission may follow.
+    AlreadySubmitted,
+}
+
 /// Revalidates one stored intent payload against the constructor bounds.
 ///
 /// Heartbeat, Gap, and Recovery payloads pass through untouched. Intent
@@ -494,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn intent_rows_land_in_watchdog_redb_and_wait_for_governor_admission() {
+    fn intent_rows_land_in_watchdog_redb_and_export_for_fenced_reconciliation() {
         let dir = temp_root("intent-rows");
         let spool =
             WatchdogSpool::open_test(&dir.join("watchdog.redb")).expect("open intent spool");
@@ -562,9 +987,9 @@ mod tests {
             WatchdogSpoolPayload::IncidentIntent { .. }
         ));
         assert_eq!(entries[2].observed_at_ms, observed_incident);
-        // The export window stops before the first intent: only the leading
-        // gap ships, and no Recovery-disposition path can touch an intent
-        // before Governor reconciliation.
+        // The export window continues past the intents: the fenced Kernel
+        // intent route reconciles them, and both the leading gap and the two
+        // intents ship inside one batch instead of parking the frontier.
         let predecessor = WatchdogSpoolCursor {
             schema_version: 1,
             acknowledged_sequence: 0,
@@ -581,21 +1006,21 @@ mod tests {
                 high_water,
                 WatchdogSpoolExportLimits::default(),
             )
-            .expect("export stops before intents");
-        assert_eq!(batch.entries.len(), 1);
+            .expect("export continues past intents");
+        assert_eq!(batch.entries.len(), 3);
         assert_eq!(batch.first_sequence, 1);
-        assert_eq!(batch.last_sequence, 1);
+        assert_eq!(batch.last_sequence, 3);
         assert_eq!(batch.entries[0].payload_kind, WatchdogSpoolPayloadKind::Gap);
-        assert_eq!(raws.len(), 1);
+        assert_eq!(raws.len(), 3);
         drop(spool);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn intent_head_parks_export_with_empty_batch() {
-        let dir = temp_root("intent-parked");
+    fn intent_headed_window_still_forms_a_batch() {
+        let dir = temp_root("intent-headed");
         let spool =
-            WatchdogSpool::open_test(&dir.join("watchdog.redb")).expect("open parked spool");
+            WatchdogSpool::open_test(&dir.join("watchdog.redb")).expect("open intent-headed spool");
         let problem = ProblemIntentRecord::new(
             test_proof(),
             SERVICE_NAME.to_owned(),
@@ -603,11 +1028,11 @@ mod tests {
             test_lineage(),
             1_000,
         )
-        .expect("parked problem intent");
+        .expect("head problem intent");
         assert!(matches!(
             spool
                 .append(1_000, problem.to_payload())
-                .expect("append parked problem intent"),
+                .expect("append head problem intent"),
             SpoolAppendOutcome::Stored
         ));
         let incident = IncidentIntentRecord::new(
@@ -617,11 +1042,11 @@ mod tests {
             test_lineage(),
             2_000,
         )
-        .expect("parked incident intent");
+        .expect("head incident intent");
         assert!(matches!(
             spool
                 .append(2_000, incident.to_payload())
-                .expect("append parked incident intent"),
+                .expect("append head incident intent"),
             SpoolAppendOutcome::Stored
         ));
         let predecessor = WatchdogSpoolCursor {
@@ -632,26 +1057,29 @@ mod tests {
             installation_id: "installation-test".to_owned(),
             sink_id: "sink-test".to_owned(),
         };
-        let high_water = spool.high_water_sequence().expect("parked high-water");
+        let high_water = spool.high_water_sequence().expect("intent-headed high-water");
         assert_eq!(high_water, 2);
-        // Head of the window is an intent: no batch can form, so the spool
-        // owner returns the parked empty batch and the sink is never
-        // submitted to (`export_once` short-circuits on `is_empty_batch`).
         let (batch, raws) = spool
             .export_batch(
                 &predecessor,
                 high_water,
                 WatchdogSpoolExportLimits::default(),
             )
-            .expect("parked export");
-        assert!(batch.is_empty_batch);
-        assert!(batch.entries.is_empty());
-        assert!(raws.is_empty());
-        assert_eq!(batch.high_water_sequence, predecessor.acknowledged_sequence);
+            .expect("intent-headed export");
+        // The export window continues past an intent: the fenced Kernel
+        // `watchdog-spool-batch-v1` intent route reconciles it, so a retained
+        // intent can never park the frontier in front of later observations.
+        assert!(!batch.is_empty_batch);
+        assert_eq!(batch.entries.len(), 2);
+        assert_eq!(raws.len(), 2);
         assert_eq!(batch.first_sequence, 1);
-        assert_eq!(batch.last_sequence, 0);
-        // Parked intents stay retained for Governor reconciliation.
-        let entries = spool.readback().expect("parked readback");
+        assert_eq!(batch.last_sequence, 2);
+        assert!(matches!(
+            batch.entries[0].payload_kind,
+            WatchdogSpoolPayloadKind::Recovery
+        ));
+        // Both intents stay retained for the Governor's later decision.
+        let entries = spool.readback().expect("intent-headed readback");
         assert_eq!(entries.len(), 2);
         drop(spool);
         let _ = std::fs::remove_dir_all(&dir);

@@ -60,8 +60,9 @@ pub enum WatchdogSpoolPayload {
         corrupt_digest: String,
     },
     /// Watchdog-owned problem intent for Governor-unavailable reconciliation
-    /// (I8.1, case-(b) spool-local kind: stored and retained, never exported
-    /// until Governor-side admission lands, and never as a new shared kind).
+    /// (I8.1, spool-local kind: stored, retained for forensic linkage, and
+    /// exported inside its export window for the fenced Kernel
+    /// `watchdog-spool-batch-v1` intent route, never as a new shared kind).
     /// Evidence refs are 64-hex digests;
     /// lineage mirrors the export cursor identities; the reason proves
     /// an observed Governor admission failure (an admission/lease reason only;
