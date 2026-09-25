@@ -2196,7 +2196,7 @@ mod tests {
         let CanarySourceBundleMaterializeOutcome::Published(receipt) = outcome else {
             panic!("exact materializer publication unexpectedly requires reconciliation");
         };
-        assert_eq!(receipt.files.len(), 14);
+        assert_eq!(receipt.files.len(), 15);
         assert_eq!(
             receipt.directory_publication.source_identity,
             receipt.directory_publication.destination_identity

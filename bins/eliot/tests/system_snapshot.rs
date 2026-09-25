@@ -759,6 +759,10 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
             fixture_path(root, "eliotd.json"),
             fixture_handle("--eliotd-descriptor-sha256"),
             fixture_handle("9".repeat(64)),
+            fixture_handle("--dreamer-artifact-sha256"),
+            fixture_handle("c".repeat(64)),
+            fixture_handle("--dreamer-executable-path"),
+            fixture_path(root, "eliot-dreamer.exe"),
         ],
         store_bridge_arguments: vec![
             fixture_handle("--portable-dev-root"),
