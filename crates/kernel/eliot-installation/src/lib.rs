@@ -43,15 +43,15 @@ use eliot_platform_windows::{
     InstallerRootPrimitiveCreate, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
     InstallerRootProfile, InstallerRootStage, InstallerSecretCreateDisposition,
     InstallerSecretObservation, ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease,
-    ServiceAbsentProof, ServiceAccount, ServiceBootstrapArguments, ServiceRegistrationCurrent,
-    ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
-    ServiceRegistrationRuntimeReadback, ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome,
-    StagingReceipt, SupervisionAuthorityKeyError, SupervisionAuthorityKeyStoreRequest,
-    UserOwnedPathLease, WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider,
-    WindowsPlatform, WindowsStoreCredentialTargetGenerator, WindowsSupervisionAuthorityKeyStore,
-    current_user_local_app_data_root, fresh_service_registration_nonce,
-    observe_running_eliot_host_process, protected_program_data_root,
-    require_protected_program_data_path, resolve_service_sid,
+    ServiceAbsentProof, ServiceAccount, ServiceBootstrapArguments, ServiceInspectionUnknownDetail,
+    ServiceRegistrationCurrent, ServiceRegistrationOutcome, ServiceRegistrationRequest,
+    ServiceRegistrationRuntimeInspection, ServiceRegistrationRuntimeReadback, ServiceStartMode,
+    ServiceStartOutcome, ServiceStopOutcome, StagingReceipt, SupervisionAuthorityKeyError,
+    SupervisionAuthorityKeyStoreRequest, UserOwnedPathLease, WindowsInstallerRootPrimitive,
+    WindowsInstallerSecretProvider, WindowsPlatform, WindowsStoreCredentialTargetGenerator,
+    WindowsSupervisionAuthorityKeyStore, current_user_local_app_data_root,
+    fresh_service_registration_nonce, observe_running_eliot_host_process,
+    protected_program_data_root, require_protected_program_data_path, resolve_service_sid,
 };
 #[cfg(test)]
 use eliot_platform_windows::{
@@ -4537,8 +4537,19 @@ impl WindowsInstallationEffectPort {
                 }
             }
             ServiceRegistrationRuntimeReadback::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationRuntimeReadback::Unknown { .. } => {
-                Ok(root_mismatch("service-readback"))
+            ServiceRegistrationRuntimeReadback::Unknown { detail } => {
+                // Issue #1352: an indeterminate or failed read is not an
+                // established configuration mismatch. Preserve the exact
+                // typed stage/Win32/state/PID cause through the existing
+                // `PortError::ProviderReference` owner so the coordinator
+                // retains it as `InstallationEffectProgressState::Unknown`
+                // instead of publishing a known `Mismatch`. A detail that
+                // cannot form its own bounded reference is a typed
+                // `PortError` contract rejection, propagated unchanged.
+                Err(PortError::ProviderReference {
+                    error: service_registration_unknown_provider_error(&detail),
+                    reference: service_registration_unknown_reference(request, &detail)?,
+                })
             }
         }
     }
@@ -4627,8 +4638,16 @@ impl WindowsInstallationEffectPort {
                 )
             }
             ServiceRegistrationRuntimeReadback::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationRuntimeReadback::Unknown { .. } => {
-                Ok(root_mismatch("service-readback"))
+            ServiceRegistrationRuntimeReadback::Unknown { detail } => {
+                // Issue #1352: the same bounded non-`Known` projection as
+                // `inspect_service`. After a registration effect the retained
+                // reference is correlated to this exact request identity, so
+                // the unresolved read stays attributable to its original
+                // operation instead of becoming a known mismatch.
+                Err(PortError::ProviderReference {
+                    error: service_registration_unknown_provider_error(&detail),
+                    reference: service_registration_unknown_reference(request, &detail)?,
+                })
             }
         }
     }
@@ -4863,8 +4882,17 @@ impl WindowsInstallationEffectPort {
             }
             ServiceRegistrationRuntimeInspection::Absent => Ok(root_mismatch("service-missing")),
             ServiceRegistrationRuntimeInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationRuntimeInspection::Unknown { .. } => {
-                Ok(root_mismatch("service-readback"))
+            ServiceRegistrationRuntimeInspection::Unknown { detail } => {
+                // Issue #1352: `service-readback` named no cause, so an
+                // access-denied open, an unstable two-sample state/PID pair or
+                // a missing process identity was published as a proven
+                // configuration mismatch. The typed detail is preserved
+                // instead, through the same bounded owner the
+                // `RegisterService` inspect/reconcile arms use.
+                Err(PortError::ProviderReference {
+                    error: service_registration_unknown_provider_error(&detail),
+                    reference: service_registration_unknown_reference(request, &detail)?,
+                })
             }
         }
     }
@@ -4928,8 +4956,16 @@ impl WindowsInstallationEffectPort {
             }
             ServiceRegistrationRuntimeInspection::Absent => Ok(root_mismatch("service-missing")),
             ServiceRegistrationRuntimeInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationRuntimeInspection::Unknown { .. } => {
-                Ok(root_mismatch("service-readback"))
+            ServiceRegistrationRuntimeInspection::Unknown { detail } => {
+                // Issue #1352: the same bounded non-`Known` projection as
+                // `service_start_inspect` and `reconcile_service`. After a
+                // start effect the retained reference is correlated to this
+                // exact request identity, so the unresolved read stays
+                // attributable to its original operation.
+                Err(PortError::ProviderReference {
+                    error: service_registration_unknown_provider_error(&detail),
+                    reference: service_registration_unknown_reference(request, &detail)?,
+                })
             }
         }
     }
@@ -7086,6 +7122,63 @@ pub fn registry_projection_pending_ref(
 /// its convergence deadline without acknowledgement.
 pub(crate) const SERVICE_START_TIMEOUT_PENDING_REF: &str = "timeout:service-start-convergence";
 
+/// Typed class of the post-bootstrap non-effect failure whose durable
+/// rejection is persisted by
+/// [`WindowsInstallationCoordinator::persist_non_effect_rejection`].
+///
+/// The class is the durable reference's type. It is never collapsed into a
+/// display string or a generic code between the CLI seam and this crate, so
+/// `recover`/`rollback` can tell a retained-Host-root reopen apart from a
+/// registry projection failure instead of reading a sibling's reference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostBootstrapRejectionClass {
+    /// `E3`: the retained per-installation Host root could not be reopened
+    /// after the Host bootstrap prefix applied. No registry projection was
+    /// attempted, so the reference must not name one.
+    HostRootReopen,
+    /// `E4`/`E5` and the still-`Registering` branch of `E6`: the pending
+    /// installation registry could not be opened, read, or projected.
+    RegistryProjection,
+}
+
+impl PostBootstrapRejectionClass {
+    /// Stable durable reference prefix for this failure class. The prefix is
+    /// part of the durable typed reference and never changes meaning.
+    #[must_use]
+    pub const fn pending_ref_prefix(self) -> &'static str {
+        match self {
+            Self::HostRootReopen => "pending:host-root-reopen:",
+            Self::RegistryProjection => "pending:registry-projection:",
+        }
+    }
+}
+
+/// Builds the durable typed rejection reference for one
+/// [`PostBootstrapRejectionClass`] observed after the Host bootstrap prefix.
+///
+/// The reference binds the exact transaction to the class that actually
+/// failed, so a later `recover`/`rollback` promotes through the existing
+/// `Registering → RollbackRequired → RolledBack` gate against a truthful
+/// cause rather than a sibling failure mode's reference.
+pub fn post_bootstrap_rejection_pending_ref(
+    transaction_id: &PlatformHandle,
+    class: PostBootstrapRejectionClass,
+) -> Result<PlatformHandle, InstallationError> {
+    match class {
+        // One reference text per class: the registry-projection reference is
+        // the exact text the existing durable-rejection proof asserts.
+        PostBootstrapRejectionClass::RegistryProjection => {
+            registry_projection_pending_ref(transaction_id)
+        }
+        PostBootstrapRejectionClass::HostRootReopen => PlatformHandle::new(format!(
+            "{}{}",
+            class.pending_ref_prefix(),
+            transaction_id.as_str()
+        ))
+        .map_err(|error| platform_error(&error)),
+    }
+}
+
 /// Coordinates one durable installation transaction without owning platform mechanics.
 pub(crate) struct InstallationCoordinator<P, S> {
     port: P,
@@ -9051,15 +9144,20 @@ where
     }
 
     /// Persists a durable typed rejection for a non-effect failure observed
-    /// after the Host bootstrap prefix (registry projection open/load).
+    /// after the Host bootstrap prefix (retained Host-root reopen, registry
+    /// projection open/load).
     ///
     /// This is the `mark_unknown`-equivalent coordinator-owned CAS seam: it
     /// sets `pending_external_changes=[pending_ref]` and advances
     /// `Registering → RollbackRequired` via [`InstallationTransaction::mark_unknown`]
     /// plus a version-checked `compare_and_save`. It is refused in `Activating`
     /// or when an activation projection intent is present (mirroring
-    /// `mark_unknown`), so `E6` callers must reload and only persist while
-    /// still `Registering`. The `rollback()` gate itself is unchanged.
+    /// `mark_unknown`), so a caller that must reload first may only persist
+    /// while still `Registering`. The `rollback()` gate itself is unchanged.
+    ///
+    /// `pending_ref` is built by [`post_bootstrap_rejection_pending_ref`] from
+    /// the [`PostBootstrapRejectionClass`] that actually failed, so the durable
+    /// reference names the real cause.
     pub fn persist_non_effect_rejection(
         &mut self,
         transaction_id: &PlatformHandle,
@@ -9092,6 +9190,15 @@ where
     /// any residual unknown, or any contour outside the timeout shape refuses
     /// with recovery/forward-repair rather than quarantining or dropping the
     /// intent.  This never executes an effect: reconciliation is read-only.
+    ///
+    /// The readback is issued on the `Rollback` leg because that is the only
+    /// leg for which the sealed port admits a stopped service as `Absent`.  An
+    /// unsettled start records no external identity of its own, so the request
+    /// is bound to the identity the transaction durably recorded for the same
+    /// named service on its `RegisterService` effect; see
+    /// `InstallationTransaction::recorded_service_registration_identity`.
+    /// A present or differently-identified service therefore mismatches and
+    /// refuses; the reconciliation can never adopt an unknown process.
     pub(crate) fn reconcile_timeout_starts_for_owner_rollback(
         &mut self,
         transaction: &InstallationTransaction,
@@ -9108,6 +9215,10 @@ where
         }
         let candidates = transaction.recoverable_timeout_start_indexes()?;
         for index in &candidates {
+            let role = match &transaction.installer_effects[*index] {
+                InstallerEffectPlan::StartService { role, .. } => *role,
+                _ => return Err(InstallationError::IdentityConflict),
+            };
             let attempt = match &transaction.effect_progress[*index].state {
                 InstallationEffectProgressState::IntentCommitted { attempt, .. } => *attempt,
                 InstallationEffectProgressState::Unknown { .. } => 1,
@@ -9120,7 +9231,7 @@ where
                 *index,
                 attempt,
                 InstallationEffectAction::Rollback,
-                None,
+                Some(transaction.recorded_service_registration_identity(role)?),
             )?;
             let observed = match self.port.reconcile(&request) {
                 PortOutcome::Known(observed) => {
@@ -9338,14 +9449,15 @@ where
     }
 
     /// Persists a durable typed rejection for a post-bootstrap non-effect
-    /// failure (registry projection open/load, `E4`/`E5` and the
-    /// still-`Registering` branch of `E6`).
+    /// failure (retained Host-root reopen, registry projection open/load).
     ///
     /// Coordinator-owned `mark_unknown`-equivalent CAS:
     /// `pending_external_changes=[pending_ref]` + `Registering → RollbackRequired`.
     /// Refused in `Activating` or with an activation intent (mirroring
-    /// `mark_unknown`); `E6` must reload first and only call this while still
-    /// `Registering`. The `rollback()` gate is unchanged.
+    /// `mark_unknown`); a caller that must reload first may only persist while
+    /// still `Registering`. The `rollback()` gate is unchanged. Build
+    /// `pending_ref` with [`post_bootstrap_rejection_pending_ref`] so the
+    /// durable reference names the failure class that actually occurred.
     pub fn persist_non_effect_rejection(
         &mut self,
         transaction_id: &PlatformHandle,
@@ -9368,9 +9480,12 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
     ///
     /// The ordinary `rollback` seam deliberately continues to reject a
     /// transaction carrying an activation intent.  Production recovery callers
-    /// must supply the already-open Host owner capability and registry through
-    /// this explicit owner-aware seam; no caller-supplied approval fields are
-    /// accepted.
+    /// must supply the retained Host state root and the already-open Host
+    /// owner capability through this explicit owner-aware seam;
+    /// no caller-supplied approval fields are accepted.  The root is the
+    /// durable transaction's own candidate-manifest Host root, re-proved by
+    /// `ProtectedRootLease` before redb is opened; it is not a widened or
+    /// caller-chosen path.
     ///
     /// Two pre-no-return first-install contours are admitted.  `Activating`
     /// with the exact pending service-start/credential/Phase-B suffix needs no
@@ -9386,12 +9501,33 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
     /// The intent is cleared only after the exact owner acknowledgement, inside
     /// the single transaction-store `compare_and_save`.  A CAS conflict, a
     /// mismatched pending projection, a missing Host owner, or an unknown
-    /// provider result leaves the intent durable and returns an error.  The
-    /// cleared transaction then re-enters the ordinary exact-effect rollback
-    /// loop, so only `CreatedByTransaction` identities are removed.
+    /// provider result leaves the intent durable and returns an error.  A pending
+    /// activation that is not this transaction's exact projection is never
+    /// aborted and instead persists the durable `Quarantined`
+    /// recovery-required disposition, keeping the intent.  The cleared
+    /// transaction then re-enters the ordinary exact-effect rollback loop, so
+    /// only `CreatedByTransaction` identities are removed.
+    ///
+    /// A13.9 short-lived ownership: the registry writer below is opened fresh
+    /// for the abort phase only (one `open_existing_at` with the single typed
+    /// bounded `AlreadyOpen` retry) and is dropped before the transaction CAS
+    /// and the external rollback effects that follow.  The exclusive redb
+    /// writer is therefore never retained across the transaction
+    /// compare-and-save or across effect execution, so a polling Watchdog
+    /// reader is blocked for at most one bounded abort phase.
+    ///
+    /// # Errors
+    /// Returns `IncompleteObservation` past the no-return boundary, after a
+    /// committed activation, or on a non-first install, before any readback;
+    /// `IllegalTransition` for any stage other than `Activating` or
+    /// `RollbackRequired`; and the typed refusal of a failed service-start
+    /// reconciliation, approval derivation, or registry abort.  A pending
+    /// projection owned by another transaction, plan, approval, or registry
+    /// revision does not reach an error return: it returns the durable
+    /// `Quarantined` outcome instead.
     pub fn rollback_with_activation_owner(
         &mut self,
-        registry: &RedbInstallationRegistry,
+        host_state_root: &Path,
         host: &HostOwnerEpochCapability,
         transaction_id: &PlatformHandle,
     ) -> Result<InstallationStepOutcome, InstallationError> {
@@ -9452,46 +9588,22 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
         let manifest_digest = candidate_manifest_digest(&transaction.candidate_manifest)?;
         let activation_intent_digest = activation_projection_intent_digest(&intent)?;
         let expected_transaction = TransactionVersion::of(&transaction)?;
-        let abort_evidence = match registry.read_exact_aborted_activation_ack(
+        // One short-lived writer for the registry abort phase only.  The
+        // handle (and its exclusive redb file lock) is dropped before the
+        // transaction compare-and-save and the external rollback effects
+        // below, so neither can be blocked behind a retained writer.
+        let abort_evidence = match abort_activation_evidence(&ActivationAbortRequest {
+            host_state_root,
             host,
             transaction_id,
-            &transaction.installer_plan_digest,
-            &transaction.candidate_manifest.generation,
-            &manifest_digest,
-            &approval,
-            &activation_intent_digest,
-        )? {
-            Some(evidence) => evidence,
-            None => {
-                let pending_revision = registry.read_exact_pending_activation_revision(
-                    host,
-                    transaction_id,
-                    &transaction.installer_plan_digest,
-                    &approval,
-                    &activation_intent_digest,
-                )?;
-                registry.abort_pending_activation_exact(
-                    host,
-                    pending_revision,
-                    &approval,
-                    &activation_intent_digest,
-                )?;
-                registry
-                    .read_exact_aborted_activation_ack(
-                        host,
-                        transaction_id,
-                        &transaction.installer_plan_digest,
-                        &transaction.candidate_manifest.generation,
-                        &manifest_digest,
-                        &approval,
-                        &activation_intent_digest,
-                    )?
-                    .ok_or_else(|| {
-                        InstallationError::IncompleteObservation(
-                            "Host abort returned without the exact durable ABORTED terminal"
-                                .to_owned(),
-                        )
-                    })?
+            transaction: &transaction,
+            manifest_digest: &manifest_digest,
+            approval: &approval,
+            activation_intent_digest: &activation_intent_digest,
+        })? {
+            AbortEvidenceOutcome::Aborted(evidence) => evidence,
+            AbortEvidenceOutcome::ForeignPendingProjection(pending_ref) => {
+                return self.inner.persist_quarantined(transaction, pending_ref);
             }
         };
         let mut cleared = transaction;
@@ -9518,6 +9630,143 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
             expected_registry_revision,
         )
     }
+}
+
+/// The two non-error dispositions of the owner-aware activation abort (issue
+/// #1325): the exact durable `ABORTED` acknowledgement the intent is cleared
+/// against, or a foreign pending projection the caller must quarantine instead.
+enum AbortEvidenceOutcome {
+    /// The Host registry durably acknowledged this transaction's exact abort.
+    Aborted(PlatformHandle),
+    /// The pending projection is not this transaction's exact projection. The
+    /// carried reference is the reason to persist; the intent is kept and the
+    /// projection is never aborted.
+    ForeignPendingProjection(PlatformHandle),
+}
+
+/// The exact identities one owner-aware activation abort is proved against.
+///
+/// These are the values the activation projection intent, the signed
+/// transaction state, and the retained Host registry must all agree on. They
+/// travel as one value so no call site can pass a fence from one read and a
+/// plan digest from another.
+struct ActivationAbortRequest<'a> {
+    /// The transaction's own candidate-manifest Host root, re-proved by the
+    /// lease before redb is opened.
+    host_state_root: &'a Path,
+    /// The already-open Host owner capability; never minted here.
+    host: &'a HostOwnerEpochCapability,
+    /// The transaction whose activation intent is being retired.
+    transaction_id: &'a PlatformHandle,
+    /// The loaded transaction, borrowed: the caller still owns it and
+    /// performs the durable quarantine write itself, so the intent is retired
+    /// by exactly one owner.
+    transaction: &'a InstallationTransaction,
+    /// Digest of the exact candidate manifest the intent names.
+    manifest_digest: &'a PlatformHandle,
+    /// The approval derived from the retained signed transaction state.
+    approval: &'a InstallationActivationApproval,
+    /// Digest of the exact activation projection intent.
+    activation_intent_digest: &'a PlatformHandle,
+}
+
+/// Acquires the exact durable abort evidence for one activation intent, or names
+/// the foreign pending projection the caller must quarantine.
+///
+/// A13.9 short-lived ownership is kept here rather than at the call site: the
+/// registry writer is opened once for this abort phase and dropped before the
+/// caller's transaction compare-and-save and external rollback effects, so the
+/// exclusive redb writer is never retained across them.
+///
+/// # Errors
+/// The typed refusal of the lease, the registry open, the exact acknowledgement
+/// read, the pending-revision read, the exact abort, or the post-abort
+/// acknowledgement read.
+fn abort_activation_evidence(
+    request: &ActivationAbortRequest<'_>,
+) -> Result<AbortEvidenceOutcome, InstallationError> {
+    let ActivationAbortRequest {
+        host_state_root,
+        host,
+        transaction_id,
+        transaction,
+        manifest_digest,
+        approval,
+        activation_intent_digest,
+    } = *request;
+    let root = ProtectedRootLease::open_existing(host_state_root)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let registry = RedbInstallationRegistry::open_existing_at(root)?.ok_or_else(|| {
+        InstallationError::IncompleteObservation(
+            "Host activation registry is absent for owner-aware rollback".to_owned(),
+        )
+    })?;
+    // The two registry-keyed identities are read out of the borrowed
+    // transaction once, so every read-back below names the same values.
+    let plan_digest = transaction.installer_plan_digest.clone();
+    let generation = transaction.candidate_manifest.generation.clone();
+    let evidence = if let Some(evidence) = registry.read_exact_aborted_activation_ack(
+        host,
+        transaction_id,
+        &plan_digest,
+        &generation,
+        manifest_digest,
+        approval,
+        activation_intent_digest,
+    )? {
+        AbortEvidenceOutcome::Aborted(evidence)
+    } else {
+        // Issue #1325: a pending activation that is not this transaction's
+        // exact projection — another transaction, plan, generation,
+        // approval, or registry revision, or a registry whose Host owner
+        // binding does not match — is never ours to abort. Refusing it
+        // alone would leave the install transaction byte-identical in its
+        // prior stage with the intent still retained, so an operator would
+        // see no on-disk state at all. The caller persists the existing
+        // durable recovery-required disposition instead: the intent is
+        // kept, the projection is untouched, and the exact reason is named
+        // by the pending reference.
+        let pending_revision = match registry.read_exact_pending_activation_revision(
+            host,
+            transaction_id,
+            &plan_digest,
+            approval,
+            activation_intent_digest,
+        ) {
+            Ok(revision) => revision,
+            Err(InstallationError::IdentityConflict) => {
+                let pending_ref = PlatformHandle::new("mismatch:foreign-pending-activation")
+                    .map_err(|error| platform_error(&error))?;
+                return Ok(AbortEvidenceOutcome::ForeignPendingProjection(pending_ref));
+            }
+            Err(error) => return Err(error),
+        };
+        registry.abort_pending_activation_exact(
+            host,
+            pending_revision,
+            approval,
+            activation_intent_digest,
+        )?;
+        AbortEvidenceOutcome::Aborted(
+            registry
+                .read_exact_aborted_activation_ack(
+                    host,
+                    transaction_id,
+                    &plan_digest,
+                    &generation,
+                    manifest_digest,
+                    approval,
+                    activation_intent_digest,
+                )?
+                .ok_or_else(|| {
+                    InstallationError::IncompleteObservation(
+                        "Host abort returned without the exact durable ABORTED terminal".to_owned(),
+                    )
+                })?,
+        )
+    };
+    drop(registry);
+    Ok(evidence)
 }
 
 fn increment_revision(transaction: &mut InstallationTransaction) -> Result<(), InstallationError> {
@@ -9660,6 +9909,181 @@ fn effect_request(
 
 const REDACTED_PROVIDER_REFERENCE_PENDING: &str = "pending:provider-reference-redacted";
 
+/// Bounded, request-correlated projection of one typed
+/// `ServiceRegistrationRuntimeReadback::Unknown` detail.
+///
+/// Grammar (exactly five `:`-separated fields after the prefix):
+///
+/// ```text
+/// service-registration-unknown-v1:<intent-digest>:<stage>:<win32>:<state|none>:<pid|none>
+/// ```
+///
+/// The reference carries only the exact effect request's identity digest and
+/// the stage, `GetLastError` code and raw SCM state/PID sample the platform
+/// actually observed. It contains no filesystem path, credential, SACL value,
+/// free-form provider prose or authority identity, and it never synthesizes a
+/// sample the platform did not read. `win32` is exactly eight lowercase hex
+/// digits; `state`/`pid` are exactly eight lowercase hex digits when the stage
+/// carries a status sample and the literal `none` when it does not.
+///
+/// Every installation inspect/reconcile arm that observes a typed
+/// `ServiceRegistrationRuntimeInspection::Unknown` or
+/// `ServiceRegistrationRuntimeReadback::Unknown` publishes the cause as
+/// `PortError::ProviderReference { error: .., reference: .. }` built from
+/// `service_registration_unknown_provider_error` and
+/// `service_registration_unknown_reference`. A failed or indeterminate read is
+/// therefore never published as `InstallationEffectObservation::Mismatch`,
+/// never as `Absent` and never as `Matching`; only an actual `Mismatched`
+/// readback stays a known mismatch. A detail that cannot form its own bounded
+/// reference is a typed `PortError` contract rejection and is propagated
+/// unchanged, never widened into a mismatch, a synthesized reference, or a
+/// string.
+const SERVICE_REGISTRATION_UNKNOWN_REFERENCE_PREFIX: &str = "service-registration-unknown-v1:";
+
+/// The exact platform-owned `ServiceInspectionUnknownDetail` stages that the
+/// service-registration runtime readback can carry.
+///
+/// This is the closed producer set of
+/// `WindowsPlatform::inspect_service_registration_runtime_with_control_grant`.
+/// A stage outside it is never rewritten into a representable reference: the
+/// durable projection keeps the existing redaction disposition instead.
+fn is_service_registration_unknown_stage(stage: &str) -> bool {
+    matches!(
+        stage,
+        "open-scm"
+            | "open-service"
+            | "query-config"
+            | "query-sid-type"
+            | "read-grant"
+            | "query-owner"
+            | "query-group"
+            | "resolve-expected-group"
+            | "query-status"
+            | "absent-proof"
+            | "unsupported-platform"
+    )
+}
+
+/// Only the `query-status` stage carries the raw SCM state/PID sample; every
+/// other stage fails before any status sample exists.
+fn is_service_registration_unknown_sample_stage(stage: &str) -> bool {
+    stage == "query-status"
+}
+
+fn is_lowercase_hex8(value: &str) -> bool {
+    value.len() == 8
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Accepts only the exact reference grammar this module produces, with the
+/// stage/sample relationship the platform owner actually establishes.
+fn is_typed_service_registration_unknown_reference(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix(SERVICE_REGISTRATION_UNKNOWN_REFERENCE_PREFIX) else {
+        return false;
+    };
+    let mut parts = rest.split(':');
+    // The field names below name four distinct facts: the request identity
+    // `digest`, the `read_stage` that failed, the raw `GetLastError` `code`,
+    // and the two observed SCM sample fields. `read_stage` deliberately does
+    // not reuse the `state` word: the stage is the read that failed, while
+    // `state`/`pid` are the sample it read.
+    let Some(digest) = parts.next() else {
+        return false;
+    };
+    let Some(read_stage) = parts.next() else {
+        return false;
+    };
+    let Some(code) = parts.next() else {
+        return false;
+    };
+    let Some(state) = parts.next() else {
+        return false;
+    };
+    let Some(pid) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some()
+        || !is_lower_sha256(digest)
+        || !is_service_registration_unknown_stage(read_stage)
+        || !is_lowercase_hex8(code)
+    {
+        return false;
+    }
+    if (state, pid) == ("none", "none") {
+        return true;
+    }
+    is_service_registration_unknown_sample_stage(read_stage)
+        && is_lowercase_hex8(state)
+        && is_lowercase_hex8(pid)
+}
+
+/// Projects one observed typed detail into the bounded reference.
+///
+/// A sample is published only when the platform actually read one, and a
+/// stage that cannot carry a sample never gains one. A detail outside the
+/// closed grammar is a contract-level rejection of the platform token rather
+/// than a synthesized reference.
+fn service_registration_unknown_reference(
+    request: &InstallationEffectRequest,
+    detail: &ServiceInspectionUnknownDetail,
+) -> Result<PlatformHandle, PortError> {
+    // A request that cannot form its own canonical identity cannot carry a
+    // request-correlated reference; that is a deterministic contract
+    // rejection, never a synthesized digest and never a published mismatch.
+    let intent_digest = request
+        .intent_digest()
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+    let (state, pid) = match (detail.current_state(), detail.process_id()) {
+        (Some(state), Some(pid))
+            if is_service_registration_unknown_sample_stage(detail.stage()) =>
+        {
+            (format!("{state:08x}"), format!("{pid:08x}"))
+        }
+        (None, None) => ("none".to_owned(), "none".to_owned()),
+        _ => {
+            return Err(PortError::InvalidText {
+                field: SERVICE_REGISTRATION_UNKNOWN_REFERENCE_PREFIX.to_owned(),
+            });
+        }
+    };
+    let reference = format!(
+        "{SERVICE_REGISTRATION_UNKNOWN_REFERENCE_PREFIX}{}:{}:{:08x}:{state}:{pid}",
+        intent_digest.as_str(),
+        detail.stage(),
+        detail.win32_error()
+    );
+    if !is_typed_service_registration_unknown_reference(&reference) {
+        return Err(PortError::InvalidText {
+            field: SERVICE_REGISTRATION_UNKNOWN_REFERENCE_PREFIX.to_owned(),
+        });
+    }
+    PlatformHandle::new(reference)
+}
+
+/// The non-retryable provider classification for one observed read failure.
+///
+/// Access denial stays distinguishable from other failed reads, and the
+/// `unsupported-platform` contour stays distinguishable from a Windows read
+/// failure. None of these codes is retryable before an exact reconciliation
+/// probe succeeds.
+fn service_registration_unknown_provider_error(
+    detail: &ServiceInspectionUnknownDetail,
+) -> ProviderError {
+    let code = if detail.stage() == "unsupported-platform" {
+        ProviderErrorCode::Unavailable
+    } else if detail.win32_error() == 5 {
+        ProviderErrorCode::PermissionDenied
+    } else {
+        ProviderErrorCode::Failed
+    };
+    ProviderError {
+        code,
+        retryable: false,
+    }
+}
+
 fn port_pending<T>(outcome: PortOutcome<T>) -> PlatformHandle {
     let value = match outcome {
         PortOutcome::Known(_) => "unknown:unexpected-known".to_owned(),
@@ -9671,6 +10095,7 @@ fn port_pending<T>(outcome: PortOutcome<T>) -> PlatformHandle {
         PortOutcome::Error(PortError::ProviderReference { reference, .. }) => {
             if is_typed_installer_root_reference(reference.as_str())
                 || is_typed_package_staging_reference(reference.as_str())
+                || is_typed_service_registration_unknown_reference(reference.as_str())
             {
                 return reference;
             }

@@ -25,8 +25,83 @@ public static class OperatorProtocol
     public const int MaxControlStringChars = 1_024;
     public const int MaxControlDepth = 4;
     public const int MaxControlTokens = 512;
-    /// Bounded connect/handshake timeouts in seconds.
+    /// Bounded connect/handshake timeouts in seconds. The effective connect
+    /// deadline is additionally clamped to the remaining lifetime of the
+    /// owner-issued handoff; a handoff that cannot be consumed in time is
+    /// refused instead of burned.
     public const int ConnectTimeoutSeconds = 10;
+    /// The owner contract issues one Operator handoff with a five second
+    /// lifetime (`OPERATOR_HANDOFF_TTL_MS` in
+    /// `crates/surfaces/eliot-user-broker-core`). The UI never holds a handoff
+    /// longer than the owner allows it to live.
+    public const int HandoffLifetimeSeconds = 5;
+    /// Absolute per-request ceiling in seconds, applied even when the caller
+    /// supplies no cancellation token.
+    public const int RequestTimeoutSeconds = 30;
+
+    // Independently bounded response surfaces. These are separate caps, not a
+    // single "size" number: a response may legitimately carry many small
+    // members, deep nesting, long strings or many array items, and each axis
+    // is refused before the offending data can be trusted or retained.
+    public const int MaxResponseMembers = 200_000;
+    public const int MaxResponseDepth = 32;
+    public const int MaxResponseTokens = 1_000_000;
+    public const int MaxResponseStringChars = 32_768;
+    public const int MaxResponseArrayItems = 20_000;
+
+    /// Bounded local (operator-typed) JSON parameter surface. Operator input
+    /// is parsed by the UI before it ever reaches the wire, so it carries its
+    /// own independent caps and can never become an unbounded nested payload.
+    public const int MaxLocalParameterChars = 16_384;
+    public const int MaxLocalParameterMembers = 256;
+    public const int MaxLocalParameterDepth = 8;
+    public const int MaxLocalParameterTokens = 2_048;
+    public const int MaxLocalParameterStringChars = 1_024;
+    public const int MaxLocalParameterItems = 256;
+
+    /// Retained operator text fields (search, action input, typed JSON) are
+    /// bounded before they are stored on the view model.
+    public const int MaxRetainedInputChars = 16_384;
+
+    /// Retained result payload shown to the operator. An oversized payload is
+    /// refused whole; it is never truncated into a valid-looking object.
+    public const int MaxRetainedResultChars = 64 * 1_024;
+
+    /// Page and cursor surfaces.
+    public const int MinPageSize = 1;
+    public const int MaxCursorChars = 512;
+    public const int MaxProjectionRecords = 1_000;
+    public const int MaxTotalMatching = 10_000_000;
+
+    // Retained projection container caps.
+    public const int MaxRecordFields = 64;
+    public const int MaxRecordRelationships = 128;
+    public const int MaxRecordActions = 32;
+    public const int MaxRecordRefs = 256;
+    public const int MaxRecordTextChars = 2_048;
+    public const int MaxPageCollections = 512;
+}
+
+/// One closed serializer profile for every Operator surface. `Web` defaults
+/// alone leave three surfaces open, so they are closed explicitly here:
+/// unmapped members are refused instead of silently ignored, duplicate names
+/// are refused by the framing guard, and the depth is bounded by
+/// [`OperatorProtocol.MaxResponseDepth`].
+public static class OperatorJson
+{
+    /// Serializer options for wire and local payloads. `NumberHandling`
+    /// stays at the framework default so a typed numeric field is never
+    /// accepted as a string by accident.
+    public static JsonSerializerOptions Reader { get; } = new(JsonSerializerDefaults.Web)
+    {
+        MaxDepth = OperatorProtocol.MaxResponseDepth,
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
+        NumberHandling = JsonNumberHandling.Strict
+    };
+
+    /// Redacts nothing and rewrites nothing: it is the same closed profile.
+    /// It exists so producers name the surface they use.
+    public static JsonSerializerOptions Writer => Reader;
 }
 
 /// One broker-owned, one-shot UI binding. It contains no bearer credential.

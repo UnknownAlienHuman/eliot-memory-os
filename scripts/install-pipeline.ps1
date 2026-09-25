@@ -4,7 +4,9 @@
 
 .DESCRIPTION
     Pipeline orchestrator:
-    - Step 0 (if -Reset): Runs reset-developer-install.ps1. If -not $Install, exits 0.
+    - Step 0 (if -Reset): Runs reset-developer-install.ps1 against the same -Anchor the
+      pipeline installs into. If -not $Install, exits 0 after the reset. A non-zero reset
+      exit code stops the pipeline: the machine is not in the 'not installed' state.
     - Step 4: Runs invoke-eliot-windows-x64-production.ps1 for phase-a materialization.
     - Step 5: Runs eliot.exe installation apply for durable effects.
     Supports -WhatIf / dry-run.
@@ -32,9 +34,11 @@ $WhatIf = [bool]$WhatIfPreference
 if ($Reset) {
     Write-Host "INSTALL step0 reset-developer-install"
     $global:LASTEXITCODE = 0
-    & "$PSScriptRoot\reset-developer-install.ps1" -WhatIf:$WhatIf
-    if ($LASTEXITCODE -ne 0) {
-        throw "reset-developer-install failed with exit code $LASTEXITCODE"
+    & "$PSScriptRoot\reset-developer-install.ps1" -ProgramDataRoot $Anchor -WhatIf:$WhatIf
+    $resetRc = $LASTEXITCODE
+    Write-Host "INSTALL step0 reset-developer-install rc=$resetRc anchor=$Anchor"
+    if ($resetRc -ne 0) {
+        throw "reset-developer-install failed with exit code $resetRc; the machine is not in the 'not installed' state"
     }
     if (-not $Install) {
         $global:LASTEXITCODE = 0

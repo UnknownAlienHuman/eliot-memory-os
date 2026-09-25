@@ -34,8 +34,12 @@
 //! transport bytes. [`publish_owner_feed`] remains available for a
 //! caller that already holds a restored provider.
 
-use eliot_contracts::StateFence;
+use std::collections::{BTreeMap, BTreeSet};
+
+use eliot_authority::RevocationHistoryEvidence;
+use eliot_contracts::{StateFence, canonical_json_bytes};
 use eliot_kernel_core::{GovernorClosureRestore, owner_bundle_digest};
+use eliot_receipts::ReceiptIdentity;
 use eliot_store_api::CanonicalReadClient;
 
 use crate::{
@@ -58,6 +62,15 @@ pub trait OwnerPublishPort: Send + Sync {
         bundle: GovernorClosureRestore,
         expected_revision: u64,
     ) -> Result<u64, CompositionError>;
+    /// Initializes or proves the current owner-lineage graph revision before
+    /// the first history read. It carries no owner bundle or authority.
+    async fn initialize_owner_revision(
+        &self,
+        authority_root_ref: &str,
+        expected_revision: u64,
+        state_fence: &StateFence,
+    ) -> Result<u64, CompositionError>;
+
     /// Reads back the retained owner triple for verification.
     async fn query_owner_readback(
         &self,
@@ -132,22 +145,129 @@ pub async fn synchronize_owner_feed<
     kernel: &P,
     snapshot: AuthorityOwnerSnapshot,
     state_fence: &StateFence,
-    origin_ref: &str,
+    origin_refs: &[String],
     max_records: u32,
     expected_revision: u64,
 ) -> Result<u64, CompositionError> {
-    let request = revocation_history_read_request(state_fence, origin_ref, max_records)?;
-    let response = reads
-        .execute_named(request)
-        .await
-        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-    let evidence = decode_revocation_history_evidence(&response, state_fence)?;
-    if evidence.source_revision != expected_revision {
-        return Err(CompositionError::Recovery(format!(
-            "owner feed observed revision {} disagrees with expected {expected_revision}; trigger is stale",
-            evidence.source_revision
-        )));
+    synchronize_owner_feed_with_canonical_receipts(
+        reads,
+        kernel,
+        snapshot,
+        state_fence,
+        origin_refs,
+        max_records,
+        expected_revision,
+        BTreeMap::new(),
+    )
+    .await
+}
+
+/// Runs the owner feed with canonical second-phase links read from the
+/// durable ORS boundary. The map is never reconstructed from process-local
+/// state; an absent link remains explicitly pending.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the durable feed boundary keeps read, publish, fence, roots, history, revision, and canonical receipt evidence explicit"
+)]
+pub async fn synchronize_owner_feed_with_canonical_receipts<
+    R: CanonicalReadClient + ?Sized,
+    P: OwnerPublishPort + ?Sized,
+>(
+    reads: &R,
+    kernel: &P,
+    snapshot: AuthorityOwnerSnapshot,
+    state_fence: &StateFence,
+    origin_refs: &[String],
+    max_records: u32,
+    expected_revision: u64,
+    canonical_receipts: BTreeMap<String, ReceiptIdentity>,
+) -> Result<u64, CompositionError> {
+    if expected_revision == 0 {
+        return Err(CompositionError::Owner(
+            "owner feed expected revision must be nonzero".to_owned(),
+        ));
     }
-    let provider = OwnerClosureProvider::restore(snapshot, Some(evidence), state_fence)?;
+    if snapshot.state_fence != *state_fence || snapshot.grant_graph.revision != expected_revision {
+        return Err(CompositionError::Recovery(
+            "owner feed snapshot is not bound to the expected fence and graph revision".to_owned(),
+        ));
+    }
+    let expected_roots: BTreeSet<String> = snapshot
+        .grant_graph
+        .grants
+        .iter()
+        .map(|grant| grant.authority_root_ref.clone())
+        .collect();
+    let requested_roots: BTreeSet<String> = origin_refs.iter().cloned().collect();
+    if requested_roots.is_empty() || requested_roots != expected_roots {
+        return Err(CompositionError::Recovery(
+            "owner feed origin set does not match the durable graph roots".to_owned(),
+        ));
+    }
+    let durable_registry = snapshot
+        .owner_hydrations
+        .as_ref()
+        .map(canonical_json_bytes)
+        .transpose()
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    let mut merged_closures = BTreeMap::new();
+    for origin_ref in origin_refs {
+        let initialized = kernel
+            .initialize_owner_revision(origin_ref, expected_revision, state_fence)
+            .await?;
+        if initialized != expected_revision {
+            return Err(CompositionError::Recovery(format!(
+                "owner feed initialized revision {initialized} disagrees with expected {expected_revision}"
+            )));
+        }
+        let request = revocation_history_read_request(state_fence, origin_ref, max_records)?;
+        let response = reads
+            .execute_named(request)
+            .await
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let evidence = decode_revocation_history_evidence(&response, state_fence)?;
+        if evidence.source_revision != expected_revision {
+            return Err(CompositionError::Recovery(format!(
+                "owner feed observed revision {} disagrees with expected {expected_revision}; trigger is stale",
+                evidence.source_revision
+            )));
+        }
+        for closure in evidence.closures {
+            if closure.root_ref != *origin_ref {
+                return Err(CompositionError::Recovery(
+                    "owner history returned a closure for a different authority root".to_owned(),
+                ));
+            }
+            if let Some(previous) = merged_closures.get(&closure.closure_id) {
+                if previous != &closure {
+                    return Err(CompositionError::Recovery(
+                        "owner histories disagree for the same closure identity".to_owned(),
+                    ));
+                }
+            } else {
+                merged_closures.insert(closure.closure_id.clone(), closure);
+            }
+        }
+    }
+    let evidence = RevocationHistoryEvidence {
+        state_fence: state_fence.clone(),
+        source_revision: expected_revision,
+        closures: merged_closures.into_values().collect(),
+    };
+    let provider = OwnerClosureProvider::restore_with_canonical_receipts(
+        snapshot,
+        Some(evidence),
+        state_fence,
+        canonical_receipts,
+    )?;
+    if let Some(expected_registry) = durable_registry {
+        let actual_registry = provider.export_registry()?;
+        if actual_registry != expected_registry {
+            return Err(CompositionError::Recovery(
+                "owner feed rebuilt a hydration registry different from durable owner payload"
+                    .to_owned(),
+            ));
+        }
+    }
     publish_owner_feed(kernel, &provider, expected_revision).await
 }

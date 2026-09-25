@@ -175,7 +175,9 @@ impl ProofCeiling {
 }
 
 /// The bounded effect class named by an operation or authority binding.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EffectClass {
     Read,
@@ -450,6 +452,487 @@ impl AuthorityBinding {
             });
         }
         Ok(())
+    }
+}
+
+/// Stable schema identity for the versioned grant-closure contract family.
+pub const GRANT_CLOSURE_SCHEMA: &str = "eliot.receipts.grant-closure";
+/// Current grant-closure declaration/receipt wire version.
+pub const GRANT_CLOSURE_VERSION: u16 = 1;
+
+/// Canonical owner declaration of one grant and every same-root descendant.
+///
+/// Governor produces this complete parent-before-child declaration at one
+/// graph revision. Kernel consumes it as an immutable mechanical projection;
+/// it never derives semantic membership from process-local state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GrantClosureDeclaration {
+    /// Closed grant-closure schema identity.
+    pub schema: String,
+    /// Closed grant-closure schema version.
+    pub version: u16,
+    /// Exact closure target and first parent-before-child member.
+    pub target_grant_id: String,
+    /// Shared authority root for every member.
+    pub authority_root_ref: String,
+    /// Exact canonical grant-graph revision used for enumeration.
+    pub grant_graph_revision: u64,
+    /// Complete parent-before-child closure membership.
+    pub members: Vec<GrantClosureMemberDeclaration>,
+    /// Exact-use alternate paths explicitly retained by Governor.
+    pub preserved: Vec<GrantClosureAlternatePath>,
+    /// Strongest proof interpretation admitted for this closure declaration.
+    pub proof_ceiling: ProofCeiling,
+}
+
+/// One owner-declared member identity in a grant closure.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GrantClosureMemberDeclaration {
+    /// Exact grant identity.
+    pub grant_id: String,
+    /// Parent grant identity; absent only for the closure target/root.
+    pub parent_grant_id: Option<String>,
+}
+
+/// One exact use that remains covered by an independent valid root path.
+#[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantClosureAlternatePath {
+    /// Descendant grant whose authority remains usable for the exact use.
+    pub grant_id: String,
+    /// Grant that supplies the surviving independent path.
+    pub covering_grant_id: String,
+    /// Root of the surviving independent path.
+    pub covering_root_ref: String,
+    /// Canonical effect/operation identity.
+    pub operation_id: String,
+    /// Exact admitted operation name.
+    pub operation_name: String,
+    /// Exact resource reference covered by the alternate path.
+    pub resource_ref: String,
+    /// Exact effect ceiling claimed for the use.
+    pub effect: EffectClass,
+    /// Holder principal admitted for the use.
+    pub holder_principal: String,
+    /// Session identity admitted for the use.
+    pub session_id: String,
+    /// `WorkScope` identity admitted for the use.
+    pub scope_id: String,
+    /// Canonical request digest for the exact use.
+    pub canonical_request_hash: String,
+}
+
+/// Terminal state of one committed grant-closure projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum GrantClosureState {
+    /// A delegated closure activation committed every member as active.
+    Active,
+    /// A delegated closure revocation committed every affected member fenced.
+    Revoked,
+}
+
+/// Exact Kernel authority-receipt reference bound into a closure receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GrantClosureAuthorityReceiptRef {
+    /// Authority activation/revocation receipt identity.
+    pub receipt_id: String,
+    /// Governor snapshot committed by the authority receipt.
+    pub snapshot_id: String,
+    /// Exact Authority Epoch carried by the authority receipt.
+    pub authority_epoch: EpochId,
+    /// Authority state committed by the receipt.
+    pub state: GrantClosureState,
+}
+
+/// Store-issued ORS receipt reference persisted with a closure projection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GrantClosureOrsReceiptRef {
+    /// ORS operational record identity.
+    pub record_id: String,
+    /// ORS operational subject identity.
+    pub subject_id: String,
+    /// Monotonic ORS operation order.
+    pub operation_order: u64,
+    /// ORS state committed for the member.
+    pub state: GrantClosureState,
+    /// SHA-256 digest of the exact ORS stored state.
+    pub state_sha256: String,
+}
+
+/// Durable, versioned projection of one committed grant closure.
+///
+/// This is a store-neutral receipt contract. Governor creates the declaration;
+/// ORS persists the commit and its issued member-receipt references; Kernel
+/// validates the same bytes before installing live state or returning them to
+/// Governor for canonical reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GrantClosureReceipt {
+    /// Closed grant-closure schema identity.
+    pub schema: String,
+    /// Closed grant-closure schema version.
+    pub version: u16,
+    /// Closure operation identity.
+    pub operation_id: String,
+    /// Canonical digest of the complete idempotent closure request.
+    pub idempotency_digest: String,
+    /// Exact canonical owner declaration committed by this operation.
+    pub declaration: GrantClosureDeclaration,
+    /// Authority owner, State Fence, Authority Epoch, effect and proof ceilings.
+    pub authority: AuthorityBinding,
+    /// Strongest proof interpretation recorded by the closure commit.
+    pub proof_ceiling: ProofCeiling,
+    /// Kernel-issued authority receipt reference.
+    pub authority_receipt: GrantClosureAuthorityReceiptRef,
+    /// Exact ORS receipt reference for every affected member, in affected order.
+    pub ors_member_receipts: Vec<GrantClosureOrsReceiptRef>,
+    /// Introduction identities fenced by the same atomic closure commit.
+    pub fenced_introductions: Vec<String>,
+    /// Exact ORS receipt reference for every fenced introduction.
+    pub ors_introduction_receipts: Vec<GrantClosureOrsReceiptRef>,
+    /// Canonical store receipt linked after the Kernel-first reconciliation
+    /// saga. `None` is an explicit pending second phase, never an assertion
+    /// that canonical reconciliation completed.
+    pub canonical_receipt: Option<ReceiptIdentity>,
+    /// Committed closure state.
+    pub state: GrantClosureState,
+}
+
+impl GrantClosureDeclaration {
+    /// Returns the sorted complete affected grant identities.
+    #[must_use]
+    pub fn affected_grants(&self) -> Vec<String> {
+        let mut affected = self
+            .members
+            .iter()
+            .map(|member| member.grant_id.clone())
+            .collect::<Vec<_>>();
+        affected.sort();
+        affected
+    }
+
+    /// Validates schema, revision, root, parent order and alternate-path shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReceiptError`] for an unsupported version, malformed identity,
+    /// zero revision, empty/misordered closure, cross-root member, or invalid
+    /// alternate-path evidence.
+    pub fn validate(&self) -> Result<(), ReceiptError> {
+        if self.schema != GRANT_CLOSURE_SCHEMA || self.version != GRANT_CLOSURE_VERSION {
+            return Err(ReceiptError::InvalidField {
+                field: "grant_closure.schema",
+                reason: "unsupported grant-closure schema or version",
+            });
+        }
+        text(&self.target_grant_id, "grant_closure.target_grant_id")?;
+        text(&self.authority_root_ref, "grant_closure.authority_root_ref")?;
+        if self.grant_graph_revision == 0 || self.members.is_empty() {
+            return Err(ReceiptError::InvalidField {
+                field: "grant_closure.members",
+                reason: "requires a nonzero revision and at least one member",
+            });
+        }
+        let preserved_ids = self
+            .preserved
+            .iter()
+            .map(|alternate| alternate.grant_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut seen = std::collections::BTreeSet::new();
+        for (index, member) in self.members.iter().enumerate() {
+            text(&member.grant_id, "grant_closure.member.grant_id")?;
+            if !seen.insert(member.grant_id.as_str()) {
+                return Err(ReceiptError::InvalidChain("duplicate grant-closure member"));
+            }
+            if index == 0 && member.grant_id != self.target_grant_id {
+                return Err(ReceiptError::InvalidChain(
+                    "grant-closure target must be its first member",
+                ));
+            }
+            if let Some(parent) = &member.parent_grant_id {
+                text(parent, "grant_closure.member.parent_grant_id")?;
+                if index > 0
+                    && !seen.contains(parent.as_str())
+                    && !preserved_ids.contains(parent.as_str())
+                {
+                    return Err(ReceiptError::InvalidChain(
+                        "grant-closure members must be parent-before-child",
+                    ));
+                }
+            } else if index != 0 {
+                return Err(ReceiptError::InvalidChain(
+                    "only the closure target may omit its parent",
+                ));
+            }
+        }
+        for alternate in &self.preserved {
+            text(&alternate.grant_id, "grant_closure.alternate.grant_id")?;
+            text(
+                &alternate.covering_grant_id,
+                "grant_closure.alternate.covering_grant_id",
+            )?;
+            text(
+                &alternate.covering_root_ref,
+                "grant_closure.alternate.covering_root_ref",
+            )?;
+            text(
+                &alternate.operation_id,
+                "grant_closure.alternate.operation_id",
+            )?;
+            text(
+                &alternate.operation_name,
+                "grant_closure.alternate.operation_name",
+            )?;
+            text(
+                &alternate.resource_ref,
+                "grant_closure.alternate.resource_ref",
+            )?;
+            text(
+                &alternate.holder_principal,
+                "grant_closure.alternate.holder_principal",
+            )?;
+            text(&alternate.session_id, "grant_closure.alternate.session_id")?;
+            text(&alternate.scope_id, "grant_closure.alternate.scope_id")?;
+            digest(
+                &alternate.canonical_request_hash,
+                "grant_closure.alternate.canonical_request_hash",
+            )?;
+            if seen.contains(alternate.grant_id.as_str())
+                || seen.contains(alternate.covering_grant_id.as_str())
+                || alternate.grant_id == self.target_grant_id
+                || alternate.covering_grant_id == alternate.grant_id
+            {
+                return Err(ReceiptError::InvalidField {
+                    field: "grant_closure.alternate.grant_id",
+                    reason: "alternate path must be disjoint and independently covered",
+                });
+            }
+        }
+        if self.preserved.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(ReceiptError::InvalidField {
+                field: "grant_closure.alternate",
+                reason: "alternate paths must be sorted and unique",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl GrantClosureReceipt {
+    /// Revalidates the complete durable closure projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReceiptError`] when the declaration, authority contour,
+    /// authority receipt, ORS member receipts, or optional canonical receipt
+    /// does not match the committed closure.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the shared closure receipt validates declaration, authority, member fences, introduction fences, and canonical reconciliation as one contract"
+    )]
+    pub fn validate(&self) -> Result<(), ReceiptError> {
+        if self.schema != GRANT_CLOSURE_SCHEMA || self.version != GRANT_CLOSURE_VERSION {
+            return Err(ReceiptError::InvalidField {
+                field: "grant_closure.schema",
+                reason: "unsupported grant-closure schema or version",
+            });
+        }
+        self.declaration.validate()?;
+        self.authority.validate()?;
+        text(&self.operation_id, "grant_closure.operation_id")?;
+        digest(&self.idempotency_digest, "grant_closure.idempotency_digest")?;
+        if self.proof_ceiling > self.authority.proof_ceiling
+            || self.proof_ceiling > self.declaration.proof_ceiling
+        {
+            return Err(ReceiptError::ProofOverclaim);
+        }
+        text(
+            &self.authority_receipt.receipt_id,
+            "grant_closure.authority_receipt.receipt_id",
+        )?;
+        text(
+            &self.authority_receipt.snapshot_id,
+            "grant_closure.authority_receipt.snapshot_id",
+        )?;
+        let expected_authority_receipt = match self.state {
+            GrantClosureState::Active => format!("activation-{}", self.operation_id),
+            GrantClosureState::Revoked => format!("revocation-{}", self.operation_id),
+        };
+        if self.authority_receipt.authority_epoch != self.authority.authority_epoch
+            || self.authority_receipt.state != self.state
+            || self.authority_receipt.receipt_id != expected_authority_receipt
+        {
+            return Err(ReceiptError::FenceMismatch {
+                left: "grant_closure.authority_receipt",
+                right: "grant_closure.authority",
+            });
+        }
+        if self.ors_member_receipts.len() != self.declaration.members.len() {
+            return Err(ReceiptError::InvalidField {
+                field: "grant_closure.ors_member_receipts",
+                reason: "requires one ORS receipt for every declared member",
+            });
+        }
+        let mut subjects = std::collections::BTreeSet::new();
+        for (member, receipt) in self
+            .declaration
+            .members
+            .iter()
+            .zip(&self.ors_member_receipts)
+        {
+            text(&receipt.record_id, "grant_closure.ors_receipt.record_id")?;
+            text(&receipt.subject_id, "grant_closure.ors_receipt.subject_id")?;
+            digest(
+                &receipt.state_sha256,
+                "grant_closure.ors_receipt.state_sha256",
+            )?;
+            if receipt.subject_id != member.grant_id
+                || receipt.state != self.state
+                || receipt.operation_order == 0
+                || !subjects.insert(receipt.subject_id.as_str())
+            {
+                return Err(ReceiptError::InvalidField {
+                    field: "grant_closure.ors_member_receipts",
+                    reason: "receipt identity, subject, state, or order disagrees with its member",
+                });
+            }
+        }
+        if self.ors_introduction_receipts.len() != self.fenced_introductions.len() {
+            return Err(ReceiptError::InvalidField {
+                field: "grant_closure.ors_introduction_receipts",
+                reason: "requires one ORS receipt for every fenced introduction",
+            });
+        }
+        if self
+            .fenced_introductions
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(ReceiptError::InvalidField {
+                field: "grant_closure.fenced_introductions",
+                reason: "fenced introductions must be sorted and unique",
+            });
+        }
+        let mut introduction_subjects = std::collections::BTreeSet::new();
+        for (introduction_id, receipt) in self
+            .fenced_introductions
+            .iter()
+            .zip(&self.ors_introduction_receipts)
+        {
+            text(introduction_id, "grant_closure.fenced_introduction")?;
+            text(
+                &receipt.record_id,
+                "grant_closure.introduction_receipt.record_id",
+            )?;
+            text(
+                &receipt.subject_id,
+                "grant_closure.introduction_receipt.subject_id",
+            )?;
+            if receipt.subject_id != *introduction_id
+                || receipt.state != self.state
+                || receipt.operation_order == 0
+                || !introduction_subjects.insert(receipt.subject_id.as_str())
+            {
+                return Err(ReceiptError::InvalidField {
+                    field: "grant_closure.ors_introduction_receipts",
+                    reason: "receipt identity or state disagrees with its introduction",
+                });
+            }
+            digest(
+                &receipt.state_sha256,
+                "grant_closure.introduction_receipt.state_sha256",
+            )?;
+        }
+        if let Some(canonical) = &self.canonical_receipt {
+            canonical.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Principal, session and scope identity one authority activation or
+/// revocation must name in addition to the compact [`AuthorityBinding`].
+///
+/// `AuthorityBinding` is a compact transport/projection form: it pins the
+/// authority owner, epoch, state fence, effect ceiling and proof ceiling, and
+/// deliberately carries no semantic session or `WorkScope` identity. That is
+/// correct for a receipt and insufficient for a request that *mutates*
+/// authority state: without the holder subject, a Kernel authority owner
+/// cannot tell a cross-principal, cross-session or cross-scope presentation
+/// from the one the authenticated session may perform, and the compact form
+/// alone would be the only gate.
+///
+/// This type closes that gap without changing `AuthorityBinding`: the
+/// transport presents the subject, and the authority owner compares it
+/// against the subject it independently authenticated. It carries no
+/// secret, provider credential, arbitrary payload or free prose — only
+/// three closed identity strings.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityRequestSubject {
+    /// Exact principal the presented authority is for.
+    pub principal: String,
+    /// Exact authenticated session the request travels on.
+    pub session_id: String,
+    /// Exact capability/scope the request is bounded to.
+    pub scope_id: String,
+}
+
+impl AuthorityRequestSubject {
+    /// Builds the subject after proving the closed shape: three non-blank,
+    /// control-free identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReceiptError::InvalidField`] for a blank or control-bearing
+    /// principal, session, or scope.
+    pub fn new(
+        principal: impl Into<String>,
+        session_id: impl Into<String>,
+        scope_id: impl Into<String>,
+    ) -> Result<Self, ReceiptError> {
+        let subject = Self {
+            principal: principal.into(),
+            session_id: session_id.into(),
+            scope_id: scope_id.into(),
+        };
+        subject.validate()?;
+        Ok(subject)
+    }
+
+    /// Re-checks the closed shape at every transport and storage boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReceiptError::InvalidField`] for a blank or control-bearing
+    /// principal, session, or scope.
+    pub fn validate(&self) -> Result<(), ReceiptError> {
+        text(&self.principal, "subject.principal")?;
+        text(&self.session_id, "subject.session_id")?;
+        text(&self.scope_id, "subject.scope_id")
+    }
+
+    /// Returns whether the presented principal is exactly `principal`.
+    #[must_use]
+    pub fn is_principal(&self, principal: &str) -> bool {
+        self.principal == principal
+    }
+
+    /// Returns whether the presented session is exactly `session_id`.
+    #[must_use]
+    pub fn is_session(&self, session_id: &str) -> bool {
+        self.session_id == session_id
+    }
+
+    /// Returns whether the presented scope is exactly `scope_id`.
+    #[must_use]
+    pub fn is_scope(&self, scope_id: &str) -> bool {
+        self.scope_id == scope_id
     }
 }
 

@@ -171,6 +171,19 @@ impl InstallationActivationApproval {
         &self,
         transaction: &InstallationTransaction,
     ) -> Result<(), InstallationError> {
+        Self::require_activation_contour(transaction)?;
+        self.require_approval_binding(transaction)
+    }
+
+    /// Admits exactly the contours in which this approval may be projected.
+    ///
+    /// This is the gate the activation and pending-projection seams share; the
+    /// owner-recovery seam admits the `RollbackRequired` timeout contour
+    /// separately through `require_owner_recovery_contour` because retiring a
+    /// timed-out first install is not an activation projection.
+    fn require_activation_contour(
+        transaction: &InstallationTransaction,
+    ) -> Result<(), InstallationError> {
         let has_bootstrap_host_start = transaction.installer_effects.iter().any(|effect| {
             matches!(
                 effect,
@@ -214,6 +227,52 @@ impl InstallationActivationApproval {
         } else {
             transaction.require_all_effects_applied()?;
         }
+        Ok(())
+    }
+
+    /// Admits the `RollbackRequired` first-install timeout contour for owner
+    /// recovery only.
+    ///
+    /// `I3.15` keeps a stage that changed an external OS object without
+    /// acknowledgement at `ROLLBACK_REQUIRED` until read-back reconciliation
+    /// and forbids reconstructing an approval from paths or PIDs.  The approval
+    /// derived for that boundary therefore cannot be gated on the
+    /// all-effects-applied contour an activation projection requires, and
+    /// cannot require the unsettled service starts or the pending
+    /// credential/Phase-B suffix to be applied either.  The admitted evidence
+    /// is the transaction's own rule, unchanged: the durable activation
+    /// projection intent is retained, every effect before Host bootstrap is
+    /// durably `Applied`, the ordered `Watchdog` then `Host` starts are
+    /// `Pending`, unconverged `IntentCommitted`, or timeout `Unknown` with no
+    /// observed process lineage, and the credential/Phase-B suffix is still
+    /// `Pending` with no receipts.  Every other stage, a missing intent, and
+    /// any observed lineage or applied suffix effect are refused, so this never
+    /// widens the activation contour and never admits an approval
+    /// reconstructed from process state.
+    fn require_owner_recovery_contour(
+        transaction: &InstallationTransaction,
+    ) -> Result<(), InstallationError> {
+        if transaction.stage() != InstallationStage::RollbackRequired {
+            return Err(InstallationError::IncompleteObservation(format!(
+                "owner recovery requires the RollbackRequired boundary, observed {:?}",
+                transaction.stage()
+            )));
+        }
+        if transaction.activation_projection_intent().is_none() {
+            return Err(InstallationError::IncompleteObservation(
+                "owner recovery requires the retained activation projection intent".to_owned(),
+            ));
+        }
+        transaction.recoverable_timeout_start_indexes()?;
+        Ok(())
+    }
+
+    /// Requires every approval field to equal the exact transaction and
+    /// candidate manifest binding.
+    fn require_approval_binding(
+        &self,
+        transaction: &InstallationTransaction,
+    ) -> Result<(), InstallationError> {
         self.validate()?;
         let manifest = &transaction.candidate_manifest;
         let runtime = &manifest.runtime_launch;
@@ -472,12 +531,25 @@ impl InstallationActivationProjectionIntent {
     /// The caller cannot supply any approval fields.  Every field comes from
     /// the persisted binding plus the immutable transaction/manifest, and the
     /// returned value is admitted through the normal pending-activation gate.
+    ///
+    /// `RollbackRequired` is the one boundary whose contour is not an
+    /// activation projection: the coordinator uses this derivation to abort the
+    /// exact retained intent through the Host registry owner, so the
+    /// `all-effects-applied` gate does not apply there.  That boundary admits
+    /// only the retained-intent timeout contour, as
+    /// `require_owner_recovery_contour` states; every other stage goes through
+    /// the ordinary activation contour unchanged.
     pub(crate) fn derive_verified_approval(
         &self,
         transaction: &InstallationTransaction,
     ) -> Result<InstallationActivationApproval, InstallationError> {
         let approval = self.expected_approval_from_transaction(transaction)?;
-        approval.validate_against(transaction)?;
+        if transaction.stage() == InstallationStage::RollbackRequired {
+            InstallationActivationApproval::require_owner_recovery_contour(transaction)?;
+        } else {
+            InstallationActivationApproval::require_activation_contour(transaction)?;
+        }
+        approval.require_approval_binding(transaction)?;
         Ok(approval)
     }
 

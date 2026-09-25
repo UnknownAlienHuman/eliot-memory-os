@@ -15,22 +15,21 @@
 //! Public construction semantics remain on `KernelComposition`; this ordinary
 //! module only houses their implementation.
 use super::{
-    AgentActivationPendingState, ArtifactId, AuthorityDescriptorContour, AuthorityEpoch,
-    AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState,
-    AuthorityPreparationError, AuthoritySnapshotBinding, BlobStoreController, BoundCanonicalOwner,
-    ContractId, DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId,
-    DispatchSnapshotCodec, GenerationRoute, GenerationRouter, GovernorClosureRestore, HealthVector,
-    IpcImplementation, KernelBackupCapture, KernelBackupRestore, KernelBuildError,
-    KernelComposition, KernelConfig, KernelDispatchKey, KernelError, KernelPathAdmission,
-    KernelService, KernelStoreRebindProductionBoundary, KernelSupervisionLeaseAuthority,
-    ModuleGeneration, ModuleGenerationState, OperationalRecoveryStore, OrsError,
-    OrsGenerationCoordinator, PROTOCOL_VERSION, PreparedAuthorityMaterial,
-    ProcessAuthorityHandoffDescriptor, ProcessDispatchAuthorityController,
-    ProcessExecutionAuthorityConfig, ProcessExecutionGateway, RedbRecoveryStore, RouteScope,
-    Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy, StartupCoordinator, StateFence,
-    USER_AUTOMATION_KERNEL_CAPABILITY, UserOwnedPathLease, UserOwnedRootLease,
-    WindowsDispatchSnapshotCodec, WindowsPlatform, bind_canonical_owner, is_lower_sha256,
-    owner_bundle_digest, sha256_hex, sha256_json, unix_ms,
+    ArtifactId, AuthorityDescriptorContour, AuthorityHandoffBegin, AuthorityHandoffRecord,
+    AuthorityHandoffState, AuthorityPreparationError, AuthoritySnapshotBinding,
+    BlobStoreController, BoundCanonicalOwner, ContractId, DaemonRuntimeState, DaemonRuntimeStatus,
+    DispatchAuthorityId, DispatchSnapshotCodec, GenerationRoute, GenerationRouter,
+    GovernorClosureRestore, HealthVector, IpcImplementation, KernelBackupCapture,
+    KernelBackupRestore, KernelBuildError, KernelComposition, KernelConfig, KernelDispatchKey,
+    KernelError, KernelPathAdmission, KernelService, KernelStoreRebindProductionBoundary,
+    KernelSupervisionLeaseAuthority, ModuleGeneration, ModuleGenerationState,
+    OperationalRecoveryStore, OrsError, OrsGenerationCoordinator, PROTOCOL_VERSION,
+    PreparedAuthorityMaterial, ProcessAuthorityHandoffDescriptor,
+    ProcessDispatchAuthorityController, ProcessExecutionAuthorityConfig, ProcessExecutionGateway,
+    RedbRecoveryStore, RouteScope, Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy,
+    StartupCoordinator, StateFence, USER_AUTOMATION_KERNEL_CAPABILITY, UserOwnedPathLease,
+    UserOwnedRootLease, WindowsDispatchSnapshotCodec, WindowsPlatform, bind_canonical_owner,
+    is_lower_sha256, owner_bundle_digest, sha256_hex, sha256_json, unix_ms,
 };
 #[cfg(test)]
 use super::{CanonicalEvidenceProvider, DispatchValidationPort};
@@ -333,7 +332,31 @@ impl KernelComposition {
             .map_err(&terminal)
     }
 
-    /// Binds the canonical Governor closure owner to the P-07 port (`#2100`).
+    /// Initializes one owner-lineage graph revision before the first
+    /// revocation-history read. The operation is idempotent for the same
+    /// revision and refuses a lower presentation; it does not bind an owner
+    /// or grant authority by itself.
+    pub fn initialize_p07_owner_revision(
+        &self,
+        authority_root_ref: &str,
+        expected_revision: u64,
+        state_fence: &StateFence,
+    ) -> Result<u64, KernelBuildError> {
+        if expected_revision == 0 || authority_root_ref.trim().is_empty() {
+            return Err(KernelBuildError::Core(
+                "owner revision initialization requires a root and nonzero revision".to_owned(),
+            ));
+        }
+        state_fence
+            .validate()
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        let label = eliot_ors::OpaqueLabel::new(authority_root_ref)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        self.p07_ors
+            .note_grant_graph_revision(&label, expected_revision)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))
+    }
+
     ///
     /// The Governor feed publishes the restore bundle plus the exact
     /// expected graph revision; this method binds the port through the
@@ -344,6 +367,17 @@ impl KernelComposition {
     /// rotation goes through refresh or recover, never a silent
     /// replacement. Returns the bound revision.
     pub fn bind_p07_owner(
+        &self,
+        restore: GovernorClosureRestore,
+        expected_revision: u64,
+    ) -> Result<u64, KernelBuildError> {
+        let _transition = self.p07_owner_transition.write().map_err(|_| {
+            KernelBuildError::Service("P-07 owner transition lock poisoned".to_owned())
+        })?;
+        self.bind_p07_owner_locked(restore, expected_revision)
+    }
+
+    fn bind_p07_owner_locked(
         &self,
         restore: GovernorClosureRestore,
         expected_revision: u64,
@@ -402,29 +436,65 @@ impl KernelComposition {
         restore: GovernorClosureRestore,
         expected_revision: u64,
     ) -> Result<u64, KernelBuildError> {
+        let _transition = self.p07_owner_transition.write().map_err(|_| {
+            KernelBuildError::Service("P-07 owner transition lock poisoned".to_owned())
+        })?;
+        self.refresh_p07_owner_locked(restore, expected_revision)
+    }
+
+    fn refresh_p07_owner_locked(
+        &self,
+        restore: GovernorClosureRestore,
+        expected_revision: u64,
+    ) -> Result<u64, KernelBuildError> {
         let store: Arc<dyn OperationalRecoveryStore> =
             Arc::clone(&self.p07_ors) as Arc<dyn OperationalRecoveryStore>;
         let mut guard = self
             .p07_owner
             .lock()
             .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?;
+        let current_revision = guard.as_ref().map(BoundCanonicalOwner::bound_revision);
         let Some(bound) = guard.as_mut() else {
             return Err(KernelBuildError::Service(
                 "P-07 owner refresh requires a bound owner".to_owned(),
             ));
         };
-        let digest = owner_bundle_digest(&restore)
-            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
-        self.check_owner_digest_agreement(expected_revision, &digest)?;
-        bound
-            .refresh(restore, expected_revision, &store)
-            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
-        let revision = bound.bound_revision();
-        self.p07_owner_digest
-            .lock()
-            .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
-            .replace(digest);
-        Ok(revision)
+        let result = (|| {
+            let digest = owner_bundle_digest(&restore)
+                .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+            let retained_digest = self
+                .p07_owner_digest
+                .lock()
+                .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
+                .clone();
+            Self::check_owner_digest_agreement(
+                current_revision,
+                retained_digest.as_deref(),
+                expected_revision,
+                &digest,
+            )?;
+            bound
+                .refresh(restore, expected_revision, &store)
+                .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+            Ok((bound.bound_revision(), digest))
+        })();
+        match result {
+            Ok((revision, digest)) => {
+                let mut retained = self.p07_owner_digest.lock().map_err(|_| {
+                    KernelBuildError::Service("P-07 owner lock poisoned".to_owned())
+                })?;
+                *retained = Some(digest);
+                Ok(revision)
+            }
+            Err(error) => {
+                *guard = None;
+                drop(guard);
+                if let Ok(mut retained) = self.p07_owner_digest.lock() {
+                    *retained = None;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Rebinds the P-07 owner after a restart: binds when no owner is
@@ -436,15 +506,18 @@ impl KernelComposition {
         restore: GovernorClosureRestore,
         expected_revision: u64,
     ) -> Result<u64, KernelBuildError> {
+        let _transition = self.p07_owner_transition.write().map_err(|_| {
+            KernelBuildError::Service("P-07 owner transition lock poisoned".to_owned())
+        })?;
         let bound = self
             .p07_owner
             .lock()
             .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
             .is_some();
         if bound {
-            self.refresh_p07_owner(restore, expected_revision)
+            self.refresh_p07_owner_locked(restore, expected_revision)
         } else {
-            self.bind_p07_owner(restore, expected_revision)
+            self.bind_p07_owner_locked(restore, expected_revision)
         }
     }
 
@@ -463,6 +536,9 @@ impl KernelComposition {
     /// what it served before claiming a publish committed.
     #[must_use]
     pub fn p07_owner_readback(&self) -> (bool, Option<u64>, Option<String>) {
+        let Ok(_transition) = self.p07_owner_transition.read() else {
+            return (false, None, None);
+        };
         let owner = self.p07_owner.lock().ok();
         let digest = self.p07_owner_digest.lock().ok();
         match (owner, digest) {
@@ -482,12 +558,15 @@ impl KernelComposition {
     /// presentation, never a silent replacement. Unbound compositions
     /// have nothing to disagree with and pass through to bind.
     fn check_owner_digest_agreement(
-        &self,
+        current_revision: Option<u64>,
+        current_digest: Option<&str>,
         expected_revision: u64,
         digest: &str,
     ) -> Result<(), KernelBuildError> {
-        let (bound, revision, retained) = self.p07_owner_readback();
-        if bound && revision == Some(expected_revision) && retained.as_deref() != Some(digest) {
+        if current_revision.is_some()
+            && current_revision == Some(expected_revision)
+            && current_digest != Some(digest)
+        {
             observe_entrypoint_with_detail(
                 EntrypointStage::Composition,
                 "kernel.composition.p07_owner_digest_conflict",
@@ -1036,14 +1115,14 @@ impl KernelComposition {
         // reserved for the explicitly standalone composition, where no Store
         // authority has been injected.
         //
-        // Lineage-aware split (Implements #64): the scalar `GenerationRouter`
-        // residual keeps the exact sequence projection, while canonical
-        // `StateFence`/`KernelService` fencing uses the full `EpochId` tuple.
-        // Cross-lineage same-sequence routes never authorize through the
-        // canonical gate.
-        let (authority_epoch, canonical_epoch, generation) = match store_bootstrap.as_ref() {
+        // Lineage-aware route seed (Implements #64): the Kernel route table is
+        // built from the exact canonical `EpochId` tuple carried by the
+        // Host-approved bootstrap fence. There is no scalar `AuthorityEpoch`
+        // projection left for the route, so a route minted under another
+        // lineage at the same sequence can never be admitted as the active
+        // route.
+        let (canonical_epoch, generation) = match store_bootstrap.as_ref() {
             None => (
-                AuthorityEpoch::genesis(),
                 eliot_contracts::EpochId::new(
                     eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
                         .map_err(|error| KernelBuildError::Service(error.to_string()))?,
@@ -1052,26 +1131,19 @@ impl KernelComposition {
                 .map_err(|error| KernelBuildError::Service(error.to_string()))?,
                 ResourceGeneration::genesis(),
             ),
-            Some(requirement) => {
-                let canonical = requirement.state_fence.authority_epoch.clone();
-                let scalar = AuthorityEpoch::new(canonical.sequence.get())
-                    .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-                (
-                    scalar,
-                    canonical,
-                    requirement.state_fence.resource_generation,
-                )
-            }
+            Some(requirement) => (
+                requirement.state_fence.authority_epoch.clone(),
+                requirement.state_fence.resource_generation,
+            ),
         };
-        let mut generations = GenerationRouter::at_epoch(authority_epoch)
-            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        let mut generations = GenerationRouter::at_epoch(canonical_epoch.clone());
         generations
             .register(
                 GenerationRoute::new(
                     RouteScope::new("daemon")
                         .map_err(|error| KernelBuildError::Core(error.to_string()))?,
                     generation,
-                    authority_epoch,
+                    canonical_epoch.clone(),
                 )
                 .map_err(|error| KernelBuildError::Core(error.to_string()))?,
             )
@@ -1085,27 +1157,29 @@ impl KernelComposition {
                     RouteScope::new("store_bridge")
                         .map_err(|error| KernelBuildError::Core(error.to_string()))?,
                     generation,
-                    authority_epoch,
+                    canonical_epoch.clone(),
                 )
                 .map_err(|error| KernelBuildError::Core(error.to_string()))?,
             )
             .map_err(|error| KernelBuildError::Core(error.to_string()))?;
         // F-LOG-KERNEL-2 (#899): exact route/generation observation. Only the
-        // fixed route names plus numeric epoch/generation are emitted, never
-        // raw bootstrap/launch/descriptor material.
+        // fixed route names plus the lineage-aware epoch tuple and generation
+        // are emitted, never raw bootstrap/launch/descriptor material. The
+        // epoch keeps its lineage: a sequence-only spelling would let two
+        // unrelated lineages share one observation.
         observe_entrypoint_with_detail(
             EntrypointStage::Composition,
             &format!(
-                "kernel.composition.route_registered:daemon:epoch={}:generation={}",
-                authority_epoch.value(),
+                "kernel.composition.route_registered:daemon:epoch={:?}:generation={}",
+                canonical_epoch,
                 generation.value()
             ),
         );
         observe_entrypoint_with_detail(
             EntrypointStage::StoreBootstrap,
             &format!(
-                "kernel.composition.route_registered:store_bridge:epoch={}:generation={}",
-                authority_epoch.value(),
+                "kernel.composition.route_registered:store_bridge:epoch={:?}:generation={}",
+                canonical_epoch,
                 generation.value()
             ),
         );
@@ -1132,11 +1206,24 @@ impl KernelComposition {
         let session_principal_binding = observed_session_principal_binding()?;
         #[cfg(not(windows))]
         let session_principal_binding = "unsupported-non-windows-principal".to_owned();
+        // The published front-door config snapshot carries the COMPLETE typed
+        // epoch tuple, never a bare sequence counter (Implements #64). A
+        // scalar spelling cannot say which lineage authorized the route, so
+        // two unrelated lineages at the same sequence would project one
+        // indistinguishable snapshot. `EpochId` is the same value shape the
+        // sibling projections publish (`health_view::daemon_snapshot` and
+        // `generation_recovery::update_handshake_policy`) and the exact shape
+        // both readers already require: `eliotd`'s
+        // `daemon_kernel_client::KernelSnapshotWire` and the CLI's
+        // `KernelConfigSnapshot` both declare
+        // `authority_epoch: EpochId` under `deny_unknown_fields`, so a bare
+        // number would fail their decode outright. The daemon takes its
+        // binding epoch from the launch handshake, never from this key.
         let mut config_snapshot = serde_json::json!({
             "service": SERVICE_NAME,
             "protocol": PROTOCOL_VERSION,
             "generation": generation.value(),
-            "authority_epoch": authority_epoch.value(),
+            "authority_epoch": canonical_epoch,
             "artifact_digest": kernel_artifact_sha256
                 .as_deref()
                 .unwrap_or("eliot-kernel-standalone"),
@@ -1254,7 +1341,7 @@ impl KernelComposition {
         #[cfg(not(windows))]
         let store_handoff_init = None;
         #[cfg(windows)]
-        let agent_activation_results = Self::rehydrate_agent_activation_results(&ors)?;
+        let agent_activation_pending = Self::rehydrate_agent_activation_state(&ors)?;
         // Implements #1967: start the ordered I1.11 coordinator at step zero.
         // Composition construction alone does not prove Host-owned startup,
         // Blob manifest, Store readiness, reconciliation, handshake, mirror,
@@ -1332,6 +1419,7 @@ impl KernelComposition {
         Ok(Self {
             p07_owner: Mutex::new(None),
             p07_owner_digest: Mutex::new(None),
+            p07_owner_transition: std::sync::RwLock::new(()),
             p07_ors: Arc::clone(&ors),
             store_rebind_boundary: KernelStoreRebindProductionBoundary,
             work_root,
@@ -1398,11 +1486,9 @@ impl KernelComposition {
             #[cfg(windows)]
             agent_bridge_connections: Mutex::new(BTreeMap::new()),
             #[cfg(windows)]
-            agent_activation_pending: Mutex::new(AgentActivationPendingState::default()),
+            agent_activation_pending: Mutex::new(agent_activation_pending),
             #[cfg(windows)]
             agent_activation_changed: tokio::sync::Notify::new(),
-            #[cfg(windows)]
-            agent_activation_results: Mutex::new(agent_activation_results),
             #[cfg(windows)]
             host_request_connection_index: Mutex::new(BTreeMap::new()),
             #[cfg(windows)]

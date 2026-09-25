@@ -60,7 +60,7 @@ mod process_execution_client;
 mod supervision_lease_authority;
 mod testd_terminal_completion_route;
 
-/// Public wire-operation name for the authenticated TestD completion route.
+/// Public wire-operation name for the authenticated `TestD` completion route.
 pub use testd_terminal_completion_route::OPERATION as TESTD_TERMINAL_COMPLETION_OPERATION;
 
 pub use backup_capture::{
@@ -109,14 +109,17 @@ use process_execution::{
 };
 pub use process_execution_client::process_execution_client;
 pub(crate) use shutdown_drain::{
-    DRAIN_RECEIPT_DEADLINE, DrainCommitDecision, DrainHalt, DrainWakeDisposition,
-    ShutdownDrainCoordinator, ShutdownPhase, ShutdownTerminal, coordinator_for,
-    reverse_quiescence_order,
+    DRAIN_RECEIPT_DEADLINE, DrainCommitDecision, DrainHalt, DrainWakeDisposition, ShutdownPhase,
+    ShutdownTerminal, coordinator_for, reverse_quiescence_order,
 };
+/// Kernel-owned exact-fence lease census for the I1.5 idle-drain gate.
+mod idle_lease_census;
+pub(crate) use idle_lease_census::KernelIdleLeaseCensus;
+pub(crate) use startup_coordinator::StartupCoordinator;
 pub use startup_coordinator::{
     AuthorityCeiling, GovernanceEnforcement, GovernanceObservation, GovernanceProfile,
-    GovernanceSupervision, STARTUP_FINAL_STEP, STARTUP_FIRST_STEP, StartupCoordinator,
-    StartupPrerequisite, StartupRejection, StartupStatus, startup_step_name,
+    GovernanceSupervision, STARTUP_FINAL_STEP, STARTUP_FIRST_STEP, StartupPrerequisite,
+    StartupRejection, StartupStatus, startup_step_name,
 };
 #[cfg(windows)]
 pub use supervision_lease_authority::{
@@ -157,6 +160,7 @@ mod front_door_session;
 mod generation_control;
 mod generation_recovery;
 mod health_view;
+pub use health_view::KernelActivationView;
 #[cfg(windows)]
 mod host_request_route;
 pub mod kernel_unavailability;
@@ -167,6 +171,7 @@ pub mod notify_operation_identity;
 mod provider_capability_route;
 pub mod reactive_restore_serve;
 mod request_dispatch;
+mod research_provider_route;
 mod runtime_identity;
 mod shutdown_drain;
 mod startup_coordinator;
@@ -352,13 +357,13 @@ use eliot_process::{
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::{
     AGENT_BRIDGE_ACTIVATION_OPERATION, AGENT_BRIDGE_MODULE_ID, AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID,
-    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationResolutionResult,
+    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationOwnerReadback,
+    AgentActivationResolutionDisposition, AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultReconcile,
-    AgentActivationResultSubmit, AgentBridgeActivationDenialCode, AgentBridgeActivationDisposition,
-    AgentBridgeActivationFence, AgentBridgeActivationRequest, AgentBridgeActivationResponse,
-    AgentBridgeAuthenticatedBinding, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
-    AgentBridgePeerChallenge, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
-    RequestIdentity,
+    AgentBridgeActivationDenialCode, AgentBridgeActivationDisposition, AgentBridgeActivationFence,
+    AgentBridgeActivationRequest, AgentBridgeActivationResponse, AgentBridgeAuthenticatedBinding,
+    AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge,
+    EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, RequestIdentity,
 };
 use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
 #[cfg(test)]
@@ -438,11 +443,14 @@ const ACTIVE_DAEMON_CALLER: &str = "eliotd";
 /// constants must not be reintroduced beside it. The windows preserve the
 /// established lease shape (60s validity, renewal due after 30s); the
 /// observation freshness bounds match the wave-1 contract proof values.
-/// Watchdog coverage stays opt-in until wave 3 reports per-tick
-/// `watchdog_covered` from the daemon; the stale-cursor horizon (three missed
-/// renewal intervals, see `DaemonSupervisionProgressState`) applies
-/// regardless. `StoreHealth` (`health_view::daemon_health`) remains a separate
-/// evidence-only view and never renews.
+/// Watchdog coverage is not inferred from daemon self-report. Lease renewal
+/// remains available for front-door/lease continuity, while I1.11 step 11 and
+/// Material/Critical supervision admission stay closed until an independent
+/// Host-observed Watchdog signal is carried into Kernel. The stale-cursor
+/// horizon (three missed renewal intervals, see
+/// `DaemonSupervisionProgressState`) applies regardless. `StoreHealth`
+/// (`health_view::daemon_health`) remains a separate evidence-only view and
+/// never renews.
 #[cfg(windows)]
 pub(crate) const SUPERVISION_LEASE_RENEWAL_POLICY: DaemonSupervisionRenewalPolicy =
     DaemonSupervisionRenewalPolicy {
@@ -564,18 +572,9 @@ pub struct KernelComposition {
     agent_activation_pending: Mutex<AgentActivationPendingState>,
     #[cfg(windows)]
     agent_activation_changed: tokio::sync::Notify,
-    /// Full typed semantic resolution results retained verbatim under their
-    /// exact ticket identities, keyed by ticket id. This is the rehydrated
-    /// result ledger only; it never contains pending entries or live bindings.
-    ///
-    /// Every one of the seven closed dispositions shares one
-    /// exact-replay/conflict ledger here. Only a `Resolved`
-    /// disposition can later yield a transport Session, and that Session is
-    /// created exactly once by the bridge activation path. The map lives
-    /// beside the pending table (rather than inside its entries) so the
-    /// ticket ledger shape stays additive.
-    #[cfg(windows)]
-    agent_activation_results: Mutex<BTreeMap<String, AgentActivationResultRecord>>,
+    /// Full typed semantic resolution results are projected into the single
+    /// `agent_activation_pending` owner below. ORS remains the durable
+    /// authority; there is no second in-memory semantic ledger.
     /// Connection-scoped index of staged P-04 host-request operations. The
     /// durable ORS record is the owner; this index only lets disconnect revoke
     /// fence the presenting connection's still-uncertain operations to
@@ -603,6 +602,11 @@ pub struct KernelComposition {
     /// one shared definition both sides call. The owner readback serves it
     /// so the Governor feed can prove the Kernel bound its exact bytes.
     p07_owner_digest: Mutex<Option<String>>,
+    /// Serializes P-07 owner publication with Resolved Session publication.
+    /// The bridge read lock is held from the current-owner comparison through
+    /// the in-memory Session/connection update; owner bind/refresh/recovery
+    /// takes the write lock, so an owner rotation cannot pass between them.
+    p07_owner_transition: RwLock<()>,
     /// ORS handle retained for P-07 owner bind/refresh/recovery. Cloned
     /// from the assembly store so later owner operations never reopen the
     /// database file or invent a second recovery store.
@@ -690,6 +694,14 @@ struct AgentActivationPendingState {
     /// entries are skipped when this order is pruned so an active bridge
     /// waiter can never lose the result it is waiting to project.
     result_order: VecDeque<String>,
+    /// Kernel-owned lifecycle fence for each ticket. It is deliberately
+    /// separate from the result payload: a cancellation/expiry terminal can
+    /// never be confused with a semantic `FailedInternal` result.
+    lifecycle: BTreeMap<String, AgentActivationLifecycle>,
+    /// Predecessor tickets that already minted a durable successor. This
+    /// mirrors the ORS `successor_ticket_id` fence so a later request cannot
+    /// repeatedly select the same immutable `NotReady` result.
+    successor_consumed: BTreeSet<String>,
 }
 
 #[cfg(windows)]
@@ -703,25 +715,60 @@ struct AgentActivationPending {
     /// result-less (#66 C4/A3): an unanswered ticket rests until the
     /// Kernel-owned deadline instead of looping the resolver.
     claim_lease_until_unix_ms: Option<u64>,
+    /// Fresh dependency discriminator supplied by the authenticated daemon
+    /// claim. It is checked before a successor enters `Claimed`.
+    claim_dependency_ref: Option<String>,
+    claim_dependency_revision: Option<String>,
+    /// A fresh ticket may be linked to one retained `NotReady` predecessor;
+    /// the predecessor result itself is immutable and is never replaced.
+    successor_of: Option<AgentActivationSuccessorBinding>,
+    /// Authenticated current owner readback stored by Kernel when the exact
+    /// result is durably accepted. It is a readback join, not a second
+    /// semantic resolver.
+    owner_readback: Option<AgentActivationOwnerReadback>,
 }
 
-/// Replay/commit/conflict disposition shared by the activation result
-/// entry classifiers (v2 result legs).
+/// Closed Kernel lifecycle fence for one activation ticket.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ActivationDecisionDisposition {
-    Commit,
-    ExactReplay,
-    Conflict,
+enum AgentActivationLifecycle {
+    Pending,
+    Claimed,
+    Accepted,
+    DeferredNotReady,
+    Cancelled,
+    Expired,
+    Reconciling,
 }
+
+#[cfg(windows)]
+impl From<eliot_ors::ActivationLifecycleState> for AgentActivationLifecycle {
+    fn from(state: eliot_ors::ActivationLifecycleState) -> Self {
+        match state {
+            eliot_ors::ActivationLifecycleState::Pending => Self::Pending,
+            eliot_ors::ActivationLifecycleState::Claimed => Self::Claimed,
+            eliot_ors::ActivationLifecycleState::ResultAccepted => Self::Accepted,
+            eliot_ors::ActivationLifecycleState::DeferredNotReady => Self::DeferredNotReady,
+            eliot_ors::ActivationLifecycleState::Cancelled => Self::Cancelled,
+            eliot_ors::ActivationLifecycleState::Expired => Self::Expired,
+            eliot_ors::ActivationLifecycleState::Reconciling => Self::Reconciling,
+        }
+    }
+}
+
+/// Immutable predecessor evidence cached from the durable ORS lifecycle. ORS
+/// remains the authority; this is not a second semantic result or resolver.
+#[cfg(windows)]
+type AgentActivationSuccessorBinding = eliot_ors::ActivationSuccessorBinding;
 
 /// Submission phase of one retained v2 semantic result.
 ///
 /// Absence of a record means the ticket is still awaiting its result. A
-/// retained record is never re-queued by claim admission: admission is not a
-/// semantic delta. A result-less ticket is admitted at most once; the sole
-/// re-queue path for a deferred ticket is a gated superseding submission on
-/// the submit path, never the admission mark.
+/// retained record is never re-queued by claim-lease expiry: an uncertain
+/// claim is durably marked `Reconciling` and removed from the live queue.
+/// A result-less ticket is admitted at most once; the sole re-queue path for
+/// a deferred result is a fresh, gated successor submission, never admission
+/// or the lease clock.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AgentActivationResultPhase {
@@ -735,17 +782,17 @@ enum AgentActivationResultPhase {
 }
 
 /// Exact retained semantic result for one Kernel-issued ticket: result
-/// identity, payload digest, full typed disposition, submission phase, and
-/// the exact transport connection that owns the ticket. The connection is
-/// retained so a projected-then-retried host-request envelope still
-/// fail-closes on cross-connection replay after the pending entry is
-/// consumed.
+/// identity, payload digest, full typed disposition, and submission phase.
+/// The immutable ticket payload carries the connection identity; this cache
+/// never restores a live connection or Session after restart.
 #[cfg(windows)]
 #[derive(Clone)]
 struct AgentActivationResultRecord {
     result: AgentActivationResolutionResult,
+    /// Opaque bridge demand identity from the immutable ticket. It binds a
+    /// successor to the same demand without carrying semantic authority.
+    demand_id: String,
     phase: AgentActivationResultPhase,
-    ticket_connection: String,
     retention_order: u64,
 }
 
@@ -775,22 +822,122 @@ fn classify_activation_result(
 
 #[cfg(windows)]
 impl AgentActivationPendingState {
-    fn claim_at(&mut self, now: u64) -> Option<AgentActivationResolutionTicket> {
+    pub(crate) fn from_rehydrated_results(
+        results: BTreeMap<String, AgentActivationResultRecord>,
+        lifecycle: BTreeMap<String, AgentActivationLifecycle>,
+        successor_consumed: BTreeSet<String>,
+    ) -> Self {
+        let mut state = Self::default();
+        let mut result_order = results
+            .values()
+            .map(|record| record.result.ticket_id.clone())
+            .collect::<Vec<_>>();
+        result_order.sort_by_key(|ticket_id| {
+            results
+                .get(ticket_id)
+                .map_or(0, |record| record.retention_order)
+        });
+        state.result_order = result_order.into_iter().collect();
+        state.lifecycle = lifecycle;
+        state.successor_consumed = successor_consumed;
+        state.results = results;
+        state
+    }
+
+    fn mark_lifecycle(&mut self, ticket_id: &str, lifecycle: AgentActivationLifecycle) {
+        self.lifecycle.insert(ticket_id.to_owned(), lifecycle);
+        if self.lifecycle.len() > eliot_ors::MAX_ACTIVATION_LIFECYCLE_RECORDS
+            && let Some(oldest) = self
+                .lifecycle
+                .iter()
+                .find(|(candidate, _)| {
+                    !self.entries.contains_key(*candidate) && !self.results.contains_key(*candidate)
+                })
+                .map(|(candidate, _)| candidate.clone())
+        {
+            self.lifecycle.remove(&oldest);
+        }
+    }
+
+    fn lifecycle(&self, ticket_id: &str) -> AgentActivationLifecycle {
+        self.lifecycle
+            .get(ticket_id)
+            .copied()
+            .unwrap_or(AgentActivationLifecycle::Pending)
+    }
+
+    /// Finds the one retained `NotReady` predecessor for this exact bridge
+    /// demand that may authorize a fresh successor ticket. The due-time check
+    /// only makes a candidate eligible for staging; `claim_at` still requires
+    /// the authenticated daemon's fresh changed-revision discriminator before
+    /// transitioning it to `Claimed`. A same-ticket replacement is never
+    /// returned, and an unrelated demand cannot inherit predecessor evidence.
+    fn successor_candidate_for(
+        &self,
+        now: u64,
+        demand_id: &str,
+    ) -> Result<Option<AgentActivationSuccessorBinding>, TransportError> {
+        let mut candidates = self
+            .results
+            .values()
+            .filter(|record| {
+                record.demand_id == demand_id
+                    && !self.successor_consumed.contains(&record.result.ticket_id)
+                    && self.lifecycle(&record.result.ticket_id)
+                        == AgentActivationLifecycle::DeferredNotReady
+                    && matches!(
+                        &record.result.disposition,
+                        AgentActivationResolutionDisposition::NotReady { .. }
+                    )
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|record| record.retention_order);
+        let Some(record) = candidates.last().copied() else {
+            return Ok(None);
+        };
+        let AgentActivationResolutionDisposition::NotReady { retry, .. } =
+            &record.result.disposition
+        else {
+            return Err(TransportError::SessionFenced);
+        };
+        if now < retry.not_before_unix_ms {
+            return Err(TransportError::IdentityConflict);
+        }
+        if self.entries.values().any(|entry| {
+            entry
+                .successor_of
+                .as_ref()
+                .is_some_and(|successor| successor.predecessor_ticket_id == record.result.ticket_id)
+        }) {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(Some(AgentActivationSuccessorBinding {
+            predecessor_ticket_id: record.result.ticket_id.clone(),
+            predecessor_ticket_sha256: record.result.ticket_sha256.clone(),
+            predecessor_result_sha256: record.result.result_sha256.clone(),
+            dependency_ref: retry.dependency_ref.clone(),
+            observed_dependency_revision: retry.observed_dependency_revision.clone(),
+            not_before_unix_ms: retry.not_before_unix_ms,
+        }))
+    }
+
+    fn claim_at(
+        &mut self,
+        now: u64,
+        dependency_ref: &str,
+        dependency_revision: &str,
+    ) -> Option<AgentActivationResolutionTicket> {
         let queue_len = self.fifo.len();
         for _ in 0..queue_len {
             let ticket_id = self.fifo.pop_front()?;
             // A retained semantic result (v2) is terminal-or-deferred
-            // durable state: admission is not a semantic delta and never
-            // re-queues it. A result-less ticket is admitted at most once:
-            // re-admitting it would repeat the same semantic resolution
-            // against the same owner state without a typed transient result
-            // or changed-dependency discriminator (#66 C4/A3). An unanswered
-            // ticket rests until the Kernel-owned deadline, which projects
-            // result-less expiry instead of looping the resolver.
+            // durable state: claim-lease expiry is not a semantic delta and
+            // never re-queues it. A result-less lost claim is removed from
+            // the live queue and reconciled by the durable owner.
             if self.results.contains_key(&ticket_id) {
                 continue;
             }
-            let Some(entry) = self.entries.get_mut(&ticket_id) else {
+            let Some(entry) = self.entries.get(&ticket_id) else {
                 continue;
             };
             if activation_deadline_expired(now, entry.ticket.kernel_deadline_unix_ms) {
@@ -800,12 +947,42 @@ impl AgentActivationPendingState {
                 self.fifo.push_back(ticket_id);
                 continue;
             }
+            let successor = entry.successor_of.clone();
+            if let Some(successor) = successor.as_ref() {
+                let Some(predecessor) = self.results.get(&successor.predecessor_ticket_id) else {
+                    self.fifo.push_back(ticket_id);
+                    continue;
+                };
+                let AgentActivationResolutionDisposition::NotReady {
+                    retry: predecessor_retry,
+                    ..
+                } = &predecessor.result.disposition
+                else {
+                    self.fifo.push_back(ticket_id);
+                    continue;
+                };
+                if now < predecessor_retry.not_before_unix_ms
+                    || successor.dependency_ref != dependency_ref
+                    || dependency_revision == predecessor_retry.observed_dependency_revision
+                {
+                    // A due-time-only observation is not claimable. Keep the
+                    // successor staged and invisible to the daemon until the
+                    // authenticated owner supplies a changed discriminator.
+                    self.fifo.push_back(ticket_id);
+                    continue;
+                }
+            }
+            let Some(entry) = self.entries.get_mut(&ticket_id) else {
+                continue;
+            };
             entry.claim_lease_until_unix_ms = Some(
                 now.saturating_add(AGENT_ACTIVATION_CLAIM_LEASE_MS)
                     .min(entry.ticket.kernel_deadline_unix_ms),
             );
+            entry.claim_dependency_ref = Some(dependency_ref.to_owned());
+            entry.claim_dependency_revision = Some(dependency_revision.to_owned());
             let ticket = entry.ticket.clone();
-            self.fifo.push_back(ticket_id);
+            self.mark_lifecycle(&ticket_id, AgentActivationLifecycle::Claimed);
             return Some(ticket);
         }
         None
@@ -837,34 +1014,21 @@ impl AgentActivationPendingState {
                 .all(|ticket_id| ordered.contains(ticket_id))
     }
 
-    /// Determines the only safe eviction plan for one incoming result. This
-    /// is deliberately pure: an impossible bound or order/map state returns
-    /// `None` before durable ORS publication can begin.
+    /// Validates the local ledger shape before publication. ORS, under the
+    /// same pending lock, is the sole authority for bounded eviction; the
+    /// cache never selects a victim independently.
     #[cfg(windows)]
-    fn result_retention_eviction_plan(&self, ticket_id: &str) -> Option<Vec<String>> {
+    fn result_retention_eviction_plan(&self, _ticket_id: &str) -> Option<Vec<String>> {
         if !self.result_ledger_is_consistent() {
             return None;
         }
-        if self.results.contains_key(ticket_id) {
-            return Some(Vec::new());
-        }
-        let max = eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS;
-        let required = self.results.len().saturating_add(1).saturating_sub(max);
-        let mut victims = Vec::with_capacity(required);
-        for candidate in &self.result_order {
-            if !self.entries.contains_key(candidate) {
-                victims.push(candidate.clone());
-                if victims.len() == required {
-                    break;
-                }
-            }
-        }
-        (victims.len() == required).then_some(victims)
+        Some(Vec::new())
     }
 
     /// Stages the canonical result map/order update before the durable write.
-    /// The returned copies are not published until ORS has committed, so an
-    /// impossible capacity or order state leaves the live ledger untouched.
+    /// ORS performs bounded eviction under the same pending lock and returns
+    /// the exact victim identities; this cache never chooses a different
+    /// victim independently.
     #[cfg(windows)]
     fn stage_result_retention(
         &self,
@@ -905,23 +1069,18 @@ impl AgentActivationPendingState {
         ),
         ticket_id: &str,
         retention_order: u64,
+        evicted_ticket_ids: &[String],
     ) {
         debug_assert!(staged.0.contains_key(ticket_id));
+        for evicted_ticket_id in evicted_ticket_ids {
+            staged.0.remove(evicted_ticket_id);
+            staged.1.retain(|candidate| candidate != evicted_ticket_id);
+        }
         if let Some(record) = staged.0.get_mut(ticket_id) {
             record.retention_order = retention_order;
         }
         self.results = staged.0;
         self.result_order = staged.1;
-    }
-
-    #[cfg(test)]
-    fn retain_activation_result(&mut self, record: AgentActivationResultRecord) {
-        let ticket_id = record.result.ticket_id.clone();
-        let retention_order = record.retention_order;
-        let staged = self
-            .stage_result_retention(record)
-            .expect("test result ledger must have a safe retention state");
-        self.publish_staged_result_retention(staged, &ticket_id, retention_order);
     }
 }
 
@@ -959,6 +1118,8 @@ pub enum KernelFrameAction {
     Daemon {
         /// Correlation identity to echo in the response.
         request_id: RequestId,
+        /// Exact authenticated request identity admitted on the same frame.
+        identity: RequestIdentity,
         /// Closed operation name from the daemon application wire.
         operation: String,
         /// Bounded operation payload.
@@ -977,6 +1138,9 @@ pub enum KernelFrameAction {
         operation: String,
         /// Bounded operation payload carrying the typed repair-attempt request.
         payload: serde_json::Value,
+        /// The original transport control classification.  The typed Doctor
+        /// owner still validates the closed envelope before admitting it.
+        control: bool,
     },
     /// Execute one authenticated testd admission operation (T6-X1 P-07).
     /// The operation carries the exact testd wire identity; job-bound
@@ -995,6 +1159,9 @@ pub enum KernelFrameAction {
         operation: String,
         /// Bounded operation payload carrying the typed admission request.
         payload: serde_json::Value,
+        /// The original transport control classification. The typed `TestD`
+        /// owner remains the final authority on cancellation versus submit.
+        control: bool,
     },
     /// Execute one authenticated Dreamer job operation (T12-05 K2).
     /// The operation carries the exact Dreamer wire identity; ledger-bound
@@ -1009,6 +1176,23 @@ pub enum KernelFrameAction {
         /// Closed operation name; must equal `DREAMER_JOB_WIRE_ID`.
         operation: String,
         /// Bounded operation payload carrying context plus typed job request.
+        payload: serde_json::Value,
+    },
+    /// Execute one authenticated bounded research-provider operation (#24).
+    ///
+    /// The operation carries the exact research dispatch wire identity; the
+    /// admission itself is owned by the Kernel research-provider route
+    /// (`crate::research_provider_route`), which re-queries the live authority
+    /// epoch and the session's module-generation State Fence on every call. No
+    /// provider process is spawned inside this handler: the admitted operation
+    /// is executed by `eliot-mod-research` through the shared governed process
+    /// contour, and the returned material stays candidate-only.
+    Research {
+        /// Correlation identity to echo in the response.
+        request_id: RequestId,
+        /// Closed operation name from the research-provider wire.
+        operation: String,
+        /// Bounded operation payload carrying the typed dispatch envelope.
         payload: serde_json::Value,
     },
     /// Return a typed rejection, then fence the connection.
@@ -1027,6 +1211,48 @@ fn unix_ms() -> u64 {
 #[cfg(windows)]
 fn activation_deadline_expired(now: u64, deadline: u64) -> bool {
     now >= deadline
+}
+
+/// Closed shape of one live SCM Watchdog incarnation observation:
+/// `host-scm-watchdog:{pid}:{start_time_100ns}:{image_sha256}`.
+///
+/// I1.11 step 1 makes SCM the named channel for the independent Watchdog
+/// service state, so the digest that carries it is a live process identity plus
+/// the digest of the live Watchdog image bytes. A path string, a lease revision
+/// or a health flag is not this shape and is refused.
+#[cfg(windows)]
+const LIVE_SCM_WATCHDOG_OBSERVATION_PREFIX: &str = "host-scm-watchdog";
+
+/// Validates one live SCM Watchdog incarnation digest in the closed shape.
+///
+/// This is the single owner of that shape so the supervision producer and the
+/// readiness gate can never drift into accepting different observations.
+///
+/// # Errors
+///
+/// Returns a platform error when the digest does not name a live Watchdog
+/// process identity with a non-empty image digest and nothing else.
+#[cfg(windows)]
+fn verify_live_scm_watchdog_observation(
+    digest: &eliot_platform::PlatformHandle,
+) -> Result<(), KernelServiceError> {
+    let malformed =
+        || KernelServiceError::Platform("Host SCM Watchdog observation is malformed".to_owned());
+    let mut parts = digest.as_str().split(':');
+    if parts.next() != Some(LIVE_SCM_WATCHDOG_OBSERVATION_PREFIX) {
+        return Err(malformed());
+    }
+    let Ok(process_id) = parts.next().ok_or_else(malformed)?.parse::<u32>() else {
+        return Err(malformed());
+    };
+    let Ok(process_start) = parts.next().ok_or_else(malformed)?.parse::<u64>() else {
+        return Err(malformed());
+    };
+    let image_sha256 = parts.next().ok_or_else(malformed)?;
+    if parts.next().is_some() || process_id == 0 || process_start == 0 || image_sha256.is_empty() {
+        return Err(malformed());
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1627,7 +1853,10 @@ impl KernelComposition {
             .route(&route_scope)
             .map_err(|e| KernelBuildError::Core(e.to_string()))?
             .clone();
-        if route.authority_epoch().value() != requirement.authority_epoch().sequence.get()
+        // Exact tuple equality is the authorization rule (Implements #64).
+        if !route
+            .authority_epoch()
+            .is_same_authority(requirement.authority_epoch())
             || route.active_generation() != requirement.store_generation
             || requirement.route_identity.as_str() != STORE_BRIDGE_ROUTE
         {
@@ -2216,27 +2445,16 @@ impl KernelComposition {
             })
     }
 
-    /// Normal canonical-write admission through the startup coordinator.
-    /// Inspection remains allowed; a blocked write fails with the named
-    /// unmet startup prerequisite.
-    ///
-    /// # Errors
-    ///
-    /// Returns the blocking [`StartupRejection`] naming the unmet
-    /// prerequisite, or a lock-poison platform error.
-    pub fn admit_normal_write(&self) -> Result<(), KernelServiceError> {
-        let coordinator = self
-            .startup_coordinator
-            .lock()
-            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
-        coordinator
-            .admit_normal_write()
-            .map_err(|rejection| KernelServiceError::Platform(rejection.to_string()))
-    }
-
     /// Material/Critical authority admission for one Governance Profile.
     /// Startup completeness is checked first with its named prerequisite;
     /// the profile ceiling alone decides once startup is complete.
+    ///
+    /// This is the startup-gate half of the Material decision and is the
+    /// surface the origin-control decide path consults. It does not stand in
+    /// for current independent Watchdog coverage: a protected effect that must
+    /// be admitted as independently supervised additionally passes
+    /// [`Self::admit_material_authority_for_fence`], which verifies the live
+    /// Watchdog branch for the exact target fence.
     ///
     /// # Errors
     ///
@@ -2255,28 +2473,320 @@ impl KernelComposition {
             .map_err(|rejection| KernelServiceError::Platform(rejection.to_string()))
     }
 
-    /// Advances one I1.11 startup step in order. Production calls this as
-    /// each probe/handshake actually completes; out-of-order steps fail.
+    /// Normal canonical-write admission through the startup coordinator.
+    /// Inspection remains allowed; a blocked write fails with the named
+    /// unmet startup prerequisite.
     ///
     /// # Errors
     ///
-    /// Returns the ordering error when `step` is not the next expected step
-    /// or lies outside 1-11, or a lock-poison platform error.
-    pub fn complete_startup_step(&self, step: u8) -> Result<(), KernelServiceError> {
-        let mut coordinator = self
+    /// Returns the blocking [`StartupRejection`] naming the unmet
+    /// prerequisite, or a lock-poison platform error.
+    pub fn admit_normal_write(&self) -> Result<(), KernelServiceError> {
+        let coordinator = self
             .startup_coordinator
             .lock()
             .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
         coordinator
-            .complete_step(step)
-            .map_err(KernelServiceError::Platform)
+            .admit_normal_write()
+            .map_err(|rejection| KernelServiceError::Platform(rejection.to_string()))
+    }
+
+    /// Validate the exact Kernel target fence before a protected effect.
+    ///
+    /// The fence is supplied by the authenticated route, never reconstructed
+    /// from an operation payload.  This check is deliberately separate from
+    /// the global startup cursor: a cursor can prove that prerequisites were
+    /// observed, but it cannot stand in for current independent Watchdog
+    /// coverage.  The verified current candidate binding is returned so the
+    /// supervision check reuses this one read instead of taking the
+    /// non-reentrant service lock twice.
+    fn validate_material_target_fence(
+        &self,
+        target: &StateFence,
+    ) -> Result<eliot_kernel_service::HostKernelCandidateBinding, KernelServiceError> {
+        target
+            .validate()
+            .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+        let service = self.service.lock().map_err(|_| {
+            KernelServiceError::Platform("material target lock poisoned".to_owned())
+        })?;
+        if service.state() != KernelServiceState::Ready || service.generation_fenced() {
+            return Err(KernelServiceError::Platform(
+                "material target is not the current Ready Kernel generation".to_owned(),
+            ));
+        }
+        let candidate = service.candidate_binding().ok_or_else(|| {
+            KernelServiceError::Platform(
+                "material target has no current candidate binding".to_owned(),
+            )
+        })?;
+        let activation = service.activation_receipt().ok_or_else(|| {
+            KernelServiceError::Platform(
+                "material target has no current activation receipt".to_owned(),
+            )
+        })?;
+        if candidate.kernel_epoch != target.authority_epoch
+            || activation.generation != target.resource_generation
+            || activation.authority_epoch != target.authority_epoch
+        {
+            return Err(KernelServiceError::Platform(
+                "material target fence is not the current activation generation".to_owned(),
+            ));
+        }
+        // The activation receipt is the authoritative live fence. Compare it
+        // two-sidedly so a caller cannot smuggle a `task_revision`,
+        // `policy_revision`, or `integration_revision` that Kernel never
+        // issued: `is_compatible_with` treats the live side's `None` as a
+        // wildcard, and only the reverse direction rejects that asymmetry.
+        let live_fence = StateFence::new(activation.authority_epoch.clone(), activation.generation);
+        if !eliot_contracts::fences_match_exact(target, &live_fence) {
+            return Err(KernelServiceError::Platform(
+                "material target fence carries revisions the current activation did not issue"
+                    .to_owned(),
+            ));
+        }
+        Ok(candidate.clone())
+    }
+
+    /// Material/Critical authority admission for one exact target fence.
+    ///
+    /// The decision has two independent halves. The first is mechanical: the
+    /// presented fence must be the live, Ready, unfenced activation contour
+    /// (see [`Self::validate_material_target_fence`]) and the profile ceiling
+    /// must actually permit Material effects. The second is supervision: the
+    /// independent Watchdog branch must currently verify. Only then is work
+    /// admitted as independently supervised.
+    ///
+    /// A verified branch admits; an unverified branch pauses with the explicit
+    /// `WATCHDOG_COVERAGE_UNAVAILABLE` degraded-profile refusal and the
+    /// Human-risk path requirement. The supervision half reads the revocable
+    /// I1.11 supervision step, never a latched cursor and never lease
+    /// continuity alone.
+    pub(crate) fn admit_material_authority_for_fence(
+        &self,
+        profile: GovernanceProfile,
+        target: &StateFence,
+    ) -> Result<(), KernelServiceError> {
+        let candidate = self.validate_material_target_fence(target)?;
+        if !matches!(
+            profile.ceiling(),
+            AuthorityCeiling::Material | AuthorityCeiling::Critical
+        ) {
+            return Err(KernelServiceError::Platform(
+                "material authority refused: governance profile does not permit Material effects"
+                    .to_owned(),
+            ));
+        }
+        self.verify_watchdog_supervision_branch(&candidate, target)
+            .map_err(|reason| {
+                KernelServiceError::Platform(format!(
+                    "{}: {reason}; Material/Critical work is paused under runtime-degraded-v3 and requires the explicit Human-risk path",
+                    eliot_kernel_service::ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE
+                ))
+            })
+    }
+
+    /// Admits one Host-observed live Watchdog branch observation for the exact
+    /// candidate contour it was probed under, and records the I1.11 supervision
+    /// step from it.
+    ///
+    /// This consumes the existing `HostStartupEvidence` carrier. Host already
+    /// revalidates the live SCM Watchdog incarnation when it builds that
+    /// carrier: the bound PID/start pair must still be live in the OS and the
+    /// live image bytes must still hash to the approved Watchdog artifact.
+    /// Kernel re-reads the named incarnation, binds it to the presented
+    /// candidate and State Fence, and only then marks the supervision step. The
+    /// step is revocable, so a new activation contour is unverified again until
+    /// Host observes the branch under that contour. Coverage is never re-derived
+    /// from lease continuity or `eliotd` self-report.
+    ///
+    /// # Errors
+    ///
+    /// Returns a platform error when the carrier is not exactly bound to the
+    /// presented candidate, when the probe fence is not the presented target
+    /// fence, when the supervision incarnation has no non-zero Watchdog epoch,
+    /// or when the SCM Watchdog incarnation digest is not a well-formed live
+    /// observation.
+    #[cfg(windows)]
+    pub(crate) fn admit_host_observed_watchdog_branch(
+        &self,
+        evidence: &HostStartupEvidence,
+        candidate: &eliot_kernel_service::HostKernelCandidateBinding,
+        target: &StateFence,
+    ) -> Result<(), KernelServiceError> {
+        let candidate_digest = candidate.compute_digest().map_err(|_| {
+            KernelServiceError::Platform(
+                "Watchdog branch observation candidate has no computable digest".to_owned(),
+            )
+        })?;
+        if evidence.candidate_digest != candidate_digest
+            || evidence.state_fence != *target
+            || !eliot_contracts::fences_match_exact(&evidence.state_fence, target)
+        {
+            return Err(KernelServiceError::Platform(
+                "Host Watchdog branch observation is not bound to the presented candidate contour"
+                    .to_owned(),
+            ));
+        }
+        let incarnation = &candidate.supervision_incarnation;
+        if incarnation.watchdog_epoch.sequence == 0 {
+            return Err(KernelServiceError::Platform(
+                "Host Watchdog branch observation has no non-zero Watchdog epoch".to_owned(),
+            ));
+        }
+        verify_live_scm_watchdog_observation(&evidence.scm_watchdog_observation_digest)?;
+        self.record_host_observed_supervision_evidence(&evidence.scm_watchdog_observation_digest)
+    }
+
+    /// Probe/readiness admission for the independent Watchdog branch.
+    ///
+    /// I1.5 (#1750) and I1.11 steps 1/11: Host validates the independent
+    /// Watchdog service state through SCM and Watchdog independently confirms
+    /// coverage, so a readiness receipt may only be authored for a contour whose
+    /// branch Kernel can currently prove. The proof is a conjunction:
+    ///
+    /// 1. the live SCM Watchdog incarnation digest Host observed for THIS
+    ///    contour is recorded with the revocable I1.11 supervision step, and is
+    ///    re-validated here in the same closed shape — a live process identity
+    ///    plus the digest of the live Watchdog image bytes, not a number copied
+    ///    out of a lease;
+    /// 2. that supervision step is still present, so a new activation contour
+    ///    that has not been observed again is unproven; and
+    /// 3. the whole supervised-branch verification
+    ///    ([`Self::verify_watchdog_supervision_branch`]) succeeds for the exact
+    ///    presented candidate and target fence.
+    ///
+    /// This is deliberately NOT a lease-derived watchdog-epoch equality. Two
+    /// `u64`s compared on a renewed ORS head are bookkeeping, not observation:
+    /// they stay equal while Watchdog is stopped, replaced or wedged. The
+    /// conjunction above refuses in every one of those cases, so it is strictly
+    /// stronger than the epoch equality it replaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns a platform error naming the missing live SCM observation or the
+    /// exact supervision fact that failed to verify.
+    #[cfg(windows)]
+    pub(crate) fn admit_probe_watchdog_branch(
+        &self,
+        candidate: &eliot_kernel_service::HostKernelCandidateBinding,
+        target: &StateFence,
+    ) -> Result<(), KernelServiceError> {
+        let observed = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?
+            .live_watchdog_incarnation()
+            .cloned()
+            .ok_or_else(|| {
+                KernelServiceError::Platform(
+                    "readiness refused: no live SCM Watchdog incarnation is observed for the current contour"
+                        .to_owned(),
+                )
+            })?;
+        verify_live_scm_watchdog_observation(&observed)?;
+        self.verify_watchdog_supervision_branch(candidate, target)
+            .map_err(|reason| {
+                KernelServiceError::Platform(format!(
+                    "readiness refused: {reason}; supervised readiness is withheld and the contour stays degraded"
+                ))
+            })
+    }
+
+    /// Revokes the recorded independent-supervision evidence at the one
+    /// owner-correct moment it can no longer describe the live contour: a new
+    /// candidate activation is admitted (I1.5).
+    ///
+    /// A previously verified Watchdog branch belonged to the previous
+    /// activation generation, host epoch, and Watchdog epoch. Admitting a new
+    /// contour therefore withdraws the claim until Host observes the branch
+    /// again under that contour. This never un-observes an earlier I1.11 step
+    /// and never grants anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lock-poison platform error.
+    pub(crate) fn revoke_supervision_evidence(&self) -> Result<(), KernelServiceError> {
+        let mut coordinator = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        coordinator.revoke_supervision_evidence();
+        Ok(())
+    }
+
+    /// Admits a process `Start` admission under Material/Critical authority.
+    ///
+    /// The target fence is derived from the already-validated admission, never
+    /// from caller-supplied loose fields, so the front-door path and the
+    /// dispatch-launch path cannot drift into checking different generations.
+    /// This performs no external effect and never retries.
+    pub(crate) fn admit_material_process_start(
+        &self,
+        admission: &eliot_process::ProcessExecutionAdmissionRequest,
+    ) -> Result<(), KernelServiceError> {
+        let target_generation =
+            eliot_contracts::ResourceGeneration::new(admission.state_fence().generation().get())
+                .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+        let target_fence = StateFence::new(
+            admission.state_fence().authority_epoch().clone(),
+            target_generation,
+        );
+        self.admit_material_authority_for_fence(GovernanceProfile::full(), &target_fence)
     }
 
     /// Records one real owner-produced I1.11 evidence item. Out-of-order
     /// evidence is retained without advancing the contiguous readiness cursor;
     /// missing earlier steps therefore remain blocking and cannot be inferred
     /// from a later successful probe.
+    ///
+    /// I1.11 step 11 is the supervision step. It is not reachable here: a
+    /// signed lease, a successful process handshake, or `ProbeReady` alone is
+    /// lease continuity, not an independent Watchdog observation. The only
+    /// production producer is
+    /// [`Self::record_host_observed_supervision_evidence`], which runs only
+    /// after `admit_host_observed_watchdog_branch` accepted a live SCM
+    /// Watchdog incarnation for the presented contour.
     pub(crate) fn record_startup_evidence(&self, step: u8) -> Result<(), KernelServiceError> {
+        if step == STARTUP_FINAL_STEP {
+            return Err(KernelServiceError::Platform(
+                "startup step 11 requires an independent Host-observed Watchdog signal".to_owned(),
+            ));
+        }
+        self.record_startup_evidence_inner(step)
+    }
+
+    /// Records the I1.11 supervision step from one verified independent
+    /// Watchdog branch observation.
+    ///
+    /// This is the sole production producer of [`STARTUP_FINAL_STEP`]. The
+    /// caller must have just accepted a live SCM Watchdog incarnation bound to
+    /// the presented candidate contour; the incarnation digest is retained
+    /// with the step so a later admission can prove the claim came from that
+    /// observation. The step is revocable, so a later contour change keeps
+    /// Material/Critical admission closed until Host observes the branch again.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lock-poison platform error, or the coordinator's fixed-shape
+    /// range error for a step outside I1.11.
+    #[cfg(windows)]
+    pub(crate) fn record_host_observed_supervision_evidence(
+        &self,
+        incarnation: &eliot_platform::PlatformHandle,
+    ) -> Result<(), KernelServiceError> {
+        let mut coordinator = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        coordinator
+            .record_live_supervision_evidence(incarnation.clone())
+            .map_err(KernelServiceError::Platform)
+    }
+
+    /// Ordered I1.11 cursor update shared by the general and
+    /// supervision-only producers.
+    fn record_startup_evidence_inner(&self, step: u8) -> Result<(), KernelServiceError> {
         let mut coordinator = self
             .startup_coordinator
             .lock()
@@ -2632,6 +3142,10 @@ impl KernelComposition {
         Ok(current)
     }
 
+    /// Renews the exact active supervision lease from process continuity when
+    /// no admitted progress observation is available. This preserves the
+    /// front-door lease only; it never records I1.11 step 11 or grants
+    /// Material authority.
     #[cfg(windows)]
     fn renew_current_supervision(
         authority: &KernelSupervisionLeaseAuthority,
@@ -2912,11 +3426,12 @@ impl KernelComposition {
         Ok((contour, snapshot))
     }
 
-    // Issue #88, wave 3: the ProbeReady path renews through the typed
-    // progress route when the latest retained per-tick observation cites the
-    // exact durable head, so ProbeReady and the per-tick submits decide on
-    // the same evidence. Without a current retained observation the
-    // policy-driven bootstrap renew covers the pre-observation window.
+    // Issue #88, wave 3: the ProbeReady path uses the latest retained
+    // per-tick observation when it is bound to the current durable head (or
+    // is the exact observation that produced its immediately preceding
+    // successor). A missing or refused progress observation falls back only to
+    // lease continuity for front-door responsiveness; that fallback never
+    // records I1.11 step 11 or grants Material authority.
     // `StoreHealth` (`health_view::daemon_health`) stays evidence-only and
     // must never be passed as renewal evidence.
     #[cfg(windows)]
@@ -2933,23 +3448,42 @@ impl KernelComposition {
         ready: &EliotdLiveReadyEvidence,
         head: &SupervisionLeaseSnapshot,
     ) -> Result<Option<(SupervisionLeaseSnapshot, EliotdLiveReceipt)>, KernelServiceError> {
-        let retained = self
+        let (observation, progress_state) = self
             .daemon_runtime
             .lock()
-            .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))?
-            .last_progress_observation
-            .clone();
-        let Some(observation) = retained else {
+            .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))
+            .map(|state| {
+                (
+                    state.last_progress_observation.clone(),
+                    state.supervision_progress.clone(),
+                )
+            })?;
+        if progress_state.reconciliation_pending {
+            // A staged ticket with an unresolved publication is reconciled by
+            // identity only; never fall through to process-continuity renewal.
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        let Some(observation) = observation else {
             return Ok(None);
         };
-        // The retained observation must cite this exact head. Anything older
-        // (including a predecessor advanced by a per-tick submit since) keeps
-        // the bootstrap path instead of deciding from stale evidence.
-        if observation.lease_id != head.record.lease_id.as_str()
-            || observation.lease_revision != head.record.revision
-            || observation.predecessor_receipt_sha256 != head.receipt.receipt_sha256
+        if !Self::progress_observation_matches_current_head(&observation, head, &progress_state) {
+            return Ok(None);
+        }
+        let now_ms = unix_ms();
+        if observation.observed_wall_ms > now_ms.saturating_add(5_000)
+            || now_ms.saturating_sub(observation.observed_wall_ms) > 10_000
         {
             return Ok(None);
+        }
+        // A successful renewal retains the observation that was evaluated
+        // against the predecessor head. When that exact observation is
+        // recorded as the producer of the current successor, ProbeReady can
+        // reconcile the publication from that successor; it must not submit the
+        // predecessor again as a new renewal request.
+        if observation.predecessor_receipt_sha256 != head.receipt.receipt_sha256 {
+            let published =
+                self.publish_eliotd_live_receipt(launch, process, ready, contour, Some(head))?;
+            return Ok(Some((head.clone(), published)));
         }
         let predecessor = eliot_runtime_contracts::SupervisionLeasePredecessorProof {
             lease_id: head.record.lease_id.as_str().to_owned(),
@@ -3000,13 +3534,25 @@ impl KernelComposition {
             }
             Ok(())
         };
-        let Ok((snapshot, decision, receipt)) = renewal else {
-            // Any refusal or authority failure keeps the bootstrap path:
-            // ProbeReady must not turn a stale retained observation into
-            // a readiness failure while the policy renew still applies.
-            // An expired lease fails closed in the bootstrap renew below.
-            put_back(progress, None)?;
-            return Ok(None);
+        let (snapshot, decision, receipt) = match renewal {
+            Ok(value) => value,
+            Err(error) => {
+                let expired = matches!(
+                    error,
+                    SupervisionProgressRenewalError::Heartbeat(
+                        DaemonSupervisionHeartbeatError::SupervisionLeaseExpired
+                    )
+                );
+                put_back(progress, Some(expired))?;
+                if expired {
+                    self.promote_agent_bridge_profile(None)
+                        .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+                }
+                // A failed renewal must not fall through to process-only
+                // continuity. Otherwise a terminal lease expiry could be
+                // revived by a later ProbeReady without a new generation.
+                return Err(KernelServiceError::ReadinessNotProven);
+            }
         };
         put_back(progress, Some(false))?;
         // A non-renewing decision still publishes the unchanged head
@@ -3050,7 +3596,10 @@ impl KernelComposition {
                 // lease expiry for this contour. Fail readiness closed on the
                 // expired marker until a new admitted generation rebinds (the
                 // rebind clears the marker); the durable-head verify below
-                // would fail identically on the expired binding.
+                // would fail identically on the expired binding. A terminal
+                // progress expiry therefore fences this contour until a newly
+                // admitted generation rebinds: a live lease snapshot or a later
+                // ProbeReady cannot revive the expired claim.
                 return Err(KernelServiceError::ReadinessNotProven);
             }
             (
@@ -3115,6 +3664,8 @@ impl KernelComposition {
         {
             pair
         } else {
+            // Front-door continuity only. This fallback cannot satisfy I1.11
+            // step 11 and therefore cannot admit Material/Critical authority.
             let renewed = Self::renew_current_supervision(authority, &contour, unix_ms())
                 .map_err(|_| KernelServiceError::ReadinessNotProven)?;
             let published = self.publish_eliotd_live_receipt(
@@ -3513,15 +4064,20 @@ impl KernelComposition {
         )?;
 
         // StoreStopLeaseZero: the store-stop request below is admitted only
-        // with no outstanding canonical-data lease.
-        if ShutdownDrainCoordinator::check_lease_zero(
-            self.canonical_store_claimed.load(Ordering::Acquire),
-        )
-        .is_err()
-        {
+        // with no outstanding lease. I1.5 widens the existing I14.23
+        // canonical-data precondition to the full Kernel-owned lease census:
+        // a live supervision lease, a live authenticated front-door Session,
+        // or an outstanding host-request operation each keeps an obligation
+        // that shutdown may not abandon.
+        let census = self.idle_lease_census();
+        health_view::observe_shutdown_observation(
+            "kernel.shutdown.lease_census_observed",
+            census.observation_code(),
+        );
+        if !census.admits_drain() {
             return Err(DrainHalt::with_pending(
-                "canonical-data-lease-outstanding",
-                vec!["canonical-store-lease".to_owned()],
+                "runtime-or-supervision-lease-outstanding",
+                vec![census.observation_code().to_owned()],
             ));
         }
         #[cfg(windows)]
@@ -3537,7 +4093,10 @@ impl KernelComposition {
         let store_evidence = "store-gateway-absent";
         record(
             ShutdownPhase::StoreStopLeaseZero,
-            format!("canonical-leases-zero;{store_evidence}"),
+            format!(
+                "lease-census:{};{store_evidence}",
+                census.observation_code()
+            ),
         )?;
 
         // DrainCommit linearization point.

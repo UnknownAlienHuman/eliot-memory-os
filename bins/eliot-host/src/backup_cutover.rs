@@ -131,13 +131,15 @@
 //! I1.5 activation/drain generations never overlap; I14.14 cutover record
 //! owns the linearization point (here: the journal append receipt).
 
-use eliot_backup::{BackupClass, OperationalValidationEvidence, RestoreReceipt};
+use eliot_backup::{
+    BackupClass, OperationalValidationEvidence, ReconciliationDenominator, RestoreReceipt,
+};
 use eliot_contracts::{StateFence, fences_match_exact};
 use eliot_host_state::{
-    AppendReceipt, EpochRetirementRecord, EpochTransition, HostInstallationEpoch, HostStateRecord,
-    IdempotencyIdentity, RecordFence,
+    AppendReceipt, CutoverIntentRecord, CutoverIntentState, EpochRetirementRecord, EpochTransition,
+    HostInstallationEpoch, HostStateRecord, IdempotencyIdentity, RecordFence,
 };
-use eliot_installation::ApprovedGenerationRegistry;
+use eliot_installation::{ApprovedGeneration, ApprovedGenerationRegistry, CandidateManifest};
 use eliot_ors::{CapabilityIntroductionProjection, OperationalPhase};
 use eliot_platform::PlatformHandle;
 use eliot_protocol::{
@@ -210,7 +212,7 @@ pub struct CutoverRequest {
     pub target_generation: PlatformHandle,
     /// Owner-issued new authority fence for the destination generation.
     pub activation_fence: StateFence,
-    /// Owner-issued UserBroker identity for the destination generation.
+    /// Owner-issued `UserBroker` identity for the destination generation.
     pub user_broker_ref: PlatformHandle,
     /// Exact active predecessor generation expected at commit time.
     pub expected_predecessor: PlatformHandle,
@@ -230,13 +232,34 @@ pub struct CutoverRequest {
 ///
 /// `Deserialize` (M2 integration) mirrors the request: transport only, all
 /// gates re-checked by owner calls.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the #960 owner evidence denominator is a flat set of independent current-completeness facts; grouping them would hide a required gate"
+)]
 #[derive(Clone, Debug, Deserialize)]
 pub struct IsolatedRecoveryEvidence {
     /// All mandatory recovery phases completed with current receipts.
     pub mandatory_phases_complete: bool,
-    /// Exact current unresolved-effect disposition count with a complete
-    /// denominator (`None` = denominator unknown => block).
-    pub unresolved_effects: Option<u64>,
+    /// Exact current unresolved-effect disposition, as the complete current
+    /// owner-issued reconciliation denominator
+    /// (`eliot_backup::ReconciliationDenominator`, `lib.rs:2164`).
+    ///
+    /// A bare count is not a disposition: the denominator names its issuing
+    /// owner and its denominator reference, names every reconciled item in
+    /// `reconciled_refs`, and its own `validate()` refuses a count that does not
+    /// equal the named items, so no presented value can be an arbitrary number
+    /// and `is_known_zero()` requires a genuinely empty current denominator.
+    /// `None` means the denominator is unknown, which blocks cutover exactly
+    /// like a non-zero count: suspension is not resolution.
+    ///
+    /// Provenance, stated precisely: like the other owner receipts in this
+    /// bundle (`RestoreReceipt`, `OperationalValidationEvidence`,
+    /// `coordination_receipt`), the *shape* is owner-issued and structurally
+    /// re-validated here, while authority comes from the separately admitted
+    /// command envelope and the live owner readbacks in `execute_cutover` — not
+    /// from the field alone. This gate therefore removes the arbitrary-count
+    /// hole; it does not by itself prove an issuer.
+    pub unresolved_effect_denominator: Option<ReconciliationDenominator>,
     /// Complete canonical reconciliation denominator known.
     pub canonical_denominator_complete: bool,
     /// Complete ORS reconciliation denominator known.
@@ -383,6 +406,63 @@ fn receipt_handle(digest: &str) -> Result<PlatformHandle, CutoverError> {
     PlatformHandle::new(digest).map_err(|_| CutoverError::BindingMismatch)
 }
 
+/// Returns the exact owner-approved artifact digests of one committed
+/// candidate manifest, in manifest order.
+///
+/// This is byte-for-byte the same set as
+/// `backup_config_projection::bind_approved_build`'s
+/// `ApprovedBuildBinding::artifact_digests` — the installer's own definition of
+/// "approved build facts", which the #958 preparation path already subset-checks
+/// presented builds against. Aligning with it means the cutover accepts exactly
+/// the builds preparation accepts, and no narrower or wider build vocabulary is
+/// invented here.
+///
+/// That binding is deliberately not reused: it requires the record to be
+/// `active`, while the cutover target is by definition the staged, not-yet-active
+/// generation, and forging an active copy to reach it would invent installation
+/// state. Reading the immutable approved manifest keeps one vocabulary and one
+/// owner — the installation registry.
+fn owner_approved_build_digests(manifest: &CandidateManifest) -> Vec<&PlatformHandle> {
+    vec![
+        &manifest.kernel_artifact_digest,
+        &manifest.store_bridge_artifact_digest,
+        &manifest.canonical_store_artifact_digest,
+        &manifest.host_artifact_digest,
+        &manifest.doctor_artifact_digest,
+        &manifest.testd_artifact_digest,
+        &manifest.native_worker_artifact_digest,
+        &manifest.wasm_host_artifact_digest,
+    ]
+}
+
+/// Resolves the exact approved target generation and checks the request's
+/// approved build/config bindings against it.
+///
+/// `target_config_digest` must equal the committed candidate configuration
+/// digest, and `target_build_digest` must be one of that manifest's
+/// owner-approved artifacts. A build or config mismatch therefore refuses
+/// before the barrier and before the registry CAS, exactly like the source,
+/// destination, archive and fence bindings.
+fn bind_approved_target<'a>(
+    request: &CutoverRequest,
+    registry: &'a ApprovedGenerationRegistry,
+) -> Result<&'a ApprovedGeneration, CutoverError> {
+    let target = registry
+        .generations()
+        .iter()
+        .find(|item| item.manifest.generation == request.target_generation)
+        .ok_or_else(|| {
+            CutoverError::Registry("cutover target generation is not approved".to_owned())
+        })?;
+    if request.target_config_digest != target.manifest.config_digest {
+        return Err(CutoverError::BindingMismatch);
+    }
+    if !owner_approved_build_digests(&target.manifest).contains(&&request.target_build_digest) {
+        return Err(CutoverError::BindingMismatch);
+    }
+    Ok(target)
+}
+
 /// Validates one exact cutover request against current owner evidence.
 ///
 /// Real owner calls: `envelope.validate()`, `admission.validate()`, the
@@ -404,6 +484,10 @@ fn receipt_handle(digest: &str) -> Result<PlatformHandle, CutoverError> {
 /// # Errors
 ///
 /// Returns the exact failing gate. Nothing is activated here.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the ordered fail-closed cutover gate set stays in one boundary so no admission, receipt, or registry check can be skipped between neighbors"
+)]
 pub fn validate_cutover_request(
     request: &CutoverRequest,
     evidence: &IsolatedRecoveryEvidence,
@@ -494,7 +578,19 @@ pub fn validate_cutover_request(
     if !evidence.mandatory_phases_complete {
         return Err(CutoverError::MissingPhaseReceipt);
     }
-    if evidence.unresolved_effects.is_none() {
+    // Exact current unresolved-effect disposition: the owner-issued denominator
+    // must validate and must prove known-zero. An absent denominator, a
+    // denominator whose named items do not match its own count, and a
+    // non-zero count all refuse — a client-declared count (including a
+    // declared zero) is never cutover authority (I5.13; #960 "known-zero
+    // unresolved work requires a complete current denominator").
+    let Some(denominator) = evidence.unresolved_effect_denominator.as_ref() else {
+        return Err(CutoverError::PartialDenominator);
+    };
+    denominator
+        .validate()
+        .map_err(|error| CutoverError::InvalidRecoveryReceipt(error.to_string()))?;
+    if !denominator.is_known_zero() {
         return Err(CutoverError::PartialDenominator);
     }
     if !evidence.canonical_denominator_complete
@@ -545,21 +641,30 @@ pub fn validate_cutover_request(
     if !evidence.destination_ready {
         return Err(CutoverError::AuthorityOrReadinessMissing);
     }
+    // New owner-issued authority for the destination generation: the
+    // `UserBroker` identity must be a real, non-degenerate handle and must
+    // name neither this cutover's own generations nor its admission receipt.
+    // Identity reuse across a cutover would revive retired authority under a
+    // new fence, which I5.13 and A13.7 forbid outright.
+    if request.user_broker_ref.as_str().trim().is_empty()
+        || request.user_broker_ref == request.target_generation
+        || request.user_broker_ref == request.expected_predecessor
+        || request.user_broker_ref == request.operation.operation_id
+        || request.user_broker_ref == request.operation.request_digest
+    {
+        return Err(CutoverError::AuthorityOrReadinessMissing);
+    }
     registry
         .validate()
         .map_err(|error| CutoverError::Registry(error.to_string()))?;
     if request.target_generation == request.expected_predecessor {
         return Err(CutoverError::BindingMismatch);
     }
-    if !registry
-        .generations()
-        .iter()
-        .any(|item| item.manifest.generation == request.target_generation)
-    {
-        return Err(CutoverError::Registry(
-            "cutover target generation is not approved".to_owned(),
-        ));
-    }
+    // Exact approved build/config binding against the committed target
+    // manifest. This is the only place the target generation is resolved, so
+    // the build and config identities the request binds are checked against
+    // the same owner record that authorizes the generation.
+    bind_approved_target(request, registry)?;
     match registry.active_generation() {
         Some(active) if *active == request.expected_predecessor => {}
         Some(_) | None => return Err(CutoverError::ExpectedPredecessorConflict),
@@ -641,7 +746,7 @@ pub fn execute_cutover(
     activation_id: &PlatformHandle,
     activation_generation: &EpochTransition,
 ) -> Result<(CutoverOutcome, GenerationRetirementBarrier), CutoverError> {
-    host.ensure_admission_open()?;
+    host.ensure_material_admission_open_for_target(&validated.request.target_generation, false)?;
     let store = super::open_registry_store_at(&host.registry_host_root)?;
     let fresh = store
         .load()
@@ -649,15 +754,11 @@ pub fn execute_cutover(
     fresh
         .validate()
         .map_err(|error| CutoverError::Registry(error.to_string()))?;
-    if !fresh
-        .generations()
-        .iter()
-        .any(|item| item.manifest.generation == validated.request.target_generation)
-    {
-        return Err(CutoverError::Registry(
-            "cutover target generation is not approved".to_owned(),
-        ));
-    }
+    // TOCTOU fence for the target approval and the approved build/config
+    // bindings: the fresh owner readback, not the cached projection check, is
+    // what the effect runs against. `bind_approved_target` also refuses an
+    // unapproved target, so it replaces the previous inline approval probe.
+    bind_approved_target(&validated.request, &fresh)?;
     match fresh.active_generation() {
         Some(active) if *active == validated.request.expected_predecessor => {}
         Some(_) | None => return Err(CutoverError::ExpectedPredecessorConflict),
@@ -681,29 +782,158 @@ pub fn execute_cutover(
     // live); and every live row must read Fenced for cutover (no live
     // authority may survive retirement, joining the barrier-proven lease
     // quiescence and the registry CAS).
+    read_and_verify_prior_authority(host, validated)?;
+    // New `UserBroker` authority for the destination generation may not be an
+    // identity this cutover retires. The comparison is against the *presented*
+    // prior-generation set, which `read_and_verify_prior_authority` has already
+    // proved exactly equal to the complete live ORS set — so a retired broker
+    // identity cannot be re-presented as the new generation's authority under a
+    // fresh fence (A13.7: old sessions, leases, approvals and epochs do not
+    // revive). It deliberately does not consult the destination's own
+    // registrations: a broker the destination legitimately owns is not retired
+    // authority, and refusing it would block an honest cutover.
+    if validated
+        .evidence
+        .fenced_introductions
+        .iter()
+        .any(|introduction| {
+            introduction.record().subject_id.as_str() == validated.request.user_broker_ref.as_str()
+        })
+    {
+        return Err(CutoverError::PriorAuthorityStillActive);
+    }
+    if retirement.activation_id != *activation_id {
+        return Err(CutoverError::BindingMismatch);
+    }
+    if retirement.activation_generation != *activation_generation {
+        return Err(CutoverError::BindingMismatch);
+    }
+    if !fences_match_exact(&retirement.state_fence, &validated.request.activation_fence) {
+        return Err(CutoverError::BindingMismatch);
+    }
+    let barrier = host
+        .require_generation_retirement_barrier(retirement)
+        .map_err(|error| CutoverError::BarrierDenied(error.to_string()))?;
+    // Exact replay guard against the durable intent, not against local state
+    // (I5.27). The committed identity is rebuilt from the durable record's own
+    // installation, cutover operation and canonical request digest, so the
+    // comparison never takes a component from the presented request. A
+    // committed intent for the same operation identity with the same request
+    // digest is a safe replay of the same cutover: the activation already
+    // happened exactly once. The same operation identity under a different
+    // request digest is `IDENTITY_CONFLICT` and performs no transition.
+    let journal = host.journal.snapshot().map_err(|error| {
+        CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string()))
+    })?;
+    if let Some(committed) = journal
+        .pending_cutover
+        .as_ref()
+        .filter(|intent| intent.cutover_operation == validated.request.operation.operation_id)
+    {
+        let identity = CutoverOperationIdentity {
+            installation: committed.installation.clone(),
+            operation_id: committed.cutover_operation.clone(),
+            request_digest: committed.request_digest.clone(),
+        };
+        if !is_exact_replay(&identity, &validated.request.operation) {
+            return Err(CutoverError::IdentityConflict);
+        }
+        match committed.state {
+            CutoverIntentState::Committed => {
+                return Ok((
+                    CutoverOutcome {
+                        disposition: CutoverDisposition::Committed,
+                        operation: validated.request.operation.clone(),
+                        evidence_refs: bounded_evidence(vec![
+                            admission_handle(&validated.request.admission)?,
+                            committed.target_generation.clone(),
+                        ]),
+                    },
+                    barrier,
+                ));
+            }
+            // A refused operation is terminal for that operation identity, and
+            // the durable record is never revised. Re-running the activation
+            // under the same key would contradict the journal, so a fresh
+            // attempt must carry a new separately admitted operation identity
+            // (I5.27).
+            CutoverIntentState::Failed => {
+                return Err(CutoverError::NotSeparatelyAdmitted(
+                    "cutover operation is terminally refused; a new attempt requires a new \
+                     separately admitted operation identity"
+                        .to_owned(),
+                ));
+            }
+            // Authorized but not applied: the same operation may still complete
+            // it, which is the exact same-transaction resumption the registry
+            // replay branch also accepts.
+            CutoverIntentState::Pending => {}
+        }
+    }
+    drop(journal);
+    // The registry handle is deliberately released before the durable intent
+    // append and the activation CAS: the Host opens the registry through a
+    // short-lived lease and never retains a handle across a wait or a journal
+    // fsync (A13.9). `commit_cutover_activation` re-reads the projection under
+    // its own expected-revision CAS, so the revision captured here is the
+    // fence, not a held lock.
+    let expected_revision = fresh.revision();
+    drop(store);
+    let committed_outcome = commit_with_durable_intent(
+        host,
+        validated,
+        retirement,
+        expected_revision,
+        activation_id,
+    )?;
+    Ok((committed_outcome, barrier))
+}
+
+/// Reloads the COMPLETE live ORS introduction set and requires exact
+/// prior-generation quiescence (F-AUR-1).
+///
+/// Live owner readback with exact-set completeness, not shape trust: the
+/// canonical ORS owner is read through the authenticated Kernel front door,
+/// then the live set must equal the presented set exactly — any omitted live
+/// subject or surprise presented subject (including an unjustified empty list
+/// against live rows) refuses. Scope derivation: one operational store holds
+/// one installation's rows (source and destination are exact different
+/// installation/store identities per #952/#961; Kernel-owned ORS is
+/// per-installation per I1.2/I05.2), so full enumeration IS the operation
+/// scope — no cross-installation rows can occur, and lineage namespaces are
+/// deliberately not compared across the disjoint ORS opaque-label /
+/// contract-UUID domains (I6.10). Per subject, in row-lifecycle order:
+/// live+Fenced/presented+Fenced requires byte-exact fence and order (fenced
+/// rows are immutable); live+Fenced/presented+Active allows a legitimate
+/// fencing race (live order at least presented order); live+Active of any
+/// presentation refuses; and every live row must read Fenced for cutover (no
+/// live authority may survive retirement, joining the barrier-proven lease
+/// quiescence and the registry CAS).
+///
+/// Bound discipline: the owner refuses limits above `MAX_RECOVERY_PAGE`, so
+/// the query carries exactly that bound (never `u16::MAX`, which would refuse
+/// every cutover unconditionally). Over-bound tables refuse explicitly via the
+/// owner; silently truncated views can never verify.
+fn read_and_verify_prior_authority(
+    host: &HostComposition,
+    validated: &ValidatedCutover,
+) -> Result<Vec<eliot_kernel_service::IntroductionRow>, CutoverError> {
     let presented = &validated.evidence.fenced_introductions;
-    // B1 bound discipline: the owner refuses limits above
-    // `MAX_RECOVERY_PAGE`, so the query carries exactly that bound (never
-    // `u16::MAX`, which would refuse every cutover unconditionally).
-    // Over-bound tables refuse explicitly via the owner; silently
-    // truncated views can never verify.
     let live = super::introduction_readback::read_live_introductions(
         host,
         &validated.request.activation_fence,
         eliot_ors::MAX_RECOVERY_PAGE,
     )
     .map_err(|_| CutoverError::AuthorityOrReadinessMissing)?;
-    {
-        let mut presented_subjects: Vec<&str> = presented
-            .iter()
-            .map(|introduction| introduction.record().subject_id.as_str())
-            .collect();
-        presented_subjects.sort_unstable();
-        let mut live_subjects: Vec<&str> = live.iter().map(|row| row.subject_id.as_str()).collect();
-        live_subjects.sort_unstable();
-        if presented_subjects != live_subjects {
-            return Err(CutoverError::PriorAuthorityStillActive);
-        }
+    let mut presented_subjects: Vec<&str> = presented
+        .iter()
+        .map(|introduction| introduction.record().subject_id.as_str())
+        .collect();
+    presented_subjects.sort_unstable();
+    let mut live_subjects: Vec<&str> = live.iter().map(|row| row.subject_id.as_str()).collect();
+    live_subjects.sort_unstable();
+    if presented_subjects != live_subjects {
+        return Err(CutoverError::PriorAuthorityStillActive);
     }
     for introduction in presented {
         let subject = introduction.record().subject_id.as_str();
@@ -730,40 +960,282 @@ pub fn execute_cutover(
             _ => return Err(CutoverError::PriorAuthorityStillActive),
         }
     }
-    if retirement.activation_id != *activation_id {
-        return Err(CutoverError::BindingMismatch);
-    }
-    if retirement.activation_generation != *activation_generation {
-        return Err(CutoverError::BindingMismatch);
-    }
-    if !fences_match_exact(&retirement.state_fence, &validated.request.activation_fence) {
-        return Err(CutoverError::BindingMismatch);
-    }
-    let barrier = host
-        .require_generation_retirement_barrier(retirement)
-        .map_err(|error| CutoverError::BarrierDenied(error.to_string()))?;
+    Ok(live)
+}
+
+/// Persists the cutover intent, runs the activation linearization point, and
+/// persists the terminal disposition — in that order.
+///
+/// The `Pending` record is durable before the registry CAS, so an activation
+/// can never exist without the intent that authorized it; the `Committed` or
+/// `Failed` record is durable after it, so reconciliation never has to infer
+/// the outcome from local state.
+fn commit_with_durable_intent(
+    host: &mut HostComposition,
+    validated: &ValidatedCutover,
+    retirement: &GenerationRetirementFence,
+    expected_revision: u64,
+    activation_id: &PlatformHandle,
+) -> Result<CutoverOutcome, CutoverError> {
+    let intent = append_cutover_intent(
+        host,
+        validated,
+        retirement,
+        CutoverIntentState::Pending,
+        &validated.request.admission,
+    )?;
+    // The registry owner is re-opened here, after the durable intent, so the
+    // handle is held only across the single bounded CAS.
+    let store = host.open_registry_store()?;
     let capability = host.owner_lease.activation_capability();
-    store
-        .commit_cutover_activation(
-            &capability,
-            fresh.revision(),
-            &validated.request.expected_predecessor,
-            &validated.request.target_generation,
-        )
-        .map_err(|error| CutoverError::Registry(error.to_string()))?;
+    let committed = store.commit_cutover_activation(
+        &capability,
+        expected_revision,
+        &validated.request.expected_predecessor,
+        &validated.request.target_generation,
+    );
     drop(store);
-    Ok((
-        CutoverOutcome {
-            disposition: CutoverDisposition::Committed,
-            operation: validated.request.operation.clone(),
-            evidence_refs: bounded_evidence(vec![
-                admission_handle(&validated.request.admission)?,
-                activation_id.clone(),
-                validated.request.target_generation.clone(),
-            ]),
+    let refusal = committed.as_ref().err().map(ToString::to_string);
+    let terminal = if refusal.is_some() {
+        CutoverIntentState::Failed
+    } else {
+        CutoverIntentState::Committed
+    };
+    // The terminal record is a separate journal mutation, so a registry
+    // refusal cannot destroy the primary error: the registry reason is
+    // returned even when the terminal append itself fails, and the append
+    // failure is reported only when the registry accepted.
+    let terminal_receipt = append_cutover_intent(
+        host,
+        validated,
+        retirement,
+        terminal,
+        &validated.request.admission,
+    );
+    if let Some(refusal) = refusal {
+        return Err(CutoverError::Registry(refusal));
+    }
+    terminal_receipt?;
+    Ok(CutoverOutcome {
+        disposition: CutoverDisposition::Committed,
+        operation: validated.request.operation.clone(),
+        evidence_refs: bounded_evidence(vec![
+            admission_handle(&validated.request.admission)?,
+            activation_id.clone(),
+            validated.request.target_generation.clone(),
+            intent,
+        ]),
+    })
+}
+
+/// Reads the exact cutover disposition for one operation from the real owners.
+///
+/// This is the implementation behind
+/// [`crate::HostComposition::backup_dispatch_cutover_disposition`]. It
+/// re-reads the Host journal's own durable cutover projection and the
+/// installation registry's active generation and projects them through
+/// [`reconcile_cutover_outcome`], so the returned disposition is the exact
+/// requested/validated/prepared/committed/reconciled/retirement-pending/
+/// failed/unknown state of the operation rather than a local assumption.
+///
+/// # Errors
+///
+/// Returns [`HostError`] when the durable Host journal or the installation
+/// registry cannot be read. A failed read is an error, never a disposition:
+/// reporting a state the owners did not prove is exactly the local assumption
+/// this function exists to remove.
+pub fn read_cutover_disposition(
+    host: &HostComposition,
+    request: &CutoverRequest,
+    validated: bool,
+    retirement_receipt: Option<&AppendReceipt>,
+) -> Result<CutoverOutcome, HostError> {
+    let snapshot = host.journal.snapshot()?;
+    let registry = host
+        .open_registry_store()?
+        .load()
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+    Ok(reconcile_cutover_outcome(
+        &request.operation,
+        validated,
+        snapshot.pending_cutover.as_ref(),
+        registry.active_generation(),
+        &request.target_generation,
+        retirement_receipt,
+    ))
+}
+
+/// Runs the separately authorized prior-generation retirement that completes
+/// one committed cutover.
+///
+/// This is the implementation behind
+/// [`crate::HostComposition::backup_dispatch_cutover_retire`]; it owns no
+/// algorithm. Retirement is never automatic cleanup: the caller must present
+/// the barrier returned by the cutover dispatch for the same operation, the
+/// exact prior epoch still retained by the journal, and an explicit non-empty
+/// retirement authorization.
+///
+/// The gate is the **durable committed cutover intent**, not the pre-activation
+/// owner gate set: `validate_cutover_request` requires the active generation to
+/// still equal the expected predecessor, which is by construction false once
+/// the activation committed, so re-running it here could never succeed. The
+/// committed intent is the owner's own record that the exact new state was
+/// applied, and the named prior epoch must still be outstanding in this Host
+/// journal.
+///
+/// The gate is therefore live only inside the Host epoch that performed the
+/// cutover, because the intent record lives in that epoch's log. After a
+/// restart the intent is gone and retirement must be re-authorized against the
+/// registry readback by the owner surface; this function refuses rather than
+/// inferring.
+///
+/// # Errors
+///
+/// Returns [`CutoverError`] when this operation has no durable cutover intent,
+/// when the intent has not committed (or was refused), when the presented
+/// barrier does not belong to this cutover's activation, or when the journal
+/// owner refuses the retirement record.
+pub fn retire_authorized_generation(
+    host: &HostComposition,
+    request: &CutoverRequest,
+    evidence: &IsolatedRecoveryEvidence,
+    barrier: &GenerationRetirementBarrier,
+    prior_host: &HostInstallationEpoch,
+    retirement_authorization: &PlatformHandle,
+) -> Result<CutoverOutcome, CutoverError> {
+    let journal = host.journal.snapshot().map_err(|error| {
+        CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string()))
+    })?;
+    let intent = journal
+        .pending_cutover
+        .as_ref()
+        .filter(|intent| {
+            intent.cutover_operation == request.operation.operation_id
+                && intent.installation == request.operation.installation
+                && intent.request_digest == request.operation.request_digest
+        })
+        .ok_or_else(|| {
+            CutoverError::NotSeparatelyAdmitted(
+                "retirement has no durable cutover intent for this operation".to_owned(),
+            )
+        })?;
+    match intent.state {
+        CutoverIntentState::Committed => {}
+        CutoverIntentState::Pending => {
+            return Err(CutoverError::AuthorityOrReadinessMissing);
+        }
+        CutoverIntentState::Failed => {
+            return Err(CutoverError::Registry(
+                "retirement refused: the cutover activation was not applied".to_owned(),
+            ));
+        }
+    }
+    if intent.target_generation != request.target_generation
+        || barrier.fence().activation_id != intent.fence.activation_id
+        || barrier.fence().activation_generation != intent.fence.activation_generation
+        || !fences_match_exact(&barrier.fence().state_fence, &request.activation_fence)
+    {
+        return Err(CutoverError::BindingMismatch);
+    }
+    // The prior epoch must be one this Host journal still retains, unretired,
+    // and different from the epoch performing the cutover. Stated precisely:
+    // the cutover determines the predecessor *generation* (the registry owns
+    // that), while the journal owns the *epochs*, so the gate proves the named
+    // epoch is genuinely outstanding — it does not claim to know which of the
+    // retained epochs the predecessor generation maps to, because no owner
+    // exposes that mapping. The journal reducer re-checks the same condition
+    // on append.
+    let outstanding = journal.retained_epochs.iter().any(|retained| {
+        retained.host == *prior_host
+            && !retained.retired
+            && prior_host.installation == host.host.installation
+            && prior_host.epoch != host.host.epoch
+    });
+    if !outstanding {
+        return Err(CutoverError::BindingMismatch);
+    }
+    retire_prior_generation(
+        host,
+        &ValidatedCutover {
+            request: request.clone(),
+            evidence: evidence.clone(),
         },
         barrier,
+        prior_host,
+        retirement_authorization,
+    )
+}
+
+/// Stable wire spelling of one cutover intent disposition, used to derive the
+/// per-disposition journal mutation identity. Keep it in lockstep with
+/// [`eliot_host_state::CutoverIntentState`]'s `SCREAMING_SNAKE_CASE` serde.
+const fn cutover_intent_state_spelling(state: CutoverIntentState) -> &'static str {
+    match state {
+        CutoverIntentState::Pending => "pending",
+        CutoverIntentState::Committed => "committed",
+        CutoverIntentState::Failed => "failed",
+    }
+}
+
+/// Appends one durable cutover intent/terminal record through the Host journal
+/// owner and returns its bounded transaction identity.
+///
+/// `Pending` is written before the activation CAS, `Committed` or `Failed`
+/// after it, all under the same operation identity. The record carries the
+/// exact admitted build/config/`UserBroker` bindings and the bounded owner
+/// receipt set, so a later reconciliation reads the identities from the
+/// durable owner instead of trusting a console-presented value.
+fn append_cutover_intent(
+    host: &HostComposition,
+    validated: &ValidatedCutover,
+    retirement: &GenerationRetirementFence,
+    state: CutoverIntentState,
+    admission: &HostRequestAdmissionReceipt,
+) -> Result<PlatformHandle, CutoverError> {
+    // One journal mutation identity per disposition. The journal keys
+    // `applied_operations` on this identity, so the intent and its terminal
+    // record must not share one; a retry of the *same* disposition reuses it
+    // and therefore replays byte-identically instead of forking a second
+    // transaction (the same convention the Store-rebind seam uses).
+    let mutation = PlatformHandle::new(format!(
+        "{}:{}",
+        validated.request.operation.operation_id.as_str(),
+        cutover_intent_state_spelling(state)
     ))
+    .map_err(|_| CutoverError::BindingMismatch)?;
+    let operation = IdempotencyIdentity {
+        operation_id: mutation,
+        idempotency_key: validated.request.operation.request_digest.clone(),
+    };
+    let record = CutoverIntentRecord {
+        fence: RecordFence {
+            host: host.host.clone(),
+            activation_id: retirement.activation_id.clone(),
+            activation_generation: retirement.activation_generation.clone(),
+        },
+        operation,
+        installation: validated.request.operation.installation.clone(),
+        cutover_operation: validated.request.operation.operation_id.clone(),
+        request_digest: validated.request.operation.request_digest.clone(),
+        expected_predecessor: validated.request.expected_predecessor.clone(),
+        target_generation: validated.request.target_generation.clone(),
+        target_build_digest: validated.request.target_build_digest.clone(),
+        target_config_digest: validated.request.target_config_digest.clone(),
+        user_broker_ref: validated.request.user_broker_ref.clone(),
+        intent_evidence_refs: bounded_evidence(vec![
+            admission_handle(admission)?,
+            validated.request.archive_digest.clone(),
+            receipt_handle(&validated.evidence.restore_receipt.receipt_id)?,
+            receipt_handle(&validated.evidence.restore_receipt.effect_receipt_sha256)?,
+            receipt_handle(&validated.evidence.operational_validation.validation_digest)?,
+        ]),
+        state,
+    };
+    let receipt = super::journal_append::append_reconciled(
+        &host.journal,
+        HostStateRecord::CutoverIntent(record),
+    )?;
+    Ok(receipt.transaction_id().clone())
 }
 
 /// Retires the prior generation holding the real barrier proof.
@@ -798,7 +1270,7 @@ pub fn retire_prior_generation(
     prior_host: &HostInstallationEpoch,
     retirement_authorization: &PlatformHandle,
 ) -> Result<CutoverOutcome, CutoverError> {
-    host.ensure_admission_open()?;
+    host.ensure_material_admission_open_for_target(&validated.request.target_generation, false)?;
     if retirement_authorization.as_str().trim().is_empty() {
         return Err(CutoverError::AuthorityOrReadinessMissing);
     }
@@ -846,6 +1318,13 @@ pub fn retire_prior_generation(
         retirement_evidence_refs: bounded_evidence(vec![
             admission_handle(&validated.request.admission)?,
             validated.request.archive_digest.clone(),
+            validated.request.target_generation.clone(),
+            // The exact new authority this retirement completes: without it
+            // the durable record would not name which `UserBroker` identity and
+            // which approved build/config the surviving generation runs under.
+            validated.request.user_broker_ref.clone(),
+            validated.request.target_build_digest.clone(),
+            validated.request.target_config_digest.clone(),
             receipt_handle(&validated.evidence.restore_receipt.receipt_id)?,
             receipt_handle(&validated.evidence.restore_receipt.effect_receipt_sha256)?,
             receipt_handle(&validated.evidence.operational_validation.validation_digest)?,
@@ -865,43 +1344,94 @@ pub fn retire_prior_generation(
     })
 }
 
-/// Reconciles a cutover from real owner observations after lost response or
-/// cancellation.
+/// Reconciles a cutover from real owner observations after lost response,
+/// crash between the registry and the journal, or cancellation.
 ///
-/// `registry_active` is the active generation freshly read back from the
-/// registry owner (`RedbInstallationRegistry::load().active_generation()`)
-/// and `retirement_receipt` is the actual `AppendReceipt` read back from
-/// the journal owner for the cutover operation identity (`None` when no
-/// such receipt exists); never locally assumed booleans. A present receipt
-/// proves the durable retirement commit; a registry flip without a receipt
-/// proves the activation commit with retirement still pending; anything
-/// else stays `Unknown` for evidence-backed retry under the same identity.
-/// Cancellation/cleanup/diagnostic failure preserves the primary result and
-/// its reconciliation path.
+/// Every owner observation is a real read: `durable_intent` is the Host
+/// journal's own `pending_cutover` projection for this cutover (`None` when no
+/// intent was ever committed), `registry_active` is the active generation
+/// freshly read back from the registry owner
+/// (`RedbInstallationRegistry::load().active_generation()`), and
+/// `retirement_receipt` is the actual `AppendReceipt` read back from the
+/// journal owner for the cutover operation identity (`None` when no such
+/// receipt exists). `validated` is the one caller-supplied input: it records
+/// whether the owner gate set actually passed for this attempt, and it is
+/// never used to assert an effect.
+///
+/// The dispositions are read off those observations, never assumed: a durable
+/// `Failed` intent is the terminal refusal that changed nothing and outranks
+/// every other observation, because the owner recorded it after observing the
+/// refusal; a present retirement receipt proves the lifecycle is durably
+/// reconciled; a registry flip to the target **together with** this operation's
+/// own durable intent proves the activation committed with retirement still
+/// owed; a durable `Pending` intent with no flip proves the effect has not been
+/// applied yet; and with no durable intent at all the operation is `Validated`
+/// when the gate set passed and `Requested` when it did not.
+///
+/// A bare active target with **no** durable intent of ours is somebody else's
+/// activation — an installer commit, or a cutover whose Host epoch has been
+/// re-based away — and stays `Unknown`, never `RetirementPending` or
+/// `Committed`: this function never marks an operation active from an
+/// observation it cannot bind to that operation. That, and a foreign intent or
+/// an unexpected active generation, is the complete `Unknown` set.
+/// `Committed` is not produced here: it is the immediate post-CAS outcome
+/// `execute_cutover` returns, and a later read of the same operation reports
+/// `RetirementPending` until the retirement receipt exists.
+/// Cancellation/cleanup/diagnostic failure preserves the primary result and its
+/// reconciliation path.
 #[must_use]
 pub fn reconcile_cutover_outcome(
     operation: &CutoverOperationIdentity,
+    validated: bool,
+    durable_intent: Option<&CutoverIntentRecord>,
     registry_active: Option<&PlatformHandle>,
     target_generation: &PlatformHandle,
     retirement_receipt: Option<&AppendReceipt>,
 ) -> CutoverOutcome {
-    if let Some(receipt) = retirement_receipt {
-        return CutoverOutcome {
-            disposition: CutoverDisposition::Reconciled,
-            operation: operation.clone(),
-            evidence_refs: vec![receipt.transaction_id().clone()],
-        };
-    }
-    if registry_active == Some(target_generation) {
-        return CutoverOutcome {
-            disposition: CutoverDisposition::Committed,
-            operation: operation.clone(),
-            evidence_refs: vec![target_generation.clone()],
-        };
-    }
+    let ours = durable_intent.filter(|intent| {
+        intent.cutover_operation == operation.operation_id
+            && intent.installation == operation.installation
+            && intent.request_digest == operation.request_digest
+    });
+    let foreign = durable_intent.is_some() && ours.is_none();
+    let disposition = if foreign {
+        // An outstanding intent that is not this exact operation is
+        // cross-operation confusion, never evidence about this one.
+        CutoverDisposition::Unknown
+    } else if ours.is_some_and(|intent| intent.state == CutoverIntentState::Failed) {
+        CutoverDisposition::Failed
+    } else if retirement_receipt.is_some() {
+        CutoverDisposition::Reconciled
+    } else if ours.is_some() && registry_active == Some(target_generation) {
+        CutoverDisposition::RetirementPending
+    } else if ours.is_some_and(|intent| intent.state == CutoverIntentState::Pending) {
+        CutoverDisposition::Prepared
+    } else if ours.is_none() && registry_active == Some(target_generation) {
+        // The target is active but nothing durable binds that flip to this
+        // operation: an installer's commit, or a cutover from a Host epoch that
+        // has since been re-based. Never reported as this operation's success.
+        CutoverDisposition::Unknown
+    } else if ours.is_none() && validated {
+        CutoverDisposition::Validated
+    } else if ours.is_none() {
+        CutoverDisposition::Requested
+    } else {
+        CutoverDisposition::Unknown
+    };
     CutoverOutcome {
-        disposition: CutoverDisposition::Unknown,
+        disposition,
         operation: operation.clone(),
-        evidence_refs: Vec::new(),
+        evidence_refs: bounded_evidence(match retirement_receipt {
+            Some(receipt) => vec![receipt.transaction_id().clone(), target_generation.clone()],
+            None => ours.map_or_else(
+                || vec![target_generation.clone()],
+                |intent| {
+                    vec![
+                        intent.cutover_operation.clone(),
+                        intent.target_generation.clone(),
+                    ]
+                },
+            ),
+        }),
     }
 }

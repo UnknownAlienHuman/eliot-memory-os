@@ -4,23 +4,32 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_platform::PlatformHandle;
-use eliot_receipts::{ReceiptDispositionKind, ReceiptEnvelope};
+use eliot_receipts::{
+    AuthorityBinding, GRANT_CLOSURE_SCHEMA, GRANT_CLOSURE_VERSION, GrantClosureOrsReceiptRef,
+    ReceiptDispositionKind, ReceiptEnvelope, ReceiptIdentity,
+};
 use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
     SignedSupervisionLease, VerifiedSupervisionLease, VerifiedSupervisionLeaseTerminalTransition,
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 #[path = "persistence_codec.rs"]
 mod persistence_codec;
-use persistence_codec::{decode, decode_named, encode};
+use persistence_codec::{
+    LegacyGrantClosureRecord, LegacyGrantClosureState, decode, decode_legacy_grant_closure_record,
+    decode_named, encode, is_current_grant_closure_shape,
+};
 
 #[path = "store/persistence_models.rs"]
 mod persistence_models;
 use persistence_models::{
-    DurableGrantClosureRecord, DurableGrantGraphRevision, DurableInboxRecord,
-    DurableOperationalRecord, DurableSupervisionLeaseResult, OperationalKind, ScopeReservationHead,
+    DurableGrantClosureRecord, DurableGrantClosureSecondPhaseRecord, DurableGrantGraphRevision,
+    DurableInboxRecord, DurableOperationalRecord, DurableSupervisionLeaseResult,
+    GRANT_CLOSURE_SECOND_PHASE_SCHEMA, GRANT_CLOSURE_SECOND_PHASE_VERSION, OperationalKind,
+    ScopeReservationHead,
 };
 
 #[path = "store/restore_journal.rs"]
@@ -35,22 +44,24 @@ use crate::cutover_ownership::{
     GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt, StoredCutoverOwnership,
 };
 use crate::{
-    AcceptedPending, ActivationResultRetentionRecord, ActiveSessionBinding, AdmissionReservation,
-    AdmissionReservationActivation, AdmissionReservationReceipt, AdmissionReservationRelease,
-    AuthorityActivationReceipt, AuthorityHandoffBegin, AuthorityHandoffRecord,
-    AuthorityHandoffState, AuthorityRevocation, AuthorityRevocationReceipt,
-    AuthoritySnapshotReceipt, CanonicalDisposition, CanonicalReconciliation,
-    CapabilityGrantActivation, CapabilityGrantProjection, CapabilityGrantRevocation,
-    CapabilityIntroductionActivation, CapabilityIntroductionFence,
+    AcceptedPending, ActivationLifecycleRecord, ActivationLifecycleState,
+    ActivationRecoverySnapshot, ActivationResultRetentionPhase, ActivationResultRetentionRecord,
+    ActiveSessionBinding, AdmissionReservation, AdmissionReservationActivation,
+    AdmissionReservationReceipt, AdmissionReservationRelease, AuthorityActivationReceipt,
+    AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState, AuthorityRevocation,
+    AuthorityRevocationReceipt, AuthoritySnapshotReceipt, CanonicalDisposition,
+    CanonicalReconciliation, CapabilityGrantActivation, CapabilityGrantProjection,
+    CapabilityGrantRevocation, CapabilityIntroductionActivation, CapabilityIntroductionFence,
     CapabilityIntroductionProjection, CapabilityIntroductionReceipt, DeliveryAcknowledgement,
     DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity, EpochLineage,
     GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
     GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit,
-    GrantClosureCommitReceipt, GrantClosureProjection, HostRequestRecord, HostRequestState,
-    JobCheckpoint, KernelAuthoritySnapshot, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
-    NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationalMutationReceipt,
-    OperationalPhase, OperationalRecordContext, OperationalRecordInput, OrsError,
-    OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord,
+    GrantClosureCommitReceipt, GrantClosureFenceReceipt, GrantClosureFenceRequest,
+    GrantClosureProjection, GrantClosureState, HostRequestRecord, HostRequestState, JobCheckpoint,
+    KernelAuthoritySnapshot, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
+    NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationIdentity,
+    OperationalMutationReceipt, OperationalPhase, OperationalRecordContext, OperationalRecordInput,
+    OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord,
     ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
     RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
     RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope, RecoveryProblem,
@@ -111,6 +122,8 @@ const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
 const ACTIVATION_RESULT_RETENTION: TableDefinition<&str, &str> =
     TableDefinition::new("ors_agent_activation_results_v1");
+const ACTIVATION_LIFECYCLES: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_agent_activation_lifecycles_v1");
 const NATIVE_WORKER_CLAIMS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_native_worker_claims_v1");
 const REPLAY_STREAMS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_streams_v1");
@@ -128,14 +141,83 @@ const RECOVERY_PROBLEMS: TableDefinition<&str, &str> =
 /// Durable grant-closure rows: one committed closure operation identity with
 /// its exact commit bytes, phase, and order (issue #2100). Keyed by the
 /// closure operation identity; rows never transition.
-const GRANT_CLOSURE_CURRENT: TableDefinition<&str, &str> =
+/// Legacy grant-closure rows are an explicit migration input only. Successful
+/// startup moves their exact bytes into a versioned disposition row in the v2
+/// table before removing the legacy row; no old wire shape is reinterpreted.
+const GRANT_CLOSURE_LEGACY_CURRENT: TableDefinition<&str, &str> =
     TableDefinition::new("ors_grant_closure_current_v1");
+const GRANT_CLOSURE_CURRENT: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_grant_closure_current_v2");
+/// Immutable, versioned canonical second-phase links. The first-phase
+/// `GRANT_CLOSURE_CURRENT` row is never rewritten; this table is keyed by the
+/// exact same closure operation identity and is written in the same `RedDB`
+/// transaction as the second-phase order reservation.
+const GRANT_CLOSURE_SECOND_PHASE_CURRENT: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_grant_closure_second_phase_v1");
+const GRANT_CLOSURE_SECOND_PHASE_KEY_PREFIX: &str = "grant_closure_second_phase:v1:";
+/// The v2 table also carries namespaced, versioned migration-disposition rows
+/// for legacy bytes that cannot be losslessly projected into a current receipt.
+const GRANT_CLOSURE_MIGRATION_KEY_PREFIX: &str = "grant_closure_migration:v1:";
 /// Durable grant-graph revision watermarks: the greatest graph revision
 /// observed for one lineage root (issue #2100). Keyed by the authority root;
 /// the stored revision only moves forward.
 const GRANT_GRAPH_REVISION_CURRENT: TableDefinition<&str, &str> =
     TableDefinition::new("ors_grant_graph_revision_current_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
+
+struct ClosureRowPlan {
+    key: String,
+    record: DurableOperationalRecord,
+    transitioned: bool,
+}
+
+const GRANT_CLOSURE_MIGRATION_SCHEMA: &str = "eliot.ors.grant-closure-migration";
+const GRANT_CLOSURE_MIGRATION_VERSION: u16 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum GrantClosureMigrationDisposition {
+    /// The legacy table already contained a complete v2 row.
+    CurrentShapeCopied,
+    /// The v1 bytes are retained in the disposition and the absent v2 fields
+    /// are named rather than replaced with defaults.
+    LegacyShapeRetained,
+    /// A complete v2 row was already present beside the retained v1 bytes.
+    LegacyShapeSupersededByCurrent,
+}
+
+impl GrantClosureMigrationDisposition {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::CurrentShapeCopied => "CURRENT_SHAPE_COPIED",
+            Self::LegacyShapeRetained => "LEGACY_SHAPE_RETAINED",
+            Self::LegacyShapeSupersededByCurrent => "LEGACY_SHAPE_SUPERSEDED_BY_CURRENT",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantClosureMigrationRecord {
+    schema: String,
+    version: u16,
+    operation_id: String,
+    legacy_key: String,
+    target_grant_id: String,
+    authority_root_ref: String,
+    grant_graph_revision: u64,
+    legacy_phase: OperationalPhase,
+    legacy_state: String,
+    legacy_operation_order: u64,
+    source_row_sha256: String,
+    legacy_row_json: String,
+    disposition: GrantClosureMigrationDisposition,
+    missing_fields: Vec<String>,
+    current_key: Option<String>,
+    current_operation_order: Option<u64>,
+    reason: String,
+}
+
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY: &str = "supervision_stage_resolution_schema";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1: &str = "eliot.ors.supervision-stage-resolution.v1";
 /// Ceiling on table names enumerated at store open. Provenance checks and the
@@ -336,12 +418,40 @@ pub trait OperationalRecoveryStore: Send + Sync {
     /// An exact recommit under one operation identity returns the durable
     /// receipt unchanged; any changed content under one identity fails with
     /// [`OrsError::DuplicateConflict`] and never overwrites. The row never
-    /// transitions: activation closures commit `Active`, revocation closures
-    /// commit `Fenced`.
+    /// transitions: this compatibility path is reserved for activation
+    /// closures (`Active`); revocation closures must use
+    /// [`Self::commit_grant_closure_fence`].
     fn commit_grant_closure(
         &self,
         closure: GrantClosureCommit,
     ) -> Result<GrantClosureCommitReceipt, OrsError>;
+    /// Atomically verifies and commits one complete grant-closure revocation.
+    ///
+    /// The single `RedDB` write transaction checks the per-root graph revision
+    /// against `request.declaration.grant_graph_revision` (or initializes an absent watermark
+    /// to that exact nonzero revision), verifies every presented grant and
+    /// introduction record against its current durable row, transitions only
+    /// `Active` rows to `Fenced`, advances the watermark when needed, and
+    /// writes the closure projection. Any mismatch aborts the transaction;
+    /// there is no partial member fence or partial closure receipt. Exact
+    /// replay under identical bytes returns the same composite receipt without
+    /// a second transition.
+    fn commit_grant_closure_fence(
+        &self,
+        request: GrantClosureFenceRequest,
+    ) -> Result<GrantClosureFenceReceipt, OrsError>;
+    /// Records the canonical second-phase receipt link for one already
+    /// committed closure operation without rewriting its first-phase commit.
+    ///
+    /// The operation identity must already name a committed closure row. An
+    /// identical link is idempotent; a different identity is an immutable
+    /// conflict. The returned projection contains the durable second-phase
+    /// link and the unchanged first-phase receipt.
+    fn link_grant_closure_canonical_receipt(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        canonical_receipt: &ReceiptIdentity,
+    ) -> Result<GrantClosureProjection, OrsError>;
     /// Reads one committed grant-closure row after validating its key,
     /// content, phase, and store-issued receipt. The returned value is
     /// operational evidence only; it grants no capability.
@@ -361,6 +471,10 @@ pub trait OperationalRecoveryStore: Send + Sync {
         authority_root: &OpaqueLabel,
         revision: u64,
     ) -> Result<u64, OrsError>;
+    /// Atomically advances every supplied lineage watermark. A stale or
+    /// malformed member aborts the whole batch, so a global owner revision
+    /// cannot race a closure on a root that has not yet been advanced.
+    fn note_grant_graph_revisions(&self, revisions: &[(OpaqueLabel, u64)]) -> Result<(), OrsError>;
     /// Reads the durable grant-graph revision watermark for one lineage
     /// root, if any.
     fn load_grant_graph_revision(
@@ -569,21 +683,58 @@ pub trait OperationalRecoveryStore: Send + Sync {
         operation_id: &crate::OperationIdentity,
         request_digest: &str,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
-    /// Atomically retains one opaque Kernel activation result before its
-    /// acknowledgement may be emitted. An exact replay returns the durable
-    /// record; a changed ticket/result identity conflicts and never overwrites.
-    fn retain_activation_result(
+    /// Durably stages one pending activation ticket before in-memory
+    /// publication or daemon claim. A successor is admitted only through the
+    /// exact durable `NotReady` predecessor and due-time gate.
+    fn stage_activation_ticket(
+        &self,
+        record: &ActivationLifecycleRecord,
+        now_unix_ms: u64,
+    ) -> Result<ActivationLifecycleRecord, OrsError>;
+    /// Claims one pending activation ticket for the authenticated daemon.
+    /// Claim expiry never reopens semantic work; it transitions the ticket to
+    /// durable reconciliation.
+    fn claim_activation_ticket(
+        &self,
+        ticket_id: &str,
+        claim_owner: &str,
+        now_unix_ms: u64,
+        claim_expires_at_unix_ms: u64,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError>;
+    /// Atomically admits one exact result and advances its lifecycle row.
+    /// Existing exact retention replays; changed identity or a terminal
+    /// result-less lifecycle conflicts and never overwrites.
+    fn commit_activation_result(
         &self,
         record: &ActivationResultRetentionRecord,
+        claim_owner: &str,
+        dependency_observation: Option<(&str, &str)>,
+        now_unix_ms: u64,
     ) -> Result<ActivationResultRetentionRecord, OrsError>;
-    /// Loads one retained activation result by exact ticket and result identity.
+    /// Durably terminalizes one result-less ticket as cancelled, expired, or
+    /// reconciling. Accepted/result-bearing states never transition here.
+    fn terminate_activation_without_result(
+        &self,
+        ticket_id: &str,
+        target: ActivationLifecycleState,
+        reason: &str,
+        now_unix_ms: u64,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError>;
+    /// Loads one activation lifecycle row by exact ticket identity.
+    fn load_activation_lifecycle(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError>;
+    /// Loads retained activation results by exact ticket and result identity.
     fn load_activation_result(
         &self,
         ticket_id: &str,
         result_sha256: &str,
     ) -> Result<Option<ActivationResultRetentionRecord>, OrsError>;
-    /// Prunes the oldest retained activation results until both hard bounds
-    /// are satisfied. Pruning is atomic and does not interpret payloads.
+    /// Loads lifecycle and result rows under one coherent ORS read snapshot.
+    fn load_activation_recovery_snapshot(&self) -> Result<ActivationRecoverySnapshot, OrsError>;
+    /// Prunes the oldest unreferenced retained activation results until both
+    /// hard bounds are satisfied. Lifecycle-referenced rows are never pruned.
     fn prune_activation_results(&self) -> Result<u64, OrsError>;
     /// Stages one native-worker claim intent before any acknowledgement.
     ///
@@ -826,8 +977,178 @@ impl persistence_codec::PersistedValue for ActivationResultRetentionRecord {
     }
 }
 
+impl persistence_codec::PersistedValue for ActivationLifecycleRecord {
+    const RECORD_TYPE: &'static str = "activation_lifecycle";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()?;
+        if self.lifecycle_order == 0 {
+            return Err(OrsError::IntegrityProblem {
+                record_type: Self::RECORD_TYPE,
+                reason: "activation lifecycle has no ORS lifecycle order".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
 impl persistence_codec::PersistedValue for NativeWorkerClaimRecord {
     const RECORD_TYPE: &'static str = "native_worker_claim";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for GrantClosureMigrationRecord {
+    const RECORD_TYPE: &'static str = "grant_closure_migration";
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "migration disposition validation keeps identity, source digest, and row bindings together"
+    )]
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        if self.schema != GRANT_CLOSURE_MIGRATION_SCHEMA
+            || self.version != GRANT_CLOSURE_MIGRATION_VERSION
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: Self::RECORD_TYPE,
+                reason: "unsupported grant-closure migration schema or version".to_owned(),
+            });
+        }
+        crate::model::validate_text(&self.operation_id, "grant_closure_migration_operation_id")
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: Self::RECORD_TYPE,
+                reason: error.to_string(),
+            })?;
+        crate::model::validate_text(&self.legacy_key, "grant_closure_migration_legacy_key")
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: Self::RECORD_TYPE,
+                reason: error.to_string(),
+            })?;
+        crate::model::validate_text(
+            &self.target_grant_id,
+            "grant_closure_migration_target_grant_id",
+        )
+        .map_err(|error| OrsError::IntegrityProblem {
+            record_type: Self::RECORD_TYPE,
+            reason: error.to_string(),
+        })?;
+        crate::model::validate_text(
+            &self.authority_root_ref,
+            "grant_closure_migration_authority_root_ref",
+        )
+        .map_err(|error| OrsError::IntegrityProblem {
+            record_type: Self::RECORD_TYPE,
+            reason: error.to_string(),
+        })?;
+        crate::model::validate_digest(
+            &self.source_row_sha256,
+            "grant_closure_migration_source_row_sha256",
+        )
+        .map_err(|error| OrsError::IntegrityProblem {
+            record_type: Self::RECORD_TYPE,
+            reason: error.to_string(),
+        })?;
+        crate::model::validate_text(&self.reason, "grant_closure_migration_reason").map_err(
+            |error| OrsError::IntegrityProblem {
+                record_type: Self::RECORD_TYPE,
+                reason: error.to_string(),
+            },
+        )?;
+        if self.legacy_row_json.is_empty()
+            || crate::model::sha256_hex(self.legacy_row_json.as_bytes()) != self.source_row_sha256
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: Self::RECORD_TYPE,
+                reason: "retained legacy row bytes do not match the source digest".to_owned(),
+            });
+        }
+        if self.grant_graph_revision == 0 || self.legacy_operation_order == 0 {
+            return Err(OrsError::IntegrityProblem {
+                record_type: Self::RECORD_TYPE,
+                reason: "graph revision and legacy operation order must be nonzero".to_owned(),
+            });
+        }
+        let expected_legacy_key = format!("grant_closure:{}", self.operation_id);
+        if self.legacy_key != expected_legacy_key {
+            return Err(OrsError::IntegrityProblem {
+                record_type: Self::RECORD_TYPE,
+                reason: "legacy key does not match the operation identity".to_owned(),
+            });
+        }
+        let expected_phase = match self.legacy_state.as_str() {
+            "ACTIVE" => OperationalPhase::Active,
+            "FENCED" | "REVOKED" => OperationalPhase::Fenced,
+            _ => {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: Self::RECORD_TYPE,
+                    reason: "source state is not ACTIVE, FENCED, or REVOKED".to_owned(),
+                });
+            }
+        };
+        if self.legacy_phase != expected_phase {
+            return Err(OrsError::IntegrityProblem {
+                record_type: Self::RECORD_TYPE,
+                reason: "legacy phase does not match the legacy state".to_owned(),
+            });
+        }
+        if self.missing_fields.iter().any(|field| {
+            crate::model::validate_text(field, "grant_closure_migration_missing_field").is_err()
+        }) || self
+            .missing_fields
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: Self::RECORD_TYPE,
+                reason: "missing fields must be nonblank, sorted, and unique".to_owned(),
+            });
+        }
+        match self.disposition {
+            GrantClosureMigrationDisposition::CurrentShapeCopied => {
+                if !self.missing_fields.is_empty()
+                    || self.current_key.as_deref() != Some(expected_legacy_key.as_str())
+                    || self.current_operation_order != Some(self.legacy_operation_order)
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: Self::RECORD_TYPE,
+                        reason: "copied migration disposition is missing its current row binding"
+                            .to_owned(),
+                    });
+                }
+            }
+            GrantClosureMigrationDisposition::LegacyShapeRetained => {
+                if self.missing_fields.is_empty()
+                    || self.current_key.is_some()
+                    || self.current_operation_order.is_some()
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: Self::RECORD_TYPE,
+                        reason: "retained legacy disposition does not name a complete migration"
+                            .to_owned(),
+                    });
+                }
+            }
+            GrantClosureMigrationDisposition::LegacyShapeSupersededByCurrent => {
+                if self.missing_fields.is_empty()
+                    || self.current_key.as_deref() != Some(expected_legacy_key.as_str())
+                    || self.current_operation_order.is_none_or(|order| order == 0)
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: Self::RECORD_TYPE,
+                        reason: "superseded legacy disposition is missing its current row binding"
+                            .to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl persistence_codec::PersistedValue for DurableGrantClosureSecondPhaseRecord {
+    const RECORD_TYPE: &'static str = "grant_closure_second_phase";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
@@ -1708,17 +2029,383 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
-    /// Atomically retains one opaque Kernel activation result before its
-    /// acknowledgement may be emitted. The ORS transaction assigns order and
-    /// prunes only after the new row is durable within the same transaction.
-    pub fn retain_activation_result(
+    /// Durably stages one pending activation ticket before it is published in
+    /// memory or returned to a daemon claim.
+    pub fn stage_activation_ticket(
         &self,
-        record: &ActivationResultRetentionRecord,
-    ) -> Result<ActivationResultRetentionRecord, OrsError> {
+        record: &ActivationLifecycleRecord,
+        now_unix_ms: u64,
+    ) -> Result<ActivationLifecycleRecord, OrsError> {
+        self.stage_activation_ticket_with_protection(record, now_unix_ms, &BTreeSet::new())
+            .map(|(staged, _)| staged)
+    }
+
+    /// Stages one ticket while protecting live Kernel waiters from bounded
+    /// retention pruning and returns every durable identity evicted by the
+    /// same transaction. The returned list is the only safe way for a cache
+    /// to mirror the ORS projection; it is never an authority decision.
+    ///
+    /// Lifecycle identity, successor binding, and capacity pruning all stay in
+    /// one ORS write transaction: this entry owns that transaction, and the
+    /// private steps below are ordinary calls on the very same
+    /// `WriteTransaction`, so a partially staged ticket is never observable.
+    pub fn stage_activation_ticket_with_protection(
+        &self,
+        record: &ActivationLifecycleRecord,
+        now_unix_ms: u64,
+        protected_ticket_ids: &BTreeSet<String>,
+    ) -> Result<(ActivationLifecycleRecord, Vec<String>), OrsError> {
         record.validate()?;
+        if record.state != ActivationLifecycleState::Pending
+            || record.lifecycle_order != 0
+            || record.result_sha256.is_some()
+            || record.claim_owner.is_some()
+            || record.successor_ticket_id.is_some()
+            || record.terminal_reason.is_some()
+        {
+            return Err(OrsError::InvalidField {
+                field: "activation_lifecycle_stage",
+                reason: "staging requires one clean pending ticket without result or claim",
+            });
+        }
+        if now_unix_ms >= record.kernel_deadline_unix_ms {
+            return Err(OrsError::ActivationLifecycleExpired {
+                ticket_id: record.ticket_id.clone(),
+            });
+        }
         let write = self.database.begin_write().map_err(storage)?;
         let key = record.record_key().to_owned();
-        let existing: Option<ActivationResultRetentionRecord> = {
+        let existing: Option<ActivationLifecycleRecord> = {
+            let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        if let Some(existing) = existing {
+            if !existing.same_immutable_identity(record) {
+                return Err(OrsError::ActivationLifecycleIdentityConflict { ticket_id: key });
+            }
+            write.commit().map_err(storage)?;
+            return Ok((existing, Vec::new()));
+        }
+
+        let mut evicted_ticket_ids = Vec::new();
+        let mut lifecycle_rows = Self::read_activation_lifecycle_rows(&write)?;
+        Self::reject_staged_activation_identity_reuse(&lifecycle_rows, record, &key)?;
+        Self::prune_activation_lifecycle_capacity(
+            &write,
+            &mut lifecycle_rows,
+            protected_ticket_ids,
+            &mut evicted_ticket_ids,
+        )?;
+        let order = Self::next_operational_order(&write)?;
+        Self::bind_staged_activation_predecessor(
+            &write,
+            &lifecycle_rows,
+            record,
+            now_unix_ms,
+            order,
+            &key,
+        )?;
+        let mut next = record.clone();
+        next.lifecycle_order = order;
+        next.validate()?;
+        let payload = encode(&next)?;
+        let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        table
+            .insert(key.as_str(), payload.as_str())
+            .map_err(storage)?;
+        drop(table);
+        write.commit().map_err(storage)?;
+        Ok((next, evicted_ticket_ids))
+    }
+
+    /// Reads and validates every durable activation lifecycle row, refusing a
+    /// table whose stored key does not match the ticket identity it holds.
+    pub(super) fn read_activation_lifecycle_rows(
+        write: &redb::WriteTransaction,
+    ) -> Result<Vec<ActivationLifecycleRecord>, OrsError> {
+        let mut lifecycle_rows = Vec::new();
+        let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        for entry in table.iter().map_err(storage)? {
+            let (existing_key, value) = entry.map_err(storage)?;
+            let existing: ActivationLifecycleRecord = decode(value.value())?;
+            if existing_key.value() != existing.record_key() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_lifecycle",
+                    reason: "table key does not match ticket identity".to_owned(),
+                });
+            }
+            existing.validate()?;
+            lifecycle_rows.push(existing);
+        }
+        Ok(lifecycle_rows)
+    }
+
+    /// Refuses staging a ticket that reuses an activation request identity, or
+    /// a predecessor ticket/result pair an existing row already bound as a
+    /// successor. One activation request and one predecessor pair admit exactly
+    /// one staged ticket.
+    pub(super) fn reject_staged_activation_identity_reuse(
+        lifecycle_rows: &[ActivationLifecycleRecord],
+        record: &ActivationLifecycleRecord,
+        key: &str,
+    ) -> Result<(), OrsError> {
+        if lifecycle_rows.iter().any(|existing| {
+            existing.activation_request_id == record.activation_request_id
+                || existing.successor_of.as_ref().is_some_and(|successor| {
+                    record.successor_of.as_ref().is_some_and(|candidate| {
+                        successor.predecessor_ticket_id == candidate.predecessor_ticket_id
+                            && successor.predecessor_result_sha256
+                                == candidate.predecessor_result_sha256
+                    })
+                })
+        }) {
+            return Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: key.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Makes room for one staged ticket when the lifecycle table is already at
+    /// its bound, evicting exactly one unprotected terminal row that carries no
+    /// successor from both the lifecycle and result-retention tables. A ticket
+    /// with nothing evictable is a refusal, never a silent overflow.
+    pub(super) fn prune_activation_lifecycle_capacity(
+        write: &redb::WriteTransaction,
+        lifecycle_rows: &mut Vec<ActivationLifecycleRecord>,
+        protected_ticket_ids: &BTreeSet<String>,
+        evicted_ticket_ids: &mut Vec<String>,
+    ) -> Result<(), OrsError> {
+        if lifecycle_rows.len() < crate::MAX_ACTIVATION_LIFECYCLE_RECORDS {
+            return Ok(());
+        }
+        let removable = lifecycle_rows
+            .iter()
+            .filter(|existing| {
+                !protected_ticket_ids.contains(&existing.ticket_id)
+                    && existing.successor_ticket_id.is_none()
+                    && matches!(
+                        existing.state,
+                        ActivationLifecycleState::ResultAccepted
+                            | ActivationLifecycleState::Cancelled
+                            | ActivationLifecycleState::Expired
+                    )
+            })
+            .min_by_key(|existing| existing.lifecycle_order)
+            .cloned();
+        let Some(removable) = removable else {
+            return Err(OrsError::ProjectionLimitExceeded);
+        };
+        {
+            let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            table.remove(removable.record_key()).map_err(storage)?;
+        }
+        {
+            let mut table = write
+                .open_table(ACTIVATION_RESULT_RETENTION)
+                .map_err(storage)?;
+            table.remove(removable.record_key()).map_err(storage)?;
+        }
+        evicted_ticket_ids.push(removable.ticket_id.clone());
+        lifecycle_rows.retain(|existing| existing.ticket_id != removable.ticket_id);
+        Ok(())
+    }
+
+    /// Binds one staged successor ticket to its exact durable predecessor and
+    /// publishes the consumed predecessor, still inside the staging
+    /// transaction. The predecessor must be a deferred, not-yet-consumed row
+    /// whose retained result and ticket digest match the successor binding, and
+    /// whose `not_before` gate has opened.
+    pub(super) fn bind_staged_activation_predecessor(
+        write: &redb::WriteTransaction,
+        lifecycle_rows: &[ActivationLifecycleRecord],
+        record: &ActivationLifecycleRecord,
+        now_unix_ms: u64,
+        order: u64,
+        key: &str,
+    ) -> Result<(), OrsError> {
+        let Some(successor) = &record.successor_of else {
+            return Ok(());
+        };
+        let predecessor = lifecycle_rows
+            .iter()
+            .find(|existing| existing.ticket_id == successor.predecessor_ticket_id)
+            .ok_or_else(|| OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: key.to_owned(),
+            })?;
+        if predecessor.state != ActivationLifecycleState::DeferredNotReady
+            || predecessor.ticket_sha256 != successor.predecessor_ticket_sha256
+            || predecessor.result_sha256.as_deref()
+                != Some(successor.predecessor_result_sha256.as_str())
+            || predecessor.successor_ticket_id.is_some()
+            || now_unix_ms < successor.not_before_unix_ms
+        {
+            return Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: key.to_owned(),
+            });
+        }
+        let mut updated_predecessor = predecessor.clone();
+        updated_predecessor.successor_ticket_id = Some(record.ticket_id.clone());
+        updated_predecessor.lifecycle_order = order;
+        updated_predecessor.validate()?;
+        let predecessor_key = updated_predecessor.record_key().to_owned();
+        let payload = encode(&updated_predecessor)?;
+        let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        table
+            .insert(predecessor_key.as_str(), payload.as_str())
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Claims one pending ticket for the authenticated daemon. An expired
+    /// claim becomes durable reconciliation and is never silently reissued.
+    pub fn claim_activation_ticket(
+        &self,
+        ticket_id: &str,
+        claim_owner: &str,
+        now_unix_ms: u64,
+        claim_expires_at_unix_ms: u64,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        crate::model::validate_text(ticket_id, "activation_claim_ticket_id")?;
+        crate::model::validate_text(claim_owner, "activation_claim_owner")?;
+        if claim_expires_at_unix_ms <= now_unix_ms {
+            return Err(OrsError::InvalidField {
+                field: "activation_claim_expiry",
+                reason: "claim expiry must be later than the admission time",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<ActivationLifecycleRecord> = {
+            let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            table
+                .get(ticket_id)
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(mut existing) = existing else {
+            write.commit().map_err(storage)?;
+            return Ok(None);
+        };
+        if existing.state == ActivationLifecycleState::Claimed {
+            if existing.claim_owner.as_deref() == Some(claim_owner)
+                && existing.claim_expires_at_unix_ms == Some(claim_expires_at_unix_ms)
+                && existing
+                    .claim_expires_at_unix_ms
+                    .is_some_and(|expiry| expiry > now_unix_ms)
+            {
+                write.commit().map_err(storage)?;
+                return Ok(Some(existing));
+            }
+            let mut reconciling = existing;
+            reconciling.state = ActivationLifecycleState::Reconciling;
+            reconciling.claim_owner = None;
+            reconciling.claim_expires_at_unix_ms = None;
+            reconciling.lifecycle_order = Self::next_operational_order(&write)?;
+            reconciling.terminal_reason =
+                Some("claim lease elapsed or ownership changed before result admission".to_owned());
+            reconciling.validate()?;
+            let payload = encode(&reconciling)?;
+            let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            table
+                .insert(reconciling.record_key(), payload.as_str())
+                .map_err(storage)?;
+            drop(table);
+            write.commit().map_err(storage)?;
+            return Err(OrsError::ActivationLifecycleStateConflict {
+                ticket_id: ticket_id.to_owned(),
+                state: ActivationLifecycleState::Reconciling,
+                expected: ActivationLifecycleState::Pending,
+            });
+        }
+        if existing.state != ActivationLifecycleState::Pending {
+            return Err(OrsError::ActivationLifecycleStateConflict {
+                ticket_id: ticket_id.to_owned(),
+                state: existing.state,
+                expected: ActivationLifecycleState::Pending,
+            });
+        }
+        if now_unix_ms >= existing.kernel_deadline_unix_ms {
+            existing.state = ActivationLifecycleState::Expired;
+            existing.lifecycle_order = Self::next_operational_order(&write)?;
+            existing.terminal_reason = Some("deadline elapsed before durable claim".to_owned());
+            existing.validate()?;
+            let payload = encode(&existing)?;
+            let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            table
+                .insert(existing.record_key(), payload.as_str())
+                .map_err(storage)?;
+            drop(table);
+            write.commit().map_err(storage)?;
+            return Err(OrsError::ActivationLifecycleExpired {
+                ticket_id: ticket_id.to_owned(),
+            });
+        }
+        existing.state = ActivationLifecycleState::Claimed;
+        existing.claim_owner = Some(claim_owner.to_owned());
+        existing.claim_expires_at_unix_ms = Some(claim_expires_at_unix_ms);
+        existing.lifecycle_order = Self::next_operational_order(&write)?;
+        existing.validate()?;
+        let payload = encode(&existing)?;
+        let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        table
+            .insert(existing.record_key(), payload.as_str())
+            .map_err(storage)?;
+        drop(table);
+        write.commit().map_err(storage)?;
+        Ok(Some(existing))
+    }
+
+    /// Atomically inserts one result and advances the exact claimed lifecycle
+    /// row. Result retention cannot exist without its lifecycle binding.
+    pub fn commit_activation_result(
+        &self,
+        record: &ActivationResultRetentionRecord,
+        claim_owner: &str,
+        dependency_observation: Option<(&str, &str)>,
+        now_unix_ms: u64,
+    ) -> Result<ActivationResultRetentionRecord, OrsError> {
+        self.commit_activation_result_with_protection(
+            record,
+            claim_owner,
+            dependency_observation,
+            now_unix_ms,
+            &BTreeSet::new(),
+        )
+        .map(|(retained, _)| retained)
+    }
+
+    /// Commits one result while protecting live Kernel waiters and returns
+    /// any bounded-retention identities evicted in the same transaction.
+    ///
+    /// Result admission, the deadline compare-and-set, lifecycle publication,
+    /// and bounded-retention pruning all stay in one ORS write transaction:
+    /// this entry owns that transaction, and the private steps below are
+    /// ordinary calls on the very same `WriteTransaction`, so a result is never
+    /// retained without its lifecycle publication.
+    pub fn commit_activation_result_with_protection(
+        &self,
+        record: &ActivationResultRetentionRecord,
+        claim_owner: &str,
+        dependency_observation: Option<(&str, &str)>,
+        now_unix_ms: u64,
+        protected_ticket_ids: &BTreeSet<String>,
+    ) -> Result<(ActivationResultRetentionRecord, Vec<String>), OrsError> {
+        record.validate()?;
+        crate::model::validate_text(claim_owner, "activation_result_claim_owner")?;
+        if record.retention_order != 0 {
+            return Err(OrsError::InvalidField {
+                field: "activation_result_retention_order",
+                reason: "caller-supplied retention order must be zero",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = record.record_key().to_owned();
+        let existing_result: Option<ActivationResultRetentionRecord> = {
             let table = write
                 .open_table(ACTIVATION_RESULT_RETENTION)
                 .map_err(storage)?;
@@ -1728,29 +2415,453 @@ impl RedbRecoveryStore {
                 .map(|value| decode(value.value()))
                 .transpose()?
         };
-        if let Some(existing) = existing {
-            if !existing.same_identity(record) {
+        let lifecycle: ActivationLifecycleRecord = {
+            let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            let bytes = table.get(key.as_str()).map_err(storage)?.ok_or_else(|| {
+                OrsError::ActivationLifecycleIdentityConflict {
+                    ticket_id: key.clone(),
+                }
+            })?;
+            let lifecycle: ActivationLifecycleRecord = decode(bytes.value())?;
+            lifecycle.validate()?;
+            drop(bytes);
+            lifecycle
+        };
+        if lifecycle.ticket_sha256 != record.ticket_sha256
+            || lifecycle.connection_id != record.connection_id
+            || lifecycle.state_fence != record.state_fence
+        {
+            return Err(OrsError::ActivationLifecycleIdentityConflict { ticket_id: key });
+        }
+        if let Some(existing_result) = existing_result {
+            if !existing_result.same_identity(record)
+                || lifecycle.result_sha256.as_deref()
+                    != Some(existing_result.result_sha256.as_str())
+            {
                 return Err(OrsError::ActivationResultRetentionIdentityConflict { ticket_id: key });
             }
             write.commit().map_err(storage)?;
-            return Ok(existing);
+            return Ok((existing_result, Vec::new()));
         }
-
-        let mut next = record.clone();
-        next.retention_order = Self::next_operational_order(&write)?;
-        next.validate()?;
-        let payload = encode(&next)?;
+        if lifecycle.state == ActivationLifecycleState::Claimed
+            && lifecycle
+                .claim_expires_at_unix_ms
+                .is_some_and(|expiry| expiry <= now_unix_ms)
         {
+            Self::reconcile_elapsed_activation_claim(write, lifecycle)?;
+            return Err(OrsError::ActivationLifecycleStateConflict {
+                ticket_id: key,
+                state: ActivationLifecycleState::Reconciling,
+                expected: ActivationLifecycleState::Claimed,
+            });
+        }
+        if now_unix_ms >= lifecycle.kernel_deadline_unix_ms {
+            Self::expire_activation_lifecycle_before_result(write, &lifecycle)?;
+            return Err(OrsError::ActivationLifecycleExpired { ticket_id: key });
+        }
+        Self::require_claimed_activation_for_result(
+            &lifecycle,
+            claim_owner,
+            dependency_observation,
+            now_unix_ms,
+            &key,
+        )?;
+        let (mut retained_rows, mut total_payload_bytes) =
+            Self::read_activation_result_rows(&write)?;
+        let mut lifecycle_rows = Self::read_activation_lifecycle_rows(&write)?;
+        let evicted_ticket_ids = Self::prune_activation_result_capacity(
+            &write,
+            &mut retained_rows,
+            &mut lifecycle_rows,
+            &mut total_payload_bytes,
+            record,
+            protected_ticket_ids,
+            &key,
+        )?;
+        let retained = Self::publish_activation_result_commit(&write, record, lifecycle)?;
+        write.commit().map_err(storage)?;
+        Ok((retained, evicted_ticket_ids))
+    }
+
+    /// Moves one claimed-but-expired-lease lifecycle to durable reconciliation
+    /// before a result can be admitted against it. The caller hands over its
+    /// write transaction: the reconciliation is committed here, and the caller
+    /// returns the refusal without touching that transaction again. A result is
+    /// never admitted against a claim this daemon no longer holds.
+    pub(super) fn reconcile_elapsed_activation_claim(
+        write: redb::WriteTransaction,
+        lifecycle: ActivationLifecycleRecord,
+    ) -> Result<(), OrsError> {
+        let mut reconciling = lifecycle;
+        reconciling.state = ActivationLifecycleState::Reconciling;
+        reconciling.claim_owner = None;
+        reconciling.claim_expires_at_unix_ms = None;
+        reconciling.lifecycle_order = Self::next_operational_order(&write)?;
+        reconciling.terminal_reason =
+            Some("claim lease elapsed before durable result admission".to_owned());
+        reconciling.validate()?;
+        let payload = encode(&reconciling)?;
+        let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        table
+            .insert(reconciling.record_key(), payload.as_str())
+            .map_err(storage)?;
+        drop(table);
+        write.commit().map_err(storage)
+    }
+
+    /// Publishes the durable deadline expiry for a result-less lifecycle. The
+    /// caller hands over its write transaction, because publishing the expiry is
+    /// itself the committed outcome of the refusal. A lifecycle that already
+    /// carries a result, or has already left `Pending`/`Claimed`, is left
+    /// exactly as it is: this returns without touching the transaction, so it
+    /// aborts instead of committing, and the caller still returns the same
+    /// deadline refusal either way.
+    pub(super) fn expire_activation_lifecycle_before_result(
+        write: redb::WriteTransaction,
+        lifecycle: &ActivationLifecycleRecord,
+    ) -> Result<(), OrsError> {
+        if lifecycle.result_sha256.is_some()
+            || !matches!(
+                lifecycle.state,
+                ActivationLifecycleState::Pending | ActivationLifecycleState::Claimed
+            )
+        {
+            return Ok(());
+        }
+        let mut expired = lifecycle.clone();
+        expired.state = ActivationLifecycleState::Expired;
+        expired.claim_owner = None;
+        expired.claim_expires_at_unix_ms = None;
+        expired.lifecycle_order = Self::next_operational_order(&write)?;
+        expired.terminal_reason =
+            Some("deadline elapsed before durable result admission".to_owned());
+        expired.validate()?;
+        let payload = encode(&expired)?;
+        let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        table
+            .insert(expired.record_key(), payload.as_str())
+            .map_err(storage)?;
+        drop(table);
+        write.commit().map_err(storage)
+    }
+
+    /// Requires that the lifecycle is still claimed by exactly this owner, and
+    /// that a successor ticket presents a strictly newer observation of its own
+    /// bound dependency after its `not_before` gate opened. A first-generation
+    /// ticket presents no dependency observation at all.
+    pub(super) fn require_claimed_activation_for_result(
+        lifecycle: &ActivationLifecycleRecord,
+        claim_owner: &str,
+        dependency_observation: Option<(&str, &str)>,
+        now_unix_ms: u64,
+        key: &str,
+    ) -> Result<(), OrsError> {
+        if lifecycle.state != ActivationLifecycleState::Claimed
+            || lifecycle.claim_owner.as_deref() != Some(claim_owner)
+        {
+            return Err(OrsError::ActivationLifecycleStateConflict {
+                ticket_id: key.to_owned(),
+                state: lifecycle.state,
+                expected: ActivationLifecycleState::Claimed,
+            });
+        }
+        match (lifecycle.successor_of.as_ref(), dependency_observation) {
+            (None, None) => Ok(()),
+            (Some(predecessor), Some((dependency_ref, observed_revision))) => {
+                if dependency_ref != predecessor.dependency_ref
+                    || observed_revision == predecessor.observed_dependency_revision
+                    || now_unix_ms < predecessor.not_before_unix_ms
+                {
+                    return Err(OrsError::ActivationLifecycleIdentityConflict {
+                        ticket_id: key.to_owned(),
+                    });
+                }
+                Ok(())
+            }
+            _ => Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: key.to_owned(),
+            }),
+        }
+    }
+
+    /// Reads every durable result-retention row and its exact total payload
+    /// size, refusing a size total that cannot be represented.
+    pub(super) fn read_activation_result_rows(
+        write: &redb::WriteTransaction,
+    ) -> Result<(Vec<ActivationResultRetentionRecord>, usize), OrsError> {
+        let mut retained_rows = Vec::new();
+        {
+            let table = write
+                .open_table(ACTIVATION_RESULT_RETENTION)
+                .map_err(storage)?;
+            for entry in table.iter().map_err(storage)? {
+                let (existing_key, value) = entry.map_err(storage)?;
+                let existing: ActivationResultRetentionRecord = decode(value.value())?;
+                if existing_key.value() != existing.record_key() {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "activation_result_retention",
+                        reason: "table key does not match ticket identity".to_owned(),
+                    });
+                }
+                retained_rows.push(existing);
+            }
+        }
+        let total_payload_bytes = retained_rows.iter().try_fold(0usize, |total, row| {
+            total
+                .checked_add(row.payload_bytes())
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "activation_result_retention",
+                    reason: "retention payload size overflow".to_owned(),
+                })
+        })?;
+        Ok((retained_rows, total_payload_bytes))
+    }
+
+    /// Makes bounded room for one more retained result, evicting the oldest
+    /// unprotected accepted row that carries no successor from both the
+    /// retention and lifecycle tables until the row count and total payload
+    /// bounds both hold. The committed ticket itself is never its own eviction
+    /// candidate, and a table with nothing evictable is a refusal.
+    pub(super) fn prune_activation_result_capacity(
+        write: &redb::WriteTransaction,
+        retained_rows: &mut Vec<ActivationResultRetentionRecord>,
+        lifecycle_rows: &mut Vec<ActivationLifecycleRecord>,
+        total_payload_bytes: &mut usize,
+        record: &ActivationResultRetentionRecord,
+        protected_ticket_ids: &BTreeSet<String>,
+        key: &str,
+    ) -> Result<Vec<String>, OrsError> {
+        let mut evicted_ticket_ids = Vec::new();
+        while retained_rows.len() >= crate::MAX_ACTIVATION_RESULT_RETENTION_RECORDS
+            || total_payload_bytes
+                .checked_add(record.payload_bytes())
+                .is_none_or(|total| total > crate::MAX_ACTIVATION_RESULT_TOTAL_PAYLOAD_BYTES)
+        {
+            let removable = lifecycle_rows
+                .iter()
+                .filter(|row| {
+                    row.ticket_id != key
+                        && !protected_ticket_ids.contains(&row.ticket_id)
+                        && row.state == ActivationLifecycleState::ResultAccepted
+                        && row.successor_ticket_id.is_none()
+                })
+                .min_by_key(|row| row.lifecycle_order)
+                .map(|row| row.ticket_id.clone());
+            let Some(removable_ticket_id) = removable else {
+                return Err(OrsError::ProjectionLimitExceeded);
+            };
+            let Some(victim) = retained_rows
+                .iter()
+                .find(|row| row.ticket_id == removable_ticket_id)
+            else {
+                return Err(OrsError::ProjectionLimitExceeded);
+            };
+            *total_payload_bytes = total_payload_bytes.saturating_sub(victim.payload_bytes());
+            retained_rows.retain(|row| row.ticket_id != removable_ticket_id);
+            lifecycle_rows.retain(|row| row.ticket_id != removable_ticket_id);
+            {
+                let mut table = write
+                    .open_table(ACTIVATION_RESULT_RETENTION)
+                    .map_err(storage)?;
+                table
+                    .remove(removable_ticket_id.as_str())
+                    .map_err(storage)?;
+            }
+            {
+                let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+                table
+                    .remove(removable_ticket_id.as_str())
+                    .map_err(storage)?;
+            }
+            evicted_ticket_ids.push(removable_ticket_id);
+        }
+        Ok(evicted_ticket_ids)
+    }
+
+    /// Publishes the retained result and the advanced lifecycle row in the
+    /// caller's write transaction, allocating one shared operational order so
+    /// the two projections advance as one durable step.
+    pub(super) fn publish_activation_result_commit(
+        write: &redb::WriteTransaction,
+        record: &ActivationResultRetentionRecord,
+        lifecycle: ActivationLifecycleRecord,
+    ) -> Result<ActivationResultRetentionRecord, OrsError> {
+        let order = Self::next_operational_order(write)?;
+        let mut retained = record.clone();
+        retained.retention_order = order;
+        retained.validate()?;
+        let mut next_lifecycle = lifecycle;
+        next_lifecycle.state = match retained.phase {
+            ActivationResultRetentionPhase::AcceptedTerminal => {
+                ActivationLifecycleState::ResultAccepted
+            }
+            ActivationResultRetentionPhase::DeferredNotReady => {
+                ActivationLifecycleState::DeferredNotReady
+            }
+        };
+        next_lifecycle.result_sha256 = Some(retained.result_sha256.clone());
+        next_lifecycle.claim_owner = None;
+        next_lifecycle.claim_expires_at_unix_ms = None;
+        next_lifecycle.terminal_reason = None;
+        next_lifecycle.lifecycle_order = order;
+        next_lifecycle.validate()?;
+        {
+            let payload = encode(&retained)?;
             let mut table = write
                 .open_table(ACTIVATION_RESULT_RETENTION)
                 .map_err(storage)?;
             table
-                .insert(key.as_str(), payload.as_str())
+                .insert(retained.record_key(), payload.as_str())
                 .map_err(storage)?;
         }
-        Self::prune_activation_results_in_write(&write)?;
+        {
+            let payload = encode(&next_lifecycle)?;
+            let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            table
+                .insert(next_lifecycle.record_key(), payload.as_str())
+                .map_err(storage)?;
+        }
+        Ok(retained)
+    }
+
+    /// Terminalizes one result-less ticket without erasing accepted results.
+    pub fn terminate_activation_without_result(
+        &self,
+        ticket_id: &str,
+        target: ActivationLifecycleState,
+        reason: &str,
+        now_unix_ms: u64,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        crate::model::validate_text(ticket_id, "activation_terminal_ticket_id")?;
+        crate::model::validate_text(reason, "activation_terminal_reason")?;
+        if !matches!(
+            target,
+            ActivationLifecycleState::Cancelled
+                | ActivationLifecycleState::Expired
+                | ActivationLifecycleState::Reconciling
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "activation_terminal_target",
+                reason: "resultless terminal target must be cancelled, expired, or reconciling",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<ActivationLifecycleRecord> = {
+            let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            table
+                .get(ticket_id)
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(mut existing) = existing else {
+            write.commit().map_err(storage)?;
+            return Ok(None);
+        };
+        if existing.state == target {
+            if existing.terminal_reason.as_deref() != Some(reason) {
+                return Err(OrsError::ActivationLifecycleIdentityConflict {
+                    ticket_id: ticket_id.to_owned(),
+                });
+            }
+            write.commit().map_err(storage)?;
+            return Ok(Some(existing));
+        }
+        if existing.result_sha256.is_some()
+            || matches!(
+                existing.state,
+                ActivationLifecycleState::DeferredNotReady
+                    | ActivationLifecycleState::ResultAccepted
+            )
+        {
+            return Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: ticket_id.to_owned(),
+            });
+        }
+        let allowed = match target {
+            ActivationLifecycleState::Cancelled => {
+                existing.state == ActivationLifecycleState::Pending
+            }
+            ActivationLifecycleState::Expired => {
+                matches!(
+                    existing.state,
+                    ActivationLifecycleState::Pending | ActivationLifecycleState::Claimed
+                ) && now_unix_ms >= existing.kernel_deadline_unix_ms
+            }
+            ActivationLifecycleState::Reconciling => matches!(
+                existing.state,
+                ActivationLifecycleState::Pending | ActivationLifecycleState::Claimed
+            ),
+            _ => false,
+        };
+        if !allowed {
+            return Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: ticket_id.to_owned(),
+            });
+        }
+        existing.state = target;
+        existing.claim_owner = None;
+        existing.claim_expires_at_unix_ms = None;
+        existing.terminal_reason = Some(reason.to_owned());
+        existing.lifecycle_order = Self::next_operational_order(&write)?;
+        existing.validate()?;
+        let payload = encode(&existing)?;
+        let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        table
+            .insert(existing.record_key(), payload.as_str())
+            .map_err(storage)?;
+        drop(table);
         write.commit().map_err(storage)?;
-        Ok(next)
+        Ok(Some(existing))
+    }
+
+    /// Cancels a result-less ticket only when the caller proves the exact
+    /// cancellation identity carried by its immutable activation request.
+    /// The identity check is a prerequisite to the state CAS; a mismatched
+    /// caller can never turn a pending row into `Cancelled`.
+    pub fn cancel_activation_without_result(
+        &self,
+        ticket_id: &str,
+        cancellation_id: &str,
+        reason: &str,
+        now_unix_ms: u64,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        crate::model::validate_text(cancellation_id, "activation_cancellation_id")?;
+        let existing = self.load_activation_lifecycle(ticket_id)?.ok_or_else(|| {
+            OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: ticket_id.to_owned(),
+            }
+        })?;
+        if existing.cancellation_id != cancellation_id {
+            return Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: ticket_id.to_owned(),
+            });
+        }
+        self.terminate_activation_without_result(
+            ticket_id,
+            ActivationLifecycleState::Cancelled,
+            reason,
+            now_unix_ms,
+        )
+    }
+
+    /// Loads one activation lifecycle row by exact ticket identity.
+    pub fn load_activation_lifecycle(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        crate::model::validate_text(ticket_id, "activation_lifecycle_ticket_id")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        table
+            .get(ticket_id)
+            .map_err(storage)?
+            .map(|value| {
+                let record: ActivationLifecycleRecord = decode(value.value())?;
+                record.validate()?;
+                Ok(record)
+            })
+            .transpose()
     }
 
     /// Loads one retained activation result by exact ticket and result identity.
@@ -1762,6 +2873,12 @@ impl RedbRecoveryStore {
         crate::model::validate_text(ticket_id, "activation_result_ticket_id")?;
         crate::model::validate_digest(result_sha256, "activation_result_result_sha256")?;
         let read = self.database.begin_read().map_err(storage)?;
+        let lifecycle_table = read.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        let lifecycle: Option<ActivationLifecycleRecord> = lifecycle_table
+            .get(ticket_id)
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()?;
         let table = read
             .open_table(ACTIVATION_RESULT_RETENTION)
             .map_err(storage)?;
@@ -1773,7 +2890,24 @@ impl RedbRecoveryStore {
         let Some(retained) = retained else {
             return Ok(None);
         };
-        if retained.result_sha256 != result_sha256 {
+        retained.validate()?;
+        let Some(lifecycle) = lifecycle else {
+            return Err(OrsError::ActivationResultRetentionIdentityConflict {
+                ticket_id: ticket_id.to_owned(),
+            });
+        };
+        lifecycle.validate()?;
+        if retained.result_sha256 != result_sha256
+            || retained.ticket_sha256 != lifecycle.ticket_sha256
+            || retained.connection_id != lifecycle.connection_id
+            || retained.state_fence != lifecycle.state_fence
+            || lifecycle.result_sha256.as_deref() != Some(retained.result_sha256.as_str())
+            || !matches!(
+                lifecycle.state,
+                ActivationLifecycleState::ResultAccepted
+                    | ActivationLifecycleState::DeferredNotReady
+            )
+        {
             return Err(OrsError::ActivationResultRetentionIdentityConflict {
                 ticket_id: ticket_id.to_owned(),
             });
@@ -1789,6 +2923,7 @@ impl RedbRecoveryStore {
         &self,
     ) -> Result<Vec<ActivationResultRetentionRecord>, OrsError> {
         let read = self.database.begin_read().map_err(storage)?;
+        let lifecycle_table = read.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
         let table = read
             .open_table(ACTIVATION_RESULT_RETENTION)
             .map_err(storage)?;
@@ -1802,10 +2937,135 @@ impl RedbRecoveryStore {
                     reason: "table key does not match ticket identity".to_owned(),
                 });
             }
+            record.validate()?;
+            let lifecycle = lifecycle_table
+                .get(key.value())
+                .map_err(storage)?
+                .ok_or_else(|| OrsError::ActivationResultRetentionIdentityConflict {
+                    ticket_id: record.ticket_id.clone(),
+                })?;
+            let lifecycle: ActivationLifecycleRecord = decode(lifecycle.value())?;
+            lifecycle.validate()?;
+            if lifecycle.ticket_sha256 != record.ticket_sha256
+                || lifecycle.connection_id != record.connection_id
+                || lifecycle.state_fence != record.state_fence
+                || lifecycle.result_sha256.as_deref() != Some(record.result_sha256.as_str())
+                || !matches!(
+                    lifecycle.state,
+                    ActivationLifecycleState::ResultAccepted
+                        | ActivationLifecycleState::DeferredNotReady
+                )
+            {
+                return Err(OrsError::ActivationResultRetentionIdentityConflict {
+                    ticket_id: record.ticket_id.clone(),
+                });
+            }
             records.push(record);
         }
         records.sort_by_key(|record| record.retention_order);
         Ok(records)
+    }
+
+    /// Loads lifecycle and retained-result rows under one coherent ORS read
+    /// transaction. Cross-table integrity is checked before publication.
+    pub fn load_activation_recovery_snapshot(
+        &self,
+    ) -> Result<ActivationRecoverySnapshot, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let lifecycle_table = read.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        let mut lifecycles = Vec::new();
+        for entry in lifecycle_table.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let record: ActivationLifecycleRecord = decode(value.value())?;
+            if key.value() != record.record_key() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_lifecycle",
+                    reason: "table key does not match ticket identity".to_owned(),
+                });
+            }
+            record.validate()?;
+            lifecycles.push(record);
+        }
+        drop(lifecycle_table);
+        let result_table = read
+            .open_table(ACTIVATION_RESULT_RETENTION)
+            .map_err(storage)?;
+        let mut results = Vec::new();
+        for entry in result_table.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let record: ActivationResultRetentionRecord = decode(value.value())?;
+            if key.value() != record.record_key() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_result_retention",
+                    reason: "table key does not match ticket identity".to_owned(),
+                });
+            }
+            record.validate()?;
+            results.push(record);
+        }
+        drop(result_table);
+        if lifecycles.len() > crate::MAX_ACTIVATION_LIFECYCLE_RECORDS
+            || results.len() > crate::MAX_ACTIVATION_RESULT_RETENTION_RECORDS
+        {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        let result_by_ticket = results
+            .iter()
+            .map(|record| (record.ticket_id.as_str(), record))
+            .collect::<BTreeMap<_, _>>();
+        for lifecycle in &lifecycles {
+            match (
+                &lifecycle.result_sha256,
+                result_by_ticket.get(lifecycle.ticket_id.as_str()),
+            ) {
+                (None, None) => {}
+                (Some(digest), Some(result)) if digest == &result.result_sha256 => {}
+                _ => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "activation_lifecycle",
+                        reason: "lifecycle and retained-result bindings disagree".to_owned(),
+                    });
+                }
+            }
+            if let Some(successor) = &lifecycle.successor_of {
+                let predecessor = lifecycles
+                    .iter()
+                    .find(|candidate| candidate.ticket_id == successor.predecessor_ticket_id)
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "activation_lifecycle",
+                        reason: "successor predecessor is missing".to_owned(),
+                    })?;
+                if predecessor.state != ActivationLifecycleState::DeferredNotReady
+                    || predecessor.ticket_sha256 != successor.predecessor_ticket_sha256
+                    || predecessor.result_sha256.as_deref()
+                        != Some(successor.predecessor_result_sha256.as_str())
+                    || predecessor.successor_ticket_id.as_deref()
+                        != Some(lifecycle.ticket_id.as_str())
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "activation_lifecycle",
+                        reason: "successor predecessor binding is inconsistent".to_owned(),
+                    });
+                }
+            }
+        }
+        for result in &results {
+            if !lifecycles
+                .iter()
+                .any(|lifecycle| lifecycle.ticket_id == result.ticket_id)
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_result_retention",
+                    reason: "retained result has no lifecycle owner".to_owned(),
+                });
+            }
+        }
+        lifecycles.sort_by_key(|record| record.lifecycle_order);
+        results.sort_by_key(|record| record.retention_order);
+        Ok(ActivationRecoverySnapshot {
+            lifecycles,
+            results,
+        })
     }
 
     /// Prunes the oldest retained activation results until the count and
@@ -1818,6 +3078,20 @@ impl RedbRecoveryStore {
     }
 
     fn prune_activation_results_in_write(write: &redb::WriteTransaction) -> Result<u64, OrsError> {
+        let protected = {
+            let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            let mut protected = BTreeSet::new();
+            for entry in table.iter().map_err(storage)? {
+                let (key, value) = entry.map_err(storage)?;
+                let lifecycle: ActivationLifecycleRecord = decode(value.value())?;
+                if lifecycle.state != ActivationLifecycleState::ResultAccepted
+                    || lifecycle.successor_ticket_id.is_some()
+                {
+                    protected.insert(key.value().to_owned());
+                }
+            }
+            protected
+        };
         let mut rows = {
             let table = write
                 .open_table(ACTIVATION_RESULT_RETENTION)
@@ -1853,25 +3127,33 @@ impl RedbRecoveryStore {
                     reason: "retention payload size overflow".to_owned(),
                 })
         })?;
-        let mut remove_count = 0usize;
-        while rows.len().saturating_sub(remove_count)
+        let mut remove_keys = Vec::new();
+        while rows.len().saturating_sub(remove_keys.len())
             > crate::MAX_ACTIVATION_RESULT_RETENTION_RECORDS
             || total_payload_bytes > crate::MAX_ACTIVATION_RESULT_TOTAL_PAYLOAD_BYTES
         {
-            let (_, oldest) = &rows[remove_count];
-            total_payload_bytes = total_payload_bytes.saturating_sub(oldest.payload_bytes());
-            remove_count += 1;
+            let candidate = rows
+                .iter()
+                .find(|(key, _)| !protected.contains(key) && !remove_keys.contains(key))
+                .ok_or(OrsError::ProjectionLimitExceeded)?;
+            total_payload_bytes = total_payload_bytes.saturating_sub(candidate.1.payload_bytes());
+            remove_keys.push(candidate.0.clone());
         }
-        if remove_count == 0 {
+        if remove_keys.is_empty() {
             return Ok(0);
         }
         let mut table = write
             .open_table(ACTIVATION_RESULT_RETENTION)
             .map_err(storage)?;
-        for (key, _) in rows.into_iter().take(remove_count) {
+        for key in &remove_keys {
             table.remove(key.as_str()).map_err(storage)?;
         }
-        u64::try_from(remove_count).map_err(|_| OrsError::IntegrityProblem {
+        drop(table);
+        let mut lifecycle_table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        for key in &remove_keys {
+            lifecycle_table.remove(key.as_str()).map_err(storage)?;
+        }
+        u64::try_from(remove_keys.len()).map_err(|_| OrsError::IntegrityProblem {
             record_type: "activation_result_retention",
             reason: "pruned record count exceeds counter".to_owned(),
         })
@@ -4780,6 +6062,10 @@ impl RedbRecoveryStore {
         Self::open_with_evidence(path, Arc::new(crate::test_support::KernelRouteEvidence))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "schema initialization keeps the durable table contract in one auditable transaction setup"
+    )]
     fn initialize(&self) -> Result<(), OrsError> {
         let write = self.database.begin_write().map_err(storage)?;
         // Bounded: provenance below and the journal family check that follows
@@ -4823,6 +6109,10 @@ impl RedbRecoveryStore {
                     .to_owned(),
             });
         };
+        // The base family — including the #1115 activation-lifecycle and
+        // activation-retention tables — is materialized by one extracted helper
+        // so this transaction reads as markers, then family, then journal, then
+        // the activation validators.
         Self::initialize_ors_tables(&write, initialize_resolution_schema)?;
         // The journal initializer owns the family AND the base-META adoption
         // marker, so every entry point that can materialize the family — this
@@ -4831,7 +6121,15 @@ impl RedbRecoveryStore {
         // also re-checks the table ceiling as a postcondition, so the base
         // tables added above cannot push this transaction past the bound.
         restore_journal::initialize_restore_journal_schema(&write)?;
+        Self::migrate_legacy_grant_closure_rows(&write)?;
+        Self::validate_grant_closure_second_phase_table(&write)?;
+        // #1115: the durable lifecycle records are validated in the same
+        // transaction that materializes them, before the retention and
+        // cross-table checks below, so a store that can open never carries a
+        // lifecycle row that disagrees with its retained result.
+        Self::validate_activation_lifecycle_table(&write)?;
         Self::validate_activation_result_retention_table(&write)?;
+        Self::validate_activation_cross_table_bindings(&write)?;
         write.commit().map_err(storage)
     }
 
@@ -4889,6 +6187,11 @@ impl RedbRecoveryStore {
                 .open_table(ACTIVATION_RESULT_RETENTION)
                 .map_err(storage)?,
         );
+        // #1115: the durable activation lifecycle table is part of the base
+        // family, created in the same position and by the same single-pass
+        // helper as every other base table, so a fresh store materializes it
+        // before `validate_activation_lifecycle_table` reads it.
+        drop(write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?);
         drop(write.open_table(REPLAY_STREAMS).map_err(storage)?);
         drop(write.open_table(REPLAY_REQUESTS).map_err(storage)?);
         drop(write.open_table(REPLAY_EVENTS).map_err(storage)?);
@@ -4910,6 +6213,124 @@ impl RedbRecoveryStore {
                 SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1,
             )
             .map_err(storage)?;
+        }
+        Ok(())
+    }
+
+    /// Binds every retained activation result to the durable lifecycle record
+    /// that owns it (#1115).
+    ///
+    /// A result without a lifecycle owner, or one whose lifecycle names a
+    /// different retained result, is a `MigrationRequired`/`IntegrityProblem`
+    /// failure: the cross-table binding is a durable invariant, so open fails
+    /// closed instead of admitting a store whose replay could publish a result
+    /// under a lifecycle that never authorized it.
+    fn validate_activation_cross_table_bindings(
+        write: &redb::WriteTransaction,
+    ) -> Result<(), OrsError> {
+        let lifecycle_table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        let mut lifecycles = BTreeMap::new();
+        for entry in lifecycle_table.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let record: ActivationLifecycleRecord = decode(value.value())?;
+            lifecycles.insert(key.value().to_owned(), record);
+        }
+        drop(lifecycle_table);
+        let result_table = write
+            .open_table(ACTIVATION_RESULT_RETENTION)
+            .map_err(storage)?;
+        for entry in result_table.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let result: ActivationResultRetentionRecord = decode(value.value())?;
+            let lifecycle =
+                lifecycles
+                    .get(key.value())
+                    .ok_or_else(|| OrsError::MigrationRequired {
+                        reason: "existing activation result lacks a durable lifecycle owner"
+                            .to_owned(),
+                    })?;
+            if lifecycle.result_sha256.as_deref() != Some(result.result_sha256.as_str()) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_lifecycle",
+                    reason: "existing result and lifecycle bindings disagree".to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates the durable activation lifecycle table (#1115).
+    ///
+    /// Every row must be keyed by its own record identity and carry a non-zero
+    /// lifecycle order, the table must stay inside its record bound, lifecycle
+    /// orders must be unique, and every `NotReady` successor must bind exactly
+    /// one `DeferredNotReady` predecessor by ticket digest and retained result
+    /// digest. A violation is an `IntegrityProblem`, so a store whose lifecycle
+    /// chain could no longer be replayed in order fails closed at open.
+    fn validate_activation_lifecycle_table(write: &redb::WriteTransaction) -> Result<(), OrsError> {
+        let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        let mut rows = Vec::new();
+        for entry in table.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let record: ActivationLifecycleRecord = decode(value.value())?;
+            if key.value() != record.record_key() || record.lifecycle_order == 0 {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_lifecycle",
+                    reason: "table key or lifecycle order is invalid".to_owned(),
+                });
+            }
+            rows.push(record);
+        }
+        if rows.len() > crate::MAX_ACTIVATION_LIFECYCLE_RECORDS {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "activation_lifecycle",
+                reason: "lifecycle record bound exceeded".to_owned(),
+            });
+        }
+        let mut lifecycle_orders = rows
+            .iter()
+            .map(|record| record.lifecycle_order)
+            .collect::<Vec<_>>();
+        lifecycle_orders.sort_unstable();
+        if lifecycle_orders.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "activation_lifecycle",
+                reason: "lifecycle order is not unique".to_owned(),
+            });
+        }
+        let mut successor_ticket_ids = BTreeSet::new();
+        for successor_row in rows.iter().filter_map(|record| {
+            record
+                .successor_of
+                .as_ref()
+                .map(|binding| (record, binding))
+        }) {
+            let (successor_row, successor) = successor_row;
+            if !successor_ticket_ids.insert(successor_row.ticket_id.clone()) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_lifecycle",
+                    reason: "successor ticket identity is duplicated".to_owned(),
+                });
+            }
+            let predecessor = rows
+                .iter()
+                .find(|record| record.ticket_id == successor.predecessor_ticket_id)
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "activation_lifecycle",
+                    reason: "successor predecessor is missing".to_owned(),
+                })?;
+            if predecessor.state != ActivationLifecycleState::DeferredNotReady
+                || predecessor.ticket_sha256 != successor.predecessor_ticket_sha256
+                || predecessor.result_sha256.as_deref()
+                    != Some(successor.predecessor_result_sha256.as_str())
+                || predecessor.successor_ticket_id.as_deref()
+                    != Some(successor_row.ticket_id.as_str())
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_lifecycle",
+                    reason: "successor predecessor binding is invalid".to_owned(),
+                });
+            }
         }
         Ok(())
     }
@@ -4964,7 +6385,79 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
+    fn reconcile_interrupted_activation_tickets(&self) -> Result<(), OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut rows = {
+            let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            let mut rows = Vec::new();
+            for entry in table.iter().map_err(storage)? {
+                let (key, value) = entry.map_err(storage)?;
+                let record: ActivationLifecycleRecord = decode(value.value())?;
+                if key.value() != record.record_key() {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "activation_lifecycle",
+                        reason: "table key does not match ticket identity".to_owned(),
+                    });
+                }
+                rows.push(record);
+            }
+            rows
+        };
+        let open_ids = rows
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.state,
+                    ActivationLifecycleState::Pending | ActivationLifecycleState::Claimed
+                )
+            })
+            .map(|record| record.ticket_id.clone())
+            .collect::<BTreeSet<_>>();
+        if open_ids.is_empty() {
+            write.commit().map_err(storage)?;
+            return Ok(());
+        }
+        let order = Self::next_operational_order(&write)?;
+        for record in &mut rows {
+            if record
+                .successor_of
+                .as_ref()
+                .is_some_and(|successor| open_ids.contains(&successor.predecessor_ticket_id))
+            {
+                continue;
+            }
+            if open_ids.contains(&record.ticket_id) {
+                record.state = ActivationLifecycleState::Reconciling;
+                record.claim_owner = None;
+                record.claim_expires_at_unix_ms = None;
+                record.terminal_reason =
+                    Some("restart interrupted activation lifecycle".to_owned());
+                record.lifecycle_order = order;
+                record.validate()?;
+            } else if record
+                .successor_ticket_id
+                .as_ref()
+                .is_some_and(|successor_id| open_ids.contains(successor_id))
+            {
+                record.successor_ticket_id = None;
+                record.lifecycle_order = order;
+                record.validate()?;
+            }
+        }
+        {
+            let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            for record in &rows {
+                let payload = encode(record)?;
+                table
+                    .insert(record.record_key(), payload.as_str())
+                    .map_err(storage)?;
+            }
+        }
+        write.commit().map_err(storage)
+    }
+
     fn recover_interrupted_execution(&self) -> Result<(), OrsError> {
+        self.reconcile_interrupted_activation_tickets()?;
         loop {
             let write = self.database.begin_write().map_err(storage)?;
             let mut interrupted = Vec::with_capacity(usize::from(crate::MAX_RECOVERY_PAGE));
@@ -5511,10 +7004,11 @@ impl RedbRecoveryStore {
     fn closure_receipt_for(
         record: &DurableGrantClosureRecord,
     ) -> Result<OperationalMutationReceipt, OrsError> {
+        crate::model::validate_grant_closure_contract(&record.commit)?;
         let encoded = encode(record)?;
         OperationalMutationReceipt::issue(
-            record.commit.operation_id.clone(),
-            record.commit.target_id.clone(),
+            OperationIdentity::new(record.commit.operation_id.as_str())?,
+            OperationIdentity::new(record.commit.declaration.target_grant_id.as_str())?,
             record.operation_order,
             record.phase,
             crate::model::sha256_hex(encoded.as_bytes()),
@@ -5546,6 +7040,704 @@ impl RedbRecoveryStore {
             });
         }
         Ok(Some(row.revision))
+    }
+
+    fn ensure_grant_closure_order_floor(
+        write: &redb::WriteTransaction,
+        operation_order: u64,
+    ) -> Result<(), OrsError> {
+        let mut meta = write.open_table(META).map_err(storage)?;
+        let prior = meta
+            .get(NEXT_GLOBAL_ORDER)
+            .map_err(storage)?
+            .map(|value| value.value().parse::<u64>())
+            .transpose()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: error.to_string(),
+            })?
+            .unwrap_or(0);
+        if operation_order > prior {
+            meta.insert(NEXT_GLOBAL_ORDER, operation_order.to_string().as_str())
+                .map_err(storage)?;
+        }
+        Ok(())
+    }
+
+    fn grant_closure_migration_key(operation_id: &str) -> String {
+        format!("{GRANT_CLOSURE_MIGRATION_KEY_PREFIX}{operation_id}")
+    }
+
+    fn grant_closure_current_key(operation_id: &str) -> String {
+        format!("grant_closure:{operation_id}")
+    }
+
+    fn grant_closure_second_phase_key(operation_id: &str) -> String {
+        format!("{GRANT_CLOSURE_SECOND_PHASE_KEY_PREFIX}{operation_id}")
+    }
+
+    fn decode_grant_closure_second_phase(
+        value: &str,
+    ) -> Result<DurableGrantClosureSecondPhaseRecord, OrsError> {
+        decode_named::<DurableGrantClosureSecondPhaseRecord>(value, "grant_closure_second_phase")
+    }
+
+    fn validate_grant_closure_second_phase_binding(
+        record: &DurableGrantClosureSecondPhaseRecord,
+        key: &str,
+        operation_id: &str,
+    ) -> Result<(), OrsError> {
+        if record.operation_id.as_str() != operation_id
+            || key != Self::grant_closure_second_phase_key(operation_id)
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_closure_second_phase",
+                reason: "second-phase key or operation identity does not match its row".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn grant_closure_phase_is_committed(phase: OperationalPhase) -> bool {
+        matches!(phase, OperationalPhase::Active | OperationalPhase::Fenced)
+    }
+
+    fn validate_grant_closure_second_phase_against_row(
+        second_phase: &DurableGrantClosureSecondPhaseRecord,
+        key: &str,
+        closure: &DurableGrantClosureRecord,
+    ) -> Result<(), OrsError> {
+        Self::validate_grant_closure_second_phase_binding(
+            second_phase,
+            key,
+            closure.commit.operation_id.as_str(),
+        )?;
+        if !Self::grant_closure_phase_is_committed(closure.phase) {
+            return Err(OrsError::InvalidTransition);
+        }
+        if second_phase.operation_order <= closure.operation_order {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_closure_second_phase",
+                reason: "second-phase order does not follow the committed first phase".to_owned(),
+            });
+        }
+        if let Some(first_phase) = &closure.commit.canonical_receipt
+            && first_phase != &second_phase.canonical_receipt
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_closure_second_phase",
+                reason: "second-phase link conflicts with the immutable first-phase receipt"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn grant_closure_second_phase_in(
+        read: &redb::ReadTransaction,
+        operation_id: &str,
+    ) -> Result<Option<DurableGrantClosureSecondPhaseRecord>, OrsError> {
+        let key = Self::grant_closure_second_phase_key(operation_id);
+        let table = read
+            .open_table(GRANT_CLOSURE_SECOND_PHASE_CURRENT)
+            .map_err(storage)?;
+        let Some(value) = table.get(key.as_str()).map_err(storage)? else {
+            return Ok(None);
+        };
+        let record = Self::decode_grant_closure_second_phase(value.value())?;
+        Self::validate_grant_closure_second_phase_binding(&record, key.as_str(), operation_id)?;
+        Ok(Some(record))
+    }
+
+    fn grant_closure_second_phases_in(
+        read: &redb::ReadTransaction,
+    ) -> Result<BTreeMap<String, DurableGrantClosureSecondPhaseRecord>, OrsError> {
+        let table = read
+            .open_table(GRANT_CLOSURE_SECOND_PHASE_CURRENT)
+            .map_err(storage)?;
+        let mut records = BTreeMap::new();
+        for entry in table.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let record = Self::decode_grant_closure_second_phase(value.value())?;
+            Self::validate_grant_closure_second_phase_binding(
+                &record,
+                key.value(),
+                record.operation_id.as_str(),
+            )?;
+            if records
+                .insert(record.operation_id.clone(), record)
+                .is_some()
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "grant_closure_second_phase",
+                    reason: "duplicate second-phase operation identity".to_owned(),
+                });
+            }
+        }
+        Ok(records)
+    }
+
+    fn grant_closure_second_phase_identity(
+        closure: &DurableGrantClosureRecord,
+        second_phase: Option<&DurableGrantClosureSecondPhaseRecord>,
+    ) -> Result<Option<ReceiptIdentity>, OrsError> {
+        if let Some(second_phase) = second_phase {
+            if let Some(first_phase) = &closure.commit.canonical_receipt
+                && first_phase != &second_phase.canonical_receipt
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "grant_closure_second_phase",
+                    reason: "second-phase link conflicts with the immutable first-phase receipt"
+                        .to_owned(),
+                });
+            }
+            Ok(Some(second_phase.canonical_receipt.clone()))
+        } else {
+            Ok(closure.commit.canonical_receipt.clone())
+        }
+    }
+
+    fn grant_closure_projection_from_record(
+        record: DurableGrantClosureRecord,
+        second_phase: Option<ReceiptIdentity>,
+    ) -> Result<GrantClosureProjection, OrsError> {
+        let receipt = Self::closure_receipt_for(&record)?;
+        Ok(GrantClosureProjection::from_store(
+            record.commit,
+            record.phase,
+            record.operation_order,
+            GrantClosureCommitReceipt::from_receipt(receipt),
+            second_phase,
+        ))
+    }
+
+    fn grant_closure_projection_from_read(
+        read: &redb::ReadTransaction,
+        record: DurableGrantClosureRecord,
+    ) -> Result<GrantClosureProjection, OrsError> {
+        let operation_id = record.commit.operation_id.as_str();
+        let second_phase = Self::grant_closure_second_phase_in(read, operation_id)?;
+        if let Some(second_phase) = second_phase.as_ref() {
+            Self::validate_grant_closure_second_phase_against_row(
+                second_phase,
+                Self::grant_closure_second_phase_key(operation_id).as_str(),
+                &record,
+            )?;
+        }
+        let second_phase =
+            Self::grant_closure_second_phase_identity(&record, second_phase.as_ref())?;
+        Self::grant_closure_projection_from_record(record, second_phase)
+    }
+
+    fn validate_grant_closure_second_phase_table(
+        write: &redb::WriteTransaction,
+    ) -> Result<(), OrsError> {
+        let rows = {
+            let table = write
+                .open_table(GRANT_CLOSURE_SECOND_PHASE_CURRENT)
+                .map_err(storage)?;
+            let mut rows = Vec::new();
+            for entry in table.iter().map_err(storage)? {
+                let (key, value) = entry.map_err(storage)?;
+                let record = Self::decode_grant_closure_second_phase(value.value())?;
+                rows.push((key.value().to_owned(), record));
+            }
+            rows
+        };
+        for (key, second_phase) in rows {
+            let operation_id = second_phase.operation_id.as_str();
+            let current_key = Self::grant_closure_current_key(operation_id);
+            let current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+            let Some(value) = current.get(current_key.as_str()).map_err(storage)? else {
+                return Err(OrsError::MigrationRequired {
+                    reason: format!(
+                        "grant-closure second-phase operation {operation_id} has no committed first-phase row"
+                    ),
+                });
+            };
+            let closure: DurableGrantClosureRecord = decode_named(value.value(), "grant_closure")?;
+            Self::validate_grant_closure_second_phase_against_row(
+                &second_phase,
+                key.as_str(),
+                &closure,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn grant_closure_state_label(state: GrantClosureState) -> &'static str {
+        match state {
+            GrantClosureState::Active => "ACTIVE",
+            GrantClosureState::Revoked => "REVOKED",
+        }
+    }
+
+    fn legacy_grant_closure_missing_fields(record: &LegacyGrantClosureRecord) -> Vec<String> {
+        let mut fields = vec![
+            "authority".to_owned(),
+            "authority_receipt.authority_epoch".to_owned(),
+            "authority_receipt.snapshot_id".to_owned(),
+            "declaration.members[].parent_grant_id".to_owned(),
+            "ors_member_receipts".to_owned(),
+            "proof_ceiling".to_owned(),
+        ];
+        if !record.commit.preserved.is_empty() {
+            fields.extend([
+                "declaration.preserved[].canonical_request_hash".to_owned(),
+                "declaration.preserved[].effect".to_owned(),
+                "declaration.preserved[].holder_principal".to_owned(),
+                "declaration.preserved[].operation_id".to_owned(),
+                "declaration.preserved[].operation_name".to_owned(),
+                "declaration.preserved[].resource_ref".to_owned(),
+                "declaration.preserved[].scope_id".to_owned(),
+                "declaration.preserved[].session_id".to_owned(),
+            ]);
+        }
+        if !record.commit.fenced_introductions.is_empty() {
+            fields.push("ors_introduction_receipts".to_owned());
+        }
+        fields.sort();
+        fields.dedup();
+        fields
+    }
+
+    fn current_grant_closure_matches_legacy(
+        current: &DurableGrantClosureRecord,
+        legacy: &LegacyGrantClosureRecord,
+    ) -> bool {
+        let current_affected = current
+            .commit
+            .declaration
+            .members
+            .iter()
+            .map(|member| member.grant_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let legacy_affected = legacy
+            .commit
+            .affected
+            .iter()
+            .map(OpaqueLabel::as_str)
+            .collect::<BTreeSet<_>>();
+        let current_preserved = current
+            .commit
+            .declaration
+            .preserved
+            .iter()
+            .map(|preserved| {
+                (
+                    preserved.grant_id.as_str(),
+                    preserved.covering_grant_id.as_str(),
+                    preserved.covering_root_ref.as_str(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let legacy_preserved = legacy
+            .commit
+            .preserved
+            .iter()
+            .map(|preserved| {
+                (
+                    preserved.grant_id.as_str(),
+                    preserved.covering_grant_id.as_str(),
+                    preserved.covering_root.as_str(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let current_introductions = current
+            .commit
+            .fenced_introductions
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let legacy_introductions = legacy
+            .commit
+            .fenced_introductions
+            .iter()
+            .map(OpaqueLabel::as_str)
+            .collect::<Vec<_>>();
+        current.commit.operation_id.as_str() == legacy.commit.operation_id.as_str()
+            && current.commit.idempotency_digest == legacy.commit.digest
+            && current.commit.declaration.target_grant_id.as_str()
+                == legacy.commit.target_id.as_str()
+            && current.commit.declaration.authority_root_ref.as_str()
+                == legacy.commit.authority_root.as_str()
+            && current.commit.declaration.grant_graph_revision == legacy.commit.revision
+            && Self::grant_closure_state_label(current.commit.state)
+                == match legacy.commit.state {
+                    LegacyGrantClosureState::Active => "ACTIVE",
+                    LegacyGrantClosureState::Fenced => "REVOKED",
+                }
+            && current_affected == legacy_affected
+            && current_preserved == legacy_preserved
+            && current_introductions == legacy_introductions
+    }
+
+    fn grant_closure_migration_refusal(record: &GrantClosureMigrationRecord) -> OrsError {
+        let missing = if record.missing_fields.is_empty() {
+            "<current v2 row binding>".to_owned()
+        } else {
+            record.missing_fields.join(", ")
+        };
+        OrsError::MigrationRequired {
+            reason: format!(
+                "grant-closure operation {} from legacy key {} has migration disposition {}; exact missing v2 field(s): {}",
+                record.operation_id,
+                record.legacy_key,
+                record.disposition.as_str(),
+                missing
+            ),
+        }
+    }
+
+    fn decode_grant_closure_migration(
+        value: &str,
+    ) -> Result<GrantClosureMigrationRecord, OrsError> {
+        decode_named::<GrantClosureMigrationRecord>(value, "grant_closure_migration")
+    }
+
+    fn grant_closure_migration_from_write(
+        write: &redb::WriteTransaction,
+        operation_id: &str,
+    ) -> Result<Option<GrantClosureMigrationRecord>, OrsError> {
+        let key = Self::grant_closure_migration_key(operation_id);
+        let current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+        current
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let migration = Self::decode_grant_closure_migration(value.value())?;
+                Self::validate_grant_closure_migration_binding(
+                    &migration,
+                    key.as_str(),
+                    operation_id,
+                )?;
+                Ok(migration)
+            })
+            .transpose()
+    }
+
+    fn validate_grant_closure_migration_binding(
+        record: &GrantClosureMigrationRecord,
+        key: &str,
+        operation_id: &str,
+    ) -> Result<(), OrsError> {
+        if record.operation_id != operation_id
+            || record.legacy_key != Self::grant_closure_current_key(operation_id)
+            || key != Self::grant_closure_migration_key(operation_id)
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_closure_migration",
+                reason: "migration key or operation identity does not match its disposition"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "schema migration validates and records each legacy row atomically before commit"
+    )]
+    fn migrate_legacy_grant_closure_rows(write: &redb::WriteTransaction) -> Result<(), OrsError> {
+        let mut rows = {
+            let legacy = write
+                .open_table(GRANT_CLOSURE_LEGACY_CURRENT)
+                .map_err(storage)?;
+            let mut rows = Vec::new();
+            for entry in legacy.iter().map_err(storage)? {
+                let (key, value) = entry.map_err(storage)?;
+                rows.push((key.value().to_owned(), value.value().to_owned()));
+            }
+            rows
+        };
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+
+        for (legacy_key, raw) in rows {
+            let operation_id = legacy_key
+                .strip_prefix("grant_closure:")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| OrsError::MigrationRequired {
+                    reason: format!(
+                        "legacy grant-closure row {legacy_key} has no exact grant_closure:<operation_id> identity"
+                    ),
+                })?;
+            let operation_identity = OperationIdentity::new(operation_id).map_err(|error| {
+                OrsError::MigrationRequired {
+                    reason: format!(
+                        "legacy grant-closure row {legacy_key} has invalid operation identity: {error}"
+                    ),
+                }
+            })?;
+            let migration_key = Self::grant_closure_migration_key(operation_identity.as_str());
+            let source_sha256 = crate::model::sha256_hex(raw.as_bytes());
+            if let Some(existing_migration) =
+                Self::grant_closure_migration_from_write(write, operation_identity.as_str())?
+            {
+                Self::validate_grant_closure_migration_binding(
+                    &existing_migration,
+                    &migration_key,
+                    operation_identity.as_str(),
+                )?;
+                if existing_migration.source_row_sha256 != source_sha256 {
+                    return Err(OrsError::MigrationRequired {
+                        reason: format!(
+                            "legacy grant-closure row {legacy_key} changed after its recorded migration disposition"
+                        ),
+                    });
+                }
+                Self::ensure_grant_closure_order_floor(
+                    write,
+                    existing_migration.legacy_operation_order,
+                )?;
+                if let Some(current_key) = existing_migration.current_key.as_deref() {
+                    let present = {
+                        let current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+                        current.get(current_key).map_err(storage)?.is_some()
+                    };
+                    if !present {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "grant_closure_migration",
+                            reason: format!(
+                                "migration disposition for {legacy_key} names a missing current row"
+                            ),
+                        });
+                    }
+                }
+                let mut legacy = write
+                    .open_table(GRANT_CLOSURE_LEGACY_CURRENT)
+                    .map_err(storage)?;
+                legacy.remove(legacy_key.as_str()).map_err(storage)?;
+                continue;
+            }
+
+            let current_key = Self::grant_closure_current_key(operation_identity.as_str());
+            let existing_current = {
+                let current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+                current
+                    .get(current_key.as_str())
+                    .map_err(storage)?
+                    .map(|value| {
+                        decode_named::<DurableGrantClosureRecord>(value.value(), "grant_closure")
+                    })
+                    .transpose()?
+            };
+
+            if is_current_grant_closure_shape(&raw) {
+                let record = decode_named::<DurableGrantClosureRecord>(&raw, "grant_closure")
+                    .map_err(|error| OrsError::MigrationRequired {
+                        reason: format!(
+                            "legacy grant-closure row {legacy_key} has a v2 shape but failed current validation: {error}"
+                        ),
+                    })?;
+                if record.commit.operation_id != operation_identity.as_str() {
+                    return Err(OrsError::MigrationRequired {
+                        reason: format!(
+                            "legacy grant-closure row {legacy_key} carries operation identity {} instead of its key",
+                            record.commit.operation_id
+                        ),
+                    });
+                }
+                Self::ensure_grant_closure_order_floor(write, record.operation_order)?;
+                if let Some(existing) = existing_current {
+                    if existing != record {
+                        return Err(OrsError::MigrationRequired {
+                            reason: format!(
+                                "legacy grant-closure row {legacy_key} conflicts with the existing current v2 row"
+                            ),
+                        });
+                    }
+                } else {
+                    let encoded = encode(&record)?;
+                    let mut current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+                    current
+                        .insert(current_key.as_str(), encoded.as_str())
+                        .map_err(storage)?;
+                }
+                let migration = GrantClosureMigrationRecord {
+                    schema: GRANT_CLOSURE_MIGRATION_SCHEMA.to_owned(),
+                    version: GRANT_CLOSURE_MIGRATION_VERSION,
+                    operation_id: operation_identity.as_str().to_owned(),
+                    legacy_key: legacy_key.clone(),
+                    target_grant_id: record.commit.declaration.target_grant_id.clone(),
+                    authority_root_ref: record.commit.declaration.authority_root_ref.clone(),
+                    grant_graph_revision: record.commit.declaration.grant_graph_revision,
+                    legacy_phase: record.phase,
+                    legacy_state: match record.commit.state {
+                        GrantClosureState::Active => "ACTIVE",
+                        GrantClosureState::Revoked => "REVOKED",
+                    }
+                    .to_owned(),
+                    legacy_operation_order: record.operation_order,
+                    source_row_sha256: source_sha256,
+                    legacy_row_json: raw.clone(),
+                    disposition: GrantClosureMigrationDisposition::CurrentShapeCopied,
+                    missing_fields: Vec::new(),
+                    current_key: Some(current_key),
+                    current_operation_order: Some(record.operation_order),
+                    reason: "the legacy table row already carried the complete v2 contract; its exact fields were revalidated and copied"
+                        .to_owned(),
+                };
+                let encoded = encode(&migration)?;
+                let mut current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+                current
+                    .insert(migration_key.as_str(), encoded.as_str())
+                    .map_err(storage)?;
+                let mut legacy = write
+                    .open_table(GRANT_CLOSURE_LEGACY_CURRENT)
+                    .map_err(storage)?;
+                legacy.remove(legacy_key.as_str()).map_err(storage)?;
+                continue;
+            }
+
+            let legacy: LegacyGrantClosureRecord =
+                decode_legacy_grant_closure_record(&raw).map_err(|error| {
+                OrsError::MigrationRequired {
+                    reason: format!(
+                        "legacy grant-closure row {legacy_key} cannot be migrated losslessly: {error}"
+                    ),
+                }
+            })?;
+            if legacy.commit.operation_id.as_str() != operation_identity.as_str() {
+                return Err(OrsError::MigrationRequired {
+                    reason: format!(
+                        "legacy grant-closure row {legacy_key} carries operation identity {} instead of its key",
+                        legacy.commit.operation_id.as_str()
+                    ),
+                });
+            }
+            Self::ensure_grant_closure_order_floor(write, legacy.operation_order)?;
+            let missing_fields = Self::legacy_grant_closure_missing_fields(&legacy);
+            let (disposition, current_key, current_operation_order, reason) = if let Some(
+                existing,
+            ) =
+                existing_current
+            {
+                if !Self::current_grant_closure_matches_legacy(&existing, &legacy) {
+                    return Err(OrsError::MigrationRequired {
+                        reason: format!(
+                            "legacy grant-closure row {legacy_key} conflicts with the existing current v2 row"
+                        ),
+                    });
+                }
+                (
+                        GrantClosureMigrationDisposition::LegacyShapeSupersededByCurrent,
+                        Some(Self::grant_closure_current_key(operation_identity.as_str())),
+                        Some(existing.operation_order),
+                        "the retained v1 row is losslessly recorded beside an already matching current v2 row; absent v2 fields remain explicitly named"
+                            .to_owned(),
+                    )
+            } else {
+                (
+                    GrantClosureMigrationDisposition::LegacyShapeRetained,
+                    None,
+                    None,
+                    format!(
+                        "the v1 row is retained byte-for-byte in the v2 migration disposition; no current authority is inferred; exact absent v2 fields: {}",
+                        missing_fields.join(", ")
+                    ),
+                )
+            };
+            let migration = GrantClosureMigrationRecord {
+                schema: GRANT_CLOSURE_MIGRATION_SCHEMA.to_owned(),
+                version: GRANT_CLOSURE_MIGRATION_VERSION,
+                operation_id: operation_identity.as_str().to_owned(),
+                legacy_key: legacy_key.clone(),
+                target_grant_id: legacy.commit.target_id.as_str().to_owned(),
+                authority_root_ref: legacy.commit.authority_root.as_str().to_owned(),
+                grant_graph_revision: legacy.commit.revision,
+                legacy_phase: legacy.phase,
+                legacy_state: legacy.commit.state.as_str().to_owned(),
+                legacy_operation_order: legacy.operation_order,
+                source_row_sha256: source_sha256,
+                legacy_row_json: raw.clone(),
+                disposition,
+                missing_fields,
+                current_key,
+                current_operation_order,
+                reason,
+            };
+            let encoded = encode(&migration)?;
+            let mut current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+            current
+                .insert(migration_key.as_str(), encoded.as_str())
+                .map_err(storage)?;
+            let mut legacy = write
+                .open_table(GRANT_CLOSURE_LEGACY_CURRENT)
+                .map_err(storage)?;
+            legacy.remove(legacy_key.as_str()).map_err(storage)?;
+        }
+        let current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+        for entry in current.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let key_text = key.value();
+            if !key_text.starts_with(GRANT_CLOSURE_MIGRATION_KEY_PREFIX) {
+                continue;
+            }
+            let migration = Self::decode_grant_closure_migration(value.value())?;
+            Self::validate_grant_closure_migration_binding(
+                &migration,
+                key_text,
+                migration.operation_id.as_str(),
+            )?;
+            Self::ensure_grant_closure_order_floor(write, migration.legacy_operation_order)?;
+            if let Some(current_key) = migration.current_key.as_deref() {
+                let current_value =
+                    current.get(current_key).map_err(storage)?.ok_or_else(|| {
+                        OrsError::IntegrityProblem {
+                            record_type: "grant_closure_migration",
+                            reason: "migration disposition names a missing current row".to_owned(),
+                        }
+                    })?;
+                let current_record: DurableGrantClosureRecord =
+                    decode_named(current_value.value(), "grant_closure")?;
+                if current_record.commit.operation_id != migration.operation_id
+                    || Some(current_record.operation_order) != migration.current_operation_order
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "grant_closure_migration",
+                        reason: "migration disposition does not bind the exact current row"
+                            .to_owned(),
+                    });
+                }
+                match migration.disposition {
+                    GrantClosureMigrationDisposition::CurrentShapeCopied => {
+                        let source = decode_named::<DurableGrantClosureRecord>(
+                            &migration.legacy_row_json,
+                            "grant_closure",
+                        )?;
+                        if current_record != source {
+                            return Err(OrsError::IntegrityProblem {
+                                record_type: "grant_closure_migration",
+                                reason: "copied current row differs from retained source bytes"
+                                    .to_owned(),
+                            });
+                        }
+                    }
+                    GrantClosureMigrationDisposition::LegacyShapeSupersededByCurrent => {
+                        let source = decode_legacy_grant_closure_record(&migration.legacy_row_json)
+                            .map_err(|error| OrsError::IntegrityProblem {
+                                record_type: "grant_closure_migration",
+                                reason: error.to_string(),
+                            })?;
+                        if !Self::current_grant_closure_matches_legacy(&current_record, &source) {
+                            return Err(OrsError::IntegrityProblem {
+                                record_type: "grant_closure_migration",
+                                reason: "superseded current row differs from retained source shape"
+                                    .to_owned(),
+                            });
+                        }
+                    }
+                    GrantClosureMigrationDisposition::LegacyShapeRetained => {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "grant_closure_migration",
+                            reason: "retained legacy disposition unexpectedly names a current row"
+                                .to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn persist_operational_record(
@@ -5741,6 +7933,117 @@ impl RedbRecoveryStore {
                 decode_named::<DurableOperationalRecord>(value.value(), "operational_current")
             })
             .transpose()
+    }
+
+    fn grant_graph_revision_from_write(
+        write: &redb::WriteTransaction,
+        authority_root: &str,
+    ) -> Result<Option<DurableGrantGraphRevision>, OrsError> {
+        let key = format!("grant_graph_revision:{authority_root}");
+        let current = write
+            .open_table(GRANT_GRAPH_REVISION_CURRENT)
+            .map_err(storage)?;
+        let Some(value) = current.get(key.as_str()).map_err(storage)? else {
+            return Ok(None);
+        };
+        let row: DurableGrantGraphRevision = decode_named(value.value(), "grant_graph_revision")?;
+        if row.root.as_str() != authority_root {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_graph_revision",
+                reason: "current revision key or lineage root mismatch".to_owned(),
+            });
+        }
+        Ok(Some(row))
+    }
+
+    fn plan_closure_row(
+        write: &redb::WriteTransaction,
+        authority: &AuthorityBinding,
+        kind: OperationalKind,
+        input: &crate::OperationalRecordInput,
+    ) -> Result<ClosureRowPlan, OrsError> {
+        crate::model::validate_grant_closure_input(authority, input)?;
+        let key = Self::operational_key(kind, &input.subject_id);
+        let current =
+            Self::decode_operational_current(write, &key)?.ok_or(OrsError::InvalidTransition)?;
+        if current.kind != kind
+            || current.input.subject_id != input.subject_id
+            || current.generation_cutover.is_some()
+            || !input
+                .authority_epoch
+                .succeeds(&current.input.authority_epoch.current)
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_closure_member",
+                reason:
+                    "current operational row identity, kind, or epoch disagrees with the request"
+                        .to_owned(),
+            });
+        }
+        let mut expected_input = input.clone();
+        expected_input.record_id = current.input.record_id.clone();
+        let (record, transitioned) = match current.phase {
+            OperationalPhase::Active => {
+                if current.input.record_id == input.record_id || current.input != expected_input {
+                    return Err(OrsError::DuplicateConflict);
+                }
+                let mut next = current.clone();
+                next.input = input.clone();
+                next.phase = OperationalPhase::Fenced;
+                next.operation_order = 0;
+                next.terminal_receipt_id = None;
+                next.terminal_receipt_sha256 = None;
+                (next, true)
+            }
+            OperationalPhase::Fenced => {
+                if current.input != *input {
+                    return Err(OrsError::DuplicateConflict);
+                }
+                (current, false)
+            }
+            _ => return Err(OrsError::InvalidTransition),
+        };
+        Ok(ClosureRowPlan {
+            key,
+            record,
+            transitioned,
+        })
+    }
+
+    fn plan_grant_closure_member_rows(
+        write: &redb::WriteTransaction,
+        authority: &AuthorityBinding,
+        revocations: &[CapabilityGrantRevocation],
+    ) -> Result<Vec<ClosureRowPlan>, OrsError> {
+        revocations
+            .iter()
+            .map(|revocation| {
+                Self::plan_closure_row(
+                    write,
+                    authority,
+                    OperationalKind::CapabilityGrant,
+                    revocation.record(),
+                )
+            })
+            .collect()
+    }
+
+    fn plan_grant_closure_introduction_rows(
+        write: &redb::WriteTransaction,
+        authority: &AuthorityBinding,
+        fences: &[CapabilityIntroductionFence],
+    ) -> Result<Vec<ClosureRowPlan>, OrsError> {
+        fences
+            .iter()
+            .map(|fence| {
+                Self::plan_closure_row(
+                    write,
+                    authority,
+                    OperationalKind::CapabilityIntroduction,
+                    fence.record(),
+                )
+            })
+            .collect()
     }
 
     /// Persists one candidate transition before the cutover linearization
@@ -6356,6 +8659,322 @@ impl RedbRecoveryStore {
             &durable,
         )?))
     }
+    fn grant_closure_receipt_refs(
+        plans: &[ClosureRowPlan],
+    ) -> Result<Vec<GrantClosureOrsReceiptRef>, OrsError> {
+        plans
+            .iter()
+            .map(|plan| {
+                let receipt = Self::receipt_for(&plan.record)?;
+                Ok(GrantClosureOrsReceiptRef {
+                    record_id: receipt.record_id().as_str().to_owned(),
+                    subject_id: receipt.subject_id().as_str().to_owned(),
+                    operation_order: receipt.operation_order(),
+                    state: GrantClosureState::Revoked,
+                    state_sha256: receipt.state_sha256().to_owned(),
+                })
+            })
+            .collect()
+    }
+
+    fn grant_closure_commit_from_request(
+        request: &GrantClosureFenceRequest,
+        member_plans: &[ClosureRowPlan],
+        introduction_plans: &[ClosureRowPlan],
+    ) -> Result<GrantClosureCommit, OrsError> {
+        let commit = GrantClosureCommit {
+            schema: GRANT_CLOSURE_SCHEMA.to_owned(),
+            version: GRANT_CLOSURE_VERSION,
+            operation_id: request.operation_id.clone(),
+            idempotency_digest: request.idempotency_digest.clone(),
+            declaration: request.declaration.clone(),
+            authority: request.authority.clone(),
+            proof_ceiling: request.proof_ceiling,
+            authority_receipt: request.authority_receipt.clone(),
+            ors_member_receipts: Self::grant_closure_receipt_refs(member_plans)?,
+            fenced_introductions: request
+                .fenced_introductions
+                .iter()
+                .map(|identity| identity.as_str().to_owned())
+                .collect(),
+            ors_introduction_receipts: Self::grant_closure_receipt_refs(introduction_plans)?,
+            canonical_receipt: request.canonical_receipt.clone(),
+            state: GrantClosureState::Revoked,
+        };
+        crate::model::validate_grant_closure_contract(&commit)?;
+        Ok(commit)
+    }
+
+    fn grant_closure_fence_receipt(
+        commit: &GrantClosureCommit,
+        closure_record: &DurableGrantClosureRecord,
+        member_plans: &[ClosureRowPlan],
+        introduction_plans: &[ClosureRowPlan],
+    ) -> Result<GrantClosureFenceReceipt, OrsError> {
+        let closure_receipt =
+            GrantClosureCommitReceipt::from_receipt(Self::closure_receipt_for(closure_record)?);
+        let member_receipts = member_plans
+            .iter()
+            .map(|plan| {
+                Ok(AuthorityRevocationReceipt::from_receipt(Self::receipt_for(
+                    &plan.record,
+                )?))
+            })
+            .collect::<Result<Vec<_>, OrsError>>()?;
+        let introduction_receipts = introduction_plans
+            .iter()
+            .map(|plan| {
+                Ok(CapabilityIntroductionReceipt::from_receipt(
+                    Self::receipt_for(&plan.record)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, OrsError>>()?;
+        Ok(GrantClosureFenceReceipt::from_parts(
+            commit.clone(),
+            closure_receipt,
+            member_receipts,
+            introduction_receipts,
+        ))
+    }
+
+    /// Commits a complete owner-declared grant closure and all presented ORS
+    /// member fences in one `RedDB` write transaction.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the atomic transaction keeps revision, every member, and the closure receipt in one fail-closed sequence"
+    )]
+    pub fn commit_grant_closure_fence(
+        &self,
+        request: &GrantClosureFenceRequest,
+    ) -> Result<GrantClosureFenceReceipt, OrsError> {
+        request.validate()?;
+        let closure_key = format!("grant_closure:{}", request.operation_id);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing = {
+            let current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+            current
+                .get(closure_key.as_str())
+                .map_err(storage)?
+                .map(|value| {
+                    decode_named::<DurableGrantClosureRecord>(value.value(), "grant_closure")
+                })
+                .transpose()?
+        };
+        if existing.is_none()
+            && let Some(migration) =
+                Self::grant_closure_migration_from_write(&write, request.operation_id.as_str())?
+        {
+            return Err(Self::grant_closure_migration_refusal(&migration));
+        }
+        let watermark = Self::grant_graph_revision_from_write(
+            &write,
+            request.declaration.authority_root_ref.as_str(),
+        )?;
+        if existing.is_none() {
+            let Some(retained) = watermark.as_ref() else {
+                return Err(OrsError::MigrationRequired {
+                    reason:
+                        "grant-closure fencing requires a pre-existing owner graph revision head"
+                            .to_owned(),
+                });
+            };
+            if retained.revision != request.declaration.grant_graph_revision {
+                return Err(OrsError::InvalidField {
+                    field: "grant_closure_revision",
+                    reason: "durable grant-graph revision does not match the closure",
+                });
+            }
+        }
+
+        if let Some(existing) = existing {
+            if existing.phase != OperationalPhase::Fenced {
+                return Err(OrsError::DuplicateConflict);
+            }
+            if watermark.is_none() {
+                return Err(OrsError::MigrationRequired {
+                    reason: "committed grant closure has no durable graph-revision watermark"
+                        .to_owned(),
+                });
+            }
+            if watermark.as_ref().is_some_and(|retained| {
+                retained.revision != request.declaration.grant_graph_revision
+            }) {
+                return Err(OrsError::InvalidField {
+                    field: "grant_closure_revision",
+                    reason: "durable grant-graph revision does not match the closure",
+                });
+            }
+            let member_plans = Self::plan_grant_closure_member_rows(
+                &write,
+                &request.authority,
+                &request.grant_revocations,
+            )?;
+            let introduction_plans = Self::plan_grant_closure_introduction_rows(
+                &write,
+                &request.authority,
+                &request.introduction_fences,
+            )?;
+            if member_plans.iter().any(|plan| plan.transitioned)
+                || introduction_plans.iter().any(|plan| plan.transitioned)
+            {
+                return Err(OrsError::MigrationRequired {
+                    reason: "committed grant closure is missing one or more exact member fences"
+                        .to_owned(),
+                });
+            }
+            let commit = Self::grant_closure_commit_from_request(
+                request,
+                &member_plans,
+                &introduction_plans,
+            )?;
+            if commit != existing.commit {
+                return Err(OrsError::DuplicateConflict);
+            }
+            return Self::grant_closure_fence_receipt(
+                &commit,
+                &existing,
+                &member_plans,
+                &introduction_plans,
+            );
+        }
+
+        let mut member_plans = Self::plan_grant_closure_member_rows(
+            &write,
+            &request.authority,
+            &request.grant_revocations,
+        )?;
+        let mut introduction_plans = Self::plan_grant_closure_introduction_rows(
+            &write,
+            &request.authority,
+            &request.introduction_fences,
+        )?;
+        for plan in member_plans
+            .iter_mut()
+            .chain(introduction_plans.iter_mut())
+            .filter(|plan| plan.transitioned)
+        {
+            plan.record.operation_order = Self::next_operational_order(&write)?;
+        }
+        let commit =
+            Self::grant_closure_commit_from_request(request, &member_plans, &introduction_plans)?;
+        for plan in member_plans.iter().chain(introduction_plans.iter()) {
+            if plan.transitioned {
+                Self::persist_operational_record(&write, &plan.key, &plan.record)?;
+            }
+        }
+        let closure_record = DurableGrantClosureRecord {
+            commit,
+            phase: OperationalPhase::Fenced,
+            operation_order: Self::next_operational_order(&write)?,
+        };
+        let encoded = encode(&closure_record)?;
+        {
+            let mut current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+            current
+                .insert(closure_key.as_str(), encoded.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Self::grant_closure_fence_receipt(
+            &closure_record.commit,
+            &closure_record,
+            &member_plans,
+            &introduction_plans,
+        )
+    }
+
+    /// Records the canonical second-phase receipt link for one already
+    /// committed closure operation without rewriting its first-phase commit.
+    pub fn link_grant_closure_canonical_receipt(
+        &self,
+        operation_id: &OperationIdentity,
+        canonical_receipt: &ReceiptIdentity,
+    ) -> Result<GrantClosureProjection, OrsError> {
+        crate::model::validate_grant_closure_canonical_receipt(canonical_receipt)?;
+        let operation_text = operation_id.as_str();
+        let closure_key = Self::grant_closure_current_key(operation_text);
+        let second_phase_key = Self::grant_closure_second_phase_key(operation_text);
+        let write = self.database.begin_write().map_err(storage)?;
+        let closure = {
+            let current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+            let Some(value) = current.get(closure_key.as_str()).map_err(storage)? else {
+                drop(current);
+                if let Some(migration) =
+                    Self::grant_closure_migration_from_write(&write, operation_text)?
+                {
+                    return Err(Self::grant_closure_migration_refusal(&migration));
+                }
+                return Err(OrsError::ReservationNotFound);
+            };
+            let record: DurableGrantClosureRecord = decode_named(value.value(), "grant_closure")?;
+            if record.commit.operation_id.as_str() != operation_text {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "grant_closure",
+                    reason: "current grant-closure key or operation identity mismatch".to_owned(),
+                });
+            }
+            record
+        };
+        if !Self::grant_closure_phase_is_committed(closure.phase) {
+            return Err(OrsError::InvalidTransition);
+        }
+        if let Some(first_phase) = &closure.commit.canonical_receipt
+            && first_phase != canonical_receipt
+        {
+            return Err(OrsError::DuplicateConflict);
+        }
+        let existing_second_phase = {
+            let table = write
+                .open_table(GRANT_CLOSURE_SECOND_PHASE_CURRENT)
+                .map_err(storage)?;
+            table
+                .get(second_phase_key.as_str())
+                .map_err(storage)?
+                .map(|value| Self::decode_grant_closure_second_phase(value.value()))
+                .transpose()?
+        };
+        if let Some(existing_second_phase) = existing_second_phase {
+            Self::validate_grant_closure_second_phase_against_row(
+                &existing_second_phase,
+                second_phase_key.as_str(),
+                &closure,
+            )?;
+            if existing_second_phase.canonical_receipt != *canonical_receipt {
+                return Err(OrsError::DuplicateConflict);
+            }
+            return Self::grant_closure_projection_from_record(
+                closure,
+                Some(existing_second_phase.canonical_receipt),
+            );
+        }
+        Self::ensure_grant_closure_order_floor(&write, closure.operation_order)?;
+        let second_phase = DurableGrantClosureSecondPhaseRecord {
+            schema: GRANT_CLOSURE_SECOND_PHASE_SCHEMA.to_owned(),
+            version: GRANT_CLOSURE_SECOND_PHASE_VERSION,
+            operation_id: operation_text.to_owned(),
+            operation_order: Self::next_operational_order(&write)?,
+            canonical_receipt: canonical_receipt.clone(),
+        };
+        second_phase.validate()?;
+        let encoded = encode(&second_phase)?;
+        {
+            let mut table = write
+                .open_table(GRANT_CLOSURE_SECOND_PHASE_CURRENT)
+                .map_err(storage)?;
+            if table
+                .get(second_phase_key.as_str())
+                .map_err(storage)?
+                .is_some()
+            {
+                return Err(OrsError::DuplicateConflict);
+            }
+            table
+                .insert(second_phase_key.as_str(), encoded.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Self::grant_closure_projection_from_record(closure, Some(canonical_receipt.clone()))
+    }
 }
 
 impl OperationalRecoveryStore for RedbRecoveryStore {
@@ -6826,9 +9445,12 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         &self,
         closure: GrantClosureCommit,
     ) -> Result<GrantClosureCommitReceipt, OrsError> {
-        closure.validate()?;
-        let phase = closure.state.phase();
-        let key = format!("grant_closure:{}", closure.operation_id.as_str());
+        crate::model::validate_grant_closure_contract(&closure)?;
+        if closure.state != GrantClosureState::Active {
+            return Err(OrsError::InvalidTransition);
+        }
+        let phase = crate::model::grant_closure_phase(closure.state);
+        let key = format!("grant_closure:{}", closure.operation_id);
         let write = self.database.begin_write().map_err(storage)?;
         let existing = {
             let current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
@@ -6840,8 +9462,14 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 })
                 .transpose()?
         };
+        if existing.is_none()
+            && let Some(migration) =
+                Self::grant_closure_migration_from_write(&write, closure.operation_id.as_str())?
+        {
+            return Err(Self::grant_closure_migration_refusal(&migration));
+        }
         if let Some(existing) = existing {
-            if existing.commit.operation_id.as_str() != closure.operation_id.as_str() {
+            if existing.commit.operation_id != closure.operation_id {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "grant_closure",
                     reason: "current grant-closure key or operation identity mismatch".to_owned(),
@@ -6873,6 +9501,25 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         ))
     }
 
+    fn commit_grant_closure_fence(
+        &self,
+        request: GrantClosureFenceRequest,
+    ) -> Result<GrantClosureFenceReceipt, OrsError> {
+        RedbRecoveryStore::commit_grant_closure_fence(self, &request)
+    }
+
+    fn link_grant_closure_canonical_receipt(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        canonical_receipt: &ReceiptIdentity,
+    ) -> Result<GrantClosureProjection, OrsError> {
+        RedbRecoveryStore::link_grant_closure_canonical_receipt(
+            self,
+            operation_id,
+            canonical_receipt,
+        )
+    }
+
     fn load_grant_closure(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -6880,23 +9527,35 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         let key = format!("grant_closure:{}", operation_id.as_str());
         let read = self.database.begin_read().map_err(storage)?;
         let current = read.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
-        let Some(value) = current.get(key.as_str()).map_err(storage)? else {
+        if let Some(value) = current.get(key.as_str()).map_err(storage)? {
+            let record: DurableGrantClosureRecord = decode_named(value.value(), "grant_closure")?;
+            if record.commit.operation_id != operation_id.as_str() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "grant_closure",
+                    reason: "current grant-closure key or operation identity mismatch".to_owned(),
+                });
+            }
+            return Ok(Some(Self::grant_closure_projection_from_read(
+                &read, record,
+            )?));
+        }
+        let migration_key = Self::grant_closure_migration_key(operation_id.as_str());
+        let Some(value) = current.get(migration_key.as_str()).map_err(storage)? else {
             return Ok(None);
         };
-        let record: DurableGrantClosureRecord = decode_named(value.value(), "grant_closure")?;
-        if record.commit.operation_id.as_str() != operation_id.as_str() {
+        let migration = Self::decode_grant_closure_migration(value.value())?;
+        Self::validate_grant_closure_migration_binding(
+            &migration,
+            migration_key.as_str(),
+            operation_id.as_str(),
+        )?;
+        if migration.current_key.is_some() {
             return Err(OrsError::IntegrityProblem {
-                record_type: "grant_closure",
-                reason: "current grant-closure key or operation identity mismatch".to_owned(),
+                record_type: "grant_closure_migration",
+                reason: "migration disposition names a current row that is absent".to_owned(),
             });
         }
-        let receipt = Self::closure_receipt_for(&record)?;
-        Ok(Some(GrantClosureProjection::from_store(
-            record.commit,
-            record.phase,
-            record.operation_order,
-            GrantClosureCommitReceipt::from_receipt(receipt),
-        )))
+        Err(Self::grant_closure_migration_refusal(&migration))
     }
 
     fn scan_grant_closures_for_lineage(
@@ -6915,10 +9574,35 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         // selected set refuses before receipt/projection work.
         let read = self.database.begin_read().map_err(storage)?;
         let current = read.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+        let second_phases = Self::grant_closure_second_phases_in(&read)?;
         let mut rows: Vec<(u64, DurableGrantClosureRecord)> = Vec::new();
         let mut resolved_root: Option<String> = None;
         for row in current.iter().map_err(storage)? {
             let (key, value) = row.map_err(storage)?;
+            let key_text = key.value();
+            if key_text.starts_with(GRANT_CLOSURE_MIGRATION_KEY_PREFIX) {
+                let migration = Self::decode_grant_closure_migration(value.value())?;
+                Self::validate_grant_closure_migration_binding(
+                    &migration,
+                    key_text,
+                    migration.operation_id.as_str(),
+                )?;
+                if let Some(current_key) = migration.current_key.as_deref()
+                    && current.get(current_key).map_err(storage)?.is_none()
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "grant_closure_migration",
+                        reason: "migration disposition names a missing current row".to_owned(),
+                    });
+                }
+                if migration.disposition == GrantClosureMigrationDisposition::LegacyShapeRetained
+                    && (migration.authority_root_ref == lineage.as_str()
+                        || migration.target_grant_id == lineage.as_str())
+                {
+                    return Err(Self::grant_closure_migration_refusal(&migration));
+                }
+                continue;
+            }
             let record: DurableGrantClosureRecord = decode_named(value.value(), "grant_closure")?;
             let expected = format!("grant_closure:{}", record.commit.operation_id.as_str());
             if key.value() != expected.as_str() {
@@ -6929,13 +9613,13 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 });
             }
             let commit = &record.commit;
-            if commit.authority_root.as_str() != lineage.as_str()
-                && commit.target_id.as_str() != lineage.as_str()
+            if commit.declaration.authority_root_ref.as_str() != lineage.as_str()
+                && commit.declaration.target_grant_id.as_str() != lineage.as_str()
             {
                 continue;
             }
             match resolved_root.as_deref() {
-                Some(known) if known != commit.authority_root.as_str() => {
+                Some(known) if known != commit.declaration.authority_root_ref.as_str() => {
                     return Err(OrsError::IntegrityProblem {
                         record_type: "grant_closure",
                         reason: "one lineage selector resolves to more than one lineage root"
@@ -6943,7 +9627,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                     });
                 }
                 Some(_) => {}
-                None => resolved_root = Some(commit.authority_root.as_str().to_owned()),
+                None => resolved_root = Some(commit.declaration.authority_root_ref.clone()),
             }
             rows.push((record.operation_order, record));
             if rows.len() > usize::from(limit) {
@@ -6961,13 +9645,21 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         let watermark = Self::grant_graph_revision_in(&read, watermark_root)?;
         let mut projections = Vec::with_capacity(rows.len());
         for (_, record) in rows {
-            let receipt = Self::closure_receipt_for(&record)?;
-            projections.push(GrantClosureProjection::from_store(
-                record.commit,
-                record.phase,
-                record.operation_order,
-                GrantClosureCommitReceipt::from_receipt(receipt),
-            ));
+            let second_phase = second_phases.get(record.commit.operation_id.as_str());
+            if let Some(second_phase) = second_phase {
+                Self::validate_grant_closure_second_phase_against_row(
+                    second_phase,
+                    Self::grant_closure_second_phase_key(record.commit.operation_id.as_str())
+                        .as_str(),
+                    &record,
+                )?;
+            }
+            let second_phase_identity =
+                Self::grant_closure_second_phase_identity(&record, second_phase)?;
+            projections.push(Self::grant_closure_projection_from_record(
+                record,
+                second_phase_identity,
+            )?);
         }
         Ok((projections, watermark))
     }
@@ -7026,6 +9718,76 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             write.commit().map_err(storage)?;
         }
         Ok(stored)
+    }
+
+    fn note_grant_graph_revisions(&self, revisions: &[(OpaqueLabel, u64)]) -> Result<(), OrsError> {
+        if revisions.is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "grant_graph_revisions",
+                reason: "at least one lineage revision is required",
+            });
+        }
+        let batch_revision = revisions[0].1;
+        if revisions
+            .iter()
+            .any(|(_, revision)| *revision != batch_revision)
+        {
+            return Err(OrsError::InvalidField {
+                field: "grant_graph_revisions",
+                reason: "all lineage roots in one owner batch must share the revision",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut roots = BTreeSet::new();
+        let mut pending = Vec::with_capacity(revisions.len());
+        for (root, revision) in revisions {
+            if *revision == 0 {
+                return Err(OrsError::InvalidField {
+                    field: "grant_graph_revision",
+                    reason: "must be greater than zero",
+                });
+            }
+            if !roots.insert(root.as_str().to_owned()) {
+                return Err(OrsError::InvalidField {
+                    field: "grant_graph_revisions",
+                    reason: "lineage roots must be unique",
+                });
+            }
+            let retained = Self::grant_graph_revision_from_write(&write, root.as_str())?;
+            if retained
+                .as_ref()
+                .is_some_and(|current| current.revision > *revision)
+            {
+                return Err(OrsError::InvalidField {
+                    field: "grant_graph_revision",
+                    reason: "a stale lineage revision cannot advance the owner batch",
+                });
+            }
+            if retained
+                .as_ref()
+                .is_none_or(|current| current.revision != *revision)
+            {
+                pending.push((root.clone(), *revision));
+            }
+        }
+        if !pending.is_empty() {
+            let mut current = write
+                .open_table(GRANT_GRAPH_REVISION_CURRENT)
+                .map_err(storage)?;
+            for (root, revision) in pending {
+                let row = DurableGrantGraphRevision {
+                    root,
+                    revision,
+                    operation_order: Self::next_operational_order(&write)?,
+                };
+                let key = format!("grant_graph_revision:{}", row.root.as_str());
+                let encoded = encode(&row)?;
+                current
+                    .insert(key.as_str(), encoded.as_str())
+                    .map_err(storage)?;
+            }
+        }
+        write.commit().map_err(storage)
     }
 
     fn load_grant_graph_revision(
@@ -8050,11 +10812,67 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         RedbRecoveryStore::load_host_request(self, operation_id, request_digest)
     }
 
-    fn retain_activation_result(
+    fn stage_activation_ticket(
+        &self,
+        record: &ActivationLifecycleRecord,
+        now_unix_ms: u64,
+    ) -> Result<ActivationLifecycleRecord, OrsError> {
+        RedbRecoveryStore::stage_activation_ticket(self, record, now_unix_ms)
+    }
+
+    fn claim_activation_ticket(
+        &self,
+        ticket_id: &str,
+        claim_owner: &str,
+        now_unix_ms: u64,
+        claim_expires_at_unix_ms: u64,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        RedbRecoveryStore::claim_activation_ticket(
+            self,
+            ticket_id,
+            claim_owner,
+            now_unix_ms,
+            claim_expires_at_unix_ms,
+        )
+    }
+
+    fn commit_activation_result(
         &self,
         record: &ActivationResultRetentionRecord,
+        claim_owner: &str,
+        dependency_observation: Option<(&str, &str)>,
+        now_unix_ms: u64,
     ) -> Result<ActivationResultRetentionRecord, OrsError> {
-        RedbRecoveryStore::retain_activation_result(self, record)
+        RedbRecoveryStore::commit_activation_result(
+            self,
+            record,
+            claim_owner,
+            dependency_observation,
+            now_unix_ms,
+        )
+    }
+
+    fn terminate_activation_without_result(
+        &self,
+        ticket_id: &str,
+        target: ActivationLifecycleState,
+        reason: &str,
+        now_unix_ms: u64,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        RedbRecoveryStore::terminate_activation_without_result(
+            self,
+            ticket_id,
+            target,
+            reason,
+            now_unix_ms,
+        )
+    }
+
+    fn load_activation_lifecycle(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        RedbRecoveryStore::load_activation_lifecycle(self, ticket_id)
     }
 
     fn load_activation_result(
@@ -8063,6 +10881,10 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         result_sha256: &str,
     ) -> Result<Option<ActivationResultRetentionRecord>, OrsError> {
         RedbRecoveryStore::load_activation_result(self, ticket_id, result_sha256)
+    }
+
+    fn load_activation_recovery_snapshot(&self) -> Result<ActivationRecoverySnapshot, OrsError> {
+        RedbRecoveryStore::load_activation_recovery_snapshot(self)
     }
 
     fn prune_activation_results(&self) -> Result<u64, OrsError> {
@@ -8413,12 +11235,65 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         self.store.load_host_request(operation_id, request_digest)
     }
 
-    /// Retains one opaque Kernel activation result before acknowledgement.
-    pub fn retain_activation_result(
+    /// Durably stages one pending activation ticket before publication.
+    pub fn stage_activation_ticket(
+        &self,
+        record: &ActivationLifecycleRecord,
+        now_unix_ms: u64,
+    ) -> Result<ActivationLifecycleRecord, OrsError> {
+        self.store.stage_activation_ticket(record, now_unix_ms)
+    }
+
+    /// Claims one pending activation ticket for the authenticated daemon.
+    pub fn claim_activation_ticket(
+        &self,
+        ticket_id: &str,
+        claim_owner: &str,
+        now_unix_ms: u64,
+        claim_expires_at_unix_ms: u64,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        self.store.claim_activation_ticket(
+            ticket_id,
+            claim_owner,
+            now_unix_ms,
+            claim_expires_at_unix_ms,
+        )
+    }
+
+    /// Atomically commits one result with its lifecycle CAS.
+    pub fn commit_activation_result(
         &self,
         record: &ActivationResultRetentionRecord,
+        claim_owner: &str,
+        dependency_observation: Option<(&str, &str)>,
+        now_unix_ms: u64,
     ) -> Result<ActivationResultRetentionRecord, OrsError> {
-        self.store.retain_activation_result(record)
+        self.store.commit_activation_result(
+            record,
+            claim_owner,
+            dependency_observation,
+            now_unix_ms,
+        )
+    }
+
+    /// Terminalizes one result-less activation ticket.
+    pub fn terminate_activation_without_result(
+        &self,
+        ticket_id: &str,
+        target: ActivationLifecycleState,
+        reason: &str,
+        now_unix_ms: u64,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        self.store
+            .terminate_activation_without_result(ticket_id, target, reason, now_unix_ms)
+    }
+
+    /// Loads one activation lifecycle row.
+    pub fn load_activation_lifecycle(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        self.store.load_activation_lifecycle(ticket_id)
     }
 
     /// Loads one retained activation result by exact ticket and result identity.
@@ -8430,7 +11305,14 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         self.store.load_activation_result(ticket_id, result_sha256)
     }
 
-    /// Prunes oldest activation results under the hard retention bounds.
+    /// Loads coherent activation lifecycle and result recovery state.
+    pub fn load_activation_recovery_snapshot(
+        &self,
+    ) -> Result<ActivationRecoverySnapshot, OrsError> {
+        self.store.load_activation_recovery_snapshot()
+    }
+
+    /// Prunes oldest unreferenced activation results under hard bounds.
     pub fn prune_activation_results(&self) -> Result<u64, OrsError> {
         self.store.prune_activation_results()
     }

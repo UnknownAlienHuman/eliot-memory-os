@@ -1017,8 +1017,10 @@ pub fn assemble_experience_for_consumer(
 /// because a commit advanced a revision head or the fence moved) means
 /// restart that family's enumeration from the headless first page —
 /// never skip ahead, never replay rows into a duplicate, never treat a
-/// rejected cursor as truncation. `None` on both families ends the read;
-/// anything else is a partial read, never a complete one.
+/// rejected cursor as truncation. Each family records its own progress in
+/// [`ConsumerFamilyState`], and a family is complete only when the owner
+/// issued no next cursor for it; any family short of that, including one
+/// restarted from the head, is a partial read, never a complete one.
 pub struct PagedExperienceConsumerBundle {
     /// Assembled bank envelope for this page.
     pub bank: BankProjection,
@@ -1081,6 +1083,49 @@ pub fn assemble_experience_for_consumer_paged(
     })
 }
 
+/// Explicit per-family progress of one paged consumer read.
+///
+/// Each source family carries its own state, so bank and feedback
+/// progress are never conflated by a shared cursor pair or a shared page
+/// counter. This is the local form of the I5.20 stable-scope rule ("if
+/// every dependency revision matches, publish; / else retry once or
+/// return stale/churn directive"): a family advances only on the cursor
+/// the owner issued for that same read, and a restart is the bounded
+/// retry, never a completion claim.
+///
+/// Variant contract:
+///
+/// - [`ConsumerFamilyState::Complete`]: an owner-observed fact, never an
+///   inference. It is recorded only from a page whose owner-issued next
+///   cursor for this family was `None`; no counter, elapsed iteration or
+///   sibling family's state can produce it.
+/// - [`ConsumerFamilyState::NeedsFirstPage`]: no page of this family has
+///   been assembled since that family's last restart, so the next
+///   selector is the headless first page.
+/// - [`ConsumerFamilyState::Continuing`]: carries the owner-issued cursor
+///   that produced this family's most recent page, and is the only state
+///   that supplies a next-read selector.
+///
+/// No `Default` is derived: the headless start state is `NeedsFirstPage`
+/// per family, which is a decision about an unfinished read rather than a
+/// neutral value, so a defaulted state would let a family that has never
+/// started read as already decided.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConsumerFamilyState {
+    /// No page of this family has been assembled since that family's last
+    /// restart; the next read selects the headless first page.
+    NeedsFirstPage,
+    /// The owner-issued cursor that produced this family's most recent
+    /// page; supplying it selects this family's next page.
+    Continuing(String),
+    /// The owner returned no next cursor for this family, so this
+    /// family's enumeration is complete. An owner-observed fact recorded
+    /// only from a page whose owner-issued next cursor for this family
+    /// was `None`, never an inference from a counter, an elapsed
+    /// iteration or a sibling family's state.
+    Complete,
+}
+
 /// Echo-next-cursor driver for the multi-page consumer read.
 ///
 /// Production loop driver over [`assemble_experience_for_consumer_paged`]:
@@ -1091,8 +1136,11 @@ pub fn assemble_experience_for_consumer_paged(
 /// read to [`ConsumerPagedReadDriver::assemble_next_page`], which runs the
 /// same per-family supply join plus consumer-edge re-resolution and stores
 /// the echoed cursors as the next iteration's selectors. The loop ends when
-/// [`ConsumerPagedReadDriver::is_complete`] reports `None` on both
-/// families; anything else is a partial read, never a complete one.
+/// the owner returned no next cursor for both families, which
+/// [`ConsumerPagedReadDriver::is_complete`] reports; anything else is a
+/// partial read, never a complete one. Per-family progress is carried by
+/// [`ConsumerFamilyState`], so a restart marks only the restarted family
+/// incomplete and never completes or rewinds the other family.
 ///
 /// Boundary: this lane never performs the store read and never parses or
 /// mints cursors. Snapshots stay caller-supplied inputs on every iteration;
@@ -1105,68 +1153,91 @@ pub fn assemble_experience_for_consumer_paged(
 /// [`ConsumerPagedReadDriver::restart_feedback_from_head`] — never skip
 /// ahead, never replay rows into a duplicate, never treat a rejected
 /// cursor as truncation. Families paginate independently: restarting one
-/// never touches the other's cursor.
+/// never touches the other's progress, and never completes it.
 pub struct ConsumerPagedReadDriver {
-    /// Opaque owner cursor to supply as the next bank read's selector
-    /// (`None` selects the headless first page, or — once pages have been
-    /// assembled — ends that family's enumeration).
-    bank_cursor: Option<String>,
-    /// Opaque owner cursor to supply as the next feedback read's selector.
-    feedback_cursor: Option<String>,
-    /// Pages successfully assembled; keeps the headless `None`/`None`
-    /// start state from reading as complete before the first page.
-    pages_assembled: u64,
+    /// Bank family's own progress; the only mutable state the driver
+    /// owns for bank enumeration.
+    bank: ConsumerFamilyState,
+    /// Feedback family's own progress, paginated independently of `bank`.
+    feedback: ConsumerFamilyState,
 }
 
 impl ConsumerPagedReadDriver {
     /// Start a headless read: both families enumerate from their first
-    /// page with `None` as the cursor selector.
+    /// page, each family explicitly incomplete.
     pub fn headless() -> Self {
         Self {
-            bank_cursor: None,
-            feedback_cursor: None,
-            pages_assembled: 0,
+            bank: ConsumerFamilyState::NeedsFirstPage,
+            feedback: ConsumerFamilyState::NeedsFirstPage,
         }
     }
 
-    /// Opaque bank cursor for the next owner-store read.
+    /// Opaque bank cursor for the next owner-store read: a selector
+    /// exactly when bank is [`ConsumerFamilyState::Continuing`].
+    ///
+    /// `None` covers both remaining states and is therefore not a
+    /// completion signal: it selects bank's headless first page when bank
+    /// is `NeedsFirstPage`, and is never a valid next selector once bank
+    /// is `Complete`. Termination is
+    /// [`ConsumerPagedReadDriver::is_complete`], never this `None`.
     pub fn bank_cursor(&self) -> Option<&str> {
-        self.bank_cursor.as_deref()
+        match &self.bank {
+            ConsumerFamilyState::Continuing(cursor) => Some(cursor.as_str()),
+            ConsumerFamilyState::NeedsFirstPage | ConsumerFamilyState::Complete => None,
+        }
     }
 
     /// Opaque feedback cursor for the next owner-store read. Same
-    /// headless/end rule as [`ConsumerPagedReadDriver::bank_cursor`].
+    /// continuation-only rule as [`ConsumerPagedReadDriver::bank_cursor`].
     pub fn feedback_cursor(&self) -> Option<&str> {
-        self.feedback_cursor.as_deref()
+        match &self.feedback {
+            ConsumerFamilyState::Continuing(cursor) => Some(cursor.as_str()),
+            ConsumerFamilyState::NeedsFirstPage | ConsumerFamilyState::Complete => None,
+        }
     }
 
-    /// `true` once at least one page is assembled and both family cursors
-    /// are `None`: `None` on both ends the read.
+    /// `true` only when both families are [`ConsumerFamilyState::Complete`],
+    /// that is when the owner returned no next cursor for both families.
+    ///
+    /// Two `None` selectors are not completion: a family restarted from
+    /// the head is `NeedsFirstPage` while its sibling may already be
+    /// `Complete`, and that read is still unfinished.
     pub fn is_complete(&self) -> bool {
-        self.pages_assembled > 0 && self.bank_cursor.is_none() && self.feedback_cursor.is_none()
+        self.bank == ConsumerFamilyState::Complete && self.feedback == ConsumerFamilyState::Complete
     }
 
     /// Restart bank enumeration from the headless first page after the
     /// owner store rejects the echoed bank cursor (fence/heads mismatch).
+    ///
+    /// Bank becomes explicitly incomplete again, never `Complete`: a
+    /// restart is the bounded retry of the I5.20 stable-scope rule ("else
+    /// retry once or return stale/churn directive"), so it must not read
+    /// as a completion claim even when the other family has finished.
     /// Feedback enumeration is untouched: families paginate independently.
     pub fn restart_bank_from_head(&mut self) {
-        self.bank_cursor = None;
+        self.bank = ConsumerFamilyState::NeedsFirstPage;
     }
 
     /// Restart feedback enumeration from the headless first page. Same
     /// independence rule as
-    /// [`ConsumerPagedReadDriver::restart_bank_from_head`].
+    /// [`ConsumerPagedReadDriver::restart_bank_from_head`]: feedback
+    /// becomes explicitly incomplete again, never `Complete`, and bank
+    /// enumeration is untouched.
     pub fn restart_feedback_from_head(&mut self) {
-        self.feedback_cursor = None;
+        self.feedback = ConsumerFamilyState::NeedsFirstPage;
     }
 
     /// Assemble the next consumer page from fresh caller-supplied
     /// snapshots and the owner-issued next cursors of this read, then
-    /// store those cursors as the next iteration's selectors.
+    /// record each family's owner-observed progress as the next
+    /// iteration's selector.
     ///
-    /// Fail-closed once the read has ended (`None` on both families after
-    /// pages were assembled): re-calling would replay the last page into
-    /// a duplicate, so it errors instead of assembling.
+    /// One call advances both families, so it fails closed only when the
+    /// read has already ended ([`ConsumerPagedReadDriver::is_complete`]):
+    /// a family that is already `Complete` while its sibling still has a
+    /// page left is a normal restartable state, not an ended read, and
+    /// re-calling past the end would replay the last page into a
+    /// duplicate, so that errors instead of assembling.
     #[allow(clippy::too_many_arguments)]
     pub fn assemble_next_page(
         &mut self,
@@ -1184,7 +1255,7 @@ impl ConsumerPagedReadDriver {
         if self.is_complete() {
             return Err(GovernorObservationError::InvalidField {
                 field: "consumer_page.read",
-                reason: "paged consumer read already ended; None on both families ends the read, never replay the last page",
+                reason: "paged consumer read already ended; the owner returned no next cursor for both families, never replay the last page",
             });
         }
         let page = assemble_experience_for_consumer_paged(
@@ -1199,10 +1270,23 @@ impl ConsumerPagedReadDriver {
             bank_next_cursor,
             feedback_next_cursor,
         )?;
-        self.bank_cursor.clone_from(&page.bank_next_cursor);
-        self.feedback_cursor.clone_from(&page.feedback_next_cursor);
-        self.pages_assembled = self.pages_assembled.saturating_add(1);
+        self.bank = family_state_after_page(page.bank_next_cursor.as_deref());
+        self.feedback = family_state_after_page(page.feedback_next_cursor.as_deref());
         Ok(page)
+    }
+}
+
+/// Map one family after an assembled page: the owner's next cursor is
+/// the only evidence of that family's progress.
+///
+/// `None` is the owner reporting no next cursor, which is the sole way a
+/// family becomes [`ConsumerFamilyState::Complete`]; any other cursor
+/// means the family continues from exactly the cursor that produced this
+/// page.
+fn family_state_after_page(next_cursor: Option<&str>) -> ConsumerFamilyState {
+    match next_cursor {
+        Some(cursor) => ConsumerFamilyState::Continuing(cursor.to_owned()),
+        None => ConsumerFamilyState::Complete,
     }
 }
 

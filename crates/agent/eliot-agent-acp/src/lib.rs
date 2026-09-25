@@ -1077,6 +1077,12 @@ pub const ACP_NORMALIZER_IDENTITY: &str = "eliot-agent-acp";
 /// the quarantined projection, so the loss manifest names the real omission
 /// instead of an empty claim.
 pub const ACP_UNDECODABLE_SOURCE_ENTRY: &str = "acp.source_message";
+/// Omitted-manifest entry naming the decoded message body withheld behind
+/// the restricted source handle. Every decodable normalization seals a typed
+/// summary projection, never the message itself, so the canonical body is
+/// always partially omitted; the normalizer declares it instead of trusting
+/// a caller-supplied empty manifest.
+pub const ACP_MESSAGE_BODY_ENTRY: &str = "acp.message_body";
 
 /// Builds an algorithm-qualified source digest from a hex digest string.
 fn qualified_digest(
@@ -1186,27 +1192,63 @@ fn validate_acp_event_input(input: &AcpHostEventInput<'_>) -> Result<(), AcpAdap
     Ok(())
 }
 
+/// Effective normalization source resolved by [`bind_normalization_source`]:
+/// the sealed payload, its coverage, the discovered loss manifest, the
+/// qualified source digest, and — for decodable bytes — the single decoded
+/// source message the receipt names.
+struct BoundNormalizationSource {
+    /// Typed payload to seal (caller-supplied, or typed quarantine).
+    payload: NormalizedHostEventPayload,
+    /// Effective coverage after loss discovery.
+    coverage: NormalizationCoverage,
+    /// Effective loss manifest after loss discovery.
+    omitted_fields: Vec<String>,
+    /// Qualified digest bound by the receipt.
+    input_digest: eliot_agent_api::QualifiedSourceDigest,
+    /// Decoded source message behind `raw_source_bytes`, when decodable.
+    decoded_message: Option<AcpJsonRpcMessage>,
+}
+
+/// Maps a sealed payload to its unsupported-field/version disposition: decode
+/// failure and deferred unsupported version are distinct from an
+/// unsupported-method quarantine, and typed observations carry none.
+fn unsupported_disposition_for(payload: &NormalizedHostEventPayload) -> UnsupportedDisposition {
+    match payload {
+        NormalizedHostEventPayload::UnsupportedQuarantined(observation)
+            if observation.reason == UnsupportedEventReason::SourceDecodeFailure =>
+        {
+            UnsupportedDisposition::SourceDecodeFailure
+        }
+        NormalizedHostEventPayload::UnsupportedQuarantined(observation)
+            if observation.reason == UnsupportedEventReason::UnsupportedVersion =>
+        {
+            UnsupportedDisposition::UnsupportedVersionDeferred
+        }
+        NormalizedHostEventPayload::UnsupportedQuarantined(_) => {
+            UnsupportedDisposition::UnsupportedMethodQuarantined
+        }
+        _ => UnsupportedDisposition::None,
+    }
+}
 /// Resolves the effective normalization source for [`normalize_acp_event`]:
 /// payload, coverage, loss manifest, and qualified digest bound to the single
 /// decoded source message behind `raw_source_bytes`.
 ///
 /// Decodable bytes bind the canonical JSON of the decoded message, so the
-/// receipt names the message the bytes actually carry. Deterministic redacted
-/// projections bind their exact bytes under the raw-bytes qualifier. Bytes
-/// that decode as neither never mint the supplied payload: they fall into
-/// typed quarantine ([`UnsupportedEventReason::SourceDecodeFailure`]) with
-/// lossy coverage and the actual omission named in the manifest.
+/// receipt names the message the bytes actually carry. The decoded message is
+/// also compared with the independently supplied typed payload: the canonical
+/// body is returned for the source-agreement checks, and the withheld body is
+/// merged into the loss manifest (with lossy coverage) instead of trusting a
+/// caller-supplied empty claim. Deterministic redacted projections bind their
+/// exact bytes under the raw-bytes qualifier. Bytes that decode as neither
+/// never mint the supplied payload: JSON with an unsupported `jsonrpc`
+/// version falls into typed quarantine with
+/// [`UnsupportedDisposition::UnsupportedVersionDeferred`]; anything else
+/// falls into typed quarantine ([`UnsupportedEventReason::SourceDecodeFailure`])
+/// with lossy coverage and the actual omission named in the manifest.
 fn bind_normalization_source(
     input: &AcpHostEventInput<'_>,
-) -> Result<
-    (
-        NormalizedHostEventPayload,
-        NormalizationCoverage,
-        Vec<String>,
-        eliot_agent_api::QualifiedSourceDigest,
-    ),
-    AcpAdapterError,
-> {
+) -> Result<BoundNormalizationSource, AcpAdapterError> {
     let redacted_projection = input
         .raw_source_bytes
         .starts_with(REDACTED_PROJECTION_MARKER.as_bytes());
@@ -1214,29 +1256,63 @@ fn bind_normalization_source(
         return Err(AcpAdapterError::InvalidInput("privacy_class/projection"));
     }
     if redacted_projection {
-        return Ok((
-            input.payload.clone(),
-            input.coverage,
-            input.omitted_source_fields.clone(),
-            qualified_digest(
+        return Ok(BoundNormalizationSource {
+            payload: input.payload.clone(),
+            coverage: input.coverage,
+            omitted_fields: input.omitted_source_fields.clone(),
+            input_digest: qualified_digest(
                 eliot_contracts::sha256_hex(input.raw_source_bytes),
                 eliot_agent_api::host_event::HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM,
             )?,
-        ));
+            decoded_message: None,
+        });
     }
     if let Ok(message) = decode_source_message(input.raw_source_bytes) {
         let canonical = eliot_contracts::canonical_json_bytes(&message).map_err(|_| {
             AcpAdapterError::ContractValidation(eliot_agent_api::ContractError::DigestMismatch)
         })?;
-        return Ok((
-            input.payload.clone(),
-            input.coverage,
-            input.omitted_source_fields.clone(),
-            qualified_digest(
+        let mut omitted = input.omitted_source_fields.clone();
+        if !omitted.iter().any(|entry| entry == ACP_MESSAGE_BODY_ENTRY) {
+            omitted.push(ACP_MESSAGE_BODY_ENTRY.to_owned());
+        }
+        omitted.sort();
+        omitted.dedup();
+        return Ok(BoundNormalizationSource {
+            payload: input.payload.clone(),
+            coverage: NormalizationCoverage::LossyOmission,
+            omitted_fields: omitted,
+            input_digest: qualified_digest(
                 eliot_contracts::sha256_hex(&canonical),
                 eliot_agent_api::HOST_EVENT_DIGEST_ALGORITHM,
             )?,
-        ));
+            decoded_message: Some(message),
+        });
+    }
+    if let Some(version) = unsupported_jsonrpc_version(input.raw_source_bytes) {
+        let mut omitted = input.omitted_source_fields.clone();
+        if !omitted
+            .iter()
+            .any(|entry| entry == ACP_UNDECODABLE_SOURCE_ENTRY)
+        {
+            omitted.push(ACP_UNDECODABLE_SOURCE_ENTRY.to_owned());
+        }
+        return Ok(BoundNormalizationSource {
+            payload: NormalizedHostEventPayload::UnsupportedQuarantined(
+                UnsupportedEventObservation {
+                    source_namespace: ACP_NORMALIZER_IDENTITY.to_owned(),
+                    source_version: Some(version),
+                    reason: UnsupportedEventReason::UnsupportedVersion,
+                    detail_ref: None,
+                },
+            ),
+            coverage: NormalizationCoverage::LossyOmission,
+            omitted_fields: omitted,
+            input_digest: qualified_digest(
+                eliot_contracts::sha256_hex(input.raw_source_bytes),
+                eliot_agent_api::host_event::HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM,
+            )?,
+            decoded_message: None,
+        });
     }
     let mut omitted = input.omitted_source_fields.clone();
     if !omitted
@@ -1245,20 +1321,114 @@ fn bind_normalization_source(
     {
         omitted.push(ACP_UNDECODABLE_SOURCE_ENTRY.to_owned());
     }
-    Ok((
-        NormalizedHostEventPayload::UnsupportedQuarantined(UnsupportedEventObservation {
+    Ok(BoundNormalizationSource {
+        payload: NormalizedHostEventPayload::UnsupportedQuarantined(UnsupportedEventObservation {
             source_namespace: ACP_NORMALIZER_IDENTITY.to_owned(),
             source_version: None,
             reason: UnsupportedEventReason::SourceDecodeFailure,
             detail_ref: None,
         }),
-        NormalizationCoverage::LossyOmission,
-        omitted,
-        qualified_digest(
+        coverage: NormalizationCoverage::LossyOmission,
+        omitted_fields: omitted,
+        input_digest: qualified_digest(
             eliot_contracts::sha256_hex(input.raw_source_bytes),
             eliot_agent_api::host_event::HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM,
         )?,
-    ))
+        decoded_message: None,
+    })
+}
+
+/// Reads an advertised but unsupported JSON-RPC version marker from bytes that
+/// otherwise fail [`decode_source_message`]. Returns the marker when the bytes
+/// are a JSON object carrying a non-`2.0` `jsonrpc` string, so the normalizer
+/// can defer (quarantine) an unsupported version instead of mislabeling it a
+/// decode failure. Returns `None` for non-JSON bytes and for supported `2.0`
+/// markers (whose failure lies elsewhere).
+fn unsupported_jsonrpc_version(raw_source_bytes: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(raw_source_bytes).ok()?;
+    let version = value.as_object()?.get("jsonrpc")?.as_str()?;
+    if version == "2.0" {
+        return None;
+    }
+    if version.trim().is_empty()
+        || version.chars().any(char::is_control)
+        || version.chars().count() > eliot_agent_api::MAX_HOST_EVENT_TEXT_CHARS
+    {
+        return Some("unknown".to_owned());
+    }
+    Some(version.to_owned())
+}
+
+/// Reports whether `needle` occurs as an exact string in the decoded source
+/// message: the message method or any string leaf of its params/result/error
+/// body. Normalizers require source-derived public names (tool names,
+/// adapter-classified codes) to satisfy this before sealing, so a typed
+/// payload can never name content the decoded source never carried.
+fn decoded_message_contains(message: &AcpJsonRpcMessage, needle: &str) -> bool {
+    fn value_contains(value: &Value, needle: &str) -> bool {
+        match value {
+            Value::String(text) => text == needle,
+            Value::Array(items) => items.iter().any(|item| value_contains(item, needle)),
+            Value::Object(object) => object.values().any(|item| value_contains(item, needle)),
+            _ => false,
+        }
+    }
+    match message {
+        AcpJsonRpcMessage::Request(request) => {
+            request.method == needle || value_contains(&request.params, needle)
+        }
+        AcpJsonRpcMessage::Notification(notification) => {
+            notification.method == needle || value_contains(&notification.params, needle)
+        }
+        AcpJsonRpcMessage::Response(response) => {
+            response
+                .result
+                .as_ref()
+                .is_some_and(|result| value_contains(result, needle))
+                || response.error.as_ref().is_some_and(|error| {
+                    error.message == needle
+                        || error
+                            .data
+                            .as_ref()
+                            .is_some_and(|data| value_contains(data, needle))
+                })
+        }
+    }
+}
+
+/// Compares the independently supplied typed payload with the decoded source
+/// message before any receipt is issued: every public string is scanned for
+/// restricted source content, and — when the bytes decoded — source-derived
+/// names (tool names, adapter-classified codes) must occur in the decoded
+/// message. A payload that names absent content or smuggles restricted text
+/// fails closed here, never sealed into a receipt.
+fn check_payload_source_agreement(
+    payload: &NormalizedHostEventPayload,
+    decoded_message: Option<&AcpJsonRpcMessage>,
+) -> Result<(), AcpAdapterError> {
+    for text in payload.public_strings() {
+        if eliot_agent_api::contains_restricted_source_token(text) {
+            return Err(AcpAdapterError::InvalidInput("payload/restricted-content"));
+        }
+    }
+    let Some(message) = decoded_message else {
+        return Ok(());
+    };
+    let derived: &[&str] = match payload {
+        NormalizedHostEventPayload::ToolInvocation(observation) => {
+            &[observation.tool_name.as_str()]
+        }
+        NormalizedHostEventPayload::ToolOutcome(observation) => &[observation.tool_name.as_str()],
+        NormalizedHostEventPayload::Warning(observation) => &[observation.code.as_str()],
+        NormalizedHostEventPayload::Error(observation) => &[observation.code.as_str()],
+        _ => &[],
+    };
+    for name in derived {
+        if !decoded_message_contains(message, name) {
+            return Err(AcpAdapterError::InvalidInput("payload/source"));
+        }
+    }
+    Ok(())
 }
 
 pub fn normalize_acp_event(
@@ -1266,35 +1436,29 @@ pub fn normalize_acp_event(
 ) -> Result<(NormalizedHostEventEnvelope, HostEventNormalizationReceipt), AcpAdapterError> {
     validate_acp_event_input(&input)?;
     // Source binding: the digest always names the message the bytes actually
-    // carry (see [`bind_normalization_source`]).
-    let (effective_payload, effective_coverage, effective_omitted, input_digest) =
-        bind_normalization_source(&input)?;
+    // carry (see [`bind_normalization_source`]). For decodable bytes the
+    // supplied typed payload is additionally compared with the decoded
+    // message (see [`check_payload_source_agreement`]) before any receipt is
+    // issued: a sealed payload can never name content its source never
+    // carried.
+    let bound = bind_normalization_source(&input)?;
+    check_payload_source_agreement(&bound.payload, bound.decoded_message.as_ref())?;
     // The restricted handle plus its qualified digest must validate together
     // before any envelope is minted; a handle without its digest (or vice
     // versa) fails closed here.
     let raw_record = eliot_agent_api::RawSourceRecord {
         handle: input.raw_source_handle.clone(),
-        digest: input_digest.clone(),
+        digest: bound.input_digest.clone(),
     };
     raw_record
         .validate()
         .map_err(AcpAdapterError::ContractValidation)?;
-    let unsupported_disposition = match &effective_payload {
-        NormalizedHostEventPayload::UnsupportedQuarantined(observation)
-            if observation.reason == UnsupportedEventReason::SourceDecodeFailure =>
-        {
-            UnsupportedDisposition::SourceDecodeFailure
-        }
-        NormalizedHostEventPayload::UnsupportedQuarantined(_) => {
-            UnsupportedDisposition::UnsupportedMethodQuarantined
-        }
-        _ => UnsupportedDisposition::None,
-    };
+    let unsupported_disposition = unsupported_disposition_for(&bound.payload);
     let receipt = HostEventNormalizationReceipt {
         normalizer_identity: ACP_NORMALIZER_IDENTITY.to_owned(),
         normalizer_version: ACP_SCHEMA_VERSION.to_owned(),
         input_handle: input.raw_source_handle.clone(),
-        input_digest: input_digest.clone(),
+        input_digest: bound.input_digest.clone(),
         output_schema_version: eliot_agent_api::HOST_EVENT_CONTRACT_VERSION.to_owned(),
         output_digest: serde_json::from_value(Value::String(
             "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
@@ -1302,11 +1466,11 @@ pub fn normalize_acp_event(
         .map_err(|_| {
             AcpAdapterError::ContractValidation(eliot_agent_api::ContractError::DigestMismatch)
         })?,
-        omitted_fields: effective_omitted,
+        omitted_fields: bound.omitted_fields,
         warnings: input.warnings.clone(),
         unsupported_disposition,
         privacy_class: input.privacy_class,
-        coverage: effective_coverage,
+        coverage: bound.coverage,
         proof_ceiling: eliot_agent_api::ProofCeiling::Observation,
     };
     let admitted_route_digest = input
@@ -1321,7 +1485,7 @@ pub fn normalize_acp_event(
         adapter_contract_version: ACP_SCHEMA_VERSION.to_owned(),
         sequence: input.sequence,
         causal_predecessors: input.predecessors,
-        payload: effective_payload,
+        payload: bound.payload,
         admitted_route_digest,
         raw_source: eliot_agent_api::RawSourceRecord {
             handle: input.raw_source_handle,
@@ -1603,6 +1767,105 @@ impl AcpResultEnvelope {
             }
         };
         self.into_agent_result(route, binding, admission, outcome)
+    }
+}
+
+/// Bound identities for one drained ACP wire result (issue #228 W2/W5).
+///
+/// The live wire pump owns the request it sent: these identities name the
+/// operation/attempt/session that request belongs to, so a provider message
+/// can never mint them. Route/binding/admission agreement is enforced by
+/// [`AcpResultEnvelope::into_agent_result`] after assembly.
+#[derive(Clone, Debug)]
+pub struct AcpWireResultIds {
+    /// ELIOT operation identity the drained message answers.
+    pub operation_id: String,
+    /// Attempt identity the drained message answers.
+    pub attempt_id: AttemptId,
+    /// External session identity, when the bound execution carries one.
+    pub session_id: Option<String>,
+}
+
+/// Production wire-result drain for one received ACP JSON-RPC message (issue
+/// #228 W2/W5): the in-crate production caller that turns live provider
+/// output into a provider-neutral candidate [`AgentResult`].
+///
+/// Mapping (fail-closed, no completion inference):
+/// - `Response` with `result` keeps the result payload and drains through
+///   [`AcpResultEnvelope::assemble_candidate_result`] (terminal provider
+///   output still maps to candidate-only `DegradedNoProof`);
+/// - `Response` with `error` keeps the error payload and drains through
+///   [`AcpResultEnvelope::into_agent_result`] with an explicit
+///   [`AcpResultOutcome::Failed`] reason (sanitized at the adapter boundary);
+/// - `Notification` is non-terminal provider output and drains through
+///   `assemble_candidate_result` to `UnknownOutcome` with its recovery handle;
+/// - `Request` is an inbound call and never a result: rejected.
+///
+/// The translated result feeds
+/// `eliot-agent-coordinator::AgentCoordinator::submit_result` (candidate
+/// intake only, never Finish authority).
+///
+/// # Errors
+///
+/// Returns [`AcpAdapterError`] when the bound identities are blank, the
+/// message is an inbound request, or the route/binding/admission linkage
+/// fails.
+pub fn drain_wire_result(
+    message: &AcpJsonRpcMessage,
+    ids: AcpWireResultIds,
+    route: RouteFingerprint,
+    binding: &ProviderExecutionBinding,
+    admission: &AdmittedRouteReceipt,
+) -> Result<AgentResult, AcpAdapterError> {
+    if ids.operation_id.trim().is_empty() {
+        return Err(AcpAdapterError::InvalidInput("operation_id"));
+    }
+    match message {
+        AcpJsonRpcMessage::Request(_) => Err(AcpAdapterError::InvalidInput(
+            "acp request is never a result",
+        )),
+        AcpJsonRpcMessage::Notification(notification) => AcpResultEnvelope {
+            operation_id: ids.operation_id,
+            attempt_id: ids.attempt_id,
+            session_id: ids.session_id,
+            payload: notification.params.clone(),
+            terminal: false,
+        }
+        .assemble_candidate_result(route, binding, admission),
+        AcpJsonRpcMessage::Response(response) => {
+            if let Some(error) = &response.error {
+                let payload = serde_json::to_value(error)
+                    .map_err(|_| AcpAdapterError::InvalidInput("acp error payload"))?;
+                AcpResultEnvelope {
+                    operation_id: ids.operation_id,
+                    attempt_id: ids.attempt_id,
+                    session_id: ids.session_id,
+                    payload,
+                    terminal: true,
+                }
+                .into_agent_result(
+                    route,
+                    binding,
+                    admission,
+                    AcpResultOutcome::Failed {
+                        reason: error.message.clone(),
+                    },
+                )
+            } else if let Some(result) = &response.result {
+                AcpResultEnvelope {
+                    operation_id: ids.operation_id,
+                    attempt_id: ids.attempt_id,
+                    session_id: ids.session_id,
+                    payload: result.clone(),
+                    terminal: true,
+                }
+                .assemble_candidate_result(route, binding, admission)
+            } else {
+                Err(AcpAdapterError::InvalidInput(
+                    "acp response carries neither result nor error",
+                ))
+            }
+        }
     }
 }
 

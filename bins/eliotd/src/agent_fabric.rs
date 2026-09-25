@@ -19,12 +19,31 @@
 //! #694 / #696 / #698 / #839 / #837 remain OPEN), the fabric stays generic
 //! over the injected port and the inventory case freezes the missing-port
 //! expectation as a `ContractChallenge` residual instead of a local substitute.
+//!
+//! Issue #1700 carries that inventory further without replacing it: each
+//! injected port reports its own accepted-interface binding state through
+//! [`PortBindingState`] (default [`PortBindingState::Uncertain` — no absence
+//! conclusion follows from an open owning issue or a generic seam), and every
+//! dependent entrypoint checks the port it actually needs before the owner
+//! call. A port that reports [`PortBindingState::Missing`],
+//! [`PortBindingState::Unavailable`], [`PortBindingState::Incompatible`] or
+//! [`PortBindingState::StaleRevoked`] blocks only its dependent operations
+//! with a typed [`MissingPortResidual`] (exact port, owner, state, blocked
+//! operation/work, fence/epoch, disposition, next action) instead of a local
+//! substitute. Plan-only planning, read-only observation, recovery/status and
+//! independently admissible solo work never consult the broken port.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
-use eliot_agent_contracts::RevisionId;
+use eliot_agent_contracts::{
+    ExecutionUpdateProposal, RevisionId, SupersessionLink, SwarmAdmissionId, SwarmExecutionId,
+    SwarmExecutionRevision, SwarmPlanAdmission, SwarmPlanAdmissionDisposition, SwarmPlanDefinition,
+    SwarmPlanDefinitionLifecycle, SwarmPlanView, check_definition_author, check_execution_update,
+    check_owner_join, check_stored_links, check_supersession, join_view,
+};
 use eliot_agent_coordinator::{
     AdmissionId, AdmittedProviderCapability, AgentCoordinator, CandidateId, CoordinatorConfig,
     CoordinatorError, CoordinatorSnapshot, OwnerCurrentness, PlanGap, PresentedClaimMaterial,
@@ -62,6 +81,450 @@ pub const PREREQ_PORTS: [&str; 5] = [
 #[must_use]
 pub fn prereq_ports() -> Vec<String> {
     PREREQ_PORTS.iter().map(|port| (*port).to_owned()).collect()
+}
+
+/// Closed identity of one injected fabric port (issue #1700).
+///
+/// This is the runtime dependency map the fabric actually enforces: each
+/// public entrypoint that needs a live owner guarantee names exactly one
+/// port through [`FabricOperation::required_port`]. It is distinct from the
+/// frozen [`PREREQ_PORTS`] string inventory above, which the 872/1 case pins
+/// verbatim (including the D-WU-FINAL #837 development assignment gate).
+/// #837 stays outside this map: it gates development assignment, never
+/// runtime execution authority.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FabricPortId {
+    /// B-MOD model registry (#694): route resolution only.
+    ModelRegistry,
+    /// B-PEER coordination channel (#696): peer delivery only.
+    PeerChannel,
+    /// B-SWARM durable swarm control (#698): swarm entry only.
+    SwarmControl,
+    /// Governor admission authority: reservation staging plus admission
+    /// commit. The fabric composes both results and implements neither.
+    AdmissionAuthority,
+    /// Kernel activation authority (#839): launch activation only.
+    ActivationAuthority,
+    /// Dispatch egress: activated dispatch emission only.
+    DispatchEgress,
+}
+
+impl FabricPortId {
+    /// Returns the stable port code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelRegistry => "MODEL_REGISTRY",
+            Self::PeerChannel => "PEER_CHANNEL",
+            Self::SwarmControl => "SWARM_CONTROL",
+            Self::AdmissionAuthority => "ADMISSION_AUTHORITY",
+            Self::ActivationAuthority => "ACTIVATION_AUTHORITY",
+            Self::DispatchEgress => "DISPATCH_EGRESS",
+        }
+    }
+
+    /// Returns the stable load-bearing interface identity served by this port.
+    #[must_use]
+    pub const fn interface(self) -> &'static str {
+        match self {
+            Self::ModelRegistry => "b-mod-route-registry",
+            Self::PeerChannel => "b-peer-coordination-channel",
+            Self::SwarmControl => "b-swarm-durable-control",
+            Self::AdmissionAuthority => "governor-admission-authority",
+            Self::ActivationAuthority => "kernel-activation-authority",
+            Self::DispatchEgress => "dispatch-egress",
+        }
+    }
+
+    /// Returns the owning-contract reference for this port, which doubles as
+    /// the development `ContractChallenge` surface key where applicable
+    /// (I2.17). A static reference never confers execution authority; only
+    /// a [`PortBindingState::Bound`] report from the injected port admits
+    /// dependent use, and only the per-call owner verifier admits effects.
+    #[must_use]
+    pub const fn owner_ref(self) -> &'static str {
+        match self {
+            Self::ModelRegistry => "B-MOD #694",
+            Self::PeerChannel => "B-PEER #696",
+            Self::SwarmControl => "B-SWARM #698",
+            Self::AdmissionAuthority => "governor-admission",
+            Self::ActivationAuthority => "B-ACTIVATION-PROJECTION #839",
+            Self::DispatchEgress => "dispatch-egress",
+        }
+    }
+}
+
+/// Runtime ports the fabric may block on (issue #1700): exactly the six
+/// injected seams. D-WU-FINAL #837 is deliberately absent — it is a
+/// development assignment gate, not a runtime service dependency, unless an
+/// actual separately documented runtime contract requires it.
+pub const RUNTIME_PORTS: [FabricPortId; 6] = [
+    FabricPortId::ModelRegistry,
+    FabricPortId::PeerChannel,
+    FabricPortId::SwarmControl,
+    FabricPortId::AdmissionAuthority,
+    FabricPortId::ActivationAuthority,
+    FabricPortId::DispatchEgress,
+];
+
+/// Returns the runtime port identities the fabric enforces.
+#[must_use]
+pub fn runtime_ports() -> Vec<FabricPortId> {
+    RUNTIME_PORTS.to_vec()
+}
+
+/// How one injected port reports its own accepted-interface binding state
+/// (issue #1700). Missing, unavailable, incompatible, stale/revoked and
+/// uncertain stay distinct: only a positively reported non-bound state
+/// blocks dependent use. An accepted interface (owner-validated revision
+/// identity) stays distinct from a currently available/authorized provider —
+/// availability is decided per call by the owner verifier, never here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum PortBindingState {
+    /// The owner affirms an accepted interface binding at the named
+    /// revision. Dependent use proceeds to the per-call owner verifier,
+    /// which still decides. A nonempty revision, trait implementation,
+    /// self-hash or serialized `Verified` snapshot cannot establish
+    /// acceptance on its own: only the owner's affirmative report does,
+    /// and only through this variant.
+    Bound {
+        /// Accepted interface revision affirmed by the owner.
+        interface_revision: String,
+    },
+    /// The owner has no accepted revision for this interface.
+    Missing,
+    /// The owner is temporarily unreachable; carries no claim about
+    /// acceptance either way.
+    Unavailable,
+    /// The owner observes an interface revision the fabric cannot consume.
+    Incompatible {
+        /// Interface revision the fabric requires.
+        required_revision: String,
+        /// Interface revision the owner observes.
+        observed_revision: String,
+    },
+    /// The binding was accepted but is now stale or revoked by its owner.
+    StaleRevoked,
+    /// The port does not report binding state. The fabric draws no absence
+    /// conclusion from this state and proceeds to the per-call owner
+    /// verifier, which remains the authority. This is the default for every
+    /// injected seam, so generic injection stays a seam, not a defect.
+    Uncertain,
+}
+
+impl PortBindingState {
+    /// Reports an owner-affirmed accepted binding. Blank or control-bearing
+    /// revisions are rejected here: forged or empty acceptance evidence
+    /// cannot pass as [`PortBindingState::Bound`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] when the revision is blank or
+    /// control-bearing.
+    pub fn bound(interface_revision: String) -> Result<Self, FabricError> {
+        validate_text(&interface_revision, "interface_revision")?;
+        Ok(Self::Bound { interface_revision })
+    }
+
+    /// Reports an incompatible observed revision. Both revisions must be
+    /// well-formed text; blank evidence cannot pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] when either revision is blank or
+    /// control-bearing.
+    pub fn incompatible(
+        required_revision: String,
+        observed_revision: String,
+    ) -> Result<Self, FabricError> {
+        validate_text(&required_revision, "required_revision")?;
+        validate_text(&observed_revision, "observed_revision")?;
+        Ok(Self::Incompatible {
+            required_revision,
+            observed_revision,
+        })
+    }
+
+    /// Returns true only when dependent use may proceed past the pre-check:
+    /// [`PortBindingState::Bound`] proceeds to the per-call owner verifier,
+    /// and [`PortBindingState::Uncertain`] defers to it entirely. Every
+    /// other state blocks with a typed residual at the point of use.
+    #[must_use]
+    pub const fn admits_dependent_use(&self) -> bool {
+        matches!(self, Self::Bound { .. } | Self::Uncertain)
+    }
+}
+
+/// Stable I7.20 disposition carried by a missing-prerequisite residual.
+/// The disposition is derived from the reported binding state; it never
+/// widens into a generic internal error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ResidualDisposition {
+    /// The owner reports no accepted binding: further evidence is required.
+    NeedsEvidence,
+    /// The owner is unreachable: capacity/availability, not refusal.
+    UnavailableOrCapacity,
+    /// The observed revision cannot be consumed.
+    Denied,
+    /// The binding is stale or revoked.
+    StaleOrConflict,
+}
+
+impl ResidualDisposition {
+    /// Derives the disposition from the reported binding state. `Bound` and
+    /// `Uncertain` never reach a residual; they map here only for
+    /// completeness and keep the pre-check/refusal vocabulary closed.
+    #[must_use]
+    pub const fn of_state(state: &PortBindingState) -> Self {
+        match state {
+            PortBindingState::Missing => Self::NeedsEvidence,
+            PortBindingState::Unavailable => Self::UnavailableOrCapacity,
+            PortBindingState::Incompatible { .. } => Self::Denied,
+            PortBindingState::StaleRevoked => Self::StaleOrConflict,
+            PortBindingState::Bound { .. } | PortBindingState::Uncertain => {
+                Self::UnavailableOrCapacity
+            }
+        }
+    }
+
+    /// Returns the stable disposition code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NeedsEvidence => "NEEDS_EVIDENCE",
+            Self::UnavailableOrCapacity => "UNAVAILABLE_OR_CAPACITY",
+            Self::Denied => "DENIED",
+            Self::StaleOrConflict => "STALE_OR_CONFLICT",
+        }
+    }
+}
+
+/// Next permitted action carried by a missing-prerequisite residual. A
+/// newly accepted owner binding permits reevaluation of the retained
+/// operation under the current policy/fence; it never auto-activates old
+/// candidates, resumes unknown attempts, or rewrites refusal evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NextPermittedAction {
+    /// Restore the owner binding, then reevaluate the same retained
+    /// operation under the current fence. Never mint a replacement
+    /// identity and never implicitly retry: resolving the prerequisite
+    /// requires a fresh normal evaluation, not a replay with new IDs.
+    ReevaluateAfterOwnerAcceptance,
+    /// The blocked delivery is optional: skip it. Independently valid
+    /// solo/read-only work proceeds without the missing peer path.
+    ProceedWithoutBlockedDelivery,
+}
+
+impl NextPermittedAction {
+    /// Returns the stable action code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReevaluateAfterOwnerAcceptance => "REEVALUATE_AFTER_OWNER_ACCEPTANCE",
+            Self::ProceedWithoutBlockedDelivery => "PROCEED_WITHOUT_BLOCKED_DELIVERY",
+        }
+    }
+}
+
+/// Fabric operation that may block on a missing prerequisite port
+/// (issue #1700). Plan-only planning, read-only observation,
+/// recovery/status/control reads and snapshot/restore carry no entry here:
+/// they keep their own explicit dependency set and must not require the
+/// broken execution port merely to explain or contain its failure.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FabricOperation {
+    /// Candidate-only route resolution through the model registry.
+    ResolveModelRoute,
+    /// One peer delivery through the owning channel.
+    DeliverPeer,
+    /// Entry of one planned candidate through swarm control.
+    EnterSwarm,
+    /// Staging of one inactive Kernel reservation.
+    StageReservation,
+    /// Commit of one canonical Governor admission.
+    CommitAdmission,
+    /// Activation of launch authority for one admitted attempt.
+    Activate,
+    /// Emission of one built dispatch intent through the egress port.
+    Emit,
+}
+
+impl FabricOperation {
+    /// Returns the stable operation code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResolveModelRoute => "RESOLVE_MODEL_ROUTE",
+            Self::DeliverPeer => "DELIVER_PEER",
+            Self::EnterSwarm => "ENTER_SWARM",
+            Self::StageReservation => "STAGE_RESERVATION",
+            Self::CommitAdmission => "COMMIT_ADMISSION",
+            Self::Activate => "ACTIVATE",
+            Self::Emit => "EMIT",
+        }
+    }
+
+    /// Returns the single injected port this operation depends on. A peer
+    /// gap blocks only [`FabricOperation::DeliverPeer`]; every other
+    /// operation names its own port, so an optional missing peer path never
+    /// blocks an independently valid solo/read-only path.
+    #[must_use]
+    pub const fn required_port(self) -> FabricPortId {
+        match self {
+            Self::ResolveModelRoute => FabricPortId::ModelRegistry,
+            Self::DeliverPeer => FabricPortId::PeerChannel,
+            Self::EnterSwarm => FabricPortId::SwarmControl,
+            Self::StageReservation | Self::CommitAdmission => FabricPortId::AdmissionAuthority,
+            Self::Activate => FabricPortId::ActivationAuthority,
+            Self::Emit => FabricPortId::DispatchEgress,
+        }
+    }
+
+    /// Returns the next permitted action when this operation blocks. Only a
+    /// blocked peer delivery is skippable; every other block retains the
+    /// exact operation for reevaluation after owner acceptance.
+    #[must_use]
+    pub const fn next_permitted_action(self) -> NextPermittedAction {
+        match self {
+            Self::DeliverPeer => NextPermittedAction::ProceedWithoutBlockedDelivery,
+            Self::ResolveModelRoute
+            | Self::EnterSwarm
+            | Self::StageReservation
+            | Self::CommitAdmission
+            | Self::Activate
+            | Self::Emit => NextPermittedAction::ReevaluateAfterOwnerAcceptance,
+        }
+    }
+}
+
+/// Typed admission-blocking residual for an unresolved fabric port contract
+/// (issue #1700).
+///
+/// Source-derived facts (the port's own report, the owner reference, the
+/// fence/epoch observed at the failure) stay separate from unverified
+/// expectations: the residual never claims the port is absent beyond what
+/// the port itself reported, and it never confers execution authority.
+/// Propagated through the daemon response/status path via
+/// [`FabricError::MissingPrerequisite`] without string matching.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MissingPortResidual {
+    /// Injected port that reported no accepted binding.
+    pub port: FabricPortId,
+    /// Stable load-bearing interface identity that is missing.
+    pub interface: String,
+    /// Owning-contract reference (I2.17 `ContractChallenge` surface key).
+    pub owner_ref: String,
+    /// Non-bound binding state the port reported. Never `Bound` or
+    /// `Uncertain`: those admit dependent use and never build a residual.
+    pub state: PortBindingState,
+    /// Blocked fabric operation.
+    pub blocked_operation: FabricOperation,
+    /// Affected operation/work identity (definition, reservation,
+    /// admission/attempt, dispatch, role, or message identity).
+    pub work_identity: String,
+    /// Fence observed at the failure, when the operation carries one.
+    pub fence: Option<StateFence>,
+    /// Authority epoch observed at the failure, when the operation carries one.
+    pub epoch: Option<EpochId>,
+    /// Stable I7.20 disposition derived from the binding state.
+    pub disposition: ResidualDisposition,
+    /// Next permitted action for the blocked work.
+    pub next_action: NextPermittedAction,
+}
+
+impl MissingPortResidual {
+    /// Builds the residual from the port's own binding report. The port must
+    /// serve the blocked operation, the state must be a blocking one, and
+    /// the work identity must be well-formed text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] when the state admits dependent
+    /// use, the port does not serve the blocked operation, or the work
+    /// identity is blank or control-bearing.
+    pub fn new(
+        port: FabricPortId,
+        state: PortBindingState,
+        blocked_operation: FabricOperation,
+        work_identity: String,
+        fence: Option<StateFence>,
+        epoch: Option<EpochId>,
+    ) -> Result<Self, FabricError> {
+        if state.admits_dependent_use() {
+            return Err(FabricError::Contract(
+                "missing-prerequisite residual requires a blocking binding state".to_owned(),
+            ));
+        }
+        if blocked_operation.required_port() != port {
+            return Err(FabricError::Contract(
+                "residual port does not serve the blocked operation".to_owned(),
+            ));
+        }
+        validate_text(&work_identity, "blocked_work_identity")?;
+        Ok(Self {
+            port,
+            interface: port.interface().to_owned(),
+            owner_ref: port.owner_ref().to_owned(),
+            disposition: ResidualDisposition::of_state(&state),
+            next_action: blocked_operation.next_permitted_action(),
+            state,
+            blocked_operation,
+            work_identity,
+            fence,
+            epoch,
+        })
+    }
+}
+
+impl fmt::Display for MissingPortResidual {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "port=[{}] interface=[{}] owner=[{}] state=[{}] op=[{}] work=[{}] disposition=[{}] next=[{}]",
+            self.port.as_str(),
+            self.interface,
+            self.owner_ref,
+            self.state,
+            self.blocked_operation.as_str(),
+            self.work_identity,
+            self.disposition.as_str(),
+            self.next_action.as_str(),
+        )?;
+        if let Some(fence) = &self.fence {
+            write!(f, " fence=[{fence:?}]")?;
+        }
+        if let Some(epoch) = &self.epoch {
+            write!(f, " epoch=[{epoch:?}]")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for PortBindingState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bound { interface_revision } => {
+                write!(f, "BOUND revision=[{interface_revision}]")
+            }
+            Self::Missing => write!(f, "MISSING"),
+            Self::Unavailable => write!(f, "UNAVAILABLE"),
+            Self::Incompatible {
+                required_revision,
+                observed_revision,
+            } => write!(
+                f,
+                "INCOMPATIBLE required=[{required_revision}] observed=[{observed_revision}]"
+            ),
+            Self::StaleRevoked => write!(f, "STALE_REVOKED"),
+            Self::Uncertain => write!(f, "UNCERTAIN"),
+        }
+    }
 }
 
 fn validate_text(value: &str, _field: &'static str) -> Result<(), FabricError> {
@@ -168,7 +631,14 @@ pub struct VerifiedProviderMaterial {
 }
 
 /// Builds the sealed admission capability from authenticated Kernel claim
-/// material (issue #1108, production composition caller for W4/A1/A2).
+/// material (issue #1108).
+///
+/// Crate-internal: the only cross-crate construction path is
+/// [`DaemonComposition::agent_fabric_verified_capability`](crate::DaemonComposition::agent_fabric_verified_capability),
+/// which unconditionally overwrites the caller-supplied session halves
+/// (live fence, session binding) with the live authenticated session
+/// values before calling this builder. External callers therefore cannot
+/// bypass the session-half overwrite with coherent caller-built halves.
 ///
 /// Wiring plus coherence: forwards the daemon-resolved
 /// [`VerifiedProviderMaterial`] halves into the presented/owner capability
@@ -184,7 +654,7 @@ pub struct VerifiedProviderMaterial {
 ///
 /// Returns the coordinator owner rejection unchanged (shape, coherence, or
 /// stale/revoked binding).
-pub fn build_admitted_provider_capability(
+pub(crate) fn build_admitted_provider_capability(
     material: VerifiedProviderMaterial,
 ) -> Result<AdmittedProviderCapability, FabricError> {
     let presented = PresentedClaimMaterial::new(
@@ -554,6 +1024,21 @@ pub enum FabricError {
     /// A second launch was attempted for an already-registered operation.
     #[error("fabric duplicate launch: {0}")]
     DuplicateLaunch(String),
+    /// An execution update attempted to change frozen plan semantics
+    /// (work graph, objective, acceptance, ceilings, stop conditions, wave
+    /// or root). Semantic change needs a new definition revision, never an
+    /// execution update.
+    #[error("fabric semantic drift: {0}")]
+    SemanticDrift(String),
+    /// The presenter is not the current owner lease holder or epoch.
+    #[error("fabric stale owner lease: {0}")]
+    StaleOwnerLease(String),
+    /// The caller attempted another owner's fields.
+    #[error("fabric foreign owner field: {0}")]
+    ForeignOwnerField(String),
+    /// The definition/admission/execution ownership join is broken.
+    #[error("fabric broken ownership link: {0}")]
+    BrokenOwnershipLink(String),
     /// Cancellation was requested but its terminal reconciliation has not been
     /// observed; the two remain distinct.
     #[error("fabric cancellation requested: {0}")]
@@ -572,6 +1057,118 @@ pub enum FabricError {
         "fabric restore blocked: snapshot holds a verified provider binding; supply fresh owner material through restore_verified"
     )]
     ProviderEvidenceRequired,
+    /// A load-bearing injected port reports no accepted interface binding
+    /// for the blocked operation (issue #1700). The boxed residual names
+    /// the exact port, owner, binding state, blocked operation/work,
+    /// fence/epoch, disposition and next permitted action. Boxed: the
+    /// residual rides every fallible fabric boundary, so the error itself
+    /// stays small.
+    #[error("missing prerequisite: {0}")]
+    MissingPrerequisite(Box<MissingPortResidual>),
+}
+
+/// Maps a semantic contract rejection onto the fabric vocabulary.
+///
+/// Owner-identity failures keep their typed meaning (`SemanticDrift`,
+/// `StaleOwnerLease`, `ForeignOwnerField`, `BrokenOwnershipLink`); all other
+/// contract failures surface as [`FabricError::Contract`]. The mapping is
+/// total: no contract rejection escapes unclassified.
+fn contract_rejection(error: eliot_agent_contracts::ContractError) -> FabricError {
+    use eliot_agent_contracts::ContractError as ContractRejection;
+    match error {
+        ContractRejection::SemanticDrift(field) => FabricError::SemanticDrift(field.to_owned()),
+        ContractRejection::StaleLease(owner) => FabricError::StaleOwnerLease(owner.to_owned()),
+        ContractRejection::ForeignOwner(field) => FabricError::ForeignOwnerField(field.to_owned()),
+        ContractRejection::BrokenOwnershipLink(link) => {
+            FabricError::BrokenOwnershipLink(link.to_owned())
+        }
+        other => FabricError::Contract(format!("semantic contract: {other}")),
+    }
+}
+
+/// Verifies semantic ownership maps carried by a durable snapshot.
+///
+/// Every stored definition revalidates (shape plus bound digest); every map
+/// key must equal its record identity; every stored execution must satisfy
+/// the structural ownership links against its stored definition and
+/// admission; every supersession link must join its stored prior and
+/// replacement. Legacy snapshots carry no semantic records and pass
+/// trivially. A contradictory image fails closed so torn persistence never
+/// restores authority; live coherence (leases, active dispositions) is
+/// rehydrated independently by the owners after restore, never from saved
+/// labels alone.
+fn verify_snapshot_semantics(snapshot: &FabricSnapshot) -> Result<(), FabricError> {
+    for (key, definition) in &snapshot.semantic_definitions {
+        definition.validate().map_err(contract_rejection)?;
+        if key != definition.definition_id.as_str() {
+            return Err(FabricError::BrokenOwnershipLink(
+                "semantic definition map key does not match record identity".to_owned(),
+            ));
+        }
+    }
+    for (key, admission) in &snapshot.semantic_admissions {
+        admission.validate().map_err(contract_rejection)?;
+        if key != admission.admission_id.as_str() {
+            return Err(FabricError::BrokenOwnershipLink(
+                "semantic admission map key does not match record identity".to_owned(),
+            ));
+        }
+        if !snapshot
+            .semantic_definitions
+            .contains_key(admission.definition_id.as_str())
+        {
+            return Err(FabricError::BrokenOwnershipLink(
+                "semantic admission without stored definition".to_owned(),
+            ));
+        }
+    }
+    for (key, execution) in &snapshot.semantic_executions {
+        execution.validate().map_err(contract_rejection)?;
+        if key != execution.execution_id.as_str() {
+            return Err(FabricError::BrokenOwnershipLink(
+                "semantic execution map key does not match record identity".to_owned(),
+            ));
+        }
+        let definition = snapshot
+            .semantic_definitions
+            .get(execution.definition_id.as_str())
+            .ok_or_else(|| {
+                FabricError::BrokenOwnershipLink(
+                    "semantic execution without stored definition".to_owned(),
+                )
+            })?;
+        let admission = snapshot
+            .semantic_admissions
+            .get(execution.admission_id.as_str())
+            .ok_or_else(|| {
+                FabricError::BrokenOwnershipLink(
+                    "semantic execution without stored admission".to_owned(),
+                )
+            })?;
+        check_stored_links(definition, admission, execution).map_err(contract_rejection)?;
+    }
+    for (key, link) in &snapshot.semantic_supersessions {
+        let next = snapshot.semantic_definitions.get(key).ok_or_else(|| {
+            FabricError::BrokenOwnershipLink(
+                "supersession without stored replacement definition".to_owned(),
+            )
+        })?;
+        let prior = snapshot
+            .semantic_definitions
+            .get(link.prior_definition_id.as_str())
+            .ok_or_else(|| {
+                FabricError::BrokenOwnershipLink(
+                    "supersession without stored prior definition".to_owned(),
+                )
+            })?;
+        if next.supersedes.as_ref() != Some(link) {
+            return Err(FabricError::BrokenOwnershipLink(
+                "supersession link does not match stored replacement".to_owned(),
+            ));
+        }
+        check_supersession(prior, next).map_err(contract_rejection)?;
+    }
+    Ok(())
 }
 
 /// B-MOD model registry seam (#694). The fabric resolves routes only through
@@ -583,6 +1180,17 @@ pub trait ModelRegistryPort: Send + Sync {
         &self,
         requirements: &RouteRequirements,
     ) -> Result<Option<RouteFingerprint>, FabricError>;
+
+    /// Reports this port's accepted-interface binding state (issue #1700).
+    ///
+    /// The default is [`PortBindingState::Uncertain`]: the port does not
+    /// report binding state, so the fabric proceeds to the per-call owner
+    /// verifier, which remains the authority. Override with an
+    /// owner-affirmed [`PortBindingState::Bound`] (or a positively known
+    /// non-bound state) once the owner tracks acceptance revisions.
+    fn interface_binding(&self) -> PortBindingState {
+        PortBindingState::Uncertain
+    }
 }
 
 /// B-PEER coordination channel seam (#696). The fabric delivers only through
@@ -590,6 +1198,12 @@ pub trait ModelRegistryPort: Send + Sync {
 pub trait PeerChannelPort: Send + Sync {
     /// Delivers one peer message through the owning channel.
     fn deliver(&self, message: &PeerMessage) -> Result<PeerReceipt, FabricError>;
+
+    /// Reports this port's accepted-interface binding state (issue #1700).
+    /// See [`ModelRegistryPort::interface_binding`].
+    fn interface_binding(&self) -> PortBindingState {
+        PortBindingState::Uncertain
+    }
 }
 
 /// B-SWARM durable swarm control seam (#698). The fabric enters the admitted
@@ -600,6 +1214,12 @@ pub trait SwarmControlPort: Send + Sync {
         &self,
         candidate: &StaffingPlanCandidate,
     ) -> Result<SwarmEntryReceipt, FabricError>;
+
+    /// Reports this port's accepted-interface binding state (issue #1700).
+    /// See [`ModelRegistryPort::interface_binding`].
+    fn interface_binding(&self) -> PortBindingState {
+        PortBindingState::Uncertain
+    }
 }
 
 /// Governor admission authority seam. Kernel stages the inactive reservation;
@@ -610,6 +1230,12 @@ pub trait AdmissionAuthorityPort: Send + Sync {
     fn stage_reservation(&self, definition: &SwarmDefinition) -> Result<Reservation, FabricError>;
     /// Commits one canonical admission referencing the staged reservation.
     fn commit_admission(&self, reservation: &Reservation) -> Result<FabricAdmission, FabricError>;
+
+    /// Reports this port's accepted-interface binding state (issue #1700).
+    /// See [`ModelRegistryPort::interface_binding`].
+    fn interface_binding(&self) -> PortBindingState {
+        PortBindingState::Uncertain
+    }
 }
 
 /// Kernel activation authority seam (#839). Activation is granted only after
@@ -621,6 +1247,12 @@ pub trait ActivationAuthorityPort: Send + Sync {
         admission: &FabricAdmission,
         attempt_id: &AttemptId,
     ) -> Result<ActivationEvidence, FabricError>;
+
+    /// Reports this port's accepted-interface binding state (issue #1700).
+    /// See [`ModelRegistryPort::interface_binding`].
+    fn interface_binding(&self) -> PortBindingState {
+        PortBindingState::Uncertain
+    }
 }
 
 /// Dispatch egress seam. The provider-neutral intent leaves the control
@@ -628,6 +1260,12 @@ pub trait ActivationAuthorityPort: Send + Sync {
 pub trait DispatchEgressPort: Send + Sync {
     /// Emits one activated dispatch intent.
     fn emit(&self, intent: &DispatchIntent) -> Result<DispatchAck, FabricError>;
+
+    /// Reports this port's accepted-interface binding state (issue #1700).
+    /// See [`ModelRegistryPort::interface_binding`].
+    fn interface_binding(&self) -> PortBindingState {
+        PortBindingState::Uncertain
+    }
 }
 
 /// Injected owner ports for one fabric instance.
@@ -671,6 +1309,20 @@ pub struct FabricSnapshot {
     pub attempt_states: BTreeMap<String, AttemptLifecycle>,
     /// Cancellation states by attempt identity.
     pub cancellations: BTreeMap<String, CancellationLifecycle>,
+    /// Validated Task-Controller semantic definitions by definition identity
+    /// (issue #1702). Absent on legacy snapshots; legacy restores proceed
+    /// without semantic bindings exactly as before.
+    #[serde(default)]
+    pub semantic_definitions: BTreeMap<String, SwarmPlanDefinition>,
+    /// Governor semantic admissions by admission identity (issue #1702).
+    #[serde(default)]
+    pub semantic_admissions: BTreeMap<String, SwarmPlanAdmission>,
+    /// Coordinator execution revisions by execution identity (issue #1702).
+    #[serde(default)]
+    pub semantic_executions: BTreeMap<String, SwarmExecutionRevision>,
+    /// Supersession links by replacement definition identity (issue #1702).
+    #[serde(default)]
+    pub semantic_supersessions: BTreeMap<String, SupersessionLink>,
 }
 
 /// Attempt lifecycle tracked by this composition. Terminal states never
@@ -720,6 +1372,14 @@ pub struct AgentFabric {
     intent_by_operation: BTreeMap<String, String>,
     attempt_states: BTreeMap<String, AttemptLifecycle>,
     cancellations: BTreeMap<String, CancellationLifecycle>,
+    /// Validated Task-Controller semantic definitions by definition identity.
+    semantic_definitions: BTreeMap<String, SwarmPlanDefinition>,
+    /// Governor semantic admissions by admission identity.
+    semantic_admissions: BTreeMap<String, SwarmPlanAdmission>,
+    /// Coordinator execution revisions by execution identity.
+    semantic_executions: BTreeMap<String, SwarmExecutionRevision>,
+    /// Supersession links by replacement definition identity.
+    semantic_supersessions: BTreeMap<String, SupersessionLink>,
     initialized: bool,
 }
 
@@ -754,6 +1414,10 @@ impl AgentFabric {
             intent_by_operation: BTreeMap::new(),
             attempt_states: BTreeMap::new(),
             cancellations: BTreeMap::new(),
+            semantic_definitions: BTreeMap::new(),
+            semantic_admissions: BTreeMap::new(),
+            semantic_executions: BTreeMap::new(),
+            semantic_supersessions: BTreeMap::new(),
             initialized: true,
         };
         fabric.record("coordinator_constructed", "coordinator");
@@ -798,6 +1462,10 @@ impl AgentFabric {
             intent_by_operation: BTreeMap::new(),
             attempt_states: BTreeMap::new(),
             cancellations: BTreeMap::new(),
+            semantic_definitions: BTreeMap::new(),
+            semantic_admissions: BTreeMap::new(),
+            semantic_executions: BTreeMap::new(),
+            semantic_supersessions: BTreeMap::new(),
             initialized: true,
         };
         fabric.record("coordinator_constructed_verified", "coordinator");
@@ -852,6 +1520,56 @@ impl AgentFabric {
             event: event.to_owned(),
             operation: operation.to_owned(),
         });
+    }
+
+    /// Checks the accepted-interface binding of the single port the given
+    /// operation depends on, before the owner call (issue #1700).
+    ///
+    /// [`PortBindingState::Bound`] proceeds to the per-call owner verifier
+    /// and [`PortBindingState::Uncertain`] defers to it entirely: this check
+    /// supplements, never replaces, the existing per-call
+    /// authority/fence/receipt verification. A positively reported
+    /// non-bound state stops before staging dependent capacity and returns
+    /// the typed [`MissingPortResidual`] at the point of use. Operations
+    /// without a map entry (plan-only planning, read-only observation,
+    /// recovery/status/control, snapshot/restore) never call this helper.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::MissingPrerequisite`] when the required port
+    /// reports a non-bound binding state, or [`FabricError::Contract`] when
+    /// the residual itself is malformed.
+    fn check_port_binding(
+        &mut self,
+        operation: FabricOperation,
+        work_identity: &str,
+        fence: Option<StateFence>,
+        epoch: Option<EpochId>,
+    ) -> Result<(), FabricError> {
+        let port = operation.required_port();
+        let state = match port {
+            FabricPortId::ModelRegistry => self.ports.model_registry.interface_binding(),
+            FabricPortId::PeerChannel => self.ports.peer_channel.interface_binding(),
+            FabricPortId::SwarmControl => self.ports.swarm_control.interface_binding(),
+            FabricPortId::AdmissionAuthority => self.ports.admission_authority.interface_binding(),
+            FabricPortId::ActivationAuthority => {
+                self.ports.activation_authority.interface_binding()
+            }
+            FabricPortId::DispatchEgress => self.ports.dispatch_egress.interface_binding(),
+        };
+        if state.admits_dependent_use() {
+            return Ok(());
+        }
+        let residual = MissingPortResidual::new(
+            port,
+            state,
+            operation,
+            work_identity.to_owned(),
+            fence,
+            epoch,
+        )?;
+        self.record("prerequisite_blocked", work_identity);
+        Err(FabricError::MissingPrerequisite(Box::new(residual)))
     }
 
     /// Validates and freezes one Task-Controller definition, then compiles its
@@ -913,6 +1631,16 @@ impl AgentFabric {
         requirements: &RouteRequirements,
     ) -> Result<Option<RouteFingerprint>, FabricError> {
         requirements.validate()?;
+        // #1700: a missing route binding prevents claiming an
+        // evidence-backed selected route. The registry is not consulted and
+        // no resolution is recorded when the port itself reports no accepted
+        // binding; an uncertain port defers to the owner call below.
+        self.check_port_binding(
+            FabricOperation::ResolveModelRoute,
+            &requirements.role,
+            None,
+            None,
+        )?;
         let route = self.ports.model_registry.resolve_route(requirements)?;
         self.record("model_route_resolved", &requirements.role);
         Ok(route)
@@ -968,6 +1696,15 @@ impl AgentFabric {
     /// Returns the channel owner rejection.
     pub fn deliver_peer(&mut self, message: &PeerMessage) -> Result<PeerReceipt, FabricError> {
         validate_text(&message.message_id, "peer_message_id")?;
+        // #1700: a peer gap blocks only this delivery. Solo/read-only paths
+        // never consult the peer port, so an optional missing peer path does
+        // not block independently valid work.
+        self.check_port_binding(
+            FabricOperation::DeliverPeer,
+            &message.message_id,
+            None,
+            None,
+        )?;
         let receipt = self.ports.peer_channel.deliver(message)?;
         self.record("peer_delivered", &message.message_id);
         Ok(receipt)
@@ -984,6 +1721,14 @@ impl AgentFabric {
         &mut self,
         candidate: &StaffingPlanCandidate,
     ) -> Result<SwarmEntryReceipt, FabricError> {
+        // #1700: stop before entering when the swarm port reports no accepted
+        // binding; the planned candidate is retained for reevaluation.
+        self.check_port_binding(
+            FabricOperation::EnterSwarm,
+            candidate.candidate_id.as_str(),
+            Some(candidate.state_fence.clone()),
+            None,
+        )?;
         let planned_digest = digest_json(candidate)?;
         let receipt = self.ports.swarm_control.enter_plan(candidate)?;
         if receipt.entered_digest != planned_digest
@@ -1018,6 +1763,15 @@ impl AgentFabric {
             .get(&key)
             .cloned()
             .ok_or_else(|| FabricError::Contract(format!("unknown definition {key}")))?;
+        // #1700: a missing admission prerequisite is already known here, so
+        // stop before staging dependent capacity unnecessarily. The frozen
+        // definition is retained for reevaluation after owner acceptance.
+        self.check_port_binding(
+            FabricOperation::StageReservation,
+            &key,
+            Some(definition.fence.clone()),
+            None,
+        )?;
         let reservation = self
             .ports
             .admission_authority
@@ -1108,6 +1862,16 @@ impl AgentFabric {
                 "definition {definition_key} already admitted under a different reservation"
             )));
         }
+        // #1700: unresolved admission binding prevents launch with a typed
+        // residual naming the exact prerequisite and the blocked operation.
+        // Exact replay above stays untouched: an already-committed admission
+        // is returned without consulting the port again.
+        self.check_port_binding(
+            FabricOperation::CommitAdmission,
+            reservation_id,
+            Some(reservation.fence.clone()),
+            None,
+        )?;
         let receipt = self
             .ports
             .admission_authority
@@ -1153,6 +1917,399 @@ impl AgentFabric {
         Ok(receipt)
     }
 
+    /// Registers one Task-Controller semantic definition revision (issue
+    /// #1702).
+    ///
+    /// Only the holder of the definition's current Task Controller lease may
+    /// register; a valid payload digest never substitutes for author
+    /// authority. `DRAFT` and `FROZEN` revisions register; superseded or
+    /// cancelled history stays in the records and never re-registers as
+    /// current. Same-identity replay is exact; changed content conflicts.
+    /// Freezing (`DRAFT → FROZEN` with otherwise identical content) replaces
+    /// the stored draft; any other same-identity change is a conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns the semantic contract rejection,
+    /// [`FabricError::StaleOwnerLease`] for a foreign or stale controller, or
+    /// [`FabricError::DefinitionConflict`] for changed content under a live
+    /// identity.
+    pub fn register_semantic_definition(
+        &mut self,
+        definition: SwarmPlanDefinition,
+        controller_holder: &str,
+        controller_epoch: u64,
+    ) -> Result<(), FabricError> {
+        definition.validate().map_err(contract_rejection)?;
+        check_definition_author(&definition, controller_holder, controller_epoch)
+            .map_err(contract_rejection)?;
+        if !matches!(
+            definition.lifecycle,
+            SwarmPlanDefinitionLifecycle::Draft | SwarmPlanDefinitionLifecycle::Frozen
+        ) {
+            return Err(FabricError::BrokenOwnershipLink(
+                "only draft or frozen definitions register as current".to_owned(),
+            ));
+        }
+        let key = definition.definition_id.as_str().to_owned();
+        if let Some(stored) = self.semantic_definitions.get(&key).cloned() {
+            if stored == definition {
+                self.record("semantic_definition_replayed", &key);
+                return Ok(());
+            }
+            if stored.lifecycle == SwarmPlanDefinitionLifecycle::Draft {
+                let mut frozen = stored.clone();
+                frozen.lifecycle = SwarmPlanDefinitionLifecycle::Frozen;
+                if frozen == definition {
+                    self.semantic_definitions.insert(key.clone(), definition);
+                    self.record("semantic_definition_frozen", &key);
+                    return Ok(());
+                }
+            }
+            return Err(FabricError::DefinitionConflict(format!(
+                "semantic definition {key} reused with different bytes"
+            )));
+        }
+        self.semantic_definitions.insert(key.clone(), definition);
+        self.record("semantic_definition_registered", &key);
+        Ok(())
+    }
+
+    /// Binds one Governor semantic admission to its registered frozen
+    /// definition (issue #1702).
+    ///
+    /// Only `FROZEN` definitions may be admitted and only `ADMITTED`
+    /// dispositions bind; admitted ceilings must narrow, never widen, the
+    /// definition. Same-identity replay is exact; a second admission identity
+    /// for one definition conflicts, so a new definition revision always
+    /// yields a distinct admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns the semantic contract rejection,
+    /// [`FabricError::BrokenOwnershipLink`] when the definition is unknown,
+    /// not frozen, or not bound exactly, [`FabricError::SemanticDrift`] when
+    /// admitted ceilings widen the definition, or
+    /// [`FabricError::DefinitionConflict`] for a second admission identity on
+    /// one definition.
+    pub fn bind_semantic_admission(
+        &mut self,
+        admission: SwarmPlanAdmission,
+    ) -> Result<(), FabricError> {
+        admission.validate().map_err(contract_rejection)?;
+        let definition_key = admission.definition_id.as_str().to_owned();
+        let definition = self
+            .semantic_definitions
+            .get(&definition_key)
+            .cloned()
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic definition {definition_key}"))
+            })?;
+        if definition.lifecycle != SwarmPlanDefinitionLifecycle::Frozen {
+            return Err(FabricError::BrokenOwnershipLink(
+                "only frozen definitions may be admitted".to_owned(),
+            ));
+        }
+        if !admission.binds(&definition) {
+            return Err(FabricError::BrokenOwnershipLink(
+                "admission does not bind the exact frozen definition".to_owned(),
+            ));
+        }
+        if admission.disposition != SwarmPlanAdmissionDisposition::Admitted {
+            return Err(FabricError::BrokenOwnershipLink(
+                "only admitted dispositions bind".to_owned(),
+            ));
+        }
+        if !admission
+            .admitted_ceilings
+            .narrowed_from(&definition.ceilings)
+        {
+            return Err(FabricError::SemanticDrift(
+                "admitted ceilings widen the frozen definition".to_owned(),
+            ));
+        }
+        for existing in self.semantic_admissions.values() {
+            if existing.definition_id == admission.definition_id
+                && existing.admission_id != admission.admission_id
+            {
+                return Err(FabricError::DefinitionConflict(format!(
+                    "semantic definition {definition_key} already admitted under a different admission"
+                )));
+            }
+        }
+        let key = admission.admission_id.as_str().to_owned();
+        if let Some(stored) = self.semantic_admissions.get(&key).cloned() {
+            if stored == admission {
+                self.record("semantic_admission_replayed", &key);
+                return Ok(());
+            }
+            return Err(FabricError::DefinitionConflict(format!(
+                "semantic admission {key} reused with different bytes"
+            )));
+        }
+        self.semantic_admissions.insert(key.clone(), admission);
+        self.record("semantic_admission_bound", &key);
+        Ok(())
+    }
+
+    /// Mirrors the Governor disposition of a bound semantic admission (issue
+    /// #1702).
+    ///
+    /// The fabric never originates dispositions: the Governor owner decides
+    /// and this composition only records the transition after validating it
+    /// against the I14.20 admission lifecycle. Mirroring `SUPERSEDED` or
+    /// `CANCELLED` freezes new execution updates under the old admission;
+    /// retained records stay readable history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] for an unknown admission, or the
+    /// semantic contract rejection for an illegal disposition transition.
+    pub fn note_semantic_admission_disposition(
+        &mut self,
+        admission_id: &SwarmAdmissionId,
+        disposition: SwarmPlanAdmissionDisposition,
+    ) -> Result<(), FabricError> {
+        let key = admission_id.as_str().to_owned();
+        let mut admission =
+            self.semantic_admissions.get(&key).cloned().ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic admission {key}"))
+            })?;
+        admission.disposition = admission
+            .disposition
+            .decide(disposition)
+            .map_err(contract_rejection)?;
+        admission.validate().map_err(contract_rejection)?;
+        self.semantic_admissions.insert(key.clone(), admission);
+        self.record("semantic_admission_disposition_noted", &key);
+        Ok(())
+    }
+
+    /// Records one coordinator execution revision against its bound admission
+    /// (issue #1702).
+    ///
+    /// Validates the full ownership join at record time: the definition must
+    /// be registered, the admission bound, and the execution linked to both.
+    /// Same-identity replay is exact; changed content conflicts. Terminal
+    /// states are retained verbatim: history is never rewritten and
+    /// `UNKNOWN_OUTCOME` never becomes a clean failure here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] when the definition or admission is
+    /// unknown, the semantic contract rejection for a broken join, or
+    /// [`FabricError::DefinitionConflict`] for changed content under a live
+    /// execution identity.
+    pub fn record_semantic_execution(
+        &mut self,
+        execution: SwarmExecutionRevision,
+    ) -> Result<(), FabricError> {
+        execution.validate().map_err(contract_rejection)?;
+        let definition_key = execution.definition_id.as_str().to_owned();
+        let definition = self
+            .semantic_definitions
+            .get(&definition_key)
+            .cloned()
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic definition {definition_key}"))
+            })?;
+        let admission_key = execution.admission_id.as_str().to_owned();
+        let admission = self
+            .semantic_admissions
+            .get(&admission_key)
+            .cloned()
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic admission {admission_key}"))
+            })?;
+        check_owner_join(&definition, &admission, &execution).map_err(contract_rejection)?;
+        let key = execution.execution_id.as_str().to_owned();
+        if let Some(stored) = self.semantic_executions.get(&key).cloned() {
+            if stored == execution {
+                self.record("semantic_execution_replayed", &key);
+                return Ok(());
+            }
+            return Err(FabricError::DefinitionConflict(format!(
+                "semantic execution {key} reused with different bytes"
+            )));
+        }
+        self.semantic_executions.insert(key.clone(), execution);
+        self.record("semantic_execution_recorded", &key);
+        Ok(())
+    }
+
+    /// Guards one coordinator execution update against frozen plan semantics
+    /// (issue #1702).
+    ///
+    /// Mechanical updates under the current coordinator lease and the exact
+    /// active admission pass; any attempt to change the work graph,
+    /// objective, acceptance, ceilings, stop conditions, wave or root fails
+    /// with [`FabricError::SemanticDrift`]. Updates against a superseded
+    /// definition fail with [`FabricError::Superseded`]: replacement work
+    /// needs the new definition and its distinct admission. A stale or
+    /// foreign coordinator fails with [`FabricError::StaleOwnerLease`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] when the admission or execution is
+    /// unknown, or the mapped semantic rejection otherwise.
+    pub fn check_semantic_execution_update(
+        &self,
+        admission_id: &SwarmAdmissionId,
+        execution_id: &SwarmExecutionId,
+        update: &ExecutionUpdateProposal,
+        caller_holder: &str,
+        caller_epoch: u64,
+    ) -> Result<(), FabricError> {
+        let admission_key = admission_id.as_str().to_owned();
+        let admission = self
+            .semantic_admissions
+            .get(&admission_key)
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic admission {admission_key}"))
+            })?;
+        let execution_key = execution_id.as_str().to_owned();
+        let execution = self
+            .semantic_executions
+            .get(&execution_key)
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic execution {execution_key}"))
+            })?;
+        let definition_key = admission.definition_id.as_str().to_owned();
+        let definition = self
+            .semantic_definitions
+            .get(&definition_key)
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic definition {definition_key}"))
+            })?;
+        if self
+            .semantic_supersessions
+            .values()
+            .any(|link| link.prior_definition_id.as_str() == definition_key)
+        {
+            return Err(FabricError::Superseded(format!(
+                "semantic definition {definition_key} superseded; update through the replacement admission"
+            )));
+        }
+        check_execution_update(
+            definition,
+            admission,
+            execution,
+            update,
+            caller_holder,
+            caller_epoch,
+        )
+        .map_err(contract_rejection)
+    }
+
+    /// Proposes the replacement of active work with a new definition revision
+    /// (issue #1702).
+    ///
+    /// The proposer must hold the prior definition's current Task Controller
+    /// lease or the replacement's named lease (owner-loss reassignment under
+    /// a newer epoch); anyone else fails with
+    /// [`FabricError::StaleOwnerLease`]. The replacement links the exact
+    /// prior revision with an explicit drain/cancel/supersede disposition and
+    /// carries a distinct identity. Stored history is never mutated: the
+    /// prior frozen record stays verbatim and the link records the
+    /// disposition. The new revision still needs its distinct Governor
+    /// admission ([`AgentFabric::bind_semantic_admission`]) before any
+    /// execution runs under it, and the old admission disposition is mirrored
+    /// through [`AgentFabric::note_semantic_admission_disposition`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the semantic contract rejection, or
+    /// [`FabricError::DefinitionConflict`] when the replacement identity is
+    /// already registered.
+    pub fn supersede_semantic_definition(
+        &mut self,
+        next: SwarmPlanDefinition,
+        controller_holder: &str,
+        controller_epoch: u64,
+    ) -> Result<(), FabricError> {
+        next.validate().map_err(contract_rejection)?;
+        let link = next.supersedes.clone().ok_or_else(|| {
+            FabricError::BrokenOwnershipLink("replacement without supersedes link".to_owned())
+        })?;
+        let prior_key = link.prior_definition_id.as_str().to_owned();
+        let prior = self
+            .semantic_definitions
+            .get(&prior_key)
+            .cloned()
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic definition {prior_key}"))
+            })?;
+        if !prior
+            .controller
+            .authorizes(controller_holder, controller_epoch)
+            && !next
+                .controller
+                .authorizes(controller_holder, controller_epoch)
+        {
+            return Err(FabricError::StaleOwnerLease("task controller".to_owned()));
+        }
+        check_supersession(&prior, &next).map_err(contract_rejection)?;
+        let next_key = next.definition_id.as_str().to_owned();
+        if self.semantic_definitions.contains_key(&next_key) {
+            return Err(FabricError::DefinitionConflict(format!(
+                "replacement semantic definition {next_key} already registered"
+            )));
+        }
+        self.semantic_definitions.insert(next_key.clone(), next);
+        self.semantic_supersessions.insert(next_key.clone(), link);
+        self.record("semantic_definition_superseded", &next_key);
+        Ok(())
+    }
+
+    /// Reads the joined owner state as an explicit non-authoritative view
+    /// (issue #1702).
+    ///
+    /// Built only from validated stored records; joined reads never serve as
+    /// write authorization. Surfaces the pending replacement link, when one
+    /// is proposed, and preserved unknown effects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] when the admission or execution is
+    /// unknown, or the mapped semantic rejection for a broken join.
+    pub fn semantic_join_view(
+        &self,
+        admission_id: &SwarmAdmissionId,
+        execution_id: &SwarmExecutionId,
+        unknown_effects: Vec<String>,
+    ) -> Result<SwarmPlanView, FabricError> {
+        let admission_key = admission_id.as_str().to_owned();
+        let admission = self
+            .semantic_admissions
+            .get(&admission_key)
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic admission {admission_key}"))
+            })?;
+        let execution_key = execution_id.as_str().to_owned();
+        let execution = self
+            .semantic_executions
+            .get(&execution_key)
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic execution {execution_key}"))
+            })?;
+        let definition = self
+            .semantic_definitions
+            .get(execution.definition_id.as_str())
+            .ok_or_else(|| {
+                FabricError::Contract(format!(
+                    "unknown semantic definition {}",
+                    execution.definition_id.as_str()
+                ))
+            })?;
+        let pending = self
+            .semantic_supersessions
+            .values()
+            .find(|link| link.prior_definition_id == definition.definition_id)
+            .cloned();
+        join_view(definition, admission, execution, pending, unknown_effects)
+            .map_err(contract_rejection)
+    }
+
     /// Activates launch authority for one admitted attempt after the matching
     /// canonical receipt under an unchanged fence and epoch.
     ///
@@ -1183,6 +2340,14 @@ impl AgentFabric {
             self.record("activation_replayed", &key);
             return Ok(existing);
         }
+        // #1700: unresolved activation binding prevents launch with a typed
+        // residual. Replay of already-committed evidence stays untouched.
+        self.check_port_binding(
+            FabricOperation::Activate,
+            &key,
+            Some(admission.fence.clone()),
+            Some(admission.epoch.clone()),
+        )?;
         let evidence = self
             .ports
             .activation_authority
@@ -1293,6 +2458,15 @@ impl AgentFabric {
             .get(dispatch_id)
             .cloned()
             .ok_or_else(|| FabricError::Contract(format!("unknown dispatch {dispatch_id}")))?;
+        // #1700: stop before emitting when the egress port reports no
+        // accepted binding. The built intent is retained (never recomputed
+        // under a new ID) for reevaluation after owner acceptance.
+        self.check_port_binding(
+            FabricOperation::Emit,
+            dispatch_id,
+            Some(intent.fence.clone()),
+            Some(intent.epoch.clone()),
+        )?;
         let ack = self.ports.dispatch_egress.emit(&intent)?;
         if ack.dispatch_id != dispatch_id {
             return Err(FabricError::IdentityConflict(
@@ -1552,6 +2726,10 @@ impl AgentFabric {
             ledger: self.ledger.clone(),
             attempt_states: self.attempt_states.clone(),
             cancellations: self.cancellations.clone(),
+            semantic_definitions: self.semantic_definitions.clone(),
+            semantic_admissions: self.semantic_admissions.clone(),
+            semantic_executions: self.semantic_executions.clone(),
+            semantic_supersessions: self.semantic_supersessions.clone(),
         })
     }
 
@@ -1559,7 +2737,10 @@ impl AgentFabric {
     ///
     /// Definition, admission, lease, and epoch revisions are preserved;
     /// unresolved reservations stay unresolved and no second coordinator is
-    /// created.
+    /// created. Semantic ownership maps (issue #1702) verify strictly before
+    /// any state is adopted: contradictory definition/admission/execution
+    /// links fail closed with [`FabricError::BrokenOwnershipLink`] instead of
+    /// restoring authority.
     ///
     /// A snapshot carrying a verified provider binding is rejected here
     /// with [`FabricError::ProviderEvidenceRequired`]: without freshly
@@ -1572,7 +2753,8 @@ impl AgentFabric {
     ///
     /// Returns [`FabricError::ProviderEvidenceRequired`] when the snapshot
     /// holds a verified provider binding, the coordinator owner restore
-    /// rejection, or a stale-config conflict.
+    /// rejection, a stale-config conflict, or a broken semantic ownership
+    /// link.
     pub fn restore(
         snapshot: FabricSnapshot,
         config: CoordinatorConfig,
@@ -1589,6 +2771,10 @@ impl AgentFabric {
         ) {
             return Err(FabricError::ProviderEvidenceRequired);
         }
+        // Issue #1702: contradictory semantic ownership never restores
+        // authority. Legacy snapshots carry no semantic records and pass
+        // trivially.
+        verify_snapshot_semantics(&snapshot)?;
         let coordinator = AgentCoordinator::restore(
             snapshot.coordinator_snapshot.clone(),
             config.clone(),
@@ -1633,6 +2819,10 @@ impl AgentFabric {
             intent_by_operation,
             attempt_states: snapshot.attempt_states,
             cancellations: snapshot.cancellations,
+            semantic_definitions: snapshot.semantic_definitions,
+            semantic_admissions: snapshot.semantic_admissions,
+            semantic_executions: snapshot.semantic_executions,
+            semantic_supersessions: snapshot.semantic_supersessions,
             initialized: true,
         };
         fabric.record("fabric_restored", "fabric");
@@ -1664,6 +2854,10 @@ impl AgentFabric {
                 "restore config does not match the snapshotted coordinator config".to_owned(),
             ));
         }
+        // Issue #1702: contradictory semantic ownership never restores
+        // authority. Legacy snapshots carry no semantic records and pass
+        // trivially.
+        verify_snapshot_semantics(&snapshot)?;
         let coordinator = AgentCoordinator::restore_with_admitted_provider(
             snapshot.coordinator_snapshot.clone(),
             config.clone(),
@@ -1706,6 +2900,10 @@ impl AgentFabric {
             intent_by_operation,
             attempt_states: snapshot.attempt_states,
             cancellations: snapshot.cancellations,
+            semantic_definitions: snapshot.semantic_definitions,
+            semantic_admissions: snapshot.semantic_admissions,
+            semantic_executions: snapshot.semantic_executions,
+            semantic_supersessions: snapshot.semantic_supersessions,
             initialized: true,
         };
         fabric.record("fabric_restored_verified", "fabric");
@@ -1714,6 +2912,12 @@ impl AgentFabric {
 
     /// Restores the fabric on freshly resolved owner material in one call
     /// (issue #1108, verified restore for A8).
+    ///
+    /// Crate-internal: the only cross-crate restore path is
+    /// [`DaemonComposition::agent_fabric_restore_verified`](crate::DaemonComposition::agent_fabric_restore_verified),
+    /// which re-resolves the session halves over the live authenticated
+    /// session before calling this restore. External callers therefore
+    /// cannot restore effecting readiness with caller-held halves alone.
     ///
     /// Builds a fresh capability from `material` — the daemon's per-restore
     /// resolution over its authenticated session (fresh live fence, current
@@ -1727,7 +2931,7 @@ impl AgentFabric {
     ///
     /// Returns the capability construction rejection, the coordinator owner
     /// restore rejection, or a stale-config conflict unchanged.
-    pub fn restore_verified(
+    pub(crate) fn restore_verified(
         snapshot: FabricSnapshot,
         config: CoordinatorConfig,
         ports: FabricPorts,

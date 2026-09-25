@@ -3,6 +3,16 @@
 //! The binary owns only process lifetime and durable registration wiring. G-01
 //! and P-04 remain explicit provider boundaries; this root never manufactures
 //! authority or process evidence when those providers are not composed.
+//!
+//! Issue #74 makes the per-operation identity ledger durable. The protected
+//! launch binding still carries stable caller/launch fields only and never a
+//! per-operation [`eliot_protocol::RequestIdentity`]; instead every identity
+//! the issuer spends is projected into the same atomic snapshot publication as
+//! the registration state, and a restarted broker re-seeds its issuer from that
+//! recovered ledger before `self_register` can mint. A restart therefore
+//! continues from the protected launch/caller identity plus a *new*
+//! registration operation and never revives a historical request id,
+//! cancellation id, or idempotency key.
 
 #![forbid(unsafe_code)]
 
@@ -24,9 +34,11 @@ use eliot_process::{
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_user_broker_core::{
-    AuthorityPort, BrokerError, BrokerSnapshot, DurableRegistrationPort, HeartbeatReceipt,
-    HeartbeatRequest, LaunchGrant, LaunchRequest, PortError, ProcessPort, ProcessStartOutcome,
-    RegistrationReceipt, RequiredProvider, UserBroker,
+    AuthorityPort, BrokerAdmissionIdentity, BrokerControlOperation, BrokerError, BrokerSnapshot,
+    DurableRegistrationPort, HeartbeatReceipt, HeartbeatRequest, IssuedOperationIdentity,
+    IssuedOperationIdentityLedger, LaunchGrant, LaunchRequest, LostOperation, PortError,
+    ProcessPort, ProcessStartOutcome, RegistrationReceipt, RegistrationStatus, RequiredProvider,
+    UserBroker,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -43,12 +55,16 @@ pub use notify_fallback_ensure::{
     NotifyFallbackRegistration, ensure_notify_fallback_registered,
 };
 pub use notify_launch_callin::{
-    BrokerNotifyError, NotifyLaunchStage, VerifiedLaunchRef, resolve_broker_notify_launch,
+    BrokerNotifyError, BrokerNotifyLaunchAuthority, NotifyLaunchStage, VerifiedLaunchRef,
+    admit_notify_request, request_names_notify_image, resolve_broker_notify_launch,
     stage_normal_notify_launch,
 };
-use operation_identity::{IssuerHandle, OperationIdentityIssuer};
+use operation_identity::{
+    BrokerOperation, DurableIssuedIdentity, IssuerHandle, OperationIdentityIssuer,
+};
 use protected_launch_config::{
-    BrokerLaunchBinding, REGISTRATION_LEASE_TTL_MS, binding_digest, fresh_registration_request,
+    BrokerLaunchBinding, BrokerProcessBinding, REGISTRATION_LEASE_TTL_MS, binding_digest,
+    current_process_binding, current_process_identity, fresh_registration_request,
     load_protected_launch_binding,
 };
 
@@ -88,6 +104,89 @@ impl BrokerConfig {
     }
 }
 
+/// Typed, closed refusal taxonomy for the broker's own admission boundary.
+///
+/// A refusal keeps its exact cause across the composition and reaches the
+/// operation stream as its own stable code. Collapsing these into one
+/// "composition rejected" string would make an unverifiable principal
+/// indistinguishable from a lost lease, which is precisely the read the
+/// registration contour must never leave ambiguous.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum BrokerAdmissionRefusal {
+    /// The live process identity (id, start instant, or running image) could
+    /// not be proven, or the running image is not the executable this process
+    /// started from.
+    #[error("BROKER_PROCESS_IDENTITY_UNPROVABLE")]
+    ProcessIdentityUnprovable,
+    /// The live process identity changed after admission: a replaced image, a
+    /// recycled process id, or a substituted process.
+    #[error("BROKER_PROCESS_IDENTITY_CHANGED")]
+    ProcessIdentityChanged,
+    /// The durable registration belongs to another installation, SID, logon
+    /// Session, or boot Session, so this broker is not its owner.
+    #[error("BROKER_REGISTRATION_IDENTITY_FOREIGN")]
+    RegistrationIdentityForeign,
+    /// A broker-owned control operation named an effect whose outcome is not
+    /// yet proven; it must be reconciled before it can be cancelled.
+    #[error("BROKER_OPERATION_OUTCOME_UNRECONCILED")]
+    OperationOutcomeUnreconciled,
+    /// The launch's tool is not in the introduced operation set.
+    #[error("CAPABILITY_INTRODUCTION_REQUIRED")]
+    IntroductionOperationNotGranted,
+    /// The launch's resource root is not in the introduced resource set.
+    #[error("CAPABILITY_INTRODUCTION_REQUIRED")]
+    IntroductionResourceNotGranted,
+    /// The launch's effect ceiling exceeds the introduced ceiling.
+    #[error("CAPABILITY_INTRODUCTION_REQUIRED")]
+    IntroductionEffectCeilingExceeded,
+    /// The grant introduces no resource or credential for this launch.
+    #[error("CAPABILITY_INTRODUCTION_REQUIRED")]
+    IntroductionRequired,
+    /// The introduced resource or credential lease is not active.
+    #[error("CAPABILITY_GRANT_REVOKED")]
+    IntroductionExpired,
+    /// The launch's credential is not the one its introduction names.
+    #[error("CAPABILITY_INTRODUCTION_REQUIRED")]
+    IntroductionCredentialUnnamed,
+    /// An operation identity was already spent under a fenced generation.
+    #[error("IDENTITY_CONFLICT")]
+    OperationIdRetired,
+    /// An exact replay of an operation that a fenced generation already
+    /// spent, under a new generation.
+    #[error("UNKNOWN_OUTCOME")]
+    RetiredOperation,
+}
+
+impl BrokerAdmissionRefusal {
+    /// Returns the exact stable wire code of this refusal.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ProcessIdentityUnprovable => "BROKER_PROCESS_IDENTITY_UNPROVABLE",
+            Self::ProcessIdentityChanged => "BROKER_PROCESS_IDENTITY_CHANGED",
+            Self::RegistrationIdentityForeign => "BROKER_REGISTRATION_IDENTITY_FOREIGN",
+            Self::OperationOutcomeUnreconciled => "BROKER_OPERATION_OUTCOME_UNRECONCILED",
+            Self::IntroductionOperationNotGranted
+            | Self::IntroductionResourceNotGranted
+            | Self::IntroductionEffectCeilingExceeded
+            | Self::IntroductionRequired
+            | Self::IntroductionCredentialUnnamed => "CAPABILITY_INTRODUCTION_REQUIRED",
+            Self::IntroductionExpired => "CAPABILITY_GRANT_REVOKED",
+            Self::OperationIdRetired => "IDENTITY_CONFLICT",
+            Self::RetiredOperation => "UNKNOWN_OUTCOME",
+        }
+    }
+
+    /// Attaches the adapter detail that explains *why* the refusal happened
+    /// without letting that detail become the refusal's identity.
+    pub fn with_platform(self, detail: impl std::fmt::Display) -> CompositionError {
+        CompositionError::Admission {
+            refusal: self,
+            detail: detail.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CompositionError {
     #[error("invalid broker configuration: {0}")]
@@ -100,15 +199,105 @@ pub enum CompositionError {
     Protected(String),
     #[error("protected launch configuration: {0}")]
     Launch(String),
+    #[error("broker admission refused: {refusal} ({detail})")]
+    Admission {
+        /// Exact closed refusal cause.
+        refusal: BrokerAdmissionRefusal,
+        /// Adapter detail explaining the refusal; never its identity.
+        detail: String,
+    },
     #[error("broker recovery: {0}")]
     Recovery(#[source] BrokerError),
     #[error("Kernel front-door composition: {0}")]
     Kernel(String),
     #[error("Kernel front-door lock poisoned")]
     KernelLock,
+    /// The durable per-operation identity ledger recovered at startup
+    /// contradicts itself or the retained launch declaration. The broker
+    /// refuses to start rather than mint an identity a previous process
+    /// already spent.
+    #[error("durable operation identity ledger conflict: {0}")]
+    OperationIdentityLedger(String),
+    /// One broker-owned Kernel operation lost its acknowledgement. The exact
+    /// transport identity that issued it is named so the outcome is reconciled
+    /// by operation identity (issue #74 A6), never by a blind retry: a new
+    /// registration refresh, a second logoff, or a second launch is not
+    /// created from this path.
+    #[error(
+        "Kernel {operation} acknowledgement is unknown for request {request_id} (cancellation {cancellation_id}, idempotency key {idempotency_key}, canonical digest {canonical_digest}); the exact operation must be reconciled before any further effect"
+    )]
+    LostOperation {
+        /// Closed Kernel operation selector that issued the identity.
+        operation: &'static str,
+        /// Exact transport request id of the issued identity.
+        request_id: String,
+        /// Exact transport cancellation id of the issued identity.
+        cancellation_id: String,
+        /// Exact transport idempotency key of the issued identity.
+        idempotency_key: String,
+        /// Canonical digest of the exact operation payload.
+        canonical_digest: String,
+    },
 }
 
 type SharedKernelClient = Arc<Mutex<eliot_cli::kernel_client::KernelClient>>;
+
+/// Projects the composed per-operation identity issuer into the durable
+/// broker snapshot.
+///
+/// This is the one place where broker-local transport identity strings become
+/// durable state. It carries no authority: the registration receipt beside it
+/// in the same snapshot remains the only registration/epoch evidence, and the
+/// broker-local `user_broker_epoch` scalar is never copied into these rows.
+struct IssuedIdentityLedger {
+    issuer: IssuerHandle,
+}
+
+impl IssuedOperationIdentityLedger for IssuedIdentityLedger {
+    fn issued_operation_identities(&self) -> Vec<IssuedOperationIdentity> {
+        match self.issuer.lock() {
+            Ok(issuer) => issuer
+                .issued_identities()
+                .into_iter()
+                .map(IssuedOperationIdentity::from)
+                .collect(),
+            // A poisoned identity lock must not silently drop the spent
+            // identities from the durable snapshot; returning the empty
+            // projection makes the next issuance fail closed instead.
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+impl From<DurableIssuedIdentity> for IssuedOperationIdentity {
+    fn from(issued: DurableIssuedIdentity) -> Self {
+        Self {
+            operation: issued.operation,
+            canonical_digest: issued.canonical_digest,
+            request_id: issued.request_id,
+            idempotency_key: issued.idempotency_key,
+            cancellation_id: issued.cancellation_id,
+            deadline_unix_ms: issued.deadline_unix_ms,
+            issued_at_ms: issued.issued_at_ms,
+            caller_request_id: issued.caller_request_id,
+        }
+    }
+}
+
+impl From<&IssuedOperationIdentity> for DurableIssuedIdentity {
+    fn from(issued: &IssuedOperationIdentity) -> Self {
+        Self {
+            operation: issued.operation.clone(),
+            canonical_digest: issued.canonical_digest.clone(),
+            request_id: issued.request_id.clone(),
+            idempotency_key: issued.idempotency_key.clone(),
+            cancellation_id: issued.cancellation_id.clone(),
+            deadline_unix_ms: issued.deadline_unix_ms,
+            issued_at_ms: issued.issued_at_ms,
+            caller_request_id: issued.caller_request_id.clone(),
+        }
+    }
+}
 
 /// Retains observation-only process evidence without granting any additional
 /// authority to the broker or its callers.
@@ -303,6 +492,26 @@ impl LocalProcessPort {
         if grant.expires_at <= now {
             return Err(PortError::Denied);
         }
+        // The introduced user-session resource/credential has its own
+        // deadline, enforced here at the point of use rather than only at
+        // admission: a grant that outlived its own introduction, or a
+        // credential lease that ended inside it, cannot start a child.
+        let introduction = &grant.approved.introduction;
+        if introduction.expires_at <= now
+            || introduction
+                .credential_binding
+                .as_ref()
+                .is_some_and(|binding| binding.expires_at <= now)
+        {
+            return Err(PortError::Denied);
+        }
+        // The credential is introduced as an opaque reference only. It is
+        // deliberately NOT added to the child environment: `ProcessExecutor`
+        // refuses any request carrying environment secret references
+        // ("secret environment references require an admitted secret
+        // projection"), and I6.15 requires that signing secrets never enter
+        // a child environment. The child resolves the handle itself through
+        // its own crypto port, so nothing here materialises or forwards it.
         let intent = ProcessIntent::new(
             grant.approved.operation_id.clone(),
             grant.approved.process_tree_id.clone(),
@@ -604,8 +813,17 @@ pub struct BrokerComposition {
     providers_admitted: bool,
     launch_binding: Option<BrokerLaunchBinding>,
     launch_lease: Option<ProtectedPathLease>,
+    /// The live process identity this broker admitted itself as. Re-observed
+    /// on every authenticated operation; see [`Self::verify_launch_lease`].
+    process_binding: Option<BrokerProcessBinding>,
     registration_digest: Option<String>,
     identity_issuer: IssuerHandle,
+    /// Broker-retained normal Notify launch authority: the verified installed
+    /// `eliot-notify.exe` reference resolved from the installer-published
+    /// declaration at startup. This is what makes the notification adapter
+    /// launchable only from here; see
+    /// [`BrokerComposition::launch_notify`].
+    notify_launch: BrokerNotifyLaunchAuthority,
 }
 
 impl BrokerComposition {
@@ -681,24 +899,79 @@ impl BrokerComposition {
                     registration: None,
                     user_broker_epoch: 0,
                     operation_cursors: Vec::new(),
+                    operation_identities: Vec::new(),
+                    retired_operations: Vec::new(),
                 })
                 .map_err(|error| CompositionError::InvalidConfiguration(error.to_string()))?;
         }
         let providers_admitted = authority.is_some() && process.is_some();
         let mut broker = UserBroker::new(authority, process, Some(Box::new(durable)));
+        // The live identity ledger must be attached before recovery so the
+        // snapshot is republished with the exact identities this process
+        // issues, and before the first Kernel call can mint.
+        broker.attach_issued_operation_identity_ledger(Box::new(IssuedIdentityLedger {
+            issuer: issuer.clone(),
+        }));
         broker.recover().map_err(CompositionError::Recovery)?;
-        let registration_digest = broker.registration_digest().map(ToOwned::to_owned);
+        // The live process identity is observed before anything is admitted:
+        // an unprovable id/start/image means this process cannot name which
+        // process the declaration describes, so no registration is refreshed,
+        // no launch is admitted, and no control operation is accepted.
+        let process_binding = current_process_binding()?;
+        // Single-broker admission. A registration recovered from shared
+        // durable state is adopted only when it carries exactly this
+        // installation/SID/Session/boot-Session tuple; a surviving
+        // registration of another principal is refused, never heartbeated.
         let (launch_binding, launch_lease) = launch.map_or((None, None), |(binding, lease)| {
             (Some(binding), Some(lease))
         });
+        if let Some(binding) = launch_binding.as_ref() {
+            broker
+                .bind_admission(&BrokerAdmissionIdentity {
+                    installation_id: binding.registration.installation_id.clone(),
+                    windows_sid: binding.registration.windows_sid.clone(),
+                    interactive_session_id: binding.registration.interactive_session_id.clone(),
+                    boot_session_id: binding.registration.boot_session_id.clone(),
+                    broker_process_id: binding.registration.broker_process_id.clone(),
+                    broker_artifact_digest: binding.registration.broker_artifact_digest.clone(),
+                    protocol_generation: binding.registration.protocol_generation,
+                    launch_nonce: binding.registration.launch_nonce.clone(),
+                })
+                .map_err(|error| match error {
+                    BrokerError::StaleRegistrationIdentity => {
+                        BrokerAdmissionRefusal::RegistrationIdentityForeign.with_platform(error)
+                    }
+                    other => CompositionError::Recovery(other),
+                })?;
+        }
+        // A4: a restart continues from the protected launch/caller identity
+        // plus a new registration operation and never revives a historical
+        // request id.  Re-seeding the issuer from the recovered durable ledger
+        // before `self_register` is what holds that: every request id,
+        // cancellation id, and idempotency key the previous process spent is
+        // already bound to its exact operation, so replaying one is an
+        // identity conflict rather than a fresh mint.  A retained row that
+        // contradicts live state fails the whole composition closed.
+        let mut identity = issuer.lock().map_err(|_| CompositionError::KernelLock)?;
+        for retained in broker.recovered_operation_identities() {
+            identity
+                .restore_issued(&DurableIssuedIdentity::from(&retained))
+                .map_err(|error| CompositionError::OperationIdentityLedger(error.to_string()))?;
+        }
+        drop(identity);
+        let registration_digest = broker.registration_digest().map(ToOwned::to_owned);
         Ok(Self {
             broker,
             snapshot,
             providers_admitted,
             launch_binding,
             launch_lease,
+            process_binding: Some(process_binding),
             registration_digest,
             identity_issuer: issuer,
+            notify_launch: BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::Deferred {
+                reason: "NOT_STAGED",
+            }),
         })
     }
 
@@ -737,7 +1010,18 @@ impl BrokerComposition {
                 CompositionError::Launch("registration lease window overflowed".to_owned())
             })?;
         let declaration = fresh_registration_request(&binding, observed_at, lease_expires_at)?;
-        if self.broker.registration_digest().is_some() {
+        // A recovered registration is only refreshable while it is still the
+        // current one. A `Closed`/`Draining` registration — this process's
+        // own previous process after a clean stop, or a registration the
+        // Kernel already fenced — carries no launch authority, and renewing
+        // it would either resurrect a fenced lease or leave the broker unable
+        // to ever start again. Such a broker registers afresh under a new
+        // broker generation instead.
+        let refreshable = self.broker.registration().is_some_and(|registration| {
+            registration.status == RegistrationStatus::Active
+                && observed_at < registration.expires_at
+        });
+        if refreshable {
             let receipt = self.heartbeat()?;
             self.registration_digest = Some(receipt.registration_digest);
         } else {
@@ -755,6 +1039,14 @@ impl BrokerComposition {
 
     /// Refreshes the exact protected registration lease; the stdin protocol
     /// cannot manufacture or submit a heartbeat identity.
+    ///
+    /// A lost lease-refresh acknowledgement is first reconciled against the
+    /// durable registration bound to that exact operation. When the durable
+    /// projection already proves the renewal, the recovered receipt is
+    /// returned and no second refresh identity is minted; otherwise the exact
+    /// transport identity that lost its acknowledgement is named in
+    /// [`CompositionError::LostOperation`] and the broker must re-attach
+    /// through a fresh protected launch binding.
     pub fn heartbeat(&mut self) -> Result<HeartbeatReceipt, CompositionError> {
         self.verify_launch_lease()?;
         let registration_digest = self
@@ -768,13 +1060,14 @@ impl BrokerComposition {
             .as_millis()
             .try_into()
             .map_err(|error| CompositionError::Launch(format!("clock overflow: {error}")))?;
-        let receipt = self
-            .broker
-            .heartbeat(HeartbeatRequest {
-                registration_digest,
-                observed_at,
-            })
-            .map_err(CompositionError::Recovery)?;
+        let receipt = match self.broker.heartbeat(HeartbeatRequest {
+            registration_digest,
+            observed_at,
+        }) {
+            Ok(receipt) => receipt,
+            Err(BrokerError::UnknownOutcome) => return Err(self.lost_operation_error()),
+            Err(error) => return Err(CompositionError::Recovery(error)),
+        };
         self.registration_digest = Some(receipt.registration_digest.clone());
         Ok(receipt)
     }
@@ -784,11 +1077,63 @@ impl BrokerComposition {
     /// A clean stdin EOF and an admitted `stop` operation use the same durable
     /// close path; dropping the composition alone must never leave an active
     /// registration lease for the next process instance.
+    ///
+    /// The fence owns its own operation identity, so closing twice is one
+    /// Kernel operation, not two. A lost logoff acknowledgement is reconciled
+    /// against the durable projection of that exact fence: when the fence
+    /// landed, the close completes without a duplicate logoff; otherwise the
+    /// exact transport identity is named in
+    /// [`CompositionError::LostOperation`].
     pub fn close(&mut self) -> Result<(), CompositionError> {
         self.verify_launch_lease()?;
-        self.broker.logoff().map_err(CompositionError::Recovery)?;
-        self.registration_digest = None;
-        Ok(())
+        match self.broker.logoff() {
+            Ok(()) => {
+                self.registration_digest = None;
+                Ok(())
+            }
+            Err(BrokerError::UnknownOutcome) => Err(self.lost_operation_error()),
+            Err(error) => Err(CompositionError::Recovery(error)),
+        }
+    }
+
+    /// Reconciles a lost or unknown broker-owned Kernel acknowledgement by the
+    /// exact transport operation identity that issued it.
+    ///
+    /// The core classifies *which* broker-owned operation lost its outcome
+    /// (a lease refresh or a fence), and the exact transport identity for
+    /// that operation is read back from the issuer's spent ledger: request id,
+    /// cancellation id, idempotency key, and the canonical payload digest it
+    /// is bound to. Naming it here instead of returning a bare error is what
+    /// keeps a heartbeat/fence race from being settled by a second refresh, a
+    /// duplicate logoff, or a second launch under a new identity.
+    fn lost_operation_error(&mut self) -> CompositionError {
+        let Some(lost) = self.broker.take_lost_operation() else {
+            return CompositionError::OperationIdentityLedger(
+                "an unknown outcome was reported without a classified broker operation".to_owned(),
+            );
+        };
+        let operation = match lost {
+            LostOperation::LeaseRefresh => BrokerOperation::HeartbeatRenewal,
+            LostOperation::Fence => BrokerOperation::FenceLogoff,
+        };
+        let issued = self
+            .identity_issuer
+            .lock()
+            .ok()
+            .and_then(|issuer| issuer.last_issued(operation));
+        let Some(issued) = issued else {
+            return CompositionError::OperationIdentityLedger(format!(
+                "{} has no issued operation identity to reconcile",
+                operation.selector()
+            ));
+        };
+        CompositionError::LostOperation {
+            operation: operation.selector(),
+            request_id: issued.request_id,
+            cancellation_id: issued.cancellation_id,
+            idempotency_key: issued.idempotency_key,
+            canonical_digest: issued.canonical_digest,
+        }
     }
 
     /// Stages broker-bound Notify normal-launch inputs for one grant.
@@ -830,27 +1175,88 @@ impl BrokerComposition {
         )
     }
 
+    /// Stages the installer-published Notify declaration and RETAINS the
+    /// verified launch reference used by [`Self::launch_notify`].
+    ///
+    /// This is the composition's production entry to
+    /// [`stage_normal_notify_launch`]. The reference it retains is the whole
+    /// point: without it the broker could prove it *can* name the installed
+    /// image but had no authority to spawn one, which is exactly the gap that
+    /// left normal `eliot-notify` invocation unconstrained.
+    pub fn stage_notify_launch(&mut self) -> NotifyLaunchStage {
+        let authority = stage_normal_notify_launch(self);
+        let stage = authority.stage().clone();
+        self.notify_launch = authority;
+        stage
+    }
+
+    /// The broker-retained normal Notify launch authority.
+    #[must_use]
+    pub fn notify_launch_authority(&self) -> &BrokerNotifyLaunchAuthority {
+        &self.notify_launch
+    }
+
+    /// Spawns the per-user notification adapter on a Kernel-authorized grant.
+    ///
+    /// This is the ONLY dispatcher that may start `eliot-notify.exe`, and it is
+    /// notify-specific on purpose (I11.6:3, "Normal delivery is launched
+    /// through the authorized User Broker"). Before anything is dispatched the
+    /// request must satisfy three independent gates:
+    ///
+    /// 1. the protected launch lease still verifies and the registration is
+    ///    heartbeated, so a revoked or expired broker cannot spawn;
+    /// 2. this broker currently RETAINS a verified launch reference, resolved at
+    ///    startup from the installer-published declaration and bound to the
+    ///    broker's authenticated SID/session plus the Kernel-issued
+    ///    registration digest;
+    /// 3. the request names exactly that executable path and its artifact
+    ///    digest equals the digest of the bytes this broker observed.
+    ///
+    /// Only then is the request dispatched on the existing authority/process
+    /// ports, which apply the Kernel grant. A generic `Launch` request naming
+    /// the notify image is refused by the binary before reaching here (see
+    /// [`request_names_notify_image`]), so no other request shape can produce a
+    /// normal notification invocation.
+    pub fn launch_notify(
+        &mut self,
+        request: LaunchRequest,
+    ) -> Result<eliot_user_broker_core::LaunchReceipt, CompositionError> {
+        self.verify_launch_lease()?;
+        notify_launch_callin::admit_notify_request(&self.notify_launch, &request).map_err(
+            |error| CompositionError::Launch(format!("notify launch rejected: {}", error.code())),
+        )?;
+        // The dispatch itself is the existing generic authority/process path,
+        // so the Kernel grant, operation identity, and fencing stay exactly
+        // where they are; only the admission above is notify-specific.
+        self.launch(request)
+    }
+
     /// Heartbeats the protected registration before an admitted launch.
     pub fn launch(
         &mut self,
         request: LaunchRequest,
     ) -> Result<eliot_user_broker_core::LaunchReceipt, CompositionError> {
         let _ = self.heartbeat()?;
-        self.broker
-            .launch(request)
-            .map_err(CompositionError::Recovery)
+        self.broker.launch(request).map_err(Self::classify)
     }
 
     /// Cancels a broker-owned operation selected by its admitted operation
     /// identity.  The sealed operation permit remains inside `UserBroker`.
+    ///
+    /// The cancellation first passes the broker's own control-operation
+    /// admission: an exact durable cancel identity is recorded for that exact
+    /// target under the current registration, and a target whose outcome is
+    /// still unproven is refused so an unknown launch/effect is reconciled
+    /// before anything tries to erase it.
     pub fn cancel(
         &mut self,
         operation_id: &OperationId,
     ) -> Result<CancellationReceipt, CompositionError> {
         self.verify_launch_lease()?;
+        self.admit_control_operation(BrokerControlOperation::Cancel, operation_id)?;
         self.broker
             .cancel_operation(operation_id)
-            .map_err(CompositionError::Recovery)
+            .map_err(Self::classify)
     }
 
     /// Reconciles a broker-owned operation selected by its admitted operation
@@ -860,17 +1266,89 @@ impl BrokerComposition {
         operation_id: &OperationId,
     ) -> Result<ProcessExecutionView, CompositionError> {
         self.verify_launch_lease()?;
+        self.admit_control_operation(BrokerControlOperation::Reconcile, operation_id)?;
         self.broker
             .reconcile_operation(operation_id)
-            .map_err(CompositionError::Recovery)
+            .map_err(Self::classify)
     }
 
+    /// Records this broker-owned control operation's distinct durable
+    /// operation identity before its effect is dispatched.
+    fn admit_control_operation(
+        &mut self,
+        operation: BrokerControlOperation,
+        operation_id: &OperationId,
+    ) -> Result<(), CompositionError> {
+        let observed_at = now_unix_ms()?;
+        self.broker
+            .admit_control_operation(operation, operation_id, observed_at)
+            .map_err(Self::classify)
+    }
+
+    /// Projects one core refusal onto the broker's closed admission taxonomy.
+    ///
+    /// A refusal the broker can name keeps its exact cause and its own stable
+    /// code; anything else stays the typed `Recovery` variant rather than a
+    /// string. Nothing here is downgraded to a generic composition error.
+    fn classify(error: BrokerError) -> CompositionError {
+        let refusal = match error {
+            BrokerError::StaleRegistrationIdentity => {
+                Some(BrokerAdmissionRefusal::RegistrationIdentityForeign)
+            }
+            BrokerError::UnreconciledEffect(_) => {
+                Some(BrokerAdmissionRefusal::OperationOutcomeUnreconciled)
+            }
+            BrokerError::RetiredOperation(_) => Some(BrokerAdmissionRefusal::RetiredOperation),
+            BrokerError::OperationIdRetired(_) => Some(BrokerAdmissionRefusal::OperationIdRetired),
+            BrokerError::IntroductionRequired(_) => {
+                Some(BrokerAdmissionRefusal::IntroductionRequired)
+            }
+            BrokerError::IntroductionOperationNotGranted => {
+                Some(BrokerAdmissionRefusal::IntroductionOperationNotGranted)
+            }
+            BrokerError::IntroductionResourceNotGranted => {
+                Some(BrokerAdmissionRefusal::IntroductionResourceNotGranted)
+            }
+            BrokerError::IntroductionEffectCeilingExceeded => {
+                Some(BrokerAdmissionRefusal::IntroductionEffectCeilingExceeded)
+            }
+            BrokerError::IntroductionExpired => Some(BrokerAdmissionRefusal::IntroductionExpired),
+            BrokerError::IntroductionCredentialUnnamed => {
+                Some(BrokerAdmissionRefusal::IntroductionCredentialUnnamed)
+            }
+            _ => None,
+        };
+        match refusal {
+            Some(refusal) => refusal.with_platform(error),
+            None => CompositionError::Recovery(error),
+        }
+    }
+
+    /// Proves, before any authenticated broker operation, that the protected
+    /// launch declaration is still the retained protected object *and* that
+    /// this process is still the process that was admitted.
+    ///
+    /// The launch lease alone cannot carry that: it proves the declaration
+    /// bytes are intact, not that the running image, process id, and process
+    /// start are the ones the broker authenticated itself with. Both are
+    /// re-proven here so a replaced image, a recycled process id, or a
+    /// substituted process fails closed before a register, heartbeat, launch,
+    /// cancel, reconcile, or close can cross the Kernel boundary.
     fn verify_launch_lease(&self) -> Result<(), CompositionError> {
         if let Some(lease) = &self.launch_lease {
             lease
                 .verify_stable_identity()
                 .and_then(|()| lease.verify_path_identity())
                 .map_err(|error| CompositionError::Protected(error.to_string()))?;
+        }
+        let bound = self.process_binding.as_ref().ok_or_else(|| {
+            BrokerAdmissionRefusal::ProcessIdentityUnprovable
+                .with_platform("broker process identity is not bound")
+        })?;
+        let observed = current_process_identity()?;
+        if !bound.identity.is_same_process(&observed) {
+            return Err(BrokerAdmissionRefusal::ProcessIdentityChanged
+                .with_platform("live process identity differs from the admitted one"));
         }
         Ok(())
     }

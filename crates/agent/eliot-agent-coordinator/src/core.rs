@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentAttempt, AgentResult, AttemptId, AttemptState, AuthorityEnvelope,
-    CancellationState, CandidateSelectionDisposition, ContinuityKind, ContractError, EffectCeiling,
-    EffectKind, HostEventNormalizationReceipt, HostEventQuarantineReason,
-    HostEventReplayDisposition, NormalizedHostEventEnvelope, PhysicalRouteObservationReceipt,
+    CancellationState, CandidateSelectionDisposition, CommittedHostEventIntake, ContinuityKind,
+    ContractError, EffectCeiling, EffectKind, HostEventNormalizationReceipt,
+    HostEventQuarantineReason, HostEventReplayDisposition, MAX_ROUTE_CANDIDATES,
+    NormalizedHostEventEnvelope, NormalizedHostEventPayload, PhysicalRouteObservationReceipt,
     ProviderExecutionBinding, ProviderObservationLineage, RejectedRouteCandidate,
     ResultDisposition, RouteSelectionCandidate, WorkLeaseId, candidate_digest_for,
     validate_execution_binding,
@@ -35,6 +36,9 @@ use crate::model::{
 };
 use crate::provider_admission::{
     AdmittedProviderCapability, KernelProviderVerifier, ProviderSelectionHealth,
+};
+use crate::swarm_definition_admission::{
+    SwarmDefinitionAdmissionPrep, compile_swarm_definition_admission,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -606,6 +610,25 @@ impl AgentCoordinator {
             request: Box::new(request),
         });
         Ok(candidate)
+    }
+
+    /// Prepares one Task Controller-authored swarm definition for Governor
+    /// admission without admitting it (issue #1699).
+    ///
+    /// This is the production caller of `compile_swarm_definition_admission`:
+    /// a valid `eliot_swarm::SwarmPlanProposal` plus sealed
+    /// `eliot_swarm::SealedIndependentMaps` traverses the reachable
+    /// `eliotd` → `AgentCoordinator` → `eliot-swarm` owner path to
+    /// coordinator-managed admission preparation. The prep is candidate-only
+    /// and performs no durable write, queue insertion, launch, or recovery;
+    /// Governor admission and launch stay with the existing injected
+    /// admission/activation/dispatch ports.
+    pub fn prepare_swarm_definition_admission(
+        &self,
+        proposal: &eliot_swarm::SwarmPlanProposal,
+        maps: &eliot_swarm::SealedIndependentMaps,
+    ) -> Result<SwarmDefinitionAdmissionPrep, CoordinatorError> {
+        compile_swarm_definition_admission(&self.config, proposal, maps)
     }
 
     /// Reconciles only an admission accepted by the sealed verifier.
@@ -1472,6 +1495,80 @@ impl AgentCoordinator {
         Ok(receipt)
     }
 
+    /// Verifies a `candidate-result-available` reference against the retained
+    /// admitted #370 submission for its attempt: the reference attempt must
+    /// resolve (session-only references carry no attempt authority), the
+    /// attempt must have a recorded result submission with a stored
+    /// admission, and the reference must verify against both (attempt,
+    /// governing admission, and recomputed result digest). A reference
+    /// without recorded linkage is an identity conflict; a reference naming
+    /// a different result than the admitted one is quarantined as
+    /// conflicting payload. Runs before any mutation.
+    fn check_candidate_reference(
+        &self,
+        event: &NormalizedHostEventEnvelope,
+        attempt_id: Option<&AttemptId>,
+    ) -> Result<(), CoordinatorError> {
+        let NormalizedHostEventPayload::CandidateResultAvailable(reference) = &event.payload else {
+            return Ok(());
+        };
+        let attempt = attempt_id.ok_or(CoordinatorError::IdentityConflict(
+            "candidate_result_reference",
+        ))?;
+        let stored_admission = self
+            .attempts
+            .get(attempt)
+            .cloned()
+            .ok_or(CoordinatorError::UnknownAttempt)?
+            .admitted_route
+            .clone()
+            .ok_or(CoordinatorError::IdentityConflict("admitted_route"))?;
+        let admitted = self.candidate_reference_result(attempt)?;
+        reference
+            .verify_against(&admitted, &stored_admission)
+            .map_err(|error| match error {
+                ContractError::BindingMismatch => {
+                    CoordinatorError::IdentityConflict("candidate_result_reference")
+                }
+                ContractError::DigestMismatch => CoordinatorError::HostEventQuarantine(
+                    HostEventQuarantineReason::ConflictingPayload,
+                ),
+                other => CoordinatorError::ProviderContract(other.to_string()),
+            })
+    }
+
+    /// Returns the retained admitted candidate result backing a
+    /// `candidate-result-available` reference: the submission linked to the
+    /// attempt by [`Self::submit_result`], read back from the retained
+    /// `ResultSubmitted` event. A reference for an attempt with no recorded
+    /// submission names no admitted receipt and fails as an identity
+    /// conflict before any mutation.
+    fn candidate_reference_result(
+        &self,
+        attempt: &AttemptId,
+    ) -> Result<AgentResult, CoordinatorError> {
+        let submission_id =
+            self.result_by_attempt
+                .get(attempt)
+                .ok_or(CoordinatorError::IdentityConflict(
+                    "candidate_result_reference",
+                ))?;
+        self.events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                CoordinatorEvent::ResultSubmitted { submission, .. }
+                    if submission.submission_id == *submission_id =>
+                {
+                    Some(submission.result.clone())
+                }
+                _ => None,
+            })
+            .ok_or(CoordinatorError::IdentityConflict(
+                "candidate_result_reference",
+            ))
+    }
+
     /// Observes one closed v7 provider host event under the exact recorded
     /// lineage (issue #371 S7).
     ///
@@ -1530,6 +1627,12 @@ impl AgentCoordinator {
     ///   model 642-650); the accepted observation then records its own
     ///   sequence. Reordered (stale) arrivals therefore stay stale and gaps
     ///   regenerate deterministically on snapshot restore.
+    /// - a `candidate-result-available` reference is verified against the
+    ///   retained admitted #370 submission for its attempt (attempt,
+    ///   governing admission, and recomputed result digest): a reference
+    ///   without recorded linkage is an identity conflict, and a reference
+    ///   naming a different result than the admitted one is quarantined as
+    ///   conflicting payload, both before any mutation.
     ///
     /// Observations never synthesize a candidate result or a Finish: usage,
     /// terminality, results, and completion are untouched here, so a
@@ -1603,6 +1706,9 @@ impl AgentCoordinator {
                 Some(current.attempt_id.clone())
             }
         };
+        // A `candidate-result-available` reference names the exact admitted
+        // #370 receipt by digest (see [`Self::check_candidate_reference`]).
+        self.check_candidate_reference(&event, attempt_id.as_ref())?;
         if let Some(attempt) = &attempt_id {
             let last = self.last_host_sequence.get(attempt).copied().unwrap_or(0);
             if event.sequence <= last {
@@ -1634,6 +1740,26 @@ impl AgentCoordinator {
                 normalization: Box::new(normalization),
             });
         Ok(())
+    }
+
+    /// Observes one committed durable journal record through the neutral
+    /// intake view (issues #371 W7/A27: the journal→intake conversion edge).
+    ///
+    /// Every preserved fact on the view is re-verified against the carried
+    /// envelope (receipt equality, recomputed output digest,
+    /// identity/sequence/cursor/predecessor/delivery/payload-kind/
+    /// generation/fence agreement, stable-identity recomputation) before
+    /// delegating to [`Self::observe_provider_event`]: a view that drifted
+    /// from its envelope rejects here without mutation. Acknowledgement
+    /// state is observed, never advanced: cursor acknowledgement follows
+    /// durable linkage/disposition, not this in-memory return.
+    pub fn observe_committed_intake(
+        &mut self,
+        context: ExecutionContext,
+        intake: CommittedHostEventIntake,
+    ) -> Result<(), CoordinatorError> {
+        intake.verify().map_err(binding_contract)?;
+        self.observe_provider_event(context, intake.envelope, intake.receipt)
     }
 
     pub fn reconcile_unknown_outcome(
@@ -2418,18 +2544,49 @@ fn validate_recipe(request: &StaffingPlanRequest) -> Result<(), CoordinatorError
     Ok(())
 }
 
+/// Hard-constraint rejection codes recorded in
+/// [`RejectedRouteCandidate::reason_code`] (issue #1703). Rank losers keep
+/// `LOWER_DETERMINISTIC_RANK`; these codes name the exact failed eligibility
+/// dimension so the receipt exposes the material hard-constraint rationale.
+/// Reason codes are selector-owned labels and prove nothing by themselves.
+const REJECT_CAPACITY_MISMATCH: &str = "CAPACITY_MISMATCH";
+const REJECT_NO_CAPACITY: &str = "NO_CAPACITY";
+const REJECT_ROUTE_CLASS: &str = "ROUTE_CLASS_REJECTED";
+const REJECT_MISSING_EVIDENCE: &str = "MISSING_EVIDENCE";
+
+#[allow(clippy::too_many_lines)]
 fn select_route(
     config: &CoordinatorConfig,
     request: &StaffingPlanRequest,
     role: &RoleProfileManifest,
-    mut candidates: Vec<RouteCandidateEvidence>,
+    candidates: Vec<RouteCandidateEvidence>,
     health: Option<&ProviderSelectionHealth>,
 ) -> Result<RouteSelectionCandidate, CoordinatorError> {
     if candidates.is_empty() {
         return Err(CoordinatorError::RouteEvidence);
     }
+    // Whole-request bound before expensive processing (issue #1703, I10.15
+    // route allocation): an over-bound set rejects instead of silently
+    // truncating the considered set.
+    if candidates.len() > MAX_ROUTE_CANDIDATES {
+        return Err(CoordinatorError::RouteEvidence);
+    }
+    // Contradictory input rejects as a whole: a duplicated route identity is
+    // malformed, not an honest ineligible alternative.
     let mut identities = BTreeSet::new();
     for candidate in &candidates {
+        if !identities.insert(route_key(&candidate.route)) {
+            return Err(CoordinatorError::DuplicateIdentity("route_candidate"));
+        }
+    }
+    // Hard constraints filter before ranking (issue #1703, I10.15 route
+    // allocation): malformed shapes reject the whole request, while honest
+    // hard-constraint misses become per-candidate ineligibility with a reason
+    // code, so one exhausted candidate never erases valid alternatives and a
+    // cheaper/high-ranked but ineligible route can never win.
+    let mut eligible = Vec::with_capacity(candidates.len());
+    let mut ineligible = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
         candidate.route.validate().map_err(provider_contract)?;
         candidate
             .budget_evidence
@@ -2437,47 +2594,76 @@ fn select_route(
             .map_err(provider_contract)?;
         validate_text(&candidate.capacity_identity, "capacity_identity")?;
         validate_text(candidate.capacity_revision.as_str(), "capacity_revision")?;
-        if candidate.capacity_limit == 0
-            || candidate.capacity_identity != config.capacity_identity
-            || candidate.capacity_revision != config.capacity_revision
-            || candidate.evidence_refs.is_empty()
-        {
-            return Err(CoordinatorError::RouteEvidence);
-        }
-        if !route_class_allowed(
-            &request.launch.allowed_route_classes,
-            &candidate.route.provider,
-        ) || !route_class_allowed(&role.allowed_route_classes, &candidate.route.provider)
-        {
-            return Err(CoordinatorError::RouteEvidence);
-        }
         for evidence in &candidate.evidence_refs {
             validate_text(evidence, "route_evidence_ref")?;
         }
-        if !identities.insert(route_key(&candidate.route)) {
-            return Err(CoordinatorError::DuplicateIdentity("route_candidate"));
+        let reason_code = if candidate.capacity_identity != config.capacity_identity
+            || candidate.capacity_revision != config.capacity_revision
+        {
+            Some(REJECT_CAPACITY_MISMATCH)
+        } else if candidate.capacity_limit == 0 {
+            Some(REJECT_NO_CAPACITY)
+        } else if !route_class_allowed(&request.launch.allowed_route_classes, &candidate.route)
+            || !route_class_allowed(&role.allowed_route_classes, &candidate.route)
+        {
+            Some(REJECT_ROUTE_CLASS)
+        } else if candidate.evidence_refs.is_empty() {
+            Some(REJECT_MISSING_EVIDENCE)
+        } else {
+            None
+        };
+        if let Some(reason_code) = reason_code {
+            ineligible.push(RejectedRouteCandidate {
+                route: candidate.route,
+                reason_code: reason_code.to_owned(),
+                evidence_ref: candidate.evidence_refs.first().cloned(),
+            });
+        } else {
+            eligible.push(candidate);
         }
     }
-    candidates.sort_by(|left, right| {
+    if eligible.is_empty() {
+        // Typed refusal before admission: no eligible route selects nothing
+        // and falls back to no provider. The bounded per-candidate reasons
+        // are recomputed deterministically by re-running selection over the
+        // same inputs.
+        return Err(CoordinatorError::RouteEvidence);
+    }
+    eligible.sort_by(|left, right| {
         left.preference_rank
             .cmp(&right.preference_rank)
             .then_with(|| route_key(&left.route).cmp(&route_key(&right.route)))
     });
-    let selected = candidates.remove(0);
-    let all_routes = std::iter::once(selected.route.clone())
-        .chain(candidates.iter().map(|candidate| candidate.route.clone()))
-        .collect::<Vec<_>>();
-    let rejected = candidates
-        .into_iter()
-        .map(|candidate| RejectedRouteCandidate {
+    // Deterministic rejected order: hard-constraint misses by field-complete
+    // route key first, then lower-ranked alternatives in rank order. A sole
+    // eligible candidate keeps an honestly empty rank tail: no alternative is
+    // invented.
+    ineligible.sort_by_key(|rejected| route_key(&rejected.route));
+    let selected = eligible.remove(0);
+    let mut rank_rejected = Vec::with_capacity(eligible.len());
+    let mut all_routes = Vec::with_capacity(eligible.len() + ineligible.len() + 1);
+    all_routes.push(selected.route.clone());
+    for candidate in eligible {
+        all_routes.push(candidate.route.clone());
+        rank_rejected.push(RejectedRouteCandidate {
             route: candidate.route,
             reason_code: "LOWER_DETERMINISTIC_RANK".to_owned(),
             evidence_ref: candidate.evidence_refs.first().cloned(),
-        })
-        .collect::<Vec<_>>();
+        });
+    }
+    for rejected_candidate in &ineligible {
+        all_routes.push(rejected_candidate.route.clone());
+    }
+    let mut rejected = ineligible;
+    rejected.extend(rank_rejected);
     // Typed policy revision binds to the fence's policy revision when present;
     // no bare-string parsing. Capability/intent/scope are deterministic
     // staffing-lane projections, never admission claims.
+    // Explicit compatibility (issue #1703 residual): an absent fence policy
+    // keeps the long-standing genesis mapping so pre-policy wire still plans;
+    // the selector cannot mint an unknown-policy marker in the required
+    // `PolicyRevision` field, so callers must supply the fence revision and
+    // the fence producer owns making it always present.
     let policy_revision = request
         .state_fence
         .policy_revision
@@ -2523,10 +2709,22 @@ fn select_route(
     Ok(candidate)
 }
 
-fn route_class_allowed(allowed_route_classes: &[String], provider: &str) -> bool {
-    allowed_route_classes
-        .iter()
-        .any(|class| class == provider || class == "*")
+/// Owner-defined route-class match (issue #1703): a class entry names a
+/// provider, host family, or adapter label, or the `*` wildcard. Route class
+/// is an owner-defined property, not necessarily the provider name. The model
+/// display name never satisfies a class constraint on its own: model-name
+/// inference is forbidden, so a class naming only a model stays ineligible.
+/// Both the launch and the role allowlists must admit the candidate.
+fn route_class_allowed(
+    allowed_route_classes: &[String],
+    route: &eliot_agent_api::RouteFingerprint,
+) -> bool {
+    allowed_route_classes.iter().any(|class| {
+        class == "*"
+            || class.as_str() == route.provider
+            || class.as_str() == route.host_family
+            || class.as_str() == route.adapter
+    })
 }
 
 fn validate_admission_text(receipt: &ProviderAdmissionReceipt) -> Result<(), CoordinatorError> {
@@ -2660,12 +2858,24 @@ fn validate_lane_admission(
         return Err(CoordinatorError::IdentityConflict("admitted_route"));
     }
     // Bind the exact candidate bytes and policy: the admission cannot
-    // reinterpret a newer policy or route under the same identity.
-    if admission.candidate_digest != lane.routing_receipt_digest
+    // reinterpret a newer policy or route under the same identity. The
+    // admission's claimed digest must equal the digest recomputed from the
+    // exact candidate bytes here (issue #228 A3), never merely the lane's
+    // stored copy: agreeing copies of a wrong digest fail closed.
+    let recomputed_candidate_digest = candidate_digest_for(routing)
+        .map_err(|error| CoordinatorError::Serialization(error.to_string()))?;
+    if admission.candidate_digest != recomputed_candidate_digest
+        || lane.routing_receipt_digest != recomputed_candidate_digest
         || admission.policy_revision != routing.policy_revision
     {
         return Err(CoordinatorError::IdentityConflict("admitted_route"));
     }
+    // The admission reference digest itself must also validate through the
+    // owner validator so a well-formed copy of a foreign candidate still
+    // fails against the exact candidate bytes.
+    admission
+        .validate_for_candidate(routing)
+        .map_err(provider_contract)?;
     Ok(())
 }
 

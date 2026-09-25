@@ -141,28 +141,88 @@ type SharedTransport = Rc<RefCell<KernelTransportOwner>>;
 /// Fail-closed event-route face: the Kernel front door admits activation
 /// and host-request envelopes, but no MCP/event forwarding route.
 ///
-/// Every method fails closed while distinguishing the four acknowledgement
-/// phases honestly. Receipt is owned by the bridge: the core journals the
-/// host event (`observe_host_event`) before the port is called, so the
-/// receipt stands in the bridge journal even though forwarding is refused.
-/// Durability, normalization, and application are owned by the Kernel
-/// observation route, which has not admitted this bridge — so no Kernel ORS
-/// durable record is staged, nothing is normalized, and nothing is applied.
-/// The event-delivery capability is therefore exposed as unavailable with
-/// its owner/dependency reference (#77 req 4 allocates the bounded
-/// event-delivery/reconciliation child to the Kernel observation/ORS
+/// The face holds the same retained transport owner as the activation and
+/// host-request faces (one admitted transport, one runtime, one lease —
+/// never a second transport, runtime, or lease). Every call first runs the
+/// closed local half of the forwarding map: envelope/gap shape validation
+/// through the existing contract validators, then a validated
+/// continuity/recovery binding check of the presented attach binding against
+/// the retained kernel-issued session captured by the one-shot activation
+/// exchange. A foreign, stale, or pre-activation session is refused here
+/// with its own typed refusal and never reaches the event route; a
+/// reconnect may therefore deliver an old producer's unacknowledged event
+/// only while it still presents the same kernel-issued session. Producer
+/// generation fencing, operational staging, provider normalization,
+/// Governor ingest, and result readback belong to the Kernel
+/// observation/ORS event route, which has not admitted this bridge.
+///
+/// Every method still fails closed while distinguishing the four
+/// acknowledgement phases honestly. Receipt is owned by the bridge: the core
+/// journals the host event (`observe_host_event`) before the port is called,
+/// so the receipt stands in the bridge journal even though forwarding is
+/// refused. Durability, normalization, and application are owned by the
+/// Kernel observation route, which has not admitted this bridge — so no
+/// Kernel ORS durable record is staged, nothing is normalized, and nothing
+/// is applied. The event-delivery capability is therefore exposed as
+/// unavailable with its owner/dependency reference (#77 req 4 allocates the
+/// bounded event-delivery/reconciliation child to the Kernel observation/ORS
 /// owner): neither `ReconcileExternal` (also unadmitted here) nor a retry
 /// can succeed until that route is admitted. Host-request
 /// submit/cancel/reconcile entries carry invocation intent and are not
 /// event delivery; never resubmit a refused event as a host request.
-struct KernelMcpForwardingPort;
+struct KernelMcpForwardingPort {
+    shared: SharedTransport,
+}
+
+impl KernelMcpForwardingPort {
+    /// Runs the validated continuity/recovery binding check for one
+    /// forwarding call against the single retained transport owner.
+    ///
+    /// The presented attach binding must still name the exact kernel-issued
+    /// session the one-shot activation exchange captured on this admitted
+    /// transport. Session identity is the continuity binding a reconnect
+    /// preserves, so a foreign session, a stale pre-activation binding, or a
+    /// call before any activation completes is refused here — before any
+    /// route refusal — with a typed continuity refusal. A matching session
+    /// returns `Ok(())` so the caller falls through to the unadmitted-route
+    /// refusal; it never implies durability, normalization, or application.
+    fn check_continuity(&self, binding: &AttachBinding) -> Result<(), ProviderFailure> {
+        let owner = self.shared.try_borrow().map_err(|_| {
+            ProviderFailure::new(
+                "eliot-kernel-front-door",
+                "event continuity check unavailable: retained transport owner is mutably borrowed",
+            )
+        })?;
+        let live = owner.activated_session.as_deref().unwrap_or("");
+        if !live.is_empty() && live == binding.session_id().as_str() {
+            return Ok(());
+        }
+        Err(ProviderFailure::new(
+            "eliot-kernel-front-door",
+            "event continuity refused: presented attach session is not the retained kernel-issued \
+             session for this admitted transport (foreign, stale, or pre-activation binding); no \
+             Kernel durable record staged, nothing normalized or applied; owner: Kernel \
+             observation route (#77 req 4 allocates the event-delivery/reconciliation child \
+             there); reconnect must present the validated continuity binding",
+        ))
+    }
+}
 
 impl McpForwardingPort for KernelMcpForwardingPort {
     fn forward_hook(
         &mut self,
-        _binding: &AttachBinding,
-        _event: &HostEventEnvelope,
+        binding: &AttachBinding,
+        event: &HostEventEnvelope,
     ) -> Result<(), ProviderFailure> {
+        if event.validate().is_err() {
+            return Err(ProviderFailure::new(
+                "eliot-kernel-front-door",
+                "hook envelope refused: host event envelope failed closed validation (identity, \
+                 sequence, or route); nothing staged, nothing forwarded; owner: Kernel observation \
+                 route (#77 req 4 allocates the event-delivery/reconciliation child there)",
+            ));
+        }
+        self.check_continuity(binding)?;
         Err(ProviderFailure::new(
             "eliot-kernel-front-door",
             "hook forwarding unavailable: no admitted Kernel observation/ORS event route \
@@ -175,9 +235,19 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     }
     fn forward_event(
         &mut self,
-        _binding: &AttachBinding,
-        _event: &EventEnvelope,
+        binding: &AttachBinding,
+        event: &EventEnvelope,
     ) -> Result<EventPortOutcome, ProviderFailure> {
+        if event.validate().is_err() {
+            return Err(ProviderFailure::new(
+                "eliot-kernel-front-door",
+                "event envelope refused: durable/control event envelope failed closed validation \
+                 (identity, sequence, or fence/authority coherence); nothing staged, nothing \
+                 forwarded; owner: Kernel observation route (#77 req 4 allocates the \
+                 event-delivery/reconciliation child there)",
+            ));
+        }
+        self.check_continuity(binding)?;
         Err(ProviderFailure::new(
             "eliot-kernel-front-door",
             "event forwarding unavailable: no admitted Kernel observation/ORS event route \
@@ -190,9 +260,18 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     }
     fn forward_gap(
         &mut self,
-        _binding: &AttachBinding,
-        _gap: &eliot_agent_bridge_core::CoverageGap,
+        binding: &AttachBinding,
+        gap: &eliot_agent_bridge_core::CoverageGap,
     ) -> Result<(), ProviderFailure> {
+        if gap.validate().is_err() {
+            return Err(ProviderFailure::new(
+                "eliot-kernel-front-door",
+                "gap refused: coverage gap failed closed validation (identity or interval); no \
+                 coverage advanced; owner: Kernel observation route (#77 req 4 allocates the \
+                 event-delivery/reconciliation child there)",
+            ));
+        }
+        self.check_continuity(binding)?;
         Err(ProviderFailure::new(
             "eliot-kernel-front-door",
             "gap forwarding unavailable: no admitted Kernel observation/ORS event route, so \
@@ -203,8 +282,9 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     }
     fn reconcile_external(
         &mut self,
-        _binding: &AttachBinding,
+        binding: &AttachBinding,
     ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
+        self.check_continuity(binding)?;
         Err(ProviderFailure::new(
             "eliot-kernel-front-door",
             "event-route reconciliation unavailable: no admitted Kernel observation/ORS \
@@ -265,11 +345,14 @@ fn load_declaration(path: &Path) -> Result<LoadedAgentBridgeDeclaration, Runtime
 /// only rehydrate hook: the Kernel-owned reconcile/restore entries
 /// (`agent_host_request_reconcile`, `REACTIVE_RESTORE_OPERATION`) reuse it,
 /// so no second transport and no duplicated envelope state machine exist
-/// here. The forwarding face deliberately holds no transport: refused events
-/// expose the unadmitted event-delivery capability with its Kernel
+/// here. The forwarding face holds a third clone of the same owner: refused
+/// events expose the unadmitted event-delivery capability with its Kernel
 /// observation-route owner reference, never by resubmitting them
 /// as host requests and never through a reconcile-then-retry loop that
-/// cannot succeed until that route is admitted.
+/// cannot succeed until that route is admitted. The shared owner also backs
+/// the face's validated continuity binding: the presented attach session
+/// must still equal the retained kernel-issued session before any route
+/// refusal is reached.
 pub fn kernel_ports_with_declaration(
     declaration_path: &Path,
 ) -> Result<KernelPorts, RuntimeBuildError> {
@@ -365,8 +448,12 @@ pub fn kernel_ports_with_declaration(
     let host: Box<dyn HostActivationPort> = Box::new(KernelHostActivationPort {
         shared: owner.clone(),
     });
-    let host_request = KernelHostRequestClient { shared: owner };
-    let fwd: Box<dyn McpForwardingPort> = Box::new(KernelMcpForwardingPort);
+    let host_request = KernelHostRequestClient {
+        shared: owner.clone(),
+    };
+    let fwd: Box<dyn McpForwardingPort> = Box::new(KernelMcpForwardingPort {
+        shared: owner.clone(),
+    });
     Ok((host, host_request, fwd))
 }
 

@@ -29,7 +29,7 @@ use std::sync::OnceLock;
 
 use eliot_protocol::{AgentActivationResolutionDisposition, AgentActivationResultAckOutcome};
 
-use super::agent_fabric::{FabricAdmission, FabricError, Reservation};
+use super::agent_fabric::{FabricAdmission, FabricError, FabricPortId, Reservation};
 use super::{DaemonError, PROTOCOL_VERSION, SERVICE_NAME};
 
 /// Marker recorded when an identity was not available from its owner.
@@ -444,6 +444,69 @@ pub fn emit_daemon_readiness(ready: bool, degraded: bool) -> DiagnosticRecord {
     )
 }
 
+/// Emits one Governor maintenance trigger decision so it is inspectable.
+///
+/// I14.22 requires the single `AutomationTriggerDecision` to make maintenance
+/// start behaviour inspectable. One record carries every field of the
+/// decision (`trigger`, `family`, `scope`, `decision`, `reason`,
+/// `admits_job`, `durable_job_ref`) plus the exact observed gates that
+/// produced it, so a reader can enumerate the decision and re-derive it from
+/// the same minimal operational sink that already serves the rest of the
+/// daemon. Nothing here interprets the decision, retries it, or claims work
+/// was performed: a `START` decision is a decision, not an executed job, and
+/// this record never reads as a completion.
+#[must_use]
+pub fn emit_maintenance_trigger_decision(
+    input: &eliot_maintenance::MaintenanceTriggerInput,
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+) -> DiagnosticRecord {
+    let trigger = sanitize_identity(&input.trigger_id);
+    let scope = sanitize_identity(&input.scope_ref);
+    let durable_job_ref = match &decision.durable_job_ref {
+        Some(reference) => sanitize_identity(reference),
+        None => UNAVAILABLE.to_owned(),
+    };
+    let evidence = input
+        .evidence_refs
+        .iter()
+        .map(|reference| sanitize_identity(reference))
+        .collect::<Vec<_>>()
+        .join(",");
+    emit_line(
+        "eliotd.maintenance_trigger_decision",
+        &format!(
+            "service='{SERVICE_NAME}' trigger='{trigger}' family='{}' scope='{scope}' \
+             decision='{:?}' reason='{:?}' admits_job={} durable_job_ref='{durable_job_ref}' \
+             origin='{:?}' mode='{:?}' idle={} scheduled_window={} route_available={} \
+             budget_available={} user_session_available={} user_session_required={} \
+             explicit_request={} safety_required={} active_job='{}' expires_at_ms='{}' \
+             evidence='{evidence}'",
+            input.family,
+            decision.decision,
+            decision.reason,
+            decision.admits_job,
+            input.trigger,
+            input.mode,
+            input.idle,
+            input.scheduled_window,
+            input.route_available,
+            input.budget_available,
+            input.user_session_available,
+            input.user_session_required,
+            input.explicit_request,
+            input.safety_required,
+            match &input.active_job_id {
+                Some(active) => sanitize_identity(active),
+                None => UNAVAILABLE.to_owned(),
+            },
+            match input.expires_at_ms {
+                Some(expires) => expires.to_string(),
+                None => UNAVAILABLE.to_owned(),
+            },
+        ),
+    )
+}
+
 /// Request receipt: exact available request/operation identity, never
 /// payload content. The constructor takes no payload parameter by design.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -807,9 +870,15 @@ pub fn fabric_rejection_of(error: &FabricError) -> (RejectionReason, OwningCompo
         | FabricError::AckNotResult(_)
         | FabricError::ResultNotFinish(_)
         | FabricError::NotActivated(_)
+        | FabricError::SemanticDrift(_)
+        | FabricError::StaleOwnerLease(_)
+        | FabricError::ForeignOwnerField(_)
+        | FabricError::BrokenOwnershipLink(_)
         | FabricError::Quarantined(_) => {
             let reason = match error {
-                FabricError::ReceiptBinding(_) => RejectionReason::ReceiptBinding,
+                FabricError::ReceiptBinding(_) | FabricError::SemanticDrift(_) => {
+                    RejectionReason::ReceiptBinding
+                }
                 FabricError::DuplicateLaunch(_) => RejectionReason::DuplicateLaunch,
                 FabricError::Quarantined(_) => RejectionReason::Quarantined,
                 _ => RejectionReason::Contract,
@@ -860,18 +929,59 @@ pub fn fabric_rejection_of(error: &FabricError) -> (RejectionReason, OwningCompo
         FabricError::ProviderEvidenceRequired => {
             (RejectionReason::Contract, OwningComponent::AgentFabric)
         }
+        // #1700: the typed residual already names the exact port, owner,
+        // state, blocked operation/work, disposition and next action (also
+        // carried verbatim in the record detail via its `Display`), so the
+        // projection keeps the closest existing reason/owner per port. No
+        // new reason or owner is introduced: both enums are pinned by the
+        // daemon diagnostics proof.
+        FabricError::MissingPrerequisite(residual) => {
+            let owner = match residual.port {
+                FabricPortId::ModelRegistry => OwningComponent::ModelRegistry,
+                FabricPortId::AdmissionAuthority => OwningComponent::AdmissionAuthority,
+                FabricPortId::ActivationAuthority => OwningComponent::ActivationProjection,
+                FabricPortId::DispatchEgress => OwningComponent::DispatchEgress,
+                FabricPortId::PeerChannel | FabricPortId::SwarmControl => {
+                    OwningComponent::AgentFabric
+                }
+            };
+            let reason = match residual.port {
+                FabricPortId::ModelRegistry => RejectionReason::NoRoute,
+                FabricPortId::AdmissionAuthority => RejectionReason::AdmissionIncomplete,
+                FabricPortId::DispatchEgress => RejectionReason::DispatchUnavailable,
+                FabricPortId::PeerChannel
+                | FabricPortId::SwarmControl
+                | FabricPortId::ActivationAuthority => RejectionReason::Contract,
+            };
+            (reason, owner)
+        }
     }
 }
 
 /// Maps one daemon error to its reporting owner. Lifecycle/config/transport
-/// boundaries report themselves; only the Governor composition owner maps
-/// to [`OwningComponent::Governor`]. The error text is never parsed for
-/// ownership.
+/// boundaries report themselves; the Governor semantic admission owner maps
+/// to [`OwningComponent::Governor`] for its own composition, finish,
+/// maintenance-trigger (issue #1688), and task-binding (issue #1929)
+/// admission failures. The error text is never parsed for ownership.
 #[must_use]
 pub fn daemon_error_owner(error: &DaemonError) -> OwningComponent {
     match error {
-        DaemonError::Composition(_) | DaemonError::Finish(_) => OwningComponent::Governor,
-        DaemonError::Kernel(_) => OwningComponent::Kernel,
+        // Issue #1929 (I5.5/I5.6): a `TaskBinding` rejection is reported to the
+        // Governor, which is the owner that actually admitted the transition.
+        // The daemon ingress validator mints no authority — it only checks the
+        // caller-presented selection against the Governor-issued
+        // `TaskSelectionEvidence` and the retained `WorkScope` binding — so
+        // both stable codes (`TASK_SELECTION_REQUIRED` and
+        // `TASK_SCOPE_INCOMPATIBLE`) name that same owner. The owner comes
+        // from the variant, never from reading the code out of the message.
+        DaemonError::Composition(_)
+        | DaemonError::Finish(_)
+        | DaemonError::Maintenance(_)
+        | DaemonError::TaskBinding(_) => OwningComponent::Governor,
+        // Issue #1115: a typed v2 receiver whose activation deadline elapsed is
+        // a kernel lifecycle failure, so it reports with the kernel owner
+        // instead of being folded into the Governor admission owner above.
+        DaemonError::Kernel(_) | DaemonError::ActivationExpired => OwningComponent::Kernel,
         DaemonError::LaunchConfig(_) | DaemonError::Protected(_) => OwningComponent::DaemonConfig,
         DaemonError::Lifecycle(_) => OwningComponent::DaemonRuntime,
         DaemonError::ProviderAdmission(error) => fabric_rejection_of(error).1,
@@ -1160,10 +1270,19 @@ impl ErrorRecord {
             DaemonError::Composition(_) => ("composition", error.to_string()),
             DaemonError::Finish(_) => ("finish-attempt", error.to_string()),
             DaemonError::Kernel(_) => ("kernel-transport", error.to_string()),
+            DaemonError::ActivationExpired => ("activation-expired", error.to_string()),
             DaemonError::LaunchConfig(_) => ("launch-config", error.to_string()),
             DaemonError::Protected(_) => ("protected-path", error.to_string()),
             DaemonError::Lifecycle(_) => ("lifecycle", error.to_string()),
             DaemonError::ProviderAdmission(_) => ("provider-admission", error.to_string()),
+            DaemonError::Maintenance(_) => ("maintenance-trigger", error.to_string()),
+            // Issue #1929: `task-binding` names the rejected edge, and the
+            // detail keeps the typed admission code verbatim — the transparent
+            // wrapper renders `TASK_SELECTION_REQUIRED` or
+            // `TASK_SCOPE_INCOMPATIBLE` ahead of the bounded detail, so the
+            // record carries the exact code the admission edge rejected with
+            // and never a reworded or narrowed one.
+            DaemonError::TaskBinding(_) => ("task-binding", error.to_string()),
         };
         Self::of(owner, code, &detail)
     }
@@ -1270,10 +1389,10 @@ impl KernelDisconnect {
 
 /// Emits the Kernel activation-result acknowledgement record.
 ///
-/// The acknowledgement outcome (`accepted`, `exact-replay`, `reconciled`,
-/// `unknown`) is correlation only: an acknowledgement is never completed
-/// work, so the record carries no completion claim. `Unknown` preserves the
-/// original ticket/result identity verbatim for the shutdown drain.
+/// The stable acknowledgement outcome (`accepted` or `unknown`) is correlation
+/// only: an acknowledgement is never completed work, so the record carries no
+/// completion claim. `Unknown` preserves the original ticket/result identity
+/// verbatim for the shutdown drain.
 pub fn emit_activation_ack(
     ticket_id: &str,
     result_sha256: &str,
@@ -1283,8 +1402,6 @@ pub fn emit_activation_ack(
     let result = sanitize_identity(result_sha256);
     let outcome_text = match outcome {
         AgentActivationResultAckOutcome::Accepted => "accepted",
-        AgentActivationResultAckOutcome::ExactReplay => "exact-replay",
-        AgentActivationResultAckOutcome::Reconciled => "reconciled",
         AgentActivationResultAckOutcome::Unknown => STATE_UNKNOWN,
     };
     emit_line(

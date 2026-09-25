@@ -268,10 +268,12 @@ impl MemoryStore {
         validate_transaction(ctx, &transition)?;
         // Recompute before any lookup or effect: supplied != recomputed is a
         // typed digest mismatch with no transaction and no lookup success.
-        // The carried ordering scopes must also still equal the hashed
-        // expected ordering heads: a post-admission scope edit leaves the
-        // shared digest unchanged but changes head advancement, so it fails
-        // here with the same typed mismatch.
+        // The carried bound semantic source revisions are hash-bound
+        // set-like input through the shared view, so substituted lineage
+        // forks the digest here. The carried ordering scopes must also
+        // still equal the hashed expected ordering heads: a post-admission
+        // scope edit leaves the shared digest unchanged but changes head
+        // advancement, so it fails here with the same typed mismatch.
         verify_ordering_scope_binding(&transition, expected_ordering_heads)?;
         let view = CanonicalRequestView::from_apply(
             ctx,

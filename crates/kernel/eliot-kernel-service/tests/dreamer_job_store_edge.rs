@@ -1657,10 +1657,17 @@ mod gateway_cases {
             .expect("loopback service")
             .acquire_admission()
             .expect("loopback admission is live");
+        // The route carries the live service's complete epoch tuple; a
+        // sequence-only route could no longer be proven current (#64).
+        let route_epoch = service
+            .lock()
+            .expect("loopback service")
+            .authority_epoch()
+            .clone();
         let route = GenerationRoute::new(
             RouteScope::new("store_bridge").expect("loopback scope"),
             live.resource_generation,
-            AuthorityEpoch::new(LIVE_GENERATION).expect("loopback epoch"),
+            route_epoch,
         )
         .expect("loopback route");
         let gateway = Arc::new(KernelStoreGateway::new(

@@ -54,18 +54,22 @@ static NEXT_TRANSACTION_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// requires every registry handle to stay short-lived: one bounded read or one
 /// bounded write, never held across polling or waits. The installer already
 /// drops its writer before the SCM start + convergence wait
-/// (`bins/eliot/src/main.rs:2228`); terminal reconcile re-opens short-lived
-/// handles via `open_existing_at` (`bins/eliot/src/main.rs:2416`) while the
-/// Watchdog polls via `inspect_existing_at` on a 250ms/2s cadence.
+/// (`bins/eliot/src/main.rs::drop(registry)`); owner-aware rollback re-opens
+/// one short-lived writer per abort-phase touch and drops it before the
+/// transaction compare-and-save and external rollback effects
+/// (`WindowsInstallationCoordinator::rollback_with_activation_owner`) while
+/// the Watchdog polls via `inspect_existing_at` on a 250ms/2s cadence.
+/// The full inventory is the owner-model table in
+/// `installation_registry.rs`.
 ///
 /// redb 4.1.0 takes an exclusive OS file lock for `Database::create`/`open`
 /// and a shared lock for `ReadOnlyDatabase::open` (`src/db.rs:362,1212-1216`),
 /// so a short-lived writer and a polling reader on the same file transiently
 /// fail with `DatabaseError::DatabaseAlreadyOpen` ("Database already open.
 /// Cannot acquire lock.", `src/error.rs:208,257`). That contention is
-/// transient, not fatal: the sole-owner contract
-/// (`installation_registry.rs:6-13`) keeps both sides short-lived, so a
-/// bounded retry converges without holding any lock across an unbounded wait.
+/// transient, not fatal: the sole-owner contract keeps both sides short-lived,
+/// so a bounded retry converges without holding any lock across an unbounded
+/// wait.
 ///
 /// Only `DatabaseAlreadyOpen` is retried; every other error (fence/approval
 /// validation, corruption, IO) returns immediately with its cause preserved

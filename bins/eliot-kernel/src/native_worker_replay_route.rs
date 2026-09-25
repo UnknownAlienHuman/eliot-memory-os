@@ -56,7 +56,7 @@
 //! the presenter.
 
 use super::{
-    KernelComposition, KernelFrameAction, KernelServiceState,
+    GovernanceProfile, KernelComposition, KernelFrameAction, KernelServiceState,
     native_worker_lifecycle_route::{NativeWorkerRouteConflict, NativeWorkerRouteError},
     status_frame, unix_ms,
 };
@@ -267,6 +267,13 @@ impl NativeWorkerReplayReceipt {
 // Dispatch entry point.
 // ---------------------------------------------------------------------------
 
+fn native_worker_replay_operation_allows_degraded(operation: &str) -> bool {
+    matches!(
+        operation,
+        NATIVE_WORKER_REPLAY_LOOKUP_OPERATION | NATIVE_WORKER_REPLAY_ACKNOWLEDGE_OPERATION
+    )
+}
+
 impl KernelComposition {
     /// Dispatches one native-worker replay frame.
     ///
@@ -279,13 +286,6 @@ impl KernelComposition {
         session: &Session,
         frame: &Frame,
     ) -> Result<KernelFrameAction, TransportError> {
-        if self
-            .service_state()
-            .map_err(|_| TransportError::SessionFenced)?
-            != KernelServiceState::Ready
-        {
-            return Err(TransportError::SessionFenced);
-        }
         session
             .peer
             .validate()
@@ -323,6 +323,22 @@ impl KernelComposition {
             .ok_or(TransportError::SessionFenced)?;
         if !is_native_worker_replay_operation(operation) {
             return Err(TransportError::SessionFenced);
+        }
+        let state = self
+            .service_state()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if state != KernelServiceState::Ready
+            && !(state == KernelServiceState::Degraded
+                && native_worker_replay_operation_allows_degraded(operation))
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if matches!(
+            operation,
+            NATIVE_WORKER_REPLAY_BEGIN_OPERATION | NATIVE_WORKER_REPLAY_APPEND_OPERATION
+        ) {
+            self.admit_material_authority_for_fence(GovernanceProfile::full(), &presented_fence)
+                .map_err(|_| TransportError::SessionFenced)?;
         }
         let receipt = match operation {
             NATIVE_WORKER_REPLAY_LOOKUP_OPERATION => {

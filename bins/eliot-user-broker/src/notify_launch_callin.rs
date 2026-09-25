@@ -21,16 +21,19 @@
 //!   presence-bound token here — grant authenticity itself is enforced by the
 //!   Kernel authority port when the staged inputs flow through the existing
 //!   `BrokerComposition::launch` path.
-//! - The return value is launch INPUTS only (`executable_path`,
-//!   `artifact_digest`, `installation_identity`). This module never spawns a
-//!   process: there is no `std::process::Command` here, and the composition
-//!   root stays thin per `bins/AGENTS.md`. The manager feeds the staged inputs
-//!   into a Kernel-approved `LaunchRequest` and dispatches it through the
-//!   EXISTING `BrokerComposition::launch` path. The production caller is
-//!   [`crate::stage_normal_notify_launch`], invoked at broker startup from
-//!   `main.rs` next to the fallback ensure; the thin
-//!   `BrokerComposition::resolve_notify_launch` projection keeps dispatch in
-//!   the composition.
+//! - The return value is the broker-retained launch authority
+//!   ([`BrokerNotifyLaunchAuthority`]): the verified `executable_path`,
+//!   `artifact_digest`, and `installation_identity` this broker observed, plus
+//!   the staging outcome. The reference is retained, never dropped, because
+//!   [`crate::BrokerComposition::launch_notify`] is the only dispatcher that
+//!   may spawn the notification adapter and it re-checks every request against
+//!   exactly these bytes. There is no `std::process::Command` in this module;
+//!   the composition root stays thin per `bins/AGENTS.md` and dispatch happens
+//!   on the existing `BrokerComposition` authority/process ports.
+//! - The production caller is [`crate::stage_normal_notify_launch`], invoked at
+//!   broker startup through [`crate::BrokerComposition::stage_notify_launch`];
+//!   the broker's `Ready` channel then reports the retained outcome as stable
+//!   codes only.
 //!
 //! Deterministic launch-input staging lives here (broker-owned launch staging,
 //! allowed under `bins/AGENTS.md`); the Notify declaration state machine and
@@ -40,7 +43,9 @@
 
 use std::path::{Path, PathBuf};
 
-use eliot_notify::{NotifyLaunchError, VerifiedNotifyLaunch, resolve_notify_launch_inputs};
+use eliot_notify::{
+    NOTIFY_IMAGE_FILE_NAME, NotifyLaunchError, VerifiedNotifyLaunch, resolve_notify_launch_inputs,
+};
 
 /// Verified Notify launch inputs staged for one broker-bound grant.
 ///
@@ -107,6 +112,9 @@ pub enum BrokerNotifyError {
     InvalidDeclaration,
     /// The bound installed binary failed verification.
     BindingRejected,
+    /// The request does not name the canonical installed Notify image, so it
+    /// cannot be admitted on the notify-specific launch path.
+    NotNotifyImage,
 }
 
 impl BrokerNotifyError {
@@ -119,6 +127,7 @@ impl BrokerNotifyError {
             Self::IdentityMismatch => "BROKER_NOTIFY_IDENTITY_MISMATCH",
             Self::InvalidDeclaration => "BROKER_NOTIFY_INVALID_DECLARATION",
             Self::BindingRejected => "BROKER_NOTIFY_BINDING_REJECTED",
+            Self::NotNotifyImage => "BROKER_NOTIFY_IMAGE_REQUIRED",
         }
     }
 }
@@ -200,11 +209,13 @@ const NOTIFY_DECLARATION_RELATIVE: &str = "Eliot/notify/watchdog-verification.js
 const DECLARATION_BYTES_LIMIT: u64 = 64 * 1024;
 
 /// Best-effort normal-launch staging outcome for the broker `Ready` channel
-/// (I11.7: failed delivery remains visible). Staging never spawns: `Staged`
-/// means the broker verified it can name the exact installed image for a
-/// later Kernel-approved grant; per-notification spawn stays on the
-/// `BrokerComposition::launch` path. Only stable state/reason codes cross
-/// this boundary — never paths, digests, SIDs, or payloads.
+/// (I11.7: failed delivery remains visible). Staging never spawns. `Staged`
+/// means the broker verified it can name the exact installed image AND retains
+/// that verified reference for the notify-specific spawn on
+/// [`BrokerComposition::launch_notify`](crate::BrokerComposition::launch_notify);
+/// the generic launch dispatcher refuses that image outright. Only stable
+/// state/reason codes cross this boundary — never paths, digests, SIDs, or
+/// payloads.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NotifyLaunchStage {
     /// Normal-launch inputs staged against the published declaration.
@@ -235,41 +246,171 @@ impl NotifyLaunchStage {
     }
 }
 
-/// Stages normal Notify launch inputs at the broker edge.
+/// Broker-retained normal Notify launch state.
+///
+/// The verified launch reference is RETAINED, never discarded: it is the only
+/// thing the broker will spawn on the normal route, and
+/// [`BrokerComposition::launch_notify`](crate::BrokerComposition::launch_notify)
+/// re-checks every request against these exact bytes. A deferred or skipped
+/// staging carries no reference at all, so an unverified image can never be
+/// launched as a notification adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrokerNotifyLaunchAuthority {
+    launch: Option<VerifiedLaunchRef>,
+    stage: NotifyLaunchStage,
+}
+
+impl BrokerNotifyLaunchAuthority {
+    /// The staging outcome for the broker `Ready` diagnostic.
+    #[must_use]
+    pub fn stage(&self) -> &NotifyLaunchStage {
+        &self.stage
+    }
+
+    /// Diagnostic projection of the retained staging outcome, including whether
+    /// a notify spawn is currently admissible.
+    #[must_use]
+    pub fn status_value(&self) -> serde_json::Value {
+        let mut value = self.stage.status_value();
+        if let serde_json::Value::Object(map) = &mut value {
+            map.insert(
+                String::from("admissible"),
+                serde_json::Value::Bool(self.launch.is_some()),
+            );
+        }
+        value
+    }
+
+    /// Whether the broker currently holds a verified notify launch reference.
+    #[must_use]
+    pub fn is_admissible(&self) -> bool {
+        self.launch.is_some()
+    }
+
+    /// The retained verified launch reference, if staging succeeded.
+    #[must_use]
+    pub fn launch_ref(&self) -> Option<&VerifiedLaunchRef> {
+        self.launch.as_ref()
+    }
+
+    /// Builds an authority that retains no launch reference.
+    ///
+    /// Only a `Staged` outcome carries a reference; every other outcome is
+    /// structurally inadmissible for a notify spawn.
+    pub(crate) fn unstaged(stage: NotifyLaunchStage) -> Self {
+        Self {
+            launch: None,
+            stage,
+        }
+    }
+}
+
+/// Admits one request against the broker-retained verified launch reference.
+///
+/// The canonical image name is reused from the `eliot-notify` binding owner
+/// ([`NOTIFY_IMAGE_FILE_NAME`]), so a generic broker request naming that image
+/// is refused here and it can be spawned only through the notify-specific,
+/// broker-authorized path.
+///
+/// Two independent bindings must both hold before a notify adapter may be
+/// spawned: the request must name the exact verified executable path, and its
+/// artifact digest must equal the digest of the bytes this broker observed when
+/// it resolved the installer-published declaration. A file swapped between
+/// staging and launch therefore fails the request-time comparison as well as
+/// the launch-time re-hash inside the process port.
+///
+/// The retained reference itself stays inside the composition: returning it
+/// would only re-expose the same verified bytes the request already names, and
+/// holding the borrow across the dispatch would tie admission to the very
+/// mutable borrow the spawn needs.
+///
+/// # Errors
+///
+/// Returns [`BrokerNotifyError::NotAuthenticated`] when the broker retains no
+/// verified reference, [`BrokerNotifyError::NotNotifyImage`] when the request
+/// does not name the canonical installed Notify image, and
+/// [`BrokerNotifyError::BindingRejected`] when the executable path or artifact
+/// digest diverges from the retained verified bytes.
+pub fn admit_notify_request(
+    authority: &BrokerNotifyLaunchAuthority,
+    request: &eliot_user_broker_core::LaunchRequest,
+) -> Result<(), BrokerNotifyError> {
+    let launch = authority
+        .launch_ref()
+        .ok_or(BrokerNotifyError::NotAuthenticated)?;
+    let approved = &request.approved;
+    if Path::new(&approved.executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some(NOTIFY_IMAGE_FILE_NAME)
+    {
+        return Err(BrokerNotifyError::NotNotifyImage);
+    }
+    let expected_executable = launch.executable_path().to_string_lossy();
+    if approved.executable.as_str() != expected_executable.as_ref()
+        || approved.artifact_digest != launch.artifact_digest()
+    {
+        return Err(BrokerNotifyError::BindingRejected);
+    }
+    Ok(())
+}
+
+/// Returns whether one generic broker request names the canonical Notify image.
+///
+/// Used to refuse the generic `Launch` operation for the notification adapter:
+/// that image is reachable only through the notify-specific admitted path, so
+/// a normal `eliot-notify` invocation cannot be produced by any other broker
+/// request shape.
+#[must_use]
+pub fn request_names_notify_image(request: &eliot_user_broker_core::LaunchRequest) -> bool {
+    Path::new(&request.approved.executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some(NOTIFY_IMAGE_FILE_NAME)
+}
+
+/// Stages normal Notify launch inputs at the broker edge and RETAINS the
+/// verified launch reference.
 ///
 /// This is the production caller of
 /// [`crate::BrokerComposition::resolve_notify_launch`]: it performs the
 /// single protected lease read of the installer-published declaration and
-/// stages the verified launch inputs for later Kernel-approved grants.
+/// retains the verified launch inputs that
+/// [`crate::BrokerComposition::launch_notify`] later spawns.
 /// Best-effort and infallible by design — like the fallback ensure, staging
 /// must never fail broker startup. Absence skips explicitly; staging failure
-/// defers with a stable code.
-pub fn stage_normal_notify_launch(composition: &crate::BrokerComposition) -> NotifyLaunchStage {
+/// defers with a stable code and retains no reference.
+pub fn stage_normal_notify_launch(
+    composition: &crate::BrokerComposition,
+) -> BrokerNotifyLaunchAuthority {
     let Ok(path) = eliot_platform_windows::protected_program_data_path(NOTIFY_DECLARATION_RELATIVE)
     else {
-        return NotifyLaunchStage::Deferred {
+        return BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::Deferred {
             reason: "PROTECTED",
-        };
+        });
     };
     if !std::path::Path::new(&path).exists() {
-        return NotifyLaunchStage::SkippedNoDeclaration;
+        return BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::SkippedNoDeclaration);
     }
     let Ok(lease) = eliot_platform_windows::ProtectedPathLease::open_existing_absolute(&path)
     else {
-        return NotifyLaunchStage::Deferred {
+        return BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::Deferred {
             reason: "PROTECTED",
-        };
+        });
     };
     let Ok(bytes) = lease.read_bounded(DECLARATION_BYTES_LIMIT) else {
-        return NotifyLaunchStage::Deferred {
+        return BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::Deferred {
             reason: "PROTECTED",
-        };
+        });
     };
     match composition.resolve_notify_launch(&bytes) {
-        Ok(_) => NotifyLaunchStage::Staged,
-        Err(error) => NotifyLaunchStage::Deferred {
-            reason: stage_deferral_code(&error),
+        Ok(launch) => BrokerNotifyLaunchAuthority {
+            launch: Some(launch),
+            stage: NotifyLaunchStage::Staged,
         },
+        Err(error) => BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::Deferred {
+            reason: stage_deferral_code(&error),
+        }),
     }
 }
 
@@ -280,5 +421,6 @@ fn stage_deferral_code(error: &BrokerNotifyError) -> &'static str {
         BrokerNotifyError::IdentityMismatch => "IDENTITY_MISMATCH",
         BrokerNotifyError::InvalidDeclaration => "INVALID_DECLARATION",
         BrokerNotifyError::BindingRejected => "BINDING_REJECTED",
+        BrokerNotifyError::NotNotifyImage => "NOT_NOTIFY_IMAGE",
     }
 }

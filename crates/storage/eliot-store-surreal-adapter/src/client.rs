@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 mod backup_restore;
+mod backup_snapshot;
 mod json_codec;
 #[cfg(all(test, windows))]
 mod payload_tests;
@@ -26,10 +27,33 @@ pub(crate) mod session_pool;
 /// sole registration point: every fixed restore statement is an adapter-owned
 /// `&'static str` with bound parameters only, and caller text can never become
 /// a statement, table, connection, or credential override.
+///
+/// The registry also owns the durable restore namespace, its row-key families
+/// and payload schema tags, so the physical registry layout has exactly one
+/// owner: no restore caller can name a table, key prefix or payload schema of
+/// its own.
 pub(crate) use backup_restore::{
-    RESTORE_OPERATION_APPLY, RESTORE_OPERATION_PREPARE, RESTORE_OPERATION_RECONCILE,
-    RESTORE_OPERATION_VALIDATE, fixed_restore_statement, restore_capability,
+    RESTORE_KEY_DESTINATION_PREFIX, RESTORE_KEY_PLACEMENT_PREFIX, RESTORE_KEY_PURGE_MEMBER_PREFIX,
+    RESTORE_KEY_PURGE_SCOPE_PREFIX, RESTORE_KEY_RECORD_PREFIX, RESTORE_NAMESPACE,
+    RESTORE_OPERATION_APPLY, RESTORE_OPERATION_FENCE, RESTORE_OPERATION_PREPARE,
+    RESTORE_OPERATION_PURGE_LEDGER, RESTORE_OPERATION_RECONCILE, RESTORE_OPERATION_VALIDATE,
+    RESTORE_REGISTRY_TABLE, RESTORE_SCHEMA_DESTINATION, RESTORE_SCHEMA_PLACEMENT,
+    RESTORE_SCHEMA_PURGE, RESTORE_SCHEMA_RECORD, fixed_restore_statement,
+    is_restore_destination_absent, is_restore_duplicate, is_restore_fence_race, restore_capability,
     validate_restore_operation,
+};
+/// Fixed coherent-snapshot operation registration (issue #951).
+///
+/// The closed snapshot vocabulary lives in [`backup_snapshot`]; the three point
+/// labels live with the capture logic in [`crate::backup_snapshot`]. Snapshot
+/// operations are pure reads, so they are pool reads. This re-export is the
+/// sole registration point: every fixed snapshot statement is an adapter-owned
+/// `&'static str` composed from the single-owner consts in [`crate::schema`]
+/// and [`crate::backup_snapshot`], carries no caller bindings, and caller text
+/// can never become a statement, table, connection, or credential override.
+pub(crate) use backup_snapshot::{
+    SNAPSHOT_MEMBERS_OPERATION, fixed_snapshot_statement, snapshot_capability,
+    validate_snapshot_operation,
 };
 pub(crate) use provider_owner::ProviderOwner;
 use session::RpcSession;
@@ -371,6 +395,7 @@ const POOL_READ_OPERATIONS: &[&str] = &[
     "recovery.snapshot",
     crate::backup_snapshot::SNAPSHOT_BEGIN_OPERATION,
     crate::backup_snapshot::SNAPSHOT_END_OPERATION,
+    SNAPSHOT_MEMBERS_OPERATION,
     crate::backup_snapshot::SNAPSHOT_PAGE_OPERATION,
 ];
 
@@ -641,6 +666,7 @@ mod tests {
                 "recovery.snapshot",
                 "snapshot.begin",
                 "snapshot.end",
+                "snapshot.members",
                 "snapshot.page",
             ]
         );
@@ -673,6 +699,8 @@ mod tests {
             "READ.schema_generation",
             "recovery.anything_new",
             "recovery.snapshot_extra",
+            "snapshot.begin_v2",
+            "snapshot.member",
         ] {
             assert!(
                 !is_pool_read_operation(refused),

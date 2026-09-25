@@ -4,7 +4,10 @@
 //! the authenticated Kernel client (session + service guard + ORS handle)
 //! and verifies one presented provider proof against the durable Kernel/ORS
 //! records bound to the exact attempt and operation, plus the presented
-//! route/capacity revision, claiming-worker generation, and fence digest
+//! route/capacity revision checked against the separately presented
+//! Governor-observed currentness (`governor_route_revision` /
+//! `governor_capacity_revision`, resolved by the daemon from its live
+//! Governor view), the claiming-worker generation, and the fence digest
 //! (wire contour `eliot-kernel-provider-capability/v2`). No signing, no
 //! tokens, no cached `Verified` marker, no user authentication: every call
 //! re-queries ORS and the live authority epoch, so restore always observes
@@ -181,6 +184,15 @@ impl ProviderCapabilityContext {
     /// re-queries ORS and the live epoch; nothing is cached, so restore
     /// always observes fresh owner evidence.
     ///
+    /// The Governor-observed currentness (`expected_route_revision` /
+    /// `expected_capacity_revision`) travels separately from the presented
+    /// proof revisions: the daemon resolves it from its live Governor view
+    /// and presents it alongside the proof, so a stale presented revision
+    /// fails closed against live currentness instead of comparing with
+    /// itself. The ORS claim row carries no revision columns (only the
+    /// opaque `route_class` selection label owned by #874), so the Kernel
+    /// cannot source currentness locally and receives it per call.
+    ///
     /// Generation and fence digest travel here echoed from the loaded row:
     /// the presented-versus-row binding for those two fields is established
     /// by [`ProviderCapabilityContext::verify_claim_binding`], which the
@@ -188,7 +200,7 @@ impl ProviderCapabilityContext {
     /// callers of this method present row-coherent material by construction.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the presented proof is one flat wire tuple; grouping it would invent a second contract beside the owner request"
+        reason = "the presented proof is one flat wire tuple plus the separately sourced Governor-observed currentness; grouping either would invent a second contract beside the owner request"
     )]
     pub fn verify(
         &self,
@@ -202,6 +214,8 @@ impl ProviderCapabilityContext {
         executable_digest: &str,
         route_rev: &str,
         capacity_rev: &str,
+        expected_route_revision: &str,
+        expected_capacity_revision: &str,
     ) -> Result<(), ProviderCapabilityRouteError> {
         let claim_identity = OperationIdentity::new(claim_id).map_err(|_| {
             ProviderCapabilityRouteError::Session("claim identity is malformed".to_owned())
@@ -268,8 +282,8 @@ impl ProviderCapabilityContext {
             fence_digest: row.fence_digest.clone(),
         };
         let expectation = ProviderCapabilityExpectation {
-            current_route_revision: route_rev.to_owned(),
-            current_capacity_revision: capacity_rev.to_owned(),
+            current_route_revision: expected_route_revision.to_owned(),
+            current_capacity_revision: expected_capacity_revision.to_owned(),
             live_authority_epoch: live_epoch.clone(),
             // A terminal claim revokes capability authority: every proof
             // under it fences until a new admission (same rule as the
@@ -513,6 +527,22 @@ impl KernelComposition {
             require_capability_text(payload, "route_revision", MAX_CAPABILITY_TEXT_LEN)?;
         let capacity_rev =
             require_capability_text(payload, "capacity_revision", MAX_CAPABILITY_TEXT_LEN)?;
+        // Governor-observed currentness rides separately from the presented
+        // proof revisions (issue #1108 A7): the daemon resolves these two
+        // fields from its live Governor view while `route_revision` /
+        // `capacity_revision` above carry what the proof itself claims. The
+        // owner compares presented against Governor-observed, so a stale
+        // proof revision fails closed instead of comparing with itself. A
+        // sender that omits either field fails closed here before any owner
+        // lookup; pre-change senders without these fields observe the same
+        // fail-closed rejection, never a silent pass.
+        let governor_route_rev =
+            require_capability_text(payload, "governor_route_revision", MAX_CAPABILITY_TEXT_LEN)?;
+        let governor_capacity_rev = require_capability_text(
+            payload,
+            "governor_capacity_revision",
+            MAX_CAPABILITY_TEXT_LEN,
+        )?;
         // Wire v2 binds generation and fence: the presented claiming-worker
         // generation must equal the durable row generation and the presented
         // fence digest must equal the durable fence digest, so a stale
@@ -533,6 +563,8 @@ impl KernelComposition {
             &executable_digest,
             &route_rev,
             &capacity_rev,
+            &governor_route_rev,
+            &governor_capacity_rev,
         )?;
         let body = serde_json::json!({
             "kind": "native_worker_provider_capability",
@@ -543,6 +575,8 @@ impl KernelComposition {
             "proof_kind": proof_kind_value,
             "route_revision": route_rev,
             "capacity_revision": capacity_rev,
+            "governor_route_revision": governor_route_rev,
+            "governor_capacity_revision": governor_capacity_rev,
             "worker_generation": worker_generation,
             "fence_digest": fence_digest,
             "verified_at_unix_ms": unix_ms(),

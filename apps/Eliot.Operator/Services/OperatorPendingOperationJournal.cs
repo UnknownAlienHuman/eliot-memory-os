@@ -8,7 +8,7 @@ namespace Eliot.Operator.Services;
 
 /// Bounded user-local recovery journal for operator mutations.
 ///
-/// The journal stores only the typed operator envelope and its local recovery
+/// The journal stores only the typed owner request and its local recovery
 /// metadata. It never stores the inherited broker endpoint, pipe name, handoff
 /// nonce, bearer material, or a credential-bearing request. A record is
 /// written before the first send and removed only after a terminal owner
@@ -21,10 +21,7 @@ public sealed class OperatorPendingOperationJournal : IDisposable
     public const int MaxEnvelopeChars = 64 * 1024;
     public const long MaxJournalBytes = 2 * 1024 * 1024;
 
-    private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web)
-    {
-        MaxDepth = 32
-    };
+    private static readonly JsonSerializerOptions Json = OperatorJson.Reader;
 
     private static readonly string[] ForbiddenFieldFragments =
     [
@@ -37,6 +34,26 @@ public sealed class OperatorPendingOperationJournal : IDisposable
         "endpoint",
         "pipe",
         "nonce",
+        "token"
+    ];
+
+    /// The typed UserAutomation route carries no transport authenticator: the
+    /// named owner route supplies session, principal, State Fence and operation
+    /// identity server-side, and the surface supplies only the closed operation
+    /// plus one retry-stable idempotency key. Its only `nonce` is the
+    /// operator-supplied one-shot `run_now` intent guard, so the handoff-nonce
+    /// class of field is not applicable to this route. Every other credential
+    /// and endpoint class still applies.
+    private static readonly string[] UserAutomationForbiddenFieldFragments =
+    [
+        "credential",
+        "password",
+        "secret",
+        "authorization",
+        "bearer",
+        "cookie",
+        "endpoint",
+        "pipe",
         "token"
     ];
 
@@ -417,14 +434,33 @@ public sealed class OperatorPendingOperationJournal : IDisposable
             try
             {
                 using var document = JsonDocument.Parse(operation.EnvelopeJson);
-                EnsureJournalSafe(document.RootElement);
-                var envelope = document.RootElement.Deserialize<OperatorIntentEnvelope>(Json)
-                    ?? throw new InvalidOperationException("envelope is empty");
-                envelope.Validate();
-                if (!string.Equals(envelope.OperationId, operation.OperationId, StringComparison.Ordinal)
-                    || envelope.ExpectedRevision != operation.ExpectedRevision)
+                EnsureJournalSafe(document.RootElement, operation.Route);
+                switch (operation.Route)
                 {
-                    throw new InvalidOperationException("journal metadata does not bind the envelope");
+                    case OperatorMutationRoute.OperatorCommand:
+                        var envelope = document.RootElement.Deserialize<OperatorIntentEnvelope>(Json)
+                            ?? throw new InvalidOperationException("envelope is empty");
+                        envelope.Validate();
+                        if (!string.Equals(envelope.OperationId, operation.OperationId, StringComparison.Ordinal)
+                            || operation.ExpectedRevision is null
+                            || envelope.ExpectedRevision != operation.ExpectedRevision.Value)
+                        {
+                            throw new InvalidOperationException("journal metadata does not bind the envelope");
+                        }
+                        break;
+                    case OperatorMutationRoute.UserAutomation:
+                        var automation = document.RootElement.Deserialize<UserAutomationOperatorRequest>(Json)
+                            ?? throw new InvalidOperationException("request is empty");
+                        automation.Validate();
+                        if (!string.Equals(automation.IdempotencyKey, operation.OperationId, StringComparison.Ordinal)
+                            || operation.ExpectedRevision is not null
+                            || !automation.Operation.IsEffect)
+                        {
+                            throw new InvalidOperationException("journal metadata does not bind the typed request");
+                        }
+                        break;
+                    default:
+                        throw new InvalidOperationException("unknown mutation route");
                 }
             }
             catch (Exception error) when (error is JsonException or InvalidOperationException)
@@ -436,35 +472,38 @@ public sealed class OperatorPendingOperationJournal : IDisposable
         }
     }
 
-    private static void EnsureJournalSafe(JsonElement element)
+    private static void EnsureJournalSafe(JsonElement element, OperatorMutationRoute route)
     {
         switch (element.ValueKind)
         {
             case JsonValueKind.Object:
                 foreach (var property in element.EnumerateObject())
                 {
-                    if (IsForbiddenField(property.Name))
+                    if (IsForbiddenField(property.Name, route))
                     {
                         throw new InvalidOperationException(
                             $"field '{property.Name}' is not allowed in the user-local journal");
                     }
-                    EnsureJournalSafe(property.Value);
+                    EnsureJournalSafe(property.Value, route);
                 }
                 break;
             case JsonValueKind.Array:
-                foreach (var item in element.EnumerateArray()) EnsureJournalSafe(item);
+                foreach (var item in element.EnumerateArray()) EnsureJournalSafe(item, route);
                 break;
         }
     }
 
-    private static bool IsForbiddenField(string field)
+    private static bool IsForbiddenField(string field, OperatorMutationRoute route)
     {
         if (string.Equals(field, "idempotency_key", StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
 
-        return ForbiddenFieldFragments.Any(fragment =>
+        var fragments = route == OperatorMutationRoute.UserAutomation
+            ? UserAutomationForbiddenFieldFragments
+            : ForbiddenFieldFragments;
+        return fragments.Any(fragment =>
             field.Contains(fragment, StringComparison.OrdinalIgnoreCase));
     }
 

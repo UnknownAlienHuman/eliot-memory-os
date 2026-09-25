@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Kernel-gated ELIOT Researcher provider process; standalone binary fails closed until admitted"
+description = "Kernel-gated ELIOT Researcher provider process; fails closed when the Kernel front door is unreachable or a reply does not verify"
 
 [lib]
 path = "src/lib.rs"
@@ -15,8 +15,27 @@ path = "src/main.rs"
 
 [dependencies]
 eliot-contracts.workspace = true
+# The authenticated Kernel front-door transport. `eliot-mod-research` reaches
+# it through `eliot-ipc` + `eliot-protocol` + `eliot-platform-windows` rather
+# than through `eliot-cli`: the CLI crate's `eliot-bootstrap` edge reaches the
+# `eliot-agent-` closure, which this runtime root forbids. These three are the
+# narrowest owner crates the transport itself is built from.
+eliot-ipc.workspace = true
+# The Kernel-owned research-provider wire contract
+# (`eliot_kernel_service::protocol::research_provider`). This crate consumes
+# the owner types and defines no dispatch semantics.
+eliot-kernel-service.workspace = true
+# `ClockObservation` is the platform-neutral clock record the shared dispatch
+# validation context is built from; `eliot-doctor` and `eliot-testd` take the
+# same edge for the same reason.
+eliot-platform.workspace = true
+eliot-platform-windows.workspace = true
 eliot-process.workspace = true
 eliot-process-executor.workspace = true
+eliot-protocol.workspace = true
+# `RequestBinding` is the C0-02 request/fence binding the EBP request identity
+# is assembled from.
+eliot-receipts.workspace = true
 eliot-research-exchange.workspace = true
 eliot-research-exchange-api.workspace = true
 eliot-researcher.workspace = true
@@ -24,6 +43,10 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+# A real reactor is required to drive the authenticated front-door transport;
+# the shared process executor future itself is polled with a noop waker and
+# needs no reactor (see `execution::block_on`).
+tokio.workspace = true
 
 [lints]
 workspace = true

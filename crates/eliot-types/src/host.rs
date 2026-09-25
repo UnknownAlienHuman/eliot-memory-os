@@ -90,7 +90,10 @@ pub enum HostProfileStatus {
     Degraded,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct HostProtocolSurfaces {
     pub mcp_stdio: bool,
@@ -104,7 +107,11 @@ pub struct HostProtocolSurfaces {
     pub permissions: bool,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`;
+/// nested `HostProtocolSurfaces` is closed too.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentHostRuntimeProfile {
     pub host_id: AgentHostId,
     pub implementation_name: String,
@@ -125,14 +132,20 @@ pub struct AgentHostRuntimeProfile {
     pub status: HostProfileStatus,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentHostIdentity {
     pub host_id: AgentHostId,
     pub implementation_name: String,
     pub client_instance_id: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct AgentCapabilityEnvelope {
     pub capabilities: Vec<String>,
@@ -151,7 +164,13 @@ pub enum AgentSessionState {
     Retired,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`;
+/// nested `AgentHostIdentity`/`AgentCapabilityEnvelope` are closed too.
+/// `state` and `generation` are required on the wire: a missing value must not
+/// decode as an `Active` current-generation binding (Appendix P).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentSessionHostBinding {
     pub agent_session_id: AgentSessionId,
     pub host_identity: AgentHostIdentity,
@@ -161,9 +180,7 @@ pub struct AgentSessionHostBinding {
     #[serde(default)]
     pub bound_task_id: Option<TaskId>,
     pub task_role_lease_refs: Vec<String>,
-    #[serde(default)]
     pub state: AgentSessionState,
-    #[serde(default)]
     pub generation: u64,
     #[serde(default)]
     pub owner_operation_id: Option<String>,
@@ -173,7 +190,12 @@ pub struct AgentSessionHostBinding {
     pub disconnect_reason: Option<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
+/// `role_lease_epoch` and `operation_generation` are required on the wire: a
+/// missing value must not decode as a current-generation authority binding.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostLaunchContract {
     pub invocation_id: String,
     pub host_profile_ref: String,
@@ -184,9 +206,7 @@ pub struct HostLaunchContract {
     pub task_id: Option<TaskId>,
     pub work_item_id: Option<WorkItemId>,
     pub role_lease_id: Option<String>,
-    #[serde(default)]
     pub role_lease_epoch: u64,
-    #[serde(default)]
     pub operation_generation: u64,
     pub work_lease_id: Option<WorkLeaseId>,
     #[serde(default)]
@@ -217,7 +237,12 @@ pub struct HostLaunchContract {
     pub contract_hash: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
+/// `role_lease_epoch` and `operation_generation` are required on the wire: a
+/// missing value must not decode as a current-generation authority binding.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostLaunchScope {
     #[serde(default)]
     pub project_id: Option<ProjectId>,
@@ -225,9 +250,7 @@ pub struct HostLaunchScope {
     pub task_id: Option<TaskId>,
     pub work_item_id: Option<WorkItemId>,
     pub role_lease_id: Option<String>,
-    #[serde(default)]
     pub role_lease_epoch: u64,
-    #[serde(default)]
     pub operation_generation: u64,
     pub work_lease_id: Option<WorkLeaseId>,
     #[serde(default)]
@@ -252,7 +275,12 @@ pub struct HostLaunchScope {
 /// `taint: TaintClass::ExternalAgent`. There is exactly one producer
 /// (`eliot-engine` host-event summary) and no conversion into the closed
 /// normalized event exists; do not add one.
+///
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
+/// `event_kind` stays an opaque summary string by owner contract (#371 `R4`).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostEventEnvelope {
     pub host_id: AgentHostId,
     pub host_session_id: Option<String>,
@@ -272,7 +300,12 @@ pub struct HostEventEnvelope {
     pub taint: TaintClass,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
+/// `role_lease_epoch` and `operation_generation` are required on the wire: a
+/// missing value must not decode as a current-generation authority binding.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentInvocationRequest {
     pub invocation_id: String,
     pub project_id: ProjectId,
@@ -280,9 +313,7 @@ pub struct AgentInvocationRequest {
     pub work_item_id: WorkItemId,
     pub requested_capabilities: Vec<String>,
     pub role_lease_id: String,
-    #[serde(default)]
     pub role_lease_epoch: u64,
-    #[serde(default)]
     pub operation_generation: u64,
     #[serde(default)]
     pub runtime_contract_sha256: Option<String>,
@@ -316,7 +347,13 @@ pub enum AuthorityLeaseLifetime {
     SealBound,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
+/// `state` and `generation` are required on the wire: a missing value must not
+/// decode as an `Active` current-generation lease. `lifetime` still defaults to
+/// `Legacy`, the honest marker for rows predating the field.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskRoleLease {
     pub role_lease_id: String,
     pub task_id: TaskId,
@@ -326,7 +363,6 @@ pub struct TaskRoleLease {
     #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
     pub epoch: u64,
-    #[serde(default)]
     pub state: AuthorityLeaseState,
     #[serde(default)]
     pub lifetime: AuthorityLeaseLifetime,
@@ -334,7 +370,6 @@ pub struct TaskRoleLease {
     pub owner_operation_id: Option<String>,
     #[serde(default)]
     pub seal_attempt_id: Option<String>,
-    #[serde(default)]
     pub generation: u64,
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub issued_at: Option<OffsetDateTime>,
@@ -350,7 +385,13 @@ pub struct TaskRoleLease {
     pub superseded_by_epoch: Option<u64>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
+/// `state` and `generation` are required on the wire: a missing value must not
+/// decode as an `Active` current-generation lease. `lifetime` still defaults to
+/// `Legacy`, the honest marker for rows predating the field.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControllerLease {
     pub controller_lease_id: String,
     pub task_id: TaskId,
@@ -358,7 +399,6 @@ pub struct ControllerLease {
     #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
     pub epoch: u64,
-    #[serde(default)]
     pub state: AuthorityLeaseState,
     #[serde(default)]
     pub lifetime: AuthorityLeaseLifetime,
@@ -366,7 +406,6 @@ pub struct ControllerLease {
     pub owner_operation_id: Option<String>,
     #[serde(default)]
     pub seal_attempt_id: Option<String>,
-    #[serde(default)]
     pub generation: u64,
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub issued_at: Option<OffsetDateTime>,
@@ -399,16 +438,22 @@ pub enum AgentResultStatus {
 /// establishes A-01 attempt attribution or task Finish. Any compatibility
 /// conversion off this envelope stays one-way, loss-visible, and fail-closed
 /// without binding; it is never convertible to a Finish decision or receipt.
+///
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
+/// `role_lease_epoch` and `operation_generation` are required on the wire: a
+/// missing value must not decode as a current-generation authority binding.
+/// Nested `canonical_receipt: WriteReceiptRef` is owned by T08/#937 and stays
+/// open here; unknown keys inside it are that owner's gap, not this decoder's.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentResultEnvelope {
     pub result_id: String,
     pub invocation_id: String,
     pub host_id: AgentHostId,
     pub host_session_id: Option<String>,
     pub status: AgentResultStatus,
-    #[serde(default)]
     pub role_lease_epoch: u64,
-    #[serde(default)]
     pub operation_generation: u64,
     pub summary: String,
     pub artifact_refs: Vec<String>,
@@ -434,7 +479,12 @@ pub enum AgentResultDispositionKind {
     ProbeRequested,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
+/// Nested `canonical_receipt: WriteReceiptRef` is owned by T08/#937 and stays
+/// open here; unknown keys inside it are that owner's gap, not this decoder's.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentResultDisposition {
     pub disposition_id: String,
     pub result_id: String,
@@ -451,7 +501,12 @@ pub struct AgentResultDisposition {
     pub canonical_receipt: Option<WriteReceiptRef>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
+/// `generation` is required on the wire: a missing value must not decode as a
+/// current-generation job.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperationJob {
     pub job_id: String,
     pub invocation_id: String,
@@ -465,7 +520,6 @@ pub struct OperationJob {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
-    #[serde(default)]
     pub generation: u64,
     #[serde(default)]
     pub phase: OperationPhase,
@@ -501,7 +555,10 @@ pub enum OperationJobState {
     Abandoned,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityRevocationReceipt {
     pub receipt_id: String,
     pub role_lease_id: String,
@@ -517,7 +574,10 @@ pub struct AuthorityRevocationReceipt {
     pub revoked_at: OffsetDateTime,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostIntegrationReceipt {
     pub receipt_id: String,
     pub host_id: AgentHostId,
@@ -537,7 +597,10 @@ pub struct HostIntegrationReceipt {
     pub verified_at: OffsetDateTime,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostContextFootprintReport {
     pub host_id: AgentHostId,
     pub host_version: String,

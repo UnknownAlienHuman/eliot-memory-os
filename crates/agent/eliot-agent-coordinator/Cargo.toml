@@ -48,6 +48,7 @@ eliot-kernel-core.workspace = true
 eliot-kernel-service.workspace = true
 eliot-receipts.workspace = true
 eliot-security-contracts.workspace = true
+eliot-swarm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

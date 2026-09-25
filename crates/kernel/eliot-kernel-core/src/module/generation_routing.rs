@@ -2,13 +2,19 @@
 //!
 //! The Kernel owns the runtime generation route table. A route is the exact
 //! decision path a capability follows, and it always points to one active
-//! generation at one authority epoch. Switching a route is a *cutover*: it
-//! never mutates the old generation, it raises the authority epoch, and it
-//! frees only the previous epoch's fences through a forward transition.
+//! generation at one lineage-aware authority epoch. Switching a route is a
+//! *cutover*: it never mutates the old generation, it raises the sequence
+//! inside the same lineage, and it frees only the previous epoch's fences
+//! through a forward transition.
+//!
+//! Implemented by issue #64: the route, the cutover decision, and the router's
+//! own active epoch all carry the canonical [`EpochId`] tuple. There is no
+//! scalar epoch field left for a caller to coerce, and no numeric comparison
+//! can decide authority across two lineages.
 
 use std::collections::BTreeMap;
 
-use eliot_contracts::{AuthorityEpoch, EpochId, ResourceGeneration};
+use eliot_contracts::{EpochId, EpochRelation, ResourceGeneration};
 use eliot_runtime_contracts::GenerationCutoverState;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -16,35 +22,33 @@ use serde::{Deserialize, Serialize};
 use crate::error::{KernelError, validate_id};
 use crate::{RouteFence, RouteScope};
 
-/// One route bound to one active generation at one authority epoch.
+/// One route bound to one active generation at one lineage-aware authority epoch.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GenerationRoute {
     route_scope: RouteScope,
     active_generation: ResourceGeneration,
-    authority_epoch: AuthorityEpoch,
+    authority_epoch: EpochId,
 }
 
 impl GenerationRoute {
     /// Creates a route binding.
     ///
+    /// The epoch is the canonical tuple: a non-zero sequence inside a named
+    /// lineage, both already validated by [`EpochId`] construction, so this
+    /// constructor has no scalar epoch to reject.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the generation or epoch is zero.
+    /// Returns an error when the generation is zero.
     pub fn new(
         route_scope: RouteScope,
         active_generation: ResourceGeneration,
-        authority_epoch: AuthorityEpoch,
+        authority_epoch: EpochId,
     ) -> Result<Self, KernelError> {
         if active_generation.value() == 0 {
             return Err(KernelError::InvalidField {
                 field: "active_generation",
-                reason: "must be greater than zero",
-            });
-        }
-        if authority_epoch.value() == 0 {
-            return Err(KernelError::InvalidField {
-                field: "authority_epoch",
                 reason: "must be greater than zero",
             });
         }
@@ -67,10 +71,10 @@ impl GenerationRoute {
         self.active_generation
     }
 
-    /// Returns the bound authority epoch.
+    /// Returns the bound lineage-aware authority epoch.
     #[must_use]
-    pub const fn authority_epoch(&self) -> AuthorityEpoch {
-        self.authority_epoch
+    pub const fn authority_epoch(&self) -> &EpochId {
+        &self.authority_epoch
     }
 }
 
@@ -78,7 +82,9 @@ impl GenerationRoute {
 ///
 /// The decision is immutable and is only *applied* by [`GenerationRouter`]
 /// when its state has reached [`GenerationCutoverState::Committed`]. Rollback
-/// is never a backward transition: it is a new cutover at a newer epoch.
+/// is never a backward transition: it is a new cutover at a newer sequence
+/// inside the same epoch lineage. A cutover never mints a lineage; restore,
+/// break-glass, and corruption recovery do that separately.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CutoverDecision {
@@ -86,26 +92,32 @@ pub struct CutoverDecision {
     route_scope: RouteScope,
     old_generation: Option<ResourceGeneration>,
     new_generation: ResourceGeneration,
-    old_epoch: AuthorityEpoch,
-    new_epoch: AuthorityEpoch,
+    old_epoch: EpochId,
+    new_epoch: EpochId,
     state: GenerationCutoverState,
 }
 
 impl CutoverDecision {
     /// Creates and validates a cutover decision.
     ///
+    /// The epoch pair is compared on the exact tuple first. Two lineages are
+    /// unrelated, never ordered, so a cross-lineage pair is refused before any
+    /// sequence is read. Only inside one lineage is the strictly-rising
+    /// sequence rule evaluated.
+    ///
     /// # Errors
     ///
     /// Returns an error when the identity is blank, the generations are not
-    /// distinct, or the epoch does not strictly rise.
+    /// distinct, the epochs belong to different lineages, or the sequence does
+    /// not strictly rise inside that one lineage.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cutover_id: impl Into<String>,
         route_scope: RouteScope,
         old_generation: Option<ResourceGeneration>,
         new_generation: ResourceGeneration,
-        old_epoch: AuthorityEpoch,
-        new_epoch: AuthorityEpoch,
+        old_epoch: EpochId,
+        new_epoch: EpochId,
         state: GenerationCutoverState,
     ) -> Result<Self, KernelError> {
         let cutover_id = cutover_id.into();
@@ -116,7 +128,13 @@ impl CutoverDecision {
                 reason: "cutover must select a distinct generation",
             });
         }
-        if new_epoch.value() <= old_epoch.value() {
+        if old_epoch.lineage_id != new_epoch.lineage_id {
+            return Err(KernelError::InvalidField {
+                field: "new_epoch",
+                reason: "cutover must stay inside one epoch lineage",
+            });
+        }
+        if new_epoch.sequence.get() <= old_epoch.sequence.get() {
             return Err(KernelError::InvalidField {
                 field: "new_epoch",
                 reason: "cutover must raise the authority epoch",
@@ -157,16 +175,16 @@ impl CutoverDecision {
         self.new_generation
     }
 
-    /// Returns the epoch before the switch.
+    /// Returns the lineage-aware epoch before the switch.
     #[must_use]
-    pub const fn old_epoch(&self) -> AuthorityEpoch {
-        self.old_epoch
+    pub const fn old_epoch(&self) -> &EpochId {
+        &self.old_epoch
     }
 
-    /// Returns the epoch reserved for the switch.
+    /// Returns the lineage-aware epoch reserved for the switch.
     #[must_use]
-    pub const fn new_epoch(&self) -> AuthorityEpoch {
-        self.new_epoch
+    pub const fn new_epoch(&self) -> &EpochId {
+        &self.new_epoch
     }
 
     /// Returns the current cutover state.
@@ -182,56 +200,46 @@ impl CutoverDecision {
 /// epoch-raising cutovers. It never mutates a prior generation record; a
 /// cutover replaces the active route while the old generation drains through
 /// the separate [`GenerationCutoverState`] machine.
-#[derive(Clone, Debug, Default)]
+///
+/// The router has no lineage-less genesis constructor: an unbound scalar epoch
+/// cannot seed a route table, so every router starts from one explicit
+/// [`EpochId`] tuple minted by the Kernel service.
+#[derive(Clone, Debug)]
 pub struct GenerationRouter {
     routes: BTreeMap<RouteScope, GenerationRoute>,
-    epoch: AuthorityEpoch,
+    epoch: EpochId,
 }
 
 impl GenerationRouter {
-    /// Creates an empty router at the genesis epoch.
+    /// Creates an empty router at the exact lineage-aware epoch.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn at_epoch(epoch: EpochId) -> Self {
         Self {
             routes: BTreeMap::new(),
-            epoch: AuthorityEpoch::genesis(),
-        }
-    }
-
-    /// Creates a router seeded with an explicit epoch.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the epoch is zero.
-    pub fn at_epoch(epoch: AuthorityEpoch) -> Result<Self, KernelError> {
-        if epoch.value() == 0 {
-            return Err(KernelError::InvalidField {
-                field: "epoch",
-                reason: "must be greater than zero",
-            });
-        }
-        Ok(Self {
-            routes: BTreeMap::new(),
             epoch,
-        })
+        }
     }
 
-    /// Returns the router's current authority epoch.
+    /// Returns the router's current lineage-aware authority epoch.
     #[must_use]
-    pub const fn epoch(&self) -> AuthorityEpoch {
-        self.epoch
+    pub const fn epoch(&self) -> &EpochId {
+        &self.epoch
     }
 
     /// Registers or replaces a route at the current epoch.
     ///
+    /// The route epoch must be the exact same tuple as the router's active
+    /// epoch. A route minted under a different lineage at the same sequence is
+    /// unrelated and is refused as [`KernelError::StaleEpochTuple`].
+    ///
     /// # Errors
     ///
-    /// Returns an error when the route's epoch does not match the router.
+    /// Returns an error when the route's epoch tuple is not the router's.
     pub fn register(&mut self, route: GenerationRoute) -> Result<(), KernelError> {
-        if route.authority_epoch() != self.epoch {
-            return Err(KernelError::StaleEpoch {
-                observed: route.authority_epoch().value(),
-                active: self.epoch.value(),
+        if !route.authority_epoch().is_same_authority(&self.epoch) {
+            return Err(KernelError::StaleEpochTuple {
+                observed: route.authority_epoch().clone(),
+                active: self.epoch.clone(),
             });
         }
         self.routes.insert(route.route_scope().clone(), route);
@@ -240,18 +248,46 @@ impl GenerationRouter {
 
     /// Resolves the active route for an exact, current fence.
     ///
+    /// The presented epoch is the canonical [`EpochId`] tuple. Exact tuple
+    /// equality is the only authorization rule: the fence's own scalar epoch
+    /// is never read here, so a cross-lineage same-sequence fence cannot be
+    /// admitted and no caller can coerce a lineaged epoch back to a counter.
+    ///
     /// # Errors
     ///
     /// Returns [`KernelError::RouteMismatch`] for an unknown route,
-    /// [`KernelError::StaleEpoch`] for a fenced fence, or
-    /// [`KernelError::FenceMismatch`] when the fence disagrees with the route.
-    pub fn route_for_fence(&self, fence: &RouteFence) -> Result<&GenerationRoute, KernelError> {
+    /// [`KernelError::StaleEpochTuple`] when the presented tuple is not the
+    /// router's active tuple, or [`KernelError::FenceMismatch`] when the
+    /// generation disagrees with the route or the fence covers another scope.
+    pub fn route_for_fence(
+        &self,
+        fence: &RouteFence,
+        fence_epoch: &EpochId,
+    ) -> Result<&GenerationRoute, KernelError> {
         let route = self
             .routes
             .get(fence.route_scope())
             .ok_or(KernelError::RouteMismatch)?;
-        fence.enforce(fence.route_scope(), self.epoch)?;
-        if route.authority_epoch() != fence.authority_epoch()
+        // #59 regression guard: only the exact active tuple is authority. A
+        // sequence inside the router's own lineage that is not the active one
+        // stays a plain `FenceMismatch`, so a lower fenced epoch and an
+        // unactivated future epoch remain typed exactly as issue #59 fixed
+        // them. An epoch from another lineage is unrelated rather than
+        // ordered, and reports both complete tuples.
+        if !fence_epoch.is_same_authority(&self.epoch) {
+            return Err(if fence_epoch.lineage_id == self.epoch.lineage_id {
+                KernelError::FenceMismatch
+            } else {
+                KernelError::StaleEpochTuple {
+                    observed: fence_epoch.clone(),
+                    active: self.epoch.clone(),
+                }
+            });
+        }
+        if fence.route_scope() != route.route_scope() {
+            return Err(KernelError::FenceMismatch);
+        }
+        if !route.authority_epoch().is_same_authority(fence_epoch)
             || route.active_generation() != fence.resource_generation()
         {
             return Err(KernelError::FenceMismatch);
@@ -266,30 +302,6 @@ impl GenerationRouter {
     /// Returns [`KernelError::RouteMismatch`] when the route is unknown.
     pub fn route(&self, scope: &RouteScope) -> Result<&GenerationRoute, KernelError> {
         self.routes.get(scope).ok_or(KernelError::RouteMismatch)
-    }
-
-    /// Resolves the active route only when the canonical exact-tuple fence matches.
-    ///
-    /// The canonical check runs first via exact lineage-plus-sequence equality:
-    /// cross-lineage same-sequence fences fail closed as
-    /// [`KernelError::FenceMismatch`] without any scalar coercion, and only an
-    /// exact canonical match delegates to the scalar [`Self::route_for_fence`]
-    /// path, which is left intact.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`KernelError::FenceMismatch`] for a non-matching canonical
-    /// tuple, then the same failures as [`Self::route_for_fence`].
-    pub fn route_for_canonical_fence(
-        &self,
-        fence: &RouteFence,
-        fence_epoch: &EpochId,
-        active_epoch: &EpochId,
-    ) -> Result<&GenerationRoute, KernelError> {
-        if !fence_epoch.is_same_authority(active_epoch) {
-            return Err(KernelError::FenceMismatch);
-        }
-        self.route_for_fence(fence)
     }
 
     /// Applies a committed cutover, raising the epoch and switching the route.
@@ -320,21 +332,27 @@ impl GenerationRouter {
         if route.active_generation() != old_generation {
             return Err(KernelError::FenceMismatch);
         }
-        if decision.old_epoch() != self.epoch {
-            return Err(KernelError::StaleEpoch {
-                observed: decision.old_epoch().value(),
-                active: self.epoch.value(),
+        // The cutover must name the router's exact active tuple. A decision
+        // minted against a different lineage, or against an already-superseded
+        // sequence, cannot advance the live fence.
+        if !decision.old_epoch().is_same_authority(&self.epoch) {
+            return Err(KernelError::StaleEpochTuple {
+                observed: decision.old_epoch().clone(),
+                active: self.epoch.clone(),
             });
         }
-        if decision.old_epoch() != self.epoch || decision.new_epoch().value() <= self.epoch.value()
-        {
-            return Err(KernelError::StaleEpoch {
-                observed: decision.old_epoch().value(),
-                active: self.epoch.value(),
+        // The new epoch must be strictly newer *inside the router's own
+        // lineage*. A different lineage is unrelated and can never advance the
+        // live fence, and an equal or older sequence is not a forward
+        // transition.
+        if decision.new_epoch().relation_to(&self.epoch) != EpochRelation::SameLineageNewer {
+            return Err(KernelError::StaleEpochTuple {
+                observed: decision.new_epoch().clone(),
+                active: self.epoch.clone(),
             });
         }
-        let new_epoch = decision.new_epoch();
-        self.epoch = decision.new_epoch();
+        let new_epoch = decision.new_epoch().clone();
+        self.epoch = new_epoch.clone();
         // The authority epoch is global.  A cutover for one scope therefore
         // re-fences every still-active scope at the same new epoch; keeping an
         // unaffected route at the old epoch would make recovery and the live
@@ -342,7 +360,8 @@ impl GenerationRouter {
         let prior_routes = self.routes.clone();
         let mut rebound_routes = BTreeMap::new();
         for (scope, prior) in prior_routes {
-            let route = GenerationRoute::new(scope.clone(), prior.active_generation(), new_epoch)?;
+            let route =
+                GenerationRoute::new(scope.clone(), prior.active_generation(), new_epoch.clone())?;
             rebound_routes.insert(scope, route);
         }
         let replaced = GenerationRoute::new(
@@ -359,200 +378,11 @@ impl GenerationRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::EpochLineageId;
+    use eliot_contracts::{AuthorityEpoch, EpochLineageId};
     use std::num::NonZeroU64;
 
-    fn router_with_daemon(epoch: u64, generation: u64) -> Result<GenerationRouter, KernelError> {
-        let mut router = GenerationRouter::at_epoch(AuthorityEpoch::new(epoch)?)?;
-        router.register(GenerationRoute::new(
-            RouteScope::new("daemon")?,
-            ResourceGeneration::new(generation)?,
-            AuthorityEpoch::new(epoch)?,
-        )?)?;
-        Ok(router)
-    }
-
-    #[test]
-    fn fence_must_match_route_generation_and_epoch() -> Result<(), KernelError> {
-        let router = router_with_daemon(2, 5)?;
-        let good_fence = RouteFence::new(
-            RouteScope::new("daemon")?,
-            AuthorityEpoch::new(2)?,
-            ResourceGeneration::new(5)?,
-            eliot_process::Generation::new(1)?,
-            "nonce",
-        )?;
-        assert!(router.route_for_fence(&good_fence).is_ok());
-
-        let wrong_generation = RouteFence::new(
-            RouteScope::new("daemon")?,
-            AuthorityEpoch::new(2)?,
-            ResourceGeneration::new(6)?,
-            eliot_process::Generation::new(1)?,
-            "nonce",
-        )?;
-        assert!(matches!(
-            router.route_for_fence(&wrong_generation),
-            Err(KernelError::FenceMismatch)
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn cutover_requires_distinct_generation_and_rising_epoch() -> Result<(), KernelError> {
-        assert!(
-            CutoverDecision::new(
-                "c-1",
-                RouteScope::new("daemon")?,
-                Some(ResourceGeneration::new(5)?),
-                ResourceGeneration::new(5)?,
-                AuthorityEpoch::new(2)?,
-                AuthorityEpoch::new(3)?,
-                GenerationCutoverState::Preparing,
-            )
-            .is_err()
-        );
-        assert!(
-            CutoverDecision::new(
-                "c-1",
-                RouteScope::new("daemon")?,
-                Some(ResourceGeneration::new(5)?),
-                ResourceGeneration::new(6)?,
-                AuthorityEpoch::new(2)?,
-                AuthorityEpoch::new(2)?,
-                GenerationCutoverState::Preparing,
-            )
-            .is_err()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn cutover_rebinds_unaffected_scopes_to_global_epoch() -> Result<(), KernelError> {
-        let mut router = router_with_daemon(2, 5)?;
-        router.register(GenerationRoute::new(
-            RouteScope::new("worker")?,
-            ResourceGeneration::new(8)?,
-            AuthorityEpoch::new(2)?,
-        )?)?;
-        let decision = CutoverDecision::new(
-            "cutover-global-epoch",
-            RouteScope::new("daemon")?,
-            Some(ResourceGeneration::new(5)?),
-            ResourceGeneration::new(6)?,
-            AuthorityEpoch::new(2)?,
-            AuthorityEpoch::new(3)?,
-            GenerationCutoverState::Committed,
-        )?;
-        router.cutover(&decision)?;
-        assert_eq!(router.epoch(), AuthorityEpoch::new(3)?);
-        assert_eq!(
-            router
-                .route(&RouteScope::new("daemon")?)?
-                .active_generation()
-                .value(),
-            6
-        );
-        assert_eq!(
-            router
-                .route(&RouteScope::new("worker")?)?
-                .active_generation()
-                .value(),
-            8
-        );
-        assert_eq!(
-            router.route(&RouteScope::new("worker")?)?.authority_epoch(),
-            AuthorityEpoch::new(3)?
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn committed_cutover_switches_route_and_raises_epoch() -> Result<(), KernelError> {
-        let mut router = router_with_daemon(2, 5)?;
-        let decision = CutoverDecision::new(
-            "c-1",
-            RouteScope::new("daemon")?,
-            Some(ResourceGeneration::new(5)?),
-            ResourceGeneration::new(6)?,
-            AuthorityEpoch::new(2)?,
-            AuthorityEpoch::new(3)?,
-            GenerationCutoverState::Committed,
-        )?;
-        router.cutover(&decision)?;
-        assert_eq!(router.epoch().value(), 3);
-        let route = router.route(&RouteScope::new("daemon")?)?;
-        assert_eq!(route.active_generation().value(), 6);
-        assert_eq!(route.authority_epoch().value(), 3);
-        Ok(())
-    }
-
-    #[test]
-    fn non_committed_cutover_is_rejected() -> Result<(), KernelError> {
-        let mut router = router_with_daemon(2, 5)?;
-        let decision = CutoverDecision::new(
-            "c-1",
-            RouteScope::new("daemon")?,
-            Some(ResourceGeneration::new(5)?),
-            ResourceGeneration::new(6)?,
-            AuthorityEpoch::new(2)?,
-            AuthorityEpoch::new(3)?,
-            GenerationCutoverState::Preparing,
-        )?;
-        assert!(matches!(
-            router.cutover(&decision),
-            Err(KernelError::IllegalTransition { .. })
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn model_based_cutover_sequence_preserves_epoch_monotonicity() -> Result<(), KernelError> {
-        // A deterministic model that mirrors the router: every successful
-        // cutover must raise the epoch and leave the route at the new
-        // generation. A stale or non-committed cutover must change nothing.
-        let mut router = GenerationRouter::at_epoch(AuthorityEpoch::genesis())?;
-        let mut model_epoch = 1u64;
-        let mut model_generation = 1u64;
-
-        for step in 0..40 {
-            let next_epoch = model_epoch + 1;
-            let next_generation = model_generation + 1;
-            let decision = CutoverDecision::new(
-                format!("c-{step}"),
-                RouteScope::new("daemon")?,
-                Some(ResourceGeneration::new(model_generation)?),
-                ResourceGeneration::new(next_generation)?,
-                AuthorityEpoch::new(model_epoch)?,
-                AuthorityEpoch::new(next_epoch)?,
-                if step % 5 == 4 {
-                    GenerationCutoverState::Preparing
-                } else {
-                    GenerationCutoverState::Committed
-                },
-            )?;
-
-            if step == 0 {
-                router.register(GenerationRoute::new(
-                    RouteScope::new("daemon")?,
-                    ResourceGeneration::new(model_generation)?,
-                    AuthorityEpoch::new(model_epoch)?,
-                )?)?;
-            }
-
-            let committed = step % 5 != 4;
-            assert_eq!(router.cutover(&decision).is_ok(), committed);
-            if committed {
-                model_epoch = next_epoch;
-                model_generation = next_generation;
-            }
-            assert_eq!(router.epoch().value(), model_epoch);
-            let route = router.route(&RouteScope::new("daemon")?)?;
-            assert_eq!(route.active_generation().value(), model_generation);
-            assert_eq!(route.authority_epoch().value(), model_epoch);
-        }
-        Ok(())
-    }
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const FOREIGN_LINEAGE: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 
     fn canonical_epoch(lineage: &str, sequence: u64) -> Result<EpochId, KernelError> {
         let lineage_id = EpochLineageId::new(lineage).map_err(|_| KernelError::InvalidField {
@@ -569,6 +399,221 @@ mod tests {
         })
     }
 
+    fn router_with_daemon(epoch: u64, generation: u64) -> Result<GenerationRouter, KernelError> {
+        let epoch = canonical_epoch(TEST_LINEAGE, epoch)?;
+        let mut router = GenerationRouter::at_epoch(epoch.clone());
+        router.register(GenerationRoute::new(
+            RouteScope::new("daemon")?,
+            ResourceGeneration::new(generation)?,
+            epoch,
+        )?)?;
+        Ok(router)
+    }
+
+    #[test]
+    fn fence_must_match_route_generation_and_epoch() -> Result<(), KernelError> {
+        let router = router_with_daemon(2, 5)?;
+        let epoch = canonical_epoch(TEST_LINEAGE, 2)?;
+        let good_fence = RouteFence::new(
+            RouteScope::new("daemon")?,
+            AuthorityEpoch::new(2)?,
+            ResourceGeneration::new(5)?,
+            eliot_process::Generation::new(1)?,
+            "nonce",
+        )?;
+        assert!(router.route_for_fence(&good_fence, &epoch).is_ok());
+
+        let wrong_generation = RouteFence::new(
+            RouteScope::new("daemon")?,
+            AuthorityEpoch::new(2)?,
+            ResourceGeneration::new(6)?,
+            eliot_process::Generation::new(1)?,
+            "nonce",
+        )?;
+        assert!(matches!(
+            router.route_for_fence(&wrong_generation, &epoch),
+            Err(KernelError::FenceMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn cutover_requires_distinct_generation_and_rising_epoch() -> Result<(), KernelError> {
+        assert!(
+            CutoverDecision::new(
+                "c-1",
+                RouteScope::new("daemon")?,
+                Some(ResourceGeneration::new(5)?),
+                ResourceGeneration::new(5)?,
+                canonical_epoch(TEST_LINEAGE, 2)?,
+                canonical_epoch(TEST_LINEAGE, 3)?,
+                GenerationCutoverState::Preparing,
+            )
+            .is_err()
+        );
+        assert!(
+            CutoverDecision::new(
+                "c-1",
+                RouteScope::new("daemon")?,
+                Some(ResourceGeneration::new(5)?),
+                ResourceGeneration::new(6)?,
+                canonical_epoch(TEST_LINEAGE, 2)?,
+                canonical_epoch(TEST_LINEAGE, 2)?,
+                GenerationCutoverState::Preparing,
+            )
+            .is_err()
+        );
+        assert!(
+            CutoverDecision::new(
+                "c-1",
+                RouteScope::new("daemon")?,
+                Some(ResourceGeneration::new(5)?),
+                ResourceGeneration::new(6)?,
+                canonical_epoch(TEST_LINEAGE, 2)?,
+                canonical_epoch(FOREIGN_LINEAGE, 9)?,
+                GenerationCutoverState::Preparing,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cutover_rebinds_unaffected_scopes_to_global_epoch() -> Result<(), KernelError> {
+        let mut router = router_with_daemon(2, 5)?;
+        router.register(GenerationRoute::new(
+            RouteScope::new("worker")?,
+            ResourceGeneration::new(8)?,
+            canonical_epoch(TEST_LINEAGE, 2)?,
+        )?)?;
+        let decision = CutoverDecision::new(
+            "cutover-global-epoch",
+            RouteScope::new("daemon")?,
+            Some(ResourceGeneration::new(5)?),
+            ResourceGeneration::new(6)?,
+            canonical_epoch(TEST_LINEAGE, 2)?,
+            canonical_epoch(TEST_LINEAGE, 3)?,
+            GenerationCutoverState::Committed,
+        )?;
+        router.cutover(&decision)?;
+        assert_eq!(router.epoch(), &canonical_epoch(TEST_LINEAGE, 3)?);
+        assert_eq!(
+            router
+                .route(&RouteScope::new("daemon")?)?
+                .active_generation()
+                .value(),
+            6
+        );
+        assert_eq!(
+            router
+                .route(&RouteScope::new("worker")?)?
+                .active_generation()
+                .value(),
+            8
+        );
+        assert_eq!(
+            router.route(&RouteScope::new("worker")?)?.authority_epoch(),
+            &canonical_epoch(TEST_LINEAGE, 3)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_cutover_switches_route_and_raises_epoch() -> Result<(), KernelError> {
+        let mut router = router_with_daemon(2, 5)?;
+        let decision = CutoverDecision::new(
+            "c-1",
+            RouteScope::new("daemon")?,
+            Some(ResourceGeneration::new(5)?),
+            ResourceGeneration::new(6)?,
+            canonical_epoch(TEST_LINEAGE, 2)?,
+            canonical_epoch(TEST_LINEAGE, 3)?,
+            GenerationCutoverState::Committed,
+        )?;
+        router.cutover(&decision)?;
+        let active = canonical_epoch(TEST_LINEAGE, 3)?;
+        assert!(router.epoch().is_same_authority(&active));
+        let route = router.route(&RouteScope::new("daemon")?)?;
+        assert_eq!(route.active_generation().value(), 6);
+        assert!(route.authority_epoch().is_same_authority(&active));
+        Ok(())
+    }
+
+    #[test]
+    fn non_committed_cutover_is_rejected() -> Result<(), KernelError> {
+        let mut router = router_with_daemon(2, 5)?;
+        let decision = CutoverDecision::new(
+            "c-1",
+            RouteScope::new("daemon")?,
+            Some(ResourceGeneration::new(5)?),
+            ResourceGeneration::new(6)?,
+            canonical_epoch(TEST_LINEAGE, 2)?,
+            canonical_epoch(TEST_LINEAGE, 3)?,
+            GenerationCutoverState::Preparing,
+        )?;
+        assert!(matches!(
+            router.cutover(&decision),
+            Err(KernelError::IllegalTransition { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn model_based_cutover_sequence_preserves_epoch_monotonicity() -> Result<(), KernelError> {
+        // A deterministic model that mirrors the router: every successful
+        // cutover must raise the epoch and leave the route at the new
+        // generation. A stale or non-committed cutover must change nothing.
+        let mut router = GenerationRouter::at_epoch(canonical_epoch(TEST_LINEAGE, 1)?);
+        let mut model_epoch = 1u64;
+        let mut model_generation = 1u64;
+
+        for step in 0..40 {
+            let next_epoch = model_epoch + 1;
+            let next_generation = model_generation + 1;
+            let decision = CutoverDecision::new(
+                format!("c-{step}"),
+                RouteScope::new("daemon")?,
+                Some(ResourceGeneration::new(model_generation)?),
+                ResourceGeneration::new(next_generation)?,
+                canonical_epoch(TEST_LINEAGE, model_epoch)?,
+                canonical_epoch(TEST_LINEAGE, next_epoch)?,
+                if step % 5 == 4 {
+                    GenerationCutoverState::Preparing
+                } else {
+                    GenerationCutoverState::Committed
+                },
+            )?;
+
+            if step == 0 {
+                router.register(GenerationRoute::new(
+                    RouteScope::new("daemon")?,
+                    ResourceGeneration::new(model_generation)?,
+                    canonical_epoch(TEST_LINEAGE, model_epoch)?,
+                )?)?;
+            }
+
+            let committed = step % 5 != 4;
+            assert_eq!(router.cutover(&decision).is_ok(), committed);
+            if committed {
+                model_epoch = next_epoch;
+                model_generation = next_generation;
+            }
+            assert!(
+                router
+                    .epoch()
+                    .is_same_authority(&canonical_epoch(TEST_LINEAGE, model_epoch)?)
+            );
+            let route = router.route(&RouteScope::new("daemon")?)?;
+            assert_eq!(route.active_generation().value(), model_generation);
+            assert!(
+                route
+                    .authority_epoch()
+                    .is_same_authority(&canonical_epoch(TEST_LINEAGE, model_epoch)?)
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn canonical_fence_gates_route_before_scalar_match() -> Result<(), KernelError> {
         let router = router_with_daemon(2, 5)?;
@@ -579,18 +624,13 @@ mod tests {
             eliot_process::Generation::new(1)?,
             "nonce",
         )?;
-        let active = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 2)?;
-        let same = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 2)?;
-        let cross_lineage_same_sequence =
-            canonical_epoch("6ba7b810-9dad-11d1-80b4-00c04fd430c8", 2)?;
-        assert!(
-            router
-                .route_for_canonical_fence(&fence, &same, &active)
-                .is_ok()
-        );
+        let active = canonical_epoch(TEST_LINEAGE, 2)?;
+        let same = canonical_epoch(TEST_LINEAGE, 2)?;
+        let cross_lineage_same_sequence = canonical_epoch(FOREIGN_LINEAGE, 2)?;
+        assert!(router.route_for_fence(&fence, &same).is_ok());
         assert!(matches!(
-            router.route_for_canonical_fence(&fence, &cross_lineage_same_sequence, &active),
-            Err(KernelError::FenceMismatch)
+            router.route_for_fence(&fence, &cross_lineage_same_sequence),
+            Err(KernelError::StaleEpochTuple { .. })
         ));
         Ok(())
     }

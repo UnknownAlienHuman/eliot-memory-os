@@ -43,7 +43,7 @@ impl HostComposition {
     ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 893/14 — pending activation reconciliation requested.
         host_activation_observe("host.activation reconcile requested");
-        self.ensure_admission_open()?;
+        self.ensure_pending_activation_continuation_open(pending)?;
         let host_capability = self.owner_lease.activation_capability();
         let pending = self.claim_pending_durable(pending, &host_capability)?;
         if pending
@@ -69,32 +69,19 @@ impl HostComposition {
             HostStartupBranch::Pending,
             Some(&pending),
         ) {
-            if pending.prior_active_generation.is_none() {
-                if let Err(abort_error) = self.abort_pending_durable(&pending, &host_capability) {
-                    let reason = format!("pending activation abort was refused: {abort_error}");
-                    if let Err(recovery_error) = persist_pending_recovery(
-                        &self.registry_host_root.clone(),
-                        &mut self.registry,
-                        &host_capability,
-                        &pending,
-                        &reason,
-                    ) {
-                        return Err(HostError::RecoveryRequired(format!(
-                            "pending activation abort was refused ({abort_error}); retaining recovery carrier also failed: {recovery_error}"
-                        )));
-                    }
-                    return Err(abort_error);
-                }
-            } else {
-                let reason = error.to_string();
-                persist_pending_recovery(
-                    &self.registry_host_root.clone(),
-                    &mut self.registry,
-                    &host_capability,
-                    &pending,
-                    &reason,
-                )?;
-            }
+            // A first-install contour has no prior active generation whose
+            // registry pointer could prove recovery. Keep the exact pending
+            // activation as a durable recovery carrier instead of aborting it
+            // and leaving an unclean Starting/Degraded journal that the next
+            // Host open cannot legally reopen. No retry is issued here.
+            let reason = error.to_string();
+            persist_pending_recovery(
+                &self.registry_host_root.clone(),
+                &mut self.registry,
+                &host_capability,
+                &pending,
+                &reason,
+            )?;
             return Err(error);
         }
         self.commit_pending_durable(&pending, &host_capability)?;

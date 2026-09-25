@@ -22,6 +22,26 @@
 //! Governor composition stays the single owner of the underlying state, and the
 //! ledger only records what the composition root observed at startup.
 //!
+//! #2560: "all seven bound" is not a readiness question, so this module
+//! refuses to answer one. It exposes three genuinely different queries and the
+//! evidence each one rests on:
+//!
+//! ```text
+//! all_slots_accounted_for                  — does every declared slot carry a
+//!                                            disposition, and does every
+//!                                            retained proof belong to the slot
+//!                                            that files it;
+//! every_declared_capability_bound          — the strict union of all seven
+//!                                            slots (full-health startup only);
+//! per-slot disposition / declared_slot     — the availability of the one
+//!                                            capability an operation uses.
+//! ```
+//!
+//! The core-readiness and per-operation verdicts live in
+//! [`crate::startup_readiness`], which reads this ledger and the composition's
+//! live owners. A name like "is complete" cannot be read as "ready" from here,
+//! because no such name exists any more.
+//!
 //! Architecture traceability: A2.3 (a material capability has one causal owner
 //! and an explicit public contract) and A13.8 (integrity evidence and visible
 //! degradation). Implementation traceability: I1.5 starts only the capabilities
@@ -73,6 +93,24 @@ impl DeclaredStartupCapability {
 
     /// Number of declared startup capabilities.
     pub const COUNT: usize = 7;
+
+    /// The slot index of this declared capability in [`Self::ALL`].
+    ///
+    /// Total by construction and total over the same closed denominator, so
+    /// the ledger can index its slot array by declaration without an optional
+    /// lookup that could silently miss.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::OwnerSessionBinding => 0,
+            Self::NotificationSnapshot => 1,
+            Self::DreamerIntake => 2,
+            Self::DreamerModel => 3,
+            Self::AgentFabric => 4,
+            Self::SkillToolSource => 5,
+            Self::SkillToolBasis => 6,
+        }
+    }
 
     /// Returns the stable capability name used in diagnostics.
     #[must_use]
@@ -129,6 +167,27 @@ pub enum RetainedStartupBinding {
 }
 
 impl RetainedStartupBinding {
+    /// The one declared slot whose own attach produces this retained proof.
+    ///
+    /// The mapping is total and one-to-one, which is what lets the ledger
+    /// reject a proof filed under a foreign slot. Positional construction
+    /// cannot express that check — `StartupCapabilityBindings::new` takes seven
+    /// arguments in declaration order, so a refactor can hand slot *n* the
+    /// value slot *m* produced without a type error. That is a binding defect,
+    /// not a satisfied capability, and it stays fail-closed.
+    #[must_use]
+    pub const fn declared_slot(&self) -> DeclaredStartupCapability {
+        match self {
+            Self::OwnerSession { .. } => DeclaredStartupCapability::OwnerSessionBinding,
+            Self::NotificationSnapshot { .. } => DeclaredStartupCapability::NotificationSnapshot,
+            Self::DreamerIntakeRoute(_) => DeclaredStartupCapability::DreamerIntake,
+            Self::DreamerModelRoute(_) => DeclaredStartupCapability::DreamerModel,
+            Self::AgentFabric(_) => DeclaredStartupCapability::AgentFabric,
+            Self::SkillToolSource { .. } => DeclaredStartupCapability::SkillToolSource,
+            Self::SkillToolBasis { .. } => DeclaredStartupCapability::SkillToolBasis,
+        }
+    }
+
     /// Renders the exact retained identity as a bounded diagnostic fragment.
     #[must_use]
     pub fn identity(&self) -> String {
@@ -204,6 +263,21 @@ impl StartupBindingDisposition {
             Self::Unbound(reason) => Some(reason.as_str()),
         }
     }
+
+    /// Returns whether this disposition answers for `capability`.
+    ///
+    /// An exact unbound reason always answers: a missing capability is a real,
+    /// fail-closed account of its slot, distinct from a bound one. A bound
+    /// disposition answers only when the retained proof is the evidence that
+    /// slot's own attach produced. A proof filed under a foreign slot answers
+    /// for nothing — neither accounted nor available.
+    #[must_use]
+    pub fn proves_slot(&self, capability: DeclaredStartupCapability) -> bool {
+        match self {
+            Self::Bound(retained) => retained.declared_slot() == capability,
+            Self::Unbound(_) => true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -212,13 +286,52 @@ struct StartupBindingSlot {
     disposition: StartupBindingDisposition,
 }
 
+/// Whole-ledger accounting outcome: are all declared slots accounted for?
+///
+/// Deliberately distinct from the other two questions a caller can ask this
+/// ledger. A ledger can be fully accounted while an optional capability is
+/// unavailable, and a single misfiled optional proof breaks accounting without
+/// touching any core prerequisite. Callers that treat this as readiness would
+/// reintroduce exactly the #2560 conflation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SlotAccounting {
+    /// Every declared capability carries one disposition, and every retained
+    /// proof belongs to the slot that files it.
+    Accounted {
+        /// Declared slots whose own attach produced a retained proof.
+        bound: usize,
+        /// Declared slots holding an exact unbound reason. These are visible
+        /// degradation, not an accounting gap.
+        unavailable: usize,
+    },
+    /// A slot files proof produced by a different declared capability's
+    /// attach. Fail-closed: the misfiled slot is neither accounted nor bound,
+    /// whatever the other six slots record.
+    Misattributed {
+        /// The declared slot whose retained proof came from another attach.
+        slot: DeclaredStartupCapability,
+        /// The declared slot whose attach actually produced that proof.
+        retained_for: DeclaredStartupCapability,
+    },
+}
+
+impl SlotAccounting {
+    /// Returns whether every declared slot is accounted for.
+    #[must_use]
+    pub const fn is_accounted(&self) -> bool {
+        matches!(self, Self::Accounted { .. })
+    }
+}
+
 /// The retained startup binding ledger for one daemon generation.
 ///
 /// Construction requires one disposition per declared capability, so a
-/// generation cannot reach the readiness decision with a capability silently
-/// skipped. Readiness is read from the recorded slots through
-/// [`Self::is_complete`]; there is no separate hard-coded readiness constant
-/// that could disagree with what was actually observed.
+/// generation cannot reach any verdict with a capability silently skipped.
+/// The verdicts themselves are read from the recorded slots, never from a
+/// hard-coded constant that could disagree with what was actually observed:
+/// [`Self::all_slots_accounted_for`] answers the accounting question,
+/// [`Self::every_declared_capability_bound`] answers the strict full-health
+/// question, and [`Self::disposition`] answers the per-operation question.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartupCapabilityBindings {
     slots: [StartupBindingSlot; DeclaredStartupCapability::COUNT],
@@ -275,13 +388,90 @@ impl StartupCapabilityBindings {
     }
 
     /// Returns true when every declared capability is bound.
+    ///
+    /// This is the strict union of all seven slots — a fully healthy startup,
+    /// nothing weaker and nothing stronger. It is deliberately **not** a
+    /// readiness answer: a notification, Dreamer, Skill or agent-fabric attach
+    /// can fail and leave this `false` while core control readiness still
+    /// holds, and (once a slot is re-evaluated) it can become `true` again
+    /// after a later generation binds. Use
+    /// [`crate::startup_readiness::StartupReadinessProjection::core_readiness_prerequisites_satisfied`]
+    /// for the core verdict and
+    /// [`Self::all_slots_accounted_for`] for the accounting verdict.
     #[must_use]
-    pub fn is_complete(&self) -> bool {
-        self.slots.iter().all(|slot| slot.disposition.is_bound())
+    pub fn every_declared_capability_bound(&self) -> bool {
+        self.slots.iter().all(|slot| {
+            slot.disposition.is_bound() && slot.disposition.proves_slot(slot.capability)
+        })
+    }
+
+    /// Returns the accounting verdict for the whole declared denominator.
+    ///
+    /// Every declared capability is accounted for when it carries one
+    /// disposition, including an exact unbound reason, and every bound
+    /// disposition files the proof its own slot's attach produced. A single
+    /// misfiled proof fails the whole ledger: a misattributed slot is not a
+    /// bound capability, and it is not a missing one either.
+    #[must_use]
+    pub fn all_slots_accounted_for(&self) -> SlotAccounting {
+        let mut bound = 0_usize;
+        let mut unavailable = 0_usize;
+        for slot in &self.slots {
+            match &slot.disposition {
+                StartupBindingDisposition::Bound(retained)
+                    if retained.declared_slot() == slot.capability =>
+                {
+                    bound += 1;
+                }
+                StartupBindingDisposition::Bound(retained) => {
+                    return SlotAccounting::Misattributed {
+                        slot: slot.capability,
+                        retained_for: retained.declared_slot(),
+                    };
+                }
+                StartupBindingDisposition::Unbound(_) => unavailable += 1,
+            }
+        }
+        SlotAccounting::Accounted { bound, unavailable }
+    }
+
+    /// Returns the recorded disposition for one declared capability.
+    ///
+    /// `slots` is built in [`DeclaredStartupCapability::ALL`] order and
+    /// [`DeclaredStartupCapability::index`] is total over the same closed
+    /// denominator, so the lookup cannot miss; the assertion keeps the two
+    /// denominators from drifting apart silently.
+    #[must_use]
+    pub fn disposition(&self, capability: DeclaredStartupCapability) -> &StartupBindingDisposition {
+        &self.slots[capability.index()].disposition
+    }
+
+    /// Files a freshly observed disposition for exactly one declared slot and
+    /// returns the disposition it replaced.
+    ///
+    /// Crate-internal on purpose: only the startup readiness projection may
+    /// re-file a slot, from evidence the owning attach or a demand-driven
+    /// re-read actually produced. A caller cannot hand the ledger a
+    /// disposition for a capability it did not observe, cannot widen the
+    /// affected set past one slot, and cannot re-file the whole ledger in one
+    /// call. It is also not a way to mark a capability bound: `Bound` still
+    /// requires a [`RetainedStartupBinding`] the owner produced.
+    pub(crate) fn replace_disposition(
+        &mut self,
+        capability: DeclaredStartupCapability,
+        disposition: StartupBindingDisposition,
+    ) -> StartupBindingDisposition {
+        let slot = &mut self.slots[capability.index()];
+        debug_assert_eq!(
+            slot.capability, capability,
+            "startup slot array diverged from the declared declaration order"
+        );
+        std::mem::replace(&mut slot.disposition, disposition)
     }
 
     /// Returns the exact reason each unbound capability did not bind, in
-    /// declaration order. Empty exactly when [`Self::is_complete`] holds.
+    /// declaration order. Empty exactly when
+    /// [`Self::every_declared_capability_bound`] holds.
     #[must_use]
     pub fn unbound_reasons(&self) -> Vec<(DeclaredStartupCapability, String)> {
         self.slots

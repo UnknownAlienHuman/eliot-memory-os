@@ -11,8 +11,15 @@
     reason = "windows-only helpers are live on Windows; allow for cross-platform check"
 )]
 
+/// Host-owned I1.5 activation / demand-start / idle-drain orchestration over
+/// the crash-safe `HostStateJournal`.
+#[cfg(windows)]
+pub mod activation_lifecycle;
 /// Backup configuration evidence projection (B-BACKUP-HOST-PREP #958).
 pub mod backup_config_projection;
+/// Host-owned installation post-restore cutover (#961).
+#[cfg(windows)]
+pub mod backup_cutover;
 /// Host-owned isolated backup destination preparation (B-BACKUP-HOST-PREP #958).
 pub mod backup_preparation;
 mod credential_control;
@@ -28,11 +35,19 @@ mod host_composition_validation;
 /// own serialized turns, never a second copy.
 pub mod host_diagnostics;
 mod host_job_launch;
+/// Authenticated Kernel ORS introduction readback for cutover evidence
+/// (issue #961, F-AUR-1).
+#[cfg(windows)]
+mod introduction_readback;
 #[cfg(windows)]
 mod launch_artifact;
 #[cfg(windows)]
 mod launch_descriptor_validation;
 mod launch_options;
+/// Exact-generation lease census and retirement admission (#1751 Host
+/// owner, consumed by #961 cutover).
+#[cfg(windows)]
+mod lease_drain;
 #[cfg(windows)]
 mod reactive_context_delivery;
 mod scm_launch;
@@ -148,6 +163,8 @@ use launch_descriptor_validation::{
 };
 pub use launch_options::HostLaunchOptions;
 use launch_options::valid_sha256_text;
+#[cfg(windows)]
+pub use lease_drain::{GenerationRetirementBarrier, GenerationRetirementFence};
 #[cfg(windows)]
 pub use reactive_context_delivery::{
     HostReactiveContextDeliveryError, HostReactiveContextProducer, HostReactiveContextProducerError,
@@ -310,6 +327,9 @@ pub enum HostError {
     StoreNotLive { evidence: StoreLivenessEvidence },
     #[error("Host child cleanup requires recovery: {0}")]
     RecoveryRequired(String),
+    #[cfg(windows)]
+    #[error("Watchdog coverage is unavailable: {0}")]
+    WatchdogCoverageUnavailable(String),
     #[cfg(windows)]
     #[error("Host-owned Store recovery is required: {0}")]
     StoreRecoveryRequired(#[from] StoreRecoveryRequired),
@@ -3613,9 +3633,9 @@ use journal_append::append_authenticated_kernel_readiness;
 #[cfg(test)]
 use journal_append::{append_clean_marker, exact_termination_binding_matches};
 use journal_append::{
-    append_reconciled, clean_marker_record, drain_commit_record_for_stop,
+    append_reconciled, clean_marker_record, degraded_activation, drain_commit_record_for_stop,
     initial_activation_record, pending_activation_binding, terminated_prior_kernel,
-    transition_activation_record,
+    transition_activation_record, transition_activation_record_with_evidence,
 };
 
 mod store_recovery_fence;
@@ -3984,10 +4004,29 @@ pub(crate) fn open_registry_store_at(
     })
 }
 
+/// One real, type-checked backup dispatch target (#961).
+///
+/// The dispatch table in
+/// [`HostComposition::register_backup_dispatch`] carries owner-path markers
+/// for documentation; this enum is the routing decision the production
+/// dispatch arms actually follow, so a cutover cannot reach the #961 owner
+/// chain through an unchecked string. Each variant names exactly one
+/// admitted owner port:
+/// - `Prepare` — [`HostComposition::backup_dispatch_prepare`], delegating to
+///   [`crate::backup_preparation::DelegatedPreparation::prepare`];
+/// - `Cutover` — [`HostComposition::backup_dispatch_cutover`], delegating to
+///   [`crate::backup_cutover::execute_cutover`] under a separate cutover
+///   admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackupDispatchTarget {
+    Prepare,
+    Cutover,
+}
+
 impl HostComposition {
     /// Opens one short-lived installation-registry handle below the retained
     /// Host root (#1339, A13.9). The caller drops it after one CAS or load.
-    fn open_registry_store(&self) -> Result<RedbInstallationRegistry, HostError> {
+    pub(crate) fn open_registry_store(&self) -> Result<RedbInstallationRegistry, HostError> {
         #[cfg(test)]
         if let Some(path) = self.test_registry_file.as_ref() {
             return RedbInstallationRegistry::open_test_support(path)
@@ -4029,13 +4068,22 @@ impl HostComposition {
         ),
         crate::backup_preparation::PreparationError,
     > {
-        use crate::backup_preparation::{DelegatedPreparation, OwnerEvidence};
+        use crate::backup_preparation::{DelegatedPreparation, OwnerEvidence, PreparationError};
         caller.authenticate_for_owner(
             &self.owner_lease,
             self.launch_options.installation(),
             &request.source_installation_id,
         )?;
         let evidence = OwnerEvidence::inspect(&self.registry_host_root)?;
+        // Registry-revision fence (A13.9 short-lived reads): the owner evidence
+        // above was read at one CAS revision, and preparing against a registry
+        // that moved since would mix owner generations. Refuse with no effect.
+        if evidence.revision() != self.registry.revision() {
+            return Err(PreparationError::InvalidRequest {
+                field: "owner_evidence_revision",
+                reason: "owner registry moved between inspection and preparation".to_owned(),
+            });
+        }
         let mut sink = DelegatedPreparation::new(journal);
         let prepared = sink.prepare(&evidence, request)?;
         Ok((sink, prepared))
@@ -4118,6 +4166,38 @@ impl HostComposition {
             Self::backup_dispatch_needs_cutover_admission(BackupOp::CompleteRehearsal),
             None
         );
+        // Pin the type-checked routing table against the admission table and
+        // the registration table: every registration entry must resolve
+        // the same real dispatch target, and rehearsal completion must
+        // resolve none in both.
+        debug_assert_eq!(
+            Self::backup_dispatch_target(BackupOp::PrepareIsolatedRestore),
+            Some(BackupDispatchTarget::Prepare)
+        );
+        debug_assert_eq!(
+            Self::backup_dispatch_target(BackupOp::AdmitCutover),
+            Some(BackupDispatchTarget::Cutover)
+        );
+        debug_assert_eq!(
+            Self::backup_dispatch_target(BackupOp::CompleteRehearsal),
+            None
+        );
+        for (operation, _, needs_cutover_admission) in dispatch {
+            // Every registered entry must resolve a real type-checked
+            // dispatch target: the marker table alone is documentation, so
+            // without this an entry could name a path that no typed arm
+            // follows.
+            debug_assert!(Self::backup_dispatch_target(operation).is_some());
+            // The registration flag is the "needs a separate cutover
+            // admission" bit, so it must agree with the admission table.
+            // It is deliberately NOT compared against `is_some()`: a
+            // prepared operation resolves a `Prepare` target and still
+            // needs no cutover admission.
+            debug_assert_eq!(
+                Self::backup_dispatch_needs_cutover_admission(operation),
+                Some(needs_cutover_admission)
+            );
+        }
     }
 
     /// Reports whether one backup operation needs a separate cutover
@@ -4137,6 +4217,32 @@ impl HostComposition {
             // `CompleteRehearsal` and every other operation share this arm:
             // rehearsal completion has no dispatch entry, so it can never
             // resolve cutover.
+            _ => None,
+        }
+    }
+
+    /// Resolves one admitted backup operation to the real owner dispatch
+    /// target the Host composition actually follows (#961).
+    ///
+    /// The dispatch table's `&'static str` markers stay documentation; this
+    /// typed resolution is the routing decision the production cutover arm
+    /// is dispatched on, so a cutover reaches
+    /// [`HostComposition::backup_dispatch_cutover`] through a type-checked
+    /// match instead of an unchecked string. `None` is returned for every
+    /// operation with no dispatch entry, including `COMPLETE_REHEARSAL`.
+    /// [`HostComposition::validate_backup_dispatch_prepare_routing`] pins
+    /// this table against the registration table and against
+    /// [`HostComposition::backup_dispatch_needs_cutover_admission`], so the
+    /// two cannot rot apart.
+    pub fn backup_dispatch_target(
+        operation: eliot_protocol::backup::BackupOperationKind,
+    ) -> Option<BackupDispatchTarget> {
+        use eliot_protocol::backup::BackupOperationKind as BackupOp;
+        match operation {
+            BackupOp::PrepareIsolatedRestore => Some(BackupDispatchTarget::Prepare),
+            BackupOp::AdmitCutover => Some(BackupDispatchTarget::Cutover),
+            // No dispatch entry: rehearsal completion and every other
+            // operation can never resolve a dispatch target.
             _ => None,
         }
     }
@@ -4171,6 +4277,226 @@ impl HostComposition {
         // it, and rehearsal completion to no entry.
         Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
         self.prepare_backup_destination(journal, caller, request)
+    }
+
+    /// Dispatches one admitted installation cutover through the existing
+    /// owner chain (#961). This is the exact admitted cutover port
+    /// delegation: it is the production caller of
+    /// [`crate::backup_cutover::execute_cutover`], which is the owner path
+    /// the registration marker names.
+    ///
+    /// Real owner calls, in order: the type-checked
+    /// [`HostComposition::backup_dispatch_target`] resolution (a
+    /// non-`Cutover` operation, including `COMPLETE_REHEARSAL`, refuses
+    /// before any owner call, so a rehearsal completion can never reach
+    /// cutover); the shared
+    /// [`HostComposition::validate_backup_dispatch_prepare_routing`] pin; a
+    /// fresh short-lived registry readback through
+    /// [`Self::open_registry_store`] plus
+    /// [`RedbInstallationRegistry::load`] feeding
+    /// [`crate::backup_cutover::validate_cutover_request`] (the same
+    /// fail-closed gate set the owner runs, never a local boolean); the
+    /// durable Host activation identity read from the journal owner, so the
+    /// activation bound by the cutover is the Host's own committed
+    /// generation and not a caller-supplied copy; then
+    /// [`crate::backup_cutover::execute_cutover`], which re-reads the
+    /// registry owner (TOCTOU fence), live-verifies the prior
+    /// capability-introduction set through the authenticated Kernel front
+    /// door, requires the exact-fence
+    /// [`GenerationRetirementBarrier`], and only then performs the
+    /// activation CAS. Finally the bounded reconciliation is closed by
+    /// re-reading the real registry owner and projecting it through
+    /// [`crate::backup_cutover::reconcile_cutover_outcome`] under the same
+    /// operation identity, so a lost response or a crash between the
+    /// registry and the journal returns the exact `Unknown` disposition
+    /// instead of a local assumption. No algorithm is reimplemented here and
+    /// no cutover is executed at Host startup: this method runs only when an
+    /// admitted cutover operation is dispatched.
+    ///
+    /// Prior-generation process/SCM retirement remains a separate explicitly
+    /// authorized
+    /// [`crate::backup_cutover::retire_prior_generation`] step holding the
+    /// returned barrier; source retention and erasure are never automatic
+    /// cleanup here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CutoverError`](crate::backup_cutover::CutoverError) when the
+    /// operation does not resolve to the cutover dispatch target, the Host
+    /// activation is absent, the owner gate set, retirement barrier, or
+    /// registry CAS refuses, or the post-commit owner readback does not show
+    /// the committed target generation.
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the admitted cutover port delegation keeps the owner gate set, the durable activation binding, and the owner-readback reconciliation in one fail-closed boundary"
+    )]
+    pub fn backup_dispatch_cutover(
+        &mut self,
+        operation: eliot_protocol::backup::BackupOperationKind,
+        request: &crate::backup_cutover::CutoverRequest,
+        evidence: &crate::backup_cutover::IsolatedRecoveryEvidence,
+        retirement: &GenerationRetirementFence,
+    ) -> Result<
+        (
+            crate::backup_cutover::CutoverOutcome,
+            GenerationRetirementBarrier,
+        ),
+        crate::backup_cutover::CutoverError,
+    > {
+        use crate::backup_cutover::{
+            CutoverDisposition, CutoverError, execute_cutover, reconcile_cutover_outcome,
+            validate_cutover_request,
+        };
+        // Real dispatch decision: only the separately admitted cutover
+        // operation resolves `Cutover`. Rehearsal completion and preparation
+        // refuse here, before any owner call.
+        if Self::backup_dispatch_target(operation) != Some(BackupDispatchTarget::Cutover) {
+            return Err(CutoverError::NotSeparatelyAdmitted(format!(
+                "backup operation {operation:?} is not the admitted cutover dispatch"
+            )));
+        }
+        // Route through the shared dispatch validation before delegating,
+        // exactly as the preparation arm does.
+        Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
+        // Owner gate set against a fresh registry projection, through the
+        // owner's own validator. No local boolean stands in for any gate.
+        let registry = self
+            .open_registry_store()?
+            .load()
+            .map_err(|error| CutoverError::Registry(error.to_string()))?;
+        let validated = validate_cutover_request(request, evidence, &registry)?;
+        drop(registry);
+        // The activation bound to the cutover is the Host journal owner's
+        // committed generation, never a caller-supplied copy.
+        let state = self.journal.snapshot().map_err(|error| {
+            CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string()))
+        })?;
+        let activation = state
+            .activation
+            .as_ref()
+            .ok_or(CutoverError::HostTransition(HostError::OwnerLeaseRecovery(
+                "cutover dispatch has no durable Host activation".to_owned(),
+            )))?;
+        let activation_id = activation.activation_id.clone();
+        let activation_generation = activation.fence.activation_generation.clone();
+        let (committed, barrier) = execute_cutover(
+            self,
+            &validated,
+            retirement,
+            &activation_id,
+            &activation_generation,
+        )?;
+        // Bounded reconciliation closed by a real owner readback under the
+        // same operation identity. The journal retirement receipt is
+        // genuinely absent here: retirement is a separate explicitly
+        // authorized step, so the registry flip alone is the observed proof
+        // and the honest disposition is `RetirementPending`.
+        let readback = self
+            .open_registry_store()?
+            .load()
+            .map_err(|error| CutoverError::Registry(error.to_string()))?;
+        let reconciled = reconcile_cutover_outcome(
+            &committed.operation,
+            true,
+            self.journal
+                .snapshot()
+                .map_err(|error| {
+                    CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string()))
+                })?
+                .pending_cutover
+                .as_ref(),
+            readback.active_generation(),
+            &validated.request.target_generation,
+            None,
+        );
+        if reconciled.disposition != CutoverDisposition::RetirementPending {
+            return Ok((reconciled, barrier));
+        }
+        Ok((committed, barrier))
+    }
+
+    /// Exact admitted cutover disposition for one operation, read from the
+    /// real owners after a lost response, a crash between the registry and
+    /// the journal, or a cancellation.
+    ///
+    /// [#962](crate::backup_cutover) or the public command surface. It owns no
+    /// algorithm. It re-reads the Host journal's own durable cutover
+    /// projection and the installation registry's active generation and
+    /// projects them through
+    /// [`crate::backup_cutover::reconcile_cutover_outcome`], so the returned
+    /// disposition is the exact requested/validated/prepared/committed/
+    /// reconciled/retirement-pending/failed/unknown state of the operation
+    /// rather than a local assumption. The optional `retirement_receipt` is the
+    /// actual journal `AppendReceipt` read back for this operation identity.
+    /// No cutover effect is performed here and nothing is retried.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError`] when the durable Host journal or the installation
+    /// registry cannot be read. A failed read is an error, never a
+    /// disposition: reporting a state the owners did not prove is exactly the
+    /// local assumption this method exists to remove.
+    #[cfg(windows)]
+    pub fn backup_dispatch_cutover_disposition(
+        &self,
+        request: &crate::backup_cutover::CutoverRequest,
+        validated: bool,
+        retirement_receipt: Option<&eliot_host_state::AppendReceipt>,
+    ) -> Result<crate::backup_cutover::CutoverOutcome, HostError> {
+        crate::backup_cutover::read_cutover_disposition(
+            self,
+            request,
+            validated,
+            retirement_receipt,
+        )
+    }
+
+    /// Executes the separately authorized prior-generation retirement that
+    /// completes one committed cutover.
+    ///
+    /// This is the second admitted cutover port, and it is the only caller of
+    /// [`crate::backup_cutover::retire_prior_generation`]. Retirement is never
+    /// automatic cleanup: the caller must present the
+    /// [`GenerationRetirementBarrier`] returned by
+    /// [`Self::backup_dispatch_cutover`] for the same operation, the exact
+    /// prior [`eliot_host_state::HostInstallationEpoch`] still retained by the
+    /// journal, and an explicit non-empty retirement authorization. Only then
+    /// is the durable `EpochRetirement` record appended. The source
+    /// installation is retained until this record commits, and source data
+    /// destruction stays a separate explicitly authorized action.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CutoverError`](crate::backup_cutover::CutoverError) when the
+    /// operation does not resolve to the cutover dispatch target, the
+    /// authorization is empty, the prior epoch is not a retained epoch of this
+    /// installation, or the journal owner refuses the retirement record.
+    #[cfg(windows)]
+    pub fn backup_dispatch_cutover_retire(
+        &self,
+        operation: eliot_protocol::backup::BackupOperationKind,
+        request: &crate::backup_cutover::CutoverRequest,
+        evidence: &crate::backup_cutover::IsolatedRecoveryEvidence,
+        barrier: &GenerationRetirementBarrier,
+        prior_host: &eliot_host_state::HostInstallationEpoch,
+        retirement_authorization: &PlatformHandle,
+    ) -> Result<crate::backup_cutover::CutoverOutcome, crate::backup_cutover::CutoverError> {
+        use crate::backup_cutover::{CutoverError, retire_authorized_generation};
+        if Self::backup_dispatch_target(operation) != Some(BackupDispatchTarget::Cutover) {
+            return Err(CutoverError::NotSeparatelyAdmitted(format!(
+                "backup operation {operation:?} is not the admitted cutover dispatch"
+            )));
+        }
+        Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
+        retire_authorized_generation(
+            self,
+            request,
+            evidence,
+            barrier,
+            prior_host,
+            retirement_authorization,
+        )
     }
 
     /// Opens the durable Host contour for one installation identity and
@@ -4486,8 +4812,10 @@ impl HostComposition {
             // Host restart must mint a fresh owner-bound Phase-B rebind before
             // any approved child contour is admitted; destination bytes alone
             // are never treated as current authority.
-            composition
-                .rebind_active_phase_b(&active, composition.active_phase_b_rebind_recovery)?;
+            composition.rebind_active_phase_b_on_open(
+                &active,
+                composition.active_phase_b_rebind_recovery,
+            )?;
             start_approved_manifest_contour(
                 &mut composition,
                 &active.manifest,
@@ -5369,7 +5697,7 @@ impl HostComposition {
                     .to_owned(),
             ));
         }
-        self.ensure_admission_open()?;
+        self.ensure_recovery_admission_open()?;
         let capability = self.owner_lease.activation_capability();
         let guard = capability
             .live_guard()
@@ -5689,6 +6017,128 @@ impl HostComposition {
             &current, state, label,
         )?))?;
         Ok(())
+    }
+
+    #[cfg(windows)]
+    fn transition_activation_with_readiness_evidence(
+        &mut self,
+        state: ActivationState,
+        label: &str,
+    ) -> Result<(), HostError> {
+        let snapshot = self.journal.snapshot()?;
+        let evidence = snapshot
+            .readiness_observations
+            .last()
+            .map(|observation| observation.evidence_refs.clone())
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "live activation transition has no fresh readiness observation".to_owned(),
+                )
+            })?;
+        if evidence.is_empty() {
+            return Err(HostError::RecoveryRequired(
+                "live activation transition has no fresh heartbeat evidence".to_owned(),
+            ));
+        }
+        // The readiness owner appends this record only after the typed
+        // continuous-coverage check. Do not reclassify authority by parsing
+        // a serialized evidence prefix here.
+        let current = snapshot.activation.ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
+        })?;
+        self.append_record(HostStateRecord::Activation(
+            transition_activation_record_with_evidence(&current, state, label, &evidence)?,
+        ))?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn persist_degraded_activation(
+        &mut self,
+        generation: &PlatformHandle,
+        label: &str,
+        failure_ref: &PlatformHandle,
+        directive: &str,
+    ) -> Result<(), HostError> {
+        let snapshot = self.journal.snapshot()?;
+        let current = snapshot.activation.ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
+        })?;
+        if current.state == ActivationState::DegradedRecovery {
+            // The activation reducer has no DegradedRecovery ->
+            // DegradedRecovery edge. Preserve each newly observed cause as a
+            // separate durable coverage-gap observation instead of silently
+            // retaining only the first cause or manufacturing a second
+            // activation state.
+            let already_recorded = snapshot.observations.iter().rev().any(|observation| {
+                observation
+                    .observation
+                    .coverage_gap
+                    .as_ref()
+                    .is_some_and(|gap| {
+                        gap.reason_ref == label
+                            && gap
+                                .evidence_refs
+                                .iter()
+                                .any(|value| value == failure_ref.as_str())
+                    })
+            });
+            if !already_recorded {
+                self.persist_degraded_process_observation(
+                    generation,
+                    HostBranchDisposition::ReadinessDegraded,
+                    Some(label),
+                    Some(failure_ref),
+                )?;
+            }
+            return Ok(());
+        }
+        self.append_record(HostStateRecord::Activation(degraded_activation(
+            &current,
+            label,
+            failure_ref,
+            directive,
+        )?))?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn persist_current_watchdog_degraded(&mut self, label: &str) -> Result<(), HostError> {
+        let activation_generation = self
+            .journal
+            .snapshot()?
+            .activation
+            .ok_or_else(|| HostError::OwnerLeaseRecovery("activation record is absent".to_owned()))?
+            .fence
+            .activation_generation
+            .current
+            .clone();
+        let target_generation = self
+            .registry
+            .pending_activation()
+            .map(|pending| pending.manifest.generation.clone())
+            .or_else(|| {
+                self.registry
+                    .active()
+                    .map(|active| active.manifest.generation.clone())
+            })
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Watchdog degradation has no exact approved target generation".to_owned(),
+                )
+            })?;
+        let failure_ref = PlatformHandle::new(format!(
+            "host-watchdog-coverage-unavailable:{}:{}",
+            activation_generation.lineage_id.as_str(),
+            activation_generation.sequence.get()
+        ))
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+        self.persist_degraded_activation(
+            &target_generation,
+            label,
+            &failure_ref,
+            "restore-watchdog-coverage",
+        )
     }
 
     #[cfg(windows)]
@@ -6162,11 +6612,11 @@ impl HostComposition {
         // only and shares correlation without its own terminal.
         host_lifecycle_observe_requested("host.start requested");
         let mut host_terminal = HostTerminalGuard::armed("host-start-failed");
-        self.ensure_admission_open()?;
         let active =
             self.registry.active().cloned().ok_or_else(|| {
                 HostError::ProcessContour("no approved active generation".to_owned())
             })?;
+        self.ensure_material_admission_open_for_target(&active.manifest.generation, false)?;
         let (_, store_artifact) = active
             .manifest
             .host_child_artifact_digests()
@@ -6296,6 +6746,14 @@ impl HostComposition {
             ));
         }
         let watchdog_approval = select_watchdog_approval_for_inspection(&self.registry, manifest)?;
+        if manifest.runtime_launch.profile == InstallationProfile::SystemService
+            && watchdog_approval.is_none()
+        {
+            return Err(HostError::WatchdogCoverageUnavailable(
+                "SystemService activation requires the installer-owned Watchdog approval"
+                    .to_owned(),
+            ));
+        }
         let current = self.journal.snapshot()?.activation.ok_or_else(|| {
             HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
         })?;
@@ -6315,15 +6773,15 @@ impl HostComposition {
         next.trigger_evidence
             .push(phase_b_activation_binding(&phase_b)?);
         self.append_record(HostStateRecord::Activation(next))?;
-        if let Some(watchdog_approval) = watchdog_approval.as_ref() {
-            if let Err(error) = self.start_watchdog(
+        if let Some(watchdog_approval) = watchdog_approval.as_ref()
+            && let Err(error) = self.start_watchdog(
                 &phase_b,
                 &manifest.runtime_launch,
                 watchdog_approval,
                 lifecycle_context(&self.host, "watchdog-start")?,
-            ) {
-                return self.cleanup_launched_contour(error);
-            }
+            )
+        {
+            return self.cleanup_launched_contour(error);
         }
         let (kernel_artifact, approved_store_artifact) = match manifest
             .host_child_artifact_digests()
@@ -6399,27 +6857,32 @@ impl HostComposition {
         if let Err(error) = self.accept_kernel_ready(&receipt) {
             return self.cleanup_active_kernel_contour(error, "kernel-ready-accept-failed");
         }
-        if let Err(error) =
-            self.transition_activation(ActivationState::ControlReady, "host-kernel-control-ready")
-        {
+        // Fresh process/readiness evidence, including the Host-observed
+        // Watchdog heartbeat admission, must succeed before any live
+        // governance profile is published. The earlier ordering made a
+        // transient heartbeat loss indistinguishable from Active.
+        if let Err(error) = self.persist_process_observations(&manifest.generation) {
+            return self.cleanup_active_kernel_contour(error, "host-process-observation-failed");
+        }
+        if let Err(error) = self.transition_activation_with_readiness_evidence(
+            ActivationState::ControlReady,
+            "host-kernel-control-ready",
+        ) {
             return self.cleanup_active_kernel_contour(error, "host-control-ready-commit-failed");
         }
-        if let Err(error) =
-            self.transition_activation(ActivationState::Active, "host-runtime-active")
-        {
+        if let Err(error) = self.transition_activation_with_readiness_evidence(
+            ActivationState::Active,
+            "host-runtime-active",
+        ) {
             return self.cleanup_active_kernel_contour(error, "host-active-commit-failed");
         }
-        if let Err(error) = self.persist_process_observations(&manifest.generation) {
-            self.cleanup_active_kernel_contour(error, "host-process-observation-failed")
-        } else {
-            // The full contour is now Active and the start carrier no longer
-            // guards a pending first-install abort. Any earlier failure kept
-            // it intact for exact SCM/heartbeat reconciliation.
-            self.watchdog_start_recovery = None;
-            // F-LOG-HOST-1: started only; readiness needs its own proof.
-            host_lifecycle_observe_requested("host.start-manifest started");
-            Ok(())
-        }
+        // The full contour is now Active and the start carrier no longer
+        // guards a pending first-install abort. Any earlier failure kept it
+        // intact for exact SCM/heartbeat reconciliation.
+        self.watchdog_start_recovery = None;
+        // F-LOG-HOST-1: started only; readiness needs its own proof.
+        host_lifecycle_observe_requested("host.start-manifest started");
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -6453,7 +6916,7 @@ impl HostComposition {
         prior_kernel: impl AsRef<Path>,
         prior_store: impl AsRef<Path>,
     ) -> Result<(), HostError> {
-        self.ensure_admission_open()?;
+        self.ensure_material_admission_open_for_target(generation, false)?;
         let host_capability = self.owner_lease.activation_capability();
         let pending = self.registry.pending_activation().cloned().ok_or_else(|| {
             HostError::ProcessContour("cutover requires a pending activation".to_owned())
@@ -6684,6 +7147,17 @@ impl HostComposition {
             },
             std::time::Instant::now(),
         );
+        let tick = if matches!(tick, HostLivenessTick::HealthyLeasePreserved)
+            && active_manifest.is_some_and(|manifest| {
+                manifest.runtime_launch.profile == InstallationProfile::SystemService
+            }) {
+            // A cached Host readiness lease is not a current Watchdog
+            // heartbeat. Force the supervised contour through a fresh probe.
+            readiness_gate.branch_degraded();
+            HostLivenessTick::FullReconcileDue
+        } else {
+            tick
+        };
         self.readiness_gate = readiness_gate;
         host_terminal.disarm();
         // Liveness observation only; never claims ready.
@@ -6796,15 +7270,50 @@ impl HostComposition {
                 ));
             }
             ScmStoreRecoveryRoute::Fenced(disposition) => {
-                if let Err(error) = self
-                    .persist_degraded_process_observation(&active.manifest.generation, disposition)
-                {
+                if let Err(error) = self.persist_degraded_process_observation(
+                    &active.manifest.generation,
+                    disposition,
+                    None,
+                    None,
+                ) {
                     self.readiness_gate.fail(
                         None,
                         readiness_failure_kind(&error),
                         std::time::Instant::now(),
                     );
                     return Ok(HostBranchDisposition::ReadinessDegraded);
+                }
+                if active.manifest.runtime_launch.profile == InstallationProfile::SystemService {
+                    let (reason_ref, directive) = match disposition {
+                        HostBranchDisposition::KernelDegraded => {
+                            ("host-kernel-degraded", "recover-kernel-readiness")
+                        }
+                        HostBranchDisposition::StoreDegraded => {
+                            ("host-store-degraded", "recover-store-readiness")
+                        }
+                        HostBranchDisposition::BothDegraded => (
+                            "host-kernel-and-store-degraded",
+                            "recover-runtime-readiness",
+                        ),
+                        HostBranchDisposition::ReadinessDegraded => {
+                            ("host-readiness-degraded", "recover-runtime-readiness")
+                        }
+                        HostBranchDisposition::LiveAwaitingReadiness
+                        | HostBranchDisposition::Healthy => {
+                            return Ok(HostBranchDisposition::ReadinessDegraded);
+                        }
+                    };
+                    let failure_ref = PlatformHandle::new(format!(
+                        "{reason_ref}:{}",
+                        active.manifest.generation.as_str()
+                    ))
+                    .map_err(|error| HostError::Platform(error.to_string()))?;
+                    self.persist_degraded_activation(
+                        &active.manifest.generation,
+                        "host-runtime-degraded",
+                        &failure_ref,
+                        directive,
+                    )?;
                 }
                 return Ok(disposition);
             }
@@ -6850,6 +7359,62 @@ impl HostComposition {
         Ok(disposition)
     }
 
+    /// Persists the durable degraded activation fence for one already-degraded
+    /// supervised system-service branch.
+    ///
+    /// The recovery directive and the reason reference are derived from the
+    /// exact branch disposition, never from a liveness signal, and the
+    /// `DegradedRecovery` record is appended before any later observation. A
+    /// handle or journal failure fails the readiness gate and reports `false`
+    /// so the caller returns degraded instead of claiming readiness.
+    #[cfg(windows)]
+    fn persist_supervised_degraded_activation(
+        &mut self,
+        generation: &PlatformHandle,
+        disposition: HostBranchDisposition,
+        now: std::time::Instant,
+    ) -> bool {
+        let (reason_ref, directive) = match disposition {
+            HostBranchDisposition::KernelDegraded => {
+                ("host-kernel-degraded", "recover-kernel-readiness")
+            }
+            HostBranchDisposition::StoreDegraded => {
+                ("host-store-degraded", "recover-store-readiness")
+            }
+            HostBranchDisposition::BothDegraded => (
+                "host-kernel-and-store-degraded",
+                "recover-runtime-readiness",
+            ),
+            HostBranchDisposition::ReadinessDegraded => {
+                ("host-readiness-degraded", "recover-runtime-readiness")
+            }
+            HostBranchDisposition::LiveAwaitingReadiness | HostBranchDisposition::Healthy => {
+                return false;
+            }
+        };
+        let failure_ref = match PlatformHandle::new(format!("{reason_ref}:{}", generation.as_str()))
+        {
+            Ok(reference) => reference,
+            Err(error) => {
+                let error = HostError::Platform(error.to_string());
+                self.readiness_gate
+                    .fail(None, readiness_failure_kind(&error), now);
+                return false;
+            }
+        };
+        if let Err(error) = self.persist_degraded_activation(
+            generation,
+            "host-runtime-degraded",
+            &failure_ref,
+            directive,
+        ) {
+            self.readiness_gate
+                .fail(None, readiness_failure_kind(&error), now);
+            return false;
+        }
+        true
+    }
+
     #[cfg(windows)]
     fn reconcile_branch_readiness_at(
         &mut self,
@@ -6863,32 +7428,189 @@ impl HostComposition {
         // F-LOG-HOST-1: readiness is claimed only with authenticated proof.
         // Degraded vs ready preserved; liveness alone never becomes ready.
         // Phase only; outer reconcile owns the terminal.
+        let supervised_system_service = self
+            .registry
+            .generations()
+            .iter()
+            .find(|item| item.manifest.generation == *generation)
+            .is_some_and(|item| {
+                item.manifest.runtime_launch.profile == InstallationProfile::SystemService
+            });
         if disposition != HostBranchDisposition::LiveAwaitingReadiness {
             self.readiness_gate.branch_degraded();
             host_lifecycle_observe_requested("host.readiness degraded");
-            if let Err(error) = self.persist_degraded_process_observation(generation, disposition) {
+            if supervised_system_service
+                && !self.persist_supervised_degraded_activation(generation, disposition, now)
+            {
+                return HostBranchDisposition::ReadinessDegraded;
+            }
+            // The durable activation fence above is written BEFORE this
+            // observation, so a failure here cannot leave a supervised contour
+            // observably `Active` in the durable projection. We still fail
+            // closed and return degraded.
+            if let Err(error) =
+                self.persist_degraded_process_observation(generation, disposition, None, None)
+            {
                 self.readiness_gate
                     .fail(None, readiness_failure_kind(&error), now);
                 return HostBranchDisposition::ReadinessDegraded;
             }
             return disposition;
         }
+        // A late Store recovery result is not proof that Host supervision
+        // recovered.  Require the exact current Active activation generation
+        // before any fresh positive readiness observation is appended; a
+        // Starting, DegradedRecovery, missing, or unreadable activation remains
+        // a visible recovery boundary.
+        let activation = match self.journal.snapshot() {
+            Ok(state) => state.activation,
+            Err(error) => {
+                self.readiness_gate.fail(
+                    None,
+                    readiness_failure_kind(&HostError::Journal(error)),
+                    now,
+                );
+                return HostBranchDisposition::ReadinessDegraded;
+            }
+        };
+        let Some(activation) = activation else {
+            self.readiness_gate.fail(
+                None,
+                readiness_failure_kind(&HostError::OwnerLeaseRecovery(
+                    "activation record is absent".to_owned(),
+                )),
+                now,
+            );
+            return HostBranchDisposition::ReadinessDegraded;
+        };
+        if activation.state != ActivationState::Active
+            || activation.fence.activation_generation != self.activation_generation
+        {
+            self.readiness_gate.fail(
+                None,
+                readiness_failure_kind(&HostError::RecoveryRequired(
+                    "fresh readiness requires the exact current Active Host activation".to_owned(),
+                )),
+                now,
+            );
+            return HostBranchDisposition::ReadinessDegraded;
+        }
         host_lifecycle_observe_requested("host.readiness requested proof");
         let contour =
             self.current_readiness_contour(generation, kernel_artifact, store_artifact, config);
+        let contour_unavailable = contour.is_err();
         let mut readiness_gate = std::mem::take(&mut self.readiness_gate);
+        // A live SystemService activation must not reuse a cached readiness
+        // lease: every full reconcile consumes a fresh Watchdog heartbeat.
+        readiness_gate.branch_degraded();
+        let mut watchdog_failure = false;
         let outcome = reconcile_authenticated_readiness(&mut readiness_gate, contour, now, || {
-            self.persist_fresh_authenticated_readiness(generation)
+            let result = self.persist_fresh_authenticated_readiness(generation);
+            watchdog_failure = matches!(&result, Err(HostError::WatchdogCoverageUnavailable(_)));
+            result
         });
         self.readiness_gate = readiness_gate;
         // Ready only when the authenticated gate admits it; degraded stays
-        // degraded. The detail below is emitted only for the ready outcome.
+        // degraded. A failed supervised proof also records a cause-specific
+        // recovery state; generic Store/Kernel failures are not mislabeled as
+        // Watchdog loss.
         if outcome == HostBranchDisposition::Healthy {
+            let activation_state = self
+                .journal
+                .snapshot()
+                .ok()
+                .and_then(|state| state.activation)
+                .map(|activation| activation.state);
+            if activation_state == Some(ActivationState::DegradedRecovery) {
+                // The durable state model does not permit a same-generation
+                // jump from DegradedRecovery back to ControlReady/Active.
+                // Keep the fence explicit; a new activation generation or
+                // owner-led recovery must perform the legal transition.
+                self.readiness_gate.branch_degraded();
+                return HostBranchDisposition::ReadinessDegraded;
+            }
             host_lifecycle_observe_requested("host.readiness ready proof");
-        } else {
-            host_lifecycle_observe_requested("host.readiness degraded");
+        } else if !self.persist_authenticated_readiness_degradation(
+            generation,
+            outcome,
+            watchdog_failure,
+            contour_unavailable,
+            supervised_system_service,
+            now,
+        ) {
+            return HostBranchDisposition::ReadinessDegraded;
         }
         outcome
+    }
+
+    /// Persists the durable evidence for one failed authenticated readiness
+    /// proof, with a cause-specific reason.
+    ///
+    /// A refused independent-Watchdog proof, an unreadable readiness contour,
+    /// and a generic readiness degradation are three distinct causes and are
+    /// never collapsed into one label. The durable activation fence is written
+    /// FIRST for a supervised system-service branch, so a degraded supervised
+    /// contour can never be observed as still `Active` in the durable
+    /// projection even if the later process observation fails; non-supervised
+    /// profiles never wrote an activation fence on this path. Every failure
+    /// closes the readiness gate and reports `false`.
+    #[cfg(windows)]
+    fn persist_authenticated_readiness_degradation(
+        &mut self,
+        generation: &PlatformHandle,
+        outcome: HostBranchDisposition,
+        watchdog_failure: bool,
+        contour_unavailable: bool,
+        supervised_system_service: bool,
+        now: std::time::Instant,
+    ) -> bool {
+        let (reason_ref, directive) = if watchdog_failure {
+            (
+                "host-watchdog-coverage-unavailable",
+                "restore-watchdog-coverage",
+            )
+        } else if contour_unavailable {
+            (
+                "host-readiness-contour-unavailable",
+                "recover-runtime-readiness",
+            )
+        } else {
+            ("host-readiness-degraded", "recover-runtime-readiness")
+        };
+        let failure_ref = match PlatformHandle::new(format!("{reason_ref}:{}", generation.as_str()))
+        {
+            Ok(reference) => reference,
+            Err(error) => {
+                let error = HostError::Platform(error.to_string());
+                self.readiness_gate
+                    .fail(None, readiness_failure_kind(&error), now);
+                return false;
+            }
+        };
+        if supervised_system_service
+            && let Err(error) = self.persist_degraded_activation(
+                generation,
+                "host-readiness-degraded",
+                &failure_ref,
+                directive,
+            )
+        {
+            self.readiness_gate
+                .fail(None, readiness_failure_kind(&error), now);
+            return false;
+        }
+        if let Err(error) = self.persist_degraded_process_observation(
+            generation,
+            outcome,
+            Some(reason_ref),
+            Some(&failure_ref),
+        ) {
+            self.readiness_gate
+                .fail(None, readiness_failure_kind(&error), now);
+            return false;
+        }
+        host_lifecycle_observe_requested("host.readiness degraded");
+        true
     }
 
     /// Returns whether either approved process branch or its bounded recovery
@@ -7120,11 +7842,13 @@ impl HostComposition {
         &self,
         manifest: &CandidateManifest,
         proof: &AuthenticatedKernelReadiness,
-    ) -> Result<Vec<PlatformHandle>, HostError> {
+    ) -> Result<watchdog_heartbeat::AdmittedHostHeartbeat, HostError> {
         let scm_launch = &manifest.runtime_launch;
         let Some(approval) = select_watchdog_approval_for_inspection(&self.registry, manifest)?
         else {
-            return Ok(Vec::new());
+            return Err(HostError::WatchdogCoverageUnavailable(
+                "approved SystemService generation has no Watchdog SCM approval".to_owned(),
+            ));
         };
         let registration = approved_service_registration_request(
             scm_launch,
@@ -7142,7 +7866,7 @@ impl HostComposition {
                 process,
             } => verify_watchdog_scm_running(&registration, state, wait_hint_ms, process.as_ref())?,
             _ => {
-                return Err(HostError::RecoveryRequired(
+                return Err(HostError::WatchdogCoverageUnavailable(
                     "Watchdog is not Running for heartbeat admission".to_owned(),
                 ));
             }
@@ -7160,12 +7884,24 @@ impl HostComposition {
             .binding
             .watchdog_epoch
             .value();
-        watchdog_heartbeat::observe_armed_heartbeat(
+        let admitted = watchdog_heartbeat::observe_armed_heartbeat_admitted(
             self.launch_options.host_state_root(),
             expected_kernel_epoch,
             expected_watchdog_epoch,
             &scm,
         )
+        .map_err(|error| match error {
+            HostError::WatchdogCoverageUnavailable(_) => error,
+            _ => HostError::WatchdogCoverageUnavailable(
+                "fresh Watchdog heartbeat admission did not prove coverage".to_owned(),
+            ),
+        })?;
+        if admitted.observation.coverage != watchdog_heartbeat::HostHeartbeatCoverage::Continuous {
+            return Err(HostError::WatchdogCoverageUnavailable(
+                "fresh Watchdog heartbeat did not prove continuous coverage".to_owned(),
+            ));
+        }
+        Ok(admitted)
     }
     #[cfg(windows)]
     #[allow(
@@ -7268,8 +8004,19 @@ impl HostComposition {
         // readiness and the watchdog-branch ref. Disarmed contours
         // contribute no refs; armed contours fail closed without a fresh
         // admitted heartbeat.
-        let heartbeat_refs =
-            self.observe_watchdog_heartbeat_for_admission(&active.manifest, &proof)?;
+        let supervised_system_service =
+            active.manifest.runtime_launch.profile == InstallationProfile::SystemService;
+        let heartbeat_refs = if supervised_system_service {
+            self.observe_watchdog_heartbeat_for_admission(&active.manifest, &proof)?
+                .evidence_refs
+        } else {
+            Vec::new()
+        };
+        if supervised_system_service && heartbeat_refs.is_empty() {
+            return Err(HostError::WatchdogCoverageUnavailable(
+                "fresh Watchdog heartbeat evidence is empty".to_owned(),
+            ));
+        }
         let (_, admitted_supervision) = append_authenticated_kernel_readiness_with_heartbeat(
             &self.journal,
             &proof,
@@ -7310,6 +8057,8 @@ impl HostComposition {
         &mut self,
         generation: &PlatformHandle,
         disposition: HostBranchDisposition,
+        reason_override: Option<&str>,
+        failure_ref: Option<&PlatformHandle>,
     ) -> Result<(), HostError> {
         // F-LOG-HOST-1: degraded is distinct from ready; phase only.
         host_lifecycle_observe_requested("host.degraded-observation requested");
@@ -7323,6 +8072,31 @@ impl HostComposition {
             HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
         })?;
         let observation_id = fresh_identity("host-branch-observation")?;
+        let (obligation_profile_ref, default_reason_ref) = match disposition {
+            HostBranchDisposition::KernelDegraded => {
+                ("runtime-live-v3-readiness", "host-kernel-degraded")
+            }
+            HostBranchDisposition::StoreDegraded => {
+                ("canonical-store-readiness", "host-store-degraded")
+            }
+            HostBranchDisposition::BothDegraded => (
+                "runtime-live-v3-readiness",
+                "host-kernel-and-store-degraded",
+            ),
+            HostBranchDisposition::ReadinessDegraded => {
+                ("runtime-live-v3-readiness", "host-readiness-degraded")
+            }
+            HostBranchDisposition::LiveAwaitingReadiness | HostBranchDisposition::Healthy => {
+                return Err(HostError::ProcessContour(
+                    "healthy disposition cannot be recorded as degraded".to_owned(),
+                ));
+            }
+        };
+        let reason_ref = reason_override.unwrap_or(default_reason_ref);
+        let mut evidence_refs = vec![generation.as_str().to_owned()];
+        if let Some(failure_ref) = failure_ref {
+            evidence_refs.push(failure_ref.as_str().to_owned());
+        }
         self.append_record(HostStateRecord::Observation(HostObservationRecord {
             fence: activation.fence,
             operation: operation("host-process-observation")?,
@@ -7332,12 +8106,12 @@ impl HostComposition {
                 event: None,
                 coverage_gap: Some(CoverageGap {
                     gap_id: observation_id.as_str().to_owned(),
-                    obligation_profile_ref: "runtime-live-v3-readiness".to_owned(),
-                    reason_ref: "host-branch-degraded".to_owned(),
+                    obligation_profile_ref: obligation_profile_ref.to_owned(),
+                    reason_ref: reason_ref.to_owned(),
                     affected_interval: None,
                     disposition: GapDisposition::BlockDependentTransition,
                     protected: true,
-                    evidence_refs: vec![generation.as_str().to_owned()],
+                    evidence_refs,
                 }),
                 journal_control_event: false,
                 parent_record_id: None,
@@ -7357,14 +8131,25 @@ impl HostComposition {
         // F-LOG-HOST-1: guard probe only; never a terminal and never readiness.
         host_lifecycle_observe_requested("host.branch-fence requested");
         let state = self.snapshot()?;
+        let supervised = self.registry.active().is_some_and(|active| {
+            active.manifest.runtime_launch.profile == InstallationProfile::SystemService
+        });
         Ok(self.store_recovery_startup_fence.is_fenced()
             || self.pending_record.is_some()
             || state.activation.as_ref().is_some_and(|activation| {
-                matches!(
-                    activation.state,
-                    ActivationState::Failed | ActivationState::DegradedRecovery
-                )
-            }))
+                activation.state == ActivationState::Failed
+                    || (supervised
+                        && matches!(
+                            activation.state,
+                            ActivationState::Starting | ActivationState::DegradedRecovery
+                        ))
+            })
+            || (supervised
+                && state
+                    .activation
+                    .as_ref()
+                    .is_some_and(|activation| activation.state == ActivationState::Active)
+                && !self.jobs.has_recorded_contour()))
     }
 
     #[cfg(windows)]
@@ -7411,16 +8196,67 @@ impl HostComposition {
     fn cleanup_launched_contour(&mut self, error: HostError) -> Result<(), HostError> {
         // F-LOG-HOST-1: cleanup phase only; outer owns the terminal.
         host_lifecycle_observe_drain("host.cleanup-launched requested");
+        let projection = (|| -> Result<(), HostError> {
+            let activation_state = self
+                .journal
+                .snapshot()?
+                .activation
+                .map(|activation| activation.state);
+            if matches!(&error, HostError::WatchdogCoverageUnavailable(_)) {
+                self.persist_current_watchdog_degraded("host-watchdog-coverage-start-failed")
+            } else if self.registry.active().is_some_and(|active| {
+                active.manifest.runtime_launch.profile == InstallationProfile::SystemService
+            }) && matches!(
+                activation_state,
+                Some(
+                    ActivationState::Starting
+                        | ActivationState::ControlReady
+                        | ActivationState::Active
+                )
+            ) {
+                // A failed supervised startup/cutover cannot leave a live-looking
+                // contour admissible to a later material caller. Use the existing
+                // recovery-state projection so the mandatory directive is
+                // persisted with a legal transition edge.
+                let failure_ref = PlatformHandle::new("host-start-failed:recovery-required")
+                    .map_err(|error| HostError::Platform(error.to_string()))?;
+                let target_generation = self
+                    .registry
+                    .pending_activation()
+                    .map(|pending| pending.manifest.generation.clone())
+                    .or_else(|| {
+                        self.registry
+                            .active()
+                            .map(|active| active.manifest.generation.clone())
+                    })
+                    .ok_or_else(|| {
+                        HostError::RecoveryRequired(
+                            "failed startup has no exact target generation for recovery".to_owned(),
+                        )
+                    })?;
+                self.persist_degraded_activation(
+                    &target_generation,
+                    "host-start-failed",
+                    &failure_ref,
+                    "recover-startup",
+                )
+            } else {
+                Ok(())
+            }
+        })();
+        // Known child cleanup is unconditional. A journal/degraded-projection
+        // failure must never leave Store or Kernel alive merely because the
+        // failure capsule could not be persisted first.
         let watchdog = self.reconcile_watchdog_start_for_cleanup();
         let store = self.jobs.terminate_store();
         let kernel = self.jobs.terminate_kernel();
-        match (watchdog, kernel, store) {
-            (Ok(()), Ok(()), Ok(())) => {
+        match (projection, watchdog, kernel, store) {
+            (Ok(()), Ok(()), Ok(()), Ok(())) => {
                 self.jobs.clear_recorded_contour();
                 Err(error)
             }
-            (watchdog, kernel, store) => Err(HostError::RecoveryRequired(format!(
-                "persistence failed ({error}); launched contour cleanup requires recovery: watchdog={watchdog:?}, kernel={kernel:?}, store={store:?}"
+            (projection, watchdog, kernel, store) => Err(HostError::RecoveryRequired(format!(
+                "persistence failed ({error}); launched contour cleanup requires recovery: projection={projection:?}, watchdog={watchdog:?}, kernel={kernel:?}, store={store:?}"
             ))),
         }
     }
@@ -7441,6 +8277,157 @@ impl HostComposition {
             return Err(HostError::OwnerLeaseRecovery(
                 "durable Host release/recovery is still pending".to_owned(),
             ));
+        }
+        Ok(())
+    }
+
+    fn ensure_recovery_admission_open(&self) -> Result<(), HostError> {
+        self.ensure_admission_open()?;
+        #[cfg(windows)]
+        {
+            let state = self.journal.snapshot()?;
+            if state.activation.as_ref().is_some_and(|activation| {
+                matches!(
+                    activation.state,
+                    ActivationState::Failed | ActivationState::Starting
+                )
+            }) {
+                return Err(HostError::OwnerLeaseRecovery(
+                    "durable Host activation is not in a recovery-capable state".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Requires the live authority needed by a material Host operation.
+    ///
+    /// Observation and explicit recovery callers use
+    /// [`Self::ensure_admission_open`] so a degraded activation can still be
+    /// inspected or drained. Phase-B, cutover, restart, and backup operations
+    /// use this stricter boundary and cannot reuse a stale live profile after
+    /// supervision loss.
+    fn ensure_material_admission_open(&self) -> Result<(), HostError> {
+        self.ensure_material_admission_open_with_options(false)
+    }
+
+    fn ensure_material_admission_open_with_options(
+        &self,
+        allow_unrecorded_open_contour: bool,
+    ) -> Result<(), HostError> {
+        self.ensure_admission_open()?;
+        #[cfg(windows)]
+        {
+            let state = self.journal.snapshot()?;
+            let supervised = self.registry.active().is_some_and(|active| {
+                active.manifest.runtime_launch.profile == InstallationProfile::SystemService
+            });
+            if state.activation.as_ref().is_some_and(|activation| {
+                activation.state == ActivationState::Failed
+                    || (supervised
+                        && matches!(
+                            activation.state,
+                            ActivationState::Starting | ActivationState::DegradedRecovery
+                        ))
+            }) {
+                return Err(HostError::OwnerLeaseRecovery(
+                    "durable degraded Host activation blocks material admission".to_owned(),
+                ));
+            }
+            if supervised
+                && !allow_unrecorded_open_contour
+                && state
+                    .activation
+                    .as_ref()
+                    .is_some_and(|activation| activation.state == ActivationState::Active)
+                && !self.jobs.has_recorded_contour()
+            {
+                return Err(HostError::OwnerLeaseRecovery(
+                    "stale Active Host activation has no recorded process contour".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Binds a Host material boundary to one exact approved generation.
+    /// The active pointer is not sufficient evidence for a pending cutover or
+    /// Phase-B continuation; the target must be present in the durable
+    /// registry and any retained Phase-B overlay must name the same target.
+    #[cfg(windows)]
+    pub(crate) fn ensure_material_admission_open_for_target(
+        &self,
+        target: &PlatformHandle,
+        allow_unrecorded_open_contour: bool,
+    ) -> Result<(), HostError> {
+        self.ensure_material_admission_open_with_options(allow_unrecorded_open_contour)?;
+        let target_is_approved = self
+            .registry
+            .active()
+            .is_some_and(|active| &active.manifest.generation == target)
+            || self
+                .registry
+                .pending_activation()
+                .is_some_and(|pending| &pending.manifest.generation == target)
+            || self
+                .registry
+                .generations()
+                .iter()
+                .any(|entry| &entry.manifest.generation == target);
+        if !target_is_approved {
+            return Err(HostError::RecoveryRequired(
+                "material target generation is not the exact approved registry target".to_owned(),
+            ));
+        }
+        if let Some(phase_b) = self.phase_b.as_ref()
+            && &phase_b.launch.generation != target
+        {
+            return Err(HostError::RecoveryRequired(
+                "retained Phase-B materialization belongs to a different target generation"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Admits only the exact durable pending-activation continuation.  This
+    /// is recovery of an already-approved target, never a fresh activation
+    /// route and never a general bypass for a degraded Host.
+    #[cfg(windows)]
+    pub(crate) fn ensure_pending_activation_continuation_open(
+        &self,
+        pending: &eliot_installation::PendingActivation,
+    ) -> Result<(), HostError> {
+        self.ensure_admission_open()?;
+        if self.registry.pending_activation() != Some(pending) {
+            return Err(HostError::RecoveryRequired(
+                "pending activation continuation is not the exact durable pending target"
+                    .to_owned(),
+            ));
+        }
+        if !matches!(
+            pending.state,
+            PendingActivationState::Pending | PendingActivationState::RecoveryRequired { .. }
+        ) {
+            return Err(HostError::RecoveryRequired(
+                "pending activation continuation is not in a recoverable pending state".to_owned(),
+            ));
+        }
+        let state = self.journal.snapshot()?.activation.ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
+        })?;
+        // Only `Stopped` has a legal edge to the `Starting` transition that
+        // `start_manifest_contour` will construct. The activation reducer has
+        // no `Starting -> Starting` and no `DegradedRecovery -> Starting` edge,
+        // so admitting those states here would accept a continuation that the
+        // journal append then rejects, leaving the carrier stuck on the same
+        // illegal transition. An unclean `Starting`/`DegradedRecovery` record
+        // needs an explicit recovery contour, not a fresh pending start.
+        if state.state != ActivationState::Stopped {
+            return Err(HostError::OwnerLeaseRecovery(format!(
+                "pending activation continuation requires a durable Stopped activation; current state is {:?}",
+                state.state
+            )));
         }
         Ok(())
     }
@@ -7482,7 +8469,11 @@ impl HostComposition {
             let activation = state.activation.clone().ok_or_else(|| {
                 HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
             })?;
+            let mut degraded_recovery_stop = false;
             match activation.state {
+                ActivationState::Stopped if activation.failure_and_recovery_directive.is_some() => {
+                    degraded_recovery_stop = true;
+                }
                 ActivationState::Stopped => {}
                 ActivationState::Active => {
                     let drain_generation = activation.fence.activation_generation.clone();
@@ -7552,6 +8543,14 @@ impl HostComposition {
                     }
                 }
                 ActivationState::Draining if state.drain_commit.is_some() => {}
+                ActivationState::DegradedRecovery => {
+                    // A degraded supervision record is a durable fence, not an
+                    // excuse to fabricate a clean stop. Move through the
+                    // model's legal Stopped edge, terminate known children, and
+                    // return a recovery-required outcome below.
+                    degraded_recovery_stop = true;
+                    self.transition_activation(ActivationState::Stopped, "host-degraded-stop")?;
+                }
                 other => {
                     return Err(HostError::OwnerLeaseRecovery(format!(
                         "Host activation {other:?} cannot enter clean shutdown"
@@ -7568,6 +8567,30 @@ impl HostComposition {
                         "Store-first stop requires recovery: store={store:?}; kernel={kernel:?}"
                     )));
                 }
+            }
+            if degraded_recovery_stop {
+                // A degraded stop deliberately has no clean marker: the
+                // journal owner would reject one because the contour is not
+                // StoppedClean. Release the in-process owner only after the
+                // durable Stopped record and known-child termination, then
+                // leave the recovery directive for a new activation owner.
+                if !self.owner_released {
+                    if let Err(error) = self
+                        .owner_lease
+                        .release()
+                        .map_err(owner_lease_release_error)
+                    {
+                        self.shutdown_failed = true;
+                        return Err(error);
+                    }
+                    self.owner_released = true;
+                }
+                self.running = false;
+                self.shutdown_failed = true;
+                return Err(HostError::RecoveryRequired(
+                    "Host stopped with a durable degraded-supervision directive; a new activation generation is required"
+                        .to_owned(),
+                ));
             }
             if self
                 .journal

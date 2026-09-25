@@ -44,12 +44,13 @@ use std::collections::BTreeMap;
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{OperationId, canonical_json_bytes, sha256_hex};
 use eliot_protocol::RequestIdentity;
+use eliot_receipts::{GrantClosureReceipt, GrantClosureState, ReceiptIdentity};
 use eliot_store_api::{
     EffectClass, EventProjectionRelationIntents, InfluenceDependencyClosure,
     NamedMutationOperation, NamedMutationRequest, NamedReadOperation, NamedReadRequest,
     NamedReadResponse, OperationManifestDigest, OrderingHeadExpectation, OrderingScopeId,
-    ReadConsistency, ScopeId, SecurityContext, TransitionClass, generated_operation_manifests,
-    operation_manifest_set_digest, parse_revocation_history_payload,
+    ReadConsistency, ScopeId, SecurityContext, TransitionClass, WriteReceipt,
+    generated_operation_manifests, operation_manifest_set_digest, parse_revocation_history_payload,
 };
 
 use crate::CompositionError;
@@ -60,6 +61,9 @@ use eliot_authority::RevocationHistoryEvidence;
 const GOVERNOR_SCOPE_ID: &str = "governor";
 /// Ordering scope reused from the observation/operator precedent.
 const GOVERNOR_ORDERING_SCOPE: &str = "scope:governor";
+/// Fixed semantic reason recorded after the Kernel has durably fenced a
+/// closure and the canonical reconciliation envelope is built.
+pub const AUTHORITY_REVOCATION_KERNEL_FIRST_REASON: &str = "KERNEL_REVOCATION_COMMITTED";
 
 fn owner_refused(detail: impl Into<String>) -> CompositionError {
     CompositionError::Owner(detail.into())
@@ -209,6 +213,71 @@ pub fn authority_revocation_envelope(
     };
     envelope.validate()?;
     Ok(envelope)
+}
+
+/// Returns the immutable canonical receipt identity produced by the Store
+/// receipt envelope. A transport receipt without its reconciliation envelope
+/// is not a source for a second-phase link.
+pub fn canonical_receipt_identity(
+    receipt: &WriteReceipt,
+) -> Result<ReceiptIdentity, CompositionError> {
+    receipt.validate().map_err(|error| {
+        identity_refused(format!("canonical write receipt is invalid: {error}"))
+    })?;
+    let envelope = receipt.require_reconciliation_envelope().map_err(|error| {
+        identity_refused(format!(
+            "canonical write receipt has no exact reconciliation envelope: {error}"
+        ))
+    })?;
+    if envelope.core.operation.operation_id != receipt.operation_id
+        || envelope.core.operation.idempotency_key != receipt.idempotency_key
+        || envelope.core.request.state_fence != receipt.state_fence
+    {
+        return Err(identity_refused(
+            "canonical receipt envelope does not bind the durable write receipt".to_owned(),
+        ));
+    }
+    Ok(envelope.identity.clone())
+}
+
+/// Builds the canonical second-phase revocation envelope from one already
+/// committed Kernel closure. Every value used for the affected-set digest,
+/// revision, root, and fence is read from the durable closure; no closure
+/// member, digest, or receipt is synthesized from process-local state.
+pub fn authority_revocation_envelope_from_closure(
+    identity: &RequestIdentity,
+    canonical_operation_id: &OperationId,
+    closure: &GrantClosureReceipt,
+) -> Result<CanonicalWriteEnvelope, CompositionError> {
+    closure
+        .validate()
+        .map_err(|error| owner_refused(format!("durable grant closure is invalid: {error}")))?;
+    if closure.state != GrantClosureState::Revoked
+        || closure.authority_receipt.state != GrantClosureState::Revoked
+    {
+        return Err(owner_refused(
+            "canonical revocation reconciliation requires a committed revoked closure".to_owned(),
+        ));
+    }
+    if closure.authority.state_fence != identity.request.metadata.state_fence {
+        return Err(identity_refused(
+            "durable closure fence disagrees with the canonical revocation request".to_owned(),
+        ));
+    }
+    let affected = closure.declaration.affected_grants();
+    let affected_digest = canonical_digest(&affected)?;
+    let fence_digest = canonical_digest(&closure.authority.state_fence)?;
+    authority_revocation_envelope(
+        identity,
+        canonical_operation_id,
+        &closure.declaration.authority_root_ref,
+        &closure.operation_id,
+        closure.declaration.grant_graph_revision,
+        &affected_digest,
+        affected.len() as u64,
+        AUTHORITY_REVOCATION_KERNEL_FIRST_REASON,
+        &fence_digest,
+    )
 }
 
 /// Builds the typed `GetAuthorityRevocationHistory` named read for one

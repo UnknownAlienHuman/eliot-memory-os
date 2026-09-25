@@ -788,6 +788,7 @@ dependencies = [
  "eliot-kernel-service",
  "eliot-receipts",
  "eliot-security-contracts",
+ "eliot-swarm",
  "serde",
  "serde_json",
  "thiserror",
@@ -1958,6 +1959,7 @@ dependencies = [
 name = "eliot-host"
 version = "0.1.0"
 dependencies = [
+ "eliot-backup",
  "eliot-contracts",
  "eliot-host-control-endpoint",
  "eliot-host-service",
@@ -1975,6 +1977,7 @@ dependencies = [
  "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime-contracts",
+ "eliot-store-api",
  "eliot-windows-ipc",
  "serde",
  "serde_json",
@@ -2520,8 +2523,14 @@ name = "eliot-mod-research"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-ipc",
+ "eliot-kernel-service",
+ "eliot-platform",
+ "eliot-platform-windows",
  "eliot-process",
  "eliot-process-executor",
+ "eliot-protocol",
+ "eliot-receipts",
  "eliot-research-exchange",
  "eliot-research-exchange-api",
  "eliot-researcher",
@@ -2529,6 +2538,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -3359,6 +3369,7 @@ dependencies = [
  "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",
+ "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime",
  "eliot-runtime-contracts",
@@ -3452,6 +3463,7 @@ dependencies = [
  "eliot-self-quality",
  "eliot-skill",
  "eliot-store-api",
+ "eliot-swarm",
  "eliot-testd-core",
  "eliot-understanding-assessment",
  "eliot-watchdog-core",

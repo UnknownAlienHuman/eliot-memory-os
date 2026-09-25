@@ -45,8 +45,8 @@
 //!
 //! # Dependency note for the integrator
 //!
-//! `eliotd` depends on `eliot-governor` but not on `eliot-swarm` or
-//! `eliot-coordination`, and this file grant excludes `Cargo.toml`, so:
+//! `eliotd` depends on `eliot-governor` and `eliot-swarm` but not on
+//! `eliot-coordination`, so:
 //!
 //! - Attachment calls go through the re-exported [`SwarmAttachmentComposition`]
 //!   API. Binding fields are read through its public accessors and the store
@@ -60,7 +60,10 @@
 //!   (`DurableWorkStore` append/load feeding seam, `WorkExecutor`
 //!   launch/observe/cancel feeding seam, `ChildDisposition`, `TerminalKind`,
 //!   `plan_cancellation_drain` with [`MAX_DRAIN_CANCELS_PER_PASS`]) field for
-//!   field. The integrator binds the real owner types with a small adapter;
+//!   field. The pass bound is build-pinned to the owner
+//!   `eliot_swarm::durable_dispatch::MAX_PLAN_DRAIN_CANCELS` (see the `const _`
+//!   assertion below), so owner drift fails the build. The integrator binds
+//!   the real owner types with a small adapter;
 //!   the order invariants enforced here (persist-before-launch,
 //!   reconcile-before-relaunch, unknown-blocks-terminal, bounded passes) hold
 //!   for any binding.
@@ -78,15 +81,22 @@
 //! [`CanonicalSwarmPlanAttachmentStore`]: eliot_governor::CanonicalSwarmPlanAttachmentStore
 
 use eliot_governor::SwarmAttachmentComposition;
+use eliot_swarm::durable_dispatch::MAX_PLAN_DRAIN_CANCELS;
 use thiserror::Error;
 
 /// Upper bound on exact active children named for cancellation in one drain
 /// pass.
 ///
-/// Mirrors `eliot-swarm` `MAX_PLAN_DRAIN_CANCELS`: termination is structural,
-/// one pass names at most this many cancels and any further active child waits
-/// for the next pass.
+/// Bound to the `eliot-swarm` owner `MAX_PLAN_DRAIN_CANCELS`: termination is
+/// structural, one pass names at most this many cancels and any further active
+/// child waits for the next pass.
 pub const MAX_DRAIN_CANCELS_PER_PASS: usize = 16;
+
+/// Build-enforced binding between the daemon drain bound and the
+/// `eliot-swarm` durable child owner bound (issue #1126 W5/A7: the daemon
+/// drain follows the owner decision's structural bound instead of carrying a
+/// free copy; owner drift fails the build, never the drain).
+const _: () = assert!(MAX_DRAIN_CANCELS_PER_PASS == MAX_PLAN_DRAIN_CANCELS);
 
 /// Upper bound on drain passes inside one [`SwarmComposition::drain_bounded`]
 /// call.
@@ -438,8 +448,7 @@ fn pinned_generation(bindings: &[(String, u64)], route_class: &str) -> Option<u6
         .map(|(_, generation)| *generation)
 }
 
-/// Verifies one ledger-persisted intent against the sealed attachment and
-/// folds its route binding into the rebuilt pins.
+/// Verifies one launch intent's lineage against the sealed attachment.
 ///
 /// Fail-closed, in order: an intent for another job or plan revision is
 /// [`SwarmCompositionError::StaleLineage`]; an intent whose operation
@@ -449,20 +458,21 @@ fn pinned_generation(bindings: &[(String, u64)], route_class: &str) -> Option<u6
 /// derivation is [`SwarmCompositionError::InternalContract`]; an intent
 /// whose fence digest differs from the sealed fence digest is `StaleLineage`
 /// (fence drift fails closed: a fence that moved under a persisted child is
-/// refused, never re-pinned); intents disagreeing on one
-/// class generation under the sealed attachment are `InternalContract`
-/// (the ledger cannot have drifted through
-/// [`SwarmComposition::launch_child`], so disagreement is refused rather
-/// than narrowed).
-fn reconcile_persisted_intent(
+/// refused, never re-pinned).
+///
+/// Shared by both directions: [`SwarmComposition::launch_child`] runs this
+/// check on the fresh intent before the durable append (a drifted derivation
+/// can neither persist nor reconcile later), and
+/// [`reconcile_persisted_intent`] runs it on every ledger intent before any
+/// relaunch is allowed.
+fn check_intent_lineage(
     intent: &ChildLaunchIntent,
     sealed: &AttachedPlan,
-    bindings: &mut Vec<(String, u64)>,
 ) -> Result<(), SwarmCompositionError> {
     if intent.job_handle != sealed.job_handle || intent.plan_revision != sealed.plan_revision {
         return Err(SwarmCompositionError::StaleLineage {
             detail: format!(
-                "persisted intent for slot {} disagrees with sealed attachment",
+                "launch intent for slot {} disagrees with sealed attachment",
                 intent.slot
             ),
         });
@@ -474,7 +484,7 @@ fn reconcile_persisted_intent(
     if intent.operation_id != derived_operation {
         return Err(SwarmCompositionError::StaleLineage {
             detail: format!(
-                "persisted intent for slot {} carries a drifted operation identity",
+                "launch intent for slot {} carries a drifted operation identity",
                 intent.slot
             ),
         });
@@ -482,7 +492,7 @@ fn reconcile_persisted_intent(
     if intent.attempt_id != format!("{}-attempt", intent.operation_id) {
         return Err(SwarmCompositionError::InternalContract {
             detail: format!(
-                "persisted intent for slot {} carries a drifted attempt identity",
+                "launch intent for slot {} carries a drifted attempt identity",
                 intent.slot
             ),
         });
@@ -490,7 +500,7 @@ fn reconcile_persisted_intent(
     if intent.cancellation_id != expected_cancellation_id(&intent.operation_id) {
         return Err(SwarmCompositionError::InternalContract {
             detail: format!(
-                "persisted intent for slot {} carries a drifted cancellation identity",
+                "launch intent for slot {} carries a drifted cancellation identity",
                 intent.slot
             ),
         });
@@ -498,11 +508,28 @@ fn reconcile_persisted_intent(
     if intent.fence_digest != sealed.fence_digest {
         return Err(SwarmCompositionError::StaleLineage {
             detail: format!(
-                "persisted intent for slot {} carries a drifted fence digest",
+                "launch intent for slot {} carries a drifted fence digest",
                 intent.slot
             ),
         });
     }
+    Ok(())
+}
+
+/// Verifies one ledger-persisted intent against the sealed attachment and
+/// folds its route binding into the rebuilt pins.
+///
+/// Runs [`check_intent_lineage`] first, then folds the route binding:
+/// intents disagreeing on one class generation under the sealed attachment
+/// are `InternalContract` (the ledger cannot have drifted through
+/// [`SwarmComposition::launch_child`], so disagreement is refused rather
+/// than narrowed).
+fn reconcile_persisted_intent(
+    intent: &ChildLaunchIntent,
+    sealed: &AttachedPlan,
+    bindings: &mut Vec<(String, u64)>,
+) -> Result<(), SwarmCompositionError> {
+    check_intent_lineage(intent, sealed)?;
     match bindings
         .iter()
         .find(|(class, _)| *class == intent.route_class)
@@ -839,9 +866,11 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
     /// (stale-route gate, item A8: provider/route replacement cannot revive
     /// stale child authority under the same plan); the launch intent,
     /// carrying the deterministic attempt and cancellation identities plus
-    /// the Governor-validated fence digest, is appended to the
-    /// durable ledger BEFORE the runner is called; the runner call happens
-    /// exactly once per appended intent. A runner failure after a persisted
+    /// the Governor-validated fence digest, passes the shared lineage check
+    /// (the same check rehydration applies to persisted intents) and is then
+    /// appended to the durable ledger BEFORE the runner is called; the runner
+    /// call happens exactly once per appended intent. A runner failure after
+    /// a persisted
     /// append propagates as [`SwarmCompositionError::OwnerFailure`] while
     /// the intent stays persisted with unknown outcome — it reconciles
     /// through [`SwarmComposition::rehydrate_after_restart`], never by
@@ -909,6 +938,11 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
             route_class: route_class.to_owned(),
             generation,
         };
+        // Lineage self-check before anything persists: the fresh intent runs
+        // the same [`check_intent_lineage`] rehydration applies to persisted
+        // intents, so a drifted derivation fails here — before the ledger
+        // append — and can neither persist nor reconcile later.
+        check_intent_lineage(&intent, &plan)?;
         // Persist BEFORE the runner call: a crash between the two leaves a
         // persisted intent with unknown outcome, which rehydration reconciles.
         // No runner call happens before this append returns.

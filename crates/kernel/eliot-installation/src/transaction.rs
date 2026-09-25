@@ -950,6 +950,57 @@ impl InstallationTransaction {
         Ok((unsettled, cursor))
     }
 
+    /// Returns the durably recorded external identity of the service
+    /// registration that owns `role`'s `StartService` effect.
+    ///
+    /// An unsettled `StartService` has no identity of its own: it records one
+    /// only once a start converges into `Applied`, which by definition has not
+    /// happened on the timeout contour.  The one identity the transaction
+    /// actually holds for that same named service is the `RegisterService`
+    /// effect's own `Applied` external identity — the same value
+    /// `service_registration_approvals` reads as the recorded configuration
+    /// digest for that role.  A recovery readback for the unsettled start is
+    /// therefore bound to that recorded registration identity and to nothing
+    /// else.
+    ///
+    /// No value is derived from the plan, the service name, or a process
+    /// enumeration, so a missing, unconverged, or unregistered role is refused
+    /// here rather than satisfied with a synthesized digest.  The bound value
+    /// is a real authoritative SCM readback, which also makes the rollback leg
+    /// fail closed: a readback that reports a *running* service is compared
+    /// against a process identity this transaction never recorded, so it can
+    /// only ever mismatch and refuse rather than adopt an unknown process.
+    pub(crate) fn recorded_service_registration_identity(
+        &self,
+        role: InstallerServiceRole,
+    ) -> Result<PlatformHandle, InstallationError> {
+        let recorded = self
+            .installer_effects
+            .iter()
+            .zip(&self.effect_progress)
+            .find_map(|(effect, progress)| match effect {
+                InstallerEffectPlan::RegisterService {
+                    role: registered_role,
+                    ..
+                } if *registered_role == role => match &progress.state {
+                    InstallationEffectProgressState::Applied {
+                        external_identity, ..
+                    } => Some(external_identity.clone()),
+                    InstallationEffectProgressState::Pending
+                    | InstallationEffectProgressState::IntentCommitted { .. }
+                    | InstallationEffectProgressState::Unknown { .. } => None,
+                },
+                _ => None,
+            });
+        let identity = recorded.ok_or_else(|| {
+            InstallationError::IncompleteObservation(format!(
+                "recovery requires the recorded {role:?} service registration identity"
+            ))
+        })?;
+        sha256_handle(&identity, "effect_progress.external_identity")?;
+        Ok(identity)
+    }
+
     /// Requires the first-install bootstrap prefix to be durable.
     ///
     /// Both Watchdog and Host `StartService` effects remain `Pending` through

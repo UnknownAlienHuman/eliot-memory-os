@@ -52,7 +52,9 @@ pub use cue_composition::{
 };
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
 pub use experience_commit::{commit_experience_bank, commit_experience_feedback};
-pub use finish_attempt::{FinishAttemptError, GovernorFinishAttempt};
+pub use finish_attempt::{
+    FinishAttemptError, GovernorFinishAttempt, PreparedFinishDecision, PreparedKernelExchange,
+};
 mod controlboard_projection;
 mod learning_admission;
 mod learning_delta_integration;
@@ -96,10 +98,10 @@ pub use eliot_finish::FinishDecisionReceipt;
 /// path (same reason as the [`CanonicalWriteEnvelope`] re-export below).
 pub use eliot_task::{TaskCommand, TaskCommandContext, TaskProposal, TaskRecord};
 pub use learning_admission::{
-    LEARNING_ADMISSION_CONTRACT, LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim,
-    LearningAdmissionError, LearningAdmissionPermit, VerifiedLearningAdmission,
-    issue_learning_admission, issue_learning_ticket, verify_learning_admission,
-    verify_learning_ticket,
+    CrossTaskAdmissionError, CrossTaskAdmissionRecord, LEARNING_ADMISSION_CONTRACT,
+    LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim, LearningAdmissionError,
+    LearningAdmissionPermit, VerifiedLearningAdmission, issue_learning_admission,
+    issue_learning_ticket, verify_learning_admission, verify_learning_ticket,
 };
 pub use learning_delta_integration::{
     AttemptCloseError, admission_claim_for_delta, close_attempt_with_activation_receipt,
@@ -113,8 +115,9 @@ pub use observation_reconciliation::{
 pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
 pub use owner_closure_feed::{OwnerPublishPort, publish_owner_feed, synchronize_owner_feed};
 pub use owner_closure_provider::{
-    GrantAdmissionParams, IntroductionAdmissionParams, OWNER_HYDRATION_SNAPSHOT_SCHEMA,
-    OWNER_HYDRATION_SNAPSHOT_VERSION, OwnerClosureProvider, PreservedAdmission,
+    AdmittedHydrationsSnapshot, GrantAdmissionParams, IntroductionAdmissionParams,
+    OWNER_HYDRATION_SNAPSHOT_SCHEMA, OWNER_HYDRATION_SNAPSHOT_VERSION, OwnerClosureProvider,
+    PreservedAdmission,
 };
 pub use reactive_admission::{
     AtomRiskBinding, ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier,

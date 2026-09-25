@@ -27,16 +27,32 @@
 //! (disposition recorded in the release manifest by
 //! `scripts/build-eliot-windows-x64-release.ps1`).
 //!
-//! Explicit per-entrypoint disposition (FRONT DOOR step 1', owner scope):
+//! Explicit per-entrypoint disposition (FRONT DOOR step 1', owner scope; issue
+//! Work parent-bullet census, tracked as a checklist item against
+//! [`gate_legacy_entrypoint`] called from `dispatch_command`):
+//! - Launcher `eliot-governor[.exe]` (active binary plus staged installed
+//!   artifact): facade entry only; every subcommand below funnels through
+//!   `dispatch_command`, the single production caller of the gate.
 //! - `mcp stdio --host claude` with the flag set: refused here with
 //!   [`LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER`] plus the canonical-route receipt.
 //! - `mcp stdio --host codex|opencode|claude-desktop` (any flag value):
 //!   retained legacy path, owned by #1719 until each host's cutover.
-//! - `hook <event>` arms: retained plugin-lifecycle path, gate intentionally
-//!   not applied; hook cutover is owned by #1719/#13, not this module.
+//! - `hook <event>` arms, including generated plugin hooks invoking
+//!   `bin/eliot-governor.exe` (`integrations/claude/eliot/hooks/hooks.json`):
+//!   retained plugin-lifecycle path, gate intentionally not applied; hook
+//!   cutover is owned by #1719/#13, not this module (files untouched here).
 //! - `daemon run`: retained shared runtime serving the not-yet-cut-over
 //!   hosts; refusing it here would break those retained paths, so the gate
 //!   intentionally does not cover it (see #1719).
+//! - `service run` (Windows service registration into the `windows_service`
+//!   dispatcher): retained alongside `daemon run`; same shared runtime and
+//!   same #1719 owner, gate intentionally not applied.
+//! - Release/host scripts staging `eliot-governor.exe` and host/skill manifests
+//!   (`scripts/*`, `integrations/*`): owned by #1719/#2562; referenced here
+//!   for census only, never mutated by this lane.
+//! - Compatibility alias `seal-provider-plan` (visible alias of the `seal`
+//!   subcommand): same-dispatch alias, not a separate entrypoint or authority;
+//!   no independent gate surface. No new aliases are added here.
 //!
 //! Wire receipt compatibility: the rejection object shape (`status`, `code`,
 //! `detail`, `canonical_route`, `completed`) and the canonical-route text

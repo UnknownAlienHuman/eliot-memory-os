@@ -99,40 +99,6 @@ fn observe_control_capacity(capacity: usize) {
     );
 }
 
-/// Verifies the independent-supervision (watchdog) branch backing one Windows
-/// `ProbeReady` admission: the candidate's supervision incarnation must carry
-/// a usable watchdog epoch, and the renewed ORS head behind this probe's
-/// supervision lease must carry that exact same epoch.
-///
-/// Fail-closed `SessionFenced` otherwise: on Windows the Kernel never authors
-/// a ready receipt — and never returns a supervision lease — as
-/// independently supervised when the watchdog branch is missing or foreign.
-/// Per I1.5, Material work requiring independent supervision is then paused
-/// (Host degrades the readiness contour into a human-visible coverage gap)
-/// instead of being admitted as supervised. Non-Windows builds have no
-/// equivalent gate yet (Linux supervision port, I1.7) and therefore emit no
-/// supervised readiness at all: `ProbeReady` fails closed below before any
-/// receipt or supervision lease is produced.
-#[cfg_attr(
-    not(windows),
-    allow(
-        dead_code,
-        reason = "the verified-watchdog ProbeReady gate has no non-Windows caller until the Linux supervision port lands (I1.7)"
-    )
-)]
-fn verify_probe_watchdog_branch(
-    incarnation_watchdog_sequence: u64,
-    binding_watchdog_sequence: u64,
-) -> Result<(), TransportError> {
-    if incarnation_watchdog_sequence == 0
-        || binding_watchdog_sequence == 0
-        || incarnation_watchdog_sequence != binding_watchdog_sequence
-    {
-        return Err(TransportError::SessionFenced);
-    }
-    Ok(())
-}
-
 impl KernelComposition {
     /// Applies one lifecycle command through the sole Kernel transition gateway.
     ///
@@ -305,7 +271,36 @@ impl KernelComposition {
                     StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
             }
         }
+        // I1.5 (#1750): a new candidate activation contour invalidates the
+        // recorded independent-supervision evidence. The previous observation
+        // belonged to the previous activation generation, host epoch, and
+        // Watchdog epoch, so it is withdrawn here and can only be re-established
+        // by a new Host observation of the live Watchdog branch under this
+        // contour. This runs before any supervised readiness is published and
+        // before the new contour is applied.
+        if matches!(
+            request.command,
+            KernelControlCommand::Activate(_) | KernelControlCommand::ReconcileActivation(_)
+        ) {
+            self.revoke_supervision_evidence()
+                .map_err(|_| TransportError::SessionFenced)?;
+        }
         if let KernelControlCommand::ReportHostStartupEvidence(evidence) = &request.command {
+            // I1.5/A8.1: this carrier is the one owner-correct route by which a
+            // Host-observed Watchdog branch reaches Kernel. Host just
+            // revalidated the live SCM Watchdog incarnation (bound PID/start
+            // pair plus image bytes equal to the approved Watchdog artifact);
+            // Kernel binds that observation to the presented candidate contour
+            // and only then marks the I1.11 supervision step. Without that
+            // step there is no supervised health projection and no
+            // Material/Critical admission.
+            #[cfg(windows)]
+            {
+                let target =
+                    StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
+                self.admit_host_observed_watchdog_branch(evidence, &request.candidate, &target)
+                    .map_err(|_| TransportError::SessionFenced)?;
+            }
             self.consume_host_startup_evidence(evidence)?;
         }
         if let Some(handoff) = bootstrap {
@@ -328,10 +323,12 @@ impl KernelComposition {
             // Post-linearization activation cannot reuse the drained
             // generation; the caller re-establishes a fresh generation
             // through the reconcile path.
-            if coordinator_for(&self.work_root)
-                .on_activate_request()
-                .fences_old_authority()
-            {
+            let disposition = coordinator_for(&self.work_root).on_activate_request();
+            observe_control(
+                "kernel.control.drain_disposition_observed",
+                disposition_code(disposition),
+            );
+            if disposition.fences_old_authority() {
                 return Err(TransportError::SessionFenced);
             }
         }
@@ -480,22 +477,39 @@ impl KernelComposition {
         let supervision_lease = None;
         #[cfg(windows)]
         if let Some((renewed_head, _)) = supervision_publication.as_ref() {
-            // I1.5 (#1750, Windows-only gate): the ProbeReady admission never
-            // proceeds as independently supervised without the verified
-            // watchdog branch. This runs before any ready receipt is authored,
-            // and the readbacks below confirm the gated head is still current,
-            // so a refusal surfaces as degraded readiness instead of
-            // supervised health. Non-Windows builds never reach a supervised
-            // admission: ProbeReady fails closed below (I1.7).
-            verify_probe_watchdog_branch(
-                request
-                    .candidate
-                    .supervision_incarnation
-                    .watchdog_epoch
-                    .sequence,
-                renewed_head.record.binding.watchdog_epoch.value(),
-            )?;
+            // I1.5 (#1750), I1.11 steps 1/11: this probe may not author a
+            // ready receipt — and therefore may not publish any
+            // supervised-readiness claim — unless the independent Watchdog
+            // branch currently verifies from a LIVE SCM incarnation.
+            //
+            // This is the production gate main had here and the branch dropped.
+            // The dropped predicate was a lease-derived watchdog-epoch
+            // equality: two bookkeeping `u64`s on the renewed ORS head, which
+            // stay equal while Watchdog is stopped, replaced or wedged, so it
+            // could admit a contour whose branch had never been observed. The
+            // replacement requires the recorded live SCM incarnation digest for
+            // THIS contour (only `HostStartupEvidence` can set it, and only
+            // after Host revalidated the PID/start pair against the live OS and
+            // the live image bytes against the approved Watchdog artifact)
+            // plus the whole supervised-branch conjunction. It therefore
+            // refuses strictly more, never less.
+            //
+            // The target fence is read from the freshly renewed,
+            // signature-verified head's own binding rather than rebuilt from
+            // the request, so this gate cannot manufacture authority out of a
+            // request field; the join clauses then bind that head back to the
+            // presented candidate. A refusal surfaces as degraded readiness
+            // instead of supervised health.
+            self.admit_probe_watchdog_branch(
+                &request.candidate,
+                &renewed_head.record.binding.state_fence,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
         }
+        // The renewed supervision head above proves lease continuity only. It
+        // does not by itself prove an independent Watchdog response, so no
+        // Material/Critical admission may be derived from it either; that path
+        // re-verifies the live branch in `admit_material_authority_for_fence`.
         let receipt = if is_probe {
             #[cfg(windows)]
             {
@@ -548,8 +562,10 @@ impl KernelComposition {
             if after_receipt_readback.as_ref() != Some(expected) {
                 return Err(TransportError::SessionFenced);
             }
-            self.record_startup_evidence(11)
-                .map_err(|_| TransportError::SessionFenced)?;
+            // I1.11 step 11 is intentionally not latched by ProbeReady.
+            // Only the typed per-tick progress path may set it after a fresh
+            // observation explicitly reports Watchdog coverage; a signed lease
+            // or a successful process handshake alone is not heartbeat proof.
         }
         #[cfg(windows)]
         let prepared_bridge_profile = if matches!(
@@ -655,6 +671,15 @@ impl KernelComposition {
             activation_receipt,
             store_rebind_receipt,
             supervision_lease,
+            // #961 read-only retirement projections. The authenticated
+            // boundary below refuses `ReadRuntimeLeaseCensus` and
+            // `ReadIntroductionRows` with a typed `InvalidField`, because no
+            // ORS owner read returns a complete runtime-lease census or a
+            // complete introduction set. A response therefore never carries
+            // either projection, and the two refusals keep the census out of
+            // readiness, activation and rebind answers by construction.
+            runtime_lease_census: None,
+            introduction_rows: None,
             error: None,
             payload_digest: String::new(),
         }
@@ -709,8 +734,40 @@ impl KernelComposition {
     #[must_use]
     pub fn request_shutdown(&self) -> bool {
         let _ = coordinator_for(&self.work_root).request_shutdown();
+        let view = self.activation_operational_view();
+        observe_control(
+            "kernel.control.drain_requested_observed",
+            view.drain_disposition,
+        );
         self.runtime.shutdown_handle().request()
     }
+}
+
+/// Bounded observation code for one wake-during-drain disposition.
+const fn disposition_code(disposition: DrainWakeDisposition) -> &'static str {
+    match disposition {
+        DrainWakeDisposition::Proceed => "proceed",
+        DrainWakeDisposition::CancelDrain => "cancel-drain",
+        DrainWakeDisposition::QueueNextGeneration => "queue-next-generation",
+        DrainWakeDisposition::RejectStale => "reject-stale",
+    }
+}
+
+/// Test-only legacy shape check retained for existing unit fixtures. It is
+/// not a production Watchdog coverage signal and is never called by the
+/// control plane.
+#[cfg(test)]
+fn verify_probe_watchdog_branch(
+    incarnation_watchdog_sequence: u64,
+    binding_watchdog_sequence: u64,
+) -> Result<(), TransportError> {
+    if incarnation_watchdog_sequence == 0
+        || binding_watchdog_sequence == 0
+        || incarnation_watchdog_sequence != binding_watchdog_sequence
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

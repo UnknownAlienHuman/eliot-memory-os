@@ -54,7 +54,7 @@
 //! backup phase rules, no epoch minting, no cutover, no activation/retirement
 //! of any installation, no in-memory/no-op journal substitute in any path.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -97,6 +97,16 @@ pub const DESTINATION_ADMISSION_FILE: &str = "destination-admission.json";
 pub const RESTORE_EVIDENCE_FILE: &str = "evidence.json";
 /// Maximum destination label length (bounded identities, I14.3).
 pub const MAX_DESTINATION_LABEL_LEN: usize = 64;
+/// Upper bound on the sealed journal-payload bodies this adapter remembers in
+/// one process so a superseded body can be pruned once its own result row is
+/// durable.
+///
+/// The bound is the ORS owner's own page ceiling: one stream cannot hold more
+/// retained rows than [`MAX_JOURNAL_PAGE_ENTRIES`], so a stream cannot seal
+/// more bodies than this before the owner refuses the next append. A body
+/// beyond the bound is FORGOTTEN, never deleted: forgetting only costs a
+/// prune, while guessing would risk removing a body something still names.
+pub const MAX_TRACKED_JOURNAL_PAYLOADS: usize = MAX_JOURNAL_PAGE_ENTRIES;
 
 /// Kernel-side destination manifest evidence: the digest projection of the
 /// Host-issued owner binding every isolated destination must carry.
@@ -168,6 +178,50 @@ fn is_hex64(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Typed refusal reason for the bounded cleanup of one restore execution's
+/// staging (issue #960, W11/A18).
+///
+/// Every reason means the same thing operationally: this execution could not
+/// PROVE that a path is its own to remove, so it preserved what it could not
+/// attribute and the primary engine failure was still returned typed. A
+/// cleanup refusal is never reported as a successful cleanup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StagedCleanupRefusal {
+    /// The destination was reopened for resume rather than constructed for
+    /// this execution, so its contents may carry another process's reconciled
+    /// observations and are not this execution's to remove.
+    AdmittedResume,
+    /// A pinned destination admission is present and does not name this
+    /// transaction and target, so the destination is not this execution's.
+    ForeignAdmission,
+    /// The destination root is no longer inside
+    /// `<work_root>/.eliot/restore-isolated/<label>` once links are resolved,
+    /// so no removal can be proven to stay in the isolated restore area.
+    OutsideIsolatedArea,
+    /// A staged path is no longer a plain file under the destination root, so
+    /// removing it is not a bounded single-file unlink.
+    PathNotOurs,
+    /// The aggregate removal budget derived for this execution was reached;
+    /// the remaining staging is preserved.
+    BudgetReached,
+    /// A staged path could not be unlinked; it is preserved.
+    RemovalFailed,
+}
+
+impl std::fmt::Display for StagedCleanupRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::AdmittedResume => "destination is an admitted resume",
+            Self::ForeignAdmission => "pinned destination admission is foreign",
+            Self::OutsideIsolatedArea => "destination left the isolated restore area",
+            Self::PathNotOurs => "a staged path is not a plain file under the destination",
+            Self::BudgetReached => "the derived removal budget was reached",
+            Self::RemovalFailed => "a staged path could not be removed",
+        };
+        formatter.write_str(reason)
+    }
+}
+
 /// Typed fail-closed errors for the Kernel restore owner.
 ///
 /// Every variant refuses an effect or an admission; none fabricates success.
@@ -206,6 +260,22 @@ pub enum KernelRestoreError {
     CutoverNotAuthorized,
     /// The journaled restore engine reported a typed failure.
     TargetFailed(BackupError),
+    /// The journaled engine reported a typed failure AND the bounded cleanup
+    /// of the staging this execution produced could not be completed.
+    ///
+    /// The engine's own failure is preserved exactly as
+    /// [`TargetFailed`](Self::TargetFailed) carries it, in `primary`; this
+    /// variant only adds the typed cleanup disposition, so the cleanup
+    /// outcome is never a formatted string and never replaces the cause. A
+    /// cleanup that removes everything, or that had nothing to remove, stays
+    /// plain [`TargetFailed`](Self::TargetFailed): there is no second fact to
+    /// report and the absence of a change is the whole truth.
+    StagedCleanupIncomplete {
+        /// The engine's typed failure, unchanged.
+        primary: BackupError,
+        /// Why the bounded cleanup preserved what it could not attribute.
+        cleanup: StagedCleanupRefusal,
+    },
 }
 
 impl std::fmt::Display for KernelRestoreError {
@@ -246,6 +316,10 @@ impl std::fmt::Display for KernelRestoreError {
                 "cutover requires a separate Human/System Owner authorization"
             ),
             Self::TargetFailed(error) => write!(formatter, "restore target failed: {error}"),
+            Self::StagedCleanupIncomplete { primary, cleanup } => write!(
+                formatter,
+                "restore staging cleanup refused ({cleanup}); primary failure preserved: {primary}"
+            ),
         }
     }
 }
@@ -317,6 +391,11 @@ pub fn kernel_to_backup(error: KernelRestoreError) -> BackupError {
             BackupError::InvalidField { field, reason }
         }
         KernelRestoreError::TargetFailed(inner) => inner,
+        // The cleanup disposition is a Kernel-owner-local fact about staging
+        // this process staged; the causal class that crosses the seam is still
+        // the engine's own typed failure, so the primary is returned rather
+        // than re-wrapped into a string.
+        KernelRestoreError::StagedCleanupIncomplete { primary, .. } => primary,
         KernelRestoreError::CutoverNotAuthorized => BackupError::CutoverNotAuthorized,
         KernelRestoreError::DestinationInvalid(_)
         | KernelRestoreError::FenceMismatch(_)
@@ -391,6 +470,22 @@ impl RestorePorts<'_> {
     }
 }
 
+/// How an isolated destination came to be.
+///
+/// This is the ownership evidence bounded staging cleanup needs (issue #960,
+/// W11/A18). A destination constructed for the execution that is running may
+/// hold only that execution's staged output; a destination that was already
+/// there, or that a caller deliberately reopened for resume, may hold another
+/// process's reconciled observations, so cleanup refuses it instead of
+/// guessing which bytes are its own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DestinationOrigin {
+    /// The isolated root did not exist and was created for this execution.
+    Fresh,
+    /// The isolated root already existed, or a caller reopened it for resume.
+    Resumed,
+}
+
 /// Kernel-owned isolated restore destination.
 ///
 /// The root is CONSTRUCTED below the canonical work root
@@ -403,6 +498,7 @@ impl RestorePorts<'_> {
 pub struct KernelIsolatedDestination {
     root: PathBuf,
     label: String,
+    origin: DestinationOrigin,
 }
 
 impl KernelIsolatedDestination {
@@ -419,11 +515,20 @@ impl KernelIsolatedDestination {
                 "isolated destination escapes the work root".to_owned(),
             ));
         }
+        // A root that already existed is a resume of prior staging, not a fresh
+        // destination, whichever constructor asked for it. Recording that here
+        // is what lets a later cleanup prove the staging is its own.
+        let origin = if root.is_dir() {
+            DestinationOrigin::Resumed
+        } else {
+            DestinationOrigin::Fresh
+        };
         std::fs::create_dir_all(&root)
             .map_err(|error| KernelRestoreError::DestinationInvalid(error.to_string()))?;
         Ok(Self {
             root,
             label: label.to_owned(),
+            origin,
         })
     }
 
@@ -448,7 +553,11 @@ impl KernelIsolatedDestination {
             })?
             .to_owned();
         Self::validate_label(&label)?;
-        Ok(Self { root, label })
+        Ok(Self {
+            root,
+            label,
+            origin: DestinationOrigin::Resumed,
+        })
     }
 
     fn validate_work_root(work_root: &Path) -> Result<(), KernelRestoreError> {
@@ -492,6 +601,16 @@ impl KernelIsolatedDestination {
     #[must_use]
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// Whether this destination was resumed rather than constructed fresh.
+    ///
+    /// Bounded staging cleanup reads this as its first ownership test: a
+    /// resumed destination may hold another execution's observations, so it is
+    /// preserved instead of being emptied.
+    #[must_use]
+    pub fn is_resumed(&self) -> bool {
+        matches!(self.origin, DestinationOrigin::Resumed)
     }
 }
 
@@ -601,6 +720,14 @@ impl OrsRestoreBinding {
 /// Reads are bounded by the ORS page ceiling. A stream that outgrows one page
 /// fails closed through the owner rather than being silently truncated, so a
 /// restore never resumes from a partial view of its own history.
+///
+/// Sealed payload bodies are bounded too, from the other direction: the
+/// adapter remembers the bodies it produced (at most
+/// [`MAX_TRACKED_JOURNAL_PAYLOADS`]) and prunes a superseded one once that
+/// slot's own result row is durable, so the content-addressed payload area
+/// does not grow with the number of phases. The prune is deliberately narrow;
+/// see [`OrsRestoreJournal::prune_superseded_payloads`] for what it may and
+/// may not remove.
 pub struct OrsRestoreJournal {
     store: Arc<RedbRecoveryStore>,
     binding: OrsRestoreBinding,
@@ -609,6 +736,10 @@ pub struct OrsRestoreJournal {
     fence_snapshot: StateFenceSnapshot,
     sealed_root: PathBuf,
     heads: BTreeMap<String, JournalPredecessor>,
+    /// Sealed bodies this adapter produced, oldest first, as
+    /// `(journal stream, locator, length)`. Bounded by
+    /// [`MAX_TRACKED_JOURNAL_PAYLOADS`].
+    payloads: VecDeque<(String, String, u64)>,
 }
 
 impl OrsRestoreJournal {
@@ -662,6 +793,7 @@ impl OrsRestoreJournal {
             fence_snapshot,
             sealed_root,
             heads: BTreeMap::new(),
+            payloads: VecDeque::new(),
         })
     }
 
@@ -795,7 +927,15 @@ impl OrsRestoreJournal {
     ///
     /// Returns `(locator, sha256, length)`. The write is temp-file plus
     /// atomic rename, so a reader never observes a partial body.
-    fn seal(&self, record: &RestoreJournalRecord) -> Result<(String, String, u64), BackupError> {
+    ///
+    /// The produced body is remembered (bounded) so a LATER compare-and-swap
+    /// on the same stream can prune it once this slot's result row is durable.
+    /// Only bodies this adapter itself resolved are remembered, so the prune
+    /// can never reach a body another writer sealed.
+    fn seal(
+        &mut self,
+        record: &RestoreJournalRecord,
+    ) -> Result<(String, String, u64), BackupError> {
         let bytes = serde_json::to_vec(record)
             .map_err(|error| BackupError::Serialization(error.to_string()))?;
         if bytes.len() > MAX_JOURNAL_PAYLOAD_BYTES {
@@ -823,6 +963,7 @@ impl OrsRestoreJournal {
                     subject: "restore journal sealed payload address collision".to_owned(),
                 });
             }
+            self.track_payload(record.journal_key.as_str(), &locator, length);
             return Ok((locator, digest, length));
         }
         let parent = path.parent().ok_or(BackupError::RestoreJournalCorrupt)?;
@@ -844,7 +985,80 @@ impl OrsRestoreJournal {
         std::fs::rename(&temporary, &path)
             .map_err(|error| BackupError::Target(error.to_string()))?;
         sync_parent_directory(parent)?;
+        self.track_payload(record.journal_key.as_str(), &locator, length);
         Ok((locator, digest, length))
+    }
+
+    /// Remembers one sealed body this adapter produced, within the bounded
+    /// tracked set.
+    ///
+    /// When the bound is reached the OLDEST entry is dropped from the tracked
+    /// set. Dropping only costs a future prune: the body stays on disk and
+    /// stays readable, because [`Self::read_state`] resolves a locator
+    /// through [`Self::sealed_path`] and the ORS row still names it.
+    fn track_payload(&mut self, journal_key: &str, locator: &str, length: u64) {
+        if self.payloads.len() >= MAX_TRACKED_JOURNAL_PAYLOADS {
+            self.payloads.pop_front();
+        }
+        self.payloads
+            .push_back((journal_key.to_owned(), locator.to_owned(), length));
+    }
+
+    /// Removes the sealed bodies this adapter sealed for EARLIER revisions of
+    /// `journal_key`, keeping the body this compare-and-swap just committed.
+    ///
+    /// What makes each removal safe, from persisted state alone:
+    ///
+    /// - the ORS owner deliberately never fetches a locator target, and this
+    ///   adapter reads a body only for the newest retained row
+    ///   ([`Self::read_state`]), so a superseded body of the same stream is
+    ///   not read again;
+    /// - the result row that made the newer record durable carries the
+    ///   envelope itself, not a fetch of the older body, so the terminal slot
+    ///   keeps its own evidence in the owner;
+    /// - a stream is permanently bound to one transaction — [`Self::ensure_bound`]
+    ///   refuses a rebind — and a sealed record carries its own `journal_key`
+    ///   and transaction id, so a different transaction or stream cannot name
+    ///   these bodies: identical bytes would require an identical record;
+    /// - only bodies this adapter itself resolved are remembered, so nothing
+    ///   another writer sealed is ever a candidate.
+    ///
+    /// Anything that cannot be established from that state is preserved: a
+    /// body the bounded tracked set can no longer name is never a candidate,
+    /// and the aggregate unlinked bytes stop at the candidate set's own
+    /// ceiling, leaving the rest for the owner's own retention. A body that
+    /// cannot be unlinked is likewise absorbed, because the only consequence
+    /// of a retained body is the pre-existing disk usage, never a wrong
+    /// journal answer.
+    fn prune_superseded_payloads(&mut self, journal_key: &str, keep: &str) {
+        let mut candidates = Vec::new();
+        while let Some((stream, locator, length)) = self.payloads.front().cloned() {
+            if stream != journal_key || locator == keep {
+                break;
+            }
+            self.payloads.pop_front();
+            candidates.push((locator, length));
+        }
+        // The candidate set is bounded by `MAX_TRACKED_JOURNAL_PAYLOADS` and
+        // every body in it was already admitted against
+        // `MAX_JOURNAL_PAYLOAD_BYTES` by `seal`, so this aggregate is the
+        // exact ceiling of what one pass can unlink.
+        let mut budget = candidates.len().saturating_mul(MAX_JOURNAL_PAYLOAD_BYTES);
+        for (locator, length) in candidates {
+            let Ok(size) = usize::try_from(length) else {
+                break;
+            };
+            if size > budget {
+                break;
+            }
+            budget -= size;
+            if let Ok(path) = self.sealed_path(&locator) {
+                // A body another execution might still be reading is refused
+                // earlier, never here: this is a reclaim of bytes whose only
+                // reader was the stream head that has already moved on.
+                let _reclaimed = std::fs::remove_file(&path);
+            }
+        }
     }
 
     /// Resolves one locator inside the payload root, refusing any other shape.
@@ -1058,6 +1272,7 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
         OrsError::DuplicateConflict
         | OrsError::HostRequestIdentityConflict { .. }
         | OrsError::ActivationResultRetentionIdentityConflict { .. }
+        | OrsError::ActivationLifecycleIdentityConflict { .. }
         | OrsError::NativeWorkerClaimIdentityConflict { .. }
         | OrsError::WorkerReplayIdentityConflict { .. }
         | OrsError::WorkerReplayStaleStream { .. } => BackupError::Duplicate {
@@ -1115,6 +1330,18 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
         OrsError::InvalidTransition | OrsError::ScopeRecoveryRequired | OrsError::UnsafeExpiry => {
             BackupError::RestorePhaseMismatch
         }
+        // The activation lifecycle vocabulary (#1115) keeps the same per-class
+        // discipline as the supervision-ticket group above: a ticket whose
+        // deadline closed before result admission is a named lifecycle record
+        // that cannot satisfy the request, never a generic target failure, and
+        // a ticket found in the wrong durable state is the same invalid
+        // phase/state transition `InvalidTransition` already reports. They are
+        // deliberately two arms rather than one so an expiry never reads as a
+        // state conflict on this seam.
+        OrsError::ActivationLifecycleExpired { .. } => BackupError::IntegrityMismatch {
+            subject: "restore journal activation ticket expiry".to_owned(),
+        },
+        OrsError::ActivationLifecycleStateConflict { .. } => BackupError::RestorePhaseMismatch,
         OrsError::ActiveExecutableReplacement
         | OrsError::IncompatibleArtifact
         | OrsError::VersionedArtifactConflict
@@ -1396,6 +1623,11 @@ impl RestoreJournalPort for OrsRestoreJournal {
             self.store
                 .verify_restore_journal_receipt(journal_key, &result_receipt)
                 .map_err(ors_to_backup)?;
+            // The result row for this slot is durable, so the sealed body of
+            // the PREVIOUS revision of the same stream is superseded: the
+            // stream head has moved past it and no reader fetches it. Reclaim
+            // it, bounded, and only from the bounded set this adapter sealed.
+            self.prune_superseded_payloads(journal_key, &locator);
         }
         Ok(())
     }

@@ -1,7 +1,12 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Content-addressed blob reference.
+///
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlobRef {
     pub algorithm: String,
     pub digest_hex: String,
@@ -16,7 +21,12 @@ pub const CANONICAL_MEMORY_SEGMENT_TARGET_BYTES: usize = 24 * 1024;
 /// admitted through the normal writer authority. The raw bytes remain in the
 /// content-addressed blob store; this record is the durable reconstruction
 /// manifest.
+///
+/// Decoder: derived, no `flatten`, no tagging; nested `BlobRef` is closed too.
+/// `schema_version` semantics stay with the canonical-memory admission owner
+/// (`validate_capacity_receipt`), not with this wire shape.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalMemoryManifest {
     pub schema_version: String,
     pub manifest_id: String,
@@ -33,7 +43,10 @@ pub struct CanonicalMemoryManifest {
 
 /// A bounded canonical child which carries semantic/indexable structure while
 /// retaining an exact range into the immutable parent blob.
+///
+/// Decoder: derived, no `flatten`, no tagging; nested `BlobRef` is closed too.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalMemorySegment {
     pub schema_version: String,
     pub segment_id: String,
@@ -55,7 +68,10 @@ pub struct CanonicalMemorySegment {
 /// Metadata-only exact-L2 expansion. It deliberately omits raw blob bytes and
 /// the full search text while preserving every fact needed for verified local
 /// expansion.
+///
+/// Decoder: derived, no `flatten`, no tagging; nested `BlobRef` is closed too.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalMemorySegmentRef {
     pub segment_id: String,
     pub parent_handle: String,
@@ -86,7 +102,14 @@ impl From<&CanonicalMemorySegment> for CanonicalMemorySegmentRef {
     }
 }
 
+/// Exact-L2 page projection. `resolved_parent_handle` and `requested_segment_id`
+/// stay `#[serde(default)]` because the canonical serialization omits them when
+/// absent; removing that would refuse the crate's own current bytes.
+///
+/// Decoder: derived, no `flatten`, no tagging; nested `CanonicalMemoryManifest`
+/// and `CanonicalMemorySegmentRef` are closed too.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalMemoryL2Page {
     pub requested_handle: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,14 +122,26 @@ pub struct CanonicalMemoryL2Page {
     pub truncated: bool,
 }
 
+/// Applied-migration receipt. `migration_id` and `checksum_blake3` are the
+/// immutable identity/checksum pair required by I5.22; this wire shape adds no
+/// schema version, so no legacy form is admitted here.
+///
+/// Decoder: derived, no `flatten`, no tagging.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MigrationRecord {
     pub migration_id: String,
     pub checksum_blake3: String,
     pub applied: bool,
 }
 
+/// Store health projection. `status` is an owned open string; its closed
+/// vocabulary belongs to `health::HealthStatus`, which this shape does not
+/// re-declare.
+///
+/// Decoder: derived, no `flatten`, no tagging.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthRecord {
     pub component: String,
     pub status: String,

@@ -637,6 +637,29 @@ impl ShutdownDrainCoordinator {
         observe_shutdown(event, "recorded");
     }
 
+    /// Read-only bounded drain disposition for the Kernel operational view.
+    ///
+    /// Unlike [`Self::classify_wake`] and [`Self::on_activate_request`] this
+    /// never mutates the durable drain state: a diagnostic projection must not
+    /// cancel a drain, and a reported disposition must be the one already
+    /// recorded, not one produced by looking.
+    pub(crate) fn drain_disposition(&self) -> &'static str {
+        let state = self.lock();
+        if state.terminal.is_some() {
+            return "terminated";
+        }
+        if state.committed.is_some() {
+            return "queue-next-generation";
+        }
+        if state.cancelled {
+            return "cancel-drain";
+        }
+        if state.requested {
+            return "draining";
+        }
+        "proceed"
+    }
+
     /// Read-only publication for Host and Watchdog over their existing
     /// control paths.
     pub(crate) fn publication(&self) -> ShutdownPublication {

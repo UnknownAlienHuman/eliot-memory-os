@@ -132,6 +132,9 @@ fn ensure_deferral_code(error: &CompositionError) -> &'static str {
         CompositionError::Recovery(_) => "RECOVERY",
         CompositionError::Kernel(_) => "KERNEL",
         CompositionError::KernelLock => "KERNEL_LOCK",
+        CompositionError::OperationIdentityLedger(_) => "OPERATION_IDENTITY_LEDGER",
+        CompositionError::LostOperation { .. } => "LOST_OPERATION",
+        CompositionError::Admission { refusal, .. } => refusal.code(),
     }
 }
 

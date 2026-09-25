@@ -285,6 +285,26 @@ fn map_composition_error(error: CompositionError, ctx: &StoreFailureIdentityCont
         )
         .map(SkillError::Store)
         .unwrap_or(SkillError::IdentityMismatch),
+        CompositionError::ActivationTaskSelectionRequired
+        | CompositionError::ActivationScopeAmbiguous { .. }
+        | CompositionError::ActivationScopeSelectionRequired => store_failure(
+            StoreFailureDisposition::DeterministicRejection,
+            "ACTIVATION_SELECTION_REQUIRED",
+            StoreMutationDisposition::NotAttempted,
+            StoreRetryDirective::DoNotRetry,
+            StoreRecoveryAction::None,
+            ctx,
+        )
+        .map_or(SkillError::IdentityMismatch, SkillError::Store),
+        CompositionError::ActivationStaleFence => store_failure(
+            StoreFailureDisposition::Conflict,
+            "ACTIVATION_FENCE_STALE",
+            StoreMutationDisposition::NotAttempted,
+            StoreRetryDirective::NewIdentityAfterCondition,
+            StoreRecoveryAction::RefreshStateFence,
+            ctx,
+        )
+        .map_or(SkillError::IdentityMismatch, SkillError::Store),
     }
 }
 
@@ -298,6 +318,8 @@ fn action_str(action: eliot_skill::LifecycleAction) -> &'static str {
         eliot_skill::LifecycleAction::Archive => "archive",
         eliot_skill::LifecycleAction::Quarantine => "quarantine",
         eliot_skill::LifecycleAction::Restore => "restore",
+        eliot_skill::LifecycleAction::Rollback => "rollback",
+        eliot_skill::LifecycleAction::Expiry => "expiry",
     }
 }
 

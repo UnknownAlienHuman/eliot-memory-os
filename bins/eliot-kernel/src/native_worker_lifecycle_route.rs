@@ -44,9 +44,10 @@
 //! `UnknownRequest`; an elapsed absolute deadline is `Timeout`.
 
 use super::{
-    KernelComposition, KernelFrameAction, KernelServiceState, ProcessExecutionRequest,
-    caller_binding, native_worker_reconcile_route::NATIVE_WORKER_RECONCILE_OPERATION, sha256_json,
-    status_frame, unix_ms,
+    GovernanceProfile, KernelComposition, KernelFrameAction, KernelServiceState,
+    ProcessExecutionRequest, caller_binding,
+    native_worker_reconcile_route::NATIVE_WORKER_RECONCILE_OPERATION, sha256_json, status_frame,
+    unix_ms,
 };
 use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_ipc::{Session, TransportError};
@@ -722,6 +723,37 @@ impl KernelComposition {
 // Dispatch entry point.
 // ---------------------------------------------------------------------------
 
+fn native_worker_operation_requires_watchdog(operation: &str) -> bool {
+    matches!(
+        operation,
+        NATIVE_WORKER_REGISTRATION_OPERATION
+            | NATIVE_WORKER_CLAIM_OPERATION
+            | NATIVE_WORKER_READY_OPERATION
+            | NATIVE_WORKER_CHECKPOINT_OPERATION
+    )
+}
+
+/// Recovery observations remain service-reachable while the Kernel is
+/// degraded.  A `BLOCKED` readiness report is an observation, not a claim
+/// transition; cancellation and reconciliation never create new authority.
+fn native_worker_operation_allows_degraded(operation: &str, payload: &serde_json::Value) -> bool {
+    if matches!(
+        operation,
+        NATIVE_WORKER_HEARTBEAT_OPERATION
+            | NATIVE_WORKER_CANCEL_OBSERVE_OPERATION
+            | NATIVE_WORKER_RECONCILE_OPERATION
+            | NATIVE_WORKER_RESULT_SUBMIT_OPERATION
+    ) {
+        return true;
+    }
+    operation == NATIVE_WORKER_READY_OPERATION
+        && payload
+            .get("readiness")
+            .and_then(|value| value.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("BLOCKED")
+}
+
 impl KernelComposition {
     /// Dispatches one native-worker lifecycle frame.
     ///
@@ -734,13 +766,6 @@ impl KernelComposition {
         session: &Session,
         frame: &Frame,
     ) -> Result<KernelFrameAction, TransportError> {
-        if self
-            .service_state()
-            .map_err(|_| TransportError::SessionFenced)?
-            != KernelServiceState::Ready
-        {
-            return Err(TransportError::SessionFenced);
-        }
         session
             .peer
             .validate()
@@ -778,6 +803,25 @@ impl KernelComposition {
             .ok_or(TransportError::SessionFenced)?;
         if !is_native_worker_operation(operation) {
             return Err(TransportError::SessionFenced);
+        }
+        let state = self
+            .service_state()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if state != KernelServiceState::Ready
+            && !(state == KernelServiceState::Degraded
+                && native_worker_operation_allows_degraded(operation, &payload))
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let ready_is_blocked = operation == NATIVE_WORKER_READY_OPERATION
+            && payload
+                .get("readiness")
+                .and_then(|value| value.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                == Some("BLOCKED");
+        if native_worker_operation_requires_watchdog(operation) && !ready_is_blocked {
+            self.admit_material_authority_for_fence(GovernanceProfile::full(), &presented_fence)
+                .map_err(|_| TransportError::SessionFenced)?;
         }
         if operation == NATIVE_WORKER_RECONCILE_OPERATION {
             return self.dispatch_native_worker_reconcile(session, frame);

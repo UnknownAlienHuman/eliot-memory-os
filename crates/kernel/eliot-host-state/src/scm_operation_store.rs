@@ -643,6 +643,19 @@ pub struct ScmOperationStore {
 }
 
 impl ScmOperationStore {
+    /// Creates a store at an arbitrary path with **no protected-root lease and
+    /// no ACL proof**. This is the only remaining creation seam for this type
+    /// and it is therefore compiled out of every production build: the
+    /// `test-support` feature is enabled only from `[dev-dependencies]`, so no
+    /// runtime root can reach it.
+    ///
+    /// A production owner MUST NOT reintroduce an unchecked creator. It must
+    /// open through the protected runtime lease that mints the file with the
+    /// installer-provisioned descriptor and then proves it, exactly as
+    /// `RedbJournalBackend::open_at` does for the Host journal; the retained
+    /// parent root lease and the retained file lease must both outlive the
+    /// store.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ScmOperationStoreError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {

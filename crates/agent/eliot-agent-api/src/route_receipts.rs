@@ -568,6 +568,30 @@ impl AdmittedRouteReceipt {
         }
         check_self_digest(self, &self.self_digest)
     }
+
+    /// Validates this admitted decision against the exact candidate it admits
+    /// (issue #228 A3): the candidate itself must validate, the stored
+    /// `candidate_digest` must equal [`candidate_digest_for`] recomputed from
+    /// the candidate bytes (a digest reference alone proves nothing), and the
+    /// receipt shape/linkage must hold via [`Self::validate`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContractError::DigestMismatch`] when the stored candidate
+    /// digest is not the recomputation of the supplied candidate, and the
+    /// underlying candidate/shape failures otherwise.
+    pub fn validate_for_candidate(
+        &self,
+        candidate: &RouteSelectionCandidate,
+    ) -> Result<(), ContractError> {
+        candidate.validate()?;
+        let recomputed =
+            candidate_digest_for(candidate).map_err(|_| ContractError::DigestMismatch)?;
+        if recomputed != self.candidate_digest {
+            return Err(ContractError::DigestMismatch);
+        }
+        self.validate()
+    }
 }
 
 /// Route observation axis of a physical observation: whether the observed

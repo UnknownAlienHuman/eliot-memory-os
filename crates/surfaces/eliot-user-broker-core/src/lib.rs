@@ -4,6 +4,15 @@
 //! authenticated grants, P-04 supplies the physical implementation behind the
 //! P-03 process contract, and durable registration state is injected.  No
 //! Windows API, SCM, process, credential, or storage implementation lives here.
+//!
+//! Issue #74 adds two durable responsibilities to the injected durable
+//! provider: the per-operation request-identity ledger
+//! ([`IssuedOperationIdentity`], projected by the composition through
+//! [`IssuedOperationIdentityLedger`]) and the exact-registration-identity
+//! reconciliation of a lost acknowledgement ([`RegistrationReconciliation`]).
+//! Neither mints authority: the Kernel still validates every identity, and the
+//! broker-local `user_broker_epoch` scalar is never copied into an identity
+//! row or conflated with an authority epoch.
 
 #![forbid(unsafe_code)]
 
@@ -233,6 +242,73 @@ fn hex_digest(value: &str, field: &'static str) -> Result<(), BrokerError> {
     Ok(())
 }
 
+/// Rejects disclosed secret material in any operator-visible launch field.
+///
+/// A user credential or resource is introduced only as an opaque
+/// [`SecretRef`] inside the exact grant.  An argument vector, an executable
+/// path, a working directory, a route fingerprint, or a tool name is
+/// published to the process table, to logs, and to diagnostic payloads, so
+/// secret material there is a disclosure, not a launch.  The marker set is
+/// the same one the process contract applies to a non-secret environment
+/// map, so the broker refuses exactly what the child would refuse to carry.
+fn validate_no_disclosed_secret(approved: &ApprovedLaunch) -> Result<(), BrokerError> {
+    const NAME_MARKERS: [&str; 7] = [
+        "PASSWORD",
+        "PASSWD",
+        "TOKEN",
+        "SECRET",
+        "PRIVATE_KEY",
+        "API_KEY",
+        "CREDENTIAL",
+    ];
+    const VALUE_MARKERS: [&str; 3] = ["bearer ", "sk-", "-----begin "];
+    let carries_marker = |value: &str| {
+        let upper = value.to_ascii_uppercase();
+        let lower = value.to_ascii_lowercase();
+        NAME_MARKERS.iter().any(|marker| upper.contains(marker))
+            || VALUE_MARKERS.iter().any(|marker| lower.contains(marker))
+    };
+    let disclosed = carries_marker(&approved.executable)
+        || carries_marker(&approved.working_directory)
+        || carries_marker(&approved.root)
+        || carries_marker(&approved.tool)
+        || carries_marker(&approved.request_id)
+        || carries_marker(&approved.route_fingerprint)
+        || carries_marker(&approved.idempotency_key)
+        || carries_marker(&approved.process_fence_nonce)
+        || carries_marker(approved.image_id.as_str())
+        || approved
+            .argv
+            .iter()
+            .any(|value| carries_marker(value.as_str()))
+        || approved
+            .dependency_closure
+            .iter()
+            .any(|value| carries_marker(value.as_str()))
+        // The introduction is scope and audience: it is published into the
+        // grant digest, the durable operation cursor, and every diagnostic
+        // the broker projects. Secret material in any of its scope fields is
+        // a disclosure of exactly the same class as a secret in argv.
+        || carries_marker(&approved.introduction.resource_ref)
+        || carries_marker(&approved.introduction.facet_manifest_ref)
+        || approved
+            .introduction
+            .introduced_operation_set
+            .iter()
+            .any(|value| carries_marker(value.as_str()))
+        || approved
+            .introduction
+            .introduced_resource_set
+            .iter()
+            .any(|value| carries_marker(value.as_str()));
+    if disclosed {
+        return Err(BrokerError::CredentialMaterialDisclosed(
+            "launch_disclosure",
+        ));
+    }
+    Ok(())
+}
+
 fn path_is_within_root(executable: &str, root: &str) -> bool {
     executable
         .strip_prefix(root)
@@ -383,6 +459,145 @@ pub struct RegistrationFenceReceipt {
     pub status: RegistrationStatus,
 }
 
+/// Principal-bound credential lease introduced for one admitted child
+/// (I6.15 `CredentialUseBinding`, narrowed to the fields this broker
+/// admission boundary must enforce).
+///
+/// Only the opaque provider/key handle crosses this boundary: no secret
+/// material is present, is derivable here, or is forwarded to the child
+/// environment. `expires_at` is the binding's own deadline and may never
+/// outlive the introduction that names it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialBinding {
+    /// Opaque provider/key handle resolved by the child's own crypto port.
+    pub handle: SecretRef,
+    /// Absolute expiry of this binding, in Unix milliseconds.
+    pub expires_at: u64,
+}
+
+/// The exact user-session resource a grant introduces to one admitted child.
+///
+/// This is I6.15's `CapabilityIntroduction` reduced to the fields a broker
+/// admission boundary can actually enforce: the opaque resource reference,
+/// the facet manifest the introduction is limited to, the operation and
+/// resource scope it covers, the effect ceiling it may reach, its own
+/// issue/expiry window and use budget, and the credential lease it names.
+/// The issuer is Kernel/Governor — this type grants nothing. Its whole
+/// purpose is to make "a grant must not introduce a resource it does not
+/// name" a checkable comparison instead of a carried-along string.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceIntroduction {
+    /// Opaque, non-revealing reference presented to the child. I6.15: an
+    /// agent sees "an opaque `ResourceRef`, not a broad reusable path
+    /// grant", so a path-shaped or drive-shaped value is refused here
+    /// rather than forwarded as one.
+    pub resource_ref: String,
+    /// Exact facet manifest identity this introduction is limited to.
+    pub facet_manifest_ref: String,
+    /// Operations this introduction may be used for.
+    pub introduced_operation_set: Vec<String>,
+    /// User-session resource roots this introduction may reach.
+    pub introduced_resource_set: Vec<String>,
+    /// Highest effect this introduction may produce.
+    pub max_effect: EffectCeiling,
+    /// Absolute issue instant of this introduction, in Unix milliseconds.
+    pub issued_at: u64,
+    /// Absolute expiry of this introduction, in Unix milliseconds.
+    pub expires_at: u64,
+    /// Use budget of this introduction. Zero is not a usable budget.
+    pub max_calls: u32,
+    /// The principal-bound credential lease, when one is introduced.
+    pub credential_binding: Option<CredentialBinding>,
+}
+
+impl ResourceIntroduction {
+    fn validate(&self) -> Result<(), BrokerError> {
+        text(&self.resource_ref, "introduction.resource_ref")?;
+        if self.resource_ref.contains(['/', '\\', ':', '*', '?']) {
+            return Err(BrokerError::InvalidField("introduction.resource_ref"));
+        }
+        text(&self.facet_manifest_ref, "introduction.facet_manifest_ref")?;
+        if self.introduced_operation_set.is_empty() {
+            return Err(BrokerError::IntroductionRequired(
+                "introduced_operation_set",
+            ));
+        }
+        unique(&self.introduced_operation_set, "introduced_operation_set")?;
+        if self.introduced_resource_set.is_empty() {
+            return Err(BrokerError::IntroductionRequired("introduced_resource_set"));
+        }
+        unique(&self.introduced_resource_set, "introduced_resource_set")?;
+        if self.max_calls == 0 || self.issued_at == 0 || self.expires_at <= self.issued_at {
+            return Err(BrokerError::InvalidField("introduction_window"));
+        }
+        if let Some(binding) = &self.credential_binding
+            && (binding.expires_at == 0
+                || binding.expires_at > self.expires_at
+                || binding.expires_at <= self.issued_at)
+        {
+            return Err(BrokerError::InvalidField("credential_binding.expires_at"));
+        }
+        Ok(())
+    }
+
+    /// Returns the rank of one effect ceiling, from least to most authority.
+    ///
+    /// `NoExternalEffect` is the narrowest ceiling, so a request for a
+    /// narrower ceiling than the introduction allows is admitted and a
+    /// request for a wider one is not.
+    const fn effect_rank(ceiling: EffectCeiling) -> u8 {
+        match ceiling {
+            EffectCeiling::ReadOnly => 0,
+            EffectCeiling::CandidateOnly => 1,
+            EffectCeiling::NoExternalEffect => 2,
+        }
+    }
+
+    /// Compares one launch request against what this introduction names.
+    ///
+    /// Every comparison is exact: the tool must be an introduced operation,
+    /// the resource root must be an introduced resource, the requested
+    /// effect must fit under the introduced ceiling, the introduction must
+    /// be active at the observation instant, and the credential lease the
+    /// launch carries must be exactly the lease the introduction names.
+    /// A request that reaches past any of those is refused with its own
+    /// typed reason (I6.15: a missing exact resource facet returns
+    /// `CAPABILITY_INTRODUCTION_REQUIRED`, and neither that condition nor a
+    /// revoked supporting grant is translated into a generic tool failure or
+    /// a silently widened introduction).
+    fn admits(&self, approved: &ApprovedLaunch, observed_at: u64) -> Result<(), BrokerError> {
+        self.validate()?;
+        if !self.introduced_operation_set.contains(&approved.tool) {
+            return Err(BrokerError::IntroductionOperationNotGranted);
+        }
+        if !self.introduced_resource_set.contains(&approved.root) {
+            return Err(BrokerError::IntroductionResourceNotGranted);
+        }
+        if Self::effect_rank(approved.effect_ceiling) > Self::effect_rank(self.max_effect) {
+            return Err(BrokerError::IntroductionEffectCeilingExceeded);
+        }
+        if observed_at < self.issued_at || observed_at >= self.expires_at {
+            return Err(BrokerError::IntroductionExpired);
+        }
+        match (&self.credential_binding, &approved.credential_handle) {
+            (Some(binding), Some(handle)) if binding.handle == *handle => {}
+            (None, None) => {}
+            // A grant that carries a credential the introduction does not
+            // name, or names a credential the launch does not carry, is a
+            // scope mismatch — never a silent pass.
+            _ => return Err(BrokerError::IntroductionCredentialUnnamed),
+        }
+        if let Some(binding) = &self.credential_binding
+            && observed_at >= binding.expires_at
+        {
+            return Err(BrokerError::IntroductionExpired);
+        }
+        Ok(())
+    }
+}
+
 /// The exact approved launch projection.  Credential material is never present.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -405,7 +620,13 @@ pub struct ApprovedLaunch {
     pub root: String,
     pub effect_ceiling: EffectCeiling,
     pub tool: String,
+    /// The opaque credential handle the launch requests. It is meaningful
+    /// only when the grant's [`ResourceIntroduction`] names exactly this
+    /// handle; a request that carries a credential its introduction does
+    /// not name is refused.
     pub credential_handle: Option<SecretRef>,
+    /// The exact user-session resource this launch introduces.
+    pub introduction: ResourceIntroduction,
     pub dependency_closure: Vec<String>,
     pub idempotency_key: String,
     pub generation: Generation,
@@ -435,6 +656,10 @@ impl LaunchRequest {
         text(&self.approved.tool, "tool")?;
         text(&self.approved.idempotency_key, "idempotency_key")?;
         text(&self.approved.process_fence_nonce, "process_fence_nonce")?;
+        validate_no_disclosed_secret(&self.approved)?;
+        self.approved
+            .introduction
+            .admits(&self.approved, self.observed_at)?;
         if self.approved.executable.contains('*')
             || self.approved.executable.contains('?')
             || self.approved.root.contains('*')
@@ -448,6 +673,94 @@ impl LaunchRequest {
             return Err(BrokerError::StaleLease);
         }
         Ok(())
+    }
+}
+
+/// One exact interactive identity tuple this broker process is admitted as.
+///
+/// The tuple is derived from the protected installation declaration the
+/// composition authenticated against the live process; it is never supplied
+/// by stdin, by a UI, or by a caller-provided launch request.  Admission is
+/// *single*: one tuple admits one broker, and a registration recovered from
+/// durable state is admitted only when it carries exactly this tuple.  A
+/// different SID, logon Session, boot Session, installation, artifact, or
+/// process is another broker's registration and is refused instead of
+/// adopted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerAdmissionIdentity {
+    pub installation_id: String,
+    pub windows_sid: String,
+    pub interactive_session_id: String,
+    pub boot_session_id: String,
+    pub broker_process_id: String,
+    pub broker_artifact_digest: String,
+    pub protocol_generation: ProtocolVersion,
+    pub launch_nonce: String,
+}
+
+impl BrokerAdmissionIdentity {
+    /// Returns whether one sealed registration is this broker's own tuple.
+    ///
+    /// The broker-local generation, the authority epoch, and the fence are
+    /// deliberately excluded: they are properties of one registration
+    /// revision, not of the process identity that is admitted to hold it.
+    /// A restart legitimately presents a new process identity and therefore
+    /// a new registration revision under the same tuple.
+    #[must_use]
+    pub fn admits(&self, registration: &RegistrationReceipt) -> bool {
+        self.installation_id == registration.installation_id
+            && self.windows_sid == registration.windows_sid
+            && self.interactive_session_id == registration.interactive_session_id
+            && self.boot_session_id == registration.boot_session_id
+    }
+
+    fn validate(&self) -> Result<(), BrokerError> {
+        text(&self.installation_id, "installation_id")?;
+        text(&self.windows_sid, "windows_sid")?;
+        text(&self.interactive_session_id, "interactive_session_id")?;
+        text(&self.boot_session_id, "boot_session_id")?;
+        text(&self.broker_process_id, "broker_process_id")?;
+        text(&self.broker_artifact_digest, "broker_artifact_digest")?;
+        hex_digest(&self.broker_artifact_digest, "broker_artifact_digest")?;
+        text(&self.launch_nonce, "launch_nonce")?;
+        self.protocol_generation
+            .validate()
+            .map_err(|error| BrokerError::Provider(error.to_string()))
+    }
+}
+
+/// Broker-owned control operation with its own canonical operation identity.
+///
+/// Register, heartbeat, launch, and the terminal fence own Kernel operation
+/// identities minted by the composed transport issuer.  Cancellation and
+/// reconciliation are broker-owned effects on the broker's own Job contour:
+/// they are not Kernel transactions, but they are still distinct, durable
+/// operations, so they get their own operation selectors in the same durable
+/// per-operation identity ledger instead of borrowing a launch identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BrokerControlOperation {
+    Cancel,
+    Reconcile,
+}
+
+impl BrokerControlOperation {
+    /// Returns the exact operation selector recorded in the durable ledger.
+    #[must_use]
+    pub const fn selector(self) -> &'static str {
+        match self {
+            Self::Cancel => "eliot.user-broker.cancel",
+            Self::Reconcile => "eliot.user-broker.reconcile",
+        }
+    }
+
+    /// Returns the short idempotency-namespace tag of this control operation.
+    const fn namespace(self) -> &'static str {
+        match self {
+            Self::Cancel => "cancel",
+            Self::Reconcile => "reconcile",
+        }
     }
 }
 
@@ -624,6 +937,76 @@ pub struct OperationPermit {
     lease_expires_at: u64,
 }
 
+/// One durably retained per-operation Kernel request identity (issue #74).
+///
+/// This is the *ledger* half of an issued operation identity, not the
+/// identity itself: it names the exact operation selector, the canonical
+/// payload digest it is bound to, and the three transport identity strings
+/// plus the absolute deadline it was minted with. A broker restart re-seeds
+/// its operation-identity issuer from these rows, so a request id, a
+/// cancellation id, or an idempotency key that was already spent is a durable
+/// `IDENTITY_CONFLICT` instead of a fresh mint.
+///
+/// No authority field is copied here: the registration/epoch binding stays in
+/// [`RegistrationReceipt`] and `user_broker_epoch` stays the broker-local
+/// scalar next to it. This record grants nothing and expires nothing on its
+/// own; the Kernel still validates every minted [`eliot_protocol::RequestIdentity`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuedOperationIdentity {
+    /// Closed Kernel operation selector this identity was minted for.
+    pub operation: String,
+    /// Lowercase SHA-256 of the canonical payload bytes the identity binds.
+    pub canonical_digest: String,
+    /// Exact transport request id of the issued identity.
+    pub request_id: String,
+    /// Exact transport idempotency key the identity is bound to.
+    pub idempotency_key: String,
+    /// Exact transport cancellation id of the issued identity.
+    pub cancellation_id: String,
+    /// Absolute transport deadline the identity was minted with.
+    pub deadline_unix_ms: u64,
+    /// Observation instant the identity was minted at.
+    pub issued_at_ms: u64,
+    /// Caller request id when a launch caller link owned this issuance.
+    pub caller_request_id: Option<String>,
+}
+
+impl IssuedOperationIdentity {
+    fn validate(&self) -> Result<(), BrokerError> {
+        text(&self.operation, "operation_identity.operation")?;
+        hex_digest(
+            &self.canonical_digest,
+            "operation_identity.canonical_digest",
+        )?;
+        text(&self.request_id, "operation_identity.request_id")?;
+        text(&self.idempotency_key, "operation_identity.idempotency_key")?;
+        text(&self.cancellation_id, "operation_identity.cancellation_id")?;
+        if self.deadline_unix_ms == 0 || self.issued_at_ms == 0 {
+            return Err(BrokerError::InvalidField("operation_identity.clock"));
+        }
+        if self.deadline_unix_ms <= self.issued_at_ms {
+            return Err(BrokerError::InvalidField("operation_identity.deadline"));
+        }
+        if let Some(caller) = self.caller_request_id.as_deref() {
+            text(caller, "operation_identity.caller_request_id")?;
+        }
+        Ok(())
+    }
+}
+
+/// Live per-operation identity ledger supplied by the composition.
+///
+/// The broker core never mints an identity: it only projects whatever the
+/// composed issuer holds into the durable snapshot, so the identity ledger
+/// and the durable registration state are written in one atomic publication.
+pub trait IssuedOperationIdentityLedger: Send {
+    /// Returns every operation identity this process has issued, in a
+    /// deterministic order. A poisoned ledger returns an empty projection and
+    /// the caller fails closed on the next issuance.
+    fn issued_operation_identities(&self) -> Vec<IssuedOperationIdentity>;
+}
+
 /// Durable restart cursor owned by the injected registration provider.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -631,6 +1014,87 @@ pub struct BrokerSnapshot {
     pub registration: Option<RegistrationReceipt>,
     pub user_broker_epoch: u64,
     pub operation_cursors: Vec<OperationCursor>,
+    /// Durable per-operation request-identity ledger (issue #74).
+    ///
+    /// `#[serde(default)]` is the versioned additive migration: a snapshot
+    /// written before the broker retained identities has no such ledger, and
+    /// an absent ledger is read as *no identity was ever issued* rather than
+    /// being reinterpreted. It is rewritten with the first publication of the
+    /// current process, and a restart re-seeds the issuer from it before any
+    /// Kernel call can mint.
+    #[serde(default)]
+    pub operation_identities: Vec<IssuedOperationIdentity>,
+    /// Durable tombstones of operations fenced by a newer broker generation.
+    ///
+    /// A new `UserBrokerEpoch` fences the previous registration, so its live
+    /// cursors stop being this broker's lineage. They are retired here
+    /// rather than discarded: an `operation_id` that was already spent is
+    /// the only thing that stops an exact replay of the same launch request
+    /// from starting a *second* process for the same operation under the
+    /// new generation. `#[serde(default)]` is the versioned additive
+    /// migration — a snapshot written before this ledger existed has no
+    /// tombstones, which is read as "nothing was retired", never as a
+    /// licence to reuse an id.
+    #[serde(default)]
+    pub retired_operations: Vec<RetiredOperationIdentity>,
+}
+
+/// One operation identity fenced by a newer broker generation.
+///
+/// This is a tombstone, not a permit: it grants nothing and admits nothing.
+/// It records that a specific `operation_id` already carried an effect under
+/// a registration that a later generation fenced, so a replay of that exact
+/// request is a typed conflict instead of a second effect.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetiredOperationIdentity {
+    /// The spent operation identity.
+    pub operation_id: OperationId,
+    /// Canonical digest of the exact request it carried.
+    pub request_digest: String,
+    /// Registration digest of the generation that spent it.
+    pub registration_digest: String,
+    /// Broker-local generation that spent it.
+    pub user_broker_epoch: u64,
+    /// The user-session resource/credential that generation introduced. It
+    /// is retained so a later audit can prove which introduction was closed
+    /// by the fence rather than infer it. `#[serde(default)]` is the versioned
+    /// additive migration for a tombstone written before this field existed.
+    #[serde(default)]
+    pub introduction: Option<ResourceIntroduction>,
+    /// State the operation held when its generation was fenced.
+    pub state: OperationState,
+}
+
+/// Which broker-owned Kernel operation currently has an unproven outcome
+/// (issue #74 A6).
+///
+/// This is a broker-core classification, not a transport selector: the
+/// composition maps it onto the exact per-operation transport identity it
+/// minted, so a lost acknowledgement is always reported against the operation
+/// that actually lost it. Register and launch are never in this state — both
+/// publish their effect durably before returning or fail closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LostOperation {
+    /// A lease refresh whose acknowledgement was lost.
+    LeaseRefresh,
+    /// A fence/logoff whose acknowledgement was lost.
+    Fence,
+}
+
+/// Typed outcome of reconciling one lost or unknown broker-owned Kernel
+/// acknowledgement by its exact registration identity (issue #74 A6).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RegistrationReconciliation {
+    /// The durable registration already projects the exact effect the lost
+    /// operation was attempting. Nothing is retried, so no second lease
+    /// refresh, duplicate logoff, or second launch is created.
+    Reconciled(RegistrationReceipt),
+    /// The durable registration still holds the pre-operation binding. The
+    /// lost effect is neither proven nor disproven, so the broker must
+    /// re-attach through a fresh protected launch binding before any further
+    /// operation; a blind retry is never issued from here.
+    Unresolved(RegistrationReceipt),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -648,6 +1112,16 @@ pub struct OperationCursor {
     pub generation: Generation,
     pub process_fence_nonce: String,
     pub process_request_digest: String,
+    /// The exact user-session resource/credential this operation introduced.
+    ///
+    /// `#[serde(default)]` is the versioned additive migration: a cursor
+    /// written before introductions were retained has no binding. `None` is
+    /// read as *this operation introduced nothing the broker still owns*,
+    /// never as permission to introduce anything; the child it started
+    /// belonged to a process that is gone, and its introduction is closed
+    /// with that process.
+    #[serde(default)]
+    pub introduction: Option<ResourceIntroduction>,
     pub state: OperationState,
 }
 
@@ -672,6 +1146,9 @@ impl OperationCursor {
             return Err(BrokerError::InvalidField("operation_cursor"));
         }
         text(&self.process_fence_nonce, "process_fence_nonce")?;
+        if let Some(introduction) = &self.introduction {
+            introduction.validate()?;
+        }
         Ok(())
     }
 }
@@ -761,10 +1238,15 @@ pub struct UserBroker {
     authority: Option<Box<dyn AuthorityPort>>,
     process: Option<Box<dyn ProcessPort>>,
     durable: Option<Box<dyn DurableRegistrationPort>>,
+    identity_ledger: Option<Box<dyn IssuedOperationIdentityLedger>>,
+    admission: Option<BrokerAdmissionIdentity>,
     registration: Option<RegistrationReceipt>,
     registration_reconciled: bool,
     broker_epoch: u64,
     operations: BTreeMap<String, OperationRecord>,
+    retired_operations: BTreeMap<String, RetiredOperationIdentity>,
+    issued_operations: BTreeMap<String, IssuedOperationIdentity>,
+    lost_operation: Option<LostOperation>,
 }
 
 impl UserBroker {
@@ -777,11 +1259,80 @@ impl UserBroker {
             authority,
             process,
             durable,
+            identity_ledger: None,
+            admission: None,
             registration: None,
             registration_reconciled: false,
             broker_epoch: 0,
             operations: BTreeMap::new(),
+            retired_operations: BTreeMap::new(),
+            issued_operations: BTreeMap::new(),
+            lost_operation: None,
         }
+    }
+
+    /// Binds the exact interactive identity tuple this process is admitted
+    /// as, and proves that a registration recovered from durable state is
+    /// this broker's own tuple rather than another principal's surviving
+    /// registration.
+    ///
+    /// This is the single-broker admission gate. It runs after
+    /// [`Self::recover`] and before any Kernel transaction: a durable
+    /// registration carrying a different installation, SID, logon Session, or
+    /// boot Session belongs to a broker this process is not, and adopting or
+    /// heartbeating it would hand this process another principal's lease,
+    /// lineage, and cancellation authority. A tuple already bound to a
+    /// different identity in this process is equally refused.
+    pub fn bind_admission(
+        &mut self,
+        identity: &BrokerAdmissionIdentity,
+    ) -> Result<(), BrokerError> {
+        identity.validate()?;
+        if let Some(bound) = &self.admission
+            && bound != identity
+        {
+            return Err(BrokerError::StaleRegistrationIdentity);
+        }
+        if let Some(registration) = &self.registration
+            && !identity.admits(registration)
+        {
+            return Err(BrokerError::StaleRegistrationIdentity);
+        }
+        self.admission = Some(identity.clone());
+        Ok(())
+    }
+
+    /// Attaches the composed per-operation identity ledger so every durable
+    /// publication carries the exact identities this process issued (issue
+    /// #74).  It must be attached before [`Self::recover`]: the recovered
+    /// rows are re-seeded into the composed issuer from
+    /// [`Self::recovered_operation_identities`], and the live ledger is
+    /// projected into every snapshot written afterwards.
+    pub fn attach_issued_operation_identity_ledger(
+        &mut self,
+        ledger: Box<dyn IssuedOperationIdentityLedger>,
+    ) {
+        self.identity_ledger = Some(ledger);
+    }
+
+    /// Returns the durable per-operation identity ledger recovered from the
+    /// restart snapshot.  A composition re-seeds its issuer from exactly this
+    /// list before it can mint, so a spent request id, cancellation id, or
+    /// idempotency key from a previous process is a conflict, not a new mint.
+    #[must_use]
+    pub fn recovered_operation_identities(&self) -> Vec<IssuedOperationIdentity> {
+        self.issued_operations.values().cloned().collect()
+    }
+
+    /// Takes the broker-owned operation whose outcome is currently unproven.
+    ///
+    /// Set exactly when a lease refresh or a fence lost its acknowledgement
+    /// and the durable reconciliation could not prove the effect. The
+    /// composition pairs it with the exact per-operation transport identity it
+    /// minted, then clears it: a reconciliation is reported once, against one
+    /// exact operation, and never as a bare unknown outcome.
+    pub fn take_lost_operation(&mut self) -> Option<LostOperation> {
+        self.lost_operation.take()
     }
 
     pub fn recover(&mut self) -> Result<(), BrokerError> {
@@ -795,6 +1346,18 @@ impl UserBroker {
         self.registration = snapshot.registration;
         self.registration_reconciled = self.registration.is_none();
         self.broker_epoch = snapshot.user_broker_epoch;
+        let mut issued_operations = BTreeMap::new();
+        for identity in snapshot.operation_identities {
+            identity.validate()?;
+            if issued_operations
+                .insert(identity.request_id.clone(), identity)
+                .is_some()
+            {
+                return Err(BrokerError::Duplicate("operation_identity.request_id"));
+            }
+        }
+        self.issued_operations = issued_operations;
+        self.retired_operations = retired_index(snapshot.retired_operations)?;
         let Some(registration) = self.registration.as_ref() else {
             if snapshot.operation_cursors.is_empty() {
                 self.operations.clear();
@@ -823,6 +1386,12 @@ impl UserBroker {
             if !operation_ids.insert(cursor.operation_id.clone()) {
                 return Err(BrokerError::Duplicate("operation_cursor.operation_id"));
             }
+            if self
+                .retired_operations
+                .contains_key(cursor.operation_id.as_str())
+            {
+                return Err(BrokerError::Duplicate("retired_operation.operation_id"));
+            }
             let permit = permit_from_cursor(&cursor);
             if operations
                 .insert(
@@ -850,6 +1419,15 @@ impl UserBroker {
             .map(|registration| registration.registration_digest.as_str())
     }
 
+    /// Returns the registration receipt this broker currently holds so the
+    /// composition can choose between refreshing that exact registration and
+    /// issuing a fresh one. A `Closed`/`Draining` registration, or one whose
+    /// lease already elapsed, carries no launch authority and must never be
+    /// heartbeated again.
+    pub fn registration(&self) -> Option<&RegistrationReceipt> {
+        self.registration.as_ref()
+    }
+
     pub fn broker_epoch(&self) -> u64 {
         self.broker_epoch
     }
@@ -860,6 +1438,21 @@ impl UserBroker {
         request: RegistrationRequest,
     ) -> Result<RegistrationReceipt, BrokerError> {
         request.validate()?;
+        // A registration request *is* this process's declared identity, so a
+        // first registration also binds the admission tuple. A tuple that was
+        // already bound to a different identity (a restarted broker admitted
+        // from its protected launch declaration) keeps that identity and the
+        // request is refused here rather than silently re-binding.
+        self.bind_admission(&BrokerAdmissionIdentity {
+            installation_id: request.installation_id.clone(),
+            windows_sid: request.windows_sid.clone(),
+            interactive_session_id: request.interactive_session_id.clone(),
+            boot_session_id: request.boot_session_id.clone(),
+            broker_process_id: request.broker_process_id.clone(),
+            broker_artifact_digest: request.broker_artifact_digest.clone(),
+            protocol_generation: request.protocol_generation,
+            launch_nonce: request.launch_nonce.clone(),
+        })?;
         if let Some(current) = &self.registration
             && current.status == RegistrationStatus::Active
             && current.installation_id == request.installation_id
@@ -879,6 +1472,26 @@ impl UserBroker {
             return Err(BrokerError::StaleEpoch);
         }
         self.broker_epoch = sealed.user_broker_epoch;
+        // A new broker generation fences the previous one, so the previous
+        // generation's operations stop being this broker's live lineage
+        // (I1.4: processes from an old broker epoch cannot receive new
+        // effect authority). They are *retired*, not discarded: the spent
+        // `operation_id` is the only durable proof that stops an exact
+        // replay of the same launch request from starting a second process
+        // for the same operation under this new generation.
+        for record in self.operations.values() {
+            let retired = RetiredOperationIdentity {
+                operation_id: record.cursor.operation_id.clone(),
+                request_digest: record.cursor.request_digest.clone(),
+                registration_digest: record.cursor.registration_digest.clone(),
+                user_broker_epoch: record.cursor.user_broker_epoch,
+                introduction: record.cursor.introduction.clone(),
+                state: record.cursor.state,
+            };
+            self.retired_operations
+                .insert(retired.operation_id.as_str().to_owned(), retired);
+        }
+        self.operations.clear();
         self.registration = Some(sealed.clone());
         self.registration_reconciled = true;
         self.persist()?;
@@ -907,15 +1520,38 @@ impl UserBroker {
             }
             current
         };
+        // Heartbeat is the reconciliation step, not an effect: it is exactly
+        // the transaction through which a recovered registration is proven to
+        // the authoritative owner. The composition has already refused a
+        // foreign tuple through `bind_admission` before it gets here, so this
+        // path deliberately does not re-gate on admission identity.
         if current.registration_digest != request.registration_digest {
             return Err(BrokerError::GrantBindingMismatch);
         }
-        let grant = self
+        let grant = match self
             .authority
             .as_mut()
             .ok_or(BrokerError::PlanGap(RequiredProvider::G01Authority))?
             .heartbeat(&current, request.observed_at)
-            .map_err(|error| map_port(RequiredProvider::G01Authority, error))?;
+        {
+            Ok(grant) => grant,
+            Err(PortError::Unknown) => {
+                // A lost lease-refresh acknowledgement is reconciled against
+                // the durable registration bound to this exact operation
+                // rather than retried blind: a second refresh under a new
+                // operation identity could renew an already renewed lease.
+                return match self.reconcile_lost_lease_refresh(&current)? {
+                    RegistrationReconciliation::Reconciled(receipt) => {
+                        Ok(heartbeat_receipt(&receipt))
+                    }
+                    RegistrationReconciliation::Unresolved(_) => {
+                        self.lost_operation = Some(LostOperation::LeaseRefresh);
+                        Err(BrokerError::UnknownOutcome)
+                    }
+                };
+            }
+            Err(error) => return Err(map_port(RequiredProvider::G01Authority, error)),
+        };
         let refreshed = match seal_registration_from_grant(&current, &grant, request.observed_at) {
             Ok(refreshed) => refreshed,
             Err(error) => {
@@ -926,12 +1562,7 @@ impl UserBroker {
         self.registration = Some(refreshed.clone());
         self.registration_reconciled = true;
         self.persist()?;
-        Ok(HeartbeatReceipt {
-            registration_digest: refreshed.registration_digest,
-            user_broker_epoch: refreshed.user_broker_epoch,
-            fence_id: refreshed.fence_id,
-            expires_at: refreshed.expires_at,
-        })
+        Ok(heartbeat_receipt(&refreshed))
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -939,6 +1570,12 @@ impl UserBroker {
     pub fn launch(&mut self, request: LaunchRequest) -> Result<LaunchReceipt, BrokerError> {
         request.validate()?;
         let current = self.active_registration(request.observed_at)?.clone();
+        // A live lease over the right registration is not enough: the
+        // registration must be the one *this* admitted process tuple holds.
+        // A durable registration left by another SID/Session/installation
+        // fails here, before any grant, process preparation, or credential
+        // introduction.
+        self.require_admitted_registration(&current)?;
         let request_digest = digest(&request)?;
         if let Some(record) = self.operations.get(&request.approved.idempotency_key) {
             if record.cursor.request_digest != request_digest {
@@ -948,6 +1585,21 @@ impl UserBroker {
                 return Ok(receipt.clone());
             }
             return Err(BrokerError::UnknownOutcome);
+        }
+        // An `operation_id` already spent under a fenced generation is never
+        // reused, whatever the caller replays. Without this tombstone an
+        // exact replay of the same request under a new registration would
+        // prepare and start a *second* process for one operation identity,
+        // including for an operation whose outcome was never proven.
+        if let Some(retired) = self
+            .retired_operations
+            .get(request.approved.operation_id.as_str())
+        {
+            return Err(if retired.request_digest == request_digest {
+                BrokerError::RetiredOperation(retired.operation_id.clone())
+            } else {
+                BrokerError::OperationIdRetired(retired.operation_id.clone())
+            });
         }
         let grant = self
             .authority
@@ -1081,16 +1733,25 @@ impl UserBroker {
     /// Cancels a previously admitted operation by its broker-issued public
     /// operation identity.  The private one-shot permit remains broker-owned;
     /// stdin/UI callers cannot manufacture or widen it.
+    ///
+    /// An operation whose outcome is not yet proven is refused here, at the
+    /// single site that performs the effect, so cancellation can never erase
+    /// a possibly committed external effect. The refusal is structural
+    /// rather than conventional: it does not depend on a caller having
+    /// remembered to reconcile first.
     pub fn cancel_operation(
         &mut self,
         operation_id: &OperationId,
     ) -> Result<CancellationReceipt, BrokerError> {
-        let permit = self
+        let record = self
             .operations
             .values()
             .find(|record| record.permit.operation_id == *operation_id)
-            .map(|record| record.permit.clone())
             .ok_or(BrokerError::OperationNotFound)?;
+        if record.cursor.state == OperationState::Unknown {
+            return Err(BrokerError::UnreconciledEffect(operation_id.clone()));
+        }
+        let permit = record.permit.clone();
         self.cancel(&permit)
     }
 
@@ -1144,6 +1805,108 @@ impl UserBroker {
             .map(|record| record.permit.clone())
             .ok_or(BrokerError::OperationNotFound)?;
         self.reconcile(&permit)
+    }
+
+    /// Admits one broker-owned control operation against one exact owned
+    /// operation and records its distinct, durable operation identity.
+    ///
+    /// Cancellation and reconciliation are effects on this broker's own Job
+    /// contour, so they are not Kernel transactions, but they are still
+    /// operations with their own identity: the identity is written into the
+    /// same durable per-operation identity ledger as register, heartbeat,
+    /// launch, and fence, in the same atomic publication, and a restart
+    /// re-seeds it before any further effect.
+    ///
+    /// The identity is derived from the exact registration binding and the
+    /// exact target operation, so an exact retry resolves to the same row and
+    /// no second effect, while a different target is a different operation
+    /// rather than a widened one.  A target that is not this broker's
+    /// admitted lineage, or that is already reconciled, fails closed.
+    ///
+    /// A cancellation is refused while its target's outcome is unproven: an
+    /// unknown launch/effect must be reconciled first, so cancellation can
+    /// never erase a possibly committed external effect.
+    pub fn admit_control_operation(
+        &mut self,
+        operation: BrokerControlOperation,
+        target: &OperationId,
+        observed_at: u64,
+    ) -> Result<(), BrokerError> {
+        let current = self.active_registration(observed_at)?.clone();
+        self.require_admitted_registration(&current)?;
+        // A target whose generation was fenced is named as retired rather
+        // than reported as merely absent, so a caller replaying an old
+        // cancellation learns it is a fenced identity, not a typo.
+        if self.retired_operations.contains_key(target.as_str()) {
+            return Err(BrokerError::OperationIdRetired(target.clone()));
+        }
+        let record = self
+            .operations
+            .values()
+            .find(|record| record.permit.operation_id == *target)
+            .ok_or(BrokerError::OperationNotFound)?;
+        if record.cursor.registration_digest != current.registration_digest
+            || record.cursor.user_broker_epoch != current.user_broker_epoch
+            || !record
+                .cursor
+                .authority_epoch
+                .is_same_authority(&current.authority_epoch)
+            || record.cursor.fence_id != current.fence_id
+        {
+            return Err(BrokerError::GrantBindingMismatch);
+        }
+        if record.cursor.state == OperationState::Reconciled {
+            return Err(BrokerError::OperationNotFound);
+        }
+        if operation == BrokerControlOperation::Cancel
+            && record.cursor.state == OperationState::Unknown
+        {
+            return Err(BrokerError::UnreconciledEffect(target.clone()));
+        }
+        let canonical_digest = digest(&(
+            &current.registration_digest,
+            current.user_broker_epoch,
+            &current.authority_epoch,
+            &current.fence_id,
+            operation.selector(),
+            target.as_str(),
+            &record.cursor.request_digest,
+        ))?;
+        if self.issued_operations.values().any(|identity| {
+            identity.operation == operation.selector()
+                && identity.canonical_digest == canonical_digest
+        }) {
+            // Exact replay of one control operation: that identity is already
+            // durable, so no second identity row and no second effect.
+            return Ok(());
+        }
+        let namespace = operation.namespace();
+        let identity = IssuedOperationIdentity {
+            operation: operation.selector().to_owned(),
+            // The registration lease is the control operation's deadline: a
+            // cancellation or reconciliation is authorized no longer than the
+            // lease that admitted it.
+            deadline_unix_ms: current.expires_at,
+            request_id: format!("ub-ctl-{namespace}-{}", &canonical_digest[..32]),
+            idempotency_key: format!("ub-ctl/{namespace}/{canonical_digest}"),
+            cancellation_id: format!("ub-ctl-end-{namespace}-{}", &canonical_digest[..32]),
+            issued_at_ms: observed_at,
+            // No caller launch link: one target operation owns both a cancel
+            // and a reconcile identity, so a single-valued caller link would
+            // make the second one look like a conflicting reuse.
+            caller_request_id: None,
+            canonical_digest,
+        };
+        identity.validate()?;
+        if self
+            .issued_operations
+            .insert(identity.request_id.clone(), identity)
+            .is_some()
+        {
+            return Err(BrokerError::Duplicate("operation_identity.request_id"));
+        }
+        self.persist()?;
+        Ok(())
     }
 
     pub fn logoff(&mut self) -> Result<(), BrokerError> {
@@ -1202,6 +1965,29 @@ impl UserBroker {
         Ok(record)
     }
 
+    /// Proves that the registration about to be used is the one this
+    /// process's admitted identity tuple holds.
+    ///
+    /// Without this the broker would happily serve a live lease over a
+    /// registration recovered from shared durable state that belongs to a
+    /// different SID, logon Session, boot Session, or installation. That is
+    /// exactly the cross-principal adoption the registration contour forbids,
+    /// so it is refused before any grant, process preparation, or credential
+    /// introduction rather than detected afterwards.
+    fn require_admitted_registration(
+        &self,
+        registration: &RegistrationReceipt,
+    ) -> Result<(), BrokerError> {
+        let admission = self
+            .admission
+            .as_ref()
+            .ok_or(BrokerError::RegistrationNotAdmitted)?;
+        if !admission.admits(registration) {
+            return Err(BrokerError::StaleRegistrationIdentity);
+        }
+        Ok(())
+    }
+
     fn active_registration(
         &mut self,
         observed_at: u64,
@@ -1221,7 +2007,13 @@ impl UserBroker {
             if let Some(registration) = &mut self.registration {
                 registration.status = RegistrationStatus::Closed;
             }
+            // Lease loss is a revocation: it closes every handle and child
+            // the registration still owns, exactly as a terminal close does.
+            // Reporting only the expiry while owned children keep running
+            // would leave a live lineage with no authority behind it.
+            let released = self.release_owned_operations();
             self.persist()?;
+            released?;
             return Err(BrokerError::LeaseExpired);
         }
         self.registration
@@ -1243,20 +2035,46 @@ impl UserBroker {
                 status,
                 operation_id,
             };
-            let receipt = self
+            match self
                 .authority
                 .as_mut()
                 .ok_or(BrokerError::PlanGap(RequiredProvider::G01Authority))?
                 .fence(&request)
-                .map_err(|error| map_port(RequiredProvider::G01Authority, error))?;
-            validate_fence_receipt(&request, &receipt)?;
+            {
+                Ok(receipt) => validate_fence_receipt(&request, &receipt)?,
+                Err(PortError::Unknown) => {
+                    // A lost logoff acknowledgement is reconciled against the
+                    // durable projection of this exact fence operation
+                    // (`user-broker-fence-<registration digest>-<status>`)
+                    // instead of issuing a second fence.  When the durable
+                    // state already carries the requested status the fence
+                    // landed and the close is complete: no duplicate logoff
+                    // and no second transport identity is created.
+                    return match self.reconcile_lost_fence(&current, status)? {
+                        RegistrationReconciliation::Reconciled(_) => Ok(()),
+                        RegistrationReconciliation::Unresolved(_) => {
+                            self.lost_operation = Some(LostOperation::Fence);
+                            Err(BrokerError::UnknownOutcome)
+                        }
+                    };
+                }
+                Err(error) => return Err(map_port(RequiredProvider::G01Authority, error)),
+            }
         }
         let mut desired = current;
         desired.status = status;
         self.registration = Some(desired.clone());
         self.registration_reconciled = true;
+        // A terminal close revokes the registration, so it also revokes every
+        // handle and child process the registration owned. Draining does not:
+        // its children are allowed to finish under the drain disposition.
+        let released = if status == RegistrationStatus::Closed {
+            self.release_owned_operations()
+        } else {
+            Ok(())
+        };
         match self.persist() {
-            Ok(()) => Ok(()),
+            Ok(()) => released,
             Err(error) => {
                 // The authoritative fence is already known, but the local
                 // projection is not durably acknowledged.  Keep the fenced
@@ -1270,9 +2088,146 @@ impl UserBroker {
                     },
                     None => false,
                 };
-                if reconciled { Ok(()) } else { Err(error) }
+                if reconciled { released } else { Err(error) }
             }
         }
+    }
+
+    /// Closes every child process this registration still owns, drops the
+    /// introduced user-session resources those children held, and removes
+    /// their durable cursors, so a revoked, fenced, or lease-expired
+    /// registration leaves no live lineage and nothing a restart could
+    /// re-adopt.
+    ///
+    /// A child that cannot be closed is reported as a typed refusal naming the
+    /// exact operation, and its cursor and introduced binding are *retained*:
+    /// reporting a clean close while a child may still run, still holding an
+    /// introduced credential, is exactly the "termination was assumed"
+    /// shortcut the containment matrix forbids.
+    fn release_owned_operations(&mut self) -> Result<(), BrokerError> {
+        let mut retained = Vec::new();
+        for record in self.operations.values() {
+            if record.cursor.state == OperationState::Reconciled {
+                continue;
+            }
+            let outcome = self
+                .process
+                .as_mut()
+                .ok_or(BrokerError::PlanGap(RequiredProvider::P03Process))?
+                .cancel(&record.cursor.operation_id);
+            if outcome.is_err() {
+                retained.push(record.cursor.operation_id.clone());
+            }
+        }
+        if let Some(operation_id) = retained.first() {
+            return Err(BrokerError::OwnedOperationNotClosed(operation_id.clone()));
+        }
+        self.operations.clear();
+        Ok(())
+    }
+
+    /// Reconciles one lost fence/logoff acknowledgement by the exact
+    /// registration identity the fence operation is derived from.
+    ///
+    /// The durable snapshot is the only admitted evidence: when it already
+    /// projects `status` for this exact registration, the authoritative fence
+    /// landed and the caller is told so instead of being invited to fence
+    /// again. Otherwise the effect is unproven and the broker is told to
+    /// re-attach. No second fence is issued from either branch.
+    fn reconcile_lost_fence(
+        &mut self,
+        fenced: &RegistrationReceipt,
+        status: RegistrationStatus,
+    ) -> Result<RegistrationReconciliation, BrokerError> {
+        let durable = self.load_durable_registration()?;
+        let reconciled = durable.as_ref().is_some_and(|durable| {
+            durable.registration_digest == fenced.registration_digest && durable.status == status
+        });
+        if !reconciled {
+            return Ok(RegistrationReconciliation::Unresolved(fenced.clone()));
+        }
+        let adopted =
+            self.adopt_durable_registration(durable.as_ref().ok_or(BrokerError::UnknownOutcome)?)?;
+        self.persist()?;
+        Ok(RegistrationReconciliation::Reconciled(adopted))
+    }
+
+    /// Reconciles one lost lease-refresh acknowledgement by the exact
+    /// registration identity the refresh was requested against.
+    ///
+    /// A lease refresh is proven only when the durable registration advanced
+    /// to a different registration digest under the same exact registration
+    /// tuple: that is the fingerprint of a refresh that landed while its
+    /// acknowledgement was lost. Returning the durable receipt keeps the
+    /// broker on the renewed lease and issues no second refresh identity.
+    fn reconcile_lost_lease_refresh(
+        &mut self,
+        current: &RegistrationReceipt,
+    ) -> Result<RegistrationReconciliation, BrokerError> {
+        let durable = self.load_durable_registration()?;
+        let advanced = durable.as_ref().is_some_and(|durable| {
+            durable.registration_digest != current.registration_digest
+                && durable.status == RegistrationStatus::Active
+                && durable.installation_id == current.installation_id
+                && durable.windows_sid == current.windows_sid
+                && durable.interactive_session_id == current.interactive_session_id
+        });
+        if !advanced {
+            return Ok(RegistrationReconciliation::Unresolved(current.clone()));
+        }
+        let adopted =
+            self.adopt_durable_registration(durable.as_ref().ok_or(BrokerError::UnknownOutcome)?)?;
+        self.persist()?;
+        Ok(RegistrationReconciliation::Reconciled(adopted))
+    }
+
+    /// Reads the durable registration projection without interpreting it.
+    ///
+    /// The durable broker-local epoch only ever moves forward: a snapshot
+    /// written before a crash cannot lower the monotonic guard that
+    /// [`Self::register`] enforces.
+    fn load_durable_registration(&mut self) -> Result<Option<RegistrationReceipt>, BrokerError> {
+        let snapshot = self
+            .durable
+            .as_mut()
+            .ok_or(BrokerError::PlanGap(RequiredProvider::DurableRegistration))?
+            .load()
+            .map_err(|error| map_port(RequiredProvider::DurableRegistration, error))?;
+        let Some(snapshot) = snapshot else {
+            return Ok(None);
+        };
+        self.broker_epoch = self.broker_epoch.max(snapshot.user_broker_epoch);
+        Ok(snapshot.registration)
+    }
+
+    /// Adopts one reconciled durable registration as the in-memory truth.
+    ///
+    /// Only same-lineage evidence is adopted: the exact registration tuple,
+    /// epoch lineage, and fence id must match, so a foreign durable
+    /// registration can never become this broker's authority. A registration
+    /// that does not match this broker's exact identity is an unresolved
+    /// reconciliation, never an adopted one.
+    fn adopt_durable_registration(
+        &mut self,
+        durable: &RegistrationReceipt,
+    ) -> Result<RegistrationReceipt, BrokerError> {
+        let current = self
+            .registration
+            .as_ref()
+            .ok_or(BrokerError::PlanGap(RequiredProvider::G01Authority))?;
+        let same_identity = current.installation_id == durable.installation_id
+            && current.windows_sid == durable.windows_sid
+            && current.interactive_session_id == durable.interactive_session_id
+            && current
+                .authority_epoch
+                .is_same_authority(&durable.authority_epoch)
+            && current.fence_id == durable.fence_id;
+        if !same_identity {
+            return Err(BrokerError::GrantBindingMismatch);
+        }
+        self.registration = Some(durable.clone());
+        self.registration_reconciled = true;
+        Ok(durable.clone())
     }
 
     fn snapshot(&self) -> BrokerSnapshot {
@@ -1284,7 +2239,27 @@ impl UserBroker {
                 .values()
                 .map(|record| record.cursor.clone())
                 .collect(),
+            operation_identities: self.projected_operation_identities(),
+            retired_operations: self.retired_operations.values().cloned().collect(),
         }
+    }
+
+    /// Projects the durable identity ledger: everything recovered from the
+    /// restart snapshot plus everything the composed issuer has issued since.
+    ///
+    /// A `request_id` can only appear in both halves when the live issuer
+    /// resolved an exact retry of that same operation, and an exact retry
+    /// carries byte-identical transport fields, so the live row is the same
+    /// row. The recovered row is still kept when the composed ledger does not
+    /// carry it, so attaching no ledger never erases durable history.
+    fn projected_operation_identities(&self) -> Vec<IssuedOperationIdentity> {
+        let mut projected = self.issued_operations.clone();
+        if let Some(ledger) = self.identity_ledger.as_ref() {
+            for identity in ledger.issued_operation_identities() {
+                projected.insert(identity.request_id.clone(), identity);
+            }
+        }
+        projected.into_values().collect()
     }
 
     fn persist(&mut self) -> Result<(), BrokerError> {
@@ -1342,6 +2317,21 @@ fn seal_registration(
         expires_at: grant.expires_at,
         status: RegistrationStatus::Active,
     })
+}
+
+/// Projects one sealed registration into its public lease-renewal receipt.
+///
+/// A reconciled lease refresh and an acknowledged one produce the same
+/// receipt from the same registration, so a lost acknowledgement that is
+/// proven by the durable projection is indistinguishable from success and
+/// cannot be used to claim a renewal that never happened.
+fn heartbeat_receipt(registration: &RegistrationReceipt) -> HeartbeatReceipt {
+    HeartbeatReceipt {
+        registration_digest: registration.registration_digest.clone(),
+        user_broker_epoch: registration.user_broker_epoch,
+        fence_id: registration.fence_id.clone(),
+        expires_at: registration.expires_at,
+    }
 }
 
 fn fence_operation_id(
@@ -1431,6 +2421,10 @@ fn validate_launch_grant(
         || grant.proof_ceiling != ProofCeiling::Observation
         || grant.expires_at <= request.observed_at
         || grant.expires_at > request.lease_expires_at
+        // A grant may never outlive the introduction it carries: an
+        // authorization that stays valid after its own user-session
+        // resource/credential lease has ended is a silent widening.
+        || grant.expires_at > grant.approved.introduction.expires_at
     {
         return Err(BrokerError::GrantBindingMismatch);
     }
@@ -1486,8 +2480,48 @@ fn cursor_from_grant(
         generation: grant.approved.generation,
         process_fence_nonce: grant.approved.process_fence_nonce.clone(),
         process_request_digest: process_request_digest.to_owned(),
+        // The introduced user-session resource/credential is retained with
+        // the operation so revocation and restart reconciliation name the
+        // exact thing that was introduced, instead of only the child id.
+        introduction: Some(grant.approved.introduction.clone()),
         state,
     }
+}
+
+/// Builds the in-memory index of operations already fenced by a newer broker
+/// generation, validating every tombstone before any index is touched.
+///
+/// A tombstone is a refusal marker, not a permit, so a malformed or
+/// duplicated one is a corrupt durable file and is rejected before it can
+/// partially bind an operation id.
+fn retired_index(
+    rows: Vec<RetiredOperationIdentity>,
+) -> Result<BTreeMap<String, RetiredOperationIdentity>, BrokerError> {
+    let mut retired_operations = BTreeMap::new();
+    for retired in rows {
+        text(
+            retired.operation_id.as_str(),
+            "retired_operation.operation_id",
+        )?;
+        text(&retired.request_digest, "retired_operation.request_digest")?;
+        text(
+            &retired.registration_digest,
+            "retired_operation.registration_digest",
+        )?;
+        if retired.user_broker_epoch == 0 {
+            return Err(BrokerError::InvalidField("retired_operation"));
+        }
+        if let Some(introduction) = &retired.introduction {
+            introduction.validate()?;
+        }
+        if retired_operations
+            .insert(retired.operation_id.as_str().to_owned(), retired)
+            .is_some()
+        {
+            return Err(BrokerError::Duplicate("retired_operation.operation_id"));
+        }
+    }
+    Ok(retired_operations)
 }
 
 fn permit_from_cursor(cursor: &OperationCursor) -> OperationPermit {
@@ -1553,6 +2587,32 @@ pub enum BrokerError {
     StaleEpoch,
     #[error("registration or launch grant binding mismatch")]
     GrantBindingMismatch,
+    #[error("broker admission identity is not composed")]
+    RegistrationNotAdmitted,
+    #[error("registration identity is not this broker's own tuple")]
+    StaleRegistrationIdentity,
+    #[error("credential or secret material is disclosed in {0}")]
+    CredentialMaterialDisclosed(&'static str),
+    #[error("the grant introduces no {0} for this launch")]
+    IntroductionRequired(&'static str),
+    #[error("the launch's tool is not in the introduced operation set")]
+    IntroductionOperationNotGranted,
+    #[error("the launch's resource root is not in the introduced resource set")]
+    IntroductionResourceNotGranted,
+    #[error("the launch's effect ceiling exceeds the introduced ceiling")]
+    IntroductionEffectCeilingExceeded,
+    #[error("the introduced resource or credential lease is not active")]
+    IntroductionExpired,
+    #[error("the launch's credential is not the one its introduction names")]
+    IntroductionCredentialUnnamed,
+    #[error("operation {} has an unreconciled outcome and must be reconciled before cancellation", .0.as_str())]
+    UnreconciledEffect(OperationId),
+    #[error("operation {} was already spent under a fenced broker generation and cannot be replayed", .0.as_str())]
+    RetiredOperation(OperationId),
+    #[error("operation id {} was already spent under a fenced broker generation and cannot be reused", .0.as_str())]
+    OperationIdRetired(OperationId),
+    #[error("owned operation {} was not closed", .0.as_str())]
+    OwnedOperationNotClosed(OperationId),
     #[error("process contract binding mismatch")]
     ProcessBindingMismatch,
     #[error("process lineage evidence mismatch")]
@@ -2283,6 +3343,20 @@ mod tests {
             credential_handle: Some(
                 SecretRef::new("credential-provider", "handle-1").expect("secret ref"),
             ),
+            introduction: ResourceIntroduction {
+                resource_ref: "resource-ref-1".to_owned(),
+                facet_manifest_ref: "facet-manifest-1".to_owned(),
+                introduced_operation_set: vec!["tool-1".to_owned()],
+                introduced_resource_set: vec!["C:\\Eliot".to_owned()],
+                max_effect: EffectCeiling::NoExternalEffect,
+                issued_at: 10,
+                expires_at: 19,
+                max_calls: 1,
+                credential_binding: Some(CredentialBinding {
+                    handle: SecretRef::new("credential-provider", "handle-1").expect("secret ref"),
+                    expires_at: 19,
+                }),
+            },
             dependency_closure: vec!["dep-1".to_owned()],
             idempotency_key: "idem-1".to_owned(),
             generation: Generation::new(1).expect("generation"),
@@ -2419,6 +3493,8 @@ mod tests {
             registration: first.registration.clone(),
             user_broker_epoch: first.broker_epoch,
             operation_cursors: Vec::new(),
+            operation_identities: Vec::new(),
+            retired_operations: Vec::new(),
         };
         let registration_digest = snapshot
             .registration
@@ -2609,6 +3685,8 @@ mod tests {
                 registration: None,
                 user_broker_epoch: 0,
                 operation_cursors: Vec::new(),
+                operation_identities: Vec::new(),
+                retired_operations: Vec::new(),
             })
             .expect("seed");
         let mut restarted = UserBroker::new(
@@ -2769,6 +3847,8 @@ mod tests {
                 .values()
                 .map(|record| record.cursor.clone())
                 .collect(),
+            operation_identities: broker.projected_operation_identities(),
+            retired_operations: broker.retired_operations.values().cloned().collect(),
         };
         let expected_cursor = snapshot.operation_cursors.first().expect("cursor").clone();
         assert_eq!(expected_cursor.operation_id, receipt.operation_id);

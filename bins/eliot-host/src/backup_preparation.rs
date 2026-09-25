@@ -18,14 +18,16 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::backup_config_projection::{ApprovedBuildBinding, ProjectionError, bind_approved_build};
+use crate::backup_config_projection::{
+    ApprovedBuildBinding, ProjectionError, bind_approved_build, hash_field,
+};
 use eliot_installation::{
     ActivationCommitFence, ApprovedGeneration, ApprovedGenerationRegistry,
     RedbInstallationRegistry, RuntimeStateRoots,
 };
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
-    FileIdentity, HostOwnerLease, ProtectedRootLease, windows_paths_equal,
+    FileIdentity, HostOwnerLease, ProtectedPathError, ProtectedRootLease, windows_paths_equal,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -95,6 +97,20 @@ pub enum PreparationError {
 pub enum PreparationClass {
     /// Isolated restore rehearsal destination (fenced, no effects).
     IsolatedRestoreRehearsal,
+}
+
+impl PreparationClass {
+    /// Canonical class token bound into the admission digest.
+    ///
+    /// The admission digest must discriminate the class, so the token is a
+    /// closed `&'static str` rather than a `Debug` rendering: adding a variant
+    /// forces a decision here instead of silently changing the digest input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IsolatedRestoreRehearsal => "isolated_restore_rehearsal",
+        }
+    }
 }
 
 /// Destination admission: explicit, fully-bound request (issue #958, cases 958/5-7, 958/9).
@@ -281,25 +297,92 @@ pub fn derive_destination_epoch(operation_id: &str, authority_nonce: &str) -> u6
     u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap_or([0; 8])).max(1)
 }
 
+/// Hashes a path through its lossless platform byte encoding.
+///
+/// `Path::to_string_lossy` maps unpaired surrogates to U+FFFD, so two distinct
+/// roots can share one digest. The admission digest exists to discriminate the
+/// admitted inputs (I5.27), so the raw OS bytes are hashed instead and a
+/// substituted root can never reuse a recorded digest.
+#[cfg(windows)]
+fn hash_path(hasher: &mut Sha256, label: &[u8], path: &Path) {
+    use std::os::windows::ffi::OsStrExt as _;
+    let units: Vec<u8> = path
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    hash_field(hasher, label, &units);
+}
+
+#[cfg(not(windows))]
+fn hash_path(hasher: &mut Sha256, label: &[u8], path: &Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+    hash_field(hasher, label, path.as_os_str().as_bytes());
+}
+
 /// Admission digest binding every admitted input (idempotency key).
+///
+/// v1 left `class`, `source_root` and `authority_generation` out of the hashed
+/// set while `conflict_field` did compare `class`. The two lists disagreed, and
+/// the disagreement was exploitable rather than cosmetic: `prepare_isolated_destination`
+/// compares the recorded digest first and returns the recorded destination
+/// without re-running [`admit_staging_parent`] when it matches, so re-presenting
+/// a recorded `operation_id` with a different `class` or a different
+/// `source_root` — including the live source installation root — hashed
+/// identically, took the "same inputs" branch, and returned `Ok` with no
+/// conflict, no naming, and no re-admission. I5.27: a field affecting authority
+/// or scope cannot be omitted silently, and reusing an idempotency key with a
+/// different canonical request hash must conflict.
+///
+/// v2 hashes every field of [`DestinationAdmission`], length-prefixed and
+/// domain-separated, with paths encoded losslessly.
 fn admission_digest(admission: &DestinationAdmission) -> String {
-    sha_hex(&[
-        b"eliot.backup.destination-admission.v1\0",
+    let mut hasher = Sha256::new();
+    hasher.update(b"eliot.backup.destination-admission.v2\0");
+    hasher.update(PREPARATION_VERSION.to_le_bytes());
+    hash_field(
+        &mut hasher,
+        b"operation_id",
         admission.operation_id.as_bytes(),
-        b"\0",
+    );
+    hash_field(&mut hasher, b"class", admission.class.as_str().as_bytes());
+    hash_field(
+        &mut hasher,
+        b"source_installation_id",
         admission.source_installation_id.as_bytes(),
-        b"\0",
-        admission.staging_parent.to_string_lossy().as_bytes(),
-        b"\0",
+    );
+    hash_path(&mut hasher, b"source_root", &admission.source_root);
+    hash_path(&mut hasher, b"staging_parent", &admission.staging_parent);
+    hash_field(
+        &mut hasher,
+        b"target_build",
         admission.target_build.as_bytes(),
-        b"\0",
+    );
+    hash_field(
+        &mut hasher,
+        b"target_profile",
         admission.target_profile.as_bytes(),
-        b"\0",
-        &admission.approved_generation.to_le_bytes(),
+    );
+    hasher.update(b"approved_generation\0");
+    hasher.update(admission.approved_generation.to_le_bytes());
+    hasher.update(b"authority_generation\0");
+    hasher.update(admission.authority_generation.to_le_bytes());
+    hash_field(
+        &mut hasher,
+        b"manifest_digest",
         admission.manifest_digest.as_bytes(),
+    );
+    hash_field(
+        &mut hasher,
+        b"authority_nonce",
         admission.authority_nonce.as_bytes(),
+    );
+    hash_field(
+        &mut hasher,
+        b"state_fence_digest",
         admission.state_fence_digest.as_bytes(),
-    ])
+    );
+    format!("{:x}", hasher.finalize())
 }
 
 /// Reparse-point attribute test (case 958/8): the exact bit the OS check enforces.
@@ -351,7 +434,7 @@ fn reject_reparse(_path: &Path) -> Result<(), PreparationError> {
 fn capture_identity(path: &Path) -> Result<RootIdentity, PreparationError> {
     eliot_platform_windows::directory_identity_for_path(path)
         .map(|identity| RootIdentity {
-            identity: format!("{}:{}", identity.volume_serial_number, identity.file_index),
+            identity: file_identity_text(identity),
         })
         .map_err(|error| PreparationError::FilesystemEffect {
             path: path.to_string_lossy().into_owned(),
@@ -362,6 +445,101 @@ fn capture_identity(path: &Path) -> Result<RootIdentity, PreparationError> {
 #[cfg(not(windows))]
 fn capture_identity(_path: &Path) -> Result<RootIdentity, PreparationError> {
     Err(PreparationError::PlatformUnsupported)
+}
+
+/// Renders one observed [`FileIdentity`] as the receipt identity text.
+///
+/// One canonical rendering is shared by creation-time capture and by every
+/// later re-verification, so a recorded identity and a freshly observed one
+/// are always compared as the same encoding instead of two independently
+/// maintained formats that can drift into a false conflict.
+fn file_identity_text(identity: FileIdentity) -> String {
+    format!("{}:{}", identity.volume_serial_number, identity.file_index)
+}
+
+/// Maps protected-path owner failures to the typed preparation failure that
+/// fits, following the [`projection_to_preparation`] precedent.
+///
+/// Every owner variant maps to an existing [`PreparationError`]; none is
+/// stringified into a generic code and no variant is invented. Owner internals
+/// are not echoed: each reason is a static sentence naming the refused
+/// property.
+fn protected_path_to_preparation(
+    operation_id: &str,
+    path: &Path,
+    error: ProtectedPathError,
+) -> PreparationError {
+    let refused = path.to_string_lossy().into_owned();
+    match error {
+        ProtectedPathError::InvalidRoot => PreparationError::ArbitraryPath {
+            reason: "protected contour root is not resolvable".to_owned(),
+        },
+        ProtectedPathError::InvalidPath => PreparationError::ArbitraryPath {
+            reason: "recorded path is outside the protected contour".to_owned(),
+        },
+        ProtectedPathError::ReparsePoint => PreparationError::AliasSubstitution { path: refused },
+        ProtectedPathError::AclMismatch => PreparationError::FilesystemEffect {
+            path: refused,
+            reason: "protected root ACL does not match owner policy".to_owned(),
+        },
+        ProtectedPathError::Io => PreparationError::FilesystemEffect {
+            path: refused,
+            reason: "protected root I/O failed".to_owned(),
+        },
+        ProtectedPathError::IdentityMismatch => PreparationError::UnknownState {
+            operation: operation_id.to_owned(),
+            reason: "protected root identity changed under the retained handle".to_owned(),
+        },
+        ProtectedPathError::Win32 { .. } => PreparationError::FilesystemEffect {
+            path: refused,
+            reason: "protected root owner call failed".to_owned(),
+        },
+        ProtectedPathError::SizeExceeded => PreparationError::ArbitraryPath {
+            reason: "protected root exceeded its bounded limit".to_owned(),
+        },
+        ProtectedPathError::UnsupportedPlatform => PreparationError::PlatformUnsupported,
+    }
+}
+
+/// Re-proves one recorded destination through the real protected-root owner.
+///
+/// A recorded receipt is evidence of a past effect, not proof of a live root.
+/// Before a recorded destination is reused ([`reconcile_preparation`]) or
+/// removed ([`cleanup_preparations`]), the recorded root is re-opened through
+/// [`ProtectedRootLease::open_existing`] — the owner that containment-checks
+/// the path and pins the whole directory contour by retained handle — and only
+/// then are the canonical path, the retained-handle alias defence
+/// ([`ProtectedRootLease::verify_stable_identity`]) and the owner-observed
+/// [`FileIdentity`] compared against the recorded values. Any failure is a
+/// typed [`PreparationError`]: the recorded root is no longer an owned
+/// protected object, and the caller preserves it rather than acting on a name.
+fn reverify_recorded_destination(
+    operation_id: &str,
+    destination: &PreparedDestination,
+) -> Result<(), PreparationError> {
+    let recorded = &destination.root;
+    let lease = ProtectedRootLease::open_existing(recorded)
+        .map_err(|error| protected_path_to_preparation(operation_id, recorded, error))?;
+    let canonical = lease
+        .canonical_path()
+        .map_err(|error| protected_path_to_preparation(operation_id, recorded, error))?;
+    if !windows_paths_equal(&canonical, recorded) {
+        return Err(PreparationError::ArbitraryPath {
+            reason: "recorded root differs from the retained protected-root identity".to_owned(),
+        });
+    }
+    lease
+        .verify_stable_identity()
+        .map_err(|error| protected_path_to_preparation(operation_id, recorded, error))?;
+    let observed = file_identity_text(lease.identity());
+    if observed != destination.root_identity.identity {
+        return Err(PreparationError::IdentityConflict {
+            operation: operation_id.to_owned(),
+            recorded: destination.root_identity.identity.clone(),
+            observed,
+        });
+    }
+    Ok(())
 }
 
 /// Validates one admission without effects (cases 958/5-7).
@@ -436,11 +614,17 @@ fn intent_json(admission: &DestinationAdmission, digest: &str, root: &Path) -> s
 
 /// Names the first differing admission field between the recorded intent and
 /// a changed re-presentation (case 958/13).
+///
+/// The compared list mirrors the v2 [`admission_digest`] hashed set exactly.
+/// `source_root` was missing here while being the field that decides which
+/// installation is the live source, so a conflict could never name it.
 fn conflict_field(intent: &serde_json::Value, admission: &DestinationAdmission) -> &'static str {
     let recorded = intent.get("admission");
     let current = serde_json::to_value(admission).unwrap_or(serde_json::Value::Null);
     for field in [
+        "class",
         "source_installation_id",
+        "source_root",
         "staging_parent",
         "target_build",
         "target_profile",
@@ -449,7 +633,6 @@ fn conflict_field(intent: &serde_json::Value, admission: &DestinationAdmission) 
         "manifest_digest",
         "authority_nonce",
         "state_fence_digest",
-        "class",
     ] {
         if recorded.and_then(|value| value.get(field)) != current.get(field) {
             return field;
@@ -581,9 +764,11 @@ pub fn prepare_isolated_destination<J: PreparationJournal>(
 /// Reconciles one operation without duplicating effects (cases 958/12, 958/14).
 ///
 /// Absent (no intent, or intent whose root never materialized) → `Absent` and
-/// retry may proceed. Intent + verifiable result → `Current` (same destination,
-/// no second creation). Anything else → `Uncertain`: preserved as-is, never
-/// deleted, never blindly retried.
+/// retry may proceed. Intent + verifiable result → `Current`, and only after
+/// the recorded root is re-proved through the real protected-root owner
+/// ([`reverify_recorded_destination`]): a receipt alone is not a live root.
+/// Anything else → `Uncertain`: preserved as-is, never deleted, never blindly
+/// retried. Reconciliation never deletes.
 pub fn reconcile_preparation<J: PreparationJournal>(
     journal: &J,
     operation_id: &str,
@@ -615,18 +800,10 @@ pub fn reconcile_preparation<J: PreparationJournal>(
             reason: "result record malformed; preserved for inspection".to_owned(),
         });
     };
-    match capture_identity(&destination.root) {
-        Ok(live) if live == destination.root_identity => {
-            Ok(ReconcileDisposition::Current(destination))
-        }
-        Ok(live) => Ok(ReconcileDisposition::Uncertain {
-            reason: format!(
-                "root identity changed (recorded {} != observed {})",
-                destination.root_identity.identity, live.identity
-            ),
-        }),
-        Err(_) => Ok(ReconcileDisposition::Uncertain {
-            reason: "recorded root no longer observable".to_owned(),
+    match reverify_recorded_destination(operation_id, &destination) {
+        Ok(()) => Ok(ReconcileDisposition::Current(destination)),
+        Err(error) => Ok(ReconcileDisposition::Uncertain {
+            reason: error.to_string(),
         }),
     }
 }
@@ -661,26 +838,41 @@ pub fn cancel_preparation<J: PreparationJournal>(
 
 /// Cleans up owned unactivated destinations (case 958/15).
 ///
-/// Removes ONLY roots whose recorded identity re-verifies against the live
-/// root (proving this lane created and still owns them) and whose journal
-/// shows no launched/effect state. Anything uncertain, foreign, mismatched,
-/// or source-related is preserved with its reason. Never deletes by bare
-/// path name: every removal is keyed by operation id through the journal.
+/// The sweep set comes from the journal's own operation list — the journal
+/// owns its key set — and an explicitly requested id narrows that set instead
+/// of extending it. A requested id the journal does not own is refused into
+/// [`CleanupReport::preserved`]; a caller can never nominate a deletion.
+///
+/// Removal happens only for a reconciled `Current` destination whose recorded
+/// root is re-proved through the real protected-root owner immediately before
+/// the irreversible delete ([`reverify_recorded_destination`], applied again
+/// here so the proof is adjacent to the effect, not merely somewhere earlier
+/// in the reconcile). Anything uncertain, foreign, mismatched, unleased, or
+/// source-related is preserved with its reason. Never deletes by bare path
+/// name: every removal is keyed by operation id through the journal, and
+/// `ARCH-RES-03` (A13.7) holds — recovery preserves what it cannot prove it
+/// owns.
 pub fn cleanup_preparations<J: PreparationJournal>(
     journal: &J,
     operation_ids: &[String],
 ) -> Result<CleanupReport, PreparationError> {
     let mut report = CleanupReport::default();
-    for operation_id in operation_ids {
+    let owned = journal.list_operations()?;
+    for requested in operation_ids {
+        if !owned.contains(requested) {
+            report.preserved.push((
+                requested.clone(),
+                "operation is not owned by this journal; refused, never deleted".to_owned(),
+            ));
+        }
+    }
+    for operation_id in &owned {
+        if !operation_ids.is_empty() && !operation_ids.contains(operation_id) {
+            continue;
+        }
         match reconcile_preparation(journal, operation_id)? {
             ReconcileDisposition::Current(destination) => {
-                match std::fs::remove_dir_all(&destination.root) {
-                    Ok(()) => report.removed.push(operation_id.clone()),
-                    Err(error) => report.preserved.push((
-                        operation_id.clone(),
-                        format!("removal failed, preserved: {error}"),
-                    )),
-                }
+                remove_reverified_destination(operation_id, &destination, &mut report);
             }
             ReconcileDisposition::Absent => {
                 report
@@ -693,6 +885,32 @@ pub fn cleanup_preparations<J: PreparationJournal>(
         }
     }
     Ok(report)
+}
+
+/// Removes one re-proven owned root, or preserves it with the reason.
+///
+/// The protected-root proof is repeated here, immediately before the
+/// irreversible effect: [`reconcile_preparation`] proves the recorded root at
+/// reconcile time, and this is the last chance to notice that the object at
+/// that path is no longer the one this lane created.
+fn remove_reverified_destination(
+    operation_id: &str,
+    destination: &PreparedDestination,
+    report: &mut CleanupReport,
+) {
+    if let Err(error) = reverify_recorded_destination(operation_id, destination) {
+        report
+            .preserved
+            .push((operation_id.to_owned(), error.to_string()));
+        return;
+    }
+    match std::fs::remove_dir_all(&destination.root) {
+        Ok(()) => report.removed.push(operation_id.to_owned()),
+        Err(error) => report.preserved.push((
+            operation_id.to_owned(),
+            format!("removal failed, preserved: {error}"),
+        )),
+    }
 }
 
 /// Resolves the source installation root from manifest-bound owner runtime
@@ -840,6 +1058,9 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
     }
 
     /// Cleans up owned unactivated destinations, preserving unknowns.
+    ///
+    /// The swept set is this sink's own journal operation list; a presented id
+    /// narrows that set and is refused when the journal does not own it.
     pub fn cleanup(&self, operation_ids: &[String]) -> Result<CleanupReport, PreparationError> {
         cleanup_preparations(&self.journal, operation_ids)
     }

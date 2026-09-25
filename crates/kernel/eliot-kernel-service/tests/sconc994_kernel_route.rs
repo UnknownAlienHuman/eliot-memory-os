@@ -688,10 +688,17 @@ async fn route(tag: &str) -> Route {
     let fixture =
         KernelRouteStoreFixture::open(&format!("994-kr-{tag}")).expect("994-kr fixture opens");
     let service = Arc::new(Mutex::new(ready_service()));
+    // The route carries the live service's complete epoch tuple; a
+    // sequence-only route could no longer be proven current (Implements #64).
+    let route_epoch = service
+        .lock()
+        .expect("994-kr route service")
+        .authority_epoch()
+        .clone();
     let generation_route = GenerationRoute::new(
         RouteScope::new("store_bridge").expect("994-kr scope"),
         ResourceGeneration::genesis(),
-        AuthorityEpoch::new(1).expect("994-kr route epoch"),
+        route_epoch,
     )
     .expect("994-kr route");
     let client = Arc::new(client);

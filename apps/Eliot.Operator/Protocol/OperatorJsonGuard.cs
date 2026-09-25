@@ -32,7 +32,7 @@ public static class OperatorJsonGuard
         int maxDepth,
         int maxTokens,
         string shapeName) =>
-        ValidateCore(rawJson, allowedProperties, maxMembers, maxStringChars, maxDepth, maxTokens, shapeName);
+        ValidateCore(rawJson, allowedProperties, maxMembers, maxStringChars, maxDepth, maxTokens, maxTokens, shapeName);
 
     /// Validates framing only for a server-owned line (handshake, tool
     /// response): caps plus duplicate-key rejection at every object level,
@@ -45,7 +45,22 @@ public static class OperatorJsonGuard
         int maxDepth,
         int maxTokens,
         string shapeName) =>
-        ValidateCore(rawJson, null, maxMembers, maxStringChars, maxDepth, maxTokens, shapeName);
+        ValidateCore(rawJson, null, maxMembers, maxStringChars, maxDepth, maxTokens, maxTokens, shapeName);
+
+    /// Validates one full owner response line. In addition to the framing
+    /// caps this bounds total array items and long string/number values, so a
+    /// single oversized container or literal is refused on its own axis before
+    /// the decoded object is allocated. Duplicate property names are refused
+    /// at every object level.
+    public static void ValidateFramedResponse(
+        string rawJson,
+        int maxMembers,
+        int maxStringChars,
+        int maxDepth,
+        int maxTokens,
+        int maxArrayItems,
+        string shapeName) =>
+        ValidateCore(rawJson, null, maxMembers, maxStringChars, maxDepth, maxTokens, maxArrayItems, shapeName);
 
     private static void ValidateCore(
         string rawJson,
@@ -54,6 +69,7 @@ public static class OperatorJsonGuard
         int maxStringChars,
         int maxDepth,
         int maxTokens,
+        int maxArrayItems,
         string shapeName)
     {
         if (string.IsNullOrEmpty(rawJson))
@@ -67,8 +83,13 @@ public static class OperatorJsonGuard
             CommentHandling = JsonCommentHandling.Disallow,
             MaxDepth = maxDepth
         });
-        var objectDepths = new Stack<HashSet<string>>(maxDepth + 1);
+        // `containers` tracks the open container kind at every level so an
+        // array element is counted for scalars and nested containers alike;
+        // `objectKeys` carries the per-object duplicate-key set.
+        var containers = new Stack<bool>(maxDepth + 1);
+        var objectKeys = new Stack<HashSet<string>>(maxDepth + 1);
         var memberCount = 0;
+        var itemCount = 0;
         var tokenCount = 0;
         var sawRootObject = false;
         var rootClosed = false;
@@ -86,22 +107,36 @@ public static class OperatorJsonGuard
             switch (reader.TokenType)
             {
                 case JsonTokenType.StartObject:
-                    if (reader.CurrentDepth == 0)
+                    CountArrayElement();
+                    if (containers.Count == 0)
                     {
                         sawRootObject = true;
                     }
-                    objectDepths.Push(new HashSet<string>(StringComparer.Ordinal));
+                    containers.Push(false);
+                    objectKeys.Push(new HashSet<string>(StringComparer.Ordinal));
                     break;
                 case JsonTokenType.EndObject:
-                    if (objectDepths.Count == 0)
+                    if (containers.Count == 0 || containers.Peek() || objectKeys.Count == 0)
                     {
                         throw new OperatorProtocolException(shapeName, "shape");
                     }
-                    objectDepths.Pop();
-                    if (objectDepths.Count == 0)
+                    containers.Pop();
+                    objectKeys.Pop();
+                    if (containers.Count == 0)
                     {
                         rootClosed = true;
                     }
+                    break;
+                case JsonTokenType.StartArray:
+                    CountArrayElement();
+                    containers.Push(true);
+                    break;
+                case JsonTokenType.EndArray:
+                    if (containers.Count == 0 || !containers.Peek())
+                    {
+                        throw new OperatorProtocolException(shapeName, "shape");
+                    }
+                    containers.Pop();
                     break;
                 case JsonTokenType.PropertyName:
                     var name = reader.GetString() ?? string.Empty;
@@ -109,8 +144,8 @@ public static class OperatorJsonGuard
                     {
                         throw new OperatorProtocolException(shapeName, "name_cap");
                     }
-                    if (objectDepths.Count == 0
-                        || !objectDepths.Peek().Add(name))
+                    if (objectKeys.Count == 0
+                        || !objectKeys.Peek().Add(name))
                     {
                         throw new OperatorProtocolException(shapeName, $"duplicate:{name}");
                     }
@@ -119,28 +154,50 @@ public static class OperatorJsonGuard
                     {
                         throw new OperatorProtocolException(shapeName, "member_cap");
                     }
-                    if (objectDepths.Count == 1 && allowedProperties is not null && !allowedProperties.Contains(name))
+                    if (containers.Count == 1 && !containers.Peek()
+                        && allowedProperties is not null
+                        && !allowedProperties.Contains(name))
                     {
                         throw new OperatorProtocolException(shapeName, $"unknown:{name}");
                     }
                     break;
                 case JsonTokenType.String:
+                    CountArrayElement();
                     if (reader.ValueSpan.Length > maxStringChars)
                     {
                         throw new OperatorProtocolException(shapeName, "string_cap");
                     }
                     break;
                 case JsonTokenType.Number:
+                    CountArrayElement();
                     if (reader.ValueSpan.Length > maxStringChars)
                     {
                         throw new OperatorProtocolException(shapeName, "string_cap");
                     }
+                    break;
+                case JsonTokenType.True:
+                case JsonTokenType.False:
+                case JsonTokenType.Null:
+                    CountArrayElement();
                     break;
             }
         }
         if (!sawRootObject || !rootClosed)
         {
             throw new OperatorProtocolException(shapeName, "shape");
+        }
+
+        void CountArrayElement()
+        {
+            if (containers.Count == 0 || !containers.Peek())
+            {
+                return;
+            }
+            itemCount++;
+            if (itemCount > maxArrayItems)
+            {
+                throw new OperatorProtocolException(shapeName, "array_item_cap");
+            }
         }
     }
 }

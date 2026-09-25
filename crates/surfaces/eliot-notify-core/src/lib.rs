@@ -22,9 +22,12 @@ use std::fmt::Write as _;
 
 use eliot_contracts::{RequestMetadata, StateFence};
 pub use eliot_kernel_core::NotificationSeverity;
+/// Re-exported so an authorized acknowledgement/disposition producer can
+/// present the protected, evidence-bound resolution authorization on the
+/// production entry without re-declaring the shared model type.
+pub use eliot_kernel_core::ResolutionAuthorization;
 use eliot_kernel_core::{
     DeliveryChannel, DeliveryState, Notification, NotificationDraft, NotificationError,
-    ResolutionAuthorization,
 };
 use eliot_platform::{
     NotificationObservation, NotificationPort, NotificationRequest, PlatformHandle, PortError,
@@ -674,6 +677,12 @@ pub const NOTIFICATION_STATE_READ_OPERATION: &str = "GetNotificationState";
 /// canonical store transition admitted behind that route.
 pub const NOTIFICATION_STATE_RECEIPT_OPERATION: &str = "store.apply.notification_state";
 
+/// Page bound for the post-adapter canonical obligation read-back.
+///
+/// One hundred and twenty-eight is the store contract's own maximum page, so
+/// the read is a single bounded authenticated page and never a scan.
+pub const NOTIFICATION_OBLIGATION_PAGE_LIMIT: u16 = 128;
+
 /// The canonical state mutation sent through the existing Kernel/store owner.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind")]
@@ -854,6 +863,27 @@ impl NotificationStateReadRequest {
         }
         self.validate()
     }
+}
+
+/// Canonical notification obligation read back from the authenticated owner.
+///
+/// I11.6 requires the obligation to survive adapter loss ("Notification
+/// adapter loss degrades delivery only") and I11.7 requires the critical
+/// unresolved item to remain on the board. This projection is the read-back
+/// evidence for both: it is produced by the canonical owner, never by the
+/// adapter, and it reports the owner's own unresolved flag rather than
+/// asserting one.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalObligation {
+    /// Canonical identity of the retained record.
+    pub notification_id: String,
+    /// Owner severity of the retained record.
+    pub severity: NotificationSeverity,
+    /// The owner's own unresolved flag after the adapter outcome.
+    pub unresolved: bool,
+    /// The owner's own latest canonical delivery state.
+    pub delivery: DeliveryState,
 }
 
 /// Canonical inbox metrics returned by A1780's `GetNotificationState` read.
@@ -1391,6 +1421,71 @@ where
         Ok(response)
     }
 
+    /// Reads one notification's canonical obligation back from the
+    /// authenticated owner after an adapter outcome.
+    ///
+    /// The read is scoped to the record's canonical `affected_scope` and asks
+    /// for resolved records too, so a record that some other contour resolved
+    /// is *visible* here and reported honestly instead of silently missing
+    /// from the page. Exactly one record with the requested identity must be
+    /// present; zero or several fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed `PLAN_GAP` when the canonical notification state port is
+    /// missing, `RequestEnvelopeMismatch` when the read is not the same fence as
+    /// the parent request, `CanonicalStateInvalid` when the owner response or
+    /// the targeted record is unusable, and the provider error when the owner
+    /// itself is unavailable.
+    pub fn canonical_obligation(
+        &mut self,
+        notification_id: &PlatformHandle,
+        affected_scope: &str,
+        request: &NotificationRequest,
+    ) -> Result<CanonicalObligation, NotifyError> {
+        let read_request = NotificationStateReadRequest {
+            context: request.context.clone(),
+            state_fence: request.context.state_fence.clone(),
+            scope: Some(affected_scope.to_owned()),
+            include_resolved: true,
+            page_limit: NOTIFICATION_OBLIGATION_PAGE_LIMIT,
+            cursor: None,
+        };
+        read_request.validate_for_parent(request)?;
+        let state = self
+            .ports
+            .notification_state
+            .as_mut()
+            .ok_or(NotifyError::PlanGap {
+                provider: ProviderId::CanonicalNotificationState,
+                reason: "canonical notification state port is missing",
+            })?;
+        let response = require_known(
+            state.read(request, &read_request),
+            ProviderId::CanonicalNotificationState,
+        )?;
+        response.validate_for_request(&read_request)?;
+        let mut found: Option<&Notification> = None;
+        for record in &response.records {
+            if &record.notification_id != notification_id {
+                continue;
+            }
+            if found.is_some() {
+                // Two same-fence records with one canonical identity is not a
+                // projection; refusing beats choosing one.
+                return Err(NotifyError::CanonicalStateInvalid);
+            }
+            found = Some(record);
+        }
+        let record = found.ok_or(NotifyError::CanonicalStateInvalid)?;
+        Ok(CanonicalObligation {
+            notification_id: record.notification_id.as_str().to_owned(),
+            severity: record.severity,
+            unresolved: record.is_unresolved(),
+            delivery: record.delivery.clone(),
+        })
+    }
+
     /// Delivers only the minimal signed Watchdog fallback content.
     ///
     /// # Errors
@@ -1460,22 +1555,31 @@ where
         )
     }
 
-    fn persist_canonical_upsert(
+    /// Applies one canonical notification lifecycle leg through the
+    /// authenticated canonical-state port and returns the owner's exact
+    /// post-commit record and receipt.
+    ///
+    /// This is the single validated entry for all four I11.5/I11.7 legs — the
+    /// create/coalesce leg before a delivery attempt, the delivery leg after
+    /// it, the operator acknowledgement, and the evidence-backed authorized
+    /// disposition. The surface validates the typed request against the parent
+    /// route, hands it to the authenticated owner, and re-validates the owner's
+    /// response against the same request; it never fabricates a record, a
+    /// receipt, or a success. An acknowledgement therefore travels the same
+    /// path as a delivery and still cannot resolve its record, and a
+    /// disposition is admitted only with a protected, evidence-bound authority
+    /// receipt the surface cannot mint.
+    pub fn apply_notification_state(
         &mut self,
-        draft: &NotificationDraft,
-        source_receipt: &ReceiptEnvelope,
-        request: &NotificationRequest,
+        parent: &NotificationRequest,
+        mutation: NotificationStateMutation,
     ) -> Result<NotificationStateResponse, NotifyError> {
-        let mutation = NotificationStateMutation::Upsert {
-            record: draft.clone(),
-            source_receipt: source_receipt.clone(),
-        };
         let state_request = NotificationStateRequest {
-            context: request.context.clone(),
-            state_fence: request.context.state_fence.clone(),
+            context: parent.context.clone(),
+            state_fence: parent.context.state_fence.clone(),
             mutation,
         };
-        state_request.validate_for_parent(request)?;
+        state_request.validate_for_parent(parent)?;
         let state = self
             .ports
             .notification_state
@@ -1485,11 +1589,26 @@ where
                 reason: "canonical notification state port is missing",
             })?;
         let response = require_known(
-            state.mutate(request, &state_request),
+            state.mutate(parent, &state_request),
             ProviderId::CanonicalNotificationState,
         )?;
         validate_state_response(&state_request, &response)?;
         Ok(response)
+    }
+
+    fn persist_canonical_upsert(
+        &mut self,
+        draft: &NotificationDraft,
+        source_receipt: &ReceiptEnvelope,
+        request: &NotificationRequest,
+    ) -> Result<NotificationStateResponse, NotifyError> {
+        self.apply_notification_state(
+            request,
+            NotificationStateMutation::Upsert {
+                record: draft.clone(),
+                source_receipt: source_receipt.clone(),
+            },
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1798,29 +1917,9 @@ where
             },
             delivery: state,
         };
-        let state_request = NotificationStateRequest {
-            context: request.context.clone(),
-            state_fence: request.context.state_fence.clone(),
-            mutation,
-        };
-        let result = (|| {
-            state_request.validate_for_parent(request)?;
-            let state_port =
-                self.ports
-                    .notification_state
-                    .as_mut()
-                    .ok_or(NotifyError::PlanGap {
-                        provider: ProviderId::CanonicalNotificationState,
-                        reason: "canonical notification state port is missing",
-                    })?;
-            let response = require_known(
-                state_port.mutate(request, &state_request),
-                ProviderId::CanonicalNotificationState,
-            )?;
-            validate_state_response(&state_request, &response)
-        })();
+        let result = self.apply_notification_state(request, mutation);
         match result {
-            Ok(()) => Ok(()),
+            Ok(_) => Ok(()),
             Err(_error) => match observation {
                 Some(observation) => Err(NotifyError::CanonicalStateCommitUncertain(Box::new(
                     observation.clone(),
@@ -1948,6 +2047,18 @@ fn validate_state_response(
             if response.record.delivery != *delivery
                 || !response.record.delivery_channels.contains(channel)
             {
+                return Err(NotifyError::CanonicalStateInvalid);
+            }
+            // I11.5: "Delivery and resolution are separate." I11.6: "Loss of
+            // notification delivery never resolves the underlying
+            // Problem/Critical Attention" and "Notification adapter loss
+            // degrades delivery only." This is the only canonical write on the
+            // adapter-outcome path, so the item is proved still on the board
+            // here for EVERY adapter outcome -- `Known`, `Partial`, `Unknown`,
+            // and provider error alike. A delivery write that left the record
+            // resolved would be the forbidden resolution, so it fails closed
+            // instead of being reported as preserved.
+            if !response.record.is_unresolved() {
                 return Err(NotifyError::CanonicalStateInvalid);
             }
         }

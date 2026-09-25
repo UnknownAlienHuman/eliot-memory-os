@@ -103,6 +103,10 @@ pub struct InstrumentBinding {
     operation_id: OperationId,
     request_digest: String,
     generation: u64,
+    /// Machine-derived observation pinned by
+    /// [`InstrumentBinding::verify_executable`], sealed into the launch
+    /// receipt by [`InstrumentRunner::launch`].
+    verified_executable: Option<ResolvedExecutableIdentity>,
 }
 
 impl InstrumentBinding {
@@ -131,6 +135,7 @@ impl InstrumentBinding {
             request_digest: process_request.invocation_digest().to_owned(),
             generation: process_request.generation().get(),
             process_request: Some(process_request),
+            verified_executable: None,
         })
     }
 
@@ -158,6 +163,7 @@ impl InstrumentBinding {
             request_digest: process_request.invocation_digest().to_owned(),
             generation: process_request.generation().get(),
             process_request: Some(process_request),
+            verified_executable: None,
         })
     }
 
@@ -170,19 +176,23 @@ impl InstrumentBinding {
     /// `entry` before launch.
     ///
     /// The entry must claim the binding invocation, the observation must be
-    /// complete and name the registry-bound executable, and the observed argv
-    /// must equal the sealed process-request argv (argv to argv: the admitted
+    /// complete and name the registry-bound executable, the observed content
+    /// digest must equal the sealed intent digest, and the observed argv must
+    /// equal the sealed process-request argv (argv to argv: the admitted
     /// invocation arguments are instrument-level filters, never argv). A
     /// missing, incomplete, or mismatched identity fails closed so the later
-    /// result can never take authoritative PASS.
+    /// result can never take authoritative PASS. On success the observation
+    /// is retained and sealed into the launch receipt by
+    /// [`InstrumentRunner::launch`], so a later executable replacement
+    /// cannot be silently rebound to this launch.
     ///
     /// # Errors
     ///
     /// Returns [`RunnerError::EntryMismatch`], [`RunnerError::UnresolvedExecutable`],
     /// [`RunnerError::ExecutableMismatch`], or [`RunnerError::ReceiptMismatch`]
-    /// when the binding is already consumed and the sealed argv is gone.
+    /// when the binding is already consumed and the sealed request is gone.
     pub fn verify_executable(
-        &self,
+        &mut self,
         entry: &RegistryEntry,
         resolved: Option<&ResolvedExecutableIdentity>,
     ) -> Result<(), RunnerError> {
@@ -196,7 +206,13 @@ impl InstrumentBinding {
                     "observed argv does not match the sealed process request".to_owned(),
                 ));
             }
+            if observation.content_digest != request.executable_sha256() {
+                return Err(RunnerError::ExecutableMismatch(
+                    "observed content digest does not match the sealed process intent".to_owned(),
+                ));
+            }
         }
+        self.verified_executable = resolved.cloned();
         Ok(())
     }
 }
@@ -240,12 +256,23 @@ fn check_governed_binding(
 }
 
 /// Receipt returned after the physical executor accepts an instrument.
+///
+/// The launch seals the executable observation pinned by
+/// [`InstrumentBinding::verify_executable`] together with the exact argv
+/// from the consumed request. A receipt launched without verification
+/// carries no observation; a governed result built from it through
+/// [`GovernedInstrumentResult::from_launch`] can then never take
+/// authoritative PASS for a process entry.
 #[derive(Debug)]
 pub struct InstrumentStartReceipt {
     /// Original provider-neutral invocation.
     pub invocation: InstrumentInvocation,
     /// P-03 acceptance receipt.
     pub process: ProcessStartReceipt,
+    /// Executable observation pinned before launch, if verified.
+    pub executable: Option<ResolvedExecutableIdentity>,
+    /// Exact process argv sealed from the request at launch.
+    pub argv: Vec<String>,
 }
 
 /// Current process observation correlated to its instrument invocation.
@@ -297,7 +324,41 @@ pub struct GovernedInstrumentResult {
 }
 
 impl GovernedInstrumentResult {
+    /// Records one governed result from a launch-sealed receipt.
+    ///
+    /// The invocation, executable observation, and argv come from the
+    /// receipt sealed at launch, never from fresh caller values, so the
+    /// authoritative verdict in
+    /// [`GovernedInstrumentResult::require_authoritative_pass`] binds to
+    /// the exact identity pinned before launch. A replaced executable
+    /// yields a different
+    /// [`ResolvedExecutableIdentity::identity_digest`], and a receipt
+    /// launched without verification carries no observation, which keeps
+    /// the result non-authoritative for every process entry.
+    pub fn from_launch(
+        receipt: &InstrumentStartReceipt,
+        adapter: String,
+        registry_generation: u64,
+        raw: RawEvidence,
+        execution: ExecutionStatus,
+    ) -> Self {
+        Self {
+            invocation: receipt.invocation.clone(),
+            adapter,
+            registry_generation,
+            executable: receipt.executable.clone(),
+            argv: receipt.argv.clone(),
+            raw,
+            execution,
+        }
+    }
+
     /// Records one governed result without deciding any verdict.
+    ///
+    /// Callers that launched through [`InstrumentRunner::launch`] hold a
+    /// sealed [`InstrumentStartReceipt`] and must prefer
+    /// [`GovernedInstrumentResult::from_launch`] so the verdict binds to
+    /// the launch-pinned identity instead of fresh caller values.
     pub fn new(
         invocation: InstrumentInvocation,
         adapter: String,
@@ -402,10 +463,12 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
 
     /// Binds an invocation, pins its executable identity, and launches it.
     ///
-    /// The machine-derived `resolved` observation is checked against `entry`
-    /// and the sealed request argv *before* the process starts, so a swapped
-    /// executable fails closed here instead of producing evidence that could
-    /// later take authoritative PASS. Composition roots that need
+    /// The machine-derived `resolved` observation is checked against `entry`,
+    /// the sealed intent digest, and the sealed request argv *before* the
+    /// process starts, so a swapped executable fails closed here instead of
+    /// producing evidence that could later take authoritative PASS. The
+    /// pinned observation and sealed argv travel in the returned receipt for
+    /// [`GovernedInstrumentResult::from_launch`]. Composition roots that need
     /// authoritative evidence must use this path; [`InstrumentRunner::launch`]
     /// performs no identity check.
     ///
@@ -441,6 +504,8 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
             .process_request
             .take()
             .ok_or(RunnerError::ReceiptMismatch)?;
+        let argv = process_request.argv().to_vec();
+        let executable = binding.verified_executable.clone();
         let process = self.executor.start(process_request, sink).await?;
         if process.operation_id() != &binding.operation_id
             || process.request_digest() != binding.request_digest
@@ -451,6 +516,8 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
         Ok(InstrumentStartReceipt {
             invocation: binding.invocation.clone(),
             process,
+            executable,
+            argv,
         })
     }
 

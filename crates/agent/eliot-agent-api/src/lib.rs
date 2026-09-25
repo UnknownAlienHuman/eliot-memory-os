@@ -27,8 +27,9 @@ pub use execution_binding::{
 };
 pub use host_event::{
     AssistantDeltaObservation, CancellationObservation, CandidateResultReference,
-    CheckpointObservation, ErrorObservation, ExecutionStartedObservation,
-    HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
+    CheckpointObservation, CommittedHostEventIntake, ErrorObservation, ExecutionStartedObservation,
+    HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM,
+    HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
     HostEventNormalizationReceipt, HostEventPrivacyClass, HostEventQuarantineReason,
     HostEventReplayDisposition, MAX_HOST_EVENT_OMITTED_FIELDS, MAX_HOST_EVENT_PREDECESSORS,
     MAX_HOST_EVENT_SAFE_TEXT_CHARS, MAX_HOST_EVENT_TEXT_CHARS, MAX_HOST_EVENT_WARNINGS,
@@ -38,6 +39,7 @@ pub use host_event::{
     SessionLifecycleTransition, ToolInvocationObservation, ToolOutcomeClass,
     ToolOutcomeObservation, UnsupportedDisposition, UnsupportedEventObservation,
     UnsupportedEventReason, WarningObservation, candidate_result_digest_for,
+    contains_restricted_source_token, stable_event_id_for,
 };
 pub use route_receipts::{
     AdmittedRouteReceipt, CandidateSelectionDisposition, ExecutionOutcome,
@@ -954,7 +956,7 @@ impl AuthorizedEffect {
 
 /// Agent-local candidate effect observation (Implements #228, narrow slice).
 /// Disposition (pre-agreed, loss-visible, no rename): the authoritative
-/// `EffectReceipt` owner is `crates/governor/eliot-authority/src/effects.rs:351`
+/// `EffectReceipt` owner is `crates/governor/eliot-authority/src/effects.rs:561`
 /// (`EffectReceipt { authorized_effect, outcome, canonical_receipt }` with
 /// `CanonicalEffectReceipt` obligations). This `eliot-agent-api::EffectReceipt`
 /// is retained as a bounded agent-local projection only and must not gain new

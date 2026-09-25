@@ -40,11 +40,14 @@ fn valid_ticket() -> Result<AgentActivationResolutionTicket, ProtocolError> {
         wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
         ticket_id: "activation-ticket-invalid-1".to_owned(),
         activation_request_id: RequestId::new("activation-request-invalid-1")?,
+        demand_id: "activation-demand-invalid-1".to_owned(),
         activation_request_sha256: "a".repeat(64),
         peer_admission_receipt_sha256: "b".repeat(64),
         connection_id: "activation-connection-invalid-1".to_owned(),
+        cancellation_id: "activation-cancellation-invalid-1".to_owned(),
         state_fence: StateFence::new(test_epoch(7)?, ResourceGeneration::new(11)?),
         kernel_deadline_unix_ms: 10_000,
+        successor_of: None,
         ticket_sha256: String::new(),
     }
     .with_computed_digest()

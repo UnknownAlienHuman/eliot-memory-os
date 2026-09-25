@@ -5,6 +5,7 @@ use serde_json::Value;
 use time::OffsetDateTime;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WindowsServiceConfig {
     pub service_name: String,
     pub display_name: String,
@@ -35,15 +36,20 @@ pub enum ServiceStartType {
     Disabled,
 }
 
+/// Restart policy carried on the service configuration wire contract.
+///
+/// `Default` below is the application-level governor SCM policy used when a
+/// caller builds one in code. It is deliberately *not* a Serde default: a
+/// missing `restart_delays_seconds` or `reset_period_seconds` must not decode
+/// into a zero/empty policy, because those values drive real restart timing.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceRestartPolicy {
     pub enabled: bool,
     pub max_restarts_per_window: u32,
     pub window_seconds: u64,
     pub backoff_seconds: u64,
-    #[serde(default)]
     pub restart_delays_seconds: Vec<u64>,
-    #[serde(default)]
     pub reset_period_seconds: u64,
     pub open_incident_on_exhaustion: bool,
 }
@@ -63,6 +69,7 @@ impl Default for ServiceRestartPolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceInstallReceipt {
     pub receipt_id: String,
     pub service_name: String,
@@ -97,6 +104,7 @@ pub enum ServiceInstallStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IpcConfig {
     pub pipe_name: String,
     pub token_file: PathRef,
@@ -108,6 +116,7 @@ pub struct IpcConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IpcAuthenticationProfile {
     pub protocol_version: String,
     pub pipe_name: String,
@@ -125,6 +134,7 @@ pub struct IpcAuthenticationProfile {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IpcHandshake {
     pub protocol_version: String,
     pub client_id: String,
@@ -135,6 +145,7 @@ pub struct IpcHandshake {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IpcHandshakeDecision {
     pub decision_id: String,
     pub accepted: bool,
@@ -156,7 +167,15 @@ pub enum IpcHandshakeReason {
     PipeAclDenied,
 }
 
+/// One IPC frame envelope.
+///
+/// `payload_inline` is explicitly bounded inert data: it is a caller-supplied
+/// transport body addressed by `payload_ref`/`payload_hash` and size-bounded by
+/// `IpcConfig::max_frame_bytes` at the owning server. It carries no authority,
+/// lifecycle, or health meaning, so it is not a protected typed payload. The
+/// envelope fields themselves are closed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IpcFrame {
     pub frame_id: String,
     pub protocol_version: String,
@@ -182,6 +201,7 @@ pub enum IpcFrameKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialRef {
     pub credential_id: String,
     pub provider: CredentialProviderKind,
@@ -209,6 +229,7 @@ pub enum CredentialPurpose {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceReadinessProbe {
     pub probe_id: String,
     pub service_name: String,
@@ -242,6 +263,7 @@ pub enum ServiceReadinessStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceRestartReceipt {
     pub receipt_id: String,
     pub service_name: String,
@@ -274,6 +296,7 @@ pub enum ServiceRestartStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StartupRecoveryReceipt {
     pub receipt_id: String,
     pub data_root: PathRef,
@@ -297,6 +320,7 @@ pub enum StartupRecoveryStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceStatusReport {
     pub component: String,
     pub config: WindowsServiceConfig,
@@ -307,6 +331,7 @@ pub struct ServiceStatusReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IpcStatusReport {
     pub component: String,
     pub pipe_name: String,
@@ -320,11 +345,16 @@ pub struct IpcStatusReport {
     pub generated_at: OffsetDateTime,
 }
 
+/// Credential diagnostics projection.
+///
+/// `statuses` is required on the wire: a missing list must not decode into an
+/// empty one next to a non-zero `resolved_count`, which would report a
+/// resolved credential with no per-credential evidence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialDiagnosticsReport {
     pub component: String,
     pub refs: Vec<CredentialRef>,
-    #[serde(default)]
     pub statuses: Vec<CredentialStatus>,
     pub resolved_count: usize,
     pub secret_values_redacted: bool,
@@ -335,6 +365,7 @@ pub struct CredentialDiagnosticsReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialStatus {
     pub credential_id: String,
     pub provider: CredentialProviderKind,

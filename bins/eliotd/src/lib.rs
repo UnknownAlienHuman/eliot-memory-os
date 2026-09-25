@@ -12,15 +12,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{EpochId, OperationId, ResourceGeneration, StateFence};
+use eliot_contracts::{EpochId, ResourceGeneration, StateFence};
 use eliot_governor::{
-    CompositionError, CompositionReadiness, FinishAttemptDraft, FinishAttemptError,
-    FinishDecisionReceipt, GovernorActivationOutcome, GovernorComposition, GovernorLaunchConfig,
-    KernelGenerationPort, KernelGenerationSnapshotProvider, QueueLimits,
+    CompositionError, CompositionReadiness, FinishAttemptError, GovernorActivationOutcome,
+    GovernorComposition, GovernorLaunchConfig, KernelGenerationPort,
+    KernelGenerationSnapshotProvider, QueueLimits,
 };
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
-use eliot_protocol::{AgentActivationResolutionResult, AgentActivationResolutionTicket};
+use eliot_protocol::{
+    AgentActivationOwnerEvidence, AgentActivationOwnerReadback, AgentActivationResolutionResult,
+    AgentActivationResolutionTicket, AgentActivationResolvedBinding,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -56,6 +59,7 @@ mod kernel_authority_client;
 mod kernel_context_read_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
+mod maintenance_trigger_evaluator;
 pub mod notification_board_attach;
 mod observation_adapters;
 mod owner_feed;
@@ -70,6 +74,7 @@ mod skill_surface_adapters;
 pub mod staffing_policy;
 pub mod startup_capability_bindings;
 pub mod startup_evidence_producer;
+pub mod startup_readiness;
 mod store_failure_projection;
 pub mod supervision_progress;
 pub mod swarm_composition;
@@ -81,6 +86,7 @@ pub use activation_projection::AgentActivationResolver;
 pub use activation_projection::{
     ActivationClaim, classify_claimed_ticket_value, terminal_for_invalid_ticket,
 };
+use agent_fabric::build_admitted_provider_capability;
 pub use agent_fabric::{
     ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric,
     AgentFabricDescriptor, AttemptLifecycle, AttemptResultRecord, COORDINATOR_CRATE,
@@ -89,7 +95,7 @@ pub use agent_fabric::{
     FabricError, FabricPorts, FabricSnapshot, LedgerEntry, ModelRegistryPort, PREREQ_PORTS,
     PeerChannelPort, PeerMessage, PeerReceipt, Reservation, RouteRequirements, SwarmControlPort,
     SwarmDefinition, SwarmEntryReceipt, VerifiedProviderMaterial, WorkerAck,
-    build_admitted_provider_capability, daemon_coordinator_config, plan_candidate, prereq_ports,
+    daemon_coordinator_config, plan_candidate, prereq_ports,
 };
 
 use controlboard_adapters::SharedOperatorReplay;
@@ -164,6 +170,9 @@ pub use governor_local_read::{
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
+pub use maintenance_trigger_evaluator::{
+    MaintenanceObservation, MaintenanceTriggerOrigin, SELF_OBSERVED_FAMILY, UNRESOLVED_AUTHORITIES,
+};
 pub use owner_feed::{KernelOwnerPublishPort, OwnerFeedTrigger, maintain_owner_feed};
 pub use process_origin::{
     CapabilityEvidenceSource, Generation, OperationDisposition, OriginChallenge,
@@ -174,7 +183,7 @@ pub use process_origin::{
 };
 pub use reactive_feed::{ReactiveFeedError, ReactiveFeedOutcome, drive_reactive_delivery_once};
 pub use route_receipts::{
-    ActualRouteReceipt, GovernorRouteAttempt, RouteCapabilityIndex, RouteReceiptError,
+    GovernorRouteAttempt, RouteAdmissionVisibility, RouteCapabilityIndex, RouteReceiptError,
     RuntimeObservedFacts, UNKNOWN_ROUTE_FACT, effective_route_key,
 };
 pub use startup_evidence_producer::{
@@ -256,6 +265,10 @@ pub enum DaemonError {
     /// Authenticated Kernel B1 transport or admission failed.
     #[error("Kernel B1 transport: {0}")]
     Kernel(String),
+    /// The Kernel durably linearized deadline expiry before result admission.
+    /// This is a settled result-less outcome, not a lost acknowledgement.
+    #[error("Kernel activation result deadline expired before admission")]
+    ActivationExpired,
     /// A second daemon owner cannot be admitted in this process.
     #[error("daemon lifecycle: {0}")]
     Lifecycle(String),
@@ -265,6 +278,24 @@ pub enum DaemonError {
     /// retryable transport without collapsing the typed failure.
     #[error(transparent)]
     ProviderAdmission(#[from] FabricError),
+    /// Governor-owned maintenance trigger evaluation or Durable Job
+    /// admission (I14.22, issue #1688) failed fail-closed. The owner's own
+    /// [`eliot_maintenance::MaintenanceError`] is preserved unchanged and
+    /// never stringified, so a driver can still tell an unresolved trigger
+    /// identity from a stale fence, a missing evidence set, or an exhausted
+    /// attempt budget instead of collapsing them into one lifecycle message.
+    #[error("Governor maintenance: {0}")]
+    Maintenance(#[from] eliot_maintenance::MaintenanceError),
+    /// Task-binding admission at the daemon ingress edge rejected the
+    /// transition (issue #1929, I5.5/I5.6).
+    ///
+    /// The typed code travels unchanged: the wrapped error renders the stable
+    /// wire token (`TASK_SELECTION_REQUIRED` or `TASK_SCOPE_INCOMPATIBLE`)
+    /// ahead of the bounded detail, so no code is collapsed into prose between
+    /// the admission edge and the caller. The rejection happens before the
+    /// Governor commit, so neither the task nor the store is touched.
+    #[error(transparent)]
+    TaskBinding(#[from] crate::task_binding_admission::TaskBindingError),
 }
 
 /// Typed revision-fence match failure for the daemon cache gate (issue #18
@@ -548,6 +579,38 @@ impl DaemonComposition {
         // handoff (prepared envelope submitted) and the commitment (validated
         // owner receipt) stay distinguishable in the sink.
         let _span = tracing::info_span!("eliotd.canonical_commit").entered();
+        // Issue #1929 (I5.5 capture/promotion split, I5.6 step 4): the daemon
+        // ingress is the admission edge, not a bypass around the store gate.
+        // The caller's compiled readiness receipt is the only place the exact
+        // `TaskSelectionEvidence` exists, so it is resolved and applied here —
+        // before any commit. A capture with no unique task selection stays a
+        // cold unbound candidate with no task memory/support/influence/finish
+        // effect; a task-relative write without current exact evidence is
+        // rejected with `TASK_SELECTION_REQUIRED`, and one whose evidence names
+        // another task, `WorkScope`, or a moved fence with
+        // `TASK_SCOPE_INCOMPATIBLE`. Neither rejection changes a task or
+        // reaches the store, and no task is ever silently selected.
+        let admission = crate::task_binding_admission::admit_canonical_write(
+            envelope.operation_id.as_str().to_owned(),
+            &identity.request.metadata,
+            &envelope,
+            readiness.receipt,
+            readiness.fence,
+        )?;
+        // Issue #1929: a capture admitted cold is still durably retained. The
+        // decision is projected here so operators can see which submissions
+        // carry no task binding and are therefore inert for task memory,
+        // support, influence, and finish until a later governed binding
+        // transition.
+        if let crate::task_binding_admission::TaskBindingAdmission::ColdUnbound(candidate) =
+            &admission
+        {
+            tracing::info!(
+                candidate_id = %crate::diagnostics::sanitize_identity(&candidate.candidate_id),
+                reason_ref = %candidate.reason_ref,
+                "cold unbound observation candidate admitted at the daemon edge: no task activation, support/influence promotion, or finish relevance"
+            );
+        }
         // Issue #1787: the scope-sensitive canonical-write trigger runs before
         // any commit. When a WorkScope binding is retained, a write addressing
         // another scope quarantines here instead of committing against the
@@ -715,51 +778,58 @@ impl DaemonComposition {
         self.committed_experience.insert(idempotency_key, receipt);
     }
 
-    /// Submits one candidate finish through the Governor owner, commits the
-    /// derived decision through the canonical `RecordFinishDecision` path,
-    /// and rehydrates the daemon projection before returning the decision
-    /// receipt. The caller supplies only a candidate draft; task completion,
-    /// evidence binding, and persistence remain Governor/Canonical-owned.
-    ///
-    /// A committed receipt is preserved when the post-commit refresh cannot
-    /// publish the new projection. In that case the daemon is marked stale,
-    /// matching [`Self::commit_canonical_and_refresh`], and the receipt still
-    /// reports the durable operation rather than a false failure.
-    pub async fn finish_attempt(
-        &mut self,
-        identity: &eliot_protocol::RequestIdentity,
-        operation_id: OperationId,
-        draft: FinishAttemptDraft,
-    ) -> Result<FinishDecisionReceipt, DaemonError> {
-        let _span = tracing::info_span!("eliotd.finish_attempt").entered();
-        let decision = self
-            .governor
-            .finish_attempt(identity, operation_id, draft)
-            .await
-            .map_err(DaemonError::Finish)?;
-        // Issue #1866 W1/W4/A1/A2 (I12.24): best-effort non-blocking closure
-        // assessment. Closure never blocks the finish ceremony: the honest
-        // decision above is already durable, owner/review semantics live in
-        // the Governor/eliot-improvement owners, and this hook only emits
-        // observability. No `?`, no propagation, return path unchanged.
-        {
-            let _closure_span = tracing::info_span!("eliotd.finish_closure_assessment").entered();
-            // Honest assessment from receipt fields (Governor-owned semantics):
-            // debt pends while no closing disposition is bound to this finish.
-            let debt_pending = closure_debt_pending(decision.closure_authority_ref.is_none());
-            tracing::info!(
-                decision_id = %decision.decision_id,
-                debt_pending,
-                has_closure_authority = decision.closure_authority_ref.is_some(),
-                unresolved_descendants = decision.unresolved_descendant_refs.len(),
-                "campaign closure assessment: honest finish while learning closure completes asynchronously; owner/review condition from Governor policy"
-            );
-        }
-        if self.governor.refresh_from_kernel().is_err() {
-            self.view_stale = true;
-        }
-        Ok(decision)
-    }
+    // (DELETED, #18 N3) `DaemonComposition::finish_attempt`.
+    //
+    // Its own contract, for the record: it submitted one candidate finish
+    // through the Governor owner, committed the derived decision through the
+    // canonical `RecordFinishDecision` path, and rehydrated the daemon
+    // projection before returning the decision receipt. The caller supplied
+    // only a candidate draft; task completion, evidence binding and persistence
+    // remained Governor/Canonical-owned. A committed receipt was preserved when
+    // the post-commit refresh could not publish the new projection: the daemon
+    // was marked stale, matching `commit_canonical_and_refresh`, and the
+    // receipt still reported the durable operation rather than a false failure.
+    //
+    // This composed one-shot submitted the evidence leg and the finish decision
+    // inside a single `&mut self` borrow, exchanging twice against the Kernel
+    // while the borrow was live. On the daemon side `&mut DaemonComposition` is
+    // obtainable only through `SharedComposition::lock()`, so every caller would
+    // have held a `tokio::sync::MutexGuard` across two Kernel round trips -
+    // the exact defect N3 exists to remove. It could not be repaired in place:
+    // a `&mut self` method cannot release the borrow around the exchange, and
+    // the method has no Kernel client of its own to exchange through.
+    //
+    // It is removed rather than kept because it had no production caller after
+    // the TestD owner drain went phase-split, and on this side of that boundary
+    // a `&mut` finish helper is structurally a re-introduction of the defect.
+    //
+    // The replacement seam is the phase pair, which the drain already uses and
+    // which needs no composition borrow at all while it exchanges:
+    // `eliot_governor::GovernorComposition::prepare_finish_evidence`,
+    // `::prepare_finish_decision` and `::accept_prepared_exchange`, exchanged
+    // through `testd_terminal_completion::exchange_testd_owner_finish_leg`
+    // with the composition lock released.
+    //
+    // The closure-assessment observability record that followed the decision is
+    // preserved on the phase path in
+    // `testd_terminal_completion::plan_testd_terminal_owner_finish`. The
+    // post-decision owner refresh the deleted body also performed
+    // (`refresh_from_kernel`, marking `view_stale` on failure) is now performed
+    // by phase (3) of the drain through the Governor's own synchronous
+    // `prepare_finish_decision`, which refreshes before the decision is
+    // derived, so the dependent view is still invalidated on a failed refresh.
+    //
+    // Doc preserved from main (#1929), so the rationale is not lost: this Finish
+    // owner entry had no caller-presented readiness receipt, so the exact
+    // `TaskSelectionEvidence` leg of issue #1929 runs at the composition-root
+    // write intake (`Self::commit_canonical_and_refresh`) and again, from the
+    // proof handles the transition actually carries, at the store gate. The
+    // finish draft's own `task_id` + `expected_task_revision` are re-validated
+    // against the canonical task owner by the Governor finish owner before the
+    // commit; nothing on the phase path guesses a task. Both legs still run on
+    // the surviving path: `plan_testd_terminal_owner_fact` prepares the fact
+    // through the Governor finish owner, and `accept_prepared_exchange`
+    // re-checks the pre-commit fence before the receipt is admitted.
 
     /// Returns the admitted Kernel snapshot.
     #[must_use]
@@ -840,10 +910,55 @@ impl DaemonComposition {
         }
     }
 
+    /// Returns the current named activation dependency discriminator used by
+    /// the pre-claim successor gate. The Governor remains the sole semantic
+    /// owner; this is a bounded readback for the authenticated claim request.
+    #[must_use]
+    pub fn activation_dependency_revision(&self) -> String {
+        self.governor.activation_dependency_revision()
+    }
+
+    /// Reads the current semantic owner projection for the exact owner
+    /// readback carried with a Resolved result submission. This is a bounded
+    /// readback of the same Governor owner, not a second Kernel resolver and
+    /// not a replacement result computation.
+    pub fn current_activation_owner_readback(
+        &self,
+        now: u64,
+    ) -> Result<AgentActivationOwnerReadback, DaemonError> {
+        let snapshot = self
+            .governor
+            .read_unique_agent_activation(now)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        let binding = AgentActivationResolvedBinding {
+            principal_id: snapshot.principal_id,
+            session_id: snapshot.session_id,
+            task_id: snapshot.task_id.to_string(),
+            work_unit_id: snapshot.work_unit_id,
+            work_scope_id: snapshot.work_scope_id,
+            task_revision: snapshot.task_revision.to_string(),
+            plan_id: snapshot.plan_id,
+            plan_revision: snapshot.plan_revision,
+        };
+        let evidence = AgentActivationOwnerEvidence::for_binding(
+            &binding,
+            snapshot.owner_revision,
+            snapshot.state_fence,
+        )
+        .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        AgentActivationOwnerReadback::from_evidence(evidence, now.max(1))
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
     /// Single production resolver spine: resolves one Kernel-issued semantic
     /// ticket to the canonical v2 typed result. Every
     /// `GovernorActivationOutcome` variant maps 1:1 to its
     /// protocol disposition without coercion to success.
+    ///
+    /// Split note: activation resolution keeps readiness, fence, successor
+    /// observation, and typed mapping together. The seam is still one ordered
+    /// spine; each step is now a named private function, so every guard still
+    /// runs in the same order over the same effects.
     pub fn resolve_agent_activation_v2(
         &self,
         ticket: &AgentActivationResolutionTicket,
@@ -859,46 +974,59 @@ impl DaemonComposition {
         ticket
             .validate()
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        let successor_observation = ticket.successor_of.as_ref().map(|_| {
+            (
+                self.governor.activation_owner_revision(),
+                self.governor.activation_dependency_revision(),
+            )
+        });
         if self.readiness() != CompositionReadiness::Ready {
             // #204: an unready Governor is an internal failure for this exact
-            // ticket, not a loop-fatal error. Answer with a typed
-            // FailedInternal terminal result so the Kernel records a
-            // disposition that stays distinct from every other negative and
-            // from the result-less deadline outcome, and the daemon stays
-            // alive for the next claim. The ticket is already validated
-            // above, so the fallback binds; if it cannot bind, the original
-            // readiness error returns unchanged: fail closed, never silence.
-            let unready = DaemonError::Lifecycle(
-                "semantic activation resolution requires a ready Governor".to_owned(),
-            );
-            return match activation_projection::failed_internal_for_unready_governor(
-                ticket,
-                now.max(1),
-            ) {
-                Ok(result) => {
-                    let _ = crate::diagnostics::ErrorRecord::of_daemon_error(&unready).emit();
-                    Ok(result)
-                }
-                Err(_) => Err(unready),
-            };
+            // ticket, not a loop-fatal error; the typed terminal result and its
+            // fail-closed fallback live in
+            // [`unready_governor_activation_result`].
+            return unready_governor_activation_result(ticket, now, successor_observation);
         }
         if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
             return Err(DaemonError::Lifecycle(
                 "semantic activation ticket deadline has expired".to_owned(),
             ));
         }
-        let outcome = match self.governor.resolve_activation_outcome(now) {
+        let outcome = self.map_activation_outcome(ticket, now, successor_observation.as_ref());
+        emit_activation_admission_diagnostics(ticket, &outcome);
+        outcome
+    }
+
+    /// Resolves this Governor's typed activation outcome for one already
+    /// validated ticket and maps it to the canonical v2 result.
+    ///
+    /// The exact `successor_observation` captured before the readiness gate
+    /// decides whether a mapping is a successor-fenced mapping, and the
+    /// stale-fence and mapping-failure terminals keep the same class of
+    /// evidence they carried inline.
+    fn map_activation_outcome(
+        &self,
+        ticket: &AgentActivationResolutionTicket,
+        now: u64,
+        successor_observation: Option<&(u64, String)>,
+    ) -> Result<AgentActivationResolutionResult, DaemonError> {
+        match self.governor.resolve_activation_outcome(now) {
             GovernorActivationOutcome::Resolved(snapshot) => {
                 if snapshot.state_fence == ticket.state_fence {
-                    match activation_projection::map_governor_outcome_to_protocol(
+                    match map_governor_outcome_under_observation(
                         ticket,
                         GovernorActivationOutcome::Resolved(snapshot),
                         now.max(1),
+                        successor_observation,
                     ) {
                         Ok(result) => Ok(result),
-                        Err(error) => {
-                            failed_internal_or_mapping_error(ticket, "RESOLVED", now.max(1), error)
-                        }
+                        Err(error) => failed_internal_or_mapping_error(
+                            ticket,
+                            "RESOLVED",
+                            now.max(1),
+                            successor_observation.cloned(),
+                            error,
+                        ),
                     }
                 } else {
                     // #66: a Resolved binding under a stale fence must not
@@ -910,39 +1038,33 @@ impl DaemonComposition {
                     // diagnostics as every other v2 resolution instead of
                     // returning silently; the Ok/Err value is unchanged.
                     let observed = snapshot.state_fence.clone();
-                    activation_projection::stale_fence_for_resolved_mismatch(
+                    activation_projection::stale_fence_for_resolved_mismatch_with_observation(
                         ticket,
                         observed,
                         now.max(1),
+                        successor_observation.cloned(),
                     )
                 }
             }
             outcome => {
                 let kind = outcome.kind_str();
-                match activation_projection::map_governor_outcome_to_protocol(
+                match map_governor_outcome_under_observation(
                     ticket,
                     outcome,
                     now.max(1),
+                    successor_observation,
                 ) {
                     Ok(result) => Ok(result),
-                    Err(error) => failed_internal_or_mapping_error(ticket, kind, now.max(1), error),
+                    Err(error) => failed_internal_or_mapping_error(
+                        ticket,
+                        kind,
+                        now.max(1),
+                        successor_observation.cloned(),
+                        error,
+                    ),
                 }
             }
-        };
-        match &outcome {
-            Ok(result) => {
-                let _ = crate::diagnostics::AdmissionRecord::of(
-                    crate::diagnostics::disposition_of_resolution(&result.disposition),
-                    &ticket.ticket_id,
-                    &result.result_sha256,
-                )
-                .emit();
-            }
-            Err(error) => {
-                let _ = crate::diagnostics::ErrorRecord::of_daemon_error(error).emit();
-            }
         }
-        outcome
     }
 
     /// Records the already-validated Kernel-issued owner session facts for
@@ -1671,13 +1793,15 @@ impl DaemonComposition {
     /// in `material` are unconditionally overwritten, never trusted; the
     /// threaded Governor expectation is epoch-bound to the live session
     /// fence (a stale or foreign expectation fails closed here, never at
-    /// first effect). The composition retains no client, no capability, and
-    /// no owner half: the driver re-resolves per admitted operation, so a
-    /// fence move surfaces as an exact mismatch instead of silent
-    /// divergence, and currency is re-checked on every coordinator
-    /// `verify` call. Without a validated handshake the composition has no
-    /// live session and resolution fails closed — the daemon stays
-    /// plan-only.
+    /// first effect). This is the sole cross-crate capability construction
+    /// path: the material-to-capability builder is crate-internal, so no
+    /// external caller can bypass the session-half overwrite. The
+    /// composition retains no client, no capability, and no owner half: the
+    /// driver re-resolves per admitted operation, so a fence move surfaces
+    /// as an exact mismatch instead of silent divergence, and currency is
+    /// re-checked on every coordinator `verify` call. Without a validated
+    /// handshake the composition has no live session and resolution fails
+    /// closed — the daemon stays plan-only.
     ///
     /// # Errors
     ///
@@ -1859,6 +1983,73 @@ impl DaemonComposition {
             .admit_production_route(skill_id, scope, now))
     }
 
+    /// Admits one explicit workspace instance as an attach to the retained
+    /// `WorkScope` binding (issue #1929, I04.4 attach trigger).
+    ///
+    /// The daemon owns exactly one step here and owns no other: it observes
+    /// the caller's explicit absolute root mechanically through
+    /// [`task_binding_admission::observe_explicit_workspace`] and then hands
+    /// that live observation to the Governor's real attach/receipt owner,
+    /// [`eliot_governor::GovernorComposition::admit_observed_scope_attach`],
+    /// together with the retained descriptor, the trigger-authenticated
+    /// authorization reference, the privacy boundary, and the onboarding-
+    /// retained source closure. The Governor produces the owner-issued
+    /// relocation/attach receipt, rebinds with it, requires a fresh `MATCHED`
+    /// source-closure check for the observed instance, and only then is the
+    /// admitted owner installed into the live composition by
+    /// [`eliot_governor::GovernorComposition::install_admitted_work_scope_owner`].
+    ///
+    /// The installed binding is immediately effective: every later
+    /// [`Self::commit_canonical_and_refresh`] runs
+    /// `check_canonical_write_work_scope` against it, so a write addressing a
+    /// different instance, root, or generation quarantines instead of
+    /// committing. Shape failures (non-absolute root, blank reference, zero
+    /// counter, invalid descriptor or privacy boundary) and a root that cannot
+    /// be observed fail closed as [`DaemonError::TaskBinding`] carrying
+    /// `TASK_SELECTION_REQUIRED` or `TASK_SCOPE_INCOMPATIBLE`, and the
+    /// retained binding, task state, and project memory stay untouched.
+    ///
+    /// The daemon never infers a workspace from cwd, proximity, or recency, and
+    /// never mints a receipt of its own: `ScopeAttachIngress` is the only
+    /// accepted input and its `receipt_ref` is a reference the Governor binds,
+    /// not an authority the daemon asserts.
+    pub fn admit_scope_attach(
+        &mut self,
+        ingress: &task_binding_admission::ScopeAttachIngress,
+    ) -> Result<
+        (
+            eliot_governor::ScopeRelocationOrAttachReceipt,
+            eliot_governor::WorkScopeBindingSnapshot,
+        ),
+        DaemonError,
+    > {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        ingress.validate()?;
+        let fence = self.governor.kernel_snapshot().state_fence();
+        let observed = task_binding_admission::observe_explicit_workspace(
+            ingress.explicit_root.as_path(),
+            &fence,
+        )?;
+        let (receipt, owner) = self.governor.admit_observed_scope_attach(
+            ingress.receipt_ref.as_str(),
+            &observed,
+            &ingress.descriptor,
+            ingress.authorizing_ref.as_str(),
+            ingress.privacy_class,
+            ingress.governing_source_generation,
+            &ingress.sources,
+            &ingress.privacy,
+            ingress.owner_revision,
+        )?;
+        let snapshot = self
+            .governor
+            .install_admitted_work_scope_owner(owner)
+            .map_err(DaemonError::Composition)?;
+        Ok((receipt, snapshot))
+    }
+
     /// Borrows the Governor reconstruction read composition over the retained
     /// owners plus daemon-held Kernel and read clients (T11.3).
     ///
@@ -1935,18 +2126,98 @@ fn failed_internal_or_mapping_error(
     ticket: &AgentActivationResolutionTicket,
     outcome_kind: &str,
     resolved_at_unix_ms: u64,
+    successor_observation: Option<(u64, String)>,
     error: DaemonError,
 ) -> Result<AgentActivationResolutionResult, DaemonError> {
-    match activation_projection::failed_internal_for_mapping_failure(
+    match activation_projection::failed_internal_for_mapping_failure_with_observation(
         ticket,
         outcome_kind,
         resolved_at_unix_ms,
+        successor_observation,
     ) {
         Ok(result) => {
             let _ = crate::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
             Ok(result)
         }
         Err(_) => Err(error),
+    }
+}
+
+/// Answers one already validated ticket for an unready Governor with the typed
+/// `FailedInternal` terminal result.
+///
+/// #204: an unready Governor is an internal failure for this exact ticket, not
+/// a loop-fatal error. The typed result keeps the disposition distinct from
+/// every other negative and from the result-less deadline outcome, and the
+/// daemon stays alive for the next claim. The ticket is validated before this
+/// seam is reached, so the fallback binds; if it cannot bind, the original
+/// readiness error returns unchanged: fail closed, never silence.
+fn unready_governor_activation_result(
+    ticket: &AgentActivationResolutionTicket,
+    now: u64,
+    successor_observation: Option<(u64, String)>,
+) -> Result<AgentActivationResolutionResult, DaemonError> {
+    let unready = DaemonError::Lifecycle(
+        "semantic activation resolution requires a ready Governor".to_owned(),
+    );
+    match activation_projection::failed_internal_for_unready_governor_with_observation(
+        ticket,
+        now.max(1),
+        successor_observation,
+    ) {
+        Ok(result) => {
+            let _ = crate::diagnostics::ErrorRecord::of_daemon_error(&unready).emit();
+            Ok(result)
+        }
+        Err(_) => Err(unready),
+    }
+}
+
+/// Maps one Governor outcome to the wire v2 result under the exact successor
+/// observation captured before the readiness gate.
+///
+/// The observation is taken from the same coherent Governor read as the
+/// outcome, so a successor claim is only published when the owner and
+/// dependency revisions really moved.
+fn map_governor_outcome_under_observation(
+    ticket: &AgentActivationResolutionTicket,
+    outcome: GovernorActivationOutcome,
+    now: u64,
+    successor_observation: Option<&(u64, String)>,
+) -> Result<AgentActivationResolutionResult, DaemonError> {
+    match successor_observation {
+        Some((owner_revision, dependency_revision)) => {
+            activation_projection::map_governor_outcome_to_protocol_for_successor(
+                ticket,
+                outcome,
+                now,
+                *owner_revision,
+                dependency_revision.clone(),
+            )
+        }
+        None => activation_projection::map_governor_outcome_to_protocol(ticket, outcome, now),
+    }
+}
+
+/// Emits the one admission or error record that every v2 resolution terminal
+/// shares, so a typed success, a typed rejection and a fallback all report
+/// through the same diagnostics seam.
+fn emit_activation_admission_diagnostics(
+    ticket: &AgentActivationResolutionTicket,
+    outcome: &Result<AgentActivationResolutionResult, DaemonError>,
+) {
+    match outcome {
+        Ok(result) => {
+            let _ = crate::diagnostics::AdmissionRecord::of(
+                crate::diagnostics::disposition_of_resolution(&result.disposition),
+                &ticket.ticket_id,
+                &result.result_sha256,
+            )
+            .emit();
+        }
+        Err(error) => {
+            let _ = crate::diagnostics::ErrorRecord::of_daemon_error(error).emit();
+        }
     }
 }
 

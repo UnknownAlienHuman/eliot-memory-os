@@ -26,7 +26,7 @@ use thiserror::Error;
 /// Freeze identity this package builds against.
 ///
 /// See `crates/smart/cognitive-rev12-contract-schema-freeze.toml`.
-pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22";
+pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r6";
 /// Stable provider label carried by every contribution from this package.
 pub const PROVIDER_LABEL: &str = "smart.epistemic.context-provider";
 

@@ -13,16 +13,28 @@ Scan discipline (mirrors the Rust oracles, no third design):
 - Rust files are lexically stripped (comments, strings, chars, lifetimes and
   raw strings become spaces, newlines kept) before any token test, so fixture
   strings, doc prose and comments can never count as definitions or uses.
+- The declaration denominator is a WHOLE-OCCURRENCE set, not a file or name
+  list: `enum_declaration_sites()` returns every `enum` declaration
+  occurrence in the scan domain with its file, enclosing `mod` path, qualified
+  name and 1-based source span, and `main()` compares that set against the one
+  allowed current declaration. `enum_declaration_files()` and
+  `versioned_kind_enums()` are derived projections of it, never the
+  authoritative denominator: a second `CueKind` inside the owner file is
+  invisible to a file list and must not be collapsed by a simple type name
+  (I05-15: a second field-level definition is an owner collision).
 - `declares_enum` uses whole-word boundaries on both sides of the `enum`
   keyword and the name, all Rust whitespace between them, `r#`-prefixed names
   count, `r#enum` never counts, and unparseable enum-adjacent syntax fails
-  closed as a hit.
+  closed as a hit. It is the boolean form of the single shared occurrence scan
+  `_declaration_offsets`, which carries that same control flow verbatim and
+  returns every occurrence instead of the first.
 - Deliberately adversarial fixture strings live only under
   `scripts/testdata/cue-kind-retirement/` (JSON, never `.rs`), so the `.rs`
   scans below cannot see them. Unknown macros/syntax/coverage is reported
   through ScanVerdict as INCOMPLETE with an explicit reason, never as zero:
   `denominator_status()` lists every unproved file (unclosed lexical input,
-  macro-rules definitions, include-macro fixture bytes, unknown scan roots).
+  macro-rules definitions, include-macro fixture bytes, unresolvable enum
+  declarations, unknown scan roots).
 
 Accepted interfaces reused (no invented process runner): unittest discovery,
 `pathlib` anchoring (`ROOT` from file location), TOML via stdlib `tomllib`,
@@ -308,8 +320,146 @@ def _is_ident(cell: str) -> bool:
     return cell.isalnum() or cell == "_"
 
 
-def declares_enum(stripped: str, name: str) -> bool:
-    data = stripped.encode("utf-8")
+# ---- whole-occurrence enum declaration denominator (issue #835 repair) ----
+#
+# `enum_declaration_files()` emitted a path once per file and
+# `versioned_kind_enums()` collapsed declarations with `found.setdefault`, so
+# a second `CueKind` in a nested module of the owner file left both
+# projections unchanged, and a second `CueKind` in another file silently
+# displaced the real owner in the name->file map. Every declaration occurrence
+# is now returned individually (`enum_declaration_sites`) and the projections
+# are derived from it. See I05-15 ("a second field-level definition is an owner
+# collision") and I18-27 ("a test author may encode the oracle but cannot create
+# its authority by assertion").
+
+DECLARATION_RESOLVED = "declaration"
+DECLARATION_UNRESOLVED = "unresolved"
+
+
+@dataclasses.dataclass(frozen=True)
+class DeclarationOffset:
+    """One `enum` declaration occurrence inside stripped code.
+
+    `offset` is a byte index into the ORIGINAL file. It is recovered from the
+    stripped text with `encode("latin-1")` and never utf-8: `_strip_core`
+    appends exactly one `chr()` per input byte, so latin-1 is the only faithful
+    byte map; a utf-8 re-encode emits two bytes for every byte >= 0x80 and
+    silently shifts every later span in a file containing non-ASCII.
+    `name` is None exactly when the scanner could not resolve the identifier
+    after the `enum` keyword (the fail-closed branch, reported as
+    `DECLARATION_UNRESOLVED` and never swallowed as a zero claim).
+    """
+
+    offset: int
+    name: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class EnumDeclarationSite:
+    """One whole-source `enum` declaration occurrence and its coordinates.
+
+    `line`/`column` and `end_line`/`end_column` are 1-based character
+    coordinates in the original file; `module_path` is the enclosing `mod`
+    chain (empty at file scope); `qualified_name` joins the two for a stable
+    display identity; `kind` is `declaration` for a resolved identifier and
+    `unresolved` for syntax the scanner cannot resolve.
+    """
+
+    path: str
+    name: str | None
+    module_path: tuple[str, ...]
+    qualified_name: str
+    line: int
+    column: int
+    end_line: int
+    end_column: int
+    kind: str
+
+    def __post_init__(self) -> None:
+        if self.kind not in (DECLARATION_RESOLVED, DECLARATION_UNRESOLVED):
+            raise ValueError(f"unknown declaration site kind: {self.kind}")
+
+
+def _stripped_bytes(stripped: str) -> bytes:
+    """Byte view of stripped code: exactly one byte per input byte, never utf-8.
+
+    `_strip_core` appends one `chr()` per input byte, so every character it
+    emits is <= U+00FF and the latin-1 round trip is exact. A character above
+    U+00FF means the caller passed something that is not stripper output, and a
+    utf-8 re-encode there would emit several bytes per character and silently
+    shift every later offset, so that fails loudly here (G-6).
+    """
+    try:
+        return stripped.encode("latin-1")
+    except UnicodeEncodeError:
+        raise ValueError(
+            "stripped text is not _strip_core output (character above U+00FF); "
+            "byte span math would be corrupted"
+        ) from None
+
+
+def _identifier_end(data: bytes, cursor: int) -> int | None:
+    """End offset of the identifier at `cursor`, or None when none starts there.
+
+    The character predicates are the accepted detector's own byte-level notion
+    (`chr(byte).isalnum()` / `.isalpha()`), so identifier boundaries here are
+    identical to the ones the ported `enum` scan has always used.
+
+    A byte >= 0x80 can never open or continue a Rust identifier: identifiers are
+    ASCII, and because `_strip_core` emits one `chr()` per input byte, any such
+    byte here is a fragment of a multi-byte UTF-8 sequence. Without this guard
+    `chr(0xC3).isalpha()` is true, so `pub enum <non-ASCII>CueKind` resolved the
+    identifier to the replacement character, matched no name, and was dropped
+    silently instead of being reported as unresolvable. Rejecting the lead byte
+    routes it into the existing `ident_end is None` branch, which records an
+    unresolved occurrence and therefore fails closed (I05-15, I18-27).
+    """
+    if cursor >= len(data):
+        return None
+    if data[cursor] >= 0x80:
+        return None
+    cell = chr(data[cursor])
+    if not (cell.isalpha() or cell == "_"):
+        return None
+    end = cursor
+    while end < len(data) and (chr(data[end]).isalnum() or data[end] == 0x5F):
+        end += 1
+    return end
+
+
+def _name_is(name: str):
+    """Selector accepting only the exact type name."""
+
+    def accept(identifier: str) -> bool:
+        return identifier == name
+
+    return accept
+
+
+def _name_contains(needle: str):
+    """Selector accepting every type name containing `needle`."""
+
+    def accept(identifier: str) -> bool:
+        return needle in identifier
+
+    return accept
+
+
+def _declaration_offsets(stripped: str, accept) -> tuple[DeclarationOffset, ...]:
+    """Every `enum` declaration occurrence in stripped code, not just the first.
+
+    One shared lexical control flow for `declares_enum`,
+    `enum_declaration_sites`, `enum_declaration_files` and
+    `versioned_kind_enums`: the whole-word / `r#` / unresolvable branches are
+    carried verbatim from the accepted single-hit detector, and each branch
+    that used to `return True` now records its occurrence and keeps scanning
+    with the same one-byte index advance. `accept` selects which resolved
+    identifiers count as a declaration of the scanned kind; unresolvable
+    enum-adjacent syntax is always recorded so it can never be silently
+    skipped.
+    """
+    data = _stripped_bytes(stripped)
+    found: list[DeclarationOffset] = []
     index = 0
     while index + 4 <= len(data):
         if data[index : index + 4] == b"enum":
@@ -330,42 +480,230 @@ def declares_enum(stripped: str, name: str) -> bool:
                     cursor += 1
                 if data[cursor : cursor + 2] == b"r#":
                     cursor += 2
-                rest = data[cursor:].decode("utf-8", "replace")
-                if rest.startswith(name):
-                    after = cursor + len(name)
-                    if after >= len(data) or not (
-                        chr(data[after]).isalnum() or data[after] == 0x5F
-                    ):
-                        return True
-                    index = after
+                ident_end = _identifier_end(data, cursor)
+                if ident_end is None:
+                    # Unresolvable enum-adjacent syntax (end of input, or a
+                    # cell that cannot start an identifier). The accepted
+                    # detector fails closed here; so does the site set.
+                    found.append(DeclarationOffset(index, None))
+                    index += 1
                     continue
-                if cursor >= len(data):
-                    return True
-                cell = chr(data[cursor])
-                if not (cell.isalpha() or cell == "_"):
-                    return True
+                declared = data[cursor:ident_end].decode("ascii", "replace")
+                if accept(declared):
+                    found.append(DeclarationOffset(index, declared))
+                    index += 1
+                    continue
         index += 1
-    return False
+    return tuple(found)
+
+
+def _is_keyword(data: bytes, index: int, word: bytes) -> bool:
+    """Whole-word keyword test with the same boundaries as the enum scan."""
+    if data[index : index + len(word)] != word:
+        return False
+    if index >= 2 and data[index - 2] == ord("r") and data[index - 1] == ord("#"):
+        return False
+    if index and (chr(data[index - 1]).isalnum() or data[index - 1] == 0x5F):
+        return False
+    after = index + len(word)
+    if after < len(data) and (chr(data[after]).isalnum() or data[after] == 0x5F):
+        return False
+    return True
+
+
+def _is_mod_keyword(data: bytes, index: int) -> bool:
+    return _is_keyword(data, index, b"mod")
+
+
+def _mod_name_after(data: bytes, index: int) -> str | None:
+    """`mod` name (raw-prefixed identifiers included), or None if unnamed."""
+    cursor = index + 3
+    while cursor < len(data) and chr(data[cursor]).isspace():
+        cursor += 1
+    if data[cursor : cursor + 2] == b"r#":
+        cursor += 2
+    ident_end = _identifier_end(data, cursor)
+    if ident_end is None:
+        return None
+    return data[cursor:ident_end].decode("ascii", "replace")
+
+
+def _module_path_at(stripped: str, offset: int) -> tuple[str, ...]:
+    """Enclosing `mod` path at `offset`, by a brace-depth walk.
+
+    `offset` is a stripped-text byte index (latin-1; see `_strip_core`). Every
+    brace frame is pushed, but only a `mod name {` frame contributes to the
+    path, so an enum inside `fn`/`impl`/`struct` is not reported as module
+    nested while an enum inside `mod tests` is. `mod name;` opens no frame (its
+    `;` clears the pending name) and so contributes nothing. Comments and
+    string literals are already blank in `stripped`, so prose can never invent
+    a module path.
+    """
+    data = _stripped_bytes(stripped)
+    limit = max(0, min(offset, len(data)))
+    frames: list[str | None] = []
+    path: list[str] = []
+    pending: str | None = None
+    index = 0
+    while index < limit:
+        cell = data[index]
+        if cell == 0x7B:  # '{'
+            frames.append(pending)
+            if pending is not None:
+                path.append(pending)
+            pending = None
+        elif cell == 0x7D:  # '}'
+            if frames and frames.pop() is not None and path:
+                path.pop()
+        elif cell == 0x3B:  # ';'
+            pending = None
+        elif cell == 0x6D and _is_mod_keyword(data, index):  # 'm'
+            pending = _mod_name_after(data, index)
+            if pending is not None:
+                index += 3
+                continue
+        index += 1
+    return tuple(path)
+
+
+def _declaration_span_end(data: bytes, offset: int) -> int:
+    """End offset of the declaration starting at `offset`.
+
+    The enum body when its braces balance (`enum Name { .. }`), else the `enum`
+    keyword itself: an occurrence with no provable body reports only the span
+    the scanner could attribute.
+    """
+    index = offset + 4
+    while index < len(data) and data[index] not in (0x7B, 0x7D, 0x3B):
+        index += 1
+    if index >= len(data) or data[index] != 0x7B:
+        return offset + 4
+    depth = 0
+    while index < len(data):
+        cell = data[index]
+        if cell == 0x7B:
+            depth += 1
+        elif cell == 0x7D:
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    return offset + 4
+
+
+def _line_column_at(raw: bytes, offset: int) -> tuple[int, int]:
+    """1-based (line, character column) of a byte offset in the original file.
+
+    `raw` is the original file bytes, because the scan offset is a byte offset
+    (see `_strip_core`). The line prefix is decoded as UTF-8 before counting
+    characters, so a line carrying non-ASCII above the declaration reports the
+    real character column and not its byte column.
+    """
+    cut = max(0, min(offset, len(raw)))
+    line_start = raw.rfind(b"\n", 0, cut) + 1
+    return raw.count(b"\n", 0, cut) + 1, len(raw[line_start:cut].decode("utf-8")) + 1
+
+
+def _qualified_name(module_path: tuple[str, ...], name: str | None) -> str:
+    return "::".join((*module_path, name if name is not None else "<unresolved>"))
+
+
+def declares_enum(stripped: str, name: str) -> bool:
+    """True when stripped code declares `name` (or holds unresolvable enum syntax).
+
+    Boolean form of the shared occurrence scan; the whole-occurrence view is
+    `enum_declaration_sites`, which is the authoritative denominator.
+    """
+    return bool(_declaration_offsets(stripped, _name_is(name)))
+
+
+def enum_declaration_sites(needle: str = "CueKind") -> tuple[EnumDeclarationSite, ...]:
+    """Every `*needle*` enum declaration occurrence in the scan domain.
+
+    One site per declaration occurrence, never per file and never per type
+    name, each carrying its repo-relative path, enclosing `mod` path, qualified
+    name and 1-based source span. Cached like the rest of the pure scan layer.
+    """
+    return _enum_declaration_sites_cached(needle)
+
+
+@functools.lru_cache(maxsize=None)
+def _enum_declaration_sites_cached(
+    needle: str,
+) -> tuple[EnumDeclarationSite, ...]:
+    sites: list[EnumDeclarationSite] = []
+    for rel in candidate_files(needle):
+        text = read_text(rel)
+        raw = _read_bytes_cached(rel)
+        stripped = strip_rust(text)
+        data = _stripped_bytes(stripped)
+        for occurrence in _declaration_offsets(stripped, _name_contains(needle)):
+            end = _declaration_span_end(data, occurrence.offset)
+            module_path = _module_path_at(stripped, occurrence.offset)
+            line, column = _line_column_at(raw, occurrence.offset)
+            end_line, end_column = _line_column_at(raw, end)
+            sites.append(
+                EnumDeclarationSite(
+                    path=rel,
+                    name=occurrence.name,
+                    module_path=module_path,
+                    qualified_name=_qualified_name(module_path, occurrence.name),
+                    line=line,
+                    column=column,
+                    end_line=end_line,
+                    end_column=end_column,
+                    kind=DECLARATION_UNRESOLVED
+                    if occurrence.name is None
+                    else DECLARATION_RESOLVED,
+                )
+            )
+    return tuple(sites)
 
 
 def enum_declaration_files(name: str = "CueKind") -> list[str]:
-    hits: list[str] = []
-    for rel in candidate_files(name):
-        if declares_enum(strip_rust(read_text(rel)), name):
-            hits.append(rel)
-    return hits
+    """Repo-relative files declaring `name`; projection over the site set.
+
+    Deliberately the FILE view of `enum_declaration_sites`, never the
+    authoritative denominator: a second declaration inside one file cannot
+    appear here at all, so no owner/uniqueness claim may rest on it.
+    """
+    return sorted(
+        {
+            site.path
+            for site in enum_declaration_sites(name)
+            if site.name == name or site.kind == DECLARATION_UNRESOLVED
+        }
+    )
 
 
 def versioned_kind_enums() -> dict[str, str]:
-    """Every `enum *CueKind*` declaration site, name -> file (stripped code)."""
+    """Every `*CueKind*` declaration site, name -> file (stripped code).
+
+    Projection over `enum_declaration_sites`. A name declared at more than one
+    site is an owner collision: this projection keeps the first site in scan
+    order so the real owner is never silently displaced, and
+    `enum_name_collisions()` reports every collision instead of hiding it
+    behind a dict entry.
+    """
     found: dict[str, str] = {}
-    pattern = re.compile(
-        r"\benum\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*CueKind[A-Za-z0-9_]*|CueKind)\b"
-    )
-    for rel in candidate_files("CueKind"):
-        for match in pattern.finditer(strip_rust(read_text(rel))):
-            found.setdefault(match.group(1), rel)
+    for site in enum_declaration_sites():
+        if site.name is not None and site.name not in found:
+            found[site.name] = site.path
     return found
+
+
+def enum_name_collisions() -> list[str]:
+    """`name@path:line:column` for every type name declared at more than one site."""
+    counts: dict[str, list[EnumDeclarationSite]] = {}
+    for site in enum_declaration_sites():
+        if site.name is not None:
+            counts.setdefault(site.name, []).append(site)
+    return [
+        f"{name}@{site.path}:{site.line}:{site.column}"
+        for name, sites in sorted(counts.items())
+        if len(sites) > 1
+        for site in sites
+    ]
 
 
 def type_alias_hits() -> list[str]:
@@ -428,13 +766,64 @@ def allow_deprecated_files() -> list[str]:
     ]
 
 
-def permissive_lines(relative: str) -> list[str]:
-    needles = ("untagged", "alias", "Other", "Unknown", "_ =>", "impl Default")
+def permissive_lines_in(region: str) -> list[str]:
+    """Permissive escape hatches inside one already-scoped enum region.
+
+    Region-scoped on purpose. The previous whole-file form reported
+    `crates/smart/eliot-cue-contracts/src/normalization.rs:370` - a wildcard arm
+    of a `match` on a `NormalizationOutcome` tuple that returns a typed error,
+    in a file whose `CueKind` enum body contains no escape at all. A
+    file-granularity needle list cannot tell an enum escape from unrelated
+    control flow, and `enum_region_text` already exists precisely to draw that
+    line: "only the enum body counts for permissive-escape detection, never
+    attributes above it or unrelated code below it". A gate built on the
+    unscoped form would have been a false red on a clean tree, which is how a
+    gate gets ignored and then deleted.
+    """
     return [
         line.strip()
-        for line in strip_rust(read_text(relative)).splitlines()
-        if any(needle in line for needle in needles)
+        for line in region.splitlines()
+        if any(needle in line for needle in PERMISSIVE_NEEDLES)
     ]
+
+
+def permissive_enum_escapes() -> list[str]:
+    """Every permissive escape inside either declared kind enum's own body."""
+    escapes: list[str] = []
+    for label, relative, declaration, end_marker in (
+        ("V1", LEGACY_OWNER_FILE, LEGACY_OWNER_DECLARATION, LEGACY_OWNER_END),
+        ("A-10", CURRENT_OWNER_FILE, CURRENT_OWNER_DECLARATION, CURRENT_OWNER_END),
+    ):
+        try:
+            region = enum_region_text(relative, declaration, end_marker)
+        except ValueError:
+            escapes.append(f"{label}: enum region not resolvable in {relative}")
+            continue
+        escapes.extend(f"{label}:{line}" for line in permissive_lines_in(region))
+    return escapes
+
+
+def deprecated_suppression_violations() -> list[str]:
+    """`#[allow(deprecated)]` sites that actually suppress a current-kind use.
+
+    `allow_deprecated_files()` is a candidate finder and is expected to be
+    non-empty: `crates/agent/eliot-agent-acp/src/lib.rs` carries two
+    `#[allow(deprecated)]` attributes, both on `#[test]` functions and neither
+    anywhere near `CueKind`. Treating a non-empty candidate list as a finding
+    would be a false red, so the oracle applies the same adjudication the
+    contract case applies - a window around the attribute must mention the
+    current kind. The candidate finder stays a finder; this is the gate.
+    """
+    violations: list[str] = []
+    for relative in allow_deprecated_files():
+        lines = read_text(relative).splitlines()
+        for index, line in enumerate(lines):
+            if "allow(deprecated" not in line:
+                continue
+            window = "\n".join(lines[max(0, index - 15) : index + 15])
+            if re.search(TOKEN, window):
+                violations.append(f"{relative}:{index + 1}")
+    return violations
 
 
 def enum_region_text(relative: str, declaration: str, end_marker: str) -> str:
@@ -709,6 +1098,11 @@ INCOMPLETE_INCLUDE_MACRO = "include-macro-fixture-bytes"
 INCOMPLETE_MACRO_RULES = "macro-rules-definition"
 INCOMPLETE_UNCLOSED = "unclosed-lexical-input"
 INCOMPLETE_UNKNOWN_ROOT = "unknown-scan-root"
+# `enum` occurrences whose following identifier the scanner cannot resolve
+# (end of input, or a cell that cannot start an identifier). A file in the
+# scan domain carrying one has an unproved declaration denominator, so it is
+# reported INCOMPLETE rather than counted as a proven single owner.
+INCOMPLETE_UNRESOLVED_DECLARATION = "unresolved-enum-declaration"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -783,43 +1177,178 @@ def _unknown_root_kind_files_cached() -> tuple[str, ...]:
     return tuple(out)
 
 
+def unresolved_declaration_files() -> list[str]:
+    """Scan-domain files holding an `enum` occurrence the scanner cannot resolve.
+
+    Issue rule: unknown syntax is INCOMPLETE, never zero. These files are
+    reported through `INCOMPLETE_UNRESOLVED_DECLARATION` instead of being
+    counted as a proven absence of a second owner.
+    """
+    return sorted(
+        {
+            site.path
+            for site in enum_declaration_sites()
+            if site.kind == DECLARATION_UNRESOLVED
+        }
+    )
+
+
 def denominator_status() -> ScanVerdict:
-    """Explicit denominator verdict: COMPLETE or INCOMPLETE (never zero-claim)."""
+    """Explicit denominator verdict: COMPLETE or INCOMPLETE (never zero-claim).
+
+    The whole-occurrence declaration set is the denominator here: every file
+    carrying a `*CueKind*` declaration occurrence (resolved or unresolved)
+    joins the legacy consumer files, and an unresolvable occurrence makes its
+    file INCOMPLETE rather than silently absent.
+    """
     denominator = sorted(
         set(legacy_kind_consumer_files())
-        | set(versioned_kind_enums().values())
-        | set(enum_declaration_files())
+        | {site.path for site in enum_declaration_sites()}
     )
+    unresolved = set(unresolved_declaration_files())
     complete: list[str] = []
     incomplete: list[tuple[str, str]] = []
     for rel in denominator:
+        if rel in unresolved:
+            # An unresolvable `enum` leaves this file's declaration denominator
+            # unproved, so the file is never also reported as a proven-complete
+            # scan; the unresolvable-declaration reason is the stable one.
+            incomplete.append((rel, INCOMPLETE_UNRESOLVED_DECLARATION))
+            continue
         status, reason = scan_file_status(rel)
         if status == "COMPLETE":
             complete.append(rel)
         else:
             incomplete.append((rel, reason))
+    for rel in sorted(unresolved - set(denominator)):
+        incomplete.append((rel, INCOMPLETE_UNRESOLVED_DECLARATION))
     for rel in unknown_root_kind_files():
         incomplete.append((rel, INCOMPLETE_UNKNOWN_ROOT))
     status = "INCOMPLETE" if incomplete else "COMPLETE"
     return ScanVerdict(status, tuple(complete), tuple(incomplete))
 
 
+# The one allowed current declaration: A-10 (#804) at the top level of its own
+# owner file. Any other current-kind declaration is an owner collision, whether
+# it is a second enum in this same file, an enum in another file, an enum
+# nested in any `mod`, or syntax the scanner cannot resolve.
+CURRENT_OWNER_NAME = "CueKind"
+CURRENT_OWNER_FILE = "crates/smart/eliot-cue-contracts/src/normalization.rs"
+
+# The retained explicit V1 legacy owner, and the region boundaries used to read
+# each declared kind enum's own body. The A-10 end marker is the enum's closing
+# brace at column 0, which is what keeps attributes above the declaration and
+# unrelated code below it out of the permissive-escape scan.
+LEGACY_OWNER_FILE = "crates/eliot-types/src/ul/cue.rs"
+LEGACY_OWNER_DECLARATION = "pub enum LegacyCueKindV1"
+LEGACY_OWNER_END = "impl LegacyCueKindV1"
+CURRENT_OWNER_DECLARATION = "pub enum CueKind"
+CURRENT_OWNER_END = "\n}\n"
+
+# Escape hatches that would make a closed kind vocabulary open. Shared by the
+# oracle and the contract case so the two cannot drift apart.
+PERMISSIVE_NEEDLES = ("untagged", "alias", "Other", "Unknown", "_ =>", "impl Default")
+
+# Two live owners are legitimate and named, so the gate is a drift check against
+# these exact sets rather than an emptiness check. Emptiness would be wrong in
+# both directions: it would pass a second, illegitimate `pub use` of the bare
+# current kind, and it would fail on the A-13 facade re-export that the issue
+# requires to survive.
+ALLOWED_CURRENT_REEXPORTS = (
+    (
+        "crates/smart/eliot-cues/src/lib.rs",
+        "pub use eliot_cue_contracts::{CueKind, MatchMode};",
+    ),
+)
+# Exactly one live owner branches on historical V1 spelling literals: the named
+# #833 decoder, whose arms construct the A-10 owner.
+ALLOWED_STRING_SWITCH_OWNERS = ("crates/smart/eliot-cues/src/legacy_adapter.rs",)
+
+
+def current_owner_site_violations() -> list[str]:
+    """Every current-kind occurrence that is not the single allowed declaration.
+
+    Whole-occurrence check, not a file check: a file-granularity list is
+    unchanged by `pub mod accidental_second_owner { pub enum CueKind { .. } }`
+    appended to the owner file, which is exactly the second-owner collision
+    I05-15 forbids. The occurrence set is compared against the single allowed
+    declaration, so a missing owner declaration, an extra occurrence, a
+    `mod`-nested occurrence, an out-of-file occurrence and an unresolved
+    occurrence all fail closed. Never weaker than the file-granularity check it
+    replaces: every input that made `enum_declaration_files() != [OWNER]` true
+    is a violation here, plus the occurrences that list could not see.
+    """
+    violations: list[str] = []
+    allowed = 0
+    for site in enum_declaration_sites():
+        if site.name is not None and site.name != CURRENT_OWNER_NAME:
+            continue
+        reasons: list[str] = []
+        if site.kind == DECLARATION_UNRESOLVED:
+            reasons.append("unresolved-declaration")
+        if site.module_path:
+            reasons.append("module-nested:" + "::".join(site.module_path))
+        if site.path != CURRENT_OWNER_FILE:
+            reasons.append("outside-current-owner")
+        if reasons:
+            violations.append(
+                f"{site.path}:{site.line}:{site.column}"
+                f"-{site.end_line}:{site.end_column} {site.qualified_name}"
+                f" [{', '.join(reasons)}]"
+            )
+        else:
+            allowed += 1
+    if allowed != 1:
+        violations.append(
+            f"{CURRENT_OWNER_FILE}: expected exactly one current "
+            f"{CURRENT_OWNER_NAME} declaration, found {allowed}"
+        )
+    return violations
+
+
 def main() -> int:
     findings: list[str] = []
-    if enum_declaration_files() != [
-        "crates/smart/eliot-cue-contracts/src/normalization.rs"
-    ]:
-        findings.append(f"current-enum-denominator: {enum_declaration_files()}")
+    if current_owner_site_violations():
+        findings.append(
+            f"current-enum-occurrence-denominator: {current_owner_site_violations()}"
+        )
+    for collision in enum_name_collisions():
+        findings.append(f"current-enum-name-collision: {collision}")
     if type_alias_hits():
         findings.append(f"legacy-alias-present: {type_alias_hits()}")
     if eliot_types_consumer_files():
         findings.append(f"eliot-types-consumers: {eliot_types_consumer_files()}")
+    # The four detectors below were implemented and never called: each had
+    # exactly one reference in this file, its own `def`. An implemented check
+    # that nothing invokes is not a weaker check, it is no check, so they are
+    # wired here where a real run can reach them. Two of them are drift checks
+    # against a named legitimate owner rather than emptiness checks, and two
+    # needed their scan narrowed before wiring, because wiring them as written
+    # would have produced a false red on a clean tree and taught everyone to
+    # ignore this script.
+    if list(reexport_lines()) != list(ALLOWED_CURRENT_REEXPORTS):
+        findings.append(
+            f"current-kind-reexport-drift: expected {list(ALLOWED_CURRENT_REEXPORTS)}, "
+            f"found {reexport_lines()}"
+        )
+    if tuple(string_switch_owner_files()) != ALLOWED_STRING_SWITCH_OWNERS:
+        findings.append(
+            f"string-switch-owner-drift: expected {list(ALLOWED_STRING_SWITCH_OWNERS)}, "
+            f"found {string_switch_owner_files()}"
+        )
+    if deprecated_suppression_violations():
+        findings.append(
+            f"current-kind-deprecation-suppression: {deprecated_suppression_violations()}"
+        )
+    if permissive_enum_escapes():
+        findings.append(f"permissive-enum-escape: {permissive_enum_escapes()}")
     verdict = denominator_status()
     # Pass-with-pending (accepted residual): the include-macro incomplete set
     # below is the explicitly admitted boundary. Anything else — a second
     # current enum, a legacy alias, an eliot_types consumer, a changed
-    # incomplete set, an unclosed input, a macro-rules definition or an
-    # unknown scan root — fails closed with exit 1.
+    # incomplete set, an unclosed input, a macro-rules definition, an
+    # unresolvable declaration or an unknown scan root — fails closed with
+    # exit 1.
     accepted = {
         ("crates/eliot-app/src/mcp_stdio/protocol_tests.rs", INCOMPLETE_INCLUDE_MACRO),
         ("crates/eliot-app/tests/ul_pyramid_delivery.rs", INCOMPLETE_INCLUDE_MACRO),

@@ -10,9 +10,39 @@
 //! retained in bridge outcome evidence and never promoted to canonical
 //! task/job identity: the exchange keys on the admitted operation identity.
 //! Provider bodies never enter errors; every refusal carries a stable reason.
+//!
+//! ## Envelope delivery (issue #24, W4)
+//!
+//! The shared process contour has no stdin channel. This module therefore
+//! does **not** pretend the full envelope bytes are delivered to the child.
+//! Instead the submit is delivered in two exact, separately verifiable parts:
+//!
+//! 1. [`SubmitBinding`] — the envelope *minus* the process-request digest. It
+//!    contains the operation identity, exchange and idempotency correlation,
+//!    protocol revision, required schema, and the exact request digest. Its
+//!    canonical SHA-256 is projected into the **admitted** `ProcessIntent`
+//!    argv, which the dispatch permit seals through the intent's
+//!    `effect_digest`. The provider therefore receives a Kernel-authorized,
+//!    digest-bound description of exactly which request it must answer, and it
+//!    cannot be substituted or retargeted without detection. No child pipe is
+//!    opened, so no ambient caller-supplied input surface returns.
+//!
+//! 2. [`SubmitEnvelope`] — the full canonical envelope, which additionally
+//!    binds the sealed process-request digest. Its bytes are the exact
+//!    reconciliation/evidence record: they are retained in
+//!    `ProviderExecution::wire_bytes` and in the terminal
+//!    `ProviderExecutionReceipt`, so a replay or an unknown outcome can be
+//!    reconciled byte-for-byte against the digest the provider was given.
+//!
+//! Splitting the binding from the invocation digest is what makes this
+//! non-circular: the binding digest is computed before the process request
+//! exists, and the process request's own digest is what the envelope then
+//! records. A single self-referential digest would be uncomputable.
 
 use eliot_contracts::ContractVersion;
 use serde::{Deserialize, Serialize};
+
+use crate::evidence::sha256_hex;
 
 /// Current research-provider wire version. The bridge accepts exactly this
 /// version; anything else is a stale/foreign wire, never a best-effort parse.
@@ -37,6 +67,8 @@ pub enum ProtocolRefusal {
     MissingResultFrame,
     /// Provider output exceeds the line scan bound.
     TooManyLines,
+    /// The envelope and its binding disagree on a shared field.
+    BindingMismatch,
 }
 
 impl ProtocolRefusal {
@@ -50,15 +82,70 @@ impl ProtocolRefusal {
             Self::BlankCorrelation => "provider correlation field is blank",
             Self::MissingResultFrame => "provider output carries no terminal result frame",
             Self::TooManyLines => "provider output exceeds the wire line bound",
+            Self::BindingMismatch => "submit envelope disagrees with its delivered submit binding",
         }
     }
 }
 
-/// Canonical submit envelope handed to the request-minting port.
+/// Bounded submit projection delivered to the provider through the admitted
+/// `ProcessIntent` argv.
 ///
-/// The port decides how these bytes reach the child (argv/digest reference);
-/// the envelope binds operation, route, and exact request content so the
-/// child cannot be substituted or retargeted without detection.
+/// This is the part of the submit the provider can actually verify: its
+/// canonical digest is the value handed over, and the field values are the
+/// exact correlation the answer must be attributed to. It deliberately omits
+/// the process-request digest, which cannot exist before the argv is sealed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitBinding {
+    /// Exact wire version (must equal `RESEARCH_PROVIDER_WIRE_VERSION`).
+    pub wire_version: u16,
+    /// Stable admitted operation identity.
+    pub operation_id: String,
+    /// Exchange correlation echoed from the request.
+    pub exchange_id: String,
+    /// Idempotency correlation echoed from the request.
+    pub idempotency_key: String,
+    /// Admitted protocol revision.
+    pub protocol_revision: ContractVersion,
+    /// Admitted required result schema.
+    pub required_schema: String,
+    /// SHA-256 of the canonical request JSON this binding was built from.
+    pub request_sha256: String,
+}
+
+impl SubmitBinding {
+    /// Returns the canonical bytes of this binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolRefusal::WireTooLarge`] when the encoded binding
+    /// exceeds the wire bound.
+    pub fn encode(&self) -> Result<Vec<u8>, ProtocolRefusal> {
+        let bytes = serde_json::to_vec(self).map_err(|_| ProtocolRefusal::MalformedWire)?;
+        if bytes.len() > MAX_WIRE_BYTES {
+            return Err(ProtocolRefusal::WireTooLarge);
+        }
+        Ok(bytes)
+    }
+
+    /// Returns the canonical SHA-256 digest projected into the admitted argv.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolRefusal::WireTooLarge`] when the encoded binding
+    /// exceeds the wire bound.
+    pub fn digest(&self) -> Result<String, ProtocolRefusal> {
+        Ok(sha256_hex(&self.encode()?))
+    }
+}
+
+/// Canonical submit envelope retained as the exact reconciliation record.
+///
+/// The envelope binds operation, route, exact request content, and the sealed
+/// process-request digest the execution ran under. Its bytes never reach the
+/// child as a stream (see the module docs); they are retained so an unknown
+/// outcome or a replay can be reconciled byte-for-byte against the binding
+/// digest the provider was actually given.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitEnvelope {
@@ -81,6 +168,24 @@ pub struct SubmitEnvelope {
 }
 
 impl SubmitEnvelope {
+    /// Returns the bounded submit projection of this envelope.
+    ///
+    /// # Errors
+    ///
+    /// Never fails for a well-formed envelope; the signature stays total so
+    /// the call site cannot silently skip the projection.
+    pub fn binding(&self) -> SubmitBinding {
+        SubmitBinding {
+            wire_version: self.wire_version,
+            operation_id: self.operation_id.clone(),
+            exchange_id: self.exchange_id.clone(),
+            idempotency_key: self.idempotency_key.clone(),
+            protocol_revision: self.protocol_revision,
+            required_schema: self.required_schema.clone(),
+            request_sha256: self.request_sha256.clone(),
+        }
+    }
+
     /// Encodes the envelope to canonical bounded bytes.
     pub fn encode(&self) -> Result<Vec<u8>, ProtocolRefusal> {
         let bytes = serde_json::to_vec(self).map_err(|_| ProtocolRefusal::MalformedWire)?;

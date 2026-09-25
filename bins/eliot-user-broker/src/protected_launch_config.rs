@@ -27,7 +27,7 @@
 
 use std::fs;
 
-use eliot_platform_windows::ProtectedPathLease;
+use eliot_platform_windows::{ProtectedPathLease, WindowsPlatform};
 use eliot_user_broker_core::{OperatorArtifact, RegistrationRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,6 +35,7 @@ use sha2::{Digest, Sha256};
 
 use super::CompositionError;
 use super::operation_identity::validate_fence_value;
+use crate::BrokerAdmissionRefusal;
 
 /// Stable protected launch binding schema version.
 pub(super) const LAUNCH_BINDING_SCHEMA: &str = "eliot.user-broker.launch-binding.v2";
@@ -66,6 +67,54 @@ pub(super) struct BrokerLaunchBinding {
     pub(super) launch_authority_fence: Value,
 }
 
+/// The live process identity this broker is admitted as.
+///
+/// A process id alone is not a process: Windows reuses ids, and a broker that
+/// only pinned its pid could be satisfied by an unrelated process that later
+/// inherited the number. The binding therefore names the id, the observed
+/// process start instant, and the SHA-256 of the exact executable image that
+/// was running when the broker admitted itself. It is re-observed on every
+/// authenticated broker operation, so a replaced image, a recycled id, or a
+/// substituted process fails closed before any Kernel transaction.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BrokerProcessBinding {
+    /// The observable live-process identity, re-proven on every operation.
+    pub(super) identity: BrokerProcessIdentity,
+    /// Lowercase SHA-256 of the exact running executable image, observed once
+    /// when the broker admitted itself against its protected declaration.
+    pub(super) artifact_digest: String,
+}
+
+/// The cheap, per-operation half of the live process identity.
+///
+/// Re-proving the id, the start instant, and the running image path on every
+/// authenticated operation is what makes a replaced image, a recycled
+/// process id, or a substituted process fail closed. Re-hashing the image
+/// bytes is deliberately *not* repeated here: it is proven once at admission
+/// (and again on the next start), because the bytes a running process
+/// executes cannot change underneath it without the start instant changing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BrokerProcessIdentity {
+    /// Current OS process id.
+    pub(super) process_id: u32,
+    /// Observed process start instant, in 100 ns units since the Windows
+    /// epoch. Zero is not a usable start observation and is refused.
+    pub(super) process_start_100ns: u64,
+    /// Image path the OS reports for this process id.
+    pub(super) image_path: String,
+}
+
+impl BrokerProcessIdentity {
+    /// Returns whether this observation is the same live process.
+    pub(super) fn is_same_process(&self, other: &Self) -> bool {
+        self.process_id == other.process_id
+            && self.process_start_100ns == other.process_start_100ns
+            && eliot_platform_windows::ordinal_eq_str(&self.image_path, &other.image_path)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct OperatorArtifactConfig {
@@ -78,6 +127,49 @@ fn artifact_digest() -> Result<String, CompositionError> {
     let executable = std::env::current_exe().map_err(CompositionError::Durable)?;
     let bytes = fs::read(executable).map_err(CompositionError::Durable)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+/// Observes the live process identity (id, start instant, running image).
+///
+/// The image path observed from the OS handle must be the executable this
+/// process started from: an observed path that names anything else means the
+/// id was inspected for a different process, which is refused rather than
+/// interpreted. Nothing here mints authority — it only proves which process
+/// the authenticated declaration is describing.
+pub(super) fn current_process_identity() -> Result<BrokerProcessIdentity, CompositionError> {
+    let executable = std::env::current_exe().map_err(CompositionError::Durable)?;
+    let root = executable.parent().ok_or_else(|| {
+        BrokerAdmissionRefusal::ProcessIdentityUnprovable.with_platform("executable has no parent")
+    })?;
+    let platform = WindowsPlatform::new(root)
+        .map_err(|error| BrokerAdmissionRefusal::ProcessIdentityUnprovable.with_platform(error))?;
+    let observed = platform
+        .process_identity(std::process::id())
+        .map_err(|error| BrokerAdmissionRefusal::ProcessIdentityUnprovable.with_platform(error))?;
+    if observed.process_id == 0
+        || observed.start_time_100ns == 0
+        || !eliot_platform_windows::ordinal_eq_str(
+            &observed.image_path,
+            &executable.to_string_lossy(),
+        )
+    {
+        return Err(BrokerAdmissionRefusal::ProcessIdentityUnprovable
+            .with_platform("observed process image is not this executable"));
+    }
+    Ok(BrokerProcessIdentity {
+        process_id: observed.process_id,
+        process_start_100ns: observed.start_time_100ns,
+        image_path: observed.image_path,
+    })
+}
+
+/// Observes the complete admission binding: the live process identity plus
+/// the digest of the exact image bytes that process is running.
+pub(super) fn current_process_binding() -> Result<BrokerProcessBinding, CompositionError> {
+    Ok(BrokerProcessBinding {
+        identity: current_process_identity()?,
+        artifact_digest: artifact_digest()?,
+    })
 }
 
 fn validate_operator_artifact(config: &OperatorArtifactConfig) -> Result<(), CompositionError> {

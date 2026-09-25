@@ -362,7 +362,6 @@ fn constructed_store_runtime_is_not_ready() {
 fn route_and_generation_are_exact() {
     let dir = temp_root(7);
     let requirement = test_requirement(7);
-    let expected_epoch = requirement.state_fence.authority_epoch.sequence.get();
     let expected_generation = requirement.state_fence.resource_generation.value();
     let (bytes, kernel) = capture(|| {
         KernelComposition::new(KernelConfig::new(&dir).with_store_bootstrap(requirement.clone()))
@@ -371,14 +370,21 @@ fn route_and_generation_are_exact() {
     let text = captured_text(&bytes);
     assert!(text.contains("kernel.composition.route_registered:daemon"));
     assert!(text.contains("kernel.composition.route_registered:store_bridge"));
-    assert!(text.contains(&format!("epoch={expected_epoch}")));
+    // The composition observation now spells the whole epoch tuple, so the
+    // route observation can no longer be satisfied by a bare sequence from
+    // another lineage (Implements #64).
+    assert!(text.contains(&format!(
+        "epoch={:?}",
+        requirement.state_fence.authority_epoch
+    )));
     assert!(text.contains(&format!("generation={expected_generation}")));
     let routes = kernel.generation_route_snapshot().expect("snapshot");
     let scope = eliot_kernel_core::RouteScope::new("store_bridge").expect("scope");
     let route = routes.route(&scope).expect("store_bridge route");
-    assert_eq!(
-        route.authority_epoch().value(),
-        requirement.state_fence.authority_epoch.sequence.get()
+    assert!(
+        route
+            .authority_epoch()
+            .is_same_authority(&requirement.state_fence.authority_epoch)
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

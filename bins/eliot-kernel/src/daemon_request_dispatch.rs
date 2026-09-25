@@ -31,8 +31,8 @@ use eliot_process::{
     ProcessExecutionView, ProcessLifecycle,
 };
 use eliot_protocol::{
-    HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt, RequestIdentity,
-    host_request_operation_id,
+    AgentActivationClaimRequest, HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
+    RequestIdentity, host_request_operation_id,
 };
 #[cfg(windows)]
 use eliot_runtime_contracts::{
@@ -68,6 +68,49 @@ pub(crate) const DAEMON_SUPERVISION_PROGRESS_OPERATION: &str = "daemon_supervisi
 /// open handshake supplies the channel evidence and the Host owner supplies
 /// the Durable Job/Wake effects.
 pub(crate) const USER_AUTOMATION_RUNTIME_OPERATION: &str = "user_automation_runtime";
+/// Authenticated owner route carrying one canonical notification lifecycle
+/// transition (issue #1780, I11.5/I11.7).
+///
+/// The marker is the canonical store contract's own closed mutation name
+/// (`eliot_store_api::NOTIFICATION_STATE_MUTATION_NAME`, i.e.
+/// `ApplyNotificationState`) and not a second Kernel vocabulary: the same
+/// string is the mutation leg marker multiplexed by the notification
+/// surface's `eliot.notify.state.v1` selector, so surface and Kernel cannot
+/// drift into two spellings of one canonical write.
+pub(crate) const NOTIFICATION_STATE_MUTATION_OPERATION: &str =
+    eliot_store_api::NOTIFICATION_STATE_MUTATION_NAME;
+/// Authenticated owner route serving one bounded canonical notification inbox
+/// page (issue #1780). The marker is the store contract's own closed read name
+/// (`eliot_store_api::NOTIFICATION_STATE_READ_NAME`, i.e.
+/// `GetNotificationState`), the same selector the `ControlBoard` inbox read
+/// already exercises through `store_named`.
+pub(crate) const NOTIFICATION_STATE_READ_OPERATION: &str =
+    eliot_store_api::NOTIFICATION_STATE_READ_NAME;
+/// Response `kind` of the committed notification transition projection.
+#[cfg(windows)]
+const NOTIFICATION_STATE_RESPONSE_KIND: &str = "notification_state";
+/// Response `kind` of the bounded notification inbox projection.
+#[cfg(windows)]
+const NOTIFICATION_STATE_PAGE_RESPONSE_KIND: &str = "notification_state_page";
+
+/// Authenticated P-07 read route answering the completed canonical second
+/// phases of one authority root (issue #2100, `R6`).
+///
+/// The Kernel commits the immutable first-phase grant-closure row and the
+/// canonical receipt identity as two separate ORS records, and it owns ORS in
+/// its own process. Without this route the daemon can observe that a closure
+/// was fenced but can never learn whether its canonical second phase already
+/// completed, so it can neither complete a pending one nor avoid re-presenting
+/// a completed one. The route is read-only: it never links, never fences, and
+/// never mints authority, and it requires no bound P-07 owner so the very first
+/// feed pass can learn the links of a lineage whose owner is not bound yet.
+pub(crate) const QUERY_GRANT_CLOSURE_LINKS_OPERATION: &str =
+    "query_grant_closure_canonical_receipts";
+/// Typed receipt kind answered by the canonical second-phase read arm.
+const GRANT_CLOSURE_LINKS_KIND: &str = "grant_closure_canonical_receipts";
+/// Typed refusal kind answered by the same arm, carrying the durable reason a
+/// read could not be served. A refusal is never an empty link set.
+const GRANT_CLOSURE_LINKS_REFUSAL_KIND: &str = "grant_closure_canonical_receipts_refused";
 
 const STARTUP_EVIDENCE_FIELDS: [&str; 8] = [
     "transport_binding",
@@ -374,6 +417,8 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "apply_prepared" => "apply_prepared",
         "receipt" => "receipt",
         "store_named" => "store_named",
+        NOTIFICATION_STATE_MUTATION_OPERATION => NOTIFICATION_STATE_MUTATION_OPERATION,
+        NOTIFICATION_STATE_READ_OPERATION => NOTIFICATION_STATE_READ_OPERATION,
         "local_read" => "local_read",
         "daemon_degraded" => "daemon_degraded",
         "daemon_fatal" => "daemon_fatal",
@@ -387,10 +432,12 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "agent_host_request_cancel" => "agent_host_request_cancel",
         "publish_owner_bundle" => "publish_owner_bundle",
         "query_owner_bundle" => "query_owner_bundle",
+        "initialize_owner_revision" => "initialize_owner_revision",
         "activate_grant" => "activate_grant",
         "revoke_grant" => "revoke_grant",
         "activate_introduction" => "activate_introduction",
         "revoke_introduction" => "revoke_introduction",
+        QUERY_GRANT_CLOSURE_LINKS_OPERATION => QUERY_GRANT_CLOSURE_LINKS_OPERATION,
         "publish_wasm_dispatch_bundle" => "publish_wasm_dispatch_bundle",
         "bind_notify_launch_grant" => "bind_notify_launch_grant",
         "agent_host_request_reconcile" => "agent_host_request_reconcile",
@@ -436,23 +483,35 @@ struct StoreRecoveryOperation {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OwnerPublishOperation {
+    operation: String,
     bundle: super::GovernorClosureRestore,
     expected_revision: u64,
+}
+
+/// Closed owner-lineage revision initialization operation (`#2100`).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerRevisionOperation {
+    authority_root_ref: String,
+    expected_revision: u64,
+    state_fence: StateFence,
 }
 
 /// Closed P-07 grant activation operation (`#1110`).
 ///
 /// Mirrors the authenticated `KernelAuthorityClient` payload: string
-/// identities plus the exact presented authority binding. The dispatcher
-/// decodes, rechecks the binding against the authenticated session, and
-/// routes through the retained P-07 owner port; it never mints authority.
-/// Unknown fields fail closed.
+/// identities, the exact presented authority binding, and the presented
+/// principal/session/scope subject. The dispatcher decodes, rechecks both
+/// against the authenticated session, and routes through the retained P-07
+/// owner port; it never mints authority. Unknown or absent fields fail
+/// closed.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GrantActivationOperation {
     grant_id: String,
     snapshot_id: String,
     binding: eliot_receipts::AuthorityBinding,
+    subject: eliot_receipts::AuthorityRequestSubject,
 }
 
 /// Closed P-07 grant revocation operation (`#1110`). Same shape and
@@ -464,10 +523,11 @@ struct GrantRevocationOperation {
     grant_id: String,
     snapshot_id: String,
     binding: eliot_receipts::AuthorityBinding,
+    subject: eliot_receipts::AuthorityRequestSubject,
 }
 
-/// Closed P-07 introduction activation operation (`#1110`). Same shape and
-/// fail-closed contract as the grant activation operation, keyed by
+/// Closed P-07 introduction activation operation (`#1110`). Same shape
+/// and fail-closed contract as the grant activation operation, keyed by
 /// introduction identity.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -475,10 +535,11 @@ struct IntroductionActivationOperation {
     introduction_id: String,
     snapshot_id: String,
     binding: eliot_receipts::AuthorityBinding,
+    subject: eliot_receipts::AuthorityRequestSubject,
 }
 
-/// Closed P-07 introduction revocation operation (`#1110`). Same shape and
-/// fail-closed contract as the grant revocation operation, keyed by
+/// Closed P-07 introduction revocation operation (`#1110`). Same shape
+/// and fail-closed contract as the grant revocation operation, keyed by
 /// introduction identity.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -486,6 +547,7 @@ struct IntroductionRevocationOperation {
     introduction_id: String,
     snapshot_id: String,
     binding: eliot_receipts::AuthorityBinding,
+    subject: eliot_receipts::AuthorityRequestSubject,
 }
 
 /// Canonical installed WASM-host image filename pinned by the
@@ -548,6 +610,12 @@ fn owner_bundle_agrees_with_session(
     bundle: &super::GovernorClosureRestore,
     session: &Session,
 ) -> bool {
+    let Some(history) = &bundle.revocation_history else {
+        return false;
+    };
+    if history.state_fence != session.module_generation.state_fence {
+        return false;
+    }
     let mut bindings = bundle
         .members
         .iter()
@@ -560,23 +628,42 @@ fn owner_bundle_agrees_with_session(
                 .map(|hydration| &hydration.intent.binding),
         );
     bindings.all(|binding| {
-        binding
-            .authority_epoch
-            .is_same_authority(&session.authority_epoch)
+        binding.authority_epoch == session.authority_epoch
+            && binding.state_fence == session.module_generation.state_fence
     })
 }
 
-/// Rechecks one presented P-07 binding against the authenticated session
-/// before the dispatcher touches the retained owner: the fence must validate,
-/// the binding epoch must agree with the fence epoch, the binding authority
-/// must be the session authority, and the presented fence must be the session
-/// generation fence. Anything else fails closed before mutation.
+/// Rechecks one presented P-07 binding and subject against the authenticated
+/// session before the dispatcher touches the retained owner, and therefore
+/// before any authority mutation.
+///
+/// Four independent closed checks, none of them satisfied by caller material
+/// alone:
+///
+/// - the presented subject is a well-formed principal/session/scope triple
+///   (no blank or control-bearing identity, and no secret, provider detail,
+///   arbitrary payload or free prose);
+/// - the presented principal is exactly the caller the authenticated
+///   handshake proved, so a cross-principal presentation is refused;
+/// - the presented session is exactly the authenticated transport session, so
+///   a request replayed or forwarded on another session is refused;
+/// - the presented scope is one the authenticated session actually holds, so
+///   a cross-scope presentation is refused even on the right session;
+///
+/// plus the compact binding: the fence must validate, the binding epoch must
+/// agree with the fence epoch, the binding authority must be the session
+/// authority, and the presented fence must be the session generation fence.
+/// Anything else fails closed before mutation.
 fn p07_binding_agrees_with_session(
     binding: &eliot_receipts::AuthorityBinding,
+    subject: &eliot_receipts::AuthorityRequestSubject,
     session: &Session,
 ) -> Result<(), TransportError> {
     binding
         .state_fence
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    subject
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
     if binding.authority_epoch != binding.state_fence.authority_epoch
@@ -584,6 +671,15 @@ fn p07_binding_agrees_with_session(
             .authority_epoch
             .is_same_authority(&session.authority_epoch)
         || binding.state_fence != session.module_generation.state_fence
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    if !subject.is_principal(session.module_generation.module_id.as_str())
+        || !subject.is_session(session.connection_id.as_str())
+        || !session
+            .capabilities
+            .iter()
+            .any(|capability| subject.is_scope(capability.as_str()))
     {
         return Err(TransportError::SessionFenced);
     }
@@ -640,6 +736,133 @@ struct StoreApplyOperation {
     transition: PreparedTransition,
     expected_revision_heads: Vec<RevisionHeadExpectation>,
     expected_ordering_heads: Vec<OrderingHeadExpectation>,
+}
+
+/// Canonical notification transition carrier for the
+/// [`NOTIFICATION_STATE_MUTATION_OPERATION`] route (issue #1780).
+///
+/// The owner submits the already-admitted plan exactly as the
+/// `apply_prepared` route requires; the Kernel never mints the operation
+/// identity, the admission digests, or the mutation plan digest here. The
+/// route exists so the canonical notification lifecycle has one admitted,
+/// Kernel-owned entry instead of riding the general transition route
+/// unreviewed.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NotificationStateApplyOperation {
+    context: RequestMeta,
+    transition: PreparedTransition,
+    expected_revision_heads: Vec<RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<OrderingHeadExpectation>,
+}
+
+/// Bounded canonical notification inbox selectors for the
+/// [`NOTIFICATION_STATE_READ_OPERATION`] route (issue #1780).
+///
+/// Exactly the store contract's closed `GetNotificationState` selector set:
+/// no quiet-hours field, no delivery-visibility field, and no role filter can
+/// travel here, so a read can never be narrowed by a suppression policy.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NotificationStateReadOperation {
+    state_fence: StateFence,
+    scope: Option<String>,
+    dedup_key: Option<String>,
+    notification_id: Option<String>,
+    include_resolved: bool,
+    page_limit: u16,
+    cursor: Option<String>,
+}
+
+/// One bounded canonical notification page query (issue #1780).
+///
+/// The typed parameter of the single notification read seam
+/// ([`KernelComposition::read_notification_page`]): the store contract's
+/// closed `GetNotificationState` selector set together with the fence the
+/// page must be served and proved under. The fence is a named field rather
+/// than a sibling argument because that is the whole hazard this value
+/// removes — a selector set and the fence it is served under are one fact
+/// about one read, and a caller can no longer hand `read_notification_page` a
+/// query built for one fence and check the echoed fence against another.
+///
+/// Exactly the closed selector set, nothing else: no quiet-hours field, no
+/// delivery-visibility field, and no role filter, so no read resolved through
+/// this value can be narrowed by a suppression policy (I11.7, I11.10).
+#[cfg(windows)]
+struct NotificationPageQuery {
+    /// The exact fence the page is served and proved under.
+    state_fence: StateFence,
+    /// Optional canonical scope selector.
+    scope: Option<String>,
+    /// Optional deduplication-index selector.
+    dedup_key: Option<String>,
+    /// Optional canonical notification-identity selector.
+    notification_id: Option<String>,
+    /// Whether resolved records join the page.
+    include_resolved: bool,
+    /// Bounded page size; the store contract rejects an out-of-range value.
+    page_limit: u16,
+    /// Opaque page cursor.
+    cursor: Option<String>,
+}
+
+#[cfg(windows)]
+impl NotificationPageQuery {
+    /// Folds the peer-presented selectors of the
+    /// [`NOTIFICATION_STATE_READ_OPERATION`] route into the page query, so
+    /// the route cannot re-spell, drop, or default one of them.
+    fn from_read_operation(operation: &NotificationStateReadOperation) -> Self {
+        Self {
+            state_fence: operation.state_fence.clone(),
+            scope: operation.scope.clone(),
+            dedup_key: operation.dedup_key.clone(),
+            notification_id: operation.notification_id.clone(),
+            include_resolved: operation.include_resolved,
+            page_limit: operation.page_limit,
+            cursor: operation.cursor.clone(),
+        }
+    }
+
+    /// The addressed-record page: exactly the record one lifecycle leg names,
+    /// resolved at the fence that leg was admitted under.
+    ///
+    /// The single named constructor for the two read-backs that must agree —
+    /// the committed transition's post-commit read-back and the Notify launch
+    /// grant's durable-record join. Both ask "does this exact record persist
+    /// at this exact fence", so both build the same value here instead of
+    /// repeating the selector spelling at two call sites.
+    fn addressed_record(
+        state_fence: &StateFence,
+        dedup_key: Option<String>,
+        notification_id: Option<String>,
+    ) -> Self {
+        Self {
+            state_fence: state_fence.clone(),
+            scope: None,
+            dedup_key,
+            notification_id,
+            include_resolved: true,
+            page_limit: 1,
+            cursor: None,
+        }
+    }
+
+    /// The store contract's own closed `GetNotificationState` request for
+    /// these selectors. The contract builder stays the only encoder of the
+    /// parameter set and the only range check on the page limit.
+    fn read_request(&self) -> Result<NamedReadRequest, StoreError> {
+        eliot_store_api::notification_read_request(
+            self.scope.clone(),
+            self.dedup_key.clone(),
+            self.notification_id.clone(),
+            self.include_resolved,
+            self.page_limit,
+            self.cursor.clone(),
+            self.state_fence.clone(),
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -777,6 +1000,36 @@ impl KernelComposition {
             }
         }
         result
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn validate_activation_submitter(
+        session: &Session,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<(), TransportError> {
+        let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if identity.request.metadata.product_id.as_str() != ACTIVE_DAEMON_CALLER
+            || identity.request.metadata.source_id.as_str() != ACTIVE_DAEMON_CALLER
+            || identity.request.metadata.session_id.is_some()
+            || identity.request.metadata.task_id.is_some()
+            || identity.request.state_fence != session.module_generation.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let (owner, _) =
+            super::caller_binding(session).map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        if owner.module_id() != ACTIVE_DAEMON_CALLER
+            || owner.generation().get() != session.module_generation.generation.value()
+            || !owner
+                .authority_epoch()
+                .is_same_authority(&session.authority_epoch)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
     }
 
     #[allow(
@@ -928,6 +1181,17 @@ impl KernelComposition {
                 Box::pin(self.store_apply_operation(session, request_id.clone(), payload.clone()))
                     .await
             }
+            NOTIFICATION_STATE_MUTATION_OPERATION => {
+                Box::pin(self.notification_state_operation(
+                    session,
+                    request_id.clone(),
+                    payload.clone(),
+                ))
+                .await
+            }
+            NOTIFICATION_STATE_READ_OPERATION => {
+                Box::pin(self.notification_state_read_operation(session, payload.clone())).await
+            }
             "receipt" => store_receipt_dispatch::dispatch(self, session, payload.clone()).await,
             "store_named" => self.store_named_operation(session, payload.clone()).await,
             "local_read" => self.local_read_operation(session, payload.clone()).await,
@@ -975,10 +1239,41 @@ impl KernelComposition {
             "agent_activation_claim" => {
                 #[cfg(windows)]
                 {
-                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                    let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
+                    if object.len() != 2
+                        || object.get("operation").and_then(serde_json::Value::as_str)
+                            != Some("agent_activation_claim")
+                        || !object.contains_key("claim")
+                    {
                         return Err(TransportError::SessionFenced);
                     }
-                    self.claim_agent_activation_ticket().map(|ticket| {
+                    // Issue #1115: the closed claim operation carries exactly
+                    // one typed `AgentActivationClaimRequest` naming the
+                    // dependency the claimant is bound to; the shape was already
+                    // closed above by the exact two-key envelope check.
+                    // Main's material-authority admission still runs first, so a
+                    // claimant without fresh material authority never reaches
+                    // the claim step at all.
+                    self.admit_material_authority_for_fence(
+                        GovernanceProfile::full(),
+                        &session.module_generation.state_fence,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+                    let claim: AgentActivationClaimRequest = serde_json::from_value(
+                        object
+                            .get("claim")
+                            .cloned()
+                            .ok_or(TransportError::SessionFenced)?,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+                    claim
+                        .validate()
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    self.claim_agent_activation_ticket(
+                        &claim.dependency_ref,
+                        &claim.dependency_revision,
+                    )
+                    .map(|ticket| {
                         serde_json::json!({
                             "status": "known",
                             "value": { "ticket": ticket },
@@ -995,65 +1290,50 @@ impl KernelComposition {
             "agent_activation_submit" => {
                 #[cfg(windows)]
                 {
-                    // The closed submit operation carries exactly one resolver
-                    // outcome in one of two result shapes: the production v2
-                    // typed submit envelope carrying one
-                    // AgentActivationResolutionResult (unknown envelope
-                    // versions are rejected before adoption), or the
-                    // unenveloped P-04 typed result shape covering the same
-                    // seven closed dispositions. The v2 envelope is trial-decoded first so
-                    // production traffic keeps its typed acknowledgement and
-                    // reconcile support; the two result shapes share the
-                    // ticket ledger but keep independent
-                    // exact-replay/conflict accounting. The legacy
-                    // success-only `decision` key is no longer accepted
-                    // (#204 v1 removal): a payload carrying it, or carrying
-                    // no `result`, is fail-closed.
-                    let has_legacy_decision = payload
-                        .get("decision")
-                        .is_some_and(|value| !value.is_null());
-                    let has_result = payload.get("result").is_some_and(|value| !value.is_null());
-                    if has_legacy_decision || !has_result {
+                    // The production operation is exactly one closed v2
+                    // envelope. There is no bare-result fallback and a legacy
+                    // `decision` key is rejected even when it is null.
+                    //
+                    // This is main's fail-closed `#204` v1 removal, kept whole
+                    // and made stricter: main rejected a *non-null* `decision`
+                    // or a missing/non-null `result`; rejecting the key whenever
+                    // it is present covers the non-null case, and the exact
+                    // two-key envelope check below covers a missing `result`.
+                    let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
+                    if object.contains_key("decision") {
+                        // Historical v1 bytes are decoded only by the
+                        // namespaced import module. Production dispatch rejects
+                        // the key without invoking that decoder, including when
+                        // its value is null, so v1 can never become a fallback.
                         return Err(TransportError::SessionFenced);
                     }
+                    if object.len() != 2
+                        || object.get("operation").and_then(serde_json::Value::as_str)
+                            != Some("agent_activation_submit")
+                        || !object.contains_key("result")
                     {
-                        let result_value = payload
-                            .get("result")
-                            .cloned()
-                            .ok_or(TransportError::SessionFenced)?;
-                        if let Ok(submit) = serde_json::from_value::<AgentActivationResultSubmit>(
-                            result_value.clone(),
-                        ) {
-                            match self.submit_agent_activation_result(submit) {
-                                Ok(ack) => Ok(Self::activation_result_daemon_response(&ack)),
-                                // Deadline expiry is an expected race at this
-                                // boundary, not a daemon-fatal transport failure.
-                                // Return an explicit known outcome so the caller can
-                                // retain liveness without parsing error strings.
-                                // A retained terminal result never takes this
-                                // path: exact replay stays idempotent across the
-                                // deadline.
-                                Err(TransportError::Timeout) => {
-                                    Ok(Self::expired_activation_daemon_response())
-                                }
-                                Err(error) => Err(error),
-                            }
-                        } else {
-                            let result: AgentActivationResolutionResult =
-                                serde_json::from_value(result_value)
-                                    .map_err(|_| TransportError::SessionFenced)?;
-                            match self.submit_agent_activation_resolution_result(result) {
-                                Ok(()) => Ok(Self::accepted_daemon_response()),
-                                // Same deadline-expiry race as the v2 path:
-                                // the ticket lapsed before the typed result
-                                // arrived, so the caller observes expiry without
-                                // losing daemon liveness.
-                                Err(TransportError::Timeout) => {
-                                    Ok(Self::expired_activation_daemon_response())
-                                }
-                                Err(error) => Err(error),
-                            }
+                        return Err(TransportError::SessionFenced);
+                    }
+                    let submit = eliot_protocol::decode_agent_activation_result_submit(
+                        object.get("result").ok_or(TransportError::SessionFenced)?,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+                    Self::validate_activation_submitter(session, request_identity)?;
+                    let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                    match self.submit_agent_activation_result_authenticated(
+                        submit,
+                        Some(session),
+                        Some(identity),
+                    ) {
+                        Ok(ack) => Ok(Self::activation_result_daemon_response(&ack)),
+                        // Deadline expiry is an expected race at this
+                        // boundary, not a daemon-fatal transport failure.
+                        // A retained terminal result never takes this path:
+                        // exact replay stays idempotent across the deadline.
+                        Err(TransportError::Timeout) => {
+                            Ok(Self::expired_activation_daemon_response())
                         }
+                        Err(error) => Err(error),
                     }
                 }
                 #[cfg(not(windows))]
@@ -1065,20 +1345,32 @@ impl KernelComposition {
             "agent_activation_reconcile" => {
                 #[cfg(windows)]
                 {
-                    // Lost-acknowledgement reconcile: answered purely from
-                    // the retained per-ticket record, never by recomputing
-                    // semantics or reading the Governor a second time. An
-                    // unknown ticket yields a typed Unknown acknowledgement
-                    // (the daemon then resubmits its retained result); a
-                    // digest mismatch is an identity conflict.
-                    let query_value = payload
-                        .get("reconcile")
-                        .cloned()
-                        .ok_or(TransportError::SessionFenced)?;
-                    let query: AgentActivationResultReconcile = serde_json::from_value(query_value)
-                        .map_err(|_| TransportError::SessionFenced)?;
-                    self.reconcile_agent_activation_result(&query)
-                        .map(|ack| Self::reconciled_activation_daemon_response(&ack))
+                    // Reconcile is a closed, typed query and is answered only
+                    // from durable retention. No result payload or alternate
+                    // decoder is admitted on this route.
+                    let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
+                    if object.len() != 2
+                        || object.get("operation").and_then(serde_json::Value::as_str)
+                            != Some("agent_activation_reconcile")
+                        || !object.contains_key("reconcile")
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    let query: AgentActivationResultReconcile = serde_json::from_value(
+                        object
+                            .get("reconcile")
+                            .cloned()
+                            .ok_or(TransportError::SessionFenced)?,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+                    Self::validate_activation_submitter(session, request_identity)?;
+                    let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                    self.reconcile_agent_activation_result_authenticated(
+                        &query,
+                        Some(session),
+                        Some(identity),
+                    )
+                    .map(|ack| Self::reconciled_activation_daemon_response(&ack))
                 }
                 #[cfg(not(windows))]
                 {
@@ -1197,10 +1489,32 @@ impl KernelComposition {
                     &record,
                 ))
             }
+            "initialize_owner_revision" => {
+                let operation: OwnerRevisionOperation = serde_json::from_value(payload.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if operation.state_fence != session.module_generation.state_fence {
+                    return Err(TransportError::SessionFenced);
+                }
+                let revision = self
+                    .initialize_p07_owner_revision(
+                        &operation.authority_root_ref,
+                        operation.expected_revision,
+                        &operation.state_fence,
+                    )
+                    .map_err(|error| match error {
+                        KernelBuildError::Core(_) => TransportError::IdentityConflict,
+                        _ => TransportError::SessionFenced,
+                    })?;
+                Ok(serde_json::json!({
+                    "kind": "owner_revision_receipt",
+                    "value": { "revision": revision },
+                }))
+            }
             "publish_owner_bundle" => {
                 let operation: OwnerPublishOperation = serde_json::from_value(payload.clone())
                     .map_err(|_| TransportError::SessionFenced)?;
-                if operation.expected_revision == 0 {
+                if operation.operation != "publish_owner_bundle" || operation.expected_revision == 0
+                {
                     return Err(TransportError::SessionFenced);
                 }
                 // Session-authority agreement under the existing session
@@ -1210,28 +1524,85 @@ impl KernelComposition {
                 if !owner_bundle_agrees_with_session(&operation.bundle, session) {
                     return Err(TransportError::SessionFenced);
                 }
+                self.admit_material_authority_for_fence(
+                    GovernanceProfile::full(),
+                    &session.module_generation.state_fence,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
+                // Restart recovery (`#1110`): a process that retained an
+                // owner only rotates it through the exact-revision refresh
+                // gate, while a process that retained none is a Kernel/daemon
+                // restart and `bind_canonical_owner` rebuilds live authority
+                // state from ORS plus the canonical rehydration before the
+                // owner is retained. The receipt shape is unchanged: the
+                // readback route and the existing publisher decode it
+                // strictly.
                 match self.recover_p07_owner(operation.bundle, operation.expected_revision) {
                     Ok(revision) => Ok(serde_json::json!({
-                        "kind": "owner_bundle_receipt",
-                        "value": { "revision": revision, "status": "bound" },
+                        "status": "known",
+                        "value": {
+                            "kind": "owner_bundle_receipt",
+                            "value": { "revision": revision, "status": "bound" },
+                        },
+                        "recovery": null,
                     })),
-                    // The presented bundle conflicts with Kernel owner
-                    // state (stale revision, disagreeing material): the
-                    // caller re-serves fresh state, never retries blindly.
+                    // The presented bundle or a durable row disagrees with
+                    // Kernel owner state (stale revision, disagreeing
+                    // material, an unprovable rehydration): the caller
+                    // re-serves fresh state, never retries blindly.
                     Err(KernelBuildError::Core(_)) => Err(TransportError::IdentityConflict),
                     Err(_) => Err(TransportError::SessionFenced),
                 }
             }
             "query_owner_bundle" => {
+                let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
+                if object.len() != 1
+                    || object.get("operation").and_then(serde_json::Value::as_str)
+                        != Some("query_owner_bundle")
+                {
+                    return Err(TransportError::SessionFenced);
+                }
                 let (bound, revision, digest) = self.p07_owner_readback();
                 Ok(serde_json::json!({
-                    "kind": "owner_bundle_readback",
+                    "status": "known",
                     "value": {
-                        "bound": bound,
-                        "revision": revision,
-                        "digest": digest,
+                        "kind": "owner_bundle_readback",
+                        "value": {
+                            "bound": bound,
+                            "revision": revision,
+                            "digest": digest,
+                        },
                     },
+                    "recovery": null,
                 }))
+            }
+            QUERY_GRANT_CLOSURE_LINKS_OPERATION => {
+                let query: eliot_kernel_service::GrantClosureCanonicalLinksQuery =
+                    serde_json::from_value(payload.clone())
+                        .map_err(|_| TransportError::SessionFenced)?;
+                // The live session fence binds the served view, exactly as the
+                // authority-history read binds it: a query presented under any
+                // other fence is refused before the durable store is touched.
+                if query.state_fence != session.module_generation.state_fence {
+                    return Err(TransportError::SessionFenced);
+                }
+                match eliot_kernel_service::grant_closure_canonical_links(
+                    self.p07_ors.as_ref(),
+                    &query,
+                    &session.module_generation.state_fence,
+                ) {
+                    Ok(links) => Ok(serde_json::json!({
+                        "kind": GRANT_CLOSURE_LINKS_KIND,
+                        "value": links,
+                    })),
+                    // A refusal keeps its durable reason and stays a refusal:
+                    // the daemon must never read it as "no second phase
+                    // completed here".
+                    Err(error) => Ok(serde_json::json!({
+                        "kind": GRANT_CLOSURE_LINKS_REFUSAL_KIND,
+                        "value": { "reason": error.to_string() },
+                    })),
+                }
             }
             "activate_grant" => {
                 let operation: GrantActivationOperation =
@@ -1240,7 +1611,12 @@ impl KernelComposition {
                 if operation.grant_id.trim().is_empty() || operation.snapshot_id.trim().is_empty() {
                     return Err(TransportError::SessionFenced);
                 }
-                p07_binding_agrees_with_session(&operation.binding, session)?;
+                p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
+                self.admit_material_authority_for_fence(
+                    GovernanceProfile::full(),
+                    &session.module_generation.state_fence,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
                 let request = eliot_authority::GrantActivationRequest {
                     grant_id: eliot_authority::GrantId::new(operation.grant_id)
                         .map_err(|_| TransportError::SessionFenced)?,
@@ -1267,7 +1643,7 @@ impl KernelComposition {
                 if operation.grant_id.trim().is_empty() || operation.snapshot_id.trim().is_empty() {
                     return Err(TransportError::SessionFenced);
                 }
-                p07_binding_agrees_with_session(&operation.binding, session)?;
+                p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
                 let request = eliot_authority::GrantRevocationRequest {
                     grant_id: eliot_authority::GrantId::new(operation.grant_id)
                         .map_err(|_| TransportError::SessionFenced)?,
@@ -1296,7 +1672,12 @@ impl KernelComposition {
                 {
                     return Err(TransportError::SessionFenced);
                 }
-                p07_binding_agrees_with_session(&operation.binding, session)?;
+                p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
+                self.admit_material_authority_for_fence(
+                    GovernanceProfile::full(),
+                    &session.module_generation.state_fence,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
                 let request = eliot_authority::IntroductionActivationRequest {
                     introduction_id: eliot_authority::IntroductionId::new(
                         operation.introduction_id,
@@ -1329,7 +1710,7 @@ impl KernelComposition {
                 {
                     return Err(TransportError::SessionFenced);
                 }
-                p07_binding_agrees_with_session(&operation.binding, session)?;
+                p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
                 let request = eliot_authority::IntroductionRevocationRequest {
                     introduction_id: eliot_authority::IntroductionId::new(
                         operation.introduction_id,
@@ -1360,7 +1741,15 @@ impl KernelComposition {
             }
             _ => return Err(TransportError::SessionFenced),
         };
-        let value = result.map_err(|_| TransportError::SessionFenced)?;
+        // Typed refusal propagation (`#1110`): the arm already decided the
+        // closed disposition. Collapsing every one of them into
+        // `SessionFenced` here erased the typed P-07 `IdentityConflict` and
+        // `UnknownOutcome` observations (`map_p07_port_error`) and the owner
+        // publish/revision conflicts before they reached the operator
+        // observation (`daemon_terminal_code`) or the agent-facing surface, so
+        // a changed payload under one operation identity was indistinguishable
+        // from a missing owner. Propagate the decided variant unchanged.
+        let value = result?;
         let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
         frame.request_id = Some(request_id);
         frame.validate()?;
@@ -1520,6 +1909,10 @@ impl KernelComposition {
     /// retains progress (releasing the runtime lock) before this runs, so
     /// the bridge locks are taken after, matching the degraded/failed
     /// order.
+    ///
+    /// I1.5 (#1750): the expired generation remains fenced until a newly
+    /// admitted generation rebinds; a later `ProbeReady` or heartbeat cannot
+    /// revive it.
     #[cfg(windows)]
     fn revoke_supervision_expired_effect_admission(&self) -> Result<(), TransportError> {
         self.promote_agent_bridge_profile(None)?;
@@ -1811,6 +2204,11 @@ impl KernelComposition {
 
         match request {
             UserAutomationHostExecutionOperation::AdmitOccurrence { request } => {
+                self.admit_material_authority_for_fence(
+                    GovernanceProfile::full(),
+                    &session.module_generation.state_fence,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
                 match Box::pin(client.admit_occurrence(request)).await {
                     Ok(execution) => Ok(serde_json::json!({
                         "status": "known",
@@ -2592,6 +2990,14 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?;
         validate_origin_session_fence(session, presentation.request().state_fence())?;
         validate_origin_control_operation(presentation.request().operation())?;
+        // Implements #1967 W3: an origin-control grant issues authority, so
+        // the decide path requires Material admission (startup gates plus a
+        // material-grade profile) before touching the process gateway. The
+        // rejection names the unmet prerequisite. Emergency process kills
+        // continue through the Job/watchdog owners, never this grant path.
+        if let Some(rejection) = self.material_authority_admission_response() {
+            return Ok(rejection);
+        }
         let (owner, _) =
             super::caller_binding(session).map_err(|_| TransportError::PeerIdentityUnavailable)?;
         let gateway = self
@@ -2675,6 +3081,14 @@ impl KernelComposition {
         }
 
         self.validate_daemon_config_mirror(&evidence.config_mirror_digest)?;
+        // Implements #1967 W4 (I1.11 step 8): the rebuilt Config mirror is
+        // byte-equal to the Kernel-protected snapshot digest, so the mirror
+        // half of step 8 is proven by the Kernel-owned comparison above.
+        // Policy-snapshot ownership stays with its future R1 owner: presence
+        // is reported below but never synthesized into a success claim.
+        self.record_startup_evidence(8)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let mut steps_recorded = vec![8_u8];
         let capabilities_complete = match (
             &evidence.required_capabilities,
             &evidence.capability_outcomes,
@@ -2692,21 +3106,31 @@ impl KernelComposition {
             }
             _ => return Err(TransportError::SessionFenced),
         };
+        if capabilities_complete {
+            // Implements #1967 W4 (I1.11 step 9): the required set is covered
+            // by live outcomes bound to the active generation fingerprint and
+            // the registry digest recomputes exactly, so the
+            // required-capability evaluation is proven mechanically.
+            // Optional failures surface through `daemon_degraded`, never as
+            // silent Material.
+            self.record_startup_evidence(9)
+                .map_err(|_| TransportError::SessionFenced)?;
+            steps_recorded.push(9);
+        }
 
-        // There is no Kernel-owned PolicyOwnerSnapshot or Governor semantic
-        // eligibility result in this checkout. A present self-reported policy
-        // digest is therefore still insufficient for step 8; the active R1
-        // owner must supply the authenticated canonical read before these
-        // steps can advance. Likewise, mechanical R4/capability checks do not
-        // replace the Governor's R2/R3 attestation for step 9.
-        let reason = if evidence.policy_mirror_digest.is_none() {
-            "policy_owner_snapshot_absent"
-        } else if !capabilities_complete {
-            "required_capability_owner_snapshot_absent"
-        } else {
-            "governor_semantic_attestation_unavailable"
-        };
-        Ok(Self::incomplete_startup_evidence_response(reason))
+        if evidence.policy_mirror_digest.is_none() {
+            return Ok(Self::partial_startup_evidence_response(
+                &steps_recorded,
+                "policy_owner_snapshot_absent",
+            ));
+        }
+        if !capabilities_complete {
+            return Ok(Self::partial_startup_evidence_response(
+                &steps_recorded,
+                "required_capability_owner_snapshot_absent",
+            ));
+        }
+        Ok(Self::accepted_startup_evidence_response(&steps_recorded))
     }
 
     fn validate_daemon_config_mirror(
@@ -2767,14 +3191,36 @@ impl KernelComposition {
         Ok(())
     }
 
-    fn incomplete_startup_evidence_response(reason: &'static str) -> serde_json::Value {
+    /// Reports validated Governor evidence with the steps it actually
+    /// recorded. `accepted` means the payload was well-formed, fence-bound,
+    /// and mechanically validated; `reason` names the owner input still
+    /// missing for complete evidence. Partial progress is recorded, never
+    /// synthesized: absent markers leave their steps absent.
+    fn partial_startup_evidence_response(
+        steps_recorded: &[u8],
+        reason: &'static str,
+    ) -> serde_json::Value {
         serde_json::json!({
             "status": "known",
             "value": {
-                "accepted": false,
-                "recorded": false,
-                "steps_recorded": [],
+                "accepted": true,
+                "recorded": true,
+                "steps_recorded": steps_recorded,
                 "reason": reason,
+            },
+            "recovery": null,
+        })
+    }
+
+    /// Reports fully validated Governor evidence with every recorded step.
+    fn accepted_startup_evidence_response(steps_recorded: &[u8]) -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": {
+                "accepted": true,
+                "recorded": true,
+                "steps_recorded": steps_recorded,
+                "reason": null,
             },
             "recovery": null,
         })
@@ -2851,7 +3297,16 @@ impl KernelComposition {
         validate_store_session_fence(session, &operation.request.state_fence)?;
         let gateway = self.retained_store_gateway()?;
         match gateway.recovery(operation.request).await {
-            Ok(snapshot) => Ok(store_recovery_response(&snapshot)),
+            Ok(snapshot) => {
+                // Implements #1967 W4 (I1.11 step 6): the gateway returns
+                // only a validated same-fence snapshot (shape, fence, and
+                // record binding are checked inside `recovery`), so a
+                // successful recovery proves pending/unknown operations are
+                // reconciled before normal writes are enabled.
+                self.record_startup_evidence(6)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                Ok(store_recovery_response(&snapshot))
+            }
             Err(error) => Ok(Self::store_error_response_text("store_recovery", &error)),
         }
     }
@@ -2887,6 +3342,11 @@ impl KernelComposition {
         validate_store_session_fence(session, &operation.context.state_fence)?;
         if operation.request.state_fence != operation.context.state_fence {
             return Err(TransportError::SessionFenced);
+        }
+        if let Some(rejection) =
+            self.material_write_admission_response(&operation.context.state_fence)
+        {
+            return Ok(rejection);
         }
         let gateway = self.retained_store_gateway()?;
         match gateway
@@ -2995,10 +3455,18 @@ impl KernelComposition {
                 ));
             }
         }
-        if let Some(rejection) = self.normal_write_admission_response() {
+        let gateway = self.retained_store_gateway()?;
+        if let Some(replayed) = self
+            .replay_committed_apply_receipt(&gateway, &operation)
+            .await?
+        {
+            return Ok(replayed);
+        }
+        if let Some(rejection) =
+            self.material_write_admission_response(&operation.context.state_fence)
+        {
             return Ok(rejection);
         }
-        let gateway = self.retained_store_gateway()?;
         match gateway
             .apply(
                 &operation.context,
@@ -3013,6 +3481,47 @@ impl KernelComposition {
         }
     }
 
+    /// Resolves an already-committed `Apply` receipt for this exact operation
+    /// identity.
+    ///
+    /// A committed receipt is an exact, read-only replay result, so it is
+    /// resolved before the Material gate and response-loss recovery stays
+    /// reachable while degraded. The receipt must be the same terminal receipt
+    /// for the same operation: a different operation identity, idempotency
+    /// key, canonical request hash, State Fence, or a non-committed status is
+    /// an identity conflict and never a fresh write. An unreadable receipt
+    /// read is not a coverage observation either, so it yields `None` and
+    /// leaves the decision to the callers below.
+    #[cfg(windows)]
+    async fn replay_committed_apply_receipt(
+        &self,
+        gateway: &Arc<KernelStoreGateway>,
+        operation: &StoreApplyOperation,
+    ) -> Result<Option<serde_json::Value>, TransportError> {
+        let Ok(Some(receipt)) = gateway
+            .receipt(
+                &operation.context.state_fence,
+                operation.transition.identity.operation_id.clone(),
+            )
+            .await
+        else {
+            return Ok(None);
+        };
+        if receipt.operation_id != operation.transition.identity.operation_id
+            || receipt.idempotency_key != operation.transition.identity.idempotency_key
+            || receipt.canonical_request_hash
+                != operation.transition.identity.canonical_request_hash
+            || receipt.state_fence != operation.context.state_fence
+            || receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        receipt
+            .validate()
+            .map_err(|_| TransportError::IdentityConflict)?;
+        Ok(Some(store_apply_response(&receipt)))
+    }
+
     #[cfg(not(windows))]
     async fn store_apply_operation(
         &self,
@@ -3022,6 +3531,272 @@ impl KernelComposition {
     ) -> Result<serde_json::Value, TransportError> {
         let _ = payload;
         Err(TransportError::SessionFenced)
+    }
+
+    /// Admits one canonical notification lifecycle transition (issue #1780).
+    ///
+    /// This is the Kernel-owned write route for all four I11.5/I11.7 legs.
+    /// The authenticated owner session submits an already-admitted plan whose
+    /// only named operation is the store contract's
+    /// `ApplyNotificationState`; the Kernel re-checks the closed transition
+    /// class, the fixed notification scope and ordering scope, and the closed
+    /// leg parameter set against the store contract itself, recomputes the
+    /// canonical request hash, and dispatches exactly once through the
+    /// retained production store gateway (the spawned
+    /// `eliot-store-surreal.exe` bridge, not the Kernel's ORS file).
+    ///
+    /// The committed receipt is then proved by a same-fence read-back of the
+    /// addressed record. That read-back is what makes "created or updated
+    /// before the delivery attempt" observable: the caller learns the
+    /// canonical record exists at the admitted fence, and the Notify launch
+    /// grant's own durable-record join ([`Self::require_durable_notification_record`])
+    /// can then refuse a delivery attempt for a record that does not persist.
+    /// Any other class, scope, or leg fails closed before the gateway is
+    /// entered; an uncommitted or misfenced outcome never reports success.
+    #[cfg(windows)]
+    async fn notification_state_operation(
+        &self,
+        session: &Session,
+        request_id: RequestId,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: NotificationStateApplyOperation =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        if let Some(refusal) =
+            Self::validate_notification_state_apply(session, &request_id, &operation)?
+        {
+            return Ok(refusal);
+        }
+        if let Some(rejection) = self.normal_write_admission_response() {
+            return Ok(rejection);
+        }
+        let (dedup_key, notification_id) =
+            notification_state_read_selectors(&operation.transition)?;
+        let state_fence = operation.transition.state_fence.clone();
+        let gateway = self.retained_store_gateway()?;
+        let receipt = match gateway
+            .apply(
+                &operation.context,
+                operation.transition,
+                operation.expected_revision_heads,
+                operation.expected_ordering_heads,
+            )
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return Ok(Self::store_error_response_text(
+                    NOTIFICATION_STATE_RESPONSE_KIND,
+                    &error,
+                ));
+            }
+        };
+        if receipt.status != eliot_store_api::WriteReceiptStatus::Committed {
+            return Ok(Self::store_error_response_text(
+                NOTIFICATION_STATE_RESPONSE_KIND,
+                "canonical notification transition was not committed",
+            ));
+        }
+        if receipt.state_fence != state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        // Same-fence read-back: the receipt alone is not the record. A commit
+        // whose record is not readable at the admitted fence is not a
+        // successful canonical write and never reports one.
+        let page = self
+            .read_notification_page(&NotificationPageQuery::addressed_record(
+                &state_fence,
+                dedup_key,
+                notification_id,
+            ))
+            .await?;
+        if page
+            .get(eliot_store_api::NOTIFY_PAGE_RECORDS)
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "kind": NOTIFICATION_STATE_RESPONSE_KIND,
+                "value": { "receipt": receipt, "page": page },
+            },
+            "recovery": null,
+        }))
+    }
+
+    /// Every closed-plan check the canonical notification write must pass
+    /// before the store gateway is entered (issue #1780).
+    ///
+    /// `Ok(None)` means the transition is proved and may be dispatched;
+    /// `Ok(Some(text))` is a fail-closed refusal the route returns verbatim;
+    /// `Err` is the session-fence refusal, which never becomes a store error
+    /// response because it is not an owner rejection.
+    ///
+    /// The order is fixed and is the audited one: request-identity binding,
+    /// request-metadata validation, the transition's own validation, the
+    /// closed notification-state plan check, the store session fence, the
+    /// transition/context fence agreement, every expected head's own
+    /// validation and fence agreement, the ordering-scope binding, and finally
+    /// the canonical request hash recomputed from the exact values about to be
+    /// executed — a plan edited after admission fails here instead of entering
+    /// the store bridge.
+    #[cfg(windows)]
+    fn validate_notification_state_apply(
+        session: &Session,
+        request_id: &RequestId,
+        operation: &NotificationStateApplyOperation,
+    ) -> Result<Option<serde_json::Value>, TransportError> {
+        if operation.context.request_id != *request_id {
+            return Err(TransportError::SessionFenced);
+        }
+        operation
+            .context
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if let Err(error) = operation.transition.validate() {
+            return Ok(Some(Self::store_error_response_text(
+                NOTIFICATION_STATE_RESPONSE_KIND,
+                &error.to_string(),
+            )));
+        }
+        if let Err(error) = validate_notification_state_transition(&operation.transition) {
+            return Ok(Some(Self::store_error_response_text(
+                NOTIFICATION_STATE_RESPONSE_KIND,
+                &error,
+            )));
+        }
+        validate_store_session_fence(session, &operation.context.state_fence)?;
+        if operation.transition.state_fence != operation.context.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        for head in &operation.expected_revision_heads {
+            if let Err(error) = head.validate() {
+                return Ok(Some(Self::store_error_response_text(
+                    NOTIFICATION_STATE_RESPONSE_KIND,
+                    &error.to_string(),
+                )));
+            }
+            if head.state_fence != operation.context.state_fence {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        for head in &operation.expected_ordering_heads {
+            if let Err(error) = head.validate() {
+                return Ok(Some(Self::store_error_response_text(
+                    NOTIFICATION_STATE_RESPONSE_KIND,
+                    &error.to_string(),
+                )));
+            }
+            if head.state_fence != operation.context.state_fence {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        if let Err(error) =
+            verify_ordering_scope_binding(&operation.transition, &operation.expected_ordering_heads)
+        {
+            return Ok(Some(Self::store_error_response_text(
+                NOTIFICATION_STATE_RESPONSE_KIND,
+                &error.to_string(),
+            )));
+        }
+        let view = CanonicalRequestView::from_apply(
+            &operation.context,
+            &operation.transition,
+            &operation.expected_revision_heads,
+            &operation.expected_ordering_heads,
+        );
+        if let Err(error) = verify_canonical_request_hash(
+            &view,
+            &operation.transition.identity.canonical_request_hash,
+        ) {
+            return Ok(Some(Self::store_error_response_text(
+                NOTIFICATION_STATE_RESPONSE_KIND,
+                &error.to_string(),
+            )));
+        }
+        Ok(None)
+    }
+
+    /// No durable canonical store exists off Windows: the retained store
+    /// gateway is a Windows-only contour, so the canonical notification write
+    /// is unprovable here and the route fails closed.
+    #[cfg(not(windows))]
+    async fn notification_state_operation(
+        &self,
+        _session: &Session,
+        _request_id: RequestId,
+        _payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        Err(TransportError::SessionFenced)
+    }
+
+    /// Serves one bounded canonical notification inbox page (issue #1780).
+    ///
+    /// Same-fence projection only, through the same retained production store
+    /// gateway the transition route uses. The selectors are the store
+    /// contract's closed set, so an unresolved acknowledged record, an
+    /// unresolved failed-delivery record, and an unresolved critical record
+    /// all stay visible: there is no quiet-hours, role, or delivery-visibility
+    /// input this read could be narrowed by (I11.7, I11.10).
+    #[cfg(windows)]
+    async fn notification_state_read_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: NotificationStateReadOperation =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        validate_store_session_fence(session, &operation.state_fence)?;
+        let page = self
+            .read_notification_page(&NotificationPageQuery::from_read_operation(&operation))
+            .await?;
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": { "kind": NOTIFICATION_STATE_PAGE_RESPONSE_KIND, "value": page },
+            "recovery": null,
+        }))
+    }
+
+    #[cfg(not(windows))]
+    async fn notification_state_read_operation(
+        &self,
+        _session: &Session,
+        _payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        Err(TransportError::SessionFenced)
+    }
+
+    /// Reads one bounded canonical notification page through the retained
+    /// production store gateway and proves the echoed operation and fence.
+    ///
+    /// The one read seam both notification routes share: the transition's
+    /// post-commit read-back, the owner inbox read, and the Notify launch
+    /// grant's durable-record join all resolve the record through this single
+    /// call, so none of them can observe a different projection shape. The
+    /// selectors and the fence arrive as one [`NotificationPageQuery`], so the
+    /// echoed fence is proved against the same fence the query was built for.
+    #[cfg(windows)]
+    async fn read_notification_page(
+        &self,
+        query: &NotificationPageQuery,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request = query
+            .read_request()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let gateway = self.retained_store_gateway()?;
+        let response = gateway
+            .execute_named(request)
+            .await
+            .map_err(|_| TransportError::SessionFenced)?;
+        if response.operation != eliot_store_api::NamedReadOperation::GetNotificationState
+            || response.state_fence != query.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(response.payload)
     }
 
     #[cfg(windows)]
@@ -3312,6 +4087,11 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        self.admit_material_authority_for_fence(
+            GovernanceProfile::full(),
+            &session.module_generation.state_fence,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
         let host_executable_path = operation.host_executable_path.clone();
         let host_artifact_digest = operation.host_artifact_digest.clone();
         // Installation-observed host binding: absolute path, canonical image
@@ -3411,6 +4191,11 @@ impl KernelComposition {
         let operation: NotifyLaunchGrantOperation =
             serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
         validate_store_session_fence(session, &session.module_generation.state_fence)?;
+        self.admit_material_authority_for_fence(
+            GovernanceProfile::full(),
+            &session.module_generation.state_fence,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
         // Installer-observed launch artifact first: absolute path plus the
         // canonical image name (re-checked by the binder), then re-hash of
         // the real installed bytes against the presented digest.
@@ -3486,9 +4271,10 @@ impl KernelComposition {
     /// identity. An unavailable store, a failed read, a missing record, or a
     /// fence disagreement fails closed. The presented digest is intentionally
     /// opaque here (no derivation is specified; shape is enforced by the
-    /// binder). This performs no canonical write: record creation stays on
-    /// the owning admission path; the grant only proceeds when the record
-    /// already persists.
+    /// binder). This performs no canonical write: record creation is the
+    /// owner's job on the admitted [`NOTIFICATION_STATE_MUTATION_OPERATION`]
+    /// route, and this join only proves that record already persists before a
+    /// Notify launch is admitted.
     #[cfg(windows)]
     async fn require_durable_notification_record(
         &self,
@@ -3497,29 +4283,15 @@ impl KernelComposition {
         _notification_digest: &str,
     ) -> Result<(), TransportError> {
         let fence = session.module_generation.state_fence.clone();
-        let query = eliot_store_api::notification_read_request(
-            None,
-            None,
-            Some(notification_id.to_owned()),
-            true,
-            1,
-            None,
-            fence.clone(),
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
-        let gateway = self.retained_store_gateway()?;
-        let response = gateway
-            .execute_named(query)
-            .await
-            .map_err(|_| TransportError::SessionFenced)?;
-        if response.operation != eliot_store_api::NamedReadOperation::GetNotificationState
-            || response.state_fence != fence
-        {
-            return Err(TransportError::SessionFenced);
-        }
-        let records = response
-            .payload
-            .get("records")
+        let page = self
+            .read_notification_page(&NotificationPageQuery::addressed_record(
+                &fence,
+                None,
+                Some(notification_id.to_owned()),
+            ))
+            .await?;
+        let records = page
+            .get(eliot_store_api::NOTIFY_PAGE_RECORDS)
             .and_then(serde_json::Value::as_array)
             .ok_or(TransportError::SessionFenced)?;
         let record = records
@@ -3570,10 +4342,82 @@ impl KernelComposition {
     /// admitted normal canonical writes. This is deliberately kept directly
     /// before the retained gateway call in `apply_prepared`, so a fenced
     /// request cannot enter the Store backend.
+    ///
+    /// Implements #1967 A1: the rejection carries the named unmet startup
+    /// prerequisite (read from the production [`Self::startup_status`]
+    /// surface) instead of collapsing to a bare null-valued store error.
+    /// The `status`/`value.kind` shape is unchanged; the name travels in
+    /// `recovery` so existing `write_receipt` consumers keep parsing.
     fn normal_write_admission_response(&self) -> Option<serde_json::Value> {
-        self.admit_normal_write()
+        let error = self.admit_normal_write().err()?;
+        let status = self.startup_status(GovernanceProfile::minimal());
+        let prerequisite = status.blocking_prerequisite.unwrap_or("startup-incomplete");
+        Some(serde_json::json!({
+            "status": "error",
+            "value": { "kind": "write_receipt", "value": null },
+            "recovery": {
+                "prerequisite": prerequisite,
+                "message": error.to_string(),
+            },
+        }))
+    }
+
+    /// Returns the typed rejection when startup or the Governance Profile
+    /// has not admitted Material authority for one origin-control decision.
+    ///
+    /// Implements #1967 W3/A1: origin-control grants issue authority, so the
+    /// decide path consults [`Self::admit_material_authority`] (startup gates
+    /// first, then the profile ceiling) rather than inferring authority from
+    /// pipe liveness. The named prerequisite and the current ceiling travel
+    /// in `recovery`; `status`/`value.kind` keep the existing error shape.
+    /// Origin-control decisions require a material-grade profile: once every
+    /// mandatory prerequisite completes, the profile ceiling alone decides.
+    fn material_authority_admission_response(&self) -> Option<serde_json::Value> {
+        let profile = GovernanceProfile::material_grade();
+        if self.admit_material_authority(profile).is_ok() {
+            return None;
+        }
+        let status = self.startup_status(GovernanceProfile::minimal());
+        let ceiling = self.startup_authority_ceiling(profile);
+        let prerequisite = status
+            .blocking_prerequisite
+            .unwrap_or("governance-profile-ceiling");
+        Some(serde_json::json!({
+            "status": "error",
+            "value": { "kind": "origin_control_decide", "value": null },
+            "recovery": {
+                "prerequisite": prerequisite,
+                "authority_ceiling": ceiling.as_str(),
+            },
+        }))
+    }
+
+    /// Store apply is the production Material/Critical admission boundary.
+    /// It keeps the existing helper seam used by the package-local gate proof,
+    /// but now requires the owner-backed current Watchdog observation before
+    /// the retained Store gateway can be entered.
+    ///
+    /// The answer uses the daemon's `error` wire variant. A refusal must be
+    /// decodable by the client: an unrecognised `status` would be surfaced as an
+    /// unknown transport outcome, which is exactly the ambiguity this
+    /// fail-closed path exists to avoid.
+    fn material_write_admission_response(&self, target: &StateFence) -> Option<serde_json::Value> {
+        self.admit_material_authority_for_fence(GovernanceProfile::full(), target)
             .err()
-            .map(|error| Self::store_error_response_text("write_receipt", &error.to_string()))
+            .map(|_| {
+                serde_json::json!({
+                    "status": "error",
+                    "code": eliot_kernel_service::ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE,
+                    "reason": "independent Host-observed Watchdog coverage is not integrated; no Material/Critical effect was admitted",
+                    "value": {
+                        "kind": "material_authority",
+                        "code": eliot_kernel_service::ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE,
+                        "degraded_profile": "runtime-degraded-v3",
+                        "human_risk_path_required": true,
+                    },
+                    "recovery": null,
+                })
+            })
     }
 
     fn store_error_response_text(kind: &str, error: &str) -> serde_json::Value {
@@ -3783,6 +4627,73 @@ fn validate_origin_inspection(
         return Err(TransportError::SessionFenced);
     }
     Ok(())
+}
+
+/// Requires one closed canonical notification plan before any store IO
+/// (issue #1780).
+///
+/// The store contract — not this route — owns the leg discriminator and its
+/// complete parameter set, so this only proves the plan *is* a canonical
+/// notification transition: the fixed `NotificationState` class, the fixed
+/// notification scope and ordering scope, exactly one named operation, and a
+/// decodable leg. A plan that smuggles another class, another scope, or a
+/// second named operation is refused before the gateway is entered.
+#[cfg(windows)]
+fn validate_notification_state_transition(transition: &PreparedTransition) -> Result<(), String> {
+    if transition.transition_class != eliot_store_api::TransitionClass::NotificationState {
+        return Err(
+            "ApplyNotificationState admits only the NotificationState transition class".to_owned(),
+        );
+    }
+    if transition.scope_id.as_str() != eliot_store_api::NOTIFICATION_STATE_SCOPE
+        || transition.ordering_scopes.len() != 1
+        || transition.ordering_scopes[0].as_str() != eliot_store_api::NOTIFICATION_STATE_SCOPE
+    {
+        return Err(
+            "canonical notification transitions use the fixed notification-state scope".to_owned(),
+        );
+    }
+    if transition.named_operations.len() != 1
+        || transition.named_operations[0].operation
+            != eliot_store_api::NamedMutationOperation::ApplyNotificationState
+    {
+        return Err(
+            "canonical notification transitions carry exactly one ApplyNotificationState operation"
+                .to_owned(),
+        );
+    }
+    eliot_store_api::decode_notification_mutation(&transition.named_operations[0].parameters)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Returns the closed read selectors addressing the record one notification
+/// transition just wrote: the dedup key for the create/coalesce leg, and the
+/// canonical notification identity for every other lifecycle leg. The store
+/// bridge resolves the non-upsert legs against its own dedup index, so a
+/// caller can never substitute a dedup key on the delivery, acknowledgement,
+/// or resolution legs.
+#[cfg(windows)]
+fn notification_state_read_selectors(
+    transition: &PreparedTransition,
+) -> Result<(Option<String>, Option<String>), TransportError> {
+    let parameters = &transition.named_operations[0].parameters;
+    let decoded = eliot_store_api::decode_notification_mutation(parameters)
+        .map_err(|_| TransportError::SessionFenced)?;
+    Ok(match decoded {
+        eliot_store_api::DecodedNotificationMutation::Upsert { dedup_key, .. } => {
+            (Some(dedup_key), None)
+        }
+        eliot_store_api::DecodedNotificationMutation::Delivery {
+            notification_id, ..
+        }
+        | eliot_store_api::DecodedNotificationMutation::Acknowledge {
+            notification_id, ..
+        }
+        | eliot_store_api::DecodedNotificationMutation::Resolve {
+            notification_id, ..
+        } => (None, Some(notification_id)),
+    })
 }
 
 fn validate_store_session_fence(

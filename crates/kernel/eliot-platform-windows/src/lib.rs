@@ -2806,16 +2806,32 @@ impl SecretPort for WindowsPlatform {
 }
 
 impl NotificationPort for WindowsPlatform {
+    /// Normal native notification delivery for the per-user one-shot adapter.
+    ///
+    /// I11.6:3: "Normal delivery is launched through the authorized User
+    /// Broker." This port is the P-01 native provider of the per-user
+    /// `eliot-notify.exe` process, not of the Host/Kernel service: the
+    /// Host/Kernel contour never calls it, and the only production consumer is
+    /// the one-shot process whose normal invocation the authorized User Broker
+    /// owns. I11.6:19 therefore still holds -- the Host/Kernel service does not
+    /// attempt to display desktop toasts directly; this process does, and only
+    /// once the broker has launched it on a Kernel-authorized grant.
+    ///
+    /// The result is observed OS acceptance evidence, never an assumption:
+    /// `Known` requires the bounded callback pump to have observed the shell
+    /// balloon callback for this submission. Every other case is reported as
+    /// `Unknown` so the caller persists delivery degradation and never claims a
+    /// toast. I11.6:13-14: without an interactive user session no immediate
+    /// desktop toast is promised, so a missing session is not delivered and not
+    /// guessed.
     fn deliver(&mut self, request: &NotificationRequest) -> PortOutcome<NotificationObservation> {
         if let Err(error) = request.validate() {
             return PortOutcome::Error(error);
         }
-        // I11.6 normal delivery belongs to the interactive User Broker and a
-        // WinUI/AppNotificationManager owner. This low-level adapter is not a
-        // second toast authority; callers must keep the result unavailable
-        // until that owner returns authenticated OS acceptance evidence.
-        let _ = request;
-        PortOutcome::Unknown(UnknownReason::Unsupported)
+        if !interactive_non_elevated_session() {
+            return PortOutcome::Unknown(UnknownReason::NotObserved);
+        }
+        submit_native_notification(request)
     }
 }
 
@@ -2834,15 +2850,42 @@ impl WindowsPlatform {
         if !interactive_non_elevated_session() {
             return PortOutcome::Unknown(UnknownReason::NotObserved);
         }
-        match deliver_shell_notification(request) {
-            Ok(true) => PortOutcome::Known(NotificationObservation {
-                notification: request.notification.clone(),
-                delivered: true,
-            }),
-            Ok(false) => PortOutcome::Unknown(UnknownReason::NotObserved),
-            Err(_) => PortOutcome::Unknown(UnknownReason::Indeterminate),
-        }
+        submit_native_notification(request)
     }
+}
+
+/// Submits one native notification through the Windows Shell and projects the
+/// observed result into the neutral P-01 outcome.
+///
+/// Shared by the normal per-user delivery port and the restricted X-01 recovery
+/// banner: both are per-user, non-elevated, and both are proved only by the
+/// bounded callback observation. `Ok(true)` means the shell reported the
+/// submission and the callback pump observed the balloon callback; it never
+/// means a Human read or acknowledged anything.
+fn submit_native_notification(
+    request: &NotificationRequest,
+) -> PortOutcome<NotificationObservation> {
+    match deliver_shell_notification(request) {
+        Ok(true) => PortOutcome::Known(NotificationObservation {
+            notification: request.notification.clone(),
+            delivered: true,
+        }),
+        Ok(false) => PortOutcome::Unknown(UnknownReason::NotObserved),
+        Err(_) => PortOutcome::Unknown(UnknownReason::Indeterminate),
+    }
+}
+
+/// Reports whether this process holds a live, non-elevated interactive user
+/// session.
+///
+/// I11.6:13-14: "no interactive user session: no immediate desktop toast is
+/// promised". Both native notification ports gate on exactly this observation,
+/// and it is exposed so a delivery caller can name the no-session condition
+/// honestly instead of inferring it from a generic adapter failure. It observes
+/// only: it never creates, elevates, or switches a session.
+#[must_use]
+pub fn interactive_user_session_available() -> bool {
+    interactive_non_elevated_session()
 }
 
 /// Delivers one bounded Shell balloon and returns the observed API result.
@@ -4100,30 +4143,41 @@ struct ServiceSecurityBinding {
     group_sid: String,
 }
 
+/// The live OWNER/GROUP/DACL triple read from one service security descriptor.
+///
+/// `descriptor` is the allocation `GetSecurityInfo` produced; the caller owns
+/// it and releases it with `LocalFree` exactly once. `owner` and `group` borrow
+/// that same descriptor, so they stay valid only while it is alive.
 #[cfg(windows)]
-fn read_service_security_binding(
+struct LiveServiceSecurityDescriptor {
+    descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+    owner: windows_sys::Win32::Security::PSID,
+    group: windows_sys::Win32::Security::PSID,
+    dacl: *const windows_sys::Win32::Security::ACL,
+}
+
+/// Reads the live OWNER, GROUP and DACL of a service in one call.
+///
+/// The security-information mask requests only
+/// `OWNER | GROUP | DACL` and the SACL out-pointer is null, so SACL observation
+/// remains an installer-only contour and is never a requirement of this read.
+/// Every failure — the descriptor query itself, a null owner, or a null group —
+/// is reported through the typed [`ServiceGrantReadError`] `Unknown` owner with
+/// its own `GetLastError` and failing stage, never as a proven `AclMismatch`.
+#[cfg(windows)]
+fn read_live_service_security_descriptor(
     service: windows_sys::Win32::Foundation::HANDLE,
-    expected_dacl: *const windows_sys::Win32::Security::ACL,
-) -> Result<ServiceSecurityBinding, ServiceGrantReadError> {
+) -> Result<LiveServiceSecurityDescriptor, ServiceGrantReadError> {
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SUCCESS, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_SERVICE};
     use windows_sys::Win32::Security::{
-        GetSecurityDescriptorControl, GetSecurityDescriptorGroup, GetSecurityDescriptorOwner,
-        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+        GetSecurityDescriptorGroup, GetSecurityDescriptorOwner, PSECURITY_DESCRIPTOR, PSID,
     };
 
-    if expected_dacl.is_null() {
-        return Err(ServiceGrantReadError::mismatch(
-            WindowsAdapterError::InvalidInput,
-        ));
-    }
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let mut actual_owner: PSID = std::ptr::null_mut();
     let mut actual_group: PSID = std::ptr::null_mut();
     let mut actual_dacl = std::ptr::null_mut();
-    // OWNER, GROUP and DACL are read from one live service handle. The SACL
-    // pointer and security-information bit are deliberately null/absent:
-    // SACL observation remains an installer-only contour.
     // SAFETY: GetSecurityInfo reads the service security descriptor through a live
     // READ_CONTROL handle; all requested SID/ACL/descriptor out-pointers are valid
     // writable locals; the descriptor is paired with LocalFree below.
@@ -4165,7 +4219,7 @@ fn read_service_security_binding(
     let owner_ok =
         // SAFETY: GetSecurityDescriptorOwner borrows the validated descriptor; owner/defaulted are valid
         // writable out-pointers; descriptor outlives the borrow.
-        unsafe { GetSecurityDescriptorOwner(descriptor, &raw mut owner, &raw mut owner_defaulted) } != 0
+        unsafe { GetSecurityDescriptorOwner(descriptor, &raw mut owner, &raw mut owner_defaulted) != 0 }
             && !owner.is_null();
     if !owner_ok {
         // SAFETY: LocalFree releases the descriptor allocated above exactly once.
@@ -4181,7 +4235,7 @@ fn read_service_security_binding(
     let group_ok =
         // SAFETY: GetSecurityDescriptorGroup borrows the validated descriptor; group/defaulted are valid
         // writable out-pointers; descriptor outlives the borrow.
-        unsafe { GetSecurityDescriptorGroup(descriptor, &raw mut group, &raw mut group_defaulted) } != 0
+        unsafe { GetSecurityDescriptorGroup(descriptor, &raw mut group, &raw mut group_defaulted) != 0 }
             && !group.is_null();
     if !group_ok {
         // SAFETY: LocalFree releases the descriptor allocated above exactly once.
@@ -4192,13 +4246,36 @@ fn read_service_security_binding(
             "query-group",
         ));
     }
+    Ok(LiveServiceSecurityDescriptor {
+        descriptor,
+        owner,
+        group,
+        dacl: actual_dacl,
+    })
+}
 
-    let owner_text = sid_to_string(owner).map_err(|kind| {
+#[cfg(windows)]
+fn read_service_security_binding(
+    service: windows_sys::Win32::Foundation::HANDLE,
+    expected_dacl: *const windows_sys::Win32::Security::ACL,
+) -> Result<ServiceSecurityBinding, ServiceGrantReadError> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::{GetSecurityDescriptorControl, SE_DACL_PROTECTED};
+
+    if expected_dacl.is_null() {
+        return Err(ServiceGrantReadError::mismatch(
+            WindowsAdapterError::InvalidInput,
+        ));
+    }
+    let live = read_live_service_security_descriptor(service)?;
+    let descriptor = live.descriptor;
+
+    let owner_text = sid_to_string(live.owner).map_err(|kind| {
         // SAFETY: LocalFree releases the descriptor allocated above exactly once.
         unsafe { LocalFree(descriptor.cast()) };
         ServiceGrantReadError::from_adapter(kind, "query-owner")
     })?;
-    let group_text = sid_to_string(group).map_err(|kind| {
+    let group_text = sid_to_string(live.group).map_err(|kind| {
         // SAFETY: LocalFree releases the descriptor allocated above exactly once.
         unsafe { LocalFree(descriptor.cast()) };
         ServiceGrantReadError::from_adapter(kind, "query-group")
@@ -4217,21 +4294,33 @@ fn read_service_security_binding(
     let mut revision = 0_u32;
     // SAFETY: GetSecurityDescriptorControl borrows the validated descriptor; control/revision are valid
     // writable out-pointers; descriptor outlives the call; SE_DACL_PROTECTED bit read only on success.
-    let protected_dacl = unsafe {
+    let control_read = unsafe {
         GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
-            && control & SE_DACL_PROTECTED != 0
     };
+    if !control_read {
+        // The protected-control fact was never read. Collapsing this failure
+        // into `protected_dacl = false` would publish a never-read control
+        // bit as a proven security mismatch (issue #1352), so the unread
+        // read is reported through the existing typed `Unknown` owner with
+        // its own `GetLastError`.
+        // SAFETY: LocalFree releases the descriptor allocated above exactly once.
+        unsafe { LocalFree(descriptor.cast()) };
+        return Err(ServiceGrantReadError::unknown(
+            WindowsAdapterError::Failed,
+            last_win32_code(),
+            "read-grant",
+        ));
+    }
+    let protected_dacl = control & SE_DACL_PROTECTED != 0;
     // SAFETY: ACL byte compare dereferences the live DACL returned by GetSecurityInfo and the
     // validated expected DACL for exactly their declared sizes; both pointers are non-null.
     let dacl_matches = unsafe {
-        (*actual_dacl).AclSize == (*expected_dacl).AclSize
-            && std::slice::from_raw_parts(
-                actual_dacl.cast::<u8>(),
-                usize::from((*actual_dacl).AclSize),
-            ) == std::slice::from_raw_parts(
-                expected_dacl.cast::<u8>(),
-                usize::from((*expected_dacl).AclSize),
-            )
+        (*live.dacl).AclSize == (*expected_dacl).AclSize
+            && std::slice::from_raw_parts(live.dacl.cast::<u8>(), usize::from((*live.dacl).AclSize))
+                == std::slice::from_raw_parts(
+                    expected_dacl.cast::<u8>(),
+                    usize::from((*expected_dacl).AclSize),
+                )
     };
     // SAFETY: LocalFree releases the descriptor allocated above exactly once; all SID text and
     // comparison results were materialized before this point.
@@ -5110,15 +5199,20 @@ fn classify_service_runtime_observation(
     process: Option<ProcessIdentity>,
 ) -> ServiceRegistrationRuntimeInspection {
     use crate::service_registration::ServiceInspectionUnknownDetail;
-    let requires_process = matches!(state, ServiceState::Running | ServiceState::Stopping);
-    let permits_process = matches!(
+    // Every non-stopped live state the SCM can report requires a nonzero PID
+    // and a verified live process identity. `Starting` is included: SCM
+    // publishes `START_PENDING` before the service process exists, so PID 0
+    // with no verified identity is an unread transient, not a proven
+    // registration match (issue #1352). The typed owner keeps that contour
+    // `Unknown` with its raw `START_PENDING`/PID 0 sample.
+    let requires_process = matches!(
         state,
         ServiceState::Starting | ServiceState::Running | ServiceState::Stopping
     );
     if matches!(
         state,
         ServiceState::Unknown | ServiceState::Absent | ServiceState::Failed
-    ) || (!permits_process && process_id != 0)
+    ) || (!requires_process && process_id != 0)
         || (requires_process && process_id == 0)
         || (process_id == 0 && process.is_some())
         || (process_id != 0 && process.is_none())

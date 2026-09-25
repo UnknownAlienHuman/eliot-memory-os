@@ -238,6 +238,7 @@ ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["all
 eliot-agent-api = { path = "crates/agent/eliot-agent-api", version = "0.1.0" }
 eliot-agent-coordinator = { path = "crates/agent/eliot-agent-coordinator", version = "0.1.0" }
 eliot-agent-contracts = { path = "crates/agent/eliot-agent-contracts", version = "0.1.0" }
+eliot-swarm = { path = "crates/agent/eliot-swarm", version = "0.1.0" }
 eliot-engine = { path = "crates/eliot-engine", version = "0.1.0" }
 eliot-store = { path = "crates/eliot-store", version = "0.1.0" }
 eliot-types = { path = "crates/eliot-types", version = "0.1.0" }

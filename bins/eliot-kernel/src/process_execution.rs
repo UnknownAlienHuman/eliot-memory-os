@@ -1651,6 +1651,31 @@ pub(crate) fn process_session_rejection(
 }
 
 impl KernelComposition {
+    /// Returns the bounded refusal projection when an exact-fence process
+    /// `Start` cannot be admitted under the current supervision coverage.
+    ///
+    /// This never fabricates coverage and never retries: a missing independent
+    /// Host-observed Watchdog carrier, a non-current target generation, or a
+    /// stale fence each stop here before the path-proof and gateway steps. A
+    /// malformed presented generation is an invalid request, not a coverage
+    /// observation, and keeps its own stable code.
+    fn reject_process_start_without_material_coverage(
+        &self,
+        admission: &eliot_process::ProcessExecutionAdmissionRequest,
+    ) -> Option<eliot_kernel_service::ProcessExecutionRejection> {
+        match self.admit_material_process_start(admission) {
+            Ok(()) => None,
+            Err(error) => {
+                observe_process("kernel.process.request_rejected", "watchdog_coverage");
+                Some(eliot_kernel_service::ProcessExecutionRejection {
+                    code: eliot_kernel_service::ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE
+                        .to_owned(),
+                    detail: error.to_string().chars().take(512).collect(),
+                })
+            }
+        }
+    }
+
     pub async fn execute_process_request(
         &self,
         session: &Session,
@@ -1728,6 +1753,13 @@ impl KernelComposition {
         observe_process("kernel.process.request_admitted", "success");
         let result = match request {
             ProcessExecutionRequest::Start(admission) => {
+                // Material/Critical process start is fail-closed on the exact
+                // target fence before any external effect owner is entered.
+                if let Some(rejection) =
+                    self.reject_process_start_without_material_coverage(&admission)
+                {
+                    return ProcessExecutionResponse::Rejected(rejection);
+                }
                 let proof = match self.retain_process_path_proof(&admission) {
                     Ok(proof) => proof,
                     Err(error) => {

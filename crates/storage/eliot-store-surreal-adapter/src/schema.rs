@@ -78,6 +78,60 @@ pub(crate) mod table {
     /// Immutable agent-feedback row per handle + owner revision
     /// (issue #223). Same create-only rule as the bank rows.
     pub(crate) const EXPERIENCE_FEEDBACK: &str = "experience_feedback";
+
+    /// Every physical table *name* this single owner declares, in declaration
+    /// order.
+    ///
+    /// This is the closed denominator a consumer checks for exact 1:1
+    /// coverage. It adds no name: every entry is the same const declared
+    /// above, so physical-name ownership stays in this one place (A2.3 /
+    /// ARCH-MOD-03) and a consumer can name the denominator instead of
+    /// counting its own list.
+    ///
+    /// Maintenance invariant: this array MUST be updated in the same edit as
+    /// any new const declared in this module. Rust cannot reflect over `const`s,
+    /// so no compile-time or test-time link exists between the two lists.
+    ///
+    /// Exactly what a 1:1 census against this array does and does not prove:
+    ///
+    /// - It proves every name listed here has exactly one disposition, and that
+    ///   no disposition names a table absent from here. Adding a const above
+    ///   together with its disposition but forgetting this entry therefore
+    ///   fails loudly.
+    /// - It does not prove the converse. A const added above and left out of
+    ///   both this array and every disposition is a silent omission no check
+    ///   can see, so the invariant above is the only thing guarding it.
+    /// - It does not prove a name listed here is a physical table. Nothing
+    ///   machine-links these consts to this module's DDL strings, so a declared
+    ///   name that no baseline DDL ever creates is dispositioned and passed
+    ///   like any other. `automation_failure` and `automation_last_failure` are
+    ///   exactly that today: declared, dispositioned, and created by no
+    ///   generation's DDL.
+    pub(crate) const ALL_TABLES: [&str; 23] = [
+        SCHEMA_META,
+        WRITE_RECEIPT,
+        REVISION_HEAD,
+        ORDERING_HEAD,
+        CANONICAL_EVENT,
+        PROJECTION_RECORD,
+        RELATION_RECORD,
+        OUTBOX_EVENT,
+        CANONICAL_FENCE,
+        RECOVERY_OWNER,
+        RECOVERY_JOB,
+        ERASURE_INTENT,
+        ERASURE_OUTCOME,
+        NOTIFICATION_RECORD,
+        REACTIVE_SESSION,
+        RESOURCE_SNAPSHOT,
+        AUTOMATION_REVISION,
+        AUTOMATION_CURRENT,
+        AUTOMATION_INVOCATION,
+        AUTOMATION_FAILURE,
+        AUTOMATION_LAST_FAILURE,
+        EXPERIENCE_BANK,
+        EXPERIENCE_FEEDBACK,
+    ];
 }
 
 /// Record key of the single canonical fence/sequence row.

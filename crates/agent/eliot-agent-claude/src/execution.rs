@@ -17,7 +17,7 @@
 //! [`ClaudeSidecarFactory::launch`], bounded
 //! [`ClaudeRunningSidecar::ingest_line`] streaming with raw-evidence lineage,
 //! [`ClaudeRunningSidecar::complete_terminal`] candidate extraction with
-//! recomputed output digests, [`translate_candidate_result`] into
+//! exact attempt binding plus recomputed output digests, [`translate_candidate_result`] into
 //! candidate-only [`AgentResult`](eliot_agent_api::AgentResult) records,
 //! [`ClaudeSidecarFactory::cancel_running`] wired to the real
 //! `cancel(operation_id)` plus deadline and [`CleanupState`](crate::CleanupState)
@@ -553,15 +553,22 @@ impl ClaudeRunningSidecar {
     }
 
     /// Extract the terminal candidate bound to this running sidecar. The
-    /// claimed output digest is recomputed over the exact output bytes and
-    /// must match; a mismatch fails closed. The returned record carries the
-    /// request and plan linkage of this sidecar.
+    /// candidate must address this sidecar's exact attempt; a foreign
+    /// attempt id fails closed so one attempt's output is never attributed
+    /// to another. The claimed output digest is recomputed over the exact
+    /// output bytes and must match; a mismatch fails closed. The returned
+    /// record carries the request and plan linkage of this sidecar.
     pub fn complete_terminal(
         &self,
         candidate: &ClaudeCandidateResult,
         raw_line: &str,
     ) -> Result<ClaudeTerminalCandidate, ClaudeSidecarError> {
         candidate.validate()?;
+        if candidate.attempt_id != self.attempt_id {
+            return Err(ClaudeSidecarError::BindingMismatch(
+                "terminal candidate addresses another attempt".to_owned(),
+            ));
+        }
         let recomputed = claude_local_digest_256_hex(candidate.output.as_bytes());
         if recomputed != candidate.output_digest {
             return Err(ClaudeSidecarError::BadDigest(

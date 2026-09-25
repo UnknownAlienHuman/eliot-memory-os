@@ -2,7 +2,14 @@ use eliot_contracts::{
     AuthorityEpoch, EpochId, ResourceGeneration, StateFence, canonical_json_bytes,
 };
 use eliot_platform::{PlatformHandle, SecretReference};
-use eliot_receipts::{ReceiptDisposition, ReceiptEnvelope};
+use eliot_receipts::{
+    AuthorityBinding, GrantClosureAuthorityReceiptRef, GrantClosureDeclaration, ProofCeiling,
+    ReceiptDisposition, ReceiptEnvelope, ReceiptIdentity,
+};
+pub use eliot_receipts::{
+    GRANT_CLOSURE_SCHEMA, GRANT_CLOSURE_VERSION, GrantClosureAlternatePath,
+    GrantClosureMemberDeclaration, GrantClosureReceipt, GrantClosureState,
+};
 use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, LeaseState, SignedSupervisionLease,
     SupervisionGenerationBinding, SupervisionLease, SupervisionLeaseActiveStateBinding,
@@ -19,7 +26,7 @@ use thiserror::Error;
 
 use crate::reservation_model::ReservationRecord;
 use crate::{CONTRACT_VERSION, MAX_INLINE_RECOVERY_BYTES, MAX_RECOVERY_PAGE};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A validated opaque label that carries no semantic authority.
 #[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1930,7 +1937,10 @@ pub enum OperationalPhase {
 }
 
 /// Integrity-bound receipt created only by the durable store implementation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+///
+/// `Deserialize` (M2 integration adaptation, mirroring every neighboring
+/// row type) is transport only; issuance stays store-owned.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OperationalMutationReceipt {
     record_id: OperationIdentity,
     subject_id: OperationIdentity,
@@ -2038,7 +2048,12 @@ impl CapabilityGrantProjection {
 /// Introductions never reactivate: only an `Active` row carries usable
 /// authority and only a `Fenced` row carries fence evidence. Any other phase
 /// under this kind is an integrity problem, never a third lifecycle state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// `Deserialize` (M2 integration adaptation, mirroring every neighboring
+/// row type) lets the admitted-cutover console envelope carry exact
+/// owner-shaped readback rows; it grants no authority and changes no row
+/// semantics.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct CapabilityIntroductionProjection {
     record: OperationalRecordInput,
     phase: OperationalPhase,
@@ -2082,150 +2097,94 @@ impl CapabilityIntroductionProjection {
     }
 }
 
-/// Committed lifecycle state of one durable grant-closure row.
-///
-/// A closure activates its members (`Active`) or fences them (`Revoked` is
-/// reported at the port; ORS records the fence as `Fenced`). The row never
-/// transitions: an exact recommit replays its receipt, anything else
-/// conflicts.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum GrantClosureState {
-    Active,
-    Fenced,
-}
+/// The authoritative receipt contract is defined in `eliot-receipts`; ORS
+/// persists that exact versioned shape rather than defining a second wire
+/// contract.
+pub type GrantClosureCommit = GrantClosureReceipt;
 
-impl GrantClosureState {
-    pub(crate) const fn phase(self) -> OperationalPhase {
-        match self {
-            Self::Active => OperationalPhase::Active,
-            Self::Fenced => OperationalPhase::Fenced,
-        }
+/// Compatibility spelling for the authoritative alternate-path declaration.
+pub type GrantClosurePreserved = GrantClosureAlternatePath;
+
+/// Maps the authoritative closure state to ORS's non-semantic operational
+/// phase without inventing a second lifecycle state.
+pub(crate) const fn grant_closure_phase(state: GrantClosureState) -> OperationalPhase {
+    match state {
+        GrantClosureState::Active => OperationalPhase::Active,
+        GrantClosureState::Revoked => OperationalPhase::Fenced,
     }
 }
 
-/// One owner-declared alternate-path survivor retained in a closure row.
-///
-/// The covering path is Governor semantic evidence recorded verbatim; ORS
-/// validates identity shape only and never evaluates coverage.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GrantClosurePreserved {
-    pub grant_id: OperationIdentity,
-    pub covering_grant_id: OperationIdentity,
-    pub covering_root: OpaqueLabel,
-}
-
-/// Durable commit input for one grant-closure operation.
-///
-/// The row binds one closure operation identity to its target, lineage root,
-/// exact graph revision, canonical closure digest, complete affected set,
-/// and survivor set. ORS stores the bytes opaquely and enforces
-/// commit-identity CAS only: the semantic validation (enumeration ownership,
-/// revision freshness, fence agreement) belongs to the P-07 port, which
-/// reconstructs and compares the exact input on every read-back.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GrantClosureCommit {
-    pub operation_id: OperationIdentity,
-    pub target_id: OperationIdentity,
-    pub authority_root: OpaqueLabel,
-    pub revision: u64,
-    pub digest: String,
-    pub affected: Vec<OperationIdentity>,
-    pub preserved: Vec<GrantClosurePreserved>,
-    /// Introductions fenced live when the closure committed, in sorted
-    /// order. They carry no supporting set here: the fence was verified
-    /// against live supporters at commit time, and this list only reinstalls
-    /// the fence after a restart so a fenced introduction can never read as
-    /// usable again.
-    pub fenced_introductions: Vec<OperationIdentity>,
-    pub state: GrantClosureState,
-}
-
-impl GrantClosureCommit {
-    pub(crate) fn validate(&self) -> Result<(), OrsError> {
-        if self.revision == 0 {
-            return Err(OrsError::InvalidField {
-                field: "grant_closure_revision",
-                reason: "must be greater than zero",
-            });
-        }
-        validate_digest(&self.digest, "grant_closure_digest")?;
-        if self.affected.is_empty() {
-            return Err(OrsError::InvalidField {
-                field: "grant_closure_affected",
-                reason: "a committed closure affects at least its target",
-            });
-        }
-        let mut previous: Option<&str> = None;
-        for grant_id in &self.affected {
-            if let Some(previous) = previous
-                && previous >= grant_id.as_str()
-            {
-                return Err(OrsError::InvalidField {
-                    field: "grant_closure_affected",
-                    reason: "affected grants must be sorted and unique",
-                });
-            }
-            previous = Some(grant_id.as_str());
-        }
-        if !self.affected.contains(&self.target_id) {
-            return Err(OrsError::InvalidField {
-                field: "grant_closure_target",
-                reason: "the closure target must be in the affected set",
-            });
-        }
-        let mut previous_survivor: Option<(&str, &str, &str)> = None;
-        for survivor in &self.preserved {
-            if self.affected.contains(&survivor.grant_id) {
-                return Err(OrsError::InvalidField {
-                    field: "grant_closure_preserved",
-                    reason: "a survivor must be disjoint from the affected set",
-                });
-            }
-            let key = (
-                survivor.grant_id.as_str(),
-                survivor.covering_grant_id.as_str(),
-                survivor.covering_root.as_str(),
-            );
-            if let Some(previous) = previous_survivor
-                && previous >= key
-            {
-                return Err(OrsError::InvalidField {
-                    field: "grant_closure_preserved",
-                    reason: "survivors must be sorted and unique",
-                });
-            }
-            previous_survivor = Some(key);
-        }
-        let mut previous_introduction: Option<&str> = None;
-        for introduction_id in &self.fenced_introductions {
-            if let Some(previous) = previous_introduction
-                && previous >= introduction_id.as_str()
-            {
-                return Err(OrsError::InvalidField {
-                    field: "grant_closure_fenced_introductions",
-                    reason: "fenced introductions must be sorted and unique",
-                });
-            }
-            previous_introduction = Some(introduction_id.as_str());
-        }
-        Ok(())
+/// Validates the authoritative versioned closure receipt before it crosses the
+/// ORS persistence boundary. The contract remains owned by `eliot-receipts`.
+pub(crate) fn validate_grant_closure_contract(commit: &GrantClosureCommit) -> Result<(), OrsError> {
+    commit
+        .validate()
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+    if let Some(receipt) = &commit.canonical_receipt {
+        validate_grant_closure_canonical_receipt(receipt)?;
     }
+    Ok(())
+}
+
+/// Validates one complete canonical second-phase receipt identity.
+///
+/// A pending first phase legitimately has no identity. Once an identity is
+/// present, both the receipt id and its canonical digest must be complete and
+/// bounded before ORS can persist or return the link.
+pub(crate) fn validate_grant_closure_canonical_receipt(
+    receipt: &ReceiptIdentity,
+) -> Result<(), OrsError> {
+    validate_text(
+        receipt.receipt_id.as_str(),
+        "grant_closure_canonical_receipt_id",
+    )?;
+    validate_digest(
+        &receipt.canonical_sha256,
+        "grant_closure_canonical_receipt_sha256",
+    )
+}
+
+/// Validates an opaque ORS record against the exact authority/fence contour
+/// carried by the authoritative closure receipt.
+pub(crate) fn validate_grant_closure_input(
+    authority: &AuthorityBinding,
+    input: &OperationalRecordInput,
+) -> Result<(), OrsError> {
+    input.validate()?;
+    authority
+        .state_fence
+        .validate()
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+    if authority.state_fence.authority_epoch != authority.authority_epoch {
+        return Err(OrsError::FenceMismatch);
+    }
+    let expected_fence = StateFenceSnapshot::capture(
+        &authority.state_fence,
+        authority.authority_epoch.sequence.get(),
+    )?;
+    if input.state_fence != expected_fence
+        || input.authority_epoch.current.epoch != authority.authority_epoch.sequence.get()
+        || input.authority_epoch.current.lineage_id.as_str()
+            != authority.authority_epoch.lineage_id.as_str()
+    {
+        return Err(OrsError::FenceMismatch);
+    }
+    Ok(())
 }
 
 /// Read-only projection of one committed grant-closure row in ORS.
 ///
 /// The commit bytes, phase, ordering, and store-issued receipt are
 /// operational evidence only; this projection grants no capability and does
-/// not interpret the closure.
+/// not interpret the closure. The second-phase receipt link is optional while
+/// canonical reconciliation is pending.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct GrantClosureProjection {
     commit: GrantClosureCommit,
     phase: OperationalPhase,
     operation_order: u64,
     receipt: GrantClosureCommitReceipt,
+    second_phase: Option<ReceiptIdentity>,
 }
 
 impl GrantClosureProjection {
@@ -2234,12 +2193,14 @@ impl GrantClosureProjection {
         phase: OperationalPhase,
         operation_order: u64,
         receipt: GrantClosureCommitReceipt,
+        second_phase: Option<ReceiptIdentity>,
     ) -> Self {
         Self {
             commit,
             phase,
             operation_order,
             receipt,
+            second_phase,
         }
     }
 
@@ -2261,6 +2222,16 @@ impl GrantClosureProjection {
     /// Returns the store-issued integrity receipt for this row.
     pub const fn receipt(&self) -> &GrantClosureCommitReceipt {
         &self.receipt
+    }
+
+    /// Returns the durable canonical second-phase receipt link, if the
+    /// immutable first-phase commit has already been linked.
+    ///
+    /// This is deliberately separate from [`Self::commit`]. The first-phase
+    /// `GrantClosureCommit` bytes are never rewritten when this link is
+    /// recorded.
+    pub const fn second_phase(&self) -> Option<&ReceiptIdentity> {
+        self.second_phase.as_ref()
     }
 }
 
@@ -2294,6 +2265,255 @@ operational_receipt!(AuthorityRevocationReceipt);
 operational_receipt!(AuthorityActivationReceipt);
 operational_receipt!(CapabilityIntroductionReceipt);
 operational_receipt!(GrantClosureCommitReceipt);
+
+/// One complete owner-presented revocation request for the atomic ORS fence.
+///
+/// The declaration and authority binding are the authoritative contract
+/// values. The two record vectors are opaque ORS inputs supplied by Kernel;
+/// ORS never derives semantic lineage or completeness from process memory.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantClosureFenceRequest {
+    /// Closed grant-closure schema identity.
+    pub schema: String,
+    /// Closed grant-closure schema version.
+    pub version: u16,
+    /// Closure operation identity.
+    pub operation_id: String,
+    /// Canonical digest of the complete idempotent closure request.
+    pub idempotency_digest: String,
+    /// Complete parent-before-child owner declaration at one graph revision.
+    pub declaration: GrantClosureDeclaration,
+    /// Exact authority owner, State Fence, Authority Epoch, and ceilings.
+    pub authority: AuthorityBinding,
+    /// Exact reference to the typed Kernel activation/revocation receipt.
+    pub authority_receipt: GrantClosureAuthorityReceiptRef,
+    /// Strongest proof interpretation recorded by the closure.
+    pub proof_ceiling: ProofCeiling,
+    /// Optional canonical store receipt linked after reconciliation.
+    pub canonical_receipt: Option<ReceiptIdentity>,
+    /// The atomic path is revocation-only; activation uses the simple row path.
+    pub state: GrantClosureState,
+    /// Introduction identities whose dependent fences are presented.
+    pub fenced_introductions: Vec<OperationIdentity>,
+    /// Exact capability-grant revocation records, one per declared member.
+    pub grant_revocations: Vec<CapabilityGrantRevocation>,
+    /// Exact capability-introduction fence records presented by Kernel.
+    pub introduction_fences: Vec<CapabilityIntroductionFence>,
+}
+
+impl GrantClosureFenceRequest {
+    /// Validates the authoritative declaration and the mechanical
+    /// closure/request correspondence before ORS opens its write transaction.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the request validator keeps the owner declaration, authority receipt, and every ORS transition mechanically aligned"
+    )]
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.schema != GRANT_CLOSURE_SCHEMA || self.version != GRANT_CLOSURE_VERSION {
+            return Err(OrsError::InvalidField {
+                field: "grant_closure_schema",
+                reason: "unsupported grant-closure request schema or version",
+            });
+        }
+        validate_text(&self.operation_id, "grant_closure_operation_id")?;
+        validate_digest(&self.idempotency_digest, "grant_closure_idempotency_digest")?;
+        self.declaration
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        if self.state != GrantClosureState::Revoked {
+            return Err(OrsError::InvalidField {
+                field: "grant_closure_state",
+                reason: "atomic fencing requires a Revoked closure",
+            });
+        }
+        self.authority
+            .state_fence
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        if self.authority.state_fence.authority_epoch != self.authority.authority_epoch {
+            return Err(OrsError::FenceMismatch);
+        }
+        validate_text(
+            self.authority.authority_owner.as_str(),
+            "grant_closure_authority_owner",
+        )?;
+        if self.proof_ceiling > self.authority.proof_ceiling
+            || self.proof_ceiling > self.declaration.proof_ceiling
+        {
+            return Err(OrsError::InvalidField {
+                field: "grant_closure_proof_ceiling",
+                reason: "closure proof ceiling exceeds its authority or declaration",
+            });
+        }
+        validate_text(
+            self.authority_receipt.receipt_id.as_str(),
+            "grant_closure_authority_receipt_id",
+        )?;
+        validate_text(
+            self.authority_receipt.snapshot_id.as_str(),
+            "grant_closure_authority_snapshot_id",
+        )?;
+        if self.authority_receipt.authority_epoch != self.authority.authority_epoch
+            || self.authority_receipt.state != self.state
+            || self.authority_receipt.receipt_id != format!("revocation-{}", self.operation_id)
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        if let Some(receipt) = &self.canonical_receipt {
+            validate_grant_closure_canonical_receipt(receipt)?;
+        }
+
+        let declared_members = self
+            .declaration
+            .members
+            .iter()
+            .map(|member| member.grant_id.as_str())
+            .collect::<Vec<_>>();
+        let declared_member_set = declared_members
+            .iter()
+            .map(|member| (*member).to_owned())
+            .collect::<BTreeSet<_>>();
+        let mut grant_subjects = BTreeSet::new();
+        let mut grant_records = BTreeSet::new();
+        for (revocation, declared_member) in self.grant_revocations.iter().zip(&declared_members) {
+            let input = revocation.record();
+            validate_grant_closure_input(&self.authority, input)?;
+            let subject = input.subject_id.as_str();
+            let record_id = input.record_id.as_str();
+            if subject != *declared_member
+                || !grant_subjects.insert(subject.to_owned())
+                || !grant_records.insert(record_id.to_owned())
+            {
+                return Err(OrsError::InvalidField {
+                    field: "grant_closure_revocations",
+                    reason: "grant revocations must follow and exactly match the declaration",
+                });
+            }
+        }
+        if self.grant_revocations.len() != declared_members.len()
+            || grant_subjects != declared_member_set
+        {
+            return Err(OrsError::InvalidField {
+                field: "grant_closure_revocations",
+                reason: "presented revocations must exactly match the declared closure members",
+            });
+        }
+
+        if self
+            .fenced_introductions
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(OrsError::InvalidField {
+                field: "grant_closure_fenced_introductions",
+                reason: "fenced introduction identities must be sorted and unique",
+            });
+        }
+        let declared_introductions: BTreeSet<String> = self
+            .fenced_introductions
+            .iter()
+            .map(|identity| identity.as_str().to_owned())
+            .collect();
+        let mut introduction_subjects = BTreeSet::new();
+        let mut introduction_records = BTreeSet::new();
+        let mut previous_subject: Option<&str> = None;
+        for fence in &self.introduction_fences {
+            let input = fence.record();
+            validate_grant_closure_input(&self.authority, input)?;
+            let subject = input.subject_id.as_str();
+            let record_id = input.record_id.as_str();
+            if previous_subject.is_some_and(|previous| previous >= subject) {
+                return Err(OrsError::InvalidField {
+                    field: "grant_closure_introduction_fences",
+                    reason: "introduction fences must be sorted by subject",
+                });
+            }
+            previous_subject = Some(subject);
+            if !introduction_subjects.insert(subject.to_owned())
+                || !introduction_records.insert(record_id.to_owned())
+            {
+                return Err(OrsError::InvalidField {
+                    field: "grant_closure_introduction_fences",
+                    reason: "introduction subject and ORS record identities must be unique",
+                });
+            }
+        }
+        if introduction_subjects != declared_introductions
+            || introduction_records.len() != self.introduction_fences.len()
+            || !grant_subjects.is_disjoint(&introduction_subjects)
+            || !grant_records.is_disjoint(&introduction_records)
+        {
+            return Err(OrsError::InvalidField {
+                field: "grant_closure_introduction_fences",
+                reason: "presented fences must be disjoint and exactly match the declared introductions",
+            });
+        }
+        let mut operation_ids = grant_records.clone();
+        operation_ids.extend(introduction_records);
+        if self
+            .declaration
+            .preserved
+            .iter()
+            .any(|alternate| operation_ids.contains(&alternate.operation_id))
+        {
+            return Err(OrsError::InvalidField {
+                field: "grant_closure_preserved",
+                reason: "alternate-path operation identity collides with a member operation",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Receipts returned by the single atomic closure-fence transaction.
+///
+/// The authoritative closure projection and every store-issued member
+/// reference are returned from the committed transaction, so exact replay
+/// returns the same values without another transition.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GrantClosureFenceReceipt {
+    commit: GrantClosureCommit,
+    closure_receipt: GrantClosureCommitReceipt,
+    member_receipts: Vec<AuthorityRevocationReceipt>,
+    introduction_receipts: Vec<CapabilityIntroductionReceipt>,
+}
+
+impl GrantClosureFenceReceipt {
+    pub(crate) fn from_parts(
+        commit: GrantClosureCommit,
+        closure_receipt: GrantClosureCommitReceipt,
+        member_receipts: Vec<AuthorityRevocationReceipt>,
+        introduction_receipts: Vec<CapabilityIntroductionReceipt>,
+    ) -> Self {
+        Self {
+            commit,
+            closure_receipt,
+            member_receipts,
+            introduction_receipts,
+        }
+    }
+
+    /// Returns the authoritative durable closure projection.
+    pub const fn commit(&self) -> &GrantClosureCommit {
+        &self.commit
+    }
+
+    /// Returns the ORS closure-row receipt.
+    pub const fn closure_receipt(&self) -> &GrantClosureCommitReceipt {
+        &self.closure_receipt
+    }
+
+    /// Returns the exact ORS member receipts in declaration order.
+    pub fn member_receipts(&self) -> &[AuthorityRevocationReceipt] {
+        &self.member_receipts
+    }
+
+    /// Returns the exact ORS introduction-fence receipts in declaration order.
+    pub fn introduction_receipts(&self) -> &[CapabilityIntroductionReceipt] {
+        &self.introduction_receipts
+    }
+}
 
 /// Integrity-checked active authority snapshot read back from ORS.
 ///
@@ -2703,6 +2923,240 @@ impl ActivationResultRetentionRecord {
     }
 }
 
+/// Maximum number of Kernel activation lifecycle rows retained by ORS.
+pub const MAX_ACTIVATION_LIFECYCLE_RECORDS: usize = 64;
+/// Maximum ticket payload retained for one activation lifecycle row.
+pub const MAX_ACTIVATION_LIFECYCLE_PAYLOAD_BYTES: usize = 128 * 1024;
+
+/// Durable mechanical lifecycle of one Kernel activation ticket.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ActivationLifecycleState {
+    /// Ticket is durably staged but no daemon claim is active.
+    Pending,
+    /// The authenticated daemon owns the bounded semantic-resolution claim.
+    Claimed,
+    /// An immutable `NotReady` result is retained and may later mint one
+    /// successor ticket after its due time and dependency-revision gate.
+    DeferredNotReady,
+    /// An immutable terminal result is retained.
+    ResultAccepted,
+    /// The ticket was cancelled before any result-bearing claim.
+    Cancelled,
+    /// The Kernel deadline linearized before any result was accepted.
+    Expired,
+    /// Outcome or ownership is uncertain and must not be replayed blindly.
+    Reconciling,
+}
+
+impl ActivationLifecycleState {
+    /// Returns whether this state can never accept a new semantic result.
+    #[must_use]
+    pub const fn is_terminal_or_reconciling(self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled | Self::Expired | Self::Reconciling | Self::ResultAccepted
+        )
+    }
+}
+
+/// Immutable durable predecessor binding for one successor activation ticket.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationSuccessorBinding {
+    pub predecessor_ticket_id: String,
+    pub predecessor_ticket_sha256: String,
+    pub predecessor_result_sha256: String,
+    pub dependency_ref: String,
+    pub observed_dependency_revision: String,
+    pub not_before_unix_ms: u64,
+}
+
+impl ActivationSuccessorBinding {
+    fn validate(&self) -> Result<(), OrsError> {
+        validate_text(
+            &self.predecessor_ticket_id,
+            "activation_predecessor_ticket_id",
+        )?;
+        validate_digest(
+            &self.predecessor_ticket_sha256,
+            "activation_predecessor_ticket_sha256",
+        )?;
+        validate_digest(
+            &self.predecessor_result_sha256,
+            "activation_predecessor_result_sha256",
+        )?;
+        validate_text(&self.dependency_ref, "activation_dependency_ref")?;
+        validate_text(
+            &self.observed_dependency_revision,
+            "activation_observed_dependency_revision",
+        )?;
+        if self.not_before_unix_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "activation_not_before_unix_ms",
+                reason: "successor due time must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One durable Kernel activation ticket lifecycle and result binding.
+///
+/// ORS treats `ticket_payload` as opaque bytes and validates only bounded
+/// identity shape. Kernel owns typed ticket/result semantics. A lifecycle row
+/// is the sole terminal/reconciling fence: result retention alone never
+/// cancels, expires, or completes a ticket.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationLifecycleRecord {
+    pub ticket_id: String,
+    pub ticket_sha256: String,
+    pub ticket_payload: String,
+    pub activation_request_id: String,
+    pub activation_request_sha256: String,
+    pub connection_id: String,
+    pub state_fence: String,
+    pub kernel_deadline_unix_ms: u64,
+    pub cancellation_id: String,
+    pub state: ActivationLifecycleState,
+    #[serde(default)]
+    pub lifecycle_order: u64,
+    #[serde(default)]
+    pub result_sha256: Option<String>,
+    #[serde(default)]
+    pub claim_owner: Option<String>,
+    #[serde(default)]
+    pub claim_expires_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub successor_of: Option<ActivationSuccessorBinding>,
+    #[serde(default)]
+    pub successor_ticket_id: Option<String>,
+    #[serde(default)]
+    pub terminal_reason: Option<String>,
+}
+
+impl ActivationLifecycleRecord {
+    /// Validates one incoming or persisted activation lifecycle row.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.ticket_id, "activation_lifecycle_ticket_id")?;
+        validate_digest(&self.ticket_sha256, "activation_lifecycle_ticket_sha256")?;
+        if self.ticket_payload.len() > MAX_ACTIVATION_LIFECYCLE_PAYLOAD_BYTES {
+            return Err(OrsError::InvalidField {
+                field: "activation_lifecycle_ticket_payload",
+                reason: "ticket payload exceeds the per-record bound",
+            });
+        }
+        validate_text(
+            &self.activation_request_id,
+            "activation_lifecycle_request_id",
+        )?;
+        validate_digest(
+            &self.activation_request_sha256,
+            "activation_lifecycle_request_sha256",
+        )?;
+        validate_text(&self.connection_id, "activation_lifecycle_connection_id")?;
+        validate_text(&self.state_fence, "activation_lifecycle_state_fence")?;
+        if self.kernel_deadline_unix_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "activation_lifecycle_deadline",
+                reason: "deadline must be greater than zero",
+            });
+        }
+        validate_text(
+            &self.cancellation_id,
+            "activation_lifecycle_cancellation_id",
+        )?;
+        if let Some(result_sha256) = &self.result_sha256 {
+            validate_digest(result_sha256, "activation_lifecycle_result_sha256")?;
+        }
+        if let Some(claim_owner) = &self.claim_owner {
+            validate_text(claim_owner, "activation_lifecycle_claim_owner")?;
+        }
+        if let Some(successor_of) = &self.successor_of {
+            successor_of.validate()?;
+        }
+        if let Some(successor_ticket_id) = &self.successor_ticket_id {
+            validate_text(successor_ticket_id, "activation_successor_ticket_id")?;
+        }
+        if let Some(reason) = &self.terminal_reason {
+            validate_text(reason, "activation_lifecycle_terminal_reason")?;
+        }
+        let claim_fields_match =
+            self.claim_owner.is_some() == self.claim_expires_at_unix_ms.is_some();
+        if !claim_fields_match {
+            return Err(OrsError::InvalidField {
+                field: "activation_lifecycle_claim",
+                reason: "claim owner and expiry must be present together",
+            });
+        }
+        if self.state == ActivationLifecycleState::Claimed
+            && (self.claim_owner.is_none() || self.result_sha256.is_some())
+        {
+            return Err(OrsError::InvalidField {
+                field: "activation_lifecycle_claim",
+                reason: "claimed state requires a claim owner and no result",
+            });
+        }
+        if matches!(
+            self.state,
+            ActivationLifecycleState::DeferredNotReady | ActivationLifecycleState::ResultAccepted
+        ) && self.result_sha256.is_none()
+        {
+            return Err(OrsError::InvalidField {
+                field: "activation_lifecycle_result",
+                reason: "result-bearing state requires the retained result digest",
+            });
+        }
+        if matches!(
+            self.state,
+            ActivationLifecycleState::Pending
+                | ActivationLifecycleState::Cancelled
+                | ActivationLifecycleState::Expired
+        ) && self.result_sha256.is_some()
+        {
+            return Err(OrsError::InvalidField {
+                field: "activation_lifecycle_result",
+                reason: "resultless state cannot retain a semantic result",
+            });
+        }
+        if self.state != ActivationLifecycleState::Claimed && self.claim_owner.is_some() {
+            return Err(OrsError::InvalidField {
+                field: "activation_lifecycle_claim",
+                reason: "only claimed state retains claim ownership",
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the exact durable key for this ticket.
+    pub fn record_key(&self) -> &str {
+        &self.ticket_id
+    }
+
+    /// Compares immutable ticket/request/cancellation identity while ignoring
+    /// mutable lifecycle state and ORS-assigned order.
+    pub fn same_immutable_identity(&self, other: &Self) -> bool {
+        self.ticket_id == other.ticket_id
+            && self.ticket_sha256 == other.ticket_sha256
+            && self.ticket_payload == other.ticket_payload
+            && self.activation_request_id == other.activation_request_id
+            && self.activation_request_sha256 == other.activation_request_sha256
+            && self.connection_id == other.connection_id
+            && self.state_fence == other.state_fence
+            && self.kernel_deadline_unix_ms == other.kernel_deadline_unix_ms
+            && self.cancellation_id == other.cancellation_id
+            && self.successor_of == other.successor_of
+    }
+}
+
+/// Coherent one-read activation recovery projection from ORS.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivationRecoverySnapshot {
+    pub lifecycles: Vec<ActivationLifecycleRecord>,
+    pub results: Vec<ActivationResultRetentionRecord>,
+}
+
 /// Typed ORS failures. None grants semantic or completion authority.
 #[derive(Debug, Error)]
 pub enum OrsError {
@@ -2803,6 +3257,18 @@ pub enum OrsError {
         "activation result ticket {ticket_id} conflicts with durable ORS state: IDENTITY_CONFLICT"
     )]
     ActivationResultRetentionIdentityConflict { ticket_id: String },
+    #[error(
+        "activation lifecycle ticket {ticket_id} conflicts with durable ORS state: IDENTITY_CONFLICT"
+    )]
+    ActivationLifecycleIdentityConflict { ticket_id: String },
+    #[error("activation ticket {ticket_id} expired before result admission")]
+    ActivationLifecycleExpired { ticket_id: String },
+    #[error("activation ticket {ticket_id} is in durable state {state:?}, not {expected:?}")]
+    ActivationLifecycleStateConflict {
+        ticket_id: String,
+        state: ActivationLifecycleState,
+        expected: ActivationLifecycleState,
+    },
     #[error("native-worker claim {claim_id} conflicts with durable ORS state: IDENTITY_CONFLICT")]
     NativeWorkerClaimIdentityConflict { claim_id: String },
     #[error(

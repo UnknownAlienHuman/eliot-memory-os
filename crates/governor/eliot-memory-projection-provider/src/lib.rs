@@ -12,10 +12,19 @@
 //! field-for-field in deterministic intake order, never re-linked.
 //!
 //! Every observed item is accounted: projected, named in `omissions` with
-//! its exact rule (scope mismatch, fence mismatch), or named in the resume
+//! its exact rule (scope mismatch, fence mismatch, admitted continuity the
+//! projection record contract cannot carry), or named in the resume
 //! `frontier` when volume truncation cuts the batch. The request
-//! `denominator_total` must equal the supplied observation count: this is
-//! the single-read contract, and multi-page reads stay MGR04 scope.
+//! `denominator_total` must equal the supplied observation count plus the
+//! supplied continuity observation count: this is the single-read contract,
+//! and multi-page reads stay MGR04 scope.
+//!
+//! Continuity is enforced here, not merely offered: [`project_batch`] refuses
+//! the whole read when a continuity observation breaks the I12.35 ingestion
+//! rules, or when an attached workflow view does not belong to the batch
+//! binding, before a single record is built. Admitted continuity then reaches
+//! the denominator exactly once, so a continuity-gated read can never report a
+//! denominator that quietly dropped the continuity material it was gated on.
 
 #![forbid(unsafe_code)]
 
@@ -28,8 +37,9 @@ use eliot_memory_projection_contracts::{
     CONTRACT_VERSION, CoverageOmission, CueTrigger, DenominatorState,
     MEMORY_PROJECTION_MAX_RECORDS, MemoryFreshness, MemoryKind, MemoryProjectionBatch,
     MemoryProjectionError, MemoryProjectionRecord, MemoryRole, MemoryScopeBinding, NegativeTrigger,
-    Precondition, ProjectionCoverage,
+    Precondition, ProjectionCoverage, WorkflowStateView,
 };
+use eliot_observation_contracts::{ContinuityError, ContinuityObservation};
 use eliot_receipts::WorkScopeId;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -41,10 +51,25 @@ use thiserror::Error;
 /// unbounded work; the read side pages across requests instead.
 pub const MAX_INTAKE_OBSERVATIONS: usize = 4_096;
 
+/// Hard ceiling on continuity observations accepted by one projection request.
+///
+/// Continuity intake is bounded separately from memory intake: the two are
+/// different record families with different bounds. Every admitted continuity
+/// observation becomes one named coverage omission, so this bound also sits
+/// inside the contracts' `MAX_BATCH_OMISSIONS` bound; a combined omission
+/// volume above that contract bound fails the batch closed.
+pub const MAX_INTAKE_CONTINUITY_OBSERVATIONS: usize = 256;
+
 /// Stable omission reason for a scope-triple mismatch.
 pub const OMISSION_SCOPE_MISMATCH: &str = "scope-mismatch";
 /// Stable omission reason for a fence incompatibility.
 pub const OMISSION_FENCE_MISMATCH: &str = "fence-mismatch";
+/// Stable omission reason for admitted continuity outside the record contract.
+///
+/// [`MemoryProjectionRecord`] carries no continuity fields, so an admitted
+/// continuity observation is accounted by name and loss reason instead of
+/// being projected with invented fields or dropped without a trace.
+pub const OMISSION_CONTINUITY_NOT_PROJECTED: &str = "continuity-admitted-not-projected";
 
 /// Projection failure for a memory read set.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -52,6 +77,9 @@ pub enum ProjectionError {
     /// The request or the projected batch is invalid.
     #[error("memory projection: {0}")]
     Contract(#[from] MemoryProjectionError),
+    /// The continuity ingestion rules refused the supplied material.
+    #[error("continuity ingestion: {0}")]
+    Continuity(#[from] ContinuityError),
     /// The declared denominator does not equal the supplied volume.
     #[error("denominator {total} contradicts supplied volume {supplied}")]
     DenominatorContradiction {
@@ -120,6 +148,12 @@ pub struct AdmittedMemoryObservation {
 }
 
 /// Bounded projection request over admitted observations.
+///
+/// The request is the provider intake port: continuity evidence travels with
+/// the memory records it was captured beside, so gating one and dropping the
+/// other at the boundary is not expressible. The material is owned, not
+/// borrowed, so the request stays one serializable, deserializable, and
+/// schema-described value the Governor read side can carry on the wire.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectionRequest {
@@ -127,11 +161,24 @@ pub struct ProjectionRequest {
     pub binding: MemoryScopeBinding,
     /// Projection revision assigned to every projected record.
     pub projection_revision: u64,
-    /// Canonical records observed by the read side; must equal the
-    /// supplied observation count (single-read contract).
+    /// Canonical records observed by the read side; must equal the supplied
+    /// observation count plus the supplied continuity observation count
+    /// (single-read contract).
     pub denominator_total: usize,
     /// Admitted observations in deterministic read order.
     pub observations: Vec<AdmittedMemoryObservation>,
+    /// Admitted continuity observations in deterministic capture order.
+    ///
+    /// Every entry is gated by
+    /// [`admit_continuity_for_projection`](crate::admit_continuity_for_projection)
+    /// and accounted in the batch denominator exactly once.
+    pub continuity: Vec<ContinuityObservation>,
+    /// Workflow state view travelling with this read, when one is attested.
+    ///
+    /// `None` means no view was supplied; it never means a view was checked
+    /// and found consistent, because a supplied view that does not belong to
+    /// the batch binding fails the whole read.
+    pub workflow_view: Option<WorkflowStateView>,
 }
 
 impl ProjectionRequest {
@@ -144,10 +191,23 @@ impl ProjectionRequest {
                 bound: MAX_INTAKE_OBSERVATIONS,
             });
         }
-        if self.denominator_total != self.observations.len() {
+        if self.continuity.len() > MAX_INTAKE_CONTINUITY_OBSERVATIONS {
+            return Err(ProjectionError::IntakeOverBound {
+                supplied: self.continuity.len(),
+                bound: MAX_INTAKE_CONTINUITY_OBSERVATIONS,
+            });
+        }
+        // Both families are canonical records the read side observed, and each
+        // one reaches the batch denominator exactly once: memory observations
+        // become a record, an omission or a frontier handle, and continuity
+        // observations become an omission. So the three coverage lists
+        // together carry this declared total, and continuity is counted here
+        // rather than being free.
+        let observed = self.observations.len() + self.continuity.len();
+        if self.denominator_total != observed {
             return Err(ProjectionError::DenominatorContradiction {
                 total: self.denominator_total,
-                supplied: self.observations.len(),
+                supplied: observed,
             });
         }
         Ok(())
@@ -158,11 +218,23 @@ impl ProjectionRequest {
 ///
 /// Scope-mismatched and fence-incompatible observations become named
 /// omissions; volume beyond [`MEMORY_PROJECTION_MAX_RECORDS`] truncates
-/// with a resume frontier. The returned batch is fully validated.
+/// with a resume frontier. Continuity material is gated first: a refused
+/// continuity observation, or a workflow view outside the batch binding,
+/// fails the read before any record exists, so a refused input can never
+/// contribute to a batch. Admitted continuity is then accounted as one named
+/// omission per observation, so every observed item lands in exactly one of
+/// records, omissions, or the resume frontier and the three together carry the
+/// declared denominator. The returned batch is fully validated.
 pub fn project_batch(
     request: &ProjectionRequest,
 ) -> Result<MemoryProjectionBatch, ProjectionError> {
     request.validate()?;
+    // Ordering is load-bearing: the continuity gates run before the first
+    // record is built, so nothing from a refused read reaches the batch.
+    admit_continuity_for_projection(&request.continuity)?;
+    if let Some(view) = &request.workflow_view {
+        admit_workflow_view_for_projection(view, &request.binding)?;
+    }
     let mut records = Vec::new();
     let mut omissions = Vec::new();
     let mut frontier: Vec<String> = Vec::new();
@@ -198,6 +270,23 @@ pub fn project_batch(
             continue;
         }
         records.push(project_one(observation, request));
+    }
+    // Admitted continuity is accounted exactly once, in the same coverage
+    // vocabulary as every other observed item. `MemoryProjectionRecord` has
+    // no continuity fields, and inventing an epistemic status, kind, or
+    // handle for a continuity observation would fabricate the very evidence
+    // the gate just refused to fabricate, so the loss is named instead. The
+    // handle is the observation's own canonical identity, which the gate
+    // already proved is non-blank and control-character free, so this
+    // construction cannot invent or reject an identity.
+    for observation in &request.continuity {
+        let handle = ArtifactId::new(observation.observation_id.as_str())
+            .map_err(MemoryProjectionError::from)
+            .map_err(ProjectionError::from)?;
+        omissions.push(CoverageOmission {
+            handle,
+            reason: OMISSION_CONTINUITY_NOT_PROJECTED.to_owned(),
+        });
     }
     let batch = MemoryProjectionBatch {
         contract_version: CONTRACT_VERSION,

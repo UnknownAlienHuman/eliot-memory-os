@@ -21,7 +21,7 @@ use eliot_mcp::{
     HostInvocationRequest, HostInvocationResult, HostRequestGateway, KernelHostRequestPort,
     ToolRequest,
 };
-use eliot_protocol::EventEnvelope;
+use eliot_protocol::{AgentActivationResolutionDisposition, EventEnvelope};
 use request_input::{
     REQUEST_INPUT_LIMIT_TABLE, REQUEST_INPUT_PROFILE, REQUEST_INPUT_PROFILE_ID, ReadOutcome,
     check_profile_id, check_request_envelope, classify_serde_error, prevalidate_record,
@@ -361,6 +361,16 @@ enum Response {
     Error {
         code: &'static str,
         detail: String,
+    },
+    /// Lossless activation-denial projection. The closed disposition,
+    /// directive, reason code, and exact owner-issued typed detail remain
+    /// structured instead of being collapsed into a generic error string.
+    ActivationDenied {
+        code: &'static str,
+        reason_code: String,
+        disposition: String,
+        directive_kind: String,
+        detail: Option<AgentActivationResolutionDisposition>,
     },
 }
 
@@ -887,7 +897,10 @@ fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
         | Response::ReactiveLedger { bootstrap, .. }
         | Response::Reconciled { bootstrap }
         | Response::Stopped { bootstrap, .. } => bootstrap,
-        Response::Bootstrap { .. } | Response::Error { .. } | Response::DryRun { .. } => {
+        Response::Bootstrap { .. }
+        | Response::Error { .. }
+        | Response::ActivationDenied { .. }
+        | Response::DryRun { .. } => {
             return;
         }
     };
@@ -1772,9 +1785,12 @@ fn bridge_error(error: &BridgeError) -> Response {
             detail: "Kernel-owned HostActivationPort rejected or fenced the request".to_owned(),
         }
     } else if let BridgeError::ActivationDenied(report) = error {
-        Response::Error {
+        Response::ActivationDenied {
             code: activation_denial_host_code(report.disposition()),
-            detail: report.agent_detail(),
+            reason_code: report.reason_code().to_owned(),
+            disposition: report.disposition().to_owned(),
+            directive_kind: report.directive_kind().to_owned(),
+            detail: report.detail().cloned(),
         }
     } else if let BridgeError::ActivationDeadlineExceeded {
         operation,

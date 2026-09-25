@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityBinaryResolverConfig {
     pub explicit_binary: Option<PathRef>,
     pub search_path_names: Vec<String>,
@@ -42,6 +43,7 @@ pub enum AntigravityBinaryResolutionStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityTrustReceipt {
     pub candidate_path: PathRef,
     pub canonical_path: Option<PathRef>,
@@ -55,6 +57,7 @@ pub struct AntigravityTrustReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityBinaryCandidate {
     pub path: PathRef,
     pub canonical_path: Option<PathRef>,
@@ -67,6 +70,7 @@ pub struct AntigravityBinaryCandidate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityBinaryResolution {
     pub status: AntigravityBinaryResolutionStatus,
     pub selected_path: Option<PathRef>,
@@ -80,6 +84,7 @@ pub struct AntigravityBinaryResolution {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityGuiProcessProbe {
     pub component: String,
     pub process_names_checked: Vec<String>,
@@ -93,6 +98,7 @@ pub struct AntigravityGuiProcessProbe {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityWindowsInstallDiscovery {
     pub component: String,
     pub local_app_data: Option<PathRef>,
@@ -117,6 +123,7 @@ pub enum AntigravityVersionGateStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityVersionGateResult {
     pub component: String,
     pub command: String,
@@ -131,6 +138,7 @@ pub struct AntigravityVersionGateResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct AntigravityOfficialCliInstallerReceipt {
     pub component: String,
@@ -190,6 +198,7 @@ pub enum AntigravityEnablementScope {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityEnablementReceipt {
     pub receipt_id: String,
     pub provider_id: String,
@@ -225,6 +234,7 @@ pub enum AntigravityAuthStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityAuthCheck {
     pub check_id: String,
     pub provider_id: String,
@@ -246,6 +256,7 @@ pub enum AntigravityLiveSmokeMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityLiveSmokeRequest {
     pub smoke_id: String,
     pub mode: AntigravityLiveSmokeMode,
@@ -271,6 +282,7 @@ pub enum AntigravityLiveSmokeStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityLiveSmokeResult {
     pub result_id: String,
     pub smoke_ref: String,
@@ -294,6 +306,7 @@ pub enum AntigravityMcpConfigSurface {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct AntigravityMcpConfigStatus {
     pub component: String,
@@ -313,6 +326,7 @@ pub struct AntigravityMcpConfigStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct AntigravityMcpRegistrationReceipt {
     pub component: String,
@@ -332,6 +346,7 @@ pub struct AntigravityMcpRegistrationReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityMcpInvocationReceipt {
     pub component: String,
     pub profile: String,
@@ -346,6 +361,7 @@ pub struct AntigravityMcpInvocationReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct AntigravityOfficialPluginStatus {
     pub component: String,
@@ -364,6 +380,7 @@ pub struct AntigravityOfficialPluginStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct AntigravityOfficialPluginInstallReceipt {
     pub component: String,
@@ -384,6 +401,7 @@ pub struct AntigravityOfficialPluginInstallReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityLiveTreeSnapshot {
     pub repo_root: PathRef,
     pub head: String,
@@ -395,6 +413,7 @@ pub struct AntigravityLiveTreeSnapshot {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityDisposableWorktreeSmokeEvidence {
     pub component: String,
     pub work_lease_id: WorkLeaseId,
@@ -415,6 +434,7 @@ pub struct AntigravityDisposableWorktreeSmokeEvidence {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityVisibilityReport {
     pub component: String,
     pub gui: AntigravityGuiProcessProbe,
@@ -430,6 +450,7 @@ pub struct AntigravityVisibilityReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityDisableReceipt {
     pub receipt_id: String,
     pub provider_id: String,
@@ -441,6 +462,7 @@ pub struct AntigravityDisableReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct AntigravityCapabilities {
     pub print_mode: bool,
@@ -483,6 +505,7 @@ impl Default for AntigravityCapabilities {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityCapabilityProbe {
     pub provider_state: AntigravityProviderState,
     pub binary_path: Option<PathRef>,
@@ -498,6 +521,7 @@ pub struct AntigravityCapabilityProbe {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityArgvPolicy {
     pub shell: bool,
     pub fuse_flag_values: bool,
@@ -506,6 +530,7 @@ pub struct AntigravityArgvPolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityPromptPolicy {
     pub deny_sensitive_paths: bool,
     pub deny_destructive_commands: bool,
@@ -514,6 +539,7 @@ pub struct AntigravityPromptPolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityEnvPolicy {
     pub clear_env_first: bool,
     pub drop_secret_like_vars: bool,
@@ -522,6 +548,7 @@ pub struct AntigravityEnvPolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravitySensitivePathPolicy {
     pub denied_fragments: Vec<String>,
     pub deny_home_secrets: bool,
@@ -558,12 +585,14 @@ pub enum AntigravitySandboxPolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityLogFilePolicy {
     pub capture_to_blob: bool,
     pub expose_raw_path: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravitySessionPolicy {
     pub allow_continue: bool,
     pub allow_conversation_id_from_user: bool,
@@ -579,6 +608,7 @@ pub enum AntigravityContractSource {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct AntigravityCommandContract {
     pub provider_id: String,
@@ -617,6 +647,7 @@ pub enum AntigravityReviewMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityReviewRequest {
     pub request_id: String,
     pub project: String,
@@ -649,6 +680,7 @@ pub enum AntigravityRunState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityOutputRedactionReceipt {
     pub redacted: bool,
     pub redacted_markers: Vec<String>,
@@ -657,6 +689,7 @@ pub struct AntigravityOutputRedactionReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravitySafetyReceipt {
     /// Governed argv with the prompt argument removed before persistence.
     pub typed_argv: Vec<String>,
@@ -678,6 +711,7 @@ pub struct AntigravitySafetyReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityModelObservation {
     pub requested_model: String,
     pub observed_model: String,
@@ -694,6 +728,7 @@ pub enum AntigravityModelObservationAuthority {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 // These four independent booleans are the stable serialized proof surface for
 // the smoke protocol; collapsing them would obscure which exact check failed.
 #[allow(clippy::struct_excessive_bools)]
@@ -705,6 +740,7 @@ pub struct AntigravityResponseProtocolReceipt {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityRun {
     pub run_id: String,
     pub request_id: String,
@@ -733,6 +769,7 @@ pub struct AntigravityRun {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityNormalizedResult {
     pub result_id: String,
     pub request_id: String,
@@ -761,6 +798,7 @@ pub enum AntigravityExecutionGateDecisionKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityExecutionGateDecision {
     pub decision: AntigravityExecutionGateDecisionKind,
     pub reasons: Vec<String>,
@@ -769,6 +807,7 @@ pub struct AntigravityExecutionGateDecision {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct AntigravityDoctorStatus {
     pub component: String,
@@ -786,6 +825,7 @@ pub struct AntigravityDoctorStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityTelemetryReport {
     pub component: String,
     pub detection_state: AntigravityProviderState,
@@ -801,6 +841,7 @@ pub struct AntigravityTelemetryReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct AntigravityRealDoctorStatus {
     pub component: String,
@@ -819,6 +860,7 @@ pub struct AntigravityRealDoctorStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityRealReport {
     pub component: String,
     pub resolution: AntigravityBinaryResolution,
@@ -837,6 +879,7 @@ pub struct AntigravityRealReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityReport {
     pub component: String,
     pub resolution: AntigravityBinaryResolution,

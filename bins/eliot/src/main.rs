@@ -15,9 +15,9 @@ use eliot_installation::{
     ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest,
     GenerationPackagePlanInput, GenerationPackagePlanner, InstallationEpoch, InstallationError,
     InstallationProfile, InstallationStage, InstallationStepOutcome, InstallationTransaction,
-    InstallationTransactionStore, PlatformHandle, RedbInstallationRegistry,
-    RedbInstallationTransactionStore, WindowsInstallationCoordinator,
-    parse_installation_transaction_id, registry_projection_pending_ref,
+    InstallationTransactionStore, PlatformHandle, PostBootstrapRejectionClass,
+    RedbInstallationRegistry, RedbInstallationTransactionStore, WindowsInstallationCoordinator,
+    parse_installation_transaction_id, post_bootstrap_rejection_pending_ref,
     require_published_source_bundle_journal, validate_installation_transaction_json,
 };
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
@@ -53,6 +53,7 @@ mod bootstrap_draft;
 mod controlboard_status;
 mod first_run_flow;
 mod plugin_preview;
+mod release_surface;
 mod scope_observe;
 mod source_bundle_materializer;
 mod update_installer;
@@ -72,6 +73,11 @@ const RESTART_REQUIRED_EXIT: i32 = 77;
 /// rehearsal was proven): backup existence is not recovery proof, so a
 /// process exit never stands in for it.
 const BACKUP_OWNER_ADMISSION_REQUIRED_EXIT: i32 = 78;
+/// Doctor observed installed-surface drift against the accepted immutable
+/// release manifest. Drift is data inside the report, but the command still
+/// terminates nonzero so a release gate cannot read a drifted installation as
+/// verified.
+const RELEASE_SURFACE_DRIFT_EXIT: i32 = 3;
 const INSTALLATION_INPUT_LIMIT: u64 = 16 * 1024 * 1024;
 const INSTALLATION_CONTRACT_VERSION: &str = "3.0.0";
 const INSTALLATION_SCOPE: &str = "bounded_all_effects_or_exact_rollback";
@@ -128,6 +134,11 @@ enum Command {
     Doctor {
         #[command(subcommand)]
         command: DoctorCommand,
+    },
+    /// Release-generation surfaces owned by the installation front door.
+    Release {
+        #[command(subcommand)]
+        command: ReleaseCommand,
     },
     /// Read the reconciled `ControlBoard` status projection (#1213).
     #[command(name = "controlboard")]
@@ -485,6 +496,111 @@ enum DoctorCommand {
         #[arg(long, value_parser = absolute_path)]
         observation: PathBuf,
     },
+    /// Compare the accepted immutable `ReleaseSurfaceManifest` with the
+    /// observed installation and report field-level `MATCH`, `MISSING`,
+    /// `MISMATCH`, `STALE`, or `UNKNOWN` (I19.8). Read-only: the accepted
+    /// manifest is never regenerated, repaired, or re-signed, and its bytes are
+    /// hashed before and after the comparison.
+    ReleaseSurface {
+        /// Absolute path to the accepted release-surface manifest.
+        #[arg(long, value_parser = absolute_path)]
+        manifest: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ReleaseCommand {
+    /// Generate and publish exactly one immutable `ReleaseSurfaceManifest` for
+    /// one installable release (I19.8).
+    ///
+    /// Run after `installation materialize-source-bundle` published the exact
+    /// Phase-A source bundle and before `installation apply` mutates the
+    /// machine. The manifest is published create-new and read-only; the
+    /// installer and runtime have no write path to it. Bind only
+    /// release-scoped, immutable Product Proof receipts and migration evidence
+    /// snapshots: a per-pulse receipt rotates and would later read as drift.
+    SurfaceManifest {
+        /// Absolute release source root. Its Git head and accepted normative
+        /// pair are the observed source and Architecture/Implementation
+        /// identities, so the tree must be the clean pinned release commit.
+        #[arg(long, value_parser = absolute_path)]
+        repo_root: PathBuf,
+        /// Absolute staged or finalized release bundle root.
+        #[arg(long, value_parser = absolute_path)]
+        release_bundle: PathBuf,
+        /// Absolute published Phase-A source bundle produced by
+        /// `installation materialize-source-bundle`.
+        #[arg(long, value_parser = absolute_path)]
+        phase_a_bundle: PathBuf,
+        /// Absolute Phase-A generation destination root the manifest binds as
+        /// the installed location of every published Phase-A role.
+        #[arg(long, value_parser = absolute_path)]
+        phase_a_install_root: PathBuf,
+        /// Absolute release payload destination root the manifest binds as the
+        /// installed location of every generated release artifact.
+        #[arg(long, value_parser = absolute_path)]
+        release_install_root: PathBuf,
+        /// Canonical relative package generation identity.
+        #[arg(long)]
+        generation: String,
+        /// Stable installation identity.
+        #[arg(long)]
+        installation: String,
+        /// Stable lineage identity.
+        #[arg(long)]
+        lineage_id: String,
+        /// Non-zero sequence within the lineage.
+        #[arg(long)]
+        sequence: u64,
+        /// Release receipt identity that authorized this generation.
+        #[arg(long)]
+        transaction_id: String,
+        /// Explicit installation profile.
+        #[arg(long, value_parser = parse_installation_profile)]
+        profile: InstallationProfile,
+        /// Exact recovery/rollback command retained by the release transaction.
+        #[arg(long)]
+        recovery_command: String,
+        /// Unix-seconds instant after which this manifest no longer describes
+        /// its release.
+        #[arg(long)]
+        expires_at_unix_seconds: i64,
+        /// Release-bundle-relative generated schema artifact; repeat for each.
+        #[arg(long = "generated-schema", value_name = "RELEASE_RELATIVE_PATH")]
+        generated_schemas: Vec<String>,
+        /// Release-bundle-relative generated plugin artifact; repeat for each.
+        #[arg(long = "generated-plugin", value_name = "RELEASE_RELATIVE_PATH")]
+        generated_plugins: Vec<String>,
+        /// Release-bundle-relative generated Skill artifact; repeat for each.
+        #[arg(long = "generated-skill", value_name = "RELEASE_RELATIVE_PATH")]
+        generated_skills: Vec<String>,
+        /// Release-bundle-relative generated hook artifact; repeat for each.
+        #[arg(long = "generated-hook", value_name = "RELEASE_RELATIVE_PATH")]
+        generated_hooks: Vec<String>,
+        /// Release-bundle-relative generated prompt artifact; repeat for each.
+        #[arg(long = "generated-prompt", value_name = "RELEASE_RELATIVE_PATH")]
+        generated_prompts: Vec<String>,
+        /// Repository-relative capability-cell registry artifact; repeat for
+        /// each.
+        #[arg(long = "capability-registry", value_name = "REPO_RELATIVE_PATH")]
+        capability_cell_registries: Vec<String>,
+        /// Absolute release-scoped Product Proof receipt; repeat for each.
+        #[arg(long = "product-proof", value_parser = absolute_path)]
+        product_proof_receipts: Vec<PathBuf>,
+        /// Absolute release-scoped migration evidence snapshot; repeat for each.
+        #[arg(long = "migration-evidence", value_parser = absolute_path)]
+        migration_evidence_snapshots: Vec<PathBuf>,
+        /// Absolute manifest this release rolls forward from.
+        #[arg(long, value_parser = absolute_path)]
+        supersedes: Option<PathBuf>,
+        /// Prior generation retained as the rollback target.
+        #[arg(long)]
+        prior_generation: Option<String>,
+        /// Absolute create-new manifest destination. It is published once and
+        /// is never overwritten.
+        #[arg(long, value_parser = absolute_path)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -631,6 +747,7 @@ fn run() -> Result<i32> {
         Command::Setup { command } => run_setup(command),
         Command::Plugin { command } => run_plugin(command),
         Command::Doctor { command } => run_doctor(command),
+        Command::Release { command } => run_release(command),
         Command::ControlBoard { command } => run_controlboard(command),
         Command::Backup { command } => backup_entry::run_backup(command),
         Command::Scope { command } => Ok(run_scope(command)),
@@ -786,6 +903,175 @@ fn run_doctor(command: DoctorCommand) -> Result<i32> {
                 }
                 Err(error) => {
                     write_installation_error("DOCTOR_INTEGRATION_INVALID", &error.to_string());
+                    Ok(INVALID_REQUEST_EXIT)
+                }
+            }
+        }
+        DoctorCommand::ReleaseSurface { manifest } => {
+            let observed_at = match release_surface::observed_unix_seconds() {
+                Ok(value) => value,
+                Err(error) => {
+                    write_installation_error("DOCTOR_RELEASE_SURFACE_INVALID", &error.to_string());
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+            };
+            // The comparison is read-only by construction: this front door
+            // decodes arguments and projects the report, and the gate never
+            // regenerates, repairs, or re-signs the accepted manifest.
+            match release_surface::verify_release_surface(&manifest, observed_at) {
+                Ok(report) => {
+                    let drift = report.drift_detected();
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    Ok(if drift { RELEASE_SURFACE_DRIFT_EXIT } else { 0 })
+                }
+                Err(error) => {
+                    write_installation_error("DOCTOR_RELEASE_SURFACE_INVALID", &error.to_string());
+                    Ok(INVALID_REQUEST_EXIT)
+                }
+            }
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one release-generation boundary keeps every observed input next to the field it binds"
+)]
+fn run_release(command: ReleaseCommand) -> Result<i32> {
+    match command {
+        ReleaseCommand::SurfaceManifest {
+            repo_root,
+            release_bundle,
+            phase_a_bundle,
+            phase_a_install_root,
+            release_install_root,
+            generation,
+            installation,
+            lineage_id,
+            sequence,
+            transaction_id,
+            profile,
+            recovery_command,
+            expires_at_unix_seconds,
+            generated_schemas,
+            generated_plugins,
+            generated_skills,
+            generated_hooks,
+            generated_prompts,
+            capability_cell_registries,
+            product_proof_receipts,
+            migration_evidence_snapshots,
+            supersedes,
+            prior_generation,
+            output,
+        } => {
+            let prior_generation = match prior_generation {
+                Some(value) => Some(cli_handle(value, "prior_generation")?),
+                None => None,
+            };
+            let input = release_surface::ReleaseSurfaceGenerateInput {
+                repo_root,
+                release_bundle,
+                phase_a_bundle,
+                phase_a_install_root,
+                release_install_root,
+                generation: cli_handle(generation, "generation")?,
+                installation: cli_handle(installation, "installation")?,
+                lineage_id: cli_handle(lineage_id, "lineage_id")?,
+                sequence,
+                transaction_id: cli_handle(transaction_id, "transaction_id")?,
+                profile,
+                recovery_command: cli_handle(recovery_command, "recovery_command")?,
+                expires_at_unix_seconds,
+                generated_schemas,
+                generated_plugins,
+                generated_skills,
+                generated_hooks,
+                generated_prompts,
+                capability_cell_registries,
+                product_proof_receipts,
+                migration_evidence_snapshots,
+                supersedes,
+                prior_generation,
+                output: output.clone(),
+            };
+            match release_surface::generate_release_surface_manifest(&input) {
+                Ok((manifest, bytes)) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "contract": release_surface::MANIFEST_WIRE_ID,
+                            "contract_version": release_surface::MANIFEST_SCHEMA_VERSION,
+                            "status": "RELEASE_SURFACE_MANIFEST_PUBLISHED",
+                            "manifest": output.display().to_string(),
+                            "manifest_bytes": bytes.len(),
+                            "manifest_sha256": format!("{:x}", Sha256::digest(&bytes)),
+                            "surface_digest": manifest.surface_digest,
+                            "release_id": manifest.release_id,
+                            "generation": manifest
+                                .product_and_source_identity
+                                .as_ref()
+                                .and_then(|identity| identity.generation.as_ref())
+                                .map(PlatformHandle::as_str),
+                            "source_commit": manifest
+                                .product_and_source_identity
+                                .as_ref()
+                                .and_then(|identity| identity.source_commit.clone()),
+                            "required_sections": release_surface::REQUIRED_SECTIONS,
+                            "bound": {
+                                "bundle_binaries": manifest
+                                    .executable_package_route_and_module_generation_digests
+                                    .as_ref()
+                                    .and_then(|value| value.bundle_binaries.as_ref())
+                                    .map_or(0, Vec::len),
+                                "phase_a_executables": manifest
+                                    .executable_package_route_and_module_generation_digests
+                                    .as_ref()
+                                    .and_then(|value| value.phase_a_executables.as_ref())
+                                    .map_or(0, Vec::len),
+                                "generated_schemas": manifest
+                                    .generated_schema_plugin_skill_hook_and_prompt_digests
+                                    .as_ref()
+                                    .and_then(|value| value.schemas.as_ref())
+                                    .map_or(0, Vec::len),
+                                "generated_plugins": manifest
+                                    .generated_schema_plugin_skill_hook_and_prompt_digests
+                                    .as_ref()
+                                    .and_then(|value| value.plugins.as_ref())
+                                    .map_or(0, Vec::len),
+                                "generated_skills": manifest
+                                    .generated_schema_plugin_skill_hook_and_prompt_digests
+                                    .as_ref()
+                                    .and_then(|value| value.skills.as_ref())
+                                    .map_or(0, Vec::len),
+                                "generated_hooks": manifest
+                                    .generated_schema_plugin_skill_hook_and_prompt_digests
+                                    .as_ref()
+                                    .and_then(|value| value.hooks.as_ref())
+                                    .map_or(0, Vec::len),
+                                "generated_prompts": manifest
+                                    .generated_schema_plugin_skill_hook_and_prompt_digests
+                                    .as_ref()
+                                    .and_then(|value| value.prompts.as_ref())
+                                    .map_or(0, Vec::len),
+                                "signing_identities": manifest
+                                    .release_receipt_and_signing_identity
+                                    .as_ref()
+                                    .and_then(|value| value.signing_identities.as_ref())
+                                    .map_or(0, Vec::len),
+                            },
+                            "immutability": "create_new_read_only_published_once",
+                            "verify_with": "eliot doctor release-surface --manifest <exact path>",
+                            "scope": INSTALLATION_SCOPE,
+                        }))?
+                    );
+                    Ok(0)
+                }
+                Err(error) => {
+                    write_installation_error(
+                        "RELEASE_SURFACE_MANIFEST_REJECTED",
+                        &error.to_string(),
+                    );
                     Ok(INVALID_REQUEST_EXIT)
                 }
             }
@@ -2918,20 +3204,27 @@ fn run_installation_effect(
     } else if preflight_transaction.profile == InstallationProfile::SystemService {
         match coordinator.drive_until_host_bootstrap(&transaction_id) {
             Ok(InstallationStepOutcome::Applied { .. }) => {
+                // The bootstrap prefix applied, so the Host root and the
+                // CreatedByTransaction service registrations may already
+                // exist. Both readback failures below are reported truthfully:
+                // a missing record cannot be rejected durably because there is
+                // nothing left to reject, and a failed read cannot be rejected
+                // durably because the store is what failed. Neither may claim a
+                // recoverable rollback it did not establish.
                 let current = match coordinator.store().load(&transaction_id) {
                     Ok(Some(transaction)) => transaction,
                     Ok(None) => {
                         write_installation_error(
-                            "INSTALLATION_APPLY_NOT_FOUND",
-                            "transaction disappeared before pending registry projection",
+                            "INSTALLATION_STATE_UNAVAILABLE",
+                            "Host bootstrap applied but the transaction record is gone, so no durable rejection can be persisted: reconcile the installation state before any retry",
                         );
                         return Ok(INVALID_REQUEST_EXIT);
                     }
                     Err(error) => {
                         write_installation_error(
-                            "INSTALLATION_APPLY_ERROR",
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
                             &format!(
-                                "transaction readback before pending projection failed: {error}"
+                                "transaction readback after the applied Host bootstrap prefix failed: {error}: no durable rejection could be persisted, so recovery is required and rollback readiness is unknown"
                             ),
                         );
                         return Ok(INVALID_REQUEST_EXIT);
@@ -2948,13 +3241,16 @@ fn run_installation_effect(
                     Ok(root) => root,
                     Err(error) => {
                         // E3: the retained Host root cannot be reopened after
-                        // the bootstrap prefix applied. Persist the same
-                        // durable typed rejection as E4/E5 so a later
-                        // recover/rollback reaches RolledBack; an unconfirmed
-                        // rejection stays INSTALLATION_APPLY_RECOVERY_REQUIRED.
+                        // the bootstrap prefix applied. Persist a durable typed
+                        // rejection so a later recover/rollback reaches
+                        // RolledBack; the reference names this Host-root-reopen
+                        // failure class, not a registry projection that was
+                        // never attempted. An unconfirmed rejection stays
+                        // INSTALLATION_APPLY_RECOVERY_REQUIRED.
                         return Ok(report_post_bootstrap_failure(
                             &mut coordinator,
                             &transaction_id,
+                            PostBootstrapRejectionClass::HostRootReopen,
                             &format!("retained Host root could not be reopened: {error}"),
                         ));
                     }
@@ -2971,6 +3267,7 @@ fn run_installation_effect(
                         return Ok(report_post_bootstrap_failure(
                             &mut coordinator,
                             &transaction_id,
+                            PostBootstrapRejectionClass::RegistryProjection,
                             &format!("pending registry could not be opened: {error}"),
                         ));
                     }
@@ -2984,6 +3281,7 @@ fn run_installation_effect(
                         return Ok(report_post_bootstrap_failure(
                             &mut coordinator,
                             &transaction_id,
+                            PostBootstrapRejectionClass::RegistryProjection,
                             &format!("pending registry preflight failed: {error}"),
                         ));
                     }
@@ -3004,12 +3302,30 @@ fn run_installation_effect(
                             current.stage() == InstallationStage::Registering
                                 && !current.has_activation_projection_intent()
                         }
-                        Ok(None) | Err(_) => false,
+                        // A FAILED store read proves nothing about the stage. It
+                        // is not "not Registering": the outcome is unknown, so
+                        // it is reported as unconfirmed instead of falling
+                        // through to a plain apply error that would imply a
+                        // durable rejection this path never established.
+                        Err(read_error) => {
+                            write_installation_error(
+                                "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                                &format!(
+                                    "pending registry projection failed: {error}; the stage readback that decides whether a durable rejection is still admissible also failed ({read_error}): recovery is required and rollback readiness is unknown"
+                                ),
+                            );
+                            return Ok(INVALID_REQUEST_EXIT);
+                        }
+                        // A successful read showing no record is not
+                        // Registering either; the existing reconcile/terminal
+                        // disposition applies.
+                        Ok(None) => false,
                     };
                     if still_registering {
                         return Ok(report_post_bootstrap_failure(
                             &mut coordinator,
                             &transaction_id,
+                            PostBootstrapRejectionClass::RegistryProjection,
                             &format!("pending registry projection failed: {error}"),
                         ));
                     }
@@ -3197,67 +3513,19 @@ fn run_installation_effect(
     Ok(installation_command_exit_code(overall_status))
 }
 
-/// The terminal-reconcile writer open below is short-lived and bounded: it
-/// retries only redb exclusive-lock contention with backoff, then fails
-/// typed with the preserved cause (A13.9:14 no exclusive owner across an
-/// unbounded wait; `crates/kernel/eliot-installation/src/installation_registry.rs:8-13`
-/// bounded-hold contract; prior `drop(registry)` fix at main.rs:2221-2228;
-/// redb `Database::open` takes an exclusive file lock while the Watchdog
-/// 250ms poll may hold the file).
-fn is_redb_exclusive_lock_contention(error: &InstallationError) -> bool {
-    match error {
-        InstallationError::Platform(reason) => {
-            let normalized = reason.to_lowercase();
-            normalized.contains("already open") || normalized.contains("cannot acquire lock")
-        }
-        _ => false,
-    }
-}
-
-/// Opens the existing registry for terminal reconcile with bounded
-/// lock-contention retry. Absent stays `Ok(None)`; non-lock failures fail
-/// fast with the preserved cause. Total sleep is bounded well below 5s so
-/// this second-apply query-reconcile never becomes an unbounded wait.
-fn open_existing_registry_for_terminal_reconcile(
-    host_state_root: &Path,
-) -> Result<Option<RedbInstallationRegistry>, InstallationError> {
-    // NOTE: Writer-A may add a shared retry primitive in the registry crate;
-    // writers run in parallel from the same base, so this file keeps a small
-    // local loop. The integrator may dedupe to the shared helper on merge.
-    const MAX_ATTEMPTS: usize = 6;
-    // 100+200+400+800+1600 = 3100ms total sleep, strictly below the 5s bound.
-    const BACKOFF_MS: [u64; 5] = [100, 200, 400, 800, 1600];
-    let mut last_contention: Option<InstallationError> = None;
-    for attempt in 0..MAX_ATTEMPTS {
-        let host_root = ProtectedRootLease::open_existing(host_state_root)
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        match RedbInstallationRegistry::open_existing_at(host_root) {
-            Ok(registry) => return Ok(registry),
-            Err(error) if is_redb_exclusive_lock_contention(&error) => {
-                last_contention = Some(error);
-                if attempt + 1 < MAX_ATTEMPTS {
-                    let Some(&backoff_ms) = BACKOFF_MS.get(attempt) else {
-                        panic!("backoff schedule covers all retries");
-                    };
-                    std::thread::sleep(Duration::from_millis(backoff_ms));
-                    continue;
-                }
-                break;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    let Some(cause) = last_contention else {
-        panic!("lock-contention loop must retain its cause");
-    };
-    Err(cause)
-}
-
 /// Re-enters the installation owner's pre-no-return rollback seam for a
 /// durable activation intent.  The CLI only wires already-owned capabilities:
-/// the protected Host root bounds the one short-lived redb writer, while the
+/// the protected Host root bounds the registry opens while the
 /// installation-wide Host lease supplies the non-forgeable mutation proof.
-/// No caller-supplied approval, registry revision, or root path is accepted.
+/// No caller-supplied approval or registry revision is accepted, and the root
+/// is not caller-supplied either: it is read from the durable transaction's
+/// own candidate manifest, never from argv, environment, or a prompt.
+///
+/// s37/#1339 ownership: the coordinator opens one short-lived registry writer
+/// per abort-phase touch (`open_existing_at` with the single typed bounded
+/// `AlreadyOpen` retry) and drops it before the transaction compare-and-save
+/// and the external rollback effects, so this seam never retains the
+/// exclusive writer across them.
 fn rollback_with_activation_owner(
     coordinator: &mut WindowsInstallationCoordinator<RedbInstallationTransactionStore>,
     transaction: &InstallationTransaction,
@@ -3271,16 +3539,10 @@ fn rollback_with_activation_owner(
             .host_state_root
             .as_str(),
     );
-    let registry =
-        open_existing_registry_for_terminal_reconcile(host_state_root)?.ok_or_else(|| {
-            InstallationError::IncompleteObservation(
-                "Host activation registry is absent for owner-aware rollback".to_owned(),
-            )
-        })?;
     let owner = HostOwnerLease::acquire(&transaction.installation_epoch.installation)
         .map_err(|error| InstallationError::Platform(error.to_string()))?;
     let host = owner.activation_capability();
-    coordinator.rollback_with_activation_owner(&registry, &host, transaction_id)
+    coordinator.rollback_with_activation_owner(host_state_root, &host, transaction_id)
 }
 
 /// Reconciles only an exact Host-committed registry terminal.  A missing
@@ -3873,6 +4135,12 @@ fn write_installation_error_with_reference(code: &str, detail: &str, reference: 
 /// projection staging: `E3`/`E4`/`E5` and the still-`Registering` branch of
 /// `E6`).
 ///
+/// `class` is the typed failure class, not a display string: it selects the
+/// durable typed rejection reference through
+/// [`post_bootstrap_rejection_pending_ref`], so the persisted
+/// `pending_external_changes` entry names the failure that actually occurred
+/// instead of a sibling failure mode.
+///
 /// The coordinator-owned durable typed rejection is always attempted and its
 /// result is never discarded: success keeps the existing
 /// `INSTALLATION_APPLY_ERROR` with a recoverable-rollback note (the stored
@@ -3883,16 +4151,18 @@ fn write_installation_error_with_reference(code: &str, detail: &str, reference: 
 /// (`UNKNOWN_OUTCOME/ROLLBACK_REQUIRED` until read-back reconciliation), never
 /// a plain apply error that would imply durable recovery. The
 /// transaction/fence/owner gates are untouched: a refusal in `Activating` (or
-/// a store CAS failure) surfaces here as unconfirmed, it is never overridden.
+/// with an activation intent) and a failed store load or `compare_and_save`
+/// are all reported here as unconfirmed, never overridden.
 fn report_post_bootstrap_failure<S>(
     coordinator: &mut WindowsInstallationCoordinator<S>,
     transaction_id: &PlatformHandle,
+    class: PostBootstrapRejectionClass,
     detail: &str,
 ) -> i32
 where
     S: InstallationTransactionStore,
 {
-    let pending_ref = match registry_projection_pending_ref(transaction_id) {
+    let pending_ref = match post_bootstrap_rejection_pending_ref(transaction_id, class) {
         Ok(pending_ref) => pending_ref,
         Err(error) => {
             write_installation_error(

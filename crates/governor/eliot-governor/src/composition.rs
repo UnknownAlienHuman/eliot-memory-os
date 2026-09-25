@@ -17,9 +17,12 @@ use crate::activation_outcome::{
 use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
+use crate::finish_attempt::{PreparedFinishDecision, PreparedKernelExchange};
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
-use crate::owner_closure_feed::{OwnerPublishPort, synchronize_owner_feed};
+use crate::owner_closure_feed::{
+    OwnerPublishPort, synchronize_owner_feed, synchronize_owner_feed_with_canonical_receipts,
+};
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
 use crate::scope_identity_admission::{
     ensure_snapshot_fresh, guard_recovery_error, require_fresh_matched_binding,
@@ -45,7 +48,9 @@ use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId,
     ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
 };
-use eliot_coordination::CoordinationOwner;
+use eliot_coordination::{
+    ActiveWorkLeaseProjection, ActiveWorkLeaseSelection, CoordinationError, CoordinationOwner,
+};
 use eliot_diagnostic::{
     CONTRACT_NAME as DIAGNOSTIC_CONTRACT, DiagnosticClassifier, DiagnosticEvent, DiagnosticInput,
     DiagnosticSeverity, DiagnosticStatus,
@@ -67,7 +72,10 @@ use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
 use eliot_protocol::RequestIdentity;
-use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
+use eliot_receipts::{GrantClosureReceipt, ReceiptIdentity};
+use eliot_runtime_contracts::{
+    AuthorityActivationReceipt, AuthorityRevocationReceipt, AuthorityState,
+};
 use eliot_security_contracts::PrivacyClass;
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
@@ -75,7 +83,7 @@ use eliot_store_api::{
     CanonicalReadClient, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
     ScopeRevisionView, StoreHealth, WriteReceipt,
 };
-use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskState};
+use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskRecord, TaskState};
 use eliot_testd_core::{
     JobState, RawArtifactStream, ReceiptBinding, TestJob, TestdSourceObservation,
     TestdSourceObservationRange, TestdStore, TestdTerminalCompletionEvidence, VerificationReceipt,
@@ -89,9 +97,9 @@ use eliot_workscope::{
     ScopeResolution, SourceAdmissionRequest, TaskBindingInput, TaskBindingState,
     TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
     WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidateSet, WorkScopeDescriptor,
-    WorkScopeResolutionReceipt, WorkScopeResolver, admit_at_trigger, admit_initial_binding,
-    check_at_trigger, evaluate_material_request, issue_resolution_receipt, produce_attach_receipt,
-    rebind_with_receipt,
+    WorkScopeError, WorkScopeResolutionReceipt, WorkScopeResolver, admit_at_trigger,
+    admit_initial_binding, check_at_trigger, evaluate_material_request, issue_resolution_receipt,
+    produce_attach_receipt, rebind_with_receipt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -106,8 +114,9 @@ pub use authority_recovery::{
 #[path = "authority_revocation.rs"]
 mod authority_revocation;
 pub use authority_revocation::{
-    authority_revocation_envelope, decode_revocation_history_evidence,
-    revocation_history_read_request,
+    AUTHORITY_REVOCATION_KERNEL_FIRST_REASON, authority_revocation_envelope,
+    authority_revocation_envelope_from_closure, canonical_receipt_identity,
+    decode_revocation_history_evidence, revocation_history_read_request,
 };
 #[path = "genesis_owner_packet.rs"]
 mod genesis_owner_packet;
@@ -164,6 +173,31 @@ pub enum KernelPortError {
     /// The authenticated Kernel generation is not currently admitted.
     #[error("Kernel generation is not admitted: {0}")]
     NotAdmitted(String),
+}
+
+/// Narrow durable boundary for the canonical second phase of a grant
+/// closure. The Kernel-side adapter must delegate this call to
+/// `eliot_ors::OperationalRecoveryStore::link_grant_closure_canonical_receipt`;
+/// Governor never edits the first-phase closure row.
+pub trait GrantClosureCanonicalLinkPort: Send + Sync {
+    /// Links the exact Store-issued `ReceiptIdentity` to the immutable
+    /// first-phase closure operation.
+    fn link_grant_closure_canonical_receipt(
+        &self,
+        operation_id: &eliot_ors::OperationIdentity,
+        canonical_receipt: &ReceiptIdentity,
+    ) -> Result<eliot_ors::GrantClosureProjection, KernelPortError>;
+}
+
+/// Readback boundary for the durable closure committed by the first P-07
+/// phase. A caller-provided closure is not accepted by the reconciliation
+/// method; the Kernel/ORS adapter must return the exact committed receipt.
+pub trait GrantClosureReceiptPort: Send + Sync {
+    /// Reads the committed closure for the exact revocation request.
+    fn grant_closure_receipt(
+        &self,
+        request: &GrantRevocationRequest,
+    ) -> Result<GrantClosureReceipt, KernelPortError>;
 }
 
 /// Explicit Kernel-owned recovery route used before Governor readiness.
@@ -800,6 +834,18 @@ pub enum CompositionError {
     /// The composition is not ready for semantic work.
     #[error("Governor is not ready")]
     NotReady,
+    /// No exact active task binding is available for activation.
+    #[error("activation task selection is required")]
+    ActivationTaskSelectionRequired,
+    /// More than one exact active task binding was observed.
+    #[error("activation scope is ambiguous")]
+    ActivationScopeAmbiguous { candidate_handles: Vec<String> },
+    /// The exact `WorkScope` binding is not currently selected.
+    #[error("activation scope selection is required")]
+    ActivationScopeSelectionRequired,
+    /// The semantic owner read was fenced or no longer current.
+    #[error("activation owner fence is stale")]
+    ActivationStaleFence,
     /// Canonical admission rejected the envelope.
     #[error("canonical admission: {0}")]
     Canonical(#[from] CanonicalError),
@@ -2496,6 +2542,8 @@ pub struct CanonicalAdmissionOwner {
 #[serde(deny_unknown_fields)]
 pub struct GovernorActivationSnapshot {
     pub state_fence: StateFence,
+    /// Current canonical owner revision observed with this snapshot.
+    pub owner_revision: u64,
     pub principal_id: String,
     pub session_id: String,
     pub task_id: TaskId,
@@ -2635,6 +2683,31 @@ impl CanonicalAdmissionOwner {
                 "canonical current plan is absent; semantic activation is unavailable".to_owned(),
             )
         })
+    }
+
+    /// Reads the current plan for activation through typed failure classes.
+    /// Unlike the general finish/recovery reader, this boundary never exposes
+    /// human error text as a semantic classifier.
+    pub(crate) fn read_current_activation_plan(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<CanonicalPlanBinding, CompositionError> {
+        state_fence
+            .validate()
+            .map_err(|_| CompositionError::ActivationStaleFence)?;
+        if self.state_fence != *state_fence
+            || self.scope.state_fence != *state_fence
+            || self.snapshot.state_fence != *state_fence
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        self.snapshot
+            .validate()
+            .map_err(|_| CompositionError::ActivationStaleFence)?;
+        self.snapshot
+            .current_plan
+            .clone()
+            .ok_or(CompositionError::ActivationScopeSelectionRequired)
     }
 
     /// Returns the durable canonical owner revision used by a finish-evidence
@@ -3193,6 +3266,17 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
         .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let authority_snapshot: AuthorityOwnerSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Authority)?;
+        let authority_snapshot =
+            if let Some(owner_hydrations) = authority_snapshot.owner_hydrations.clone() {
+                AuthorityOwnerSnapshot::new_with_owner_hydrations(
+                    authority_snapshot.state_fence.clone(),
+                    authority_snapshot.grant_graph.clone(),
+                    authority_snapshot.effect_authorizer.clone(),
+                    owner_hydrations,
+                )?
+            } else {
+                authority_snapshot
+            };
         let authority = AuthorityOwner::from_snapshot(&authority_snapshot, state_fence)?;
         let budget_read_revision = recovery.owner_read(RecoveryOwner::Budget)?.revision;
         let budget_snapshot: BudgetOwnerSnapshot =
@@ -3718,6 +3802,27 @@ pub(crate) fn evaluate_testd_verification_current(
     Ok(run)
 }
 
+/// The typed terminal result of one production authority request dispatched
+/// through [`GovernorComposition::apply_authority_request`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthorityActionReceipt {
+    /// A validated Kernel activation receipt.
+    Activation(AuthorityActivationReceipt),
+    /// A validated Kernel revocation receipt.
+    Revocation(AuthorityRevocationReceipt),
+}
+
+/// The three durable phases of one grant revocation saga.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthorityRevocationReconciliation {
+    /// Kernel-issued first-phase revocation receipt.
+    pub authority_receipt: AuthorityRevocationReceipt,
+    /// Canonical write receipt proving the second phase committed.
+    pub canonical_receipt: WriteReceipt,
+    /// ORS projection carrying the exact second-phase link.
+    pub closure_projection: eliot_ors::GrantClosureProjection,
+}
+
 impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Builds one composition only after exact provider and recovery checks.
     pub fn new(
@@ -4025,6 +4130,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// the same canonical owner CAS used by `FinishEvidence`. The caller gives
     /// only the job identity; `TestD` currentness and the full receipt/run are
     /// re-read inside the Governor service before the write.
+    ///
+    /// This is the composed form of the three phases below, for the caller that
+    /// holds only `&self`. The `TestD` owner drain drives
+    /// [`Self::prepare_testd_verifier_execution_fact_from_evidence`],
+    /// [`PreparedKernelExchange::exchange`] and
+    /// [`Self::accept_prepared_exchange`] itself, so that no composition lock is
+    /// held across the Kernel exchange.
     pub async fn publish_testd_verifier_execution_fact(
         &self,
         identity: &RequestIdentity,
@@ -4049,47 +4161,117 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .await
     }
 
-    /// Publishes the verifier-execution owner from complete identity-joined
-    /// terminal evidence supplied by the Kernel owner route. The daemon-side
-    /// entry: no `TestdStore` handle crosses the daemon boundary.
-    pub async fn publish_testd_verifier_execution_fact_from_evidence(
+    /// Prepares the exact exchange that publishes the verifier-execution owner
+    /// from complete identity-joined terminal evidence supplied by the Kernel
+    /// owner route. The daemon-side entry: no `TestdStore` handle crosses the
+    /// daemon boundary.
+    ///
+    /// This half performs no transport and mutates nothing, so the caller holds
+    /// its composition borrow for this call alone and releases it before
+    /// [`PreparedKernelExchange::exchange`].
+    pub fn prepare_testd_verifier_execution_fact_from_evidence(
         &self,
         evidence: &TestdTerminalCompletionEvidence,
-    ) -> Result<Option<WriteReceipt>, FinishAttemptError> {
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));
         }
         self.finish_attempt_service()
-            .publish_testd_verifier_execution_fact_from_evidence(evidence)
-            .await
+            .prepare_testd_verifier_execution_fact_from_evidence(evidence)
+    }
+
+    /// Prepares the exact exchange that publishes the Governor-derived
+    /// canonical finish-evidence owner image for one candidate. `None` means
+    /// the derived image is already current, so nothing is owed.
+    ///
+    /// This method transports nothing, so the caller may hold its composition
+    /// borrow for this call alone. The refresh that publishes the evidence leg's
+    /// committed image belongs to [`Self::prepare_finish_decision`].
+    pub fn prepare_finish_evidence(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        draft: &FinishAttemptDraft,
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.finish_attempt_service()
+            .prepare_finish_evidence(identity, operation_id, draft)
+    }
+
+    /// Prepares the exact exchange that persists the finish decision.
+    ///
+    /// The refresh runs here, synchronously and under the caller's `&mut self`,
+    /// because the decision must be evaluated against the canonical image the
+    /// evidence leg actually published — never against a pre-publish snapshot.
+    /// No transport is touched, so the caller may hold its composition borrow
+    /// for this call alone.
+    pub fn prepare_finish_decision(
+        &mut self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        draft: FinishAttemptDraft,
+    ) -> Result<PreparedFinishDecision, FinishAttemptError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.refresh_from_kernel()
+            .map_err(FinishAttemptError::Composition)?;
+        self.finish_attempt_service()
+            .prepare_finish_decision(identity, operation_id, draft)
+    }
+
+    /// Re-checks a completed exchange against the live canonical owner.
+    ///
+    /// The prepared leg captured its owner fence before the caller began the
+    /// exchange, and the exchange ran with no composition borrow, so this is
+    /// where a fence that moved in the meantime refuses the leg with the same
+    /// typed mismatch the prepare half uses. Nothing is re-derived and no
+    /// receipt is repaired.
+    pub fn accept_prepared_exchange(
+        &self,
+        prepared: &PreparedKernelExchange,
+    ) -> Result<(), FinishAttemptError> {
+        self.finish_attempt_service()
+            .accept_prepared_exchange(prepared)
     }
 
     /// Runs the production `FinishAttempt` path and returns only after the
     /// canonical receipt has committed. Publication is performed by the
     /// daemon composition through `refresh_from_kernel`, using the same
     /// committed-receipt boundary as the other daemon callers.
+    ///
+    /// This is the composed form of [`Self::prepare_finish_evidence`],
+    /// [`Self::prepare_finish_decision`] and [`Self::accept_prepared_exchange`]
+    /// for a caller that holds `&mut self` and accepts that borrow across the
+    /// exchanges. A caller that must not hold a lock across Kernel IO — the
+    /// `TestD` owner drain — runs the same phases itself over the same
+    /// Governor-derived exchanges, identities, fence and receipt checks, in
+    /// this same order.
+    ///
+    /// The order is load-bearing: the evidence leg is exchanged and admitted
+    /// before the decision is prepared, so the decision is derived against the
+    /// canonical image the evidence leg actually published and never against a
+    /// pre-publish snapshot.
     pub async fn finish_attempt(
         &mut self,
         identity: &RequestIdentity,
         operation_id: OperationId,
         draft: FinishAttemptDraft,
     ) -> Result<FinishDecisionReceipt, FinishAttemptError> {
-        if self.readiness != CompositionReadiness::Ready {
-            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        let evidence = self.prepare_finish_evidence(identity, &operation_id, &draft)?;
+        if let Some(prepared) = evidence.as_ref() {
+            let _receipt = prepared.exchange(self.kernel.as_ref()).await?;
+            self.accept_prepared_exchange(prepared)?;
         }
-        {
-            let service = self.finish_attempt_service();
-            service
-                .publish_finish_evidence(identity, &operation_id, &draft)
-                .await?;
+        // Refreshes the owner, so the decision sees the evidence leg's image.
+        let decision = self.prepare_finish_decision(identity, &operation_id, draft)?;
+        if let Some(prepared) = decision.exchange() {
+            let _receipt = prepared.exchange(self.kernel.as_ref()).await?;
+            self.accept_prepared_exchange(prepared)?;
         }
-        self.refresh_from_kernel()
-            .map_err(FinishAttemptError::Composition)?;
-        let receipt = {
-            let service = self.finish_attempt_service();
-            service.submit(identity, operation_id, draft).await?
-        };
-        Ok(receipt)
+        Ok(decision.into_decision())
     }
 
     /// Borrows the single observation/verified-repair reconciliation owner as
@@ -4605,6 +4787,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// expired admission and an admitted record without authority fail closed
     /// here instead of reaching readiness. The returned admission is the
     /// caller input for cold-start compilation of that scope generation.
+    /// Live status: owning thin entry for daemon/scanner ingress; no live
+    /// attach transport builds a `SourceAdmissionRequest` yet
+    /// (BLOCKED-BY attach-transport).
     pub fn admit_governing_sources_for_scope(
         request: SourceAdmissionRequest,
         now: u64,
@@ -4628,6 +4813,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// acceptance, owner, scope plus a complete example) and the bounded
     /// exploratory offer from [`eliot_workscope::task_selection_required`],
     /// so the emitted selection directive always has a backing intake shape.
+    /// Live status: owning thin entry for the activation path; the live
+    /// activation projection emits its own directive without calling this
+    /// entry yet (BLOCKED-BY activation/task-ingress).
     pub fn task_selection_intake_shape(
         scope_ref: &str,
     ) -> Result<TaskSelectionRequired, CompositionError> {
@@ -4643,6 +4831,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// task binding the delegation names (`parent`, read from live governor
     /// task state), so a `Current` binding input only ever arises from the
     /// required owner or a proven delegation, never from direct construction.
+    /// Live status: owning thin entry for task ingress; no live task ingress
+    /// builds a `TaskIntakeCandidate` yet (BLOCKED-BY task-ingress).
     pub fn promote_task_intake(
         candidate: &TaskIntakeCandidate,
         basis: &AuthorityBasis,
@@ -4660,7 +4850,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Owning thin entry for orientation ingress: runs
     /// [`eliot_workscope::TaskIntakeCandidate::admit_exploratory`], whose
     /// read-only binding can never authorize scope-sensitive Material
-    /// effects.
+    /// effects. Live status: owning thin entry for orientation ingress; no
+    /// live orientation ingress calls this entry yet (BLOCKED-BY task-ingress).
     pub fn admit_exploratory_task_intake(
         candidate: &TaskIntakeCandidate,
     ) -> Result<TaskBindingInput, CompositionError> {
@@ -5232,6 +5423,31 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         self.authority_activation.is_some()
     }
 
+    /// Dispatches one exact durable authority request through the retained
+    /// production P-07 port. The daemon composition root owns construction of
+    /// the request from its admitted canonical source; this method is the
+    /// single application seam that gives all four authority operations a
+    /// production caller without reimplementing receipt reconciliation.
+    pub fn apply_authority_request(
+        &mut self,
+        request: PresentedAuthorityRequest,
+    ) -> Result<AuthorityActionReceipt, CompositionError> {
+        match request {
+            PresentedAuthorityRequest::GrantActivation(request) => self
+                .activate_grant(&request)
+                .map(AuthorityActionReceipt::Activation),
+            PresentedAuthorityRequest::GrantRevocation(request) => self
+                .revoke_grant(&request)
+                .map(AuthorityActionReceipt::Revocation),
+            PresentedAuthorityRequest::IntroductionActivation(request) => self
+                .activate_introduction(&request)
+                .map(AuthorityActionReceipt::Activation),
+            PresentedAuthorityRequest::IntroductionRevocation(request) => self
+                .revoke_introduction(&request)
+                .map(AuthorityActionReceipt::Revocation),
+        }
+    }
+
     /// Presents one canonical grant activation to the retained P-07 port and
     /// records `PendingActivation -> Active` only after the exact
     /// Kernel-issued receipt validates `Active`.
@@ -5310,6 +5526,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .grants
             .revoke(&request.grant_id)
             .is_ok();
+        if graph_reconciled {
+            self.owners.authority.invalidate_owner_hydrations();
+        }
         let retained = self.retain_presentation(presented)?;
         if !graph_reconciled {
             // Kernel already fenced this grant (the receipt above validated),
@@ -5332,6 +5551,83 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             ));
         }
         Ok(receipt)
+    }
+
+    /// Runs the complete grant-revocation saga in its required order.
+    ///
+    /// The retained P-07 port first requests the exact graph revision and
+    /// durable descendant closure from Kernel/ORS. Only after that receipt is
+    /// validated does Governor compile the canonical declaration from the
+    /// durable [`GrantClosureReceipt`] and commit it. The Store-issued
+    /// canonical receipt identity is finally linked to the immutable ORS
+    /// first-phase row.
+    pub async fn revoke_grant_and_reconcile<
+        L: GrantClosureCanonicalLinkPort + ?Sized,
+        C: GrantClosureReceiptPort + ?Sized,
+    >(
+        &mut self,
+        request: &GrantRevocationRequest,
+        canonical_operation_id: &OperationId,
+        canonical_request_identity: &RequestIdentity,
+        durable_link: &L,
+        closure_source: &C,
+    ) -> Result<AuthorityRevocationReconciliation, CompositionError> {
+        // The first call is intentionally before the closure readback and
+        // before canonical envelope construction: Kernel/ORS must fence the
+        // exact graph revision first.
+        let authority_receipt = self.revoke_grant(request)?;
+        let closure = closure_source.grant_closure_receipt(request)?;
+        closure
+            .validate()
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        if closure.state != eliot_receipts::GrantClosureState::Revoked
+            || closure.declaration.target_grant_id != request.grant_id.as_str()
+            || closure.authority_receipt.snapshot_id != request.snapshot_id.as_str()
+            || closure.authority.state_fence != request.binding.state_fence
+            || canonical_request_identity.request.metadata.state_fence
+                != closure.authority.state_fence
+        {
+            return Err(CompositionError::Recovery(
+                "grant revocation closure does not bind the exact request, snapshot, and fence"
+                    .to_owned(),
+            ));
+        }
+        if authority_receipt.revocation_id != closure.authority_receipt.receipt_id
+            || authority_receipt.snapshot_id != closure.authority_receipt.snapshot_id
+            || !authority_receipt
+                .authority_epoch
+                .is_same_authority(&closure.authority.state_fence.authority_epoch)
+            || authority_receipt.state != AuthorityState::Revoked
+        {
+            return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+        }
+        let envelope = authority_revocation_envelope_from_closure(
+            canonical_request_identity,
+            canonical_operation_id,
+            &closure,
+        )?;
+        let canonical_receipt = self
+            .commit_canonical(canonical_request_identity, envelope)
+            .await?;
+        let receipt_identity = canonical_receipt_identity(&canonical_receipt)?;
+        let closure_operation_id = eliot_ors::OperationIdentity::new(closure.operation_id.as_str())
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let closure_projection = durable_link
+            .link_grant_closure_canonical_receipt(&closure_operation_id, &receipt_identity)?;
+        if closure_projection.commit().operation_id != closure.operation_id
+            || closure_projection.commit().declaration != closure.declaration
+            || closure_projection.second_phase() != Some(&receipt_identity)
+        {
+            return Err(CompositionError::Recovery(
+                "durable second-phase readback does not bind the canonical closure receipt"
+                    .to_owned(),
+            ));
+        }
+        Ok(AuthorityRevocationReconciliation {
+            authority_receipt,
+            canonical_receipt,
+            closure_projection,
+        })
     }
 
     /// Presents one canonical introduction activation to the retained P-07
@@ -5560,7 +5856,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self,
         reads: &R,
         kernel: &K,
-        origin_ref: &str,
+        origin_refs: &[String],
         max_records: u32,
         expected_revision: u64,
     ) -> Result<u64, CompositionError> {
@@ -5571,9 +5867,40 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             kernel,
             snapshot,
             &state_fence,
-            origin_ref,
+            origin_refs,
             max_records,
             expected_revision,
+        )
+        .await
+    }
+
+    /// Synchronizes the Kernel P-07 owner with canonical second-phase links
+    /// read from the durable ORS boundary. The legacy method above remains the
+    /// fail-closed empty-link entry point; a production caller that has read
+    /// completed links must use this method.
+    pub async fn synchronize_kernel_owner_with_canonical_receipts<
+        R: CanonicalReadClient + ?Sized,
+        K: OwnerPublishPort + ?Sized,
+    >(
+        &self,
+        reads: &R,
+        kernel: &K,
+        origin_refs: &[String],
+        max_records: u32,
+        expected_revision: u64,
+        canonical_receipts: BTreeMap<String, ReceiptIdentity>,
+    ) -> Result<u64, CompositionError> {
+        let snapshot = self.owners.authority.snapshot()?;
+        let state_fence = self.snapshot.state_fence();
+        synchronize_owner_feed_with_canonical_receipts(
+            reads,
+            kernel,
+            snapshot,
+            &state_fence,
+            origin_refs,
+            max_records,
+            expected_revision,
+            canonical_receipts,
         )
         .await
     }
@@ -5583,6 +5910,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// No semantic identity is accepted from the caller: coordination first
     /// proves one unique live work lease, then task, `WorkScope` and Canonical
     /// owners must agree on its exact fence and linked identities.
+    ///
+    /// Split note: activation admission validates one coherent semantic owner
+    /// projection before binding. The seam is still one ordered admission
+    /// cascade; each owner agreement is now a named private function, so every
+    /// guard still runs in the same order over the same effects.
     pub fn read_unique_agent_activation(
         &self,
         now: u64,
@@ -5591,102 +5923,201 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(CompositionError::NotReady);
         }
         let state_fence = self.snapshot.state_fence();
-        let work = self
-            .owners
-            .coordination
-            .read_unique_active_work_lease(now, state_fence.authority_epoch.clone(), &state_fence)
-            .map_err(|error| {
-                CompositionError::Recovery(format!(
-                    "unique coordination activation read failed: {error}"
-                ))
-            })?;
+        let work = self.prove_unique_activation_work(now, &state_fence)?;
+        let task_id = self.admit_activation_lifecycle_session(now, &state_fence, &work)?;
+        let task = self.admit_activation_task(&task_id, &state_fence)?;
+        let (work_scope_id, plan) = self.admit_activation_plan(&task_id, &state_fence)?;
+        Ok(GovernorActivationSnapshot {
+            state_fence,
+            owner_revision: self.owners.canonical.owner_revision(),
+            principal_id: work.session.principal_id,
+            session_id: work.session.session_id,
+            task_id,
+            work_unit_id: work.work_item.work_item_id,
+            work_scope_id,
+            task_revision: task.revision,
+            plan_id: plan.plan_id,
+            plan_revision: plan.plan_revision,
+        })
+    }
+
+    /// Proves exactly one live work lease for this exact fence.
+    ///
+    /// No selection, more than one selection and any coordination read failure
+    /// are three distinct typed refusals; only the unique validated projection
+    /// is ever handed to the rest of the admission cascade.
+    fn prove_unique_activation_work(
+        &self,
+        now: u64,
+        state_fence: &StateFence,
+    ) -> Result<ActiveWorkLeaseProjection, CompositionError> {
+        let work = match self.owners.coordination.read_active_work_lease_selection(
+            now,
+            state_fence.authority_epoch.clone(),
+            state_fence,
+        ) {
+            Ok(ActiveWorkLeaseSelection::None) => {
+                return Err(CompositionError::ActivationTaskSelectionRequired);
+            }
+            Ok(ActiveWorkLeaseSelection::Unique { projection }) => *projection,
+            Ok(ActiveWorkLeaseSelection::Ambiguous { projections }) => {
+                return Err(CompositionError::ActivationScopeAmbiguous {
+                    candidate_handles: projections
+                        .into_iter()
+                        .map(|projection| projection.work_item.work_item_id)
+                        .collect(),
+                });
+            }
+            Err(error) => return Err(map_activation_coordination_error(error)),
+        };
+        Ok(work)
+    }
+
+    /// Proves the one live owner session named by the unique work lease and
+    /// returns the exact task id that session is bound to.
+    ///
+    /// The semantic ids are rebuilt from the lease itself, the stored session
+    /// must be that same active session under the same authority epoch and the
+    /// same fence, its lease window must still be live, and any task scope it
+    /// names must be the same task.
+    fn admit_activation_lifecycle_session(
+        &self,
+        now: u64,
+        state_fence: &StateFence,
+        work: &ActiveWorkLeaseProjection,
+    ) -> Result<TaskId, CompositionError> {
         let task_id = TaskId::new(work.work_item.task_id.clone())
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            .map_err(|_| CompositionError::ActivationTaskSelectionRequired)?;
         let lifecycle_session_id = SessionId::new(work.session.session_id.clone())
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            .map_err(|_| CompositionError::ActivationTaskSelectionRequired)?;
         let lifecycle_session = self
             .owners
             .session
             .session(&lifecycle_session_id)
-            .ok_or_else(|| {
-                CompositionError::Recovery(format!(
-                    "missing session lifecycle record for {lifecycle_session_id}"
-                ))
-            })?;
+            .ok_or(CompositionError::ActivationTaskSelectionRequired)?;
         if lifecycle_session.session_id != lifecycle_session_id
             || lifecycle_session.status != SessionState::Active
             || !lifecycle_session
                 .authority_epoch
                 .is_same_authority(&state_fence.authority_epoch)
-            || lifecycle_session.state_fence != state_fence
-            || lifecycle_session.started_at == 0
+            || lifecycle_session.state_fence != *state_fence
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        if lifecycle_session.started_at == 0
             || lifecycle_session.heartbeat_at < lifecycle_session.started_at
             || lifecycle_session.expires_at == 0
             || lifecycle_session.expires_at < lifecycle_session.heartbeat_at
             || lifecycle_session.heartbeat_at > now
             || now > lifecycle_session.expires_at
         {
-            return Err(CompositionError::Recovery(
-                "session lifecycle record is not an exact active activation match".to_owned(),
-            ));
+            return Err(CompositionError::NotReady);
         }
         if let Some(scoped_task_id) = &lifecycle_session.task_scope
             && scoped_task_id != task_id.as_str()
         {
-            return Err(CompositionError::Recovery(
-                "session lifecycle task scope disagrees with the selected task".to_owned(),
-            ));
+            return Err(CompositionError::ActivationTaskSelectionRequired);
         }
-        let task = self.owners.task.task(&task_id).ok_or_else(|| {
-            CompositionError::Recovery(format!("missing task owner record for {task_id}"))
-        })?;
-        if task.task_id != task_id
-            || task.state_fence != state_fence
-            || task.revision == 0
+        Ok(task_id)
+    }
+
+    /// Proves the durable task owner agrees with the admitted session.
+    ///
+    /// The task must be the same task under the same fence, must be at a
+    /// nonzero revision in an authorized or running state, and must be the
+    /// exact revision the fence names when the fence names one.
+    fn admit_activation_task(
+        &self,
+        task_id: &TaskId,
+        state_fence: &StateFence,
+    ) -> Result<&TaskRecord, CompositionError> {
+        let task = self
+            .owners
+            .task
+            .task(task_id)
+            .ok_or(CompositionError::ActivationTaskSelectionRequired)?;
+        if task.task_id != *task_id || task.state_fence != *state_fence {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        if task.revision == 0
             || !matches!(
                 task.state,
                 TaskState::ActionAuthorized | TaskState::Executing | TaskState::Verifying
             )
         {
-            return Err(CompositionError::Recovery(
-                "task owner record is not an exact actionable activation match".to_owned(),
-            ));
+            return Err(CompositionError::ActivationTaskSelectionRequired);
         }
         if let Some(expected_revision) = state_fence.task_revision
             && expected_revision.value() != task.revision
         {
-            return Err(CompositionError::Recovery(
-                "task revision does not match the activation fence".to_owned(),
-            ));
+            return Err(CompositionError::ActivationStaleFence);
         }
-        let scope_owner = self.owners.work_scope.as_ref().ok_or_else(|| {
-            CompositionError::Recovery(
-                "WorkScope binding is unbound; semantic activation is unavailable".to_owned(),
-            )
-        })?;
+        Ok(task)
+    }
+
+    /// Proves the `WorkScope` and Canonical owners agree with the admitted
+    /// task, and returns the bound work scope id with the current plan.
+    ///
+    /// The scope must be installed, freshly `MATCHED`, and the plan must name
+    /// the same task and the same bound work scope, so a drifted scope is
+    /// never paired with a plan the #1115 v2 resolution would publish.
+    fn admit_activation_plan(
+        &self,
+        task_id: &TaskId,
+        state_fence: &StateFence,
+    ) -> Result<(String, CanonicalPlanBinding), CompositionError> {
+        let scope_owner = self
+            .owners
+            .work_scope
+            .as_ref()
+            .ok_or(CompositionError::ActivationScopeSelectionRequired)?;
         let scope = scope_owner
-            .read_current(&state_fence)
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            .read_current(state_fence)
+            // #1115: the activation boundary maps every `WorkScopeError` into a
+            // typed `CompositionError` class, so a scope failure is a semantic
+            // classifier here and never human error text.
+            .map_err(map_activation_scope_error)?;
         // Issue #1787: activation cannot proceed on a stale or drifted guard
-        // receipt; a generation change requires a fresh `MATCHED` receipt.
+        // receipt; a generation change requires a fresh `MATCHED` receipt. The
+        // freshness gate runs before the plan read, so a drifted scope is never
+        // paired with a plan the #1115 v2 resolution would publish.
         ensure_snapshot_fresh(&scope, "activation work scope is not freshly matched")?;
-        let plan = self.owners.canonical.read_current_plan(&state_fence)?;
-        if plan.task_id != task_id || plan.work_scope_id != scope.binding.scope.scope_ref {
-            return Err(CompositionError::Recovery(
-                "canonical active plan does not match the selected task and WorkScope".to_owned(),
-            ));
+        // #1115: activation reads the plan through the typed reader, which
+        // fails closed on a stale fence and on a missing selection rather than
+        // surfacing the general reader's recovery text.
+        let plan = self
+            .owners
+            .canonical
+            .read_current_activation_plan(state_fence)?;
+        if plan.task_id != *task_id || plan.work_scope_id != scope.binding.scope.scope_ref {
+            return Err(CompositionError::ActivationScopeSelectionRequired);
         }
-        Ok(GovernorActivationSnapshot {
-            state_fence,
-            principal_id: work.session.principal_id,
-            session_id: work.session.session_id,
-            task_id,
-            work_unit_id: work.work_item.work_item_id,
-            work_scope_id: scope.binding.scope.scope_ref,
-            task_revision: task.revision,
-            plan_id: plan.plan_id,
-            plan_revision: plan.plan_revision,
-        })
+        Ok((scope.binding.scope.scope_ref, plan))
+    }
+
+    /// Returns the current canonical owner revision used by activation
+    /// dependency observations.
+    #[must_use]
+    pub fn activation_owner_revision(&self) -> u64 {
+        self.owners.canonical.owner_revision()
+    }
+
+    /// Returns the current revision of the named activation-readiness
+    /// dependency. The value combines the canonical owner revision with the
+    /// live readiness phase, so a successor cannot claim material change from
+    /// elapsed time alone.
+    #[must_use]
+    pub fn activation_dependency_revision(&self) -> String {
+        let readiness_revision = match self.readiness {
+            CompositionReadiness::Constructing => "constructing",
+            CompositionReadiness::Ready => "ready",
+            CompositionReadiness::Stopped => "stopped",
+        };
+        format!(
+            "{}:{}",
+            self.owners.canonical.owner_revision(),
+            readiness_revision
+        )
     }
 
     /// Governor-internal typed semantic outcome for activation resolution.
@@ -5696,12 +6127,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// map losslessly to the protocol v2 result; dropping an error variant is a
     /// composition defect.
     pub fn resolve_activation_outcome(&self, now: u64) -> GovernorActivationOutcome {
+        let dependency_revision = self.activation_dependency_revision();
         if self.readiness != CompositionReadiness::Ready {
             return GovernorActivationOutcome::NotReady {
                 recovery_handle: "governor.readiness:not-ready".to_owned(),
                 retry: GovernorRetryDirective::new(
                     "governor.readiness",
-                    format!("{:?}", self.readiness),
+                    dependency_revision,
                     now.saturating_add(1).max(1),
                 ),
             };
@@ -5710,15 +6142,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             Ok(snapshot) => GovernorActivationOutcome::Resolved(snapshot),
             Err(error) => {
                 // #66 A2: an ambiguity finding must name the actual competing
-                // bindings. The unique-read error discards them, so re-read
+                // bindings. The unique-read error may discard them, so re-read
                 // the live selection here instead of manufacturing handles.
-                let message = error.to_string();
-                if message.contains("AmbiguousActiveBinding")
-                    || message.contains("multiple active work bindings")
-                {
+                if matches!(error, CompositionError::ActivationScopeAmbiguous { .. }) {
                     return self.scope_ambiguous_outcome_from_selection(now);
                 }
-                classify_activation_error(&error, now)
+                classify_activation_error(&error, now, &dependency_revision)
             }
         }
     }
@@ -5934,73 +6363,87 @@ fn validate_service_observations(
     Ok(())
 }
 
-fn classify_activation_error(error: &CompositionError, now: u64) -> GovernorActivationOutcome {
-    let message = error.to_string();
-    // NotReady is the only transient retry signal.
-    if matches!(error, CompositionError::NotReady)
-        || message.contains("not ready")
-        || message.contains("NotReady")
-    {
-        return GovernorActivationOutcome::NotReady {
+fn map_activation_coordination_error(error: CoordinationError) -> CompositionError {
+    match error {
+        CoordinationError::NoActiveBinding => CompositionError::ActivationTaskSelectionRequired,
+        CoordinationError::AmbiguousActiveBinding => CompositionError::ActivationScopeAmbiguous {
+            candidate_handles: Vec::new(),
+        },
+        CoordinationError::FenceMismatch
+        | CoordinationError::EpochMismatch
+        | CoordinationError::LeaseOwnerMismatch { .. } => CompositionError::ActivationStaleFence,
+        CoordinationError::SessionExpired
+        | CoordinationError::LeaseExpired
+        | CoordinationError::LeaseNotYetValid => CompositionError::NotReady,
+        other => {
+            CompositionError::Recovery(format!("coordination activation read failed: {other}"))
+        }
+    }
+}
+
+fn map_activation_scope_error(error: WorkScopeError) -> CompositionError {
+    match error {
+        WorkScopeError::StateFenceMismatch => CompositionError::ActivationStaleFence,
+        WorkScopeError::BindingReceiptNotMatched
+        | WorkScopeError::BindingReceiptMismatch
+        | WorkScopeError::InvalidStateFence => CompositionError::ActivationScopeSelectionRequired,
+        other => CompositionError::Recovery(format!("WorkScope activation read failed: {other}")),
+    }
+}
+
+fn classify_activation_error(
+    error: &CompositionError,
+    now: u64,
+    dependency_revision: &str,
+) -> GovernorActivationOutcome {
+    match error {
+        CompositionError::NotReady => GovernorActivationOutcome::NotReady {
             recovery_handle: "governor.readiness:not-ready".to_owned(),
             retry: GovernorRetryDirective::new(
                 "governor.readiness",
-                message.clone(),
+                dependency_revision.to_owned(),
                 now.saturating_add(1).max(1),
             ),
-        };
-    }
-    if message.contains("NoActiveBinding")
-        || message.contains("no active work binding")
-        || message.contains("missing task owner record")
-        || message.contains("canonical current plan is absent")
-    {
-        return GovernorActivationOutcome::TaskSelectionRequired {
-            selection: GovernorSelectionDirective::new(
-                Vec::new(),
-                GovernorCandidateCoverage::Unknown,
-                "governor.task-selection:recovery",
-            ),
-        };
-    }
-    // #66 A2: ambiguity without a live selection read carries no candidate
-    // identities, so the string classifier cannot name them. Such an error
-    // reaching this pure function means the selection denominator was lost
-    // between reads; it is an internal failure, never a manufactured
-    // placeholder pair and never task selection. The production resolver
-    // (`resolve_activation_outcome`) names the actual competing bindings from
-    // the live selection before this classifier is consulted.
-    if message.contains("AmbiguousActiveBinding")
-        || message.contains("multiple active work bindings")
-    {
-        return GovernorActivationOutcome::FailedInternal {
-            failure_handle: format!("governor.internal:{message}"),
-        };
-    }
-    if message.contains("WorkScope binding is unbound")
-        || message.contains("scope") && message.contains("unbound")
-    {
-        return GovernorActivationOutcome::ScopeSelectionRequired {
-            selection: GovernorSelectionDirective::new(
-                Vec::new(),
-                GovernorCandidateCoverage::Unknown,
-                "governor.scope-selection:recovery",
-            ),
-        };
-    }
-    if message.contains("stale")
-        || message.contains("StateFence")
-        || message.contains("state_fence")
-        || message.contains("fence")
-        || message.contains("FenceMismatch")
-    {
-        return GovernorActivationOutcome::StaleFence {
+        },
+        CompositionError::ActivationTaskSelectionRequired => {
+            GovernorActivationOutcome::TaskSelectionRequired {
+                selection: GovernorSelectionDirective::new(
+                    Vec::new(),
+                    GovernorCandidateCoverage::Unknown,
+                    "governor.task-selection:recovery",
+                ),
+            }
+        }
+        CompositionError::ActivationScopeAmbiguous { candidate_handles } => {
+            let coverage = if candidate_handles.is_empty() {
+                GovernorCandidateCoverage::Unknown
+            } else {
+                GovernorCandidateCoverage::Complete
+            };
+            GovernorActivationOutcome::ScopeAmbiguous {
+                selection: GovernorSelectionDirective::new(
+                    candidate_handles.clone(),
+                    coverage,
+                    "governor.scope-ambiguous:recovery",
+                ),
+            }
+        }
+        CompositionError::ActivationScopeSelectionRequired => {
+            GovernorActivationOutcome::ScopeSelectionRequired {
+                selection: GovernorSelectionDirective::new(
+                    Vec::new(),
+                    GovernorCandidateCoverage::Unknown,
+                    "governor.scope-selection:recovery",
+                ),
+            }
+        }
+        CompositionError::ActivationStaleFence => GovernorActivationOutcome::StaleFence {
             recovery_handle: "governor.stale-fence:recovery".to_owned(),
             observed_state_fence: None,
-        };
-    }
-    GovernorActivationOutcome::FailedInternal {
-        failure_handle: format!("governor.internal:{message}"),
+        },
+        _ => GovernorActivationOutcome::FailedInternal {
+            failure_handle: "governor.internal:activation-resolution-failed".to_owned(),
+        },
     }
 }
 
@@ -6107,7 +6550,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
-    const TEST_LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
 
     fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
         EpochId::new(
@@ -6115,13 +6557,6 @@ mod tests {
             std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
         )
         .expect("valid test epoch")
-    }
-
-    fn test_fence(sequence: u64) -> StateFence {
-        StateFence::new(
-            test_epoch(TEST_LINEAGE_A, sequence),
-            ResourceGeneration::genesis(),
-        )
     }
 
     struct FakeKernel {
@@ -7765,6 +8200,7 @@ mod tests {
                 "task revision does not match the activation fence".to_owned(),
             ),
             20,
+            "1:Ready",
         );
         assert_eq!(stale.kind_str(), "STALE_FENCE");
         assert!(!stale.is_resolved());
@@ -7775,6 +8211,7 @@ mod tests {
                 "session lifecycle record is not an exact active activation match".to_owned(),
             ),
             20,
+            "1:Ready",
         );
         // This particular message is treated as FailedInternal by the classifier
         // (it does not match the narrow TaskSelection pattern), proving that

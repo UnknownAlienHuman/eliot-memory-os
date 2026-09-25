@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillCardV2 {
     pub skill_id: SkillId,
     pub name: String,
@@ -54,6 +55,7 @@ pub enum SkillLifecycleState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillScopeRule {
     pub rule_id: String,
     pub description: String,
@@ -63,6 +65,7 @@ pub struct SkillScopeRule {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillInputRequirement {
     pub name: String,
     pub description: String,
@@ -86,6 +89,7 @@ pub enum SkillInputSource {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillStep {
     pub step_id: String,
     pub order: u32,
@@ -96,6 +100,7 @@ pub struct SkillStep {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillToolRequirement {
     pub capability: String,
     pub required: bool,
@@ -104,6 +109,7 @@ pub struct SkillToolRequirement {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillOutputSpec {
     pub name: String,
     pub description: String,
@@ -112,6 +118,7 @@ pub struct SkillOutputSpec {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillFailureMode {
     pub failure_id: String,
     pub description: String,
@@ -120,7 +127,11 @@ pub struct SkillFailureMode {
     pub negative_memory_refs: Vec<String>,
 }
 
+/// Decoder: derived and closed. The `#[serde(default)]` evidence vectors and
+/// optional promotion fields are kept: missing historical holdout, transfer,
+/// source or approval data decodes as absent, never as promotion evidence.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillLifecycleRecord {
     pub record_id: String,
     pub skill_ref: SkillId,
@@ -172,6 +183,7 @@ pub enum ProcedurePromotionOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillNeedEstimate {
     pub estimate_id: String,
     pub project_id: ProjectId,
@@ -197,6 +209,7 @@ pub enum SkillNeedVerdict {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillDistractorFilter {
     pub filter_id: String,
     pub project_id: ProjectId,
@@ -210,6 +223,7 @@ pub struct SkillDistractorFilter {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillExecutionProof {
     pub proof_id: String,
     pub skill_ref: SkillId,
@@ -239,6 +253,7 @@ pub enum SkillExecutionOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillInteractionMatrix {
     pub matrix_id: String,
     pub project_id: ProjectId,
@@ -251,6 +266,7 @@ pub struct SkillInteractionMatrix {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillConflict {
     pub conflict_id: String,
     pub skill_a: SkillId,
@@ -260,6 +276,7 @@ pub struct SkillConflict {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillOrderingRule {
     pub before: SkillId,
     pub after: SkillId,
@@ -267,6 +284,7 @@ pub struct SkillOrderingRule {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillInfluenceReport {
     pub report_id: String,
     pub project_id: ProjectId,
@@ -299,6 +317,7 @@ pub enum SkillActivationDecision {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillActivationRecord {
     pub skill_ref: SkillId,
     pub decision: SkillActivationDecision,
@@ -306,6 +325,7 @@ pub struct SkillActivationRecord {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProceduralSkillPacketView {
     pub included_skills: Vec<SkillId>,
     pub excluded_skills: Vec<SkillId>,
@@ -316,6 +336,7 @@ pub struct ProceduralSkillPacketView {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillCuratorRun {
     pub run_id: String,
     pub project_id: ProjectId,
@@ -342,6 +363,7 @@ pub enum SkillCuratorRunStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillCurationProposal {
     pub proposal_id: String,
     pub project_id: ProjectId,
@@ -397,6 +419,7 @@ pub enum SkillCurationReason {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillCurationExpectedEffect {
     pub summary: String,
     pub utility_delta: f64,
@@ -405,6 +428,7 @@ pub struct SkillCurationExpectedEffect {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillCurationRisk {
     pub severity: String,
     pub description: String,
@@ -412,6 +436,7 @@ pub struct SkillCurationRisk {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillCurationRollbackPlan {
     pub steps: Vec<String>,
     pub restores_previous_skill: bool,
@@ -419,6 +444,7 @@ pub struct SkillCurationRollbackPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillReplayRequirement {
     pub required: bool,
     pub reason: String,
@@ -428,6 +454,7 @@ pub struct SkillReplayRequirement {
 
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillPatchProposal {
     pub target_skill: SkillId,
     pub patch_summary: String,
@@ -440,6 +467,7 @@ pub struct SkillPatchProposal {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillMergeProposal {
     pub source_skills: Vec<SkillId>,
     pub merged_skill_name: String,
@@ -447,6 +475,7 @@ pub struct SkillMergeProposal {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillSplitProposal {
     pub source_skill: SkillId,
     pub split_names: Vec<String>,
@@ -454,6 +483,7 @@ pub struct SkillSplitProposal {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillArchiveProposal {
     pub target_skill: SkillId,
     pub retained_for_audit: bool,
@@ -461,6 +491,7 @@ pub struct SkillArchiveProposal {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillQuarantineProposal {
     pub target_skill: SkillId,
     pub negative_transfer_refs: Vec<String>,
@@ -468,6 +499,7 @@ pub struct SkillQuarantineProposal {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillCurationGateDecision {
     pub proposal_id: String,
     pub decision: SkillCurationDecisionKind,
@@ -508,6 +540,7 @@ pub enum SkillCurationGateReason {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillCurationReceipt {
     pub receipt_id: String,
     pub proposal_id: String,
@@ -524,6 +557,7 @@ pub struct SkillCurationReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillCurationRejectedAction {
     pub proposal_id: String,
     pub attempted_action: SkillCurationAction,

@@ -13,6 +13,7 @@
 //! state, or lets Kernel decode these semantic records.
 
 use super::CompositionError;
+use crate::owner_closure_provider::AdmittedHydrationsSnapshot;
 use eliot_authority::{
     EffectAuthorizer, EffectAuthorizerRecoverySnapshot, GrantActivationRequest, GrantGraph,
     GrantGraphRecoverySnapshot, GrantRevocationRequest, GrantStatus, IntroductionActivationRequest,
@@ -27,8 +28,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 /// Versioned semantic owner payload retained by Governor recovery.
-pub const AUTHORITY_OWNER_SNAPSHOT_SCHEMA: &str = "eliot.governor.authority-owner.v1";
-pub const AUTHORITY_OWNER_SNAPSHOT_VERSION: u16 = 1;
+pub const AUTHORITY_OWNER_SNAPSHOT_SCHEMA: &str = "eliot.governor.authority-owner.v2";
+pub const AUTHORITY_OWNER_SNAPSHOT_VERSION: u16 = 2;
+const LEGACY_AUTHORITY_OWNER_SNAPSHOT_SCHEMA: &str = "eliot.governor.authority-owner.v1";
+const LEGACY_AUTHORITY_OWNER_SNAPSHOT_VERSION: u16 = 1;
 
 /// Complete typed authority state bound to one outer Governor fence.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -44,14 +47,48 @@ pub struct AuthorityOwnerSnapshot {
     pub grant_graph: GrantGraphRecoverySnapshot,
     /// Full deterministic effect-idempotency snapshot.
     pub effect_authorizer: EffectAuthorizerRecoverySnapshot,
+    /// Versioned exact grant/introduction hydration registry admitted at the
+    /// same fence and graph revision. `None` is an explicit legacy/unavailable
+    /// projection: the daemon may recover its other owners, but the P-07 owner
+    /// feed remains closed until canonical hydrations are supplied.
+    pub owner_hydrations: Option<AdmittedHydrationsSnapshot>,
 }
 
 impl AuthorityOwnerSnapshot {
-    /// Constructs a typed payload after validating both authority snapshots.
+    /// Constructs a typed payload with an empty closure-hydration registry.
+    ///
+    /// This constructor remains valid for owner payloads that contain no
+    /// grant graph. Any non-empty owner restored into the production closure
+    /// feed must use [`Self::new_with_owner_hydrations`] so no hydration is
+    /// silently replaced by process-local absence.
     pub fn new(
         state_fence: StateFence,
         grant_graph: GrantGraphRecoverySnapshot,
         effect_authorizer: EffectAuthorizerRecoverySnapshot,
+    ) -> Result<Self, CompositionError> {
+        if !grant_graph.grants.is_empty() {
+            return Err(CompositionError::Recovery(
+                "non-empty authority owner snapshots require explicit owner hydrations".to_owned(),
+            ));
+        }
+        let owner_hydrations =
+            AdmittedHydrationsSnapshot::empty(state_fence.clone(), grant_graph.revision)?;
+        Self::new_with_owner_hydrations(
+            state_fence,
+            grant_graph,
+            effect_authorizer,
+            owner_hydrations,
+        )
+    }
+
+    /// Constructs the canonical authority-owner payload with the exact
+    /// versioned closure hydration registry admitted at the same graph
+    /// revision and State Fence.
+    pub fn new_with_owner_hydrations(
+        state_fence: StateFence,
+        grant_graph: GrantGraphRecoverySnapshot,
+        effect_authorizer: EffectAuthorizerRecoverySnapshot,
+        owner_hydrations: AdmittedHydrationsSnapshot,
     ) -> Result<Self, CompositionError> {
         let snapshot = Self {
             schema: AUTHORITY_OWNER_SNAPSHOT_SCHEMA.to_owned(),
@@ -59,21 +96,72 @@ impl AuthorityOwnerSnapshot {
             state_fence,
             grant_graph,
             effect_authorizer,
+            owner_hydrations: Some(owner_hydrations),
         };
         snapshot.validate()?;
         Ok(snapshot)
     }
 
+    /// Rehydrates the canonical owner parts from one durable owner payload.
+    ///
+    /// This is the production constructor seam for a v2 payload. The
+    /// hydration registry is supplied by the durable owner record; it is never
+    /// replaced with an empty registry when the graph contains live lineage.
+    pub fn from_durable_owner_payload(
+        state_fence: StateFence,
+        grant_graph: GrantGraphRecoverySnapshot,
+        effect_authorizer: EffectAuthorizerRecoverySnapshot,
+        owner_hydrations: AdmittedHydrationsSnapshot,
+    ) -> Result<Self, CompositionError> {
+        Self::new_with_owner_hydrations(
+            state_fence,
+            grant_graph,
+            effect_authorizer,
+            owner_hydrations,
+        )
+    }
+
+    /// Re-runs the v2 constructor for a decoded durable payload before the
+    /// semantic owner is built. Legacy payloads remain explicit unavailable
+    /// projections and are never promoted into a populated registry.
+    fn canonical_durable_snapshot(snapshot: &Self) -> Result<Self, CompositionError> {
+        let Some(owner_hydrations) = snapshot.owner_hydrations.clone() else {
+            return Ok(snapshot.clone());
+        };
+        Self::from_durable_owner_payload(
+            snapshot.state_fence.clone(),
+            snapshot.grant_graph.clone(),
+            snapshot.effect_authorizer.clone(),
+            owner_hydrations,
+        )
+    }
+
     /// Validates schema, semantic authority state, and exact nested fences.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "owner recovery keeps schema, graph, hydration, and fence contours in one fail-closed validator"
+    )]
     pub fn validate(&self) -> Result<(), CompositionError> {
         self.state_fence
             .validate()
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        if self.schema != AUTHORITY_OWNER_SNAPSHOT_SCHEMA
-            || self.version != AUTHORITY_OWNER_SNAPSHOT_VERSION
-        {
+        let current_schema = self.schema == AUTHORITY_OWNER_SNAPSHOT_SCHEMA
+            && self.version == AUTHORITY_OWNER_SNAPSHOT_VERSION;
+        // A v1 owner record may still recover unrelated Governor owners, but
+        // its absent closure registry is an explicit unavailable marker. The
+        // P-07 feed refuses it; it is never treated as an empty registry.
+        let legacy_schema = self.schema == LEGACY_AUTHORITY_OWNER_SNAPSHOT_SCHEMA
+            && self.version == LEGACY_AUTHORITY_OWNER_SNAPSHOT_VERSION
+            && self.owner_hydrations.is_none();
+        if !current_schema && !legacy_schema {
             return Err(CompositionError::Recovery(
                 "authority owner snapshot has an invalid schema or version".to_owned(),
+            ));
+        }
+        if legacy_schema && !self.grant_graph.grants.is_empty() {
+            return Err(CompositionError::Recovery(
+                "legacy authority owner payload cannot restore non-empty grant lineage without a v2 hydration registry"
+                    .to_owned(),
             ));
         }
         self.grant_graph
@@ -82,6 +170,149 @@ impl AuthorityOwnerSnapshot {
         self.effect_authorizer
             .validate()
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let has_hydration_entries =
+            self.owner_hydrations
+                .as_ref()
+                .is_some_and(|owner_hydrations| {
+                    !owner_hydrations.members.is_empty() || !owner_hydrations.roots.is_empty()
+                });
+        if !self.grant_graph.grants.is_empty() && !has_hydration_entries {
+            return Err(CompositionError::Recovery(
+                "non-empty authority owner requires explicit grant hydrations".to_owned(),
+            ));
+        }
+        if let Some(owner_hydrations) = &self.owner_hydrations {
+            owner_hydrations
+                .validate_shape()
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            if owner_hydrations.state_fence != self.state_fence
+                || owner_hydrations.grant_graph_revision != self.grant_graph.revision
+            {
+                return Err(CompositionError::Recovery(
+                    "authority owner hydration registry has a stale fence or graph revision"
+                        .to_owned(),
+                ));
+            }
+            let mut hydration_grants = BTreeSet::new();
+            macro_rules! validate_grant_hydration {
+                ($hydration:expr, $is_root:expr) => {{
+                    let hydration = $hydration;
+                    let intent = &hydration.intent;
+                    if intent.grant_graph_revision != self.grant_graph.revision
+                        || intent.binding.state_fence != self.state_fence
+                    {
+                        return Err(CompositionError::Recovery(
+                            "authority owner hydration entry has a mixed graph revision or fence"
+                                .to_owned(),
+                        ));
+                    }
+                    if !hydration_grants.insert(intent.grant_id.clone()) {
+                        return Err(CompositionError::Recovery(
+                            "authority owner hydration registry contains a duplicate grant identity"
+                                .to_owned(),
+                        ));
+                    }
+                    let Some(record) = self
+                        .grant_graph
+                        .grants
+                        .iter()
+                        .find(|grant| grant.grant_id == intent.grant_id)
+                    else {
+                        return Err(CompositionError::Recovery(
+                            "authority owner hydration names a grant outside the durable graph"
+                                .to_owned(),
+                        ));
+                    };
+                    if record.authority_root_ref != intent.authority_root_ref
+                        || record.parent_grant_id.as_deref() != intent.parent_grant_id.as_deref()
+                        || record.binding != intent.binding
+                        || (($is_root) && intent.parent_grant_id.is_some())
+                        || (!($is_root) && intent.parent_grant_id.is_none())
+                    {
+                        return Err(CompositionError::Recovery(
+                            "authority owner hydration entry disagrees with its durable graph lineage"
+                                .to_owned(),
+                        ));
+                    }
+                }};
+            }
+            for member in &owner_hydrations.members {
+                validate_grant_hydration!(member, false);
+            }
+            for root in &owner_hydrations.roots {
+                validate_grant_hydration!(root, true);
+            }
+            for hydration in &owner_hydrations.introductions {
+                let intent = &hydration.intent;
+                if intent.grant_graph_revision != self.grant_graph.revision
+                    || intent.binding.state_fence != self.state_fence
+                {
+                    return Err(CompositionError::Recovery(
+                        "authority owner introduction has a mixed graph revision or fence"
+                            .to_owned(),
+                    ));
+                }
+                for supporting_grant_id in &intent.supporting_grant_ids {
+                    let Some(record) = self
+                        .grant_graph
+                        .grants
+                        .iter()
+                        .find(|grant| grant.grant_id == *supporting_grant_id)
+                    else {
+                        return Err(CompositionError::Recovery(
+                            "authority owner introduction names an unknown supporting grant"
+                                .to_owned(),
+                        ));
+                    };
+                    if record.authority_root_ref != intent.authority_root_ref {
+                        return Err(CompositionError::Recovery(
+                            "authority owner introduction crosses authority roots".to_owned(),
+                        ));
+                    }
+                }
+            }
+            for (target, survivors) in &owner_hydrations.preserved {
+                let Some(target_record) = self
+                    .grant_graph
+                    .grants
+                    .iter()
+                    .find(|grant| grant.grant_id == *target)
+                else {
+                    return Err(CompositionError::Recovery(
+                        "authority owner preserved path names an unknown target".to_owned(),
+                    ));
+                };
+                for survivor in survivors {
+                    let Some(descendant) = self
+                        .grant_graph
+                        .grants
+                        .iter()
+                        .find(|grant| grant.grant_id == survivor.grant_id)
+                    else {
+                        return Err(CompositionError::Recovery(
+                            "authority owner preserved path names an unknown descendant".to_owned(),
+                        ));
+                    };
+                    let Some(covering) = self
+                        .grant_graph
+                        .grants
+                        .iter()
+                        .find(|grant| grant.grant_id == survivor.covering_grant_id)
+                    else {
+                        return Err(CompositionError::Recovery(
+                            "authority owner preserved path names an unknown cover".to_owned(),
+                        ));
+                    };
+                    if descendant.authority_root_ref != target_record.authority_root_ref
+                        || covering.authority_root_ref != survivor.covering_root_ref
+                    {
+                        return Err(CompositionError::Recovery(
+                            "authority owner preserved path crosses authority roots".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
         if self
             .grant_graph
             .grants
@@ -125,6 +356,10 @@ pub struct AuthorityOwner {
     pub effects: EffectAuthorizer,
     /// Grant graph lineage restored from its complete typed snapshot.
     pub grants: GrantGraph,
+    /// Exact closure hydration registry carried by the canonical owner
+    /// snapshot, or an explicit legacy-unavailable marker. It is data, not a
+    /// second graph owner.
+    pub(crate) owner_hydrations: Option<AdmittedHydrationsSnapshot>,
 }
 
 /// Restored authority owner with the exact history-suppressed set.
@@ -147,6 +382,7 @@ impl AuthorityOwner {
         snapshot: &AuthorityOwnerSnapshot,
         expected_fence: &StateFence,
     ) -> Result<Self, CompositionError> {
+        let snapshot = AuthorityOwnerSnapshot::canonical_durable_snapshot(snapshot)?;
         snapshot.validate_against(expected_fence)?;
         let grants = GrantGraph::from_recovery_snapshot(snapshot.grant_graph.clone())
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
@@ -156,6 +392,7 @@ impl AuthorityOwner {
             state_fence: snapshot.state_fence.clone(),
             effects,
             grants,
+            owner_hydrations: snapshot.owner_hydrations.clone(),
         })
     }
 
@@ -178,6 +415,7 @@ impl AuthorityOwner {
         expected_fence: &StateFence,
         history: Option<&RevocationHistoryEvidence>,
     ) -> Result<AuthorityRestoreOutcome, CompositionError> {
+        let snapshot = AuthorityOwnerSnapshot::canonical_durable_snapshot(snapshot)?;
         snapshot.validate_against(expected_fence)?;
         let evidence = history.ok_or_else(|| {
             CompositionError::Recovery(
@@ -188,6 +426,11 @@ impl AuthorityOwner {
         if evidence.state_fence != *expected_fence || evidence.state_fence != snapshot.state_fence {
             return Err(CompositionError::Recovery(
                 "authority revocation history is stale for this recovery fence".to_owned(),
+            ));
+        }
+        if evidence.source_revision != snapshot.grant_graph.revision {
+            return Err(CompositionError::Recovery(
+                "authority revocation history revision disagrees with the owner graph".to_owned(),
             ));
         }
         let outcome = GrantGraph::from_recovery_snapshot_with_revocation_history(
@@ -213,6 +456,7 @@ impl AuthorityOwner {
                 state_fence: snapshot.state_fence.clone(),
                 effects,
                 grants: outcome.graph,
+                owner_hydrations: snapshot.owner_hydrations.clone(),
             },
             suppressed: outcome.suppressed,
         })
@@ -222,6 +466,22 @@ impl AuthorityOwner {
     #[must_use]
     pub const fn state_fence(&self) -> &StateFence {
         &self.state_fence
+    }
+
+    pub(crate) fn invalidate_owner_hydrations(&mut self) {
+        self.owner_hydrations = None;
+    }
+
+    pub(crate) fn replace_owner_hydrations(
+        &mut self,
+        owner_hydrations: AdmittedHydrationsSnapshot,
+    ) {
+        debug_assert_eq!(owner_hydrations.state_fence, self.state_fence);
+        debug_assert_eq!(
+            owner_hydrations.grant_graph_revision,
+            self.grants.revision()
+        );
+        self.owner_hydrations = Some(owner_hydrations);
     }
 
     /// Emits the complete deterministic typed authority recovery payload.
@@ -234,7 +494,16 @@ impl AuthorityOwner {
             .effects
             .snapshot()
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        AuthorityOwnerSnapshot::new(self.state_fence.clone(), grant_graph, effect_authorizer)
+        let snapshot = AuthorityOwnerSnapshot {
+            schema: AUTHORITY_OWNER_SNAPSHOT_SCHEMA.to_owned(),
+            version: AUTHORITY_OWNER_SNAPSHOT_VERSION,
+            state_fence: self.state_fence.clone(),
+            grant_graph,
+            effect_authorizer,
+            owner_hydrations: self.owner_hydrations.clone(),
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
     }
 }
 

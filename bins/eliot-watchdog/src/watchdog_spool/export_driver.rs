@@ -8,17 +8,23 @@
 //! compacts source records. Cursor semantics stay with the Governor lane
 //! (`admit_watchdog_batch`) and the owner-neutral core; this driver chains the
 //! exact export, acknowledgement, and compaction calls without adding
-//! transport, admission, canonical-store, or semantic authority. Transport
-//! reaches the Governor through the admitted `watchdog-spool-batch-v1` Kernel
-//! route concept; the real adapter implementing [`WatchdogExportSink`] lives in
-//! the Governor lane, not here. There is no process execution, executor, or
-//! child-launch path here by construction.
+//! transport, admission, canonical-store, or semantic authority. There is no
+//! process execution, executor, or child-launch path here by construction.
+//!
+//! Spool-local intents are ordinary covered records of this window, not a
+//! parked boundary: the fenced Kernel `watchdog-spool-batch-v1` intent route
+//! reconciles each one, and the Watchdog keeps the original record (compaction
+//! never removes an intent) so the Kernel record and the Governor's later
+//! canonical Problem/Incident decision stay forensically linked to it.
 
 use eliot_watchdog_core::{
     WatchdogSpoolAcknowledgement, WatchdogSpoolExportBatch, WatchdogSpoolPayloadKind,
 };
 
-use crate::{IndependentKernelSensor, SpoolError, WatchdogSpoolExportLimits};
+use crate::watchdog_spool::intent::{
+    IntentSubmissionDisposition, PendingWatchdogIntent, WatchdogIntentSubmission,
+};
+use crate::{IndependentKernelSensor, SpoolError, WatchdogSpoolExportLimits, current_unix_ms};
 
 /// Pure admission-entry projection of one export batch, in batch order.
 ///
@@ -111,9 +117,9 @@ pub fn export_once(
 /// record digest, payload digest, observed timestamp. The projection carries
 /// no sink identity and performs no I/O; the Governor-lane adapter maps each
 /// view onto its admission entry and each canonical outcome back onto the
-/// terminal sink disposition for its payload kind. Spool-local intents never
-/// reach this projection: the spool owner stops the export window before the
-/// first intent until Governor-side admission lands.
+/// terminal sink disposition for its payload kind. A spool-local intent is
+/// projected like any other record: only the fenced Kernel intent route may
+/// turn one into a pending intent projection.
 #[must_use]
 pub fn watchdog_entry_views(batch: &WatchdogSpoolExportBatch) -> Vec<WatchdogEntryView> {
     batch
@@ -137,4 +143,154 @@ pub fn watchdog_entry_views(batch: &WatchdogSpoolExportBatch) -> Vec<WatchdogEnt
 #[must_use]
 pub fn watchog_entry_views(batch: &WatchdogSpoolExportBatch) -> Vec<WatchdogEntryView> {
     watchdog_entry_views(batch)
+}
+
+/// Kernel acknowledgement of one fenced Watchdog intent submission.
+///
+/// The acknowledgement proves only that the fenced Kernel intent route
+/// recorded a pending intent projection for the exact retained spool record
+/// under the exact reconciliation key. It is not a canonical Problem or
+/// Incident decision: the Governor performs that transition later, and the
+/// Watchdog's own record stays retained for forensic linkage either way.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchdogIntentAcknowledgement {
+    /// Retained spool sequence the fenced route recorded.
+    pub sequence: u64,
+    /// Responding sink identity echoed by the fenced route.
+    pub sink_id: String,
+    /// Reconciliation key the fenced route derived for the record.
+    pub idempotency_key: String,
+    /// Digest over the exact acknowledgement the fenced route returned.
+    pub acknowledgement_digest: String,
+}
+
+/// Transport-agnostic fenced Kernel route for one Watchdog intent submission.
+///
+/// The real EBP client implements this trait against the admitted
+/// `watchdog-spool-batch-v1` Kernel route. This crate ships no transport
+/// client and no in-memory implementation: the port exists so the Watchdog can
+/// present the exact original record, evidence, and lineage through a fenced
+/// Kernel mutation and then persist its submit-once receipt from the returned
+/// acknowledgement, with no semantic interpretation on this side.
+pub trait WatchdogIntentSink {
+    /// Returns the bound sink identity this reconciliation contour uses.
+    ///
+    /// The identity becomes the export predecessor cursor sink, so it must be
+    /// the exact sink the acknowledgement echoes.
+    fn sink_id(&self) -> &str;
+
+    /// Submits one immutable intent batch through the fenced Kernel route.
+    ///
+    /// `supervision_lease_id` is the exact lease the Watchdog last verified; the
+    /// fenced route resolves it against its own retained supervision authority,
+    /// so a submission naming a lease the Kernel does not hold is fenced. The
+    /// submission must carry each original record's bytes and the Watchdog's own
+    /// epoch lineage; the route re-derives the reconciliation key and the record
+    /// digests and fences on any presented value it cannot reproduce.
+    ///
+    /// A transport outage with an unknown stage must be reported as an error and
+    /// must never be reported as an acknowledgement: the submit-once receipt is
+    /// written only for a real acknowledgement, so a lost acknowledgement
+    /// replays instead of skipping.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the submission cannot be delivered or the
+    /// fenced route cannot form an acknowledgement at all.
+    fn submit_intent(
+        &self,
+        supervision_lease_id: &str,
+        batch: &[PendingWatchdogIntent],
+    ) -> Result<Vec<WatchdogIntentAcknowledgement>, SpoolError>;
+}
+
+/// Result of one bounded fenced-Kernel intent reconciliation pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WatchdogIntentReconciliation {
+    /// No retained intent is awaiting reconciliation.
+    NothingPending,
+    /// One bounded batch was submitted and its submit-once receipts are now
+    /// durable. `recorded` counts receipts this call wrote; `already_submitted`
+    /// counts records whose receipt already existed, so no second submission
+    /// of those records is possible.
+    Reconciled {
+        first_sequence: u64,
+        recorded: usize,
+        already_submitted: usize,
+    },
+}
+
+/// Reconciles one bounded window of retained Watchdog intents through the fenced
+/// Kernel route and records their submit-once receipts.
+///
+/// The pass is: read the oldest retained intents that have no receipt, submit
+/// the exact original records through the fenced route, verify the
+/// acknowledgements answer exactly those sequences for the bound sink, then
+/// persist one receipt per acknowledgement inside `watchdog.redb`. A receipt is
+/// written only after a real acknowledgement, so a lost acknowledgement replays
+/// the same submission instead of skipping it, and the durable receipt makes a
+/// second submission of the same spool record impossible. Retained records are
+/// never removed: the Kernel record and the Governor's later canonical
+/// decision stay forensically linked to the original Watchdog record.
+///
+/// # Errors
+///
+/// Returns [`SpoolError`] when the retained spool or its receipt ledger fails
+/// validation, the fenced route cannot acknowledge, the acknowledgement
+/// coverage or sink identity does not answer the submitted batch, or a receipt
+/// cannot be persisted.
+pub fn reconcile_watchdog_intents(
+    sensor: &IndependentKernelSensor,
+    sink: &impl WatchdogIntentSink,
+) -> Result<WatchdogIntentReconciliation, SpoolError> {
+    let batch = sensor.pending_watchdog_intents()?;
+    if batch.is_empty() {
+        return Ok(WatchdogIntentReconciliation::NothingPending);
+    }
+    let first_sequence = batch.first().map_or(0, |pending| pending.record.sequence);
+    // A gap-only sensor that never verified a lease has no lease the fenced
+    // route could resolve, so it fails closed here instead of submitting a
+    // batch the Kernel must fence anyway.
+    let supervision_lease_id = sensor
+        .verified_supervision_lease_id()
+        .ok_or_else(|| {
+            SpoolError::InvalidLease(
+                "watchdog intent reconciliation requires a verified supervision lease; none was admitted"
+                    .to_owned(),
+            )
+        })?;
+    let acknowledgements = sink.submit_intent(&supervision_lease_id, &batch)?;
+    if acknowledgements.len() != batch.len() {
+        return Err(SpoolError::Corrupt(
+            "watchdog intent acknowledgement does not cover the submitted batch".to_owned(),
+        ));
+    }
+    let submitted_at_ms = current_unix_ms()?.max(1);
+    let mut recorded = 0_usize;
+    let mut already_submitted = 0_usize;
+    for (pending, acknowledgement) in batch.iter().zip(&acknowledgements) {
+        if acknowledgement.sequence != pending.record.sequence
+            || acknowledgement.sink_id != sink.sink_id()
+        {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent acknowledgement does not answer the submitted spool record"
+                    .to_owned(),
+            ));
+        }
+        let submission = WatchdogIntentSubmission {
+            sequence: acknowledgement.sequence,
+            idempotency_key: acknowledgement.idempotency_key.clone(),
+            acknowledgement_digest: acknowledgement.acknowledgement_digest.clone(),
+            submitted_at_ms,
+        };
+        match sensor.record_intent_submission(&submission)? {
+            IntentSubmissionDisposition::Recorded => recorded += 1,
+            IntentSubmissionDisposition::AlreadySubmitted => already_submitted += 1,
+        }
+    }
+    Ok(WatchdogIntentReconciliation::Reconciled {
+        first_sequence,
+        recorded,
+        already_submitted,
+    })
 }

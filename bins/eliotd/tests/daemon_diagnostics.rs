@@ -731,8 +731,6 @@ fn eight_admission_states_remain_distinct() {
 fn worker_acknowledgement_is_never_completed_work() -> TestResult {
     for outcome in [
         AgentActivationResultAckOutcome::Accepted,
-        AgentActivationResultAckOutcome::ExactReplay,
-        AgentActivationResultAckOutcome::Reconciled,
         AgentActivationResultAckOutcome::Unknown,
     ] {
         assert!(!ack_is_completed(&outcome));

@@ -962,8 +962,12 @@ impl RecallDisposition {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecallDispositionInputs {
     /// The corpus holds no records at all when the response owner has
-    /// authoritative cardinality evidence. `None` preserves an unavailable
-    /// observation and cannot be coerced to `false`.
+    /// authoritative cardinality evidence. That evidence is a complete
+    /// unfiltered corpus scan: `Some(true)` only when such a scan considered
+    /// zero records, and any considered record is `Some(false)`. A
+    /// query-filtered result set is never cardinality evidence, so an empty
+    /// such set stays `None`. `None` preserves an unavailable observation and
+    /// cannot be coerced to `false`.
     pub corpus_empty: Option<bool>,
     /// Retrieval candidates considered before scope/lifecycle policy.
     pub candidates_considered: usize,
@@ -977,7 +981,9 @@ pub struct RecallDispositionInputs {
     /// Retrieval covered the corpus without truncation or scan gaps.
     pub coverage_complete: bool,
     /// Conflicting evidence blocks admission when observed by the response
-    /// owner. `None` preserves an unavailable observation.
+    /// owner. That observation must cover the candidates the owner actually
+    /// weighed; a path that never inspected conflict state keeps `None` and
+    /// `None` preserves an unavailable observation.
     pub conflicted: Option<bool>,
     /// Best admitted total score, when any handle was admitted.
     pub top_score: Option<i32>,

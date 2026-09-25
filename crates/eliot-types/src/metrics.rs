@@ -28,6 +28,7 @@ pub enum MetricUnit {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricDefinition {
     pub metric_id: String,
     pub name: String,
@@ -43,6 +44,7 @@ pub struct MetricDefinition {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricLabelDefinition {
     pub name: String,
     pub allowed_values: Vec<String>,
@@ -51,6 +53,7 @@ pub struct MetricLabelDefinition {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricRetentionPolicy {
     pub hot_days: u32,
     pub rollup_days: u32,
@@ -67,6 +70,7 @@ pub enum MetricRedactionPolicy {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricSample {
     pub sample_id: String,
     pub metric_id: String,
@@ -79,6 +83,7 @@ pub struct MetricSample {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricLabel {
     pub name: String,
     pub value: String,
@@ -86,6 +91,7 @@ pub struct MetricLabel {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricSeries {
     pub series_id: String,
     pub metric_id: String,
@@ -95,6 +101,7 @@ pub struct MetricSeries {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricRollup {
     pub rollup_id: String,
     pub metric_id: String,
@@ -123,6 +130,7 @@ pub enum MetricWindow {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TelemetryEvent {
     pub event_id: String,
     pub event_kind: TelemetryEventKind,
@@ -162,6 +170,7 @@ pub enum TelemetryEventKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TelemetryRollup {
     pub rollup_id: String,
     pub project_id: ProjectId,
@@ -172,6 +181,7 @@ pub struct TelemetryRollup {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SloDefinition {
     pub slo_id: String,
     pub name: String,
@@ -209,6 +219,7 @@ pub enum SloBreachSeverity {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SloEvaluation {
     pub evaluation_id: String,
     pub slo_id: String,
@@ -222,6 +233,7 @@ pub struct SloEvaluation {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LatencyHistogram {
     pub histogram_id: String,
     pub component: String,
@@ -236,6 +248,7 @@ pub struct LatencyHistogram {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CostLedger {
     pub ledger_id: String,
     pub project_id: ProjectId,
@@ -248,6 +261,7 @@ pub struct CostLedger {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CostLedgerEntry {
     pub entry_id: String,
     pub component: String,
@@ -260,6 +274,7 @@ pub struct CostLedgerEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QualitySignal {
     pub signal_id: String,
     pub component: String,
@@ -284,6 +299,7 @@ pub enum QualitySignalKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeDashboard {
     pub dashboard_id: String,
     pub project_id: ProjectId,
@@ -300,7 +316,11 @@ pub struct RuntimeDashboard {
     pub recommendations: Vec<String>,
 }
 
+/// Decoder: derived and closed. The `last_change_gate_ref` alias is an accepted
+/// spelling of the same field, not an extra key; every other unknown key is
+/// refused.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DashboardHealthSummary {
     pub status: DashboardHealthStatus,
     pub ready: bool,
@@ -320,6 +340,7 @@ pub enum DashboardHealthStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperationalTrend {
     pub trend_id: String,
     pub component: String,
@@ -340,6 +361,7 @@ pub enum OperationalTrendDirection {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DashboardReport {
     pub component: String,
     pub dashboard: RuntimeDashboard,
@@ -350,6 +372,7 @@ pub struct DashboardReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsDoctorStatus {
     pub metric_registry_ready: bool,
     pub last_dashboard_ref: Option<String>,

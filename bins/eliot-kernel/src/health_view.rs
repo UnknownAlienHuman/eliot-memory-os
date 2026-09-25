@@ -36,6 +36,70 @@ fn observe_health(event: &'static str, outcome: &'static str) {
     );
 }
 
+/// Bounded Kernel activation / generation / governance / lease / drain
+/// projection (I1.5 diagnostics requirement).
+///
+/// Every field is a closed vocabulary code. The projection therefore cannot
+/// leak a lease identity, digest, epoch value, generation string, or owner
+/// error text (I15.4), and it never reports liveness as readiness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KernelActivationView {
+    /// Kernel service lifecycle state code.
+    pub service_state: &'static str,
+    /// Whether an approved runtime generation is bound to the front door.
+    pub generation: &'static str,
+    /// Governance posture derived from the observed lease census.
+    pub governance: &'static str,
+    /// Active lease state code from the exact-fence census.
+    pub lease_state: &'static str,
+    /// Durable drain disposition code.
+    pub drain_disposition: &'static str,
+}
+
+impl KernelActivationView {
+    /// The single answer used when the service state itself is unreadable.
+    pub(crate) const FENCED: Self = Self {
+        service_state: "fenced",
+        generation: "unbound",
+        governance: "unsupervised",
+        lease_state: "unavailable",
+        drain_disposition: "proceed",
+    };
+}
+
+/// Bounded observation code for the Kernel service lifecycle state.
+const fn kernel_service_state_code(state: KernelServiceState) -> &'static str {
+    match state {
+        KernelServiceState::Cold => "cold",
+        KernelServiceState::Reconciling => "reconciling",
+        KernelServiceState::ShadowNoAuthority => "shadow-no-authority",
+        KernelServiceState::HandoffPrepared => "handoff-prepared",
+        KernelServiceState::Activating => "activating",
+        KernelServiceState::Ready => "ready",
+        KernelServiceState::Degraded => "degraded",
+        KernelServiceState::Draining => "draining",
+        KernelServiceState::Stopped => "stopped",
+        KernelServiceState::Failed => "failed",
+        KernelServiceState::ManualRecovery => "manual-recovery",
+    }
+}
+
+/// Projects the activation view onto the Kernel shutdown/control diagnostics
+/// through the same bounded-field helpers the rest of the binary uses
+/// (F-LOG-KERNEL-3, I15.4). One fixed event plus bounded codes only; never an
+/// identity, digest, generation value, or owner error string.
+pub(crate) fn observe_shutdown_observation(event: &'static str, outcome: &'static str) {
+    use crate::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        "activation observation"
+    );
+}
+
 impl KernelComposition {
     pub(super) fn daemon_health_response(health: &StoreHealth) -> serde_json::Value {
         observe_health("kernel.health.response_projected", "known");
@@ -140,6 +204,42 @@ impl KernelComposition {
         let state = service.state();
         observe_health("kernel.health.service_state_observed", "success");
         Ok(state)
+    }
+
+    /// Projects the Kernel's own activation state, generation, governance
+    /// posture, active lease state and drain disposition (I1.5 "Expose the
+    /// resulting activation state, generation, governance profile, active lease
+    /// state, and drain disposition through the existing minimal operational
+    /// diagnostics rather than relying on process liveness alone").
+    ///
+    /// View-only and bounded: every field is a closed vocabulary code, so the
+    /// projection can never leak a lease identity, digest, epoch value, or
+    /// owner error string (I15.4). It derives nothing from a live process, an
+    /// open pipe, or a heartbeat.
+    #[must_use]
+    pub fn activation_operational_view(&self) -> KernelActivationView {
+        let Ok(state) = self.service_state() else {
+            observe_health("kernel.activation.view_projected", "fenced");
+            return KernelActivationView::FENCED;
+        };
+        let generation_bound = self
+            .front_door_policy
+            .lock()
+            .is_ok_and(|policy| policy.module_generation.generation.value() != 0);
+        let census = self.idle_lease_census();
+        let view = KernelActivationView {
+            service_state: kernel_service_state_code(state),
+            generation: if generation_bound { "bound" } else { "unbound" },
+            governance: if census == KernelIdleLeaseCensus::SupervisionLeased {
+                "independently-supervised"
+            } else {
+                "unsupervised"
+            },
+            lease_state: census.observation_code(),
+            drain_disposition: crate::coordinator_for(&self.work_root).drain_disposition(),
+        };
+        observe_health("kernel.activation.view_projected", view.lease_state);
+        view
     }
 
     /// Projects blob demand-controller state into the I1.10 health vocabulary

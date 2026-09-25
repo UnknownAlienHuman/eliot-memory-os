@@ -34,6 +34,7 @@
 //! Semantically set-like collections are sorted into canonical order before
 //! hashing, so producer emission order cannot fork the digest:
 //! `expected_revision_heads` by key, `expected_ordering_heads` by scope,
+//! `semantic_source_revisions` lexicographically (`key@revision` heads),
 //! `required_proof_and_approval_refs` lexicographically, and each
 //! event/projection/relation intent list (`event_ids` by id,
 //! `projection_kinds` / `relation_kinds` lexicographically).
@@ -51,13 +52,17 @@
 //! the carried scopes to equal the hashed expected ordering heads as sets
 //! (sorted, duplicates rejected) on every path carrying an ordering
 //! contract, so adding or removing that executable set fails closed with
-//! [`StoreError::TransitionDigestMismatch`]. The transition's
-//! `semantic_source_revisions` stay informational receipt lineage and are
-//! deliberately not bound here: reserved-write legs carry revision heads
-//! with explicitly empty revisions, so equality is not a system invariant;
-//! the carried values are still digest-bound into the receipt envelope via
-//! the full-transition artifact digest, so a post-commit substitution is
-//! detectable at replay.
+//! [`StoreError::TransitionDigestMismatch`].
+//!
+//! The transition's `semantic_source_revisions` ARE hash-bound set-like
+//! input (issue #63 cross-check): I1.8 names them part of the load-bearing
+//! identity across the eliotd→Kernel→store boundary, and the store copies
+//! them into the committed receipt and envelope, so a post-admission edit
+//! that left the digest unchanged could commit substituted lineage. They
+//! render as `key@revision` heads via
+//! [`crate::render_semantic_source_revisions`] (canonically sorted) and are
+//! sorted again here before hashing, so producer emission order cannot fork
+//! the digest while any content edit forks it into the typed mismatch.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -114,6 +119,15 @@ pub struct CanonicalRequestView {
     pub security: SecurityContext,
     /// Exact proof or approval handles required by this transition.
     pub required_proof_and_approval_refs: Vec<String>,
+    /// Bound semantic source revisions rendered as `key@revision` heads.
+    ///
+    /// Set-like hash input (issue #63 cross-check): sorted into canonical
+    /// order by [`canonical_request_bytes`] before hashing, so producer
+    /// emission order cannot fork the digest while any content edit forks
+    /// it. Governor renders these from the admitted expected revision heads
+    /// and Kernel/store rebind them from the carried transition via
+    /// [`CanonicalRequestView::from_apply`].
+    pub semantic_source_revisions: Vec<String>,
     /// Compare-and-swap expectations for affected revision heads.
     pub expected_revision_heads: Vec<RevisionHeadExpectation>,
     /// Compare-and-swap expectations for affected ordering heads.
@@ -131,7 +145,10 @@ impl CanonicalRequestView {
     /// is never copied into the hashed input. The transition's own
     /// `ordering_scopes` are carried through untouched (the plan executes
     /// them directly); gates enforce their correspondence with the hashed
-    /// heads via [`verify_ordering_scope_binding`].
+    /// heads via [`verify_ordering_scope_binding`]. The transition's
+    /// `semantic_source_revisions` are rebound verbatim: they are hash-bound
+    /// set-like input, so a post-admission edit forks the recomputed digest
+    /// into the typed mismatch at every gate.
     pub fn from_apply(
         context: &RequestMeta,
         transition: &PreparedTransition,
@@ -152,6 +169,7 @@ impl CanonicalRequestView {
             event_projection_relation_intents: transition.event_projection_relation_intents.clone(),
             security: transition.security.clone(),
             required_proof_and_approval_refs: transition.required_proof_and_approval_refs.clone(),
+            semantic_source_revisions: transition.semantic_source_revisions.clone(),
             expected_revision_heads: expected_revision_heads.to_vec(),
             expected_ordering_heads: expected_ordering_heads.to_vec(),
         }
@@ -172,6 +190,9 @@ pub fn canonical_request_bytes(view: &CanonicalRequestView) -> Result<Vec<u8>, S
         .expected_ordering_heads
         .sort_by(|left, right| left.scope.cmp(&right.scope));
     normalized.required_proof_and_approval_refs.sort();
+    // Bound source lineage is set-like (`key@revision` heads): canonical
+    // order before hashing so emission order cannot fork the digest.
+    normalized.semantic_source_revisions.sort();
     normalized
         .event_projection_relation_intents
         .event_ids
@@ -478,6 +499,11 @@ mod tests {
                 "approval-golden-1".to_owned(),
                 "proof-golden-1".to_owned(),
             ],
+            // Bound source lineage mirrors the Governor envelope path: the
+            // admitted expected revision heads rendered as `key@revision`.
+            // Multi-element and already sorted, so the pinned bytes also
+            // cover the set-like ordering rule.
+            semantic_source_revisions: vec!["revision-a@1".to_owned(), "revision-b@2".to_owned()],
             expected_revision_heads: vec![
                 RevisionHeadExpectation {
                     key: RevisionKey::new("revision-a").expect("key"),
@@ -633,7 +659,7 @@ mod tests {
             operation_manifest_digest: view.operation_manifest_digest.clone(),
             admission_digest: "e".repeat(64),
             mutation_plan_digest: "f".repeat(64),
-            semantic_source_revisions: Vec::new(),
+            semantic_source_revisions: view.semantic_source_revisions.clone(),
             named_operations: view.semantic_commands.clone(),
             event_projection_relation_intents: view.event_projection_relation_intents.clone(),
             security: view.security.clone(),

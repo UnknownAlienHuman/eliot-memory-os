@@ -122,11 +122,15 @@ pub(super) async fn read_idempotency(
 /// supplied != recomputed is `TransitionDigestMismatch` (mapped to
 /// `TRANSITION_DIGEST_MISMATCH`) with no transaction and no replay. Same
 /// key + different executable bytes (recomputed != stored, supplied ==
-/// recomputed) stays `IdentityConflict` with no transaction. Exact triple
-/// with a valid envelope replays the byte-identical receipt (no re-effect);
-/// any other identity divergence is a conflict; absence means no prior
-/// attempt. A triple match with a broken envelope fails closed with the
-/// envelope error instead of replaying or conflicting.
+/// recomputed) stays `IdentityConflict` with no transaction — including a
+/// retry that differs only in bound semantic source revisions, which are
+/// hash-bound set-like input through the shared view, so the forked digest
+/// reaches the `Conflict` arm instead of the replay-candidate envelope
+/// check. Exact triple with a valid envelope replays the byte-identical
+/// receipt (no re-effect); any other identity divergence is a conflict;
+/// absence means no prior attempt. A triple match with a broken envelope
+/// fails closed with the envelope error instead of replaying or
+/// conflicting.
 ///
 /// From the recompute on, supplied == recomputed, so stored-vs-supplied and
 /// stored-vs-recomputed coincide; the comparisons below name the recomputed
