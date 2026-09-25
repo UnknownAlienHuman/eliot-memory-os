@@ -35,7 +35,7 @@ use crate::{
     CanonicalAdmissionOwner, CanonicalAdmissionSnapshot, CanonicalFinishEvidence,
     CanonicalPlanBinding, CanonicalVerifierExecutionFact, CompositionError, GovernorOwners,
     KernelPortError, KernelTransitionPort, acceptance_coverage_from_verifier_fact,
-    evaluate_testd_verification_current,
+    evaluate_testd_verification_current, metric_declarations_from_improvement,
 };
 
 const GOVERNOR_SCOPE_ID: &str = "governor";
@@ -329,6 +329,10 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
     /// this boundary: the row, receipt, run, canonical task, current plan,
     /// and fence are all read and joined here. A caller-held `TestJob` or
     /// verdict cannot become canonical proof.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "publication rehydrates the complete TestD owner and verifier evidence join"
+    )]
     pub async fn publish_testd_verifier_execution_fact(
         &self,
         identity: &RequestIdentity,
@@ -402,7 +406,22 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
                 "canonical plan has no verifier binding".to_owned(),
             ))
         })?;
-        let run = evaluate_testd_verification_current(&job, receipt, verifier_plan)?;
+        let metric_declarations = testd
+            .improvement_record(job_id)
+            .map_err(|error| {
+                FinishAttemptError::Composition(CompositionError::Recovery(format!(
+                    "improvement declaration read failed: {error}"
+                )))
+            })?
+            .as_ref()
+            .map(metric_declarations_from_improvement)
+            .transpose()?;
+        let run = evaluate_testd_verification_current(
+            &job,
+            receipt,
+            verifier_plan,
+            metric_declarations.as_ref(),
+        )?;
         let fact = CanonicalVerifierExecutionFact::from_testd(
             task_id,
             task_revision,
@@ -411,6 +430,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             &job,
             receipt,
             run,
+            metric_declarations.as_ref(),
         )?;
         let fact_operation = OperationId::new(format!("{operation_id}/verifier-execution"))
             .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
@@ -434,6 +454,10 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
     /// caller-held `TestJob` or verdict that disagrees with the admitted
     /// binding cannot become canonical proof. The daemon never opens the
     /// `TestD` database.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "publication rechecks the complete identity-joined terminal evidence"
+    )]
     pub async fn publish_testd_verifier_execution_fact_from_evidence(
         &self,
         evidence: &TestdTerminalCompletionEvidence,
@@ -502,7 +526,17 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
                 "canonical plan has no verifier binding".to_owned(),
             ))
         })?;
-        let run = evaluate_testd_verification_current(job, receipt, verifier_plan)?;
+        let metric_declarations = evidence
+            .improvement
+            .as_ref()
+            .map(metric_declarations_from_improvement)
+            .transpose()?;
+        let run = evaluate_testd_verification_current(
+            job,
+            receipt,
+            verifier_plan,
+            metric_declarations.as_ref(),
+        )?;
         let fact = CanonicalVerifierExecutionFact::from_testd(
             &task_id,
             task_revision,
@@ -511,6 +545,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             job,
             receipt,
             run,
+            metric_declarations.as_ref(),
         )?;
         let operation_id = OperationId::new(job.process.operation_id.clone())
             .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;

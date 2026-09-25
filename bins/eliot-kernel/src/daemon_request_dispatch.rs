@@ -383,6 +383,21 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "bind_notify_launch_grant" => "bind_notify_launch_grant",
         "agent_host_request_reconcile" => "agent_host_request_reconcile",
         "agent_host_request_rehydrate" => "agent_host_request_rehydrate",
+        super::testd_terminal_completion_route::OWNER_PENDING_DISPATCHES_OPERATION => {
+            super::testd_terminal_completion_route::OWNER_PENDING_DISPATCHES_OPERATION
+        }
+        super::testd_terminal_completion_route::OWNER_BIND_DISPATCH_OPERATION => {
+            super::testd_terminal_completion_route::OWNER_BIND_DISPATCH_OPERATION
+        }
+        super::testd_terminal_completion_route::OWNER_PENDING_TERMINALS_OPERATION => {
+            super::testd_terminal_completion_route::OWNER_PENDING_TERMINALS_OPERATION
+        }
+        super::testd_terminal_completion_route::OWNER_ACK_TERMINAL_OPERATION => {
+            super::testd_terminal_completion_route::OWNER_ACK_TERMINAL_OPERATION
+        }
+        super::testd_terminal_completion_route::GOVERNOR_IMPROVEMENT_SUBMIT_OPERATION => {
+            super::testd_terminal_completion_route::GOVERNOR_IMPROVEMENT_SUBMIT_OPERATION
+        }
         _ => "untrusted_operation",
     }
 }
@@ -1309,6 +1324,27 @@ impl KernelComposition {
             }
             "bind_notify_launch_grant" => {
                 self.notify_launch_grant_operation(session, payload.clone())
+                    .await
+            }
+            super::testd_terminal_completion_route::OWNER_PENDING_DISPATCHES_OPERATION => {
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                self.testd_owner_pending_dispatches_operation(session, identity, &payload)
+            }
+            super::testd_terminal_completion_route::OWNER_BIND_DISPATCH_OPERATION => {
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                self.testd_owner_bind_dispatch_operation(session, identity, &payload)
+            }
+            super::testd_terminal_completion_route::OWNER_PENDING_TERMINALS_OPERATION => {
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                self.testd_owner_pending_terminals_operation(session, identity, &payload)
+            }
+            super::testd_terminal_completion_route::OWNER_ACK_TERMINAL_OPERATION => {
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                self.testd_owner_ack_terminal_operation(session, identity, &payload)
+            }
+            super::testd_terminal_completion_route::GOVERNOR_IMPROVEMENT_SUBMIT_OPERATION => {
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                Box::pin(self.governor_improvement_submit_operation(session, identity, &payload))
                     .await
             }
             _ => return Err(TransportError::SessionFenced),

@@ -169,7 +169,7 @@ pub use improvement_candidate_route::{
     ImprovementRouteError, consume_improvement_terminal, durable_disposition,
     improvement_route_owner,
 };
-pub use improvement_intake::ImprovementExperimentDeclaration;
+pub use improvement_intake::{ImprovementExperimentDeclaration, ManualImprovementIntakeEvent};
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
 pub use owner_feed::{KernelOwnerPublishPort, OwnerFeedTrigger, maintain_owner_feed};
@@ -431,6 +431,29 @@ pub struct DaemonComposition {
 }
 
 impl DaemonComposition {
+    /// Real production intake event caller for the authenticated
+    /// Governor-maintenance route.  It is intentionally explicit/manual: no
+    /// timer or daemon startup diagnostic creates a candidate.
+    pub async fn submit_manual_improvement_event(
+        &self,
+        kernel: &DaemonKernelClient,
+        event: ManualImprovementIntakeEvent,
+    ) -> Result<eliot_testd_core::TestdOwnerSubmitResponse, DaemonError> {
+        event
+            .validate()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        self.submit_improvement_candidate(
+            kernel,
+            &event.identity,
+            &event.outcome,
+            &event.declaration,
+            event.invocation,
+            event.source_root,
+            event.process_tool,
+        )
+        .await
+    }
+
     /// Submits one real admitted improvement candidate through the authenticated
     /// Kernel/TestD owner route. The intake outcome carries the actual
     /// `eliot-improvement` candidate, safe-boundary brief, and budget proof;
@@ -464,15 +487,15 @@ impl DaemonComposition {
             improvement: Some(improvement),
         };
         kernel
-            .submit_testd_improvement_owner(identity, submission, process_tool)
+            .submit_governor_improvement_owner(identity, submission, process_tool)
             .await
             .map_err(|error| DaemonError::Kernel(error.to_string()))
     }
 
     /// Reconciles a previously persisted unknown improvement outcome through
-    /// the existing authenticated `TestD` owner wire. The supplied outcome must
-    /// contain a new independent evidence/run identity; the owner rejects a
-    /// blind retry or a changed proposal.
+    /// the existing authenticated `TestD` owner wire. The supplied typed
+    /// evidence names a new external attempt and canonical fact; the owner
+    /// rejects a blind retry, caller-authored receipt, or arbitrary verdict.
     #[allow(
         clippy::large_futures,
         reason = "the owner-wire reconciliation keeps the exact receipt and outcome in one async boundary"
@@ -481,14 +504,13 @@ impl DaemonComposition {
         &self,
         kernel: &DaemonKernelClient,
         job_id: &str,
-        receipt: eliot_store_api::WriteReceipt,
-        outcome: eliot_testd_core::ImprovementExperimentOutcome,
+        evidence: eliot_testd_core::ImprovementReconciliationEvidence,
     ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
         kernel
-            .reconcile_testd_improvement_terminal_async(job_id, receipt, outcome)
+            .reconcile_testd_improvement_terminal_async(job_id, evidence)
             .await
             .map_err(|error| DaemonError::Kernel(error.to_string()))
     }

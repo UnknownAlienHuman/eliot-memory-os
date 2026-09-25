@@ -113,6 +113,33 @@ impl ExecutionStatus {
     }
 }
 
+/// Explicit execution-reality axis for an instrument run.
+///
+/// `ExecutionStatus` says what happened to the stage.  This separate axis
+/// says whether the bytes were produced by a live admitted process, a
+/// deterministic simulation/fixture, or no execution at all.  A successful
+/// simulated run must never be confused with live evidence merely because
+/// both have a terminal execution status.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ExecutionReality {
+    /// Evidence came from an admitted external process.
+    Live,
+    /// Evidence came from a deterministic simulation or inline fixture.
+    Simulated,
+    /// No executable evidence was produced.
+    #[default]
+    NotExecuted,
+}
+
+impl ExecutionReality {
+    /// Whether this axis can support a live-effect or Product-Pulse claim.
+    #[must_use]
+    pub const fn is_live(self) -> bool {
+        matches!(self, Self::Live)
+    }
+}
+
 /// Epistemic status of normalized instrument evidence.
 #[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -478,6 +505,9 @@ pub struct VerificationRun {
     pub scope: String,
     /// Execution status remains separate from this semantic outcome.
     pub execution: ExecutionStatus,
+    /// Explicit live-versus-simulated execution axis.
+    #[serde(default)]
+    pub execution_reality: ExecutionReality,
     /// Semantic result of the declared property.
     pub outcome: VerificationOutcome,
     /// Freshness of inputs/results.
@@ -683,6 +713,7 @@ mod tests {
             property: "workspace compiles".to_owned(),
             scope: "workspace".to_owned(),
             execution: ExecutionStatus::Succeeded,
+            execution_reality: ExecutionReality::Live,
             outcome: VerificationOutcome::Pass,
             freshness: EvidenceFreshness::ExactCandidate,
             coverage: EvidenceCoverage::CompleteForScope,
@@ -722,6 +753,7 @@ mod tests {
             property: "workspace compiles".to_owned(),
             scope: "workspace".to_owned(),
             execution: ExecutionStatus::Unknown,
+            execution_reality: ExecutionReality::Live,
             outcome: VerificationOutcome::Unknown,
             freshness: EvidenceFreshness::Unknown,
             coverage: EvidenceCoverage::Unknown,

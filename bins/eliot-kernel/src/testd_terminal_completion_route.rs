@@ -10,10 +10,13 @@
 //! committed here from the Kernel-selected owner store.
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_protocol::RequestIdentity;
 use eliot_store_api::WriteReceipt;
 use eliot_testd_core::{
-    ImprovementExperimentOutcome, RetryPolicy, TestdOwnerSubmitRequest,
-    TestdPendingVerifierDispatch, TestdTerminalCompletionEvidence, TestdVerifierDispatchBinding,
+    GovernorImprovementSubmitRequest, ImprovementExperimentOutcome,
+    ImprovementOwnerAdmissionReceipt, ImprovementReconciliationEvidence, RetryPolicy,
+    TestdOwnerSubmitRequest, TestdPendingVerifierDispatch, TestdTerminalCompletionEvidence,
+    TestdVerifierDispatchBinding,
 };
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +29,10 @@ pub(crate) const WIRE_VERSION: u16 = 1;
 /// Authenticated operation name used by the `TestD` productive owner-submit
 /// intake (`TestD` worker session).
 pub(crate) const OWNER_SUBMIT_OPERATION: &str = eliot_testd_core::TESTD_OWNER_SUBMIT_OPERATION;
+/// Authenticated Governor-maintenance improvement intake operation.  This is
+/// intentionally not reachable through the TestD owner-submit operation.
+pub(crate) const GOVERNOR_IMPROVEMENT_SUBMIT_OPERATION: &str =
+    eliot_testd_core::GOVERNOR_IMPROVEMENT_SUBMIT_OPERATION;
 /// Authenticated daemon operation: list queued productive jobs that still
 /// need their canonical verifier binding.
 #[allow(
@@ -147,6 +154,22 @@ pub(crate) fn owner_submit_request_from_payload(
         .cloned()
         .ok_or_else(|| "TestD owner-submit request is absent".to_owned())?;
     let request: OwnerSubmitRequest =
+        serde_json::from_value(value).map_err(|error| error.to_string())?;
+    request.validate().map_err(|error| error.to_string())?;
+    Ok(request)
+}
+
+/// Decodes the authenticated Governor-maintenance improvement intake.  The
+/// request is still only inert material; the enclosing frame identity and
+/// live Kernel fence remain the owner authority.
+pub(crate) fn governor_improvement_request_from_payload(
+    payload: &serde_json::Value,
+) -> Result<GovernorImprovementSubmitRequest, String> {
+    let value = payload
+        .get("request")
+        .cloned()
+        .ok_or_else(|| "Governor improvement request is absent".to_owned())?;
+    let request: GovernorImprovementSubmitRequest =
         serde_json::from_value(value).map_err(|error| error.to_string())?;
     request.validate().map_err(|error| error.to_string())?;
     Ok(request)
@@ -352,11 +375,16 @@ pub(crate) struct OwnerAcknowledgeTerminalRequest {
     pub wire_id: String,
     pub wire_version: u16,
     pub job_id: String,
-    pub receipt: WriteReceipt,
-    /// Optional exact candidate outcome. When present, the owner commits the
-    /// canonical receipt and improvement disposition atomically.
+    /// Present for a normal terminal acknowledgement. Reconciliation reuses
+    /// the durable owner receipt and therefore must not accept a caller copy.
+    pub receipt: Option<WriteReceipt>,
+    /// Optional exact candidate outcome for a normal improvement terminal.
     #[serde(default)]
     pub improvement: Option<ImprovementExperimentOutcome>,
+    /// Typed evidence for a new external attempt and canonical fact. It is
+    /// mutually exclusive with a caller-supplied receipt/outcome.
+    #[serde(default)]
+    pub reconciliation: Option<ImprovementReconciliationEvidence>,
     /// Reuse of this existing owner wire for a later exact unknown-outcome
     /// reconciliation. It is never a blind retry and never creates a job.
     #[serde(default)]
@@ -376,9 +404,28 @@ impl OwnerAcknowledgeTerminalRequest {
             OWNER_ACK_TERMINAL_OPERATION,
         )?;
         validate_job_id(&self.job_id)?;
-        self.receipt.validate().map_err(|error| error.to_string())?;
-        if self.reconcile && self.improvement.is_none() {
-            return Err("reconciliation requires an exact improvement outcome".to_owned());
+        if self.reconcile {
+            if self.receipt.is_some() || self.improvement.is_some() || self.reconciliation.is_none()
+            {
+                return Err(
+                    "unknown reconciliation requires typed evidence and no caller receipt/outcome"
+                        .to_owned(),
+                );
+            }
+            self.reconciliation
+                .as_ref()
+                .ok_or_else(|| "reconciliation evidence is absent".to_owned())?;
+        } else {
+            if self.receipt.is_none() || self.reconciliation.is_some() {
+                return Err(
+                    "normal terminal acknowledgement requires its committed receipt".to_owned(),
+                );
+            }
+            self.receipt
+                .as_ref()
+                .ok_or_else(|| "terminal receipt is absent".to_owned())?
+                .validate()
+                .map_err(|error| error.to_string())?;
         }
         validate_digest(&self.request_digest)?;
         let expected = self.compute_request_digest()?;
@@ -392,18 +439,28 @@ impl OwnerAcknowledgeTerminalRequest {
         dead_code,
         reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
     )]
-    pub(crate) fn receipt_sha256(&self) -> Result<String, String> {
-        let bytes = canonical_json_bytes(&self.receipt).map_err(|error| error.to_string())?;
-        Ok(sha256_hex(&bytes))
+    pub(crate) fn receipt_sha256(&self) -> Result<Option<String>, String> {
+        self.receipt
+            .as_ref()
+            .map(|receipt| {
+                let bytes = canonical_json_bytes(receipt).map_err(|error| error.to_string())?;
+                Ok(sha256_hex(&bytes))
+            })
+            .transpose()
     }
 
     #[allow(
         dead_code,
         reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
     )]
-    pub(crate) fn receipt_json(&self) -> Result<String, String> {
-        let bytes = canonical_json_bytes(&self.receipt).map_err(|error| error.to_string())?;
-        String::from_utf8(bytes).map_err(|error| error.to_string())
+    pub(crate) fn receipt_json(&self) -> Result<Option<String>, String> {
+        self.receipt
+            .as_ref()
+            .map(|receipt| {
+                let bytes = canonical_json_bytes(receipt).map_err(|error| error.to_string())?;
+                String::from_utf8(bytes).map_err(|error| error.to_string())
+            })
+            .transpose()
     }
 
     fn compute_request_digest(&self) -> Result<String, String> {
@@ -412,8 +469,9 @@ impl OwnerAcknowledgeTerminalRequest {
             wire_id: &'a str,
             wire_version: u16,
             job_id: &'a str,
-            receipt_sha256: &'a str,
+            receipt_sha256: Option<&'a str>,
             improvement: Option<&'a ImprovementExperimentOutcome>,
+            reconciliation: Option<&'a ImprovementReconciliationEvidence>,
             reconcile: bool,
         }
         let receipt_sha256 = self.receipt_sha256()?;
@@ -421,8 +479,9 @@ impl OwnerAcknowledgeTerminalRequest {
             wire_id: &self.wire_id,
             wire_version: self.wire_version,
             job_id: &self.job_id,
-            receipt_sha256: &receipt_sha256,
+            receipt_sha256: receipt_sha256.as_deref(),
             improvement: self.improvement.as_ref(),
+            reconciliation: self.reconciliation.as_ref(),
             reconcile: self.reconcile,
         })
         .map_err(|error| error.to_string())?;
@@ -477,6 +536,56 @@ pub(crate) struct OwnerAcknowledgeTerminalResponse {
 }
 
 impl KernelComposition {
+    /// Admits one improvement experiment from the authenticated
+    /// Governor-maintenance daemon route.  The request identity is checked
+    /// against the live daemon session before the Kernel owner rehydrates the
+    /// complete declaration and persists the productive row.
+    pub(crate) async fn governor_improvement_submit_operation(
+        &self,
+        session: &Session,
+        identity: &RequestIdentity,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        Self::require_daemon_identity(session, identity)?;
+        let request = governor_improvement_request_from_payload(payload)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let issued_at = now_ms();
+        let owner_principal_digest = match &session.peer {
+            eliot_ipc::PeerIdentity::Authenticated {
+                user_identity,
+                session_identity,
+                ..
+            } => sha256_hex(format!("{user_identity}\u{1f}{session_identity}").as_bytes()),
+            _ => return Err(TransportError::PeerIdentityUnavailable),
+        };
+        let receipt = ImprovementOwnerAdmissionReceipt::issue(
+            request
+                .submission
+                .improvement
+                .as_ref()
+                .ok_or(TransportError::SessionFenced)?,
+            identity,
+            eliot_testd_core::IMPROVEMENT_OWNER,
+            eliot_testd_core::GOVERNOR_IMPROVEMENT_OWNER_OPERATION,
+            &owner_principal_digest,
+            session.module_generation.module_id.as_str(),
+            session.module_generation.artifact_id.as_str(),
+            session.session_epoch,
+            issued_at,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let response = super::dispatch_launch::submit_governor_improvement_owner_job(
+            self, identity, &request, &receipt, issued_at,
+        )
+        .await
+        .map_err(|_| TransportError::SessionFenced)?;
+        let value = serde_json::to_value(response).map_err(|_| TransportError::SessionFenced)?;
+        Ok(serde_json::json!({
+            "kind": "governor_improvement_submit",
+            "value": value,
+        }))
+    }
+
     /// Opens the single Kernel-selected `TestD` owner store. Paths are never
     /// taken from the caller; the daemon cannot substitute its own database.
     fn testd_owner_store(&self) -> Result<eliot_testd_core::TestdStore, TransportError> {
@@ -498,6 +607,20 @@ impl KernelComposition {
         Ok(())
     }
 
+    fn require_daemon_identity(
+        session: &Session,
+        identity: &RequestIdentity,
+    ) -> Result<(), TransportError> {
+        Self::require_daemon_session(session)?;
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if identity.request.state_fence != session.module_generation.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
     /// Serves one authenticated daemon pending-dispatch poll from the
     /// Kernel-owned `TestD` store.
     #[allow(
@@ -507,9 +630,10 @@ impl KernelComposition {
     pub(crate) fn testd_owner_pending_dispatches_operation(
         &self,
         session: &Session,
+        identity: &RequestIdentity,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
-        Self::require_daemon_session(session)?;
+        Self::require_daemon_identity(session, identity)?;
         let request: OwnerPendingDispatchesRequest = serde_json::from_value(
             payload
                 .get("request")
@@ -538,9 +662,10 @@ impl KernelComposition {
     pub(crate) fn testd_owner_bind_dispatch_operation(
         &self,
         session: &Session,
+        identity: &RequestIdentity,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
-        Self::require_daemon_session(session)?;
+        Self::require_daemon_identity(session, identity)?;
         let request: OwnerBindDispatchRequest = serde_json::from_value(
             payload
                 .get("request")
@@ -580,9 +705,10 @@ impl KernelComposition {
     pub(crate) fn testd_owner_pending_terminals_operation(
         &self,
         session: &Session,
+        identity: &RequestIdentity,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
-        Self::require_daemon_session(session)?;
+        Self::require_daemon_identity(session, identity)?;
         let request: OwnerPendingTerminalsRequest = serde_json::from_value(
             payload
                 .get("request")
@@ -612,9 +738,10 @@ impl KernelComposition {
     pub(crate) fn testd_owner_ack_terminal_operation(
         &self,
         session: &Session,
+        identity: &RequestIdentity,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
-        Self::require_daemon_session(session)?;
+        Self::require_daemon_identity(session, identity)?;
         let request: OwnerAcknowledgeTerminalRequest = serde_json::from_value(
             payload
                 .get("request")
@@ -629,37 +756,43 @@ impl KernelComposition {
         if now == 0 {
             return Err(TransportError::SessionFenced);
         }
-        let receipt_sha256 = request
-            .receipt_sha256()
-            .map_err(|_| TransportError::SessionFenced)?;
-        let receipt_json = request
-            .receipt_json()
-            .map_err(|_| TransportError::SessionFenced)?;
         let store = self.testd_owner_store()?;
         let job = if request.reconcile {
-            let improvement = request.improvement.ok_or(TransportError::SessionFenced)?;
+            let reconciliation = request
+                .reconciliation
+                .ok_or(TransportError::SessionFenced)?;
             store
-                .reconcile_improvement_terminal(&request.job_id, improvement, now)
-                .map_err(|_| TransportError::SessionFenced)?
-        } else if let Some(improvement) = request.improvement {
-            store
-                .acknowledge_improvement_terminal(
-                    &request.job_id,
-                    &receipt_sha256,
-                    receipt_json,
-                    improvement,
-                    now,
-                )
+                .reconcile_improvement_terminal(&request.job_id, reconciliation, now)
                 .map_err(|_| TransportError::SessionFenced)?
         } else {
-            store
-                .record_terminal_publication_receipt(
-                    &request.job_id,
-                    &receipt_sha256,
-                    receipt_json,
-                    now,
-                )
+            let receipt_sha256 = request
+                .receipt_sha256()
                 .map_err(|_| TransportError::SessionFenced)?
+                .ok_or(TransportError::SessionFenced)?;
+            let receipt_json = request
+                .receipt_json()
+                .map_err(|_| TransportError::SessionFenced)?
+                .ok_or(TransportError::SessionFenced)?;
+            if let Some(improvement) = request.improvement {
+                store
+                    .acknowledge_improvement_terminal(
+                        &request.job_id,
+                        &receipt_sha256,
+                        receipt_json,
+                        improvement,
+                        now,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?
+            } else {
+                store
+                    .record_terminal_publication_receipt(
+                        &request.job_id,
+                        &receipt_sha256,
+                        receipt_json,
+                        now,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?
+            }
         };
         let committed = job
             .terminal_publication

@@ -26,9 +26,9 @@ use eliot_protocol::{
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{NamedReadRequest, NamedReadResponse, WriteReceipt};
 use eliot_testd_core::{
-    TestdOwnerJobSubmission, TestdOwnerSubmitRequest, TestdOwnerSubmitResponse,
-    TestdPendingVerifierDispatch, TestdProcessToolIntent, TestdTerminalCompletionEvidence,
-    TestdVerifierDispatchBinding,
+    GovernorImprovementSubmitRequest, ImprovementReconciliationEvidence, TestdOwnerJobSubmission,
+    TestdOwnerSubmitResponse, TestdPendingVerifierDispatch, TestdProcessToolIntent,
+    TestdTerminalCompletionEvidence, TestdVerifierDispatchBinding,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1113,9 +1113,11 @@ pub(super) struct TestdOwnerAckTerminalRequest {
     pub wire_id: String,
     pub wire_version: u16,
     pub job_id: String,
-    pub receipt: WriteReceipt,
+    pub receipt: Option<WriteReceipt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub improvement: Option<eliot_testd_core::ImprovementExperimentOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconciliation: Option<ImprovementReconciliationEvidence>,
     #[serde(default)]
     pub reconcile: bool,
     pub request_digest: String,
@@ -1206,8 +1208,9 @@ fn testd_owner_bind_request_digest(
 
 fn testd_owner_ack_request_digest(
     job_id: &str,
-    receipt_sha256: &str,
+    receipt_sha256: Option<&str>,
     improvement: Option<&eliot_testd_core::ImprovementExperimentOutcome>,
+    reconciliation: Option<&ImprovementReconciliationEvidence>,
     reconcile: bool,
 ) -> Result<String, KernelPortError> {
     #[derive(Serialize)]
@@ -1215,8 +1218,9 @@ fn testd_owner_ack_request_digest(
         wire_id: &'a str,
         wire_version: u16,
         job_id: &'a str,
-        receipt_sha256: &'a str,
+        receipt_sha256: Option<&'a str>,
         improvement: Option<&'a eliot_testd_core::ImprovementExperimentOutcome>,
+        reconciliation: Option<&'a ImprovementReconciliationEvidence>,
         reconcile: bool,
     }
     let bytes = canonical_json_bytes(&Canonical {
@@ -1225,6 +1229,7 @@ fn testd_owner_ack_request_digest(
         job_id,
         receipt_sha256,
         improvement,
+        reconciliation,
         reconcile,
     })
     .map_err(|error| KernelPortError::Contract(error.to_string()))?;
@@ -1232,11 +1237,11 @@ fn testd_owner_ack_request_digest(
 }
 
 impl DaemonKernelClient {
-    /// Submits one actual improvement candidate through the existing
-    /// authenticated `TestD` owner-submit route. The daemon may use this leg
-    /// only for a request carrying an improvement declaration; ordinary
-    /// productive submissions remain on the `TestD` worker session.
-    pub(super) async fn submit_testd_improvement_owner(
+    /// Submits one actual improvement candidate through the authenticated
+    /// Governor-maintenance route.  The TestD owner-submit wire is not used:
+    /// a daemon frame cannot borrow TestD worker authority to create an
+    /// improvement experiment.
+    pub(super) async fn submit_governor_improvement_owner(
         &self,
         identity: &RequestIdentity,
         submission: TestdOwnerJobSubmission,
@@ -1244,11 +1249,11 @@ impl DaemonKernelClient {
     ) -> Result<TestdOwnerSubmitResponse, KernelPortError> {
         if submission.improvement.is_none() {
             return Err(KernelPortError::Contract(
-                "daemon owner submit requires an improvement declaration".to_owned(),
+                "Governor-maintenance intake requires an improvement declaration".to_owned(),
             ));
         }
-        let request = TestdOwnerSubmitRequest {
-            wire_id: eliot_testd_core::TESTD_OWNER_SUBMIT_OPERATION.to_owned(),
+        let request = GovernorImprovementSubmitRequest {
+            wire_id: eliot_testd_core::GOVERNOR_IMPROVEMENT_SUBMIT_OPERATION.to_owned(),
             wire_version: eliot_testd_core::TESTD_OWNER_WIRE_VERSION,
             submission,
             process_tool,
@@ -1258,12 +1263,13 @@ impl DaemonKernelClient {
         .map_err(|error| KernelPortError::Contract(error.to_string()))?;
         let value = self
             .transact_async_with_identity(
-                eliot_testd_core::TESTD_OWNER_SUBMIT_OPERATION,
+                eliot_testd_core::GOVERNOR_IMPROVEMENT_SUBMIT_OPERATION,
                 serde_json::json!({ "request": request }),
                 identity.clone(),
             )
             .await
             .map_err(kernel_port_error)?;
+        let value = super::kind_value(&value, "governor_improvement_submit")?;
         serde_json::from_value(value).map_err(|error| KernelPortError::Contract(error.to_string()))
     }
 
@@ -1369,7 +1375,7 @@ impl DaemonKernelClient {
         job_id: &str,
         receipt: WriteReceipt,
         improvement: Option<eliot_testd_core::ImprovementExperimentOutcome>,
-        reconcile: bool,
+        _reconcile: bool,
     ) -> Result<WriteReceipt, KernelPortError> {
         testd_owner_job_id(job_id)?;
         receipt
@@ -1378,17 +1384,19 @@ impl DaemonKernelClient {
         let receipt_sha256 = testd_owner_receipt_sha256(&receipt)?;
         let request_digest = testd_owner_ack_request_digest(
             job_id,
-            &receipt_sha256,
+            Some(&receipt_sha256),
             improvement.as_ref(),
-            reconcile,
+            None,
+            false,
         )?;
         let request = TestdOwnerAckTerminalRequest {
             wire_id: TESTD_OWNER_ACK_TERMINAL_OPERATION.to_owned(),
             wire_version: TESTD_OWNER_WIRE_VERSION,
             job_id: job_id.to_owned(),
-            receipt,
+            receipt: Some(receipt),
             improvement,
-            reconcile,
+            reconciliation: None,
+            reconcile: false,
             request_digest,
         };
         let value = self
@@ -1410,16 +1418,44 @@ impl DaemonKernelClient {
     }
 
     /// Reconciles a previously persisted unknown improvement outcome through
-    /// the same authenticated `TestD` owner wire. The owner requires a new
-    /// evidence/run identity and cannot be used to retry an un-evidenced job.
+    /// the same authenticated owner wire. The daemon supplies only a typed
+    /// external-attempt/fact evidence value; the owner rehydrates the receipt
+    /// and derives the durable outcome, so caller-authored receipts and
+    /// verdicts cannot reconcile an unknown effect.
     pub(super) async fn reconcile_testd_improvement_terminal_async(
         &self,
         job_id: &str,
-        receipt: WriteReceipt,
-        outcome: eliot_testd_core::ImprovementExperimentOutcome,
+        evidence: ImprovementReconciliationEvidence,
     ) -> Result<WriteReceipt, KernelPortError> {
-        self.acknowledge_testd_terminal_completion_async(job_id, receipt, Some(outcome), true)
+        testd_owner_job_id(job_id)?;
+        let request_digest =
+            testd_owner_ack_request_digest(job_id, None, None, Some(&evidence), true)?;
+        let request = TestdOwnerAckTerminalRequest {
+            wire_id: TESTD_OWNER_ACK_TERMINAL_OPERATION.to_owned(),
+            wire_version: TESTD_OWNER_WIRE_VERSION,
+            job_id: job_id.to_owned(),
+            receipt: None,
+            improvement: None,
+            reconciliation: Some(evidence),
+            reconcile: true,
+            request_digest,
+        };
+        let value = self
+            .transact_async(
+                TESTD_OWNER_ACK_TERMINAL_OPERATION,
+                serde_json::json!({ "request": request }),
+            )
             .await
+            .map_err(kernel_port_error)?;
+        let value = super::kind_value(&value, "testd_owner_ack_terminal")?;
+        let response: TestdOwnerAckTerminalResponse = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if response.job_id != job_id {
+            return Err(KernelPortError::Contract(
+                "Kernel reconciliation response does not bind the requested job".to_owned(),
+            ));
+        }
+        Ok(response.receipt)
     }
 }
 

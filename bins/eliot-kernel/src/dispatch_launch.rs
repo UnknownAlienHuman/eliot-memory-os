@@ -118,7 +118,8 @@ use eliot_process::{OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
-    ImprovementExperimentRecord, ImprovementProposal, JobState as TestdJobState,
+    GovernorImprovementSubmitRequest, ImprovementExperimentRecord,
+    ImprovementOwnerAdmissionReceipt, ImprovementProposal, JobState as TestdJobState,
     KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
     ProcessAdmission, RetryPolicy, TESTD_PRODUCTIVE_PROFILE, TargetRoots, TestdOwnerSubmitRequest,
     TestdOwnerSubmitResponse, TestdStore, TestdVerifierDispatchBinding, TestdVerifierJobSubmission,
@@ -1156,9 +1157,69 @@ pub(crate) async fn submit_testd_owner_job(
     request: &TestdOwnerSubmitRequest,
     now_unix_ms: u64,
 ) -> Result<TestdOwnerSubmitResponse, DispatchLaunchError> {
+    submit_testd_owner_job_inner(kernel, identity, request, now_unix_ms, None).await
+}
+
+/// Creates one improvement job only through the authenticated
+/// Governor-maintenance owner route. The owner receipt is minted by the
+/// Kernel front door after live session validation and is carried into the
+/// immutable proposal; a TestD worker request cannot manufacture it.
+pub(crate) async fn submit_governor_improvement_owner_job(
+    kernel: &KernelComposition,
+    identity: &RequestIdentity,
+    request: &GovernorImprovementSubmitRequest,
+    owner_receipt: &ImprovementOwnerAdmissionReceipt,
+    now_unix_ms: u64,
+) -> Result<TestdOwnerSubmitResponse, DispatchLaunchError> {
     request
         .validate()
         .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    owner_receipt
+        .validate_for(
+            request
+                .submission
+                .improvement
+                .as_ref()
+                .ok_or(DispatchLaunchError::InvalidMaterial(
+                    "Governor improvement request has no declaration".to_owned(),
+                ))?,
+            identity,
+        )
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let owner_request = TestdOwnerSubmitRequest {
+        wire_id: eliot_testd_core::TESTD_OWNER_SUBMIT_OPERATION.to_owned(),
+        wire_version: eliot_testd_core::TESTD_OWNER_WIRE_VERSION,
+        submission: request.submission.clone(),
+        process_tool: request.process_tool.clone(),
+        request_digest: String::new(),
+    }
+    .with_computed_digest()
+    .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    submit_testd_owner_job_inner(
+        kernel,
+        identity,
+        &owner_request,
+        now_unix_ms,
+        Some(owner_receipt),
+    )
+    .await
+}
+
+async fn submit_testd_owner_job_inner(
+    kernel: &KernelComposition,
+    identity: &RequestIdentity,
+    request: &TestdOwnerSubmitRequest,
+    now_unix_ms: u64,
+    owner_receipt: Option<&ImprovementOwnerAdmissionReceipt>,
+) -> Result<TestdOwnerSubmitResponse, DispatchLaunchError> {
+    request
+        .validate()
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    if request.submission.improvement.is_some() != owner_receipt.is_some() {
+        return Err(DispatchLaunchError::Gate(
+            "improvement submissions require the authenticated Governor owner receipt".to_owned(),
+        ));
+    }
     identity
         .validate()
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
@@ -1226,16 +1287,20 @@ pub(crate) async fn submit_testd_owner_job(
     let operation_id = request.submission.invocation.request.request_id.as_str();
     let job_digest = sha256_hex(operation_id.as_bytes());
     let job_id = format!("testd-{job_digest}");
-    let improvement_record = request
+    let mut improvement_record = request
         .submission
         .improvement
         .as_ref()
         .map(|improvement| {
-            let proposal = ImprovementProposal::from_kernel_facts(
+            let receipt = owner_receipt.ok_or(DispatchLaunchError::Gate(
+                "improvement proposal has no authenticated owner receipt".to_owned(),
+            ))?;
+            let proposal = ImprovementProposal::from_kernel_facts_with_owner_receipt(
                 improvement,
                 identity,
                 &request.submission.invocation,
                 &request.process_tool,
+                receipt,
                 &job_id,
                 &request.submission.project_id,
                 source_root.to_string_lossy().as_ref(),
@@ -1375,6 +1440,25 @@ pub(crate) async fn submit_testd_owner_job(
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let store = TestdStore::open(&owner_path, RetryPolicy::default())
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    // Exact replay must reuse the durable proposal, including its original
+    // declaration timestamp, owner receipt, plan, and canary identity.  A new
+    // wall-clock observation may authorize the same request, but it may not
+    // rewrite the retained experiment identity.
+    if let (Some(incoming), Some(retained)) = (
+        request.submission.improvement.as_ref(),
+        store
+            .improvement_record(&job_id)
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
+    ) {
+        if retained.proposal.request != *incoming
+            || retained.proposal.state_fence != identity.request.state_fence
+        {
+            return Err(DispatchLaunchError::Gate(
+                "improvement replay changed retained proposal material".to_owned(),
+            ));
+        }
+        improvement_record = Some(retained);
+    }
     let job = if let Some(improvement) = improvement_record {
         store
             .submit_productive_verifier_with_improvement(

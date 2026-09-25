@@ -1331,7 +1331,7 @@ impl CanonicalVerifierEffectBinding {
 /// verifier runs for readback.  [`Self::certifies_completion`] is deliberately
 /// derived from the bound execution/evaluation axes and never from a caller
 /// label or task command.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalVerifierExecutionFact {
     pub task_id: String,
@@ -1345,6 +1345,10 @@ pub struct CanonicalVerifierExecutionFact {
     #[serde(default)]
     pub source_observation: Option<CanonicalVerifierSourceObservationRange>,
     pub verification_run: VerificationRun,
+    /// Exact owner-declared metric table used by the independent verifier.
+    /// Ordinary verifier jobs may omit it; an improvement job may not.
+    #[serde(default)]
+    pub metric_declarations: Option<eliot_verifier::MetricDeclarations>,
     /// Observed invocation/evaluator identity recovered from the TestD job.
     /// This is the non-tautological config/currentness join.
     pub invocation: CanonicalVerifierInvocationBinding,
@@ -1360,6 +1364,11 @@ impl CanonicalVerifierExecutionFact {
     /// `receipt` must equal the full receipt retained by TestD after the
     /// worker/verifier transition.  The terminal binding and run are checked
     /// against the same invocation, fence, outcome, and artifact lineage.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the canonical fact constructor rechecks the complete terminal owner join"
+    )]
     pub fn from_testd(
         task_id: &TaskId,
         task_revision: u64,
@@ -1368,6 +1377,7 @@ impl CanonicalVerifierExecutionFact {
         job: &TestJob,
         receipt: &VerificationReceipt,
         run: VerificationRun,
+        metric_declarations: Option<&eliot_verifier::MetricDeclarations>,
     ) -> Result<Self, CompositionError> {
         receipt.validate(job).map_err(|error| {
             verifier_fact_error(format!("TestD receipt validation failed: {error}"))
@@ -1551,6 +1561,7 @@ impl CanonicalVerifierExecutionFact {
                 .as_ref()
                 .map(CanonicalVerifierSourceObservationRange::from_testd),
             verification_run: run,
+            metric_declarations: metric_declarations.cloned(),
             invocation,
             terminal_binding,
             input_artifact_bindings: job.invocation.input_artifacts.clone(),
@@ -1580,6 +1591,10 @@ impl CanonicalVerifierExecutionFact {
     }
 
     /// Validates the persisted fact without consulting a caller or provider.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "fact validation rechecks every canonical owner and evidence axis"
+    )]
     pub fn validate(&self, expected_fence: &StateFence) -> Result<(), CompositionError> {
         if &self.state_fence != expected_fence
             || self.task_id.trim().is_empty()
@@ -1631,6 +1646,45 @@ impl CanonicalVerifierExecutionFact {
         self.verification_run.validate().map_err(|error| {
             verifier_fact_error(format!("persisted VerificationRun is invalid: {error}"))
         })?;
+        if let Some(declarations) = &self.metric_declarations {
+            if !self.verification_run.execution_reality.is_live() {
+                return Err(verifier_fact_error(
+                    "improvement verifier fact must carry live execution reality",
+                ));
+            }
+            declarations.validate().map_err(|error| {
+                verifier_fact_error(format!(
+                    "persisted metric declarations are invalid: {error}"
+                ))
+            })?;
+            let mut found = BTreeSet::new();
+            for evidence in &self.verification_run.evidence {
+                if let Some(values) = evidence
+                    .value
+                    .get("metric_deltas")
+                    .and_then(serde_json::Value::as_object)
+                {
+                    for name in values.keys() {
+                        if !found.insert(name.clone()) {
+                            return Err(verifier_fact_error(
+                                "canonical metric evidence contains a duplicate metric identity",
+                            ));
+                        }
+                        if values[name].as_f64().is_none() {
+                            return Err(verifier_fact_error(
+                                "canonical metric evidence contains a non-numeric metric value",
+                            ));
+                        }
+                    }
+                }
+            }
+            let expected = declarations.all_metric_names();
+            if found != expected.iter().cloned().collect::<BTreeSet<_>>() {
+                return Err(verifier_fact_error(
+                    "canonical metric evidence does not cover the exact declared metric set",
+                ));
+            }
+        }
         if !self.verification_run.execution.is_terminal()
             || self.verification_run.state_fence != *expected_fence
         {
@@ -1941,7 +1995,7 @@ fn validate_canonical_receipt_binding(
 }
 
 /// Persisted current-plan authority for one exact Governor fence.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalAdmissionSnapshot {
     pub state_fence: StateFence,
@@ -3408,6 +3462,7 @@ pub(crate) fn evaluate_testd_verification_current(
     job: &TestJob,
     receipt: &VerificationReceipt,
     plan: &CanonicalVerifierPlanBinding,
+    metric_declarations: Option<&eliot_verifier::MetricDeclarations>,
 ) -> Result<VerificationRun, CompositionError> {
     if job.invocation.profile != eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
         return Err(CompositionError::Recovery(
@@ -3416,10 +3471,11 @@ pub(crate) fn evaluate_testd_verification_current(
     }
     let raw = testd_raw_evidence(job, receipt)?;
     let finished_at = testd_finished_clock(job);
-    let mut run = eliot_verifier::evaluate_current(
+    let mut run = eliot_verifier::evaluate_current_with_metric_declarations(
         &job.invocation,
         &raw,
         &plan.required_test_ids,
+        metric_declarations,
         job.invocation.request.clock,
         finished_at,
     )
@@ -3430,6 +3486,34 @@ pub(crate) fn evaluate_testd_verification_current(
     })?;
     normalize_nextest_run(&mut run, job, plan, receipt, &raw, finished_at)?;
     Ok(run)
+}
+
+/// Projects the durable improvement declaration into the verifier's typed
+/// metric contract.  The values come only from the owner-rehydrated proposal;
+/// the verifier never accepts a metric table from a terminal caller.
+pub(crate) fn metric_declarations_from_improvement(
+    record: &eliot_testd_core::ImprovementExperimentRecord,
+) -> Result<eliot_verifier::MetricDeclarations, CompositionError> {
+    record
+        .proposal
+        .experiment_plan
+        .validate()
+        .map_err(|error| {
+            CompositionError::Recovery(format!("invalid improvement experiment plan: {error}"))
+        })?;
+    let declarations = eliot_verifier::MetricDeclarations {
+        expected_metric_names: record
+            .proposal
+            .experiment_plan
+            .expected_metric_names
+            .clone(),
+        expected_deltas: record.proposal.experiment_plan.expected_deltas.clone(),
+        counter_metric_names: record.proposal.experiment_plan.counter_metric_names.clone(),
+    };
+    declarations.validate().map_err(|error| {
+        CompositionError::Recovery(format!("invalid improvement metric declarations: {error}"))
+    })?;
+    Ok(declarations)
 }
 
 impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
@@ -3559,7 +3643,20 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 "durable TestD job has no full verification receipt".to_owned(),
             )
         })?;
-        let run = evaluate_testd_verification_current(&job, receipt, verifier_plan)?;
+        let metric_declarations = testd
+            .improvement_record(job_id)
+            .map_err(|error| {
+                CompositionError::Recovery(format!("improvement declaration read failed: {error}"))
+            })?
+            .as_ref()
+            .map(metric_declarations_from_improvement)
+            .transpose()?;
+        let run = evaluate_testd_verification_current(
+            &job,
+            receipt,
+            verifier_plan,
+            metric_declarations.as_ref(),
+        )?;
         CanonicalVerifierExecutionFact::from_testd(
             task_id,
             task_revision,
@@ -3568,6 +3665,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             &job,
             receipt,
             run,
+            metric_declarations.as_ref(),
         )
     }
 

@@ -8,14 +8,15 @@
 
 use eliot_contracts::{ClockReading, ContractId, RequestId, sha256_hex};
 use eliot_instrument_api::{
-    EvidenceCoverage, EvidenceFreshness, InstrumentContractError, InstrumentKind, RawEvidence,
-    VerificationOutcome, VerificationRun as CurrentVerificationRun,
+    EvidenceAxes, EvidenceCoverage, EvidenceFreshness, ExecutionReality, InstrumentContractError,
+    InstrumentKind, NormalizedEvidence, RawEvidence, VerificationOutcome,
+    VerificationRun as CurrentVerificationRun,
 };
 use eliot_instrument_nextest::{
-    NEXTEST_INSTRUMENT, NEXTEST_STDERR_CONTENT_TYPE, NEXTEST_STDOUT_CONTENT_TYPE,
-    NextestTestEvent, NextestTestStatus, parse_jsonl, parse_test_events,
-    catalog_test_id,
+    NEXTEST_INSTRUMENT, NEXTEST_STDERR_CONTENT_TYPE, NEXTEST_STDOUT_CONTENT_TYPE, NextestTestEvent,
+    NextestTestStatus, catalog_test_id, parse_jsonl, parse_test_events,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -68,6 +69,72 @@ pub enum VerifierError {
     UnorderedClock { field: &'static str },
     #[error("current verification binding is invalid: {detail}")]
     InvalidBinding { detail: String },
+    #[error("metric declaration is invalid: {detail}")]
+    InvalidMetricDeclaration { detail: String },
+    #[error("metric {metric} was emitted more than once")]
+    DuplicateMetric { metric: String },
+}
+
+/// Immutable metric declaration carried by an admitted improvement plan.
+///
+/// The verifier never invents a metric table from a caller boolean or from
+/// test names.  The owner-supplied declaration is validated for exact
+/// uniqueness and finite thresholds before any raw evidence is normalized.
+#[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricDeclarations {
+    /// Metrics whose observed delta must meet the declared minimum.
+    pub expected_metric_names: Vec<String>,
+    /// Exact minimum deltas for the expected metrics.
+    pub expected_deltas: BTreeMap<String, f64>,
+    /// Metrics whose negative delta is a regression.
+    pub counter_metric_names: Vec<String>,
+}
+
+impl MetricDeclarations {
+    /// Validates exact, non-overlapping metric identity.
+    pub fn validate(&self) -> Result<(), VerifierError> {
+        let expected = self.expected_metric_names.iter().collect::<BTreeSet<_>>();
+        let counters = self.counter_metric_names.iter().collect::<BTreeSet<_>>();
+        if self.expected_metric_names.is_empty()
+            || expected.len() != self.expected_metric_names.len()
+            || counters.len() != self.counter_metric_names.len()
+            || self.expected_deltas.len() != self.expected_metric_names.len()
+            || self
+                .expected_metric_names
+                .iter()
+                .chain(&self.counter_metric_names)
+                .any(|name| name.trim().is_empty())
+            || self
+                .expected_deltas
+                .keys()
+                .any(|name| !self.expected_metric_names.contains(name))
+            || self
+                .expected_metric_names
+                .iter()
+                .any(|name| self.counter_metric_names.contains(name))
+            || self
+                .expected_deltas
+                .values()
+                .any(|value| !value.is_finite())
+        {
+            return Err(VerifierError::InvalidMetricDeclaration {
+                detail: "expected/counter metric identities must be finite, unique, and disjoint"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the canonical union used by normalization.
+    #[must_use]
+    pub fn all_metric_names(&self) -> Vec<String> {
+        let mut names = self.expected_metric_names.clone();
+        names.extend(self.counter_metric_names.iter().cloned());
+        names.sort();
+        names.dedup();
+        names
+    }
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), VerifierError> {
@@ -635,9 +702,9 @@ pub fn verdict(
 /// closed with a typed error instead of any outcome.
 ///
 /// The returned run is bound to the invocation's declared scope and admitted
-/// state fence. Normalized evidence is intentionally empty: normalization
-/// belongs to the registered `eliot.instrument.diagnostic` owner, and this
-/// evaluator attaches no projection it did not compute.
+/// state fence. Ordinary runs retain no normalized projection; an explicitly
+/// supplied owner metric table is normalized into exact `metric_deltas` and
+/// fails closed on missing, duplicate, undeclared, or non-live evidence.
 #[allow(clippy::too_many_lines)]
 pub fn evaluate_current(
     invocation: &eliot_instrument_api::InstrumentInvocation,
@@ -646,6 +713,35 @@ pub fn evaluate_current(
     started_at: eliot_contracts::ClockReading,
     finished_at: eliot_contracts::ClockReading,
 ) -> Result<eliot_instrument_api::VerificationRun, VerifierError> {
+    evaluate_current_with_metric_declarations(
+        invocation,
+        raw,
+        required_test_ids,
+        None,
+        started_at,
+        finished_at,
+    )
+}
+
+/// Evaluates a current run while carrying the owner-declared metric table
+/// into normalized evidence.  The table is optional for ordinary verifier
+/// plans, but an improvement experiment must use this entry so its canonical
+/// fact contains a key for every declared expected and counter metric.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the evaluator keeps validation, parsing, axes, and normalization in one proof function"
+)]
+pub fn evaluate_current_with_metric_declarations(
+    invocation: &eliot_instrument_api::InstrumentInvocation,
+    raw: &[eliot_instrument_api::RawEvidence],
+    required_test_ids: &std::collections::BTreeSet<String>,
+    metric_declarations: Option<&MetricDeclarations>,
+    started_at: eliot_contracts::ClockReading,
+    finished_at: eliot_contracts::ClockReading,
+) -> Result<eliot_instrument_api::VerificationRun, VerifierError> {
+    if let Some(declarations) = metric_declarations {
+        declarations.validate()?;
+    }
     invocation
         .validate()
         .map_err(|error| VerifierError::InvalidBinding {
@@ -717,7 +813,8 @@ pub fn evaluate_current(
         {
             stream.extend_from_slice(&item.bytes);
         } else if item.content_type == NEXTEST_STDERR_CONTENT_TYPE {
-            continue;
+            // Retained for forensic lineage; intentionally excluded from the
+            // machine-readable stdout projection.
         }
     }
     let report = parse_jsonl(&stream).map_err(|error| VerifierError::UnparsableReport {
@@ -803,6 +900,18 @@ pub fn evaluate_current(
         ContractId::new(CONTRACT_NAME).map_err(|error| VerifierError::InvalidBinding {
             detail: format!("verifier identity rejected: {error}"),
         })?;
+    let metric_evidence = metric_declarations
+        .map(|declarations| {
+            normalized_metric_evidence(
+                declarations,
+                &stream,
+                raw,
+                freshness,
+                coverage,
+                ExecutionReality::Live,
+            )
+        })
+        .transpose()?;
     let run = CurrentVerificationRun {
         run_id,
         verifier,
@@ -813,10 +922,22 @@ pub fn evaluate_current(
         ),
         scope: invocation.declared_scope.clone(),
         execution: report.execution_status(),
+        execution_reality: if raw.iter().any(|item| {
+            matches!(
+                item.source,
+                eliot_instrument_api::RawEvidenceSource::Process
+            )
+        }) {
+            eliot_instrument_api::ExecutionReality::Live
+        } else if raw.is_empty() {
+            eliot_instrument_api::ExecutionReality::NotExecuted
+        } else {
+            eliot_instrument_api::ExecutionReality::Simulated
+        },
         outcome,
         freshness,
         coverage,
-        evidence: Vec::new(),
+        evidence: metric_evidence.into_iter().collect(),
         raw_evidence: raw.iter().map(|item| item.artifact_id.clone()).collect(),
         state_fence: invocation.request.state_fence.clone(),
         started_at,
@@ -827,6 +948,141 @@ pub fn evaluate_current(
             detail: format!("constructed run rejected: {error}"),
         })?;
     Ok(run)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "metric normalization keeps raw lineage, duplicate rejection, and canonical projection together"
+)]
+fn normalized_metric_evidence(
+    declarations: &MetricDeclarations,
+    stream: &[u8],
+    raw: &[RawEvidence],
+    freshness: EvidenceFreshness,
+    coverage: EvidenceCoverage,
+    execution_reality: ExecutionReality,
+) -> Result<NormalizedEvidence, VerifierError> {
+    declarations.validate()?;
+    let names = declarations.all_metric_names();
+    if raw.iter().any(|item| {
+        !matches!(
+            item.source,
+            eliot_instrument_api::RawEvidenceSource::Process
+        )
+    }) {
+        return Err(VerifierError::InvalidMetricDeclaration {
+            detail: "improvement metric evidence must come from a live process".to_owned(),
+        });
+    }
+    let mut observed: BTreeMap<String, f64> = BTreeMap::new();
+    for line in stream.split(|byte| *byte == b'\n') {
+        let line = std::str::from_utf8(line).map(str::trim).map_err(|_| {
+            VerifierError::UnparsableReport {
+                reason: "metric evidence is not UTF-8".to_owned(),
+            }
+        })?;
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(line).map_err(|_| VerifierError::UnparsableReport {
+                reason: "metric evidence is not valid JSONL".to_owned(),
+            })?;
+        let Some(metrics) = value
+            .get("metric_deltas")
+            .or_else(|| value.get("metrics"))
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        for (name, metric) in metrics {
+            if !names.iter().any(|declared| declared == name) {
+                return Err(VerifierError::InvalidMetricDeclaration {
+                    detail: format!("metric {name} was emitted without an owner declaration"),
+                });
+            }
+            if metric.is_null() {
+                return Err(VerifierError::InvalidMetricDeclaration {
+                    detail: format!("metric {name} is explicitly null"),
+                });
+            }
+            let metric =
+                metric
+                    .as_f64()
+                    .ok_or_else(|| VerifierError::InvalidMetricDeclaration {
+                        detail: format!("metric {name} is not a finite JSON number"),
+                    })?;
+            if !metric.is_finite() {
+                return Err(VerifierError::InvalidMetricDeclaration {
+                    detail: format!("metric {name} is not finite"),
+                });
+            }
+            if observed.insert(name.clone(), metric).is_some() {
+                return Err(VerifierError::DuplicateMetric {
+                    metric: name.clone(),
+                });
+            }
+        }
+    }
+    if observed.len() != names.len() {
+        return Err(VerifierError::InvalidMetricDeclaration {
+            detail: "canonical raw evidence is missing one or more declared metrics".to_owned(),
+        });
+    }
+    let mut metric_values = serde_json::Map::new();
+    for name in names {
+        let number =
+            serde_json::Number::from_f64(observed.get(&name).copied().ok_or_else(|| {
+                VerifierError::InvalidMetricDeclaration {
+                    detail: format!("metric {name} disappeared during normalization"),
+                }
+            })?)
+            .ok_or_else(|| VerifierError::InvalidMetricDeclaration {
+                detail: format!("metric {name} is not representable as JSON"),
+            })?;
+        metric_values.insert(name.clone(), serde_json::Value::Number(number));
+    }
+    let raw_handle = raw
+        .first()
+        .ok_or(VerifierError::EmptyRawEvidence)?
+        .artifact_id
+        .clone();
+    let handles = raw
+        .iter()
+        .map(|item| item.artifact_id.to_string())
+        .collect::<Vec<_>>();
+    let digest = sha256_hex(
+        &serde_json::to_vec(&(&declarations.all_metric_names(), &metric_values)).map_err(
+            |error| VerifierError::InvalidBinding {
+                detail: error.to_string(),
+            },
+        )?,
+    );
+    let evidence_id = eliot_contracts::ArtifactId::new(format!("metric-evidence-{digest}"))
+        .map_err(|error| VerifierError::InvalidBinding {
+            detail: error.to_string(),
+        })?;
+    let normalizer = ContractId::new("eliot.instrument.verifier.metrics").map_err(|error| {
+        VerifierError::InvalidBinding {
+            detail: error.to_string(),
+        }
+    })?;
+    Ok(NormalizedEvidence {
+        evidence_id,
+        raw_artifact_id: raw_handle,
+        normalizer,
+        kind: "nextest.metrics".to_owned(),
+        summary: "owner-declared improvement metric deltas".to_owned(),
+        value: serde_json::json!({
+            "metric_deltas": metric_values,
+            "declared_metric_names": declarations.all_metric_names(),
+            "raw_artifact_handles": handles,
+            "execution_reality": execution_reality,
+        }),
+        axes: EvidenceAxes::observed(),
+        freshness,
+        coverage,
+    })
 }
 
 /// Bounds freshness to capture clocks inside the admitted run window.

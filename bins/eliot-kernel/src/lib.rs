@@ -929,6 +929,8 @@ pub enum KernelFrameAction {
     Daemon {
         /// Correlation identity to echo in the response.
         request_id: RequestId,
+        /// Exact authenticated request identity carried by the same frame.
+        identity: RequestIdentity,
         /// Closed operation name from the daemon application wire.
         operation: String,
         /// Bounded operation payload.

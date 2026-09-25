@@ -38,16 +38,20 @@ pub use claim::{
     validate_claim_binding,
 };
 pub use improvement::{
-    IMPROVEMENT_EFFECT_CEILING, IMPROVEMENT_EXPERIMENT_SCHEMA, IMPROVEMENT_KERNEL_OWNER,
+    GOVERNOR_IMPROVEMENT_OWNER_OPERATION, IMPROVEMENT_EFFECT_CEILING,
+    IMPROVEMENT_EXPERIMENT_PLAN_SCHEMA, IMPROVEMENT_EXPERIMENT_SCHEMA, IMPROVEMENT_KERNEL_OWNER,
     IMPROVEMENT_OWNER, IMPROVEMENT_PRODUCT_OWNER, IMPROVEMENT_TESTD_OWNER,
-    IMPROVEMENT_VERIFIER_OWNER, ImprovementDiscriminator, ImprovementExperimentBudget,
-    ImprovementExperimentDisposition, ImprovementExperimentOutcome, ImprovementExperimentRecord,
-    ImprovementExperimentRequest, ImprovementExperimentState, ImprovementExperimentTarget,
-    ImprovementMetricDisposition, ImprovementOperationBinding, ImprovementOperationKind,
-    ImprovementOperationSet, ImprovementPriorAttempt, ImprovementPriorOutcome,
-    ImprovementPrivacyClass, ImprovementProposal, ImprovementRiskClass, ImprovementSourceBinding,
-    IndependentExecutionEvidence, MechanismDeclaration, MechanismDeclarationReceipt,
-    RollbackContract, is_improvement_no_progress,
+    IMPROVEMENT_VERIFIER_OWNER, ImprovementActivationEvidence, ImprovementActivationStatus,
+    ImprovementCanaryIdentity, ImprovementDiscriminator, ImprovementExperimentBudget,
+    ImprovementExperimentDisposition, ImprovementExperimentOutcome, ImprovementExperimentPlan,
+    ImprovementExperimentRecord, ImprovementExperimentRequest, ImprovementExperimentState,
+    ImprovementExperimentTarget, ImprovementExternalOwnerReceipt, ImprovementMetricDisposition,
+    ImprovementOperationBinding, ImprovementOperationKind, ImprovementOperationSet,
+    ImprovementOwnerAdmissionReceipt, ImprovementPriorAttempt, ImprovementPriorOutcome,
+    ImprovementPrivacyClass, ImprovementProposal, ImprovementReconciliationEvidence,
+    ImprovementRiskClass, ImprovementSourceBinding, IndependentExecutionEvidence,
+    MechanismDeclaration, MechanismDeclarationReceipt, RollbackContract,
+    is_improvement_no_progress,
 };
 
 // ---- Closed testd profile to executable binding registry (issue #20) ----
@@ -1350,8 +1354,9 @@ pub struct TestdOwnerJobSubmission {
     pub invocation: InstrumentInvocation,
     pub source_root: String,
     /// Optional actual `eliot-improvement` candidate/intake declaration. The
-    /// authenticated Kernel owner stamps all runtime bindings into the
-    /// durable proposal before the job can be dispatched.
+    /// TestD owner-submit wire rejects this field; only the authenticated
+    /// Governor-maintenance wire can admit it, and that owner stamps all
+    /// runtime bindings into the durable proposal before dispatch.
     #[serde(default)]
     pub improvement: Option<improvement::ImprovementExperimentRequest>,
 }
@@ -1448,6 +1453,74 @@ impl TestdOwnerSubmitRequest {
         })
         .map_err(|_| TestdError::GrantDigestSerialization)?;
         Ok(eliot_contracts::sha256_hex(&bytes))
+    }
+}
+
+/// Authenticated Governor-maintenance intake operation for an improvement
+/// experiment.  This is deliberately distinct from the TestD owner-submit
+/// wire: a daemon cannot use a TestD worker session (or a static owner label)
+/// to create an improvement experiment.
+pub const GOVERNOR_IMPROVEMENT_SUBMIT_OPERATION: &str = "eliot.kernel.governor-improvement-submit";
+
+/// Typed request carried by the authenticated Governor-maintenance intake
+/// route.  The enclosing frame identity remains the authority source.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernorImprovementSubmitRequest {
+    pub wire_id: String,
+    pub wire_version: u16,
+    pub submission: TestdOwnerJobSubmission,
+    pub process_tool: TestdProcessToolIntent,
+    pub request_digest: String,
+}
+
+impl GovernorImprovementSubmitRequest {
+    /// Computes and validates the exact owner-wire digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, TestdError> {
+        self.request_digest = self.compute_request_digest()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Validates the closed wire and requires a real improvement declaration.
+    pub fn validate(&self) -> Result<(), TestdError> {
+        if self.wire_id != GOVERNOR_IMPROVEMENT_SUBMIT_OPERATION
+            || self.wire_version != TESTD_OWNER_WIRE_VERSION
+            || self.submission.improvement.is_none()
+        {
+            return Err(TestdError::Invalid {
+                field: "governor_improvement_submit.wire",
+                reason: "the Governor-maintenance improvement wire requires a declaration",
+            });
+        }
+        self.submission.validate()?;
+        self.process_tool.observation.validate()?;
+        validate_text(
+            &self.request_digest,
+            "governor_improvement_submit.request_digest",
+        )?;
+        if self.request_digest != self.compute_request_digest()? {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+
+    fn compute_request_digest(&self) -> Result<String, TestdError> {
+        #[derive(Serialize)]
+        struct Canonical<'a> {
+            wire_id: &'a str,
+            wire_version: u16,
+            submission: &'a TestdOwnerJobSubmission,
+            process_tool: &'a TestdProcessToolIntent,
+        }
+        let bytes = canonical_json_bytes(&Canonical {
+            wire_id: &self.wire_id,
+            wire_version: self.wire_version,
+            submission: &self.submission,
+            process_tool: &self.process_tool,
+        })
+        .map_err(|_| TestdError::GrantDigestSerialization)?;
+        Ok(sha256_hex(&bytes))
     }
 }
 
@@ -1960,6 +2033,7 @@ pub fn evaluate_testd_verification(
         ),
         scope: job.invocation.declared_scope.clone(),
         execution: receipt.execution,
+        execution_reality: eliot_instrument_api::ExecutionReality::Live,
         outcome: match receipt.execution {
             ExecutionStatus::Cancelled => eliot_instrument_api::VerificationOutcome::Cancelled,
             ExecutionStatus::Blocked => eliot_instrument_api::VerificationOutcome::Blocked,
@@ -2599,16 +2673,18 @@ impl TestdStore {
             };
             let job_id = record.job_id.clone();
             let material_digest = record.proposal.material_digest.clone();
-            let discriminator_id = record
-                .proposal
-                .request
-                .new_discriminator
-                .as_ref()
-                .map(|value| value.discriminator_id.clone());
+            let discriminator = record.proposal.request.new_discriminator.as_ref();
+            let discriminator_id = discriminator.map(|value| value.discriminator_id.clone());
+            let canonical_evidence_id =
+                discriminator.and_then(|value| value.canonical_evidence_id.clone());
+            let canonical_evidence_sha256 =
+                discriminator.and_then(|value| value.canonical_evidence_sha256.clone());
             attempts.push(improvement::ImprovementPriorAttempt {
                 job_id,
                 material_digest,
                 discriminator_id,
+                canonical_evidence_id,
+                canonical_evidence_sha256,
                 outcome: prior_outcome,
             });
         }
@@ -2623,7 +2699,7 @@ impl TestdStore {
     pub fn reconcile_improvement_terminal(
         &self,
         job_id: &str,
-        outcome: improvement::ImprovementExperimentOutcome,
+        evidence: improvement::ImprovementReconciliationEvidence,
         now: u64,
     ) -> Result<TestJob, TestdError> {
         validate_text(job_id, "job_id")?;
@@ -2658,9 +2734,6 @@ impl TestdStore {
         let committed_receipt_digest = sha256_hex(
             &canonical_json_bytes(&committed_receipt).map_err(|_| TestdError::InvalidBinding)?,
         );
-        if outcome.committed_receipt_sha256 != committed_receipt_digest {
-            return Err(TestdError::InvalidBinding);
-        }
         let mut record = {
             let table = write.open_table(IMPROVEMENTS).map_err(database)?;
             let value = table
@@ -2670,6 +2743,15 @@ impl TestdStore {
             serde_json::from_slice::<improvement::ImprovementExperimentRecord>(value.value())
                 .map_err(|error| TestdError::Corrupt(error.to_string()))?
         };
+        let previous = record.outcome.as_ref().ok_or(TestdError::InvalidBinding)?;
+        if evidence.committed_receipt_sha256 != committed_receipt_digest {
+            return Err(TestdError::InvalidBinding);
+        }
+        let outcome = improvement::ImprovementExperimentOutcome::from_reconciliation_evidence(
+            &record.proposal,
+            previous,
+            &evidence,
+        )?;
         record.reconcile_unknown_outcome(&outcome)?;
         let encoded_record =
             serde_json::to_vec(&record).map_err(|error| TestdError::Corrupt(error.to_string()))?;

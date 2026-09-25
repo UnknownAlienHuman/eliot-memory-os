@@ -338,7 +338,11 @@ impl DaemonComposition {
             match self.drain_one_testd_terminal(kernel, evidence).await {
                 Ok(()) => {
                     outcome.terminals_drained += 1;
-                    outcome.finish_decisions_persisted += 1;
+                    if evidence.improvement.is_none() {
+                        outcome.finish_decisions_persisted += 1;
+                    } else {
+                        outcome.improvement_dispositions_persisted += 1;
+                    }
                     outcome.terminals_acked += 1;
                 }
                 Err(error) => {
@@ -466,8 +470,11 @@ pub struct TestdOwnerDrainOutcome {
     /// Terminal rows whose verifier fact, finish decision, and ack all
     /// committed.
     pub terminals_drained: usize,
-    /// Finish decisions persisted through `FinishService::evaluate`.
+    /// Finish decisions persisted through `FinishService::evaluate` for
+    /// ordinary verifier rows. Improvement rows never increment this counter.
     pub finish_decisions_persisted: usize,
+    /// Improvement dispositions persisted through the Governor owner route.
+    pub improvement_dispositions_persisted: usize,
     /// Terminal receipts acknowledged owner-side.
     pub terminals_acked: usize,
     /// Rows recorded as diagnostics and skipped this step.

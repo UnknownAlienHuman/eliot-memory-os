@@ -27,6 +27,8 @@ pub const IMPROVEMENT_EXPERIMENT_SCHEMA: &str = "eliot.testd.improvement-experim
 pub const IMPROVEMENT_EFFECT_CEILING: &str = "candidate-only";
 /// Governor maintenance proposal owner.
 pub const IMPROVEMENT_OWNER: &str = "governor-maintenance-G-19";
+/// Authenticated owner route that may issue the maintenance admission receipt.
+pub const GOVERNOR_IMPROVEMENT_OWNER_OPERATION: &str = "eliot.kernel.governor-improvement-submit";
 /// TestD experiment execution and measurement owner.
 pub const IMPROVEMENT_TESTD_OWNER: &str = "eliot-testd-20";
 /// Independent Instrument verifier owner.
@@ -156,12 +158,36 @@ pub struct ImprovementDiscriminator {
     pub discriminator_id: String,
     /// Existing candidate evidence/input reference that supplies the new signal.
     pub evidence_ref: String,
+    /// Canonical owner evidence record that proves the signal is new.  A
+    /// discriminator without this record is not progress evidence.
+    #[serde(default)]
+    pub canonical_evidence_id: Option<String>,
+    /// Digest of the canonical owner evidence record.
+    #[serde(default)]
+    pub canonical_evidence_sha256: Option<String>,
 }
 
 impl ImprovementDiscriminator {
     fn validate(&self) -> Result<(), TestdError> {
         validate_text(&self.discriminator_id, "discriminator_id")?;
-        validate_text(&self.evidence_ref, "discriminator.evidence_ref")
+        validate_text(&self.evidence_ref, "discriminator.evidence_ref")?;
+        match (&self.canonical_evidence_id, &self.canonical_evidence_sha256) {
+            (Some(id), Some(digest)) => {
+                validate_text(id, "discriminator.canonical_evidence_id")?;
+                if !is_binding_digest(digest) {
+                    return Err(TestdError::InvalidBinding);
+                }
+            }
+            (None, None) => {}
+            _ => return Err(TestdError::InvalidBinding),
+        }
+        Ok(())
+    }
+
+    /// Whether this discriminator names a genuinely new canonical record.
+    #[must_use]
+    pub fn has_new_canonical_evidence(&self) -> bool {
+        self.canonical_evidence_id.is_some() && self.canonical_evidence_sha256.is_some()
     }
 }
 
@@ -306,6 +332,12 @@ impl ImprovementExperimentRequest {
         }
         if let Some(discriminator) = &self.new_discriminator {
             discriminator.validate()?;
+            if !discriminator.has_new_canonical_evidence() {
+                return Err(TestdError::Invalid {
+                    field: "new_discriminator",
+                    reason: "a repeated experiment requires a new canonical evidence record",
+                });
+            }
         }
         Ok(())
     }
@@ -551,6 +583,632 @@ impl ImprovementOperationSet {
     }
 }
 
+/// Stable schema for the typed, immutable experiment plan retained before
+/// execution.  The plan is the canonical join consumed by the verifier; a
+/// terminal caller cannot replace it with a metric table or a new timestamp.
+pub const IMPROVEMENT_EXPERIMENT_PLAN_SCHEMA: &str = "eliot.testd.improvement-experiment-plan.v1";
+
+/// Canonical experiment plan retained beside the durable proposal.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImprovementExperimentPlan {
+    pub schema: String,
+    pub plan_id: String,
+    pub proposal_id: String,
+    pub experiment_id: String,
+    pub candidate_id: String,
+    pub candidate_digest: String,
+    pub intake_brief_id: String,
+    pub intake_brief_digest: String,
+    pub budget_ledger_ref: String,
+    pub budget_proof_digest: String,
+    pub evidence_refs: Vec<String>,
+    pub work_scope_id: String,
+    pub target: ImprovementExperimentTarget,
+    pub state_fence: StateFence,
+    pub generation: u64,
+    pub evaluator_id: String,
+    pub expected_metric_names: Vec<String>,
+    pub expected_deltas: BTreeMap<String, f64>,
+    pub counter_metric_names: Vec<String>,
+    pub rollback: RollbackContract,
+    pub canary: ImprovementCanaryIdentity,
+    pub owner_admission_receipt_sha256: String,
+    pub declared_at_unix_ms: u64,
+    pub plan_digest: String,
+}
+
+impl ImprovementExperimentPlan {
+    /// Validates the immutable plan and all owner-derived joins.
+    pub fn validate(&self) -> Result<(), TestdError> {
+        if self.schema != IMPROVEMENT_EXPERIMENT_PLAN_SCHEMA
+            || self.generation == 0
+            || self.declared_at_unix_ms == 0
+            || self.state_fence.resource_generation.value() != self.generation
+            || self.work_scope_id != self.target.work_scope_id
+            || self.canary.work_scope_id != self.work_scope_id
+            || self.canary.generation != self.generation
+            || self.canary.state_fence != self.state_fence
+            || self.canary.owner_id != IMPROVEMENT_KERNEL_OWNER
+            || self.canary.effect_ceiling != IMPROVEMENT_EFFECT_CEILING
+            || !is_binding_digest(&self.owner_admission_receipt_sha256)
+            || self.evidence_refs.is_empty()
+            || self
+                .evidence_refs
+                .iter()
+                .any(|value| value.trim().is_empty() || value.chars().any(char::is_control))
+            || self.evidence_refs.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        for (value, field) in [
+            (&self.plan_id, "plan_id"),
+            (&self.proposal_id, "plan.proposal_id"),
+            (&self.experiment_id, "plan.experiment_id"),
+            (&self.candidate_id, "plan.candidate_id"),
+            (&self.candidate_digest, "plan.candidate_digest"),
+            (&self.intake_brief_id, "plan.intake_brief_id"),
+            (&self.intake_brief_digest, "plan.intake_brief_digest"),
+            (&self.budget_ledger_ref, "plan.budget_ledger_ref"),
+            (&self.budget_proof_digest, "plan.budget_proof_digest"),
+            (&self.evaluator_id, "plan.evaluator_id"),
+        ] {
+            validate_text(value, field)?;
+        }
+        if !is_binding_digest(&self.candidate_digest)
+            || !is_binding_digest(&self.intake_brief_digest)
+            || !is_binding_digest(&self.budget_proof_digest)
+            || self.expected_metric_names.is_empty()
+            || self.expected_metric_names.len() != self.expected_deltas.len()
+            || self
+                .expected_metric_names
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self
+                .counter_metric_names
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self
+                .expected_metric_names
+                .iter()
+                .any(|name| self.counter_metric_names.contains(name))
+            || self
+                .expected_deltas
+                .values()
+                .any(|value| !value.is_finite())
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        for (value, field) in [
+            (&self.canary.canary_id, "plan.canary_id"),
+            (&self.canary.operation_id, "plan.canary.operation_id"),
+            (&self.canary.owner_id, "plan.canary.owner_id"),
+            (&self.canary.work_scope_id, "plan.canary.work_scope_id"),
+            (&self.canary.effect_ceiling, "plan.canary.effect_ceiling"),
+        ] {
+            validate_text(value, field)?;
+        }
+        self.target.validate()?;
+        self.state_fence
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        self.rollback.validate()?;
+        if self.plan_digest != self.compute_digest()? {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+
+    fn compute_digest(&self) -> Result<String, TestdError> {
+        #[derive(Serialize)]
+        struct Preimage<'a> {
+            schema: &'a str,
+            plan_id: &'a str,
+            proposal_id: &'a str,
+            experiment_id: &'a str,
+            candidate_id: &'a str,
+            candidate_digest: &'a str,
+            intake_brief_id: &'a str,
+            intake_brief_digest: &'a str,
+            budget_ledger_ref: &'a str,
+            budget_proof_digest: &'a str,
+            evidence_refs: &'a [String],
+            work_scope_id: &'a str,
+            target: &'a ImprovementExperimentTarget,
+            state_fence: &'a StateFence,
+            generation: u64,
+            evaluator_id: &'a str,
+            expected_metric_names: &'a [String],
+            expected_deltas: &'a BTreeMap<String, f64>,
+            counter_metric_names: &'a [String],
+            rollback: &'a RollbackContract,
+            canary: &'a ImprovementCanaryIdentity,
+            owner_admission_receipt_sha256: &'a str,
+            declared_at_unix_ms: u64,
+        }
+        typed_digest(&Preimage {
+            schema: &self.schema,
+            plan_id: &self.plan_id,
+            proposal_id: &self.proposal_id,
+            experiment_id: &self.experiment_id,
+            candidate_id: &self.candidate_id,
+            candidate_digest: &self.candidate_digest,
+            intake_brief_id: &self.intake_brief_id,
+            intake_brief_digest: &self.intake_brief_digest,
+            budget_ledger_ref: &self.budget_ledger_ref,
+            budget_proof_digest: &self.budget_proof_digest,
+            evidence_refs: &self.evidence_refs,
+            work_scope_id: &self.work_scope_id,
+            target: &self.target,
+            state_fence: &self.state_fence,
+            generation: self.generation,
+            evaluator_id: &self.evaluator_id,
+            expected_metric_names: &self.expected_metric_names,
+            expected_deltas: &self.expected_deltas,
+            counter_metric_names: &self.counter_metric_names,
+            rollback: &self.rollback,
+            canary: &self.canary,
+            owner_admission_receipt_sha256: &self.owner_admission_receipt_sha256,
+            declared_at_unix_ms: self.declared_at_unix_ms,
+        })
+    }
+}
+
+/// Stable identity of the future Kernel canary/generation owner.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImprovementCanaryIdentity {
+    pub canary_id: String,
+    pub operation_id: String,
+    pub owner_id: String,
+    pub work_scope_id: String,
+    pub generation: u64,
+    pub state_fence: StateFence,
+    pub effect_ceiling: String,
+}
+
+/// Closed external activation/effect result.  A canary handoff without this
+/// record is never treated as activation evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImprovementActivationStatus {
+    NotAttempted,
+    Attempted,
+    Applied,
+    Unknown,
+    Rejected,
+}
+
+/// Owner-issued receipt for one external activation/effect attempt.
+///
+/// The receipt is intentionally separate from the candidate admission receipt:
+/// it binds the later external owner, effect operation, canonical fact, and
+/// authenticated request identity. A caller-provided status or arbitrary text
+/// cannot stand in for this owner evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImprovementExternalOwnerReceipt {
+    pub schema: String,
+    pub owner_id: String,
+    pub owner_principal_digest: String,
+    pub owner_module_id: String,
+    pub owner_artifact_id: String,
+    pub owner_session_epoch: u64,
+    pub request_identity_sha256: String,
+    pub effect_operation_id: String,
+    pub canonical_fact_id: String,
+    pub effect_receipt_sha256: String,
+    pub issued_at_unix_ms: u64,
+    pub receipt_sha256: String,
+}
+
+impl ImprovementExternalOwnerReceipt {
+    /// Stable external-owner receipt schema.
+    pub const SCHEMA: &'static str = "eliot.improvement.external-owner-receipt.v1";
+
+    fn compute_digest(&self) -> Result<String, TestdError> {
+        typed_digest(&(
+            &self.schema,
+            &self.owner_id,
+            &self.owner_principal_digest,
+            &self.owner_module_id,
+            &self.owner_artifact_id,
+            self.owner_session_epoch,
+            &self.request_identity_sha256,
+            &self.effect_operation_id,
+            &self.canonical_fact_id,
+            &self.effect_receipt_sha256,
+            self.issued_at_unix_ms,
+        ))
+    }
+
+    /// Issues an external-owner receipt over an authenticated effect request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue(
+        identity: &RequestIdentity,
+        owner_id: &str,
+        owner_principal_digest: &str,
+        owner_module_id: &str,
+        owner_artifact_id: &str,
+        owner_session_epoch: u64,
+        effect_operation_id: &str,
+        canonical_fact_id: &str,
+        effect_receipt_sha256: &str,
+        issued_at_unix_ms: u64,
+    ) -> Result<Self, TestdError> {
+        identity
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        validate_text(owner_id, "external_owner.owner_id")?;
+        validate_text(
+            owner_principal_digest,
+            "external_owner.owner_principal_digest",
+        )?;
+        validate_text(owner_module_id, "external_owner.owner_module_id")?;
+        validate_text(owner_artifact_id, "external_owner.owner_artifact_id")?;
+        validate_text(effect_operation_id, "external_owner.effect_operation_id")?;
+        if owner_id != IMPROVEMENT_KERNEL_OWNER
+            || !is_binding_digest(owner_principal_digest)
+            || !is_binding_digest(canonical_fact_id)
+            || !is_binding_digest(effect_receipt_sha256)
+            || owner_session_epoch == 0
+            || issued_at_unix_ms == 0
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        let mut receipt = Self {
+            schema: Self::SCHEMA.to_owned(),
+            owner_id: owner_id.to_owned(),
+            owner_principal_digest: owner_principal_digest.to_owned(),
+            owner_module_id: owner_module_id.to_owned(),
+            owner_artifact_id: owner_artifact_id.to_owned(),
+            owner_session_epoch,
+            request_identity_sha256: typed_digest(identity)?,
+            effect_operation_id: effect_operation_id.to_owned(),
+            canonical_fact_id: canonical_fact_id.to_owned(),
+            effect_receipt_sha256: effect_receipt_sha256.to_owned(),
+            issued_at_unix_ms,
+            receipt_sha256: String::new(),
+        };
+        receipt.receipt_sha256 = receipt.compute_digest()?;
+        Ok(receipt)
+    }
+
+    fn validate_for(
+        &self,
+        identity: &RequestIdentity,
+        effect_operation_id: &str,
+        canonical_fact_id: &str,
+        effect_receipt_sha256: &str,
+    ) -> Result<(), TestdError> {
+        identity
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        if self.schema != Self::SCHEMA
+            || self.owner_id != IMPROVEMENT_KERNEL_OWNER
+            || !is_binding_digest(&self.owner_principal_digest)
+            || self.owner_session_epoch == 0
+            || self.request_identity_sha256 != typed_digest(identity)?
+            || self.effect_operation_id != effect_operation_id
+            || self.canonical_fact_id != canonical_fact_id
+            || self.effect_receipt_sha256 != effect_receipt_sha256
+            || self.receipt_sha256 != self.compute_digest()?
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+}
+
+/// Typed evidence for one authenticated external activation/effect attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImprovementActivationEvidence {
+    pub schema: String,
+    pub proposal_id: String,
+    pub proposal_digest: String,
+    pub canary: ImprovementCanaryIdentity,
+    pub attempt_id: String,
+    pub effect_operation_id: String,
+    pub canonical_fact_id: String,
+    pub canonical_fact_sha256: String,
+    pub effect_receipt_sha256: String,
+    pub effect_request_identity: RequestIdentity,
+    pub owner_id: String,
+    pub owner_receipt: ImprovementExternalOwnerReceipt,
+    pub owner_receipt_sha256: String,
+    pub execution_reality: eliot_instrument_api::ExecutionReality,
+    pub status: ImprovementActivationStatus,
+    pub recorded_at_unix_ms: u64,
+}
+
+impl ImprovementActivationEvidence {
+    /// Stable schema for activation evidence.
+    pub const SCHEMA: &'static str = "eliot.improvement.activation-evidence.v1";
+
+    /// Validates an authenticated external effect record.  Unknown outcomes
+    /// are accepted only as an unresolved record; they never authorize retry.
+    pub fn validate_for(&self, proposal: &ImprovementProposal) -> Result<(), TestdError> {
+        self.effect_request_identity
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        if self.schema != Self::SCHEMA
+            || self.proposal_id != proposal.proposal_id
+            || self.proposal_digest != proposal.proposal_digest
+            || self.canary != proposal.experiment_plan.canary
+            || self.owner_id != IMPROVEMENT_KERNEL_OWNER
+            || self.owner_id != self.canary.owner_id
+            || self.effect_request_identity.request.state_fence != proposal.state_fence
+            || self
+                .effect_request_identity
+                .request
+                .metadata
+                .task_id
+                .as_ref()
+                .map(ToString::to_string)
+                != Some(proposal.target.task_id.clone())
+            || self
+                .effect_request_identity
+                .request
+                .metadata
+                .request_id
+                .as_str()
+                == proposal.target.invocation_id
+            || !self.execution_reality.is_live()
+            || !is_binding_digest(&self.canonical_fact_id)
+            || !is_binding_digest(&self.canonical_fact_sha256)
+            || !is_binding_digest(&self.effect_receipt_sha256)
+            || !is_binding_digest(&self.owner_receipt_sha256)
+            || self.owner_receipt_sha256 != self.owner_receipt.receipt_sha256
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        self.owner_receipt.validate_for(
+            &self.effect_request_identity,
+            &self.effect_operation_id,
+            &self.canonical_fact_id,
+            &self.effect_receipt_sha256,
+        )?;
+        for (value, field) in [
+            (&self.canary.canary_id, "activation.canary_id"),
+            (&self.canary.operation_id, "activation.operation_id"),
+            (&self.canary.owner_id, "activation.owner_id"),
+            (&self.canary.work_scope_id, "activation.work_scope_id"),
+            (&self.attempt_id, "activation.attempt_id"),
+            (&self.effect_operation_id, "activation.effect_operation_id"),
+            (&self.owner_id, "activation.owner_id"),
+        ] {
+            validate_text(value, field)?;
+        }
+        if self.recorded_at_unix_ms <= proposal.mechanism_receipt.declared_at_unix_ms
+            || self.owner_receipt.issued_at_unix_ms > self.recorded_at_unix_ms
+            || matches!(self.status, ImprovementActivationStatus::NotAttempted)
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+}
+
+/// Evidence required to reconcile a prior unknown external outcome.  The
+/// daemon supplies no caller-authored `WriteReceipt` or terminal outcome; the
+/// owner rehydrates the durable sidecar and this typed evidence supplies only
+/// a new external attempt bound to a new canonical fact.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImprovementReconciliationEvidence {
+    pub schema: String,
+    pub proposal_id: String,
+    pub proposal_digest: String,
+    pub job_id: String,
+    pub canonical_fact_id: String,
+    pub canonical_fact_sha256: String,
+    pub verifier_run_id: String,
+    pub evidence_id: String,
+    pub committed_receipt_sha256: String,
+    pub activation: ImprovementActivationEvidence,
+    pub recorded_at_unix_ms: u64,
+}
+
+impl ImprovementReconciliationEvidence {
+    /// Stable reconciliation evidence schema.
+    pub const SCHEMA: &'static str = "eliot.improvement.reconciliation-evidence.v1";
+
+    /// Validates the new attempt and its canonical joins against the retained
+    /// proposal. The owner additionally compares the attempt/fact identities
+    /// with the prior unknown outcome before committing the transition.
+    pub fn validate_for(
+        &self,
+        proposal: &ImprovementProposal,
+        previous: &ImprovementExperimentOutcome,
+    ) -> Result<(), TestdError> {
+        if self.schema != Self::SCHEMA
+            || self.proposal_id != proposal.proposal_id
+            || self.proposal_digest != proposal.proposal_digest
+            || self.job_id != proposal.experiment_id
+            || !is_binding_digest(&self.canonical_fact_id)
+            || !is_binding_digest(&self.canonical_fact_sha256)
+            || !is_binding_digest(&self.committed_receipt_sha256)
+            || self.verifier_run_id.trim().is_empty()
+            || self.evidence_id.trim().is_empty()
+            || self.recorded_at_unix_ms <= previous.recorded_at_unix_ms
+            || self.activation.canonical_fact_id != self.canonical_fact_id
+            || self.activation.canonical_fact_sha256 != self.canonical_fact_sha256
+            || self.activation.owner_id != IMPROVEMENT_KERNEL_OWNER
+            || matches!(
+                self.activation.status,
+                ImprovementActivationStatus::Unknown
+                    | ImprovementActivationStatus::Attempted
+                    | ImprovementActivationStatus::NotAttempted
+            )
+            || previous.evidence_id == self.evidence_id
+            || previous.verifier_run_id == self.verifier_run_id
+            || previous.canonical_fact_id == self.canonical_fact_id
+            || previous
+                .activation_attempt_id
+                .as_deref()
+                .is_some_and(|attempt| attempt == self.activation.attempt_id)
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        self.activation.validate_for(proposal)
+    }
+}
+
+/// Owner-authenticated maintenance admission receipt carried with intake.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImprovementOwnerAdmissionReceipt {
+    pub schema: String,
+    pub owner_id: String,
+    pub operation_id: String,
+    /// Digest of the exact authenticated daemon request identity.
+    pub request_identity_sha256: String,
+    /// Handle-bound owner principal observed by Kernel, not a caller label.
+    pub owner_principal_digest: String,
+    /// Module identity admitted by the same live session.
+    pub owner_module_id: String,
+    /// Module artifact identity admitted by the same live session.
+    pub owner_artifact_id: String,
+    /// Monotonic transport session epoch that authenticated the owner.
+    pub owner_session_epoch: u64,
+    pub candidate_digest: String,
+    pub brief_digest: String,
+    pub budget_proof_digest: String,
+    pub state_fence: StateFence,
+    pub issued_at_unix_ms: u64,
+    pub receipt_sha256: String,
+}
+
+impl ImprovementOwnerAdmissionReceipt {
+    /// Stable receipt schema.
+    pub const SCHEMA: &'static str = "eliot.improvement.owner-admission.v1";
+
+    fn compute_digest(&self) -> Result<String, TestdError> {
+        typed_digest(&(
+            &self.schema,
+            &self.owner_id,
+            &self.operation_id,
+            &self.request_identity_sha256,
+            &self.owner_principal_digest,
+            &self.owner_module_id,
+            &self.owner_artifact_id,
+            self.owner_session_epoch,
+            &self.candidate_digest,
+            &self.brief_digest,
+            &self.budget_proof_digest,
+            &self.state_fence,
+            self.issued_at_unix_ms,
+        ))
+    }
+
+    /// Revalidates the material and digest portions retained by a proposal.
+    /// The frame identity itself is checked at the owner route before the
+    /// receipt is issued; a durable proposal never reconstructs an identity
+    /// from a caller string.
+    pub fn validate_material(
+        &self,
+        request: &ImprovementExperimentRequest,
+        state_fence: &StateFence,
+    ) -> Result<(), TestdError> {
+        request.validate()?;
+        state_fence
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        if self.schema != Self::SCHEMA
+            || self.owner_id != IMPROVEMENT_OWNER
+            || self.operation_id != GOVERNOR_IMPROVEMENT_OWNER_OPERATION
+            || self.candidate_digest != request.candidate_digest
+            || self.brief_digest != request.intake_brief_digest
+            || self.budget_proof_digest != request.budget_proof_digest
+            || self.state_fence != *state_fence
+            || self.owner_module_id.trim().is_empty()
+            || self.owner_artifact_id.trim().is_empty()
+            || !is_binding_digest(&self.request_identity_sha256)
+            || !is_binding_digest(&self.owner_principal_digest)
+            || self.owner_session_epoch == 0
+            || self.receipt_sha256 != self.compute_digest()?
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+
+    /// Issues the owner receipt over the already-validated inert request and
+    /// authenticated frame identity.  The owner id/operation are still
+    /// checked by the receiving Kernel route; the receipt is not a string
+    /// label and cannot substitute for the frame identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue(
+        request: &ImprovementExperimentRequest,
+        identity: &RequestIdentity,
+        owner_id: &str,
+        operation_id: &str,
+        owner_principal_digest: &str,
+        owner_module_id: &str,
+        owner_artifact_id: &str,
+        owner_session_epoch: u64,
+        issued_at_unix_ms: u64,
+    ) -> Result<Self, TestdError> {
+        request.validate()?;
+        identity
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        validate_text(owner_id, "owner_admission.owner_id")?;
+        validate_text(operation_id, "owner_admission.operation_id")?;
+        if owner_id != IMPROVEMENT_OWNER || operation_id != GOVERNOR_IMPROVEMENT_OWNER_OPERATION {
+            return Err(TestdError::InvalidBinding);
+        }
+        validate_text(
+            owner_principal_digest,
+            "owner_admission.owner_principal_digest",
+        )?;
+        validate_text(owner_module_id, "owner_admission.owner_module_id")?;
+        validate_text(owner_artifact_id, "owner_admission.owner_artifact_id")?;
+        if !is_binding_digest(owner_principal_digest)
+            || owner_session_epoch == 0
+            || issued_at_unix_ms == 0
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        let identity_sha256 = typed_digest(identity)?;
+        let mut receipt = Self {
+            schema: Self::SCHEMA.to_owned(),
+            owner_id: owner_id.to_owned(),
+            operation_id: operation_id.to_owned(),
+            request_identity_sha256: identity_sha256,
+            owner_principal_digest: owner_principal_digest.to_owned(),
+            owner_module_id: owner_module_id.to_owned(),
+            owner_artifact_id: owner_artifact_id.to_owned(),
+            owner_session_epoch,
+            candidate_digest: request.candidate_digest.clone(),
+            brief_digest: request.intake_brief_digest.clone(),
+            budget_proof_digest: request.budget_proof_digest.clone(),
+            state_fence: identity.request.state_fence.clone(),
+            issued_at_unix_ms,
+            receipt_sha256: String::new(),
+        };
+        receipt.receipt_sha256 = receipt.compute_digest()?;
+        Ok(receipt)
+    }
+
+    /// Revalidates the receipt against the request and frame identity.
+    pub fn validate_for(
+        &self,
+        request: &ImprovementExperimentRequest,
+        identity: &RequestIdentity,
+    ) -> Result<(), TestdError> {
+        identity
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        self.validate_material(request, &identity.request.state_fence)?;
+        if self.request_identity_sha256 != typed_digest(identity)? {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+}
+
 /// Owner/timestamp/receipt proving predeclaration occurred before outcomes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -605,6 +1263,12 @@ pub struct ImprovementProposal {
     pub operations: ImprovementOperationSet,
     /// Kernel-stamped mechanism declaration receipt.
     pub mechanism_receipt: MechanismDeclarationReceipt,
+    /// Authenticated Governor-maintenance admission receipt for this exact
+    /// request and live owner session.
+    pub owner_admission_receipt: ImprovementOwnerAdmissionReceipt,
+    /// Canonical pre-execution experiment plan, including WorkScope,
+    /// generation, evidence, metric, canary and invalidation identities.
+    pub experiment_plan: ImprovementExperimentPlan,
     /// Digest over all load-bearing proposal fields.
     pub proposal_digest: String,
     /// Material identity used for durable no-progress comparison.
@@ -616,11 +1280,12 @@ impl ImprovementProposal {
     /// the registered TestD profile. No caller-supplied fence, generation,
     /// budget, deadline, operation identity, owner, or timestamp is trusted.
     #[allow(clippy::too_many_arguments)]
-    pub fn from_kernel_facts(
+    pub fn from_kernel_facts_with_owner_receipt(
         request: &ImprovementExperimentRequest,
         identity: &RequestIdentity,
         invocation: &InstrumentInvocation,
         process_tool: &TestdProcessToolIntent,
+        owner_admission_receipt: &ImprovementOwnerAdmissionReceipt,
         job_id: &str,
         project_id: &str,
         source_root: &str,
@@ -630,6 +1295,9 @@ impl ImprovementProposal {
         request.validate()?;
         identity
             .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        owner_admission_receipt
+            .validate_for(request, identity)
             .map_err(|_| TestdError::InvalidBinding)?;
         invocation
             .validate()
@@ -738,6 +1406,90 @@ impl ImprovementProposal {
             declared_at_unix_ms: now_unix_ms,
             receipt_sha256: String::new(),
         };
+        let canary_operation_id = operations
+            .operation_id(ImprovementOperationKind::CanaryHandoff)
+            .ok_or(TestdError::InvalidBinding)?
+            .to_owned();
+        let canary_id = format!(
+            "canary-{}",
+            &typed_digest(&(
+                "eliot.improvement.canary-id.v1",
+                &proposal_id,
+                canary_operation_id.as_str(),
+                identity.request.state_fence.resource_generation.value(),
+            ))?[..32]
+        );
+        let canary = ImprovementCanaryIdentity {
+            canary_id,
+            operation_id: canary_operation_id,
+            owner_id: IMPROVEMENT_KERNEL_OWNER.to_owned(),
+            work_scope_id: target.work_scope_id.clone(),
+            generation: identity.request.state_fence.resource_generation.value(),
+            state_fence: identity.request.state_fence.clone(),
+            effect_ceiling: IMPROVEMENT_EFFECT_CEILING.to_owned(),
+        };
+        let candidate_value: serde_json::Value = serde_json::from_str(&request.candidate_json)
+            .map_err(|_| TestdError::InvalidBinding)?;
+        let mut evidence_refs = candidate_value
+            .get("evidence_refs")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        evidence_refs.extend(
+            candidate_value
+                .get("source_trace_refs")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+        );
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        if evidence_refs.is_empty() {
+            return Err(TestdError::InvalidBinding);
+        }
+        let plan_id = format!(
+            "experiment-plan-{}",
+            &typed_digest(&(
+                "eliot.improvement.experiment-plan-id.v1",
+                &proposal_id,
+                request.candidate_digest.as_str(),
+                request.intake_brief_digest.as_str(),
+                request.budget_proof_digest.as_str(),
+            ))?[..32]
+        );
+        let mut experiment_plan = ImprovementExperimentPlan {
+            schema: IMPROVEMENT_EXPERIMENT_PLAN_SCHEMA.to_owned(),
+            plan_id,
+            proposal_id: proposal_id.clone(),
+            experiment_id: job_id.to_owned(),
+            candidate_id: request.candidate_id.clone(),
+            candidate_digest: request.candidate_digest.clone(),
+            intake_brief_id: request.intake_brief_id.clone(),
+            intake_brief_digest: request.intake_brief_digest.clone(),
+            budget_ledger_ref: request.budget_ledger_ref.clone(),
+            budget_proof_digest: request.budget_proof_digest.clone(),
+            evidence_refs,
+            work_scope_id: target.work_scope_id.clone(),
+            target: target.clone(),
+            state_fence: identity.request.state_fence.clone(),
+            generation: identity.request.state_fence.resource_generation.value(),
+            evaluator_id: request.evaluator_id.clone(),
+            expected_metric_names: request.expected_metric_names.clone(),
+            expected_deltas: request.expected_deltas.clone(),
+            counter_metric_names: request.counter_metric_names.clone(),
+            rollback: request.rollback.clone(),
+            canary,
+            owner_admission_receipt_sha256: owner_admission_receipt.receipt_sha256.clone(),
+            declared_at_unix_ms: now_unix_ms,
+            plan_digest: String::new(),
+        };
+        experiment_plan.plan_digest = experiment_plan.compute_digest()?;
+        experiment_plan.validate()?;
         let mut proposal = Self {
             schema: IMPROVEMENT_EXPERIMENT_SCHEMA.to_owned(),
             proposal_id,
@@ -748,6 +1500,8 @@ impl ImprovementProposal {
             budget,
             operations,
             mechanism_receipt,
+            owner_admission_receipt: owner_admission_receipt.clone(),
+            experiment_plan,
             proposal_digest: String::new(),
             material_digest,
         };
@@ -781,6 +1535,32 @@ impl ImprovementProposal {
         self.budget
             .validate(self.mechanism_receipt.declared_at_unix_ms)?;
         self.operations.validate(&self.request.rollback.owner_id)?;
+        self.owner_admission_receipt
+            .validate_material(&self.request, &self.state_fence)?;
+        self.experiment_plan.validate()?;
+        if self.experiment_plan.proposal_id != self.proposal_id
+            || self.experiment_plan.experiment_id != self.experiment_id
+            || self.experiment_plan.candidate_id != self.request.candidate_id
+            || self.experiment_plan.candidate_digest != self.request.candidate_digest
+            || self.experiment_plan.intake_brief_id != self.request.intake_brief_id
+            || self.experiment_plan.intake_brief_digest != self.request.intake_brief_digest
+            || self.experiment_plan.budget_ledger_ref != self.budget.budget_ledger_ref
+            || self.experiment_plan.budget_proof_digest != self.budget.budget_proof_digest
+            || self.experiment_plan.target != self.target
+            || self.experiment_plan.state_fence != self.state_fence
+            || self.experiment_plan.generation != self.state_fence.resource_generation.value()
+            || self.experiment_plan.evaluator_id != self.request.evaluator_id
+            || self.experiment_plan.expected_metric_names != self.request.expected_metric_names
+            || self.experiment_plan.expected_deltas != self.request.expected_deltas
+            || self.experiment_plan.counter_metric_names != self.request.counter_metric_names
+            || self.experiment_plan.rollback != self.request.rollback
+            || self.experiment_plan.owner_admission_receipt_sha256
+                != self.owner_admission_receipt.receipt_sha256
+            || self.experiment_plan.declared_at_unix_ms
+                != self.mechanism_receipt.declared_at_unix_ms
+        {
+            return Err(TestdError::InvalidBinding);
+        }
         if self.target.project_id != self.request.project_id
             || self.target.target_surface != self.request.target_surface
             || self.target.invocation_id.is_empty()
@@ -866,6 +1646,16 @@ pub struct ImprovementExperimentOutcome {
     pub verifier_run_id: String,
     /// Committed canonical verifier-fact receipt digest.
     pub committed_receipt_sha256: String,
+    /// Canonical verifier-fact identity retained by the owner.
+    pub canonical_fact_id: String,
+    /// Digest of the canonical fact bytes.
+    pub canonical_fact_sha256: String,
+    /// External activation attempt, present only after reconciliation.
+    #[serde(default)]
+    pub activation_attempt_id: Option<String>,
+    /// External activation status, present only after reconciliation.
+    #[serde(default)]
+    pub activation_status: Option<ImprovementActivationStatus>,
     /// Exact invalidation set covered by rollback/forward repair.
     pub invalidation_set: Vec<String>,
     /// Digest over the exact invalidation set.
@@ -894,8 +1684,26 @@ impl ImprovementExperimentOutcome {
             || proposal.experiment_id != job_id
             || self.candidate_id != proposal.request.candidate_id
             || !is_binding_digest(&self.committed_receipt_sha256)
+            || !is_binding_digest(&self.canonical_fact_id)
+            || !is_binding_digest(&self.canonical_fact_sha256)
             || self.evidence_id.trim().is_empty()
             || self.verifier_run_id.trim().is_empty()
+            || (self.activation_attempt_id.is_some() != self.activation_status.is_some())
+            || self
+                .activation_attempt_id
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            || (self.disposition == ImprovementExperimentDisposition::UnknownRequiresReconciliation
+                && (self.activation_attempt_id.is_some() || self.activation_status.is_some()))
+            || (self.disposition != ImprovementExperimentDisposition::UnknownRequiresReconciliation
+                && self.activation_status.is_some_and(|status| {
+                    matches!(
+                        status,
+                        ImprovementActivationStatus::Unknown
+                            | ImprovementActivationStatus::Attempted
+                            | ImprovementActivationStatus::NotAttempted
+                    )
+                }))
             || self.recorded_at_unix_ms <= proposal.mechanism_receipt.declared_at_unix_ms
             || self.invalidation_set != proposal.request.rollback.invalidation_set
             || self.invalidation_set_digest != proposal.request.rollback.invalidation_set_digest
@@ -926,9 +1734,63 @@ impl ImprovementExperimentOutcome {
         }
         Ok(())
     }
-}
 
-/// Durable lifecycle of the TestD-owned improvement sidecar.
+    /// Builds the owner-owned outcome for a new external reconciliation
+    /// attempt. Callers provide typed reconciliation evidence, never a
+    /// disposition or `WriteReceipt`; the durable owner derives the state from
+    /// the authenticated activation status.
+    pub fn from_reconciliation_evidence(
+        proposal: &ImprovementProposal,
+        previous: &ImprovementExperimentOutcome,
+        evidence: &ImprovementReconciliationEvidence,
+    ) -> Result<Self, TestdError> {
+        evidence.validate_for(proposal, previous)?;
+        let disposition = match evidence.activation.status {
+            ImprovementActivationStatus::Applied => {
+                ImprovementExperimentDisposition::CanaryHandoffPending
+            }
+            ImprovementActivationStatus::Rejected => ImprovementExperimentDisposition::Rejected,
+            ImprovementActivationStatus::Unknown
+            | ImprovementActivationStatus::Attempted
+            | ImprovementActivationStatus::NotAttempted => {
+                return Err(TestdError::InvalidBinding);
+            }
+        };
+        let decision_operation_id = match disposition {
+            ImprovementExperimentDisposition::CanaryHandoffPending => proposal
+                .operation_id(ImprovementOperationKind::CanaryHandoff)
+                .ok_or(TestdError::InvalidBinding)?,
+            ImprovementExperimentDisposition::Rejected => proposal
+                .operation_id(ImprovementOperationKind::AdmitCanary)
+                .ok_or(TestdError::InvalidBinding)?,
+            _ => return Err(TestdError::InvalidBinding),
+        };
+        let outcome = Self {
+            schema: IMPROVEMENT_EXPERIMENT_SCHEMA.to_owned(),
+            proposal_id: proposal.proposal_id.clone(),
+            proposal_digest: proposal.proposal_digest.clone(),
+            job_id: proposal.experiment_id.clone(),
+            candidate_id: proposal.request.candidate_id.clone(),
+            disposition,
+            decision_operation_id: decision_operation_id.to_owned(),
+            evidence_id: evidence.evidence_id.clone(),
+            verifier_run_id: evidence.verifier_run_id.clone(),
+            committed_receipt_sha256: evidence.committed_receipt_sha256.clone(),
+            canonical_fact_id: evidence.canonical_fact_id.clone(),
+            canonical_fact_sha256: evidence.canonical_fact_sha256.clone(),
+            activation_attempt_id: Some(evidence.activation.attempt_id.clone()),
+            activation_status: Some(evidence.activation.status),
+            invalidation_set: proposal.request.rollback.invalidation_set.clone(),
+            invalidation_set_digest: proposal.request.rollback.invalidation_set_digest.clone(),
+            rollback_owner_id: proposal.request.rollback.owner_id.clone(),
+            rollback_ref: proposal.request.rollback.rollback_ref.clone(),
+            forward_repair_ref: proposal.request.rollback.forward_repair_ref.clone(),
+            recorded_at_unix_ms: evidence.recorded_at_unix_ms,
+        };
+        outcome.validate_for(proposal, &proposal.experiment_id)?;
+        Ok(outcome)
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImprovementExperimentState {
@@ -1336,6 +2198,8 @@ fn compute_proposal_digest(proposal: &ImprovementProposal) -> Result<String, Tes
         budget: &'a ImprovementExperimentBudget,
         operations: &'a ImprovementOperationSet,
         mechanism_receipt: &'a MechanismDeclarationReceipt,
+        owner_admission_receipt: &'a ImprovementOwnerAdmissionReceipt,
+        experiment_plan: &'a ImprovementExperimentPlan,
         material_digest: &'a str,
     }
 
@@ -1349,6 +2213,8 @@ fn compute_proposal_digest(proposal: &ImprovementProposal) -> Result<String, Tes
         budget: &proposal.budget,
         operations: &proposal.operations,
         mechanism_receipt: &proposal.mechanism_receipt,
+        owner_admission_receipt: &proposal.owner_admission_receipt,
+        experiment_plan: &proposal.experiment_plan,
         material_digest: &proposal.material_digest,
     })
 }
@@ -1377,6 +2243,10 @@ pub struct ImprovementPriorAttempt {
     pub material_digest: String,
     /// Optional discriminator on the prior proposal.
     pub discriminator_id: Option<String>,
+    /// Canonical evidence identity supplied by the prior owner.
+    pub canonical_evidence_id: Option<String>,
+    /// Canonical evidence digest supplied by the prior owner.
+    pub canonical_evidence_sha256: Option<String>,
     /// Exact durable prior disposition.
     pub outcome: ImprovementPriorOutcome,
 }
@@ -1386,15 +2256,28 @@ pub fn is_improvement_no_progress(
     proposal: &ImprovementProposal,
     prior_attempts: &[ImprovementPriorAttempt],
 ) -> bool {
-    let current_discriminator = proposal
-        .request
-        .new_discriminator
-        .as_ref()
-        .map(|value| value.discriminator_id.as_str());
+    let current_discriminator = proposal.request.new_discriminator.as_ref();
     prior_attempts.iter().any(|prior| {
-        prior.outcome == ImprovementPriorOutcome::Failed
-            && prior.material_digest == proposal.material_digest
-            && prior.discriminator_id.as_deref() == current_discriminator
+        if prior.outcome != ImprovementPriorOutcome::Failed
+            || prior.material_digest != proposal.material_digest
+            || prior.discriminator_id.as_deref()
+                != current_discriminator.map(|value| value.discriminator_id.as_str())
+        {
+            return false;
+        }
+        let Some(current) = current_discriminator else {
+            return true;
+        };
+        // A different discriminator label is not enough: the owner must
+        // present a different canonical evidence identity and digest. Missing
+        // prior evidence cannot prove progress and therefore remains debt.
+        let genuinely_new = current.has_new_canonical_evidence()
+            && prior.canonical_evidence_id.is_some()
+            && prior.canonical_evidence_sha256.is_some()
+            && prior.canonical_evidence_id.as_deref() != current.canonical_evidence_id.as_deref()
+            && prior.canonical_evidence_sha256.as_deref()
+                != current.canonical_evidence_sha256.as_deref();
+        !genuinely_new
     })
 }
 
@@ -1485,7 +2368,7 @@ impl IndependentExecutionEvidence {
             || self.invocation_id != proposal.target.invocation_id
             || self.state_fence != proposal.state_fence
             || !is_binding_digest(&self.committed_receipt_sha256)
-            || self.evidence_id.trim().is_empty()
+            || !is_binding_digest(&self.evidence_id)
             || self.verifier_run_id.trim().is_empty()
             || self
                 .observed_metric_deltas

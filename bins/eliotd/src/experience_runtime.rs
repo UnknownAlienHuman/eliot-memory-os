@@ -74,7 +74,7 @@ use eliot_understanding_assessment::{
 };
 use thiserror::Error;
 
-use super::{DaemonComposition, DaemonKernelClient};
+use super::{DaemonComposition, DaemonKernelClient, ManualImprovementIntakeEvent};
 
 /// Typed failures of the experience runtime driver.
 #[derive(Debug, Error)]
@@ -106,6 +106,10 @@ pub enum ExperienceDriverError {
     /// The Governor-backed experience commit failed.
     #[error("experience commit failed: {0}")]
     Commit(String),
+    /// The explicit improvement intake event was refused by the
+    /// Governor-maintenance owner.
+    #[error("improvement intake event failed: {0}")]
+    Improvement(String),
 }
 
 /// Maps a Dreamer memory-revision owner rejection into the Governor
@@ -710,6 +714,35 @@ pub async fn run_experience_quality_event(
         understanding,
         common_ground,
     })
+}
+
+/// Real current-daemon production edge for an explicit manual/admitted
+/// improvement intake.  The quality event remains read-only; only the typed
+/// owner-issued intake event can cross into the Governor-maintenance route.
+/// There is no timer, startup side effect, or test-only caller here.
+#[allow(
+    dead_code,
+    reason = "explicit manual/admitted improvement intake entry is invoked by the operator edge"
+)]
+pub async fn run_experience_quality_event_with_improvement(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    ctx: &RequestMetadata,
+    event: &ExperienceQualityEvent<'_>,
+    intake: ManualImprovementIntakeEvent,
+) -> Result<
+    (
+        ExperienceQualityEventOutput,
+        eliot_testd_core::TestdOwnerSubmitResponse,
+    ),
+    ExperienceDriverError,
+> {
+    let output = run_experience_quality_event(composition, kernel, ctx, event).await?;
+    let response = composition
+        .submit_manual_improvement_event(kernel, intake)
+        .await
+        .map_err(|error| ExperienceDriverError::Improvement(error.to_string()))?;
+    Ok((output, response))
 }
 
 /// Terminal event entry with an optional admitted extinction intake.

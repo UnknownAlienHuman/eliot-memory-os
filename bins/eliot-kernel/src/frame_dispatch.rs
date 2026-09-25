@@ -524,6 +524,7 @@ impl KernelComposition {
                 }
                 return Ok(KernelFrameAction::Daemon {
                     request_id,
+                    identity: identity.clone(),
                     operation: operation.to_owned(),
                     payload,
                 });
@@ -894,6 +895,11 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "local_read"
             | "local_read_claim"
             | "local_read_result"
+            | super::testd_terminal_completion_route::OWNER_PENDING_DISPATCHES_OPERATION
+            | super::testd_terminal_completion_route::OWNER_BIND_DISPATCH_OPERATION
+            | super::testd_terminal_completion_route::OWNER_PENDING_TERMINALS_OPERATION
+            | super::testd_terminal_completion_route::OWNER_ACK_TERMINAL_OPERATION
+            | super::testd_terminal_completion_route::GOVERNOR_IMPROVEMENT_SUBMIT_OPERATION
     )
 }
 
@@ -1493,11 +1499,9 @@ impl KernelComposition {
         let request =
             super::testd_terminal_completion_route::owner_submit_request_from_payload(&payload)
                 .map_err(|_| TransportError::SessionFenced)?;
-        let testd_session = session.module_generation.module_id.as_str() == TESTD_MODULE_ID;
-        let daemon_improvement_session = session.module_generation.module_id.as_str()
-            == super::ACTIVE_DAEMON_CALLER
-            && request.submission.improvement.is_some();
-        if !testd_session && !daemon_improvement_session {
+        if session.module_generation.module_id.as_str() != TESTD_MODULE_ID
+            || request.submission.improvement.is_some()
+        {
             return Err(TransportError::SessionFenced);
         }
         session

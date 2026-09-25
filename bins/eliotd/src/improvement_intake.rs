@@ -27,11 +27,13 @@ use eliot_improvement::{
     SafeBoundary, SourcedEvidence, intake_from_evidence, record_owner_decision, sourced_evidence,
     stamp_outcome_budget,
 };
+use eliot_instrument_api::InstrumentInvocation;
+use eliot_protocol::RequestIdentity;
 use eliot_self_quality::SelfQualityError;
 use eliot_self_quality::improvement_handoff::sourced_evidence_from_handoff;
 use eliot_testd_core::{
     ImprovementDiscriminator, ImprovementExperimentRequest, ImprovementPrivacyClass,
-    ImprovementRiskClass, MechanismDeclaration, RollbackContract,
+    ImprovementRiskClass, MechanismDeclaration, RollbackContract, TestdProcessToolIntent,
 };
 use thiserror::Error;
 
@@ -119,6 +121,53 @@ pub struct ImprovementExperimentDeclaration {
     pub invalidation_set: Vec<String>,
     /// Optional new discriminator for a repeated experiment.
     pub new_discriminator: Option<ImprovementDiscriminator>,
+}
+
+/// Explicit, authenticated manual/admitted intake event for the current
+/// daemon.  It is a typed event seam, not a timer or a test helper: the
+/// current-daemon caller supplies the already-admitted candidate outcome and
+/// the owner-issued experiment material, while Kernel rehydrates the live
+/// fence, target, budget, generation, and tool identities before persistence.
+#[derive(Clone, Debug)]
+pub struct ManualImprovementIntakeEvent {
+    pub identity: RequestIdentity,
+    pub outcome: IntakeOutcome,
+    pub declaration: ImprovementExperimentDeclaration,
+    pub invocation: InstrumentInvocation,
+    pub source_root: String,
+    pub process_tool: TestdProcessToolIntent,
+}
+
+impl ManualImprovementIntakeEvent {
+    /// Validates the event's owner-issued joins before any transport call.
+    pub fn validate(&self) -> Result<(), IntakeBridgeError> {
+        if !self.outcome.admitted {
+            return Err(IntakeBridgeError::Bridge(
+                "manual improvement intake requires an admitted candidate outcome".to_owned(),
+            ));
+        }
+        self.identity
+            .validate()
+            .map_err(|error| IntakeBridgeError::Bridge(error.to_string()))?;
+        self.invocation
+            .validate()
+            .map_err(|error| IntakeBridgeError::Bridge(error.to_string()))?;
+        self.process_tool
+            .observation
+            .validate()
+            .map_err(|error| IntakeBridgeError::Bridge(error.to_string()))?;
+        if self.source_root.trim().is_empty()
+            || self.source_root.chars().any(char::is_control)
+            || self.identity.request.metadata != self.invocation.request
+            || self.identity.request.state_fence != self.invocation.request.state_fence
+        {
+            return Err(IntakeBridgeError::Bridge(
+                "manual improvement intake identity/source binding is not exact".to_owned(),
+            ));
+        }
+        build_testd_improvement_request(&self.outcome, &self.declaration)?;
+        Ok(())
+    }
 }
 
 /// Projects the actual admitted candidate, safe-boundary brief, and budget
