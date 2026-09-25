@@ -174,7 +174,7 @@ pub use process_origin::{
 };
 pub use reactive_feed::{ReactiveFeedError, ReactiveFeedOutcome, drive_reactive_delivery_once};
 pub use route_receipts::{
-    ActualRouteReceipt, GovernorRouteAttempt, RouteCapabilityIndex, RouteReceiptError,
+    GovernorRouteAttempt, RouteAdmissionVisibility, RouteCapabilityIndex, RouteReceiptError,
     RuntimeObservedFacts, UNKNOWN_ROUTE_FACT, effective_route_key,
 };
 pub use startup_evidence_producer::{

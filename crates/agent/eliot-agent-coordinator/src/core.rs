@@ -2660,12 +2660,24 @@ fn validate_lane_admission(
         return Err(CoordinatorError::IdentityConflict("admitted_route"));
     }
     // Bind the exact candidate bytes and policy: the admission cannot
-    // reinterpret a newer policy or route under the same identity.
-    if admission.candidate_digest != lane.routing_receipt_digest
+    // reinterpret a newer policy or route under the same identity. The
+    // admission's claimed digest must equal the digest recomputed from the
+    // exact candidate bytes here (issue #228 A3), never merely the lane's
+    // stored copy: agreeing copies of a wrong digest fail closed.
+    let recomputed_candidate_digest = candidate_digest_for(routing)
+        .map_err(|error| CoordinatorError::Serialization(error.to_string()))?;
+    if admission.candidate_digest != recomputed_candidate_digest
+        || lane.routing_receipt_digest != recomputed_candidate_digest
         || admission.policy_revision != routing.policy_revision
     {
         return Err(CoordinatorError::IdentityConflict("admitted_route"));
     }
+    // The admission reference digest itself must also validate through the
+    // owner validator so a well-formed copy of a foreign candidate still
+    // fails against the exact candidate bytes.
+    admission
+        .validate_for_candidate(routing)
+        .map_err(provider_contract)?;
     Ok(())
 }
 

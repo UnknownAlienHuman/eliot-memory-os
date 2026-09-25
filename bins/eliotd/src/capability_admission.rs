@@ -51,7 +51,7 @@ use eliot_agent_api::RouteFingerprint;
 use eliot_agent_coordinator::{HumanModelPreferencePolicy, ModelRole};
 
 use crate::route_receipts::{
-    ActualRouteReceipt, GovernorRouteAttempt, RouteReceiptError, RuntimeObservedFacts,
+    GovernorRouteAttempt, RouteAdmissionVisibility, RouteReceiptError, RuntimeObservedFacts,
 };
 
 /// Canonical required capability set for one model invoke (R2, I1.11 step 9).
@@ -311,7 +311,7 @@ pub struct RouteAdmissionDecision {
 ///
 /// Composition entry point over the proven funnel and receipt flow: evaluates
 /// [`evaluate_production_admission`] from threaded evidence, then records
-/// [`ActualRouteReceipt::observe`] plus [`GovernorRouteAttempt::new`] for the
+/// [`RouteAdmissionVisibility::observe`] plus [`GovernorRouteAttempt::new`] for the
 /// same requested route. Malformed routes, observed facts, or attempt linkage
 /// fail closed with [`RouteReceiptError`] before any admission decision is
 /// produced.
@@ -326,7 +326,7 @@ pub fn admit_production_route(
     attempt_id: AttemptId,
     observed_facts: &RuntimeObservedFacts,
 ) -> Result<RouteAdmissionDecision, RouteReceiptError> {
-    let receipt = ActualRouteReceipt::observe(request.route.clone(), observed_facts)?;
+    let receipt = RouteAdmissionVisibility::observe(request.route.clone(), observed_facts)?;
     let attempt = GovernorRouteAttempt::new(attempt_id, request.route.clone(), receipt)?;
     let outcome = evaluate_production_admission(
         request,

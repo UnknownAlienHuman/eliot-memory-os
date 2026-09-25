@@ -954,7 +954,7 @@ impl AuthorizedEffect {
 
 /// Agent-local candidate effect observation (Implements #228, narrow slice).
 /// Disposition (pre-agreed, loss-visible, no rename): the authoritative
-/// `EffectReceipt` owner is `crates/governor/eliot-authority/src/effects.rs:351`
+/// `EffectReceipt` owner is `crates/governor/eliot-authority/src/effects.rs:561`
 /// (`EffectReceipt { authorized_effect, outcome, canonical_receipt }` with
 /// `CanonicalEffectReceipt` obligations). This `eliot-agent-api::EffectReceipt`
 /// is retained as a bounded agent-local projection only and must not gain new

@@ -1854,6 +1854,129 @@ pub fn assemble_candidate_result(
     translate_result(input, binding, admission, authority)
 }
 
+/// Production turn-result drain for one completed Codex turn (issue #228
+/// W2/W3/W5/A3/A6): the in-crate production caller that turns one drained
+/// terminal wire notification into a provider-neutral candidate [`AgentResult`].
+///
+/// The live turn pump drains complete [`CodexWireMessage`] notifications from
+/// the validated stream and calls this entry once per completed turn with the
+/// exact owner-supplied turn context: normalization runs first via
+/// [`normalize_codex_event`] (the envelope carries the attributable
+/// execution-unit lineage, never a boolean completion claim), the envelope
+/// must be terminal (observed completed/failed), and translation runs via
+/// [`assemble_candidate_result`] with the stream-completeness attestation plus
+/// the exact binding/admission/authority linkage enforced by
+/// [`translate_result`] (`validate_against`). A non-terminal envelope, an
+/// incomplete stream, or a linkage mismatch fails closed; success maps to
+/// candidate-only `Partial` exactly as [`translate_result`] defines, never
+/// Finish authority. The normalized pair feeds
+/// `eliot-agent-coordinator::AgentCoordinator::observe_provider_event`, and
+/// the translated result feeds `AgentCoordinator::submit_result`.
+#[derive(Debug)]
+pub struct CodexTurnResultDrain<'a> {
+    /// Drained terminal wire notification (must be a notification, not a
+    /// request/response).
+    pub message: &'a CodexWireMessage,
+    /// Exact JSONL wire bytes of `message`. Digested inside; never copied
+    /// into the public payload.
+    pub raw_line_bytes: &'a [u8],
+    /// Exact execution-unit lineage for the bound turn. No new attempt
+    /// invention.
+    pub lineage: ProviderObservationLineage,
+    /// Event identity from the post-R1 owner.
+    pub event_id: EventId,
+    /// Resume cursor from the post-R1 owner.
+    pub cursor: EventCursor,
+    /// Monotonic sequence within the bound stream. Must be nonzero.
+    pub sequence: u64,
+    /// Previous sequence observed by the owner (`None` for the first event).
+    pub previous_sequence: Option<u64>,
+    /// Causal predecessor event identities. Must never contain `event_id`.
+    pub predecessors: Vec<EventId>,
+    /// Restricted handle addressing the immutable raw source record.
+    pub raw_source_handle: RestrictedRawSourceHandle,
+    /// Typed observation time.
+    pub observed_at: ClockReading,
+    /// Delivery/coverage disposition of this observation.
+    pub delivery: HostEventDeliveryDisposition,
+    /// Recorded #369 admission for execution-unit lineage.
+    pub admission: Option<&'a AdmittedRouteReceipt>,
+    /// Bound session the turn executed under.
+    pub session: CodexSessionBinding,
+    /// Bound route the turn executed under.
+    pub route: RouteFingerprint,
+    /// Provider output text, when any (hashed into evidence refs, never
+    /// trusted as proof).
+    pub output: Option<String>,
+    /// Turn-level usage observed for the bound execution unit.
+    pub usage: UsageReceipt,
+    /// Whether the bound turn was cancelled.
+    pub cancelled: bool,
+    /// Bounded unknown-outcome reason, required exactly for unknown outcomes.
+    pub unknown_reason: Option<String>,
+    /// Continuation locator, when the provider supplied one.
+    pub continuation: Option<RouteContinuationLocator>,
+    /// Candidate effects proposed by the turn (never authorized here).
+    pub proposed_effects: Vec<eliot_agent_api::ProposedEffect>,
+    /// Stream-completeness attestation: must hold exactly when the drained
+    /// notification comes from a complete stream.
+    pub stream_complete: bool,
+    /// Exact #361 execution-unit binding snapshot.
+    pub binding: &'a ProviderExecutionBinding,
+    /// Effect ceiling authorizing the result intake.
+    pub authority: &'a EffectCeiling,
+}
+
+/// Drains one completed Codex turn into its candidate result.
+///
+/// # Errors
+///
+/// Returns [`CodexAdapterError`] when the notification does not normalize,
+/// the normalized envelope is not terminal, the stream is unattested, no
+/// admission backs the turn, or the binding/admission/authority linkage fails.
+pub fn drain_completed_turn(
+    drain: CodexTurnResultDrain<'_>,
+) -> Result<AgentResult, CodexAdapterError> {
+    let (terminal, _) = normalize_codex_event(CodexHostEventInput {
+        message: drain.message,
+        lineage: drain.lineage,
+        event_id: drain.event_id,
+        cursor: drain.cursor,
+        sequence: drain.sequence,
+        previous_sequence: drain.previous_sequence,
+        predecessors: drain.predecessors,
+        raw_source_bytes: drain.raw_line_bytes,
+        raw_source_handle: drain.raw_source_handle,
+        observed_at: drain.observed_at,
+        delivery: drain.delivery,
+        admission: drain.admission,
+    })?;
+    if !is_terminal_observation(&terminal.payload) {
+        return Err(CodexAdapterError::MalformedWire(
+            "codex turn observation is not terminal; no result is drained",
+        ));
+    }
+    assemble_candidate_result(
+        CodexResultInput {
+            route: drain.route,
+            session: drain.session,
+            output: drain.output,
+            terminal_observation: Some(terminal),
+            cancelled: drain.cancelled,
+            unknown_reason: drain.unknown_reason,
+            usage: drain.usage,
+            continuation: drain.continuation,
+            proposed_effects: drain.proposed_effects,
+        },
+        drain.stream_complete,
+        drain.binding,
+        drain
+            .admission
+            .ok_or(CodexAdapterError::InvalidInput("admission"))?,
+        drain.authority,
+    )
+}
+
 /// Checked interrupt construction: targets the exact bound turn on the exact
 /// bound thread. A sessionless binding cannot address a Codex turn and fails
 /// closed; the request ID follows the validated wire-ID shape so the later

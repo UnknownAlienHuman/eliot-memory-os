@@ -751,10 +751,6 @@ pub struct OpenCodeWireRouteReceipt {
     pub extra: UnknownFields,
 }
 
-/// Compatibility alias for pre-rename importers outside `src/` (e.g. the
-/// `tests/` integration suite). New code uses [`OpenCodeWireRouteReceipt`].
-pub type ActualRouteReceipt = OpenCodeWireRouteReceipt;
-
 /// Factored return shape for the observed-side classification below.
 type ObservedSideClassification = (
     Option<RouteFingerprint>,
@@ -1262,6 +1258,26 @@ impl UsageAvailability {
             value: None,
             unavailable_reason: Some(reason.into()),
             extra: UnknownFields::new(),
+        }
+    }
+
+    /// Projects turn/step usage telemetry onto the canonical [`UsageReceipt`]
+    /// (issue #228 W5): observed input/output token counts pass through
+    /// verbatim; cost stays unmeasured (`None`) because the provider-reported
+    /// `cost_usd` claim is retained in the wire result, never measured
+    /// evidence (see the bridge route-token matrix); quota travels separately
+    /// in [`QuotaAvailability`], so this projection records
+    /// [`eliot_agent_api::QuotaKnowledge::Unknown`].
+    pub fn to_usage_receipt(&self) -> UsageReceipt {
+        let (input_tokens, output_tokens) = match &self.value {
+            Some(telemetry) => (telemetry.input_tokens, telemetry.output_tokens),
+            None => (None, None),
+        };
+        UsageReceipt {
+            input_tokens,
+            output_tokens,
+            cost_microunits: None,
+            quota: eliot_agent_api::QuotaKnowledge::Unknown,
         }
     }
 }
@@ -2100,6 +2116,69 @@ impl AdmittedOpenCodeAttempt {
             consumed: true,
         })
     }
+
+    /// Observes one sealed wire receipt as the canonical provider-neutral
+    /// physical route observation (issue #228 W5): the live admitted path
+    /// calls this at seal time so the outcome carries the canonical
+    /// [`PhysicalRouteObservationReceipt`] instead of only the adapter wire
+    /// shape. Requested route, admission, and binding come from this verified
+    /// admitted attempt (never caller-supplied); the observation body
+    /// (usage, clocks, causal cursor/sequence, cancellation) comes from the
+    /// sealed run. Linkage and self-digest are enforced by
+    /// [`OpenCodeWireRouteReceipt::to_physical_observation`]; a mismatch
+    /// fails closed with [`OpenCodeObservationConversionError`] and the
+    /// caller retains the wire receipt as evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpenCodeObservationConversionError`] when the wire receipt
+    /// disagrees with the admitted route/binding or the observation body is
+    /// inconsistent with the observed state.
+    pub fn observe_physical_route(
+        &self,
+        wire: &OpenCodeWireRouteReceipt,
+        body: PhysicalObservationBody,
+    ) -> Result<PhysicalRouteObservationReceipt, OpenCodeObservationConversionError> {
+        wire.to_physical_observation(
+            &self.binding.route,
+            &self.admission,
+            &self.binding,
+            body.usage,
+            body.started,
+            body.first_byte,
+            body.first_semantic,
+            body.terminal,
+            body.event_cursor,
+            body.event_sequence,
+            body.cancellation,
+        )
+    }
+}
+
+/// Observation body for one sealed physical-route observation (issue #228
+/// W5). The admitted attempt supplies route/admission/binding; this body
+/// supplies everything the sealed run observed: usage, clocks, the causal
+/// cursor/sequence of the seal observation, and observed cancellation.
+#[derive(Clone, Debug)]
+pub struct PhysicalObservationBody {
+    /// Turn/step usage projected from the sealed run.
+    pub usage: UsageReceipt,
+    /// Attempt start reading (unknown stays unknown).
+    pub started: ClockReading,
+    /// First-byte reading (unknown stays unknown).
+    pub first_byte: ClockReading,
+    /// First-semantic reading (unknown stays unknown).
+    pub first_semantic: ClockReading,
+    /// Terminal reading. Must carry observed wall time exactly when the
+    /// converted outcome is observed execution; unknown while unproven.
+    pub terminal: ClockReading,
+    /// Causal position of the seal observation inside the bound execution
+    /// unit (the committed execution-unit message the run reconciled).
+    pub event_cursor: EventCursor,
+    /// Seal observation sequence. Must be nonzero.
+    pub event_sequence: u64,
+    /// Observed cancellation, when any.
+    pub cancellation: Option<CancellationState>,
 }
 
 /// Sealed candidate-only outcome of one admitted read-only attempt.
@@ -2841,10 +2920,10 @@ mod tests {
         ] {
             assert!(map.contains_key(wire_binding));
         }
-        // The pre-rename alias decodes the same wire for importers outside
-        // `src/`; both spellings agree byte-for-byte.
-        let via_alias: ActualRouteReceipt = serde_json::from_value(wire.clone())?;
-        assert_eq!(via_alias, receipt);
+        // The wire shape decodes deterministically; a second decode of the
+        // same bytes agrees with the first.
+        let decoded: OpenCodeWireRouteReceipt = serde_json::from_value(wire.clone())?;
+        assert_eq!(decoded, receipt);
         Ok(())
     }
 
