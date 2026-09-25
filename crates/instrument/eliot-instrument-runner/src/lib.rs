@@ -20,6 +20,8 @@ use thiserror::Error;
 
 pub mod cache_lane;
 pub mod process_owner;
+pub mod profile;
+pub mod profile_run;
 pub mod registry;
 pub mod testd_port;
 
@@ -27,6 +29,17 @@ pub use cache_lane::{CacheLane, CacheLaneAttestations, CacheLaneError, LaneOutco
 pub use process_owner::{
     KernelAdmissionError, KernelAdmittedProcess, KernelInstrumentAdmission,
     KernelInstrumentRequestPort,
+};
+pub use profile::{
+    AdmittedProfile, AdmittedStage, BUILTIN_PROFILE_REVISION, BUILTIN_SPEC_VERSION,
+    COMPILER_PROFILE, CompiledProfile, InstrumentProfile, InstrumentProfileResolver,
+    InstrumentRegistry, InstrumentSpec, ProfileCompiler, ProfileError, ProfileScopeClasses,
+    ResolvedProfile, ResolvedStage, StageDag, StageDecl, StageEnvironment, TEST_PROFILE,
+    TargetLayout, WorkScope,
+};
+pub use profile_run::{
+    AggregateStatus, InstrumentRun, PlannedStage, ProfileAggregate, ProfileRunError, StageEvidence,
+    StageIdentity, StageLauncher, StageOrchestrator, StagePlan, TestExecutionPlaneRoute,
 };
 pub use registry::{
     ExecutableIdentityCause, ProviderRegistry, RegistryEntry, RegistryError,

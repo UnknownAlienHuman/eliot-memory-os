@@ -23,9 +23,10 @@ use eliot_contracts::sha256_hex;
 use eliot_instrument_api::{ExecutionStatus, InstrumentInvocation};
 use eliot_instrument_runner::registry::RegistryFreshness;
 use eliot_instrument_runner::{
-    CacheLaneAttestations, InstrumentBinding, InstrumentObservation, InstrumentRequestPort,
-    InstrumentRunner, KernelInstrumentAdmission, KernelInstrumentRequestPort, ProviderRegistry,
-    RegistryEntry, ResolvedExecutableIdentity, RunnerError,
+    CacheLaneAttestations, CompiledProfile, InstrumentBinding, InstrumentObservation,
+    InstrumentRegistry, InstrumentRequestPort, InstrumentRunner, KernelInstrumentAdmission,
+    KernelInstrumentRequestPort, ProfileCompiler, ProviderRegistry, RegistryEntry,
+    ResolvedExecutableIdentity, RunnerError,
 };
 use eliot_process::{OperationId, ProcessEvidenceSink, ProcessExecutor};
 use thiserror::Error;
@@ -148,6 +149,10 @@ pub struct GovernedBuildOutcome {
     pub cache_consulted: bool,
     /// Cache hit or fresh process execution evidence.
     pub execution: BuildExecution,
+    /// Single-compiler output for the invocation profile: governed admission
+    /// pins the exact revision and stage graph, while quarantined legacy text
+    /// carries no governed claim.
+    pub profile: CompiledProfile,
 }
 
 /// Failures that prevent a governed BUILD from returning an artifact.
@@ -265,6 +270,24 @@ impl<E: ProcessExecutor + 'static> GovernedBuildRuntime<E> {
         }
 
         let invocation = request.invocation.clone();
+        // Route the invocation profile through the single profile compiler
+        // (#1813). Governed admissions pin the exact revision and stage graph
+        // and reject foreign invocation classes; quarantined legacy text
+        // keeps its current behavior with no governed claim.
+        let instrument_registry =
+            InstrumentRegistry::with_builtin_profiles(1).map_err(|error| {
+                EngineError::ServiceNotReady {
+                    service: "instrument-profile".to_owned(),
+                    reason: format!("builtin profile registry is unavailable: {error}"),
+                }
+            })?;
+        let compiled = ProfileCompiler::new(&instrument_registry).compile(&invocation.profile);
+        let _admitted = compiled.require_kind(invocation.kind).map_err(|error| {
+            EngineError::ServiceNotReady {
+                service: "instrument-profile".to_owned(),
+                reason: format!("profile compiler rejected the build invocation: {error}"),
+            }
+        })?;
         let mut attestations = request.attestations.clone();
         let expected =
             valid_digest(&attestations.content_digest).then(|| attestations.content_digest.clone());
@@ -282,6 +305,7 @@ impl<E: ProcessExecutor + 'static> GovernedBuildRuntime<E> {
                     derivation,
                     cache_consulted: true,
                     execution: BuildExecution::CacheHit,
+                    profile: compiled.clone(),
                 });
             }
             newest_rejection(&before, &self.cache.rejected())
@@ -347,6 +371,7 @@ impl<E: ProcessExecutor + 'static> GovernedBuildRuntime<E> {
                 operation_id,
                 observation: Box::new(observation),
             },
+            profile: compiled,
         })
     }
 
