@@ -194,7 +194,7 @@
 ### 3.0 Решения владельца (без них агенты будут бегать по кругу)
 
 1. **Отменить «тесты потом».** Заменить на правило I18.23: каждый PR содержит один исполненный тест-дискриминатор (падал до, проходит после) и `cargo test -p <каждый затронутый крейт>`. Матрицы и кампании по-прежнему не нужны: START.md прав про церемонии, но тест — не церемония.
-2. **Заморозить ширину.** Все Issue классов D2–D5 (P3–P6: ≈384 шт., см. приложение А) пометить `parked:after-osp1` и не выдавать агентам. Исключение — если Issue чинит красный тест или гейт на main.
+2. **Заморозить ширину.** Все Issue классов D2–D5 (P3–P6: 384 шт., см. приложение А) пометить `parked:after-osp1` и не выдавать агентам. Исключение — если Issue чинит красный тест или гейт на main.
 3. **Выбрать front door для OSP1.** Рекомендую перевести один хост (Claude Code) с `eliot-governor mcp stdio` на новый стек (`eliot-agent-bridge` → Kernel → `eliotd`) за флагом. Альтернатива — осознанно вести OSP1 через legacy (value-трек I17.8) и мигрировать позже. Решение должно быть явным: сейчас его нет.
 4. **Минимальный автоматический CI на PR.** Это расходится с текущим AGENTS.md («Change workflows only when requested»), поэтому решает владелец. Минимальный набор:
    - Linux: Python-гейты, `cargo check --target x86_64-pc-windows-msvc --workspace --all-targets`, `cargo test` переносимых крейтов.
@@ -358,14 +358,13 @@ Verify: `cargo test -p <crate> --test <file>` (сейчас: FAIL/PASS/absent)
 
 ### А. Классификация открытых Issue
 
-Легенда: **P1** — критический путь OSP1; **P1-LIVE** — живые проверки на Windows-машине владельца; **P1-ENABLER** — стенд и инструменты, без которых P1 не проверить; **P2** — D0/D1 hardening; **P3** — D2, legacy-retire и сквозные задачи; **P4** — D3 (smart, cognitive, Dreamer); **P5** — D4 (backup/restore, revocation, meta); **P6** — D5 (swarm, research, remote). CC — было заявление code-complete; RF — была перекрёстная проверка с опровержением; TP — пункты TEST-PHASE (cargo-testable / live, эвристика).
+Легенда: **P1** — критический путь OSP1; **P1-LIVE** — живые проверки на Windows-машине владельца; **P1-ENABLER** — стенд и инструменты, без которых P1 не проверить; **P2** — D0/D1 hardening; **P3** — D2, legacy-retire и сквозные задачи; **P4** — D3 (smart, cognitive, Dreamer); **P5** — D4 (backup/restore, revocation, meta); **P6** — D5 (swarm, research, remote). CC — было заявление code-complete; RF — была перекрёстная проверка с опровержением; TP u/l — пункты TEST-PHASE: проверяемые `cargo test` / live (эвристика).
 
 
-#### P1 (34)
+#### P1 (37)
 
 | Issue | Класс | Заголовок | влитых PR | флаги |
 |---|---|---|---|---|
-| #7 | SPINE | [integration/claude] Reconcile MCP response, bridge completion, and UI terminal state | 4 |  |
 | #8 | SPINE | [agent-context] Make attach/discovery task-bound, freshness-aware, and output-bounded | 4 | CC RF TP 9/0 |
 | #10 | SPINE | [storage/regression] Preserve record-like strings in arbitrary JSON payloads | 8 | CC RF |
 | #11 | LIVE | [runtime/live] Establish the current Windows SystemService installation and D0/D1 Produc | 51 | TP 0/1 |
@@ -384,10 +383,13 @@ Verify: `cargo test -p <crate> --test <file>` (сейчас: FAIL/PASS/absent)
 | #909 | ENABLER | [D-INT-STORE] Add the authenticated isolated SurrealDB 3.1.4 provisioner | 2 |  |
 | #911 | ENABLER | [D-INT-RUNTIME] Add the isolated Windows runtime topology provisioner | 2 |  |
 | #1115 | SPINE | [kernel/activation] Accept, persist and replay typed semantic-resolution results | 3 | CC RF TP 2/0 |
-| #1690 | SPINE | [I14-audit] Add durable unknown-commit recovery to canonical writes | 2 | TP 0/0 |
+| #1690 | SPINE | [I14-audit] Add durable unknown-commit recovery to canonical writes | 2 |  |
 | #1719 | LIVE | [release] The Windows bundle still builds eliot-governor from the legacy eliot-app crate | 0 |  |
 | #1746 | SPINE | [I7-audit] Implement authenticated session, scope, and task-contract admission | 0 |  |
 | #1751 | SPINE | [I1-audit] Implement the demand-start activation and lease-driven idle-drain lifecycle | 0 |  |
+| #1787 | SPINE | [I4-audit] Implement WorkScope identity resolution and guarded revalidation | 1 | CC RF |
+| #1788 | SPINE | [I4-audit] Build deterministic privacy-bounded bootstrap discovery | 1 |  |
+| #1789 | SPINE | [I4-audit] Enforce material-readiness gates using typed onboarding state | 1 | CC RF |
 | #1802 | SPINE | [I18-audit] Implement the canonical dev-fast profile and evidence receipt path | 0 |  |
 | #1813 | SPINE | [I10-audit] Add governed Instrument Plane ownership instead of ad hoc verification route | 0 |  |
 | #1814 | SPINE | [I10-audit] Enforce typed InstrumentSpec admission before any tool launch | 0 |  |
@@ -396,21 +398,23 @@ Verify: `cargo test -p <crate> --test <file>` (сейчас: FAIL/PASS/absent)
 | #1874 | SPINE | [I5-audit] Add the required active operational-spine mutation and receipt surface | 0 |  |
 | #1901 | SPINE | [I18-audit] Add host-route acceptance proof for the working end-to-end path | 0 |  |
 | #1915 | SPINE | [I18-audit] Make incomplete verification outcomes non-promotable through FinishService | 0 |  |
-| #1927 | SPINE | [I5-audit] Introduce deterministic PreparedTransition admission before store execution | 1 | TP 0/0 |
+| #1927 | SPINE | [I5-audit] Introduce deterministic PreparedTransition admission before store execution | 1 |  |
+| #1929 | SPINE | [I5-audit] Implement task-binding admission and safe unbound observation capture | 2 |  |
 | #1940 | SPINE | [I7-audit] Return server-derived memory dispositions and bound recall receipts | 2 | CC RF TP 0/1 |
 | #1947 | SPINE | [I12-audit] Implement canonical RetrievalPlan and RecallDisposition outputs | 2 | CC RF TP 0/1 |
 
-#### P1-LIVE (13)
+#### P1-LIVE (14)
 
 | Issue | Класс | Заголовок | влитых PR | флаги |
 |---|---|---|---|---|
+| #7 | LIVE | [integration/claude] Reconcile MCP response, bridge completion, and UI terminal state | 4 |  |
 | #1135 | LIVE | [user-broker/runtime] Prove Kernel registration, session-bound launch, and credential re | 1 | TP 0/1 |
 | #1227 | LIVE | [release/windows] Bind the signed bundle to current runtime generations and remove legac | 1 |  |
 | #1301 | LIVE | [platform-windows/installation] rc4 install fails: runtime registry file created without | 1 | TP 1/0 |
 | #1306 | LIVE | [installation] rollback of service registration: after deleting EliotWatchdog, recover f | 1 |  |
 | #1325 | LIVE | [installation] first install with signed activation intent cannot roll back after servic | 0 | TP 0/1 |
 | #1339 | LIVE | [installation/watchdog] rc9 registry redb lock: second apply query-reconcile vs watchdog | 2 | TP 1/0 |
-| #1352 | LIVE | [host/platform-windows] rc11 (with #1347): EliotHost DACL now correct but Host self-insp | 3 | CC RF TP 0/0 |
+| #1352 | LIVE | [host/platform-windows] rc11 (with #1347): EliotHost DACL now correct but Host self-insp | 3 | CC RF |
 | #1375 | LIVE | [installation/dev] One-command developer reset so a fresh install always works (owner de | 2 |  |
 | #1388 | LIVE | [watchdog/installation] Watchdog registry/approval fixtures emit Null Host service_contr | 2 |  |
 | #1537 | LIVE | T2-S08W: Reconcile and complete the existing Watchdog recovery/containment demonstration | 1 |  |
@@ -429,7 +433,7 @@ Verify: `cargo test -p <crate> --test <file>` (сейчас: FAIL/PASS/absent)
 | #1893 | ENABLER | [I1-audit] Preserve the Linux portability boundary in platform interfaces | 0 |  |
 | #1914 | ENABLER | [I18-audit] Add versioned local/CI verification profiles with shared evidence receipts | 0 |  |
 
-#### P2 (43)
+#### P2 (39)
 
 | Issue | Класс | Заголовок | влитых PR | флаги |
 |---|---|---|---|---|
@@ -451,9 +455,6 @@ Verify: `cargo test -p <crate> --test <file>` (сейчас: FAIL/PASS/absent)
 | #1744 | SPINE | [I7-audit] Generate MCP schemas from shared canonical contract types | 0 |  |
 | #1750 | SPINE | [I1-audit] Restore independent Watchdog service installation and SCM supervision | 1 | TP 0/1 |
 | #1754 | SPINE | [I8-audit] Add the watchdog-owned physically separate `watchdog.redb` intent spool | 1 |  |
-| #1787 | SPINE | [I4-audit] Implement WorkScope identity resolution and guarded revalidation | 1 | CC RF |
-| #1788 | SPINE | [I4-audit] Build deterministic privacy-bounded bootstrap discovery | 1 |  |
-| #1789 | SPINE | [I4-audit] Enforce material-readiness gates using typed onboarding state | 1 | CC RF |
 | #1790 | SPINE | [I4-audit] Implement canonical cold-start readiness compilation and single-flight leases | 0 |  |
 | #1795 | SPINE | [I6-audit] Replace bare authority counters with typed epoch lineage identities | 0 |  |
 | #1805 | SPINE | [I18-audit] Bind instrument results to exact executable identities | 1 |  |
@@ -468,13 +469,12 @@ Verify: `cargo test -p <crate> --test <file>` (сейчас: FAIL/PASS/absent)
 | #1887 | SPINE | [I1-audit] Separate Host-managed dependency liveness from store semantic readiness | 0 |  |
 | #1888 | SPINE | [I1-audit] Enforce Windows Job Object and identity isolation at process launch | 0 |  |
 | #1890 | SPINE | [I1-audit] Implement compatibility handshakes and rollback fencing | 0 |  |
-| #1892 | SPINE | [I1-audit] Enforce startup ordering and authority caps before front-door readiness | 0 | TP 0/0 |
-| #1925 | SPINE | [I5-audit] Implement complete opaque ORS staging and recovery envelopes | 1 | TP 0/0 |
-| #1929 | SPINE | [I5-audit] Implement task-binding admission and safe unbound observation capture | 2 | TP 0/0 |
+| #1892 | SPINE | [I1-audit] Enforce startup ordering and authority caps before front-door readiness | 0 |  |
+| #1925 | SPINE | [I5-audit] Implement complete opaque ORS staging and recovery envelopes | 1 |  |
 | #1933 | SPINE | [I5-audit] Add bounded store-client generations and unknown-write receipt recovery | 2 |  |
 | #1967 | SPINE | [I1-audit] Implement the canonical startup sequence and readiness gates | 2 |  |
 | #1968 | SPINE | [I1-audit] Gate every process handshake on the full compatibility envelope | 3 |  |
-| #1972 | SPINE | [I1-audit] Enforce Kernel-unavailable admission and recovery-view behavior | 2 | TP 0/0 |
+| #1972 | SPINE | [I1-audit] Enforce Kernel-unavailable admission and recovery-view behavior | 2 |  |
 | #2380 | SPINE | [I4.7] Complete receipt-bound WorkScope transitions and visible partial recovery | 1 |  |
 
 #### P3 — после OSP1 (257)
@@ -495,6 +495,7 @@ Verify: `cargo test -p <crate> --test <file>` (сейчас: FAIL/PASS/absent)
 #### P6 — D5 (31)
 
 - **D5** (31): #24, #265, #481, #484, #485, #486, #487, #501, #1126, #1376, #1683, #1699, #1702, #1762, #1763, #1764, #1765, #1766, #1767, #1768, #1769, #1820, #1821, #1822, #1825, #1826, #1827, #1828, #1829, #1835, #1963
+
 ### Б. Падающие тесты на `main@2eaa864` (переносимые крейты, Linux) и первый плохой коммит
 
 Первые плохие коммиты найдены через `git bisect run` (оракул — тест-таргет) или по контрольным точкам 18/21/23/24.09.
