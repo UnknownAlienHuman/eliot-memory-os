@@ -4,7 +4,8 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use eliot_notify::{
-    DeliveryOutcome, NotificationComposition, PROTOCOL_VERSION, SERVICE_NAME, UnsatisfiedObligation,
+    DeliveryOutcome, NOTIFY_REQUEST_ARGUMENT, NotificationComposition,
+    NotifyLaunchRequestReference, PROTOCOL_VERSION, SERVICE_NAME, UnsatisfiedObligation,
 };
 use eliot_notify_core::{
     NotificationEnvelope, NotificationStateReadRequest, NotificationStateResponse, NotifyError,
@@ -143,7 +144,7 @@ enum Response {
     reason = "the one-shot launcher keeps protected root validation, scheduler modes, and stdin dispatch in an explicit ordered state machine"
 )]
 fn main() {
-    let (root, mode) = match parse_launch() {
+    let (root, mode, launch_reference) = match parse_launch() {
         Ok(root) => root,
         Err(error) => exit(PROVIDER_REJECTED_EXIT, "NOTIFY_ROOT_REJECTED", error),
     };
@@ -212,6 +213,35 @@ fn main() {
         };
         let response = match NotificationComposition::from_fallback(root) {
             Ok(mut composition) => dispatch_fallback(&mut composition, &envelope, &request),
+            Err(error) => composition_error(error.to_string()),
+        };
+        let provider_error = is_provider_rejection(&response);
+        if !write_response(&response) {
+            std::process::exit(PROVIDER_REJECTED_EXIT);
+        }
+        if provider_error {
+            std::process::exit(PROVIDER_REJECTED_EXIT);
+        }
+        return;
+    }
+
+    // A broker-authorized normal launch carries its request on its own argv
+    // (I11.6:3), because an inherited stdin stream is a channel this process
+    // cannot authenticate. The reference is proved against live canonical
+    // notification state through the same authenticated Kernel read the
+    // composition already uses for the quiet-hours projection before any
+    // adapter call, so an unauthenticated or stale launch is refused with the
+    // existing typed rejection. No stdin is read on this contour, which is why
+    // `NOTIFICATION_REQUEST_REQUIRED` is structurally unreachable here; the
+    // installer-pinned scheduler modes above still take no stdin either.
+    if let Some(reference) = launch_reference {
+        let response = match NotificationComposition::from_kernel_with_launch_reference(
+            root.clone(),
+            &reference,
+        ) {
+            Ok(mut composition) => {
+                dispatch_deliver(&mut composition, &reference.envelope, &reference.request)
+            }
             Err(error) => composition_error(error.to_string()),
         };
         let provider_error = is_provider_rejection(&response);
@@ -314,7 +344,7 @@ fn main() {
     }
 }
 
-fn parse_launch() -> Result<(PathBuf, LaunchMode), String> {
+fn parse_launch() -> Result<(PathBuf, LaunchMode, Option<NotifyLaunchRequestReference>), String> {
     let expected = eliot_platform_windows::protected_program_data_path("Eliot/notify")
         .map_err(|error| error.to_string())?;
     parse_launch_args(std::env::args_os().skip(1), &expected)
@@ -323,7 +353,7 @@ fn parse_launch() -> Result<(PathBuf, LaunchMode), String> {
 fn parse_launch_args<I, S>(
     arguments: I,
     expected: &PathBuf,
-) -> Result<(PathBuf, LaunchMode), String>
+) -> Result<(PathBuf, LaunchMode, Option<NotifyLaunchRequestReference>), String>
 where
     I: IntoIterator<Item = S>,
     S: Into<std::ffi::OsString>,
@@ -331,6 +361,7 @@ where
     let mut args = arguments.into_iter().map(Into::into);
     let mut mode = LaunchMode::Normal;
     let mut supplied_root = None;
+    let mut launch_reference = None;
     while let Some(value) = args.next() {
         let requested_mode = if value == "--watchdog-fallback" {
             Some(LaunchMode::WatchdogFallback)
@@ -354,6 +385,16 @@ where
                 args.next()
                     .ok_or_else(|| "--work-root requires exactly one path".to_owned())?,
             );
+        } else if value == NOTIFY_REQUEST_ARGUMENT {
+            if launch_reference.is_some() {
+                return Err("a notification request reference may only be supplied once".to_owned());
+            }
+            let encoded = args.next().ok_or_else(|| {
+                format!(
+                    "{NOTIFY_REQUEST_ARGUMENT} requires exactly one canonical request reference"
+                )
+            })?;
+            launch_reference = Some(decode_launch_request_reference(encoded)?);
         } else {
             return Err(format!("unknown argument: {}", value.to_string_lossy()));
         }
@@ -377,7 +418,42 @@ where
         // installer-owned contour and does not accept a caller-selected root.
         return Err("watchdog fallback does not accept --work-root".to_owned());
     }
-    Ok((root, mode))
+    if mode != LaunchMode::Normal && launch_reference.is_some() {
+        // The scheduler modes are fixed no-stdin launch shapes with no
+        // caller-selected request authority (I11.6:5-8, ADR-0013). Their only
+        // action is the mode flag, so a request reference on that contour is a
+        // request the owner never issued.
+        return Err(
+            "watchdog fallback does not accept a notification request reference".to_owned(),
+        );
+    }
+    Ok((root, mode, launch_reference))
+}
+
+/// Decodes the broker-authorized argv request reference.
+///
+/// The reference is one JSON object with exactly the canonical request and its
+/// envelope — no other key is accepted — and it must already be self-consistent,
+/// so a malformed or mismatched launch never reaches the authenticated Kernel
+/// read. Control characters are refused so a reference can never span lines and
+/// shadow a second request.
+fn decode_launch_request_reference(
+    encoded: std::ffi::OsString,
+) -> Result<NotifyLaunchRequestReference, String> {
+    let encoded = encoded
+        .into_string()
+        .map_err(|_| format!("{NOTIFY_REQUEST_ARGUMENT} must be UTF-8 JSON"))?;
+    if encoded.trim().is_empty() || encoded.chars().any(char::is_control) {
+        return Err(format!(
+            "{NOTIFY_REQUEST_ARGUMENT} carries no canonical request reference"
+        ));
+    }
+    let reference =
+        serde_json::from_str::<NotifyLaunchRequestReference>(&encoded).map_err(|error| {
+            format!("{NOTIFY_REQUEST_ARGUMENT} is not a canonical request reference: {error}")
+        })?;
+    reference.validate()?;
+    Ok(reference)
 }
 
 fn dispatch_deliver(
@@ -625,7 +701,7 @@ mod tests {
     #[test]
     fn watchdog_fallback_is_a_no_stdin_protected_launch_mode() {
         let expected = PathBuf::from(r"C:\ProgramData\Eliot\notify");
-        let (root, fallback) = parse_launch_args(["--watchdog-fallback"], &expected)
+        let (root, fallback, _) = parse_launch_args(["--watchdog-fallback"], &expected)
             .expect("watchdog mode parses without a request stream");
         assert_eq!(root, expected);
         assert_eq!(fallback, LaunchMode::WatchdogFallback);
