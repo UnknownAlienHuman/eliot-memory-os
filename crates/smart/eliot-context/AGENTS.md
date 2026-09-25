@@ -84,7 +84,6 @@ owner-neutral provider denominator and ProviderContribution closure;
 contract/candidate/admission/assembly source-cell split inside the accepted
 physical package;
 canonical digest replacement for Debug-formatted revisions/fences;
-retirement of the duplicate eliot-understanding compilation facade;
 Governor provider and Host delivery edges;
 Decision-Safety-Floor/handle scorecard contract changes requiring consumer
 migration.
