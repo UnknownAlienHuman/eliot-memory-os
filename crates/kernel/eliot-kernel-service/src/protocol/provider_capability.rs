@@ -372,6 +372,8 @@ mod provider_capability_tests {
         operation_id: String,
         binding_digest: String,
         executable_digest: String,
+        worker_generation: u64,
+        fence_digest: String,
         live_epoch: EpochId,
     }
 
@@ -388,6 +390,8 @@ mod provider_capability_tests {
                 executable_binding_digest: "e".repeat(64),
                 route_revision: "route-rev-7".to_owned(),
                 capacity_revision: "capacity-rev-3".to_owned(),
+                worker_generation: 1,
+                fence_digest: "f".repeat(64),
             },
             expectation: ProviderCapabilityExpectation {
                 current_route_revision: "route-rev-7".to_owned(),
@@ -399,6 +403,8 @@ mod provider_capability_tests {
             operation_id: "op-t9-04-1".to_owned(),
             binding_digest: "b".repeat(64),
             executable_digest: "e".repeat(64),
+            worker_generation: 1,
+            fence_digest: "f".repeat(64),
             live_epoch: test_epoch(1),
         }
     }
@@ -411,6 +417,8 @@ mod provider_capability_tests {
             fixture.operation_id.as_str(),
             fixture.binding_digest.as_str(),
             fixture.executable_digest.as_str(),
+            fixture.worker_generation,
+            fixture.fence_digest.as_str(),
             &fixture.live_epoch,
         )
     }
