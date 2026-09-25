@@ -81,15 +81,17 @@ use eliot_testd_core::{
     TestdSourceObservationRange, TestdStore, TestdTerminalCompletionEvidence, VerificationReceipt,
 };
 use eliot_workscope::{
-    BootstrapScanner, GenerationEvidence, GoverningSourceSet, GuardTrigger, GuardVerdict,
-    IdentityEvidence, IdentityLegOutcome, MaterialAdmission, MaterialReadinessInputs,
-    ObservedScopeResources, PrivacyProfile, RequestedEffect, ResolutionAuthentication,
-    ResolutionRequest, ScannerResolverInputs, ScopeBinding, ScopeBindingDisposition,
-    ScopeBindingGuard, ScopeRelocationOrAttachReceipt, ScopeResolution, TriggerAdmission,
-    TriggerReport, WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidateSet,
-    WorkScopeDescriptor, WorkScopeResolutionReceipt, WorkScopeResolver, admit_at_trigger,
-    admit_initial_binding, check_at_trigger, evaluate_material_request, issue_resolution_receipt,
-    produce_attach_receipt, rebind_with_receipt,
+    AuthorityBasis, BootstrapScanner, GenerationEvidence, GoverningSourceAdmission,
+    GoverningSourceSet, GuardTrigger, GuardVerdict, IdentityEvidence, IdentityLegOutcome,
+    MaterialAdmission, MaterialReadinessInputs, ObservedScopeResources, PrivacyProfile,
+    RequestedEffect, ResolutionAuthentication, ResolutionRequest, ScannerResolverInputs,
+    ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeRelocationOrAttachReceipt,
+    ScopeResolution, SourceAdmissionRequest, TaskBindingInput, TaskBindingState,
+    TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
+    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidateSet, WorkScopeDescriptor,
+    WorkScopeResolutionReceipt, WorkScopeResolver, admit_at_trigger, admit_initial_binding,
+    check_at_trigger, evaluate_material_request, issue_resolution_receipt, produce_attach_receipt,
+    rebind_with_receipt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -4590,6 +4592,81 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             )));
         }
         Ok(Some(report))
+    }
+
+    /// Admits governing sources for one scope generation (issue #1791,
+    /// governing-source admission production caller).
+    ///
+    /// Owning thin entry for daemon/scanner ingress: runs
+    /// [`eliot_workscope::admit_governing_sources`] over the caller-built
+    /// request (candidates from authenticated receipts or discovery leases,
+    /// applicable authority claims, proven bindings/contracts, declared
+    /// precedences), then enforces the admission fence before returning: an
+    /// expired admission and an admitted record without authority fail closed
+    /// here instead of reaching readiness. The returned admission is the
+    /// caller input for cold-start compilation of that scope generation.
+    pub fn admit_governing_sources_for_scope(
+        request: SourceAdmissionRequest,
+        now: u64,
+    ) -> Result<GoverningSourceAdmission, CompositionError> {
+        let admission = eliot_workscope::admit_governing_sources(request)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        admission
+            .require_live(now)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        admission
+            .require_admitted_authority()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        Ok(admission)
+    }
+
+    /// Builds the `TASK_SELECTION_REQUIRED` intake shape for one scope
+    /// (issue #1791, task-selection production caller).
+    ///
+    /// Owning thin entry for the activation path: when no current task
+    /// exists, the daemon answers with the minimal valid intake shape (goal,
+    /// acceptance, owner, scope plus a complete example) and the bounded
+    /// exploratory offer from [`eliot_workscope::task_selection_required`],
+    /// so the emitted selection directive always has a backing intake shape.
+    pub fn task_selection_intake_shape(
+        scope_ref: &str,
+    ) -> Result<TaskSelectionRequired, CompositionError> {
+        eliot_workscope::task_selection_required(scope_ref)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Promotes one task-intake candidate through its owner/delegation path
+    /// (issue #1791, intake-promotion production caller).
+    ///
+    /// Owning thin entry for task ingress: runs
+    /// [`eliot_workscope::TaskIntakeCandidate::promote`] with the existing
+    /// task binding the delegation names (`parent`, read from live governor
+    /// task state), so a `Current` binding input only ever arises from the
+    /// required owner or a proven delegation, never from direct construction.
+    pub fn promote_task_intake(
+        candidate: &TaskIntakeCandidate,
+        basis: &AuthorityBasis,
+        parent: &TaskBindingState,
+        task_revision: u64,
+    ) -> Result<TaskBindingInput, CompositionError> {
+        candidate
+            .promote(basis, parent, task_revision)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Admits one bounded exploratory binding without task authority
+    /// (issue #1791, exploratory-admission production caller).
+    ///
+    /// Owning thin entry for orientation ingress: runs
+    /// [`eliot_workscope::TaskIntakeCandidate::admit_exploratory`], whose
+    /// read-only binding can never authorize scope-sensitive Material
+    /// effects.
+    pub fn admit_exploratory_task_intake(
+        candidate: &TaskIntakeCandidate,
+    ) -> Result<TaskBindingInput, CompositionError> {
+        candidate
+            .admit_exploratory()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
 
     /// Applies one Canonical-admitted transition through the sole retained
