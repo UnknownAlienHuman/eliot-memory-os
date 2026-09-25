@@ -8,7 +8,9 @@
 //! [`SwarmPlanAttachmentService`] over the canonical
 //! [`CanonicalSwarmPlanAttachmentStore`]) -> swarm consumer (vend port, pinned
 //! handle, attach through the port) -> `AdapterRegistry` surface (route
-//! adjudication: admitted, revoked, stale) -> native-worker dispatch
+//! adjudication: admitted, revoked, stale; first launch per class pins the
+//! admitted generation and later drift is blocked with no silent
+//! substitution) -> native-worker dispatch
 //! (persist intent before executor call) -> reconciliation (rehydrate after
 //! restart, reconcile nonterminal children before any relaunch, bounded
 //! cancel drain to `terminal_ready`).
@@ -188,13 +190,22 @@ pub struct AttachedPlan {
 /// The operation identity derives from `(job_handle, plan_revision, slot)`
 /// and the attempt identity appends `-attempt`, mirroring the `eliot-swarm`
 /// `dispatch_child` derivation: changed input requires a new slot identity,
-/// never a silent relaunch under an existing one.
+/// never a silent relaunch under an existing one. The cancellation identity
+/// appends `-cancel` to the operation identity (issue #1126 How-to-do: one
+/// deterministic attempt and cancellation identity derived from the parent,
+/// child slot, plan revision and State Fence — the fence enters through the
+/// attached plan, whose fence digest the Governor owner validated at attach
+/// before any launch). The cancel path resolves the slot to this identity
+/// from the ledger-persisted intent; rehydration refuses a persisted intent
+/// whose cancellation identity does not match the derivation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChildLaunchIntent {
     /// Stable operation identity `job_handle:plan_revision:slot`.
     pub operation_id: String,
     /// Stable attempt identity `operation_id-attempt`.
     pub attempt_id: String,
+    /// Deterministic cancellation identity `operation_id-cancel`.
+    pub cancellation_id: String,
     /// Child slot this intent dispatches.
     pub slot: String,
     /// Durable job handle the child derives from.
@@ -395,6 +406,83 @@ fn require_text(value: &str, field: &'static str) -> Result<(), SwarmComposition
     Ok(())
 }
 
+/// Derives the deterministic cancellation identity for one child launch
+/// intent from its operation identity.
+///
+/// Issue #1126 How-to-do requires one deterministic attempt and cancellation
+/// identity derived from the parent, child slot, plan revision and State
+/// Fence. The operation identity already binds parent job, plan revision and
+/// slot; the fence binds through the attached plan (launch requires an
+/// attached plan whose fence digest the Governor owner validated at attach),
+/// so appending the fixed `-cancel` discriminator keeps the derivation
+/// exact with no invented material.
+fn expected_cancellation_id(operation_id: &str) -> String {
+    format!("{operation_id}-cancel")
+}
+
+/// Reads the admitted generation pin for one route class, if any.
+///
+/// Returns `None` for a class with no launch yet under the attached plan;
+/// the first launch pins it (see [`SwarmComposition::launch_child`]).
+fn pinned_generation(bindings: &[(String, u64)], route_class: &str) -> Option<u64> {
+    bindings
+        .iter()
+        .find(|(class, _)| class == route_class)
+        .map(|(_, generation)| *generation)
+}
+
+/// Verifies one ledger-persisted intent against the sealed attachment and
+/// folds its route binding into the rebuilt pins.
+///
+/// Fail-closed, in order: an intent for another job or plan revision is
+/// [`SwarmCompositionError::StaleLineage`]; an intent whose cancellation
+/// identity does not match the derivation is
+/// [`SwarmCompositionError::InternalContract`]; intents disagreeing on one
+/// class generation under the sealed attachment are `InternalContract`
+/// (the ledger cannot have drifted through
+/// [`SwarmComposition::launch_child`], so disagreement is refused rather
+/// than narrowed).
+fn reconcile_persisted_intent(
+    intent: &ChildLaunchIntent,
+    sealed: &AttachedPlan,
+    bindings: &mut Vec<(String, u64)>,
+) -> Result<(), SwarmCompositionError> {
+    if intent.job_handle != sealed.job_handle || intent.plan_revision != sealed.plan_revision {
+        return Err(SwarmCompositionError::StaleLineage {
+            detail: format!(
+                "persisted intent for slot {} disagrees with sealed attachment",
+                intent.slot
+            ),
+        });
+    }
+    if intent.cancellation_id != expected_cancellation_id(&intent.operation_id) {
+        return Err(SwarmCompositionError::InternalContract {
+            detail: format!(
+                "persisted intent for slot {} carries a drifted cancellation identity",
+                intent.slot
+            ),
+        });
+    }
+    match bindings
+        .iter()
+        .find(|(class, _)| *class == intent.route_class)
+    {
+        Some((_, pinned)) if *pinned != intent.generation => {
+            Err(SwarmCompositionError::InternalContract {
+                detail: format!(
+                    "persisted intents disagree on route {:?} generation under the sealed attachment",
+                    intent.route_class
+                ),
+            })
+        }
+        Some(_) => Ok(()),
+        None => {
+            bindings.push((intent.route_class.clone(), intent.generation));
+            Ok(())
+        }
+    }
+}
+
 /// Best-effort recovery of the canonical winner job handle from a conflict
 /// rendering.
 ///
@@ -567,6 +655,17 @@ pub struct SwarmComposition<'a, L: LaunchIntentLedger, R: ChildRunner> {
     plan: Option<AttachedPlan>,
     launched: Vec<ChildLaunchIntent>,
     reconciled: bool,
+    /// Route-class → generation pins admitted by the first launch per class
+    /// under the attached plan (stale-route gate, item A8).
+    ///
+    /// A replaced backing route under an admitted class carries a different
+    /// generation; launching it under the attached plan would silently
+    /// substitute a new result for the same logical scope, so drift from the
+    /// pin is [`SwarmCompositionError::RouteBlocked`]. Pins rebuild from the
+    /// ledger on [`SwarmComposition::rehydrate_after_restart`], so a restart
+    /// cannot revive stale route authority (A0.3 hard boundary: restoration
+    /// of revoked influence after recovery fails closed).
+    route_bindings: Vec<(String, u64)>,
 }
 
 impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
@@ -587,6 +686,7 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
             plan: None,
             launched: Vec::new(),
             reconciled: false,
+            route_bindings: Vec::new(),
         }
     }
 
@@ -693,13 +793,18 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
     /// Fail-closed order, enforced in code: the registry verdict must be
     /// [`RegistryRouteStatus::Admitted`] with a non-blank route class
     /// (revoked, stale, or blank is [`SwarmCompositionError::RouteBlocked`]
-    /// with no fallback); the launch intent is appended to the durable ledger
-    /// BEFORE the runner is called; the runner call happens exactly once per
-    /// appended intent. A runner failure after a persisted append propagates
-    /// as [`SwarmCompositionError::OwnerFailure`] while the intent stays
-    /// persisted with unknown outcome — it reconciles through
-    /// [`SwarmComposition::rehydrate_after_restart`], never by timeout.
-    /// Launching requires an attached plan and, after a restart,
+    /// with no fallback); a route class launched before under this attached
+    /// plan keeps its admitted generation — drift is
+    /// [`SwarmCompositionError::RouteBlocked`] with no silent substitution
+    /// (stale-route gate, item A8: provider/route replacement cannot revive
+    /// stale child authority under the same plan); the launch intent,
+    /// carrying the deterministic cancellation identity, is appended to the
+    /// durable ledger BEFORE the runner is called; the runner call happens
+    /// exactly once per appended intent. A runner failure after a persisted
+    /// append propagates as [`SwarmCompositionError::OwnerFailure`] while
+    /// the intent stays persisted with unknown outcome — it reconciles
+    /// through [`SwarmComposition::rehydrate_after_restart`], never by
+    /// timeout. Launching requires an attached plan and, after a restart,
     /// reconciliation ([`SwarmCompositionError::ReconcileRequired`]).
     /// Reusing a slot that already carries a persisted intent is
     /// [`SwarmCompositionError::DuplicateSlot`].
@@ -736,6 +841,15 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
             }
         }
         require_text(route_class, "route_class")?;
+        if let Some(pinned) = pinned_generation(&self.route_bindings, route_class)
+            && pinned != generation
+        {
+            return Err(SwarmCompositionError::RouteBlocked {
+                detail: format!(
+                    "route {route_class:?} generation drift under the attached plan: admitted {pinned}, requested {generation}"
+                ),
+            });
+        }
         if self.launched.iter().any(|intent| intent.slot == slot) {
             return Err(SwarmCompositionError::DuplicateSlot {
                 slot: slot.to_owned(),
@@ -745,6 +859,7 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
         require_text(&operation_id, "operation_id")?;
         let intent = ChildLaunchIntent {
             attempt_id: format!("{operation_id}-attempt"),
+            cancellation_id: expected_cancellation_id(&operation_id),
             operation_id,
             slot: slot.to_owned(),
             job_handle: plan.job_handle.clone(),
@@ -756,6 +871,13 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
         // persisted intent with unknown outcome, which rehydration reconciles.
         // No runner call happens before this append returns.
         let _sequence = self.ledger.append_intent(&intent)?;
+        // Pin the admitted route binding once the intent is durable: later
+        // launches under this plan must present the same generation for the
+        // class, and rehydration rebuilds the pins from the ledger.
+        if pinned_generation(&self.route_bindings, route_class).is_none() {
+            self.route_bindings
+                .push((route_class.to_owned(), generation));
+        }
         self.launched.push(intent.clone());
         self.runner.launch(&intent).map_err(|error| match error {
             SwarmCompositionError::OwnerFailure { detail } => {
@@ -859,25 +981,22 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
         }
         // Reconcile-before-relaunch: reload every persisted intent (the ledger
         // is the source of truth, so no launched child is lost) and observe
-        // each through the runner. Unknown stays unknown.
+        // each through the runner. Unknown stays unknown. Route-binding pins
+        // rebuild from the same persisted intents, so a restart cannot revive
+        // stale route authority; a persisted intent whose cancellation
+        // identity does not match the derivation is refused rather than
+        // reconciled under a drifted binding.
         let persisted = self.ledger.intents();
         let mut children = Vec::with_capacity(persisted.len());
+        let mut bindings: Vec<(String, u64)> = Vec::new();
         for intent in &persisted {
-            if intent.job_handle != sealed.job_handle
-                || intent.plan_revision != sealed.plan_revision
-            {
-                return Err(SwarmCompositionError::StaleLineage {
-                    detail: format!(
-                        "persisted intent for slot {} disagrees with sealed attachment",
-                        intent.slot
-                    ),
-                });
-            }
+            reconcile_persisted_intent(intent, sealed, &mut bindings)?;
             let state = self.runner.observe(&intent.slot)?;
             children.push((intent.clone(), state));
         }
         self.plan = Some(rebuilt.clone());
         self.launched = persisted;
+        self.route_bindings = bindings;
         self.reconciled = true;
         Ok(RehydrationReport {
             plan: rebuilt,
