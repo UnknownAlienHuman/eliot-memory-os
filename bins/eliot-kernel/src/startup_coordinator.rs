@@ -16,6 +16,7 @@
 //! mechanics, no credentials. `KernelComposition` owns the single instance
 //! and consults it from normal-write and Material/Critical admission paths.
 
+use eliot_platform::PlatformHandle;
 use serde::Serialize;
 
 /// Ordered I1.11 startup step (1-11). Step 0 means nothing completed.
@@ -310,6 +311,11 @@ pub struct StartupCoordinator {
     store_schema_probed: bool,
     epoch_recovered: bool,
     supervision_evidence_complete: bool,
+    /// The exact live SCM Watchdog incarnation digest that produced the
+    /// current supervision step. It is stored with the step and withdrawn with
+    /// it, so a supervision claim can never outlive the observation that
+    /// established it and can never be asserted from lease bookkeeping alone.
+    live_watchdog_incarnation: Option<PlatformHandle>,
     blob_degraded: bool,
     capability_degraded: bool,
 }
@@ -331,6 +337,7 @@ impl StartupCoordinator {
             store_schema_probed: false,
             epoch_recovered: false,
             supervision_evidence_complete: false,
+            live_watchdog_incarnation: None,
             blob_degraded: false,
             capability_degraded: false,
         }
@@ -583,15 +590,54 @@ impl StartupCoordinator {
         self.completed_step >= STARTUP_FINAL_STEP && self.supervision_evidence_complete
     }
 
+    /// The live SCM Watchdog incarnation digest that produced the current I1.11
+    /// supervision step, or `None` when no such step is recorded.
+    ///
+    /// I1.11 step 1 requires Host to validate the independent Watchdog service
+    /// state *through SCM*, and step 11 requires Watchdog to confirm coverage
+    /// independently. This is that observation: a live process identity plus
+    /// the digest of the live Watchdog image bytes. It is stored with the
+    /// revocable step and cleared by [`Self::revoke_supervision_evidence`], so
+    /// a readiness or Material admission can never be justified by a lease
+    /// equality alone — the observation itself has to be present and current.
+    #[must_use]
+    pub fn live_watchdog_incarnation(&self) -> Option<&PlatformHandle> {
+        self.live_watchdog_incarnation.as_ref()
+    }
+
+    /// Records the I1.11 supervision step together with the live SCM Watchdog
+    /// incarnation that produced it.
+    ///
+    /// This is the sole production producer of the supervision claim. The
+    /// caller must have just accepted that incarnation for the presented
+    /// candidate contour; the digest is retained so later admissions can prove
+    /// the claim came from a live observation rather than from lease
+    /// bookkeeping.
+    ///
+    /// # Errors
+    ///
+    /// Returns the fixed-shape range error when the supervision step lies
+    /// outside I1.11.
+    pub(crate) fn record_live_supervision_evidence(
+        &mut self,
+        incarnation: PlatformHandle,
+    ) -> Result<(), String> {
+        self.record_step_evidence(STARTUP_FINAL_STEP)?;
+        self.supervision_evidence_complete = true;
+        self.live_watchdog_incarnation = Some(incarnation);
+        Ok(())
+    }
+
     /// Revokes the recorded independent-supervision evidence.
     ///
     /// The contiguous cursor is left untouched so no earlier I1.11 step is
-    /// un-observed; only the supervision claim itself is withdrawn. Callers use
-    /// this at the one owner-correct moment a new candidate contour is admitted
-    /// (I1.5), because the previous observation belonged to the previous
-    /// activation.
-    pub const fn revoke_supervision_evidence(&mut self) {
+    /// un-observed; only the supervision claim itself is withdrawn, together
+    /// with the live SCM incarnation that produced it. Callers use this at the
+    /// one owner-correct moment a new candidate contour is admitted (I1.5),
+    /// because the previous observation belonged to the previous activation.
+    pub fn revoke_supervision_evidence(&mut self) {
         self.supervision_evidence_complete = false;
+        self.live_watchdog_incarnation = None;
     }
 
     /// Completes every mandatory gate in I1.11 order (1-11). Test and
