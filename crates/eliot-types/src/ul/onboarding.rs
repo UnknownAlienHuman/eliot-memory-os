@@ -3,6 +3,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestPackage {
     pub name: String,
     pub description: Option<String>,
@@ -26,6 +27,7 @@ pub enum OnboardingStage {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OnboardingJob {
     pub project_id: ProjectId,
     pub project_root: String,
@@ -34,6 +36,7 @@ pub struct OnboardingJob {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OnboardingCheckpoint {
     pub project_id: ProjectId,
     pub stage: OnboardingStage,
@@ -50,6 +53,7 @@ pub enum OnboardingTestHook {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OnboardingReport {
     pub project_id: ProjectId,
     pub head_commit: String,

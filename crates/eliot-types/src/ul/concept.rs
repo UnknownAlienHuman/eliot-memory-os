@@ -3,6 +3,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModuleCard {
     pub card_id: String,
     pub project_id: ProjectId,
@@ -32,6 +33,7 @@ pub enum ConceptKind {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConceptNode {
     pub concept_id: String,
     pub project_id: ProjectId,
@@ -48,12 +50,14 @@ pub struct ConceptNode {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileDependency {
     pub path: String,
     pub blake3: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DependencyManifest {
     #[serde(default)]
     pub project_root: String,
@@ -65,6 +69,7 @@ pub struct DependencyManifest {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectCharter {
     pub charter_id: String,
     pub project_id: ProjectId,
@@ -76,6 +81,7 @@ pub struct ProjectCharter {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SystemFlow {
     pub from_concept: String,
     pub to_concept: String,
@@ -84,6 +90,7 @@ pub struct SystemFlow {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SystemMap {
     pub map_id: String,
     pub project_id: ProjectId,
@@ -96,6 +103,7 @@ pub struct SystemMap {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubsystemCapsule {
     pub capsule_id: String,
     pub project_id: ProjectId,
@@ -129,6 +137,7 @@ pub enum PyramidBuildStatus {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapsuleBuild {
     pub build_id: String,
     pub project_id: ProjectId,
@@ -142,7 +151,7 @@ pub struct CapsuleBuild {
     pub previous_build_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "status")]
 pub enum CapsuleFreshness {
     Fresh,
@@ -150,6 +159,87 @@ pub enum CapsuleFreshness {
         changed: Vec<String>,
         missing: Vec<String>,
     },
+}
+
+impl<'de> Deserialize<'de> for CapsuleFreshness {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(CapsuleFreshnessVisitor)
+    }
+}
+
+struct CapsuleFreshnessVisitor;
+
+impl<'de> serde::de::Visitor<'de> for CapsuleFreshnessVisitor {
+    type Value = CapsuleFreshness;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a capsule freshness record")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut status: Option<String> = None;
+        let mut changed: Option<Vec<String>> = None;
+        let mut missing: Option<Vec<String>> = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "status" => set_once(&mut status, map.next_value()?, "status")?,
+                "changed" => set_once(&mut changed, map.next_value()?, "changed")?,
+                "missing" => set_once(&mut missing, map.next_value()?, "missing")?,
+                _ => {
+                    return Err(serde::de::Error::unknown_field(
+                        key.as_str(),
+                        &["status", "changed", "missing"],
+                    ));
+                }
+            }
+        }
+
+        let status = required(status, "status")?;
+        match status.as_str() {
+            "fresh" => {
+                if changed.is_some() {
+                    return Err(serde::de::Error::unknown_field("changed", &["status"]));
+                }
+                if missing.is_some() {
+                    return Err(serde::de::Error::unknown_field("missing", &["status"]));
+                }
+                Ok(CapsuleFreshness::Fresh)
+            }
+            "stale" => Ok(CapsuleFreshness::Stale {
+                changed: required(changed, "changed")?,
+                missing: required(missing, "missing")?,
+            }),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["fresh", "stale"],
+            )),
+        }
+    }
+}
+
+fn set_once<T, E>(slot: &mut Option<T>, value: T, key: &'static str) -> Result<(), E>
+where
+    E: serde::de::Error,
+{
+    if slot.is_some() {
+        return Err(E::duplicate_field(key));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn required<T, E>(value: Option<T>, field: &'static str) -> Result<T, E>
+where
+    E: serde::de::Error,
+{
+    value.ok_or_else(|| E::missing_field(field))
 }
 
 #[derive(
@@ -163,6 +253,7 @@ pub enum CoverageClass {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubsystemCoverage {
     pub concept_id: String,
     pub capsule_ref: Option<String>,
@@ -176,6 +267,7 @@ pub struct SubsystemCoverage {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DangerPath {
     pub path: String,
     pub score: u8,
@@ -183,6 +275,7 @@ pub struct DangerPath {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlMetacognitionView {
     pub policy_version: String,
     pub coverage: Vec<SubsystemCoverage>,
