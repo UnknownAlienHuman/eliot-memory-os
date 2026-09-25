@@ -136,6 +136,8 @@ fn transition_with_subject(
     prepared.named_operations[0]
         .parameters
         .insert(String::from("subject"), Value::String(subject.to_owned()));
+    // The plan changed after `transition()` bound the issue-#18 digests.
+    bind_issue18_digests(&mut prepared)?;
     let ctx = request_meta(fence)?;
     let view = CanonicalRequestView::from_apply(&ctx, &prepared, &[], &[]);
     prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;

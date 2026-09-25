@@ -108,8 +108,8 @@ fn from_contribution_attaches_the_provider() {
 #[test]
 fn superseded_position_contributes_nothing() {
     let admitted = position(Currentness::Superseded);
-    let error = EpistemicContextContribution::from_position(&admitted)
-        .expect_err("superseded must fail");
+    let error =
+        EpistemicContextContribution::from_position(&admitted).expect_err("superseded must fail");
     assert!(matches!(error, ContributionError::Upstream(_)));
 }
 
@@ -131,31 +131,14 @@ fn tampered_owner_digest_is_rejected_upstream() {
 
 #[test]
 fn unknown_wire_fields_are_rejected() {
-    let json = serde_json::json!({
-        "contribution": {
-            "contract_version": {"major": 1, "minor": 2, "patch": 0},
-            "view_kind": "CURRENT_EPISTEMIC_POSITION",
-            "position_digest": hex64(),
-            "claim": "claim-1",
-            "currentness": "CURRENT",
-            "scope": "scope-epi",
-            "fence": {
-                "authority_epoch": {
-                    "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
-                    "sequence": 1
-                },
-                "resource_generation": 1,
-                "task_revision": null,
-                "policy_revision": null,
-                "integration_revision": null
-            },
-            "source_revision": "rev-1",
-            "coverage_digest": hex64(),
-            "receipt_digest": hex64()
-        },
-        "provider": "smart.epistemic.context-provider",
-        "support_score": 0.97
-    });
+    // Start from a valid contribution so the only defect is the unknown
+    // field; a hand-built object drifts whenever the contract gains a
+    // required field (it stopped reaching `support_score` once `owner`
+    // became required).
+    let mut json = serde_json::to_value(contribution()).expect("serialize valid contribution");
+    json.as_object_mut()
+        .expect("contribution serializes as an object")
+        .insert("support_score".to_owned(), serde_json::json!(0.97));
     let error = serde_json::from_value::<EpistemicContextContribution>(json)
         .expect_err("unknown field must fail");
     assert!(error.to_string().contains("support_score"));
