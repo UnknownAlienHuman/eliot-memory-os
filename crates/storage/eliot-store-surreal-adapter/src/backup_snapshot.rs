@@ -880,7 +880,7 @@ async fn enumerate_canonical_members(
     adapter: &SurrealStoreAdapter,
 ) -> Result<Enumeration, StoreError> {
     let (point, class_rows) = read_enumeration(adapter).await?;
-    let rows_by_key = observed_row_keys(&class_rows);
+    let rows_by_key = observed_row_keys(&class_rows)?;
     let mut members = resolve_member_references(&class_rows, &rows_by_key)?;
     members.sort_by(|left, right| {
         (left.0, left.1, left.2.member_id.as_str()).cmp(&(
@@ -906,21 +906,23 @@ async fn enumerate_canonical_members(
 }
 
 /// Indexes every observed row by its own class table and joined key.
+///
+/// A row whose key cannot be read is a fail-closed enumeration failure, never a
+/// silent entry with a defaulted digest: a defaulted key would let a typed edge
+/// resolve to the wrong member.
 fn observed_row_keys(
     class_rows: &[Vec<Map<String, Value>>],
-) -> BTreeMap<(&'static str, String), String> {
+) -> Result<BTreeMap<(&'static str, String), String>, StoreError> {
     let mut keys = BTreeMap::new();
     for (class, rows) in captured_member_classes().zip(class_rows) {
         for row in rows {
-            if let Ok(joined) = row_joined_key(class, row) {
-                keys.insert(
-                    (class.table, joined),
-                    row_content_digest(row).unwrap_or_default(),
-                );
-            }
+            keys.insert(
+                (class.table, row_joined_key(class, row)?),
+                row_content_digest(row)?,
+            );
         }
     }
-    keys
+    Ok(keys)
 }
 
 /// Builds every member and resolves each typed edge against the observed set.
