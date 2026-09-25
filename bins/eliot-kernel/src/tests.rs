@@ -1836,6 +1836,12 @@ fn running_daemon_retains_only_the_same_authenticated_ready_publication_operatio
         recovery_fenced: false,
         supervision: None,
         live_ready: None,
+        #[cfg(windows)]
+        supervision_progress: DaemonSupervisionProgressState::unbound(),
+        #[cfg(windows)]
+        last_progress_observation: None,
+        #[cfg(windows)]
+        supervision_expired: false,
     };
     state
         .bind_live_receipt_publication_operation(&exact)
@@ -2100,6 +2106,12 @@ fn receipt_publication_race_is_retryable_only_for_exact_bound_client() {
         recovery_fenced: false,
         supervision: None,
         live_ready: None,
+        #[cfg(windows)]
+        supervision_progress: DaemonSupervisionProgressState::unbound(),
+        #[cfg(windows)]
+        last_progress_observation: None,
+        #[cfg(windows)]
+        supervision_expired: false,
     };
     assert!(matches!(
         KernelComposition::published_daemon_receipt(&state),

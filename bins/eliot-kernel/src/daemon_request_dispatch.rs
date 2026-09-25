@@ -34,6 +34,11 @@ use eliot_protocol::{
     HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt, RequestIdentity,
     host_request_operation_id,
 };
+#[cfg(windows)]
+use eliot_runtime_contracts::{
+    DaemonChannelCursor, DaemonProgressObservation, DaemonSupervisionRenewalDecision,
+    DaemonSupervisionRenewalReceipt, SupervisionLeasePredecessorProof,
+};
 use eliot_store_api::{
     CanonicalRequestView, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OperationIdentity, OrderingHeadExpectation, PreparedTransition, ReadConsistency,
@@ -52,6 +57,12 @@ use super::generation_control::{
 /// `EliotdStartupEvidence` carrier remains bin-owned; Kernel consumes its
 /// canonical JSON mechanically and never imports `bins/eliotd`.
 pub(crate) const DAEMON_STARTUP_EVIDENCE_OPERATION: &str = "daemon_startup_evidence";
+/// Authenticated daemon operation carrying one per-tick
+/// `DaemonSupervisionRenewalRequest` (Implements #88, wave 3). The daemon
+/// submits observed progress evidence; the Kernel alone decides renewal
+/// through the single timing owner and always answers with its exact durable
+/// head so the producer converges after renewals on any path.
+pub(crate) const DAEMON_SUPERVISION_PROGRESS_OPERATION: &str = "daemon_supervision_progress";
 /// Authenticated daemon route that drives the typed Host `UserAutomation`
 /// transport.  The daemon session supplies the outer authority; the Host
 /// open handshake supplies the channel evidence and the Host owner supplies
@@ -366,6 +377,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "local_read" => "local_read",
         "daemon_degraded" => "daemon_degraded",
         "daemon_fatal" => "daemon_fatal",
+        DAEMON_SUPERVISION_PROGRESS_OPERATION => DAEMON_SUPERVISION_PROGRESS_OPERATION,
         "agent_activation_claim" => "agent_activation_claim",
         "agent_activation_submit" => "agent_activation_submit",
         "agent_activation_reconcile" => "agent_activation_reconcile",
@@ -810,7 +822,7 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 #[cfg(windows)]
-                {
+                let ready_supervision: Option<serde_json::Value> = {
                     let (launch, process) = self
                         .validated_authenticated_daemon_ready_inputs()
                         .await
@@ -836,20 +848,44 @@ impl KernelComposition {
                         {
                             return Err(TransportError::SessionFenced);
                         }
+                        let fresh_binding = state.supervision.is_none();
                         state
                             .bind_live_receipt_publication_operation(&ready)
                             .map_err(|_| TransportError::SessionFenced)?;
                         state.supervision = Some(contour.clone());
+                        if fresh_binding {
+                            // Issue #88, wave 3: a newly bound generation
+                            // starts unbound continuity. The first
+                            // shape-valid observation pins boot, session, and
+                            // monotonic evidence anew, so a restarted or
+                            // replaced daemon generation can never continue
+                            // the old series or cite the old predecessor.
+                            state.supervision_progress = DaemonSupervisionProgressState::unbound();
+                            state.last_progress_observation = None;
+                            state.supervision_expired = false;
+                        }
                     }
                     self.publish_eliotd_live_receipt(&launch, &process, &ready, &contour, None)
                         .map_err(|_| TransportError::SessionFenced)?;
-                }
+                    let supervision = Self::daemon_ready_supervision_bundle(&contour, &snapshot)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    Some(supervision)
+                };
+                #[cfg(not(windows))]
+                let ready_supervision: Option<serde_json::Value> = { None };
+                #[cfg(windows)]
+                let ready_answer = Self::daemon_ready_response(ready_supervision);
+                #[cfg(not(windows))]
+                let ready_answer = {
+                    let _ = ready_supervision;
+                    Self::accepted_daemon_response()
+                };
                 self.mark_daemon_ready()
                     .map_err(|_| TransportError::SessionFenced)
                     .and_then(|()| {
                         self.record_startup_evidence(7)
                             .map_err(|_| TransportError::SessionFenced)?;
-                        Ok(Self::accepted_daemon_response())
+                        Ok(ready_answer)
                     })
             }
             "origin_challenge_issue" => {
@@ -924,6 +960,17 @@ impl KernelComposition {
                 self.mark_daemon_failed(reason)
                     .map_err(|_| TransportError::SessionFenced)
                     .map(|()| Self::accepted_daemon_response())
+            }
+            DAEMON_SUPERVISION_PROGRESS_OPERATION => {
+                #[cfg(windows)]
+                {
+                    self.daemon_supervision_progress_operation(payload.clone())
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
             }
             "agent_activation_claim" => {
                 #[cfg(windows)]
@@ -1326,6 +1373,283 @@ impl KernelComposition {
             "value": { "accepted": true },
             "recovery": null,
         })
+    }
+
+    /// Builds the exact durable predecessor proof for one ORS head. The proof
+    /// is what the daemon cites back on its next submit; a moved head makes
+    /// the stale citation fail closed with a typed mismatch instead of
+    /// renewing from the wrong revision.
+    #[cfg(windows)]
+    fn supervision_head_proof(
+        snapshot: &SupervisionLeaseSnapshot,
+    ) -> Result<SupervisionLeasePredecessorProof, TransportError> {
+        snapshot
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let envelope_sha256 = snapshot
+            .record
+            .artifact
+            .envelope_digest()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let proof = SupervisionLeasePredecessorProof {
+            lease_id: snapshot.record.lease_id.as_str().to_owned(),
+            record_id: snapshot.record.record_id.as_str().to_owned(),
+            lease_revision: snapshot.record.revision,
+            receipt_sha256: snapshot.receipt.receipt_sha256.clone(),
+            envelope_sha256,
+        };
+        proof
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(proof)
+    }
+
+    /// Assembles the once-per-generation supervision bundle for the
+    /// `daemon_ready` answer: the authority lineage the daemon echoes back on
+    /// every submit plus the exact current lease head it cites first. Every
+    /// echoed field is re-verified against the supervision contour on submit.
+    #[cfg(windows)]
+    fn daemon_ready_supervision_bundle(
+        contour: &DaemonSupervisionContour,
+        snapshot: &SupervisionLeaseSnapshot,
+    ) -> Result<serde_json::Value, TransportError> {
+        let proof = Self::supervision_head_proof(snapshot)?;
+        serde_json::to_value(serde_json::json!({
+            "lineage": {
+                "installation_id": contour.incarnation.installation_id,
+                "activation_id": contour.incarnation.activation_id,
+                "activation_generation": contour.activation.generation.value(),
+                "generation_binding": contour.generation_binding,
+                "kernel_epoch": contour.activation.authority_epoch,
+                "state_fence": contour.state_fence,
+            },
+            "head": {
+                "predecessor": proof,
+                "lease_issued_at_ms": snapshot.record.binding.issued_at_ms,
+                "lease_expires_at_ms": snapshot.record.binding.expires_at_ms,
+            },
+        }))
+        .map_err(|_| TransportError::SessionFenced)
+    }
+
+    /// Wraps the ready answer with the supervision bundle when the Kernel
+    /// bound one. The pre-supervision shape stays byte-identical otherwise.
+    #[cfg(windows)]
+    fn daemon_ready_response(ready_supervision: Option<serde_json::Value>) -> serde_json::Value {
+        match ready_supervision {
+            Some(supervision) => serde_json::json!({
+                "status": "known",
+                "value": { "accepted": true, "supervision": supervision },
+                "recovery": null,
+            }),
+            None => Self::accepted_daemon_response(),
+        }
+    }
+
+    /// Answers one progress submit in the closed envelope. A decision and a
+    /// refusal never co-occur; the exact durable predecessor and the accepted
+    /// cursors are always present so the producer converges after renewals on
+    /// any path, including the Host-driven `ProbeReady` path.
+    #[cfg(windows)]
+    fn progress_answer_envelope(
+        decision: Option<&DaemonSupervisionRenewalDecision>,
+        receipt: Option<&DaemonSupervisionRenewalReceipt>,
+        refusal_code: Option<&str>,
+        predecessor: &SupervisionLeasePredecessorProof,
+        accepted_cursors: &[DaemonChannelCursor],
+    ) -> Result<serde_json::Value, TransportError> {
+        let decision_value = decision
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let receipt_value = receipt
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let predecessor_value =
+            serde_json::to_value(predecessor).map_err(|_| TransportError::SessionFenced)?;
+        let accepted_value =
+            serde_json::to_value(accepted_cursors).map_err(|_| TransportError::SessionFenced)?;
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "outcome": decision.map(|decided| decided.outcome),
+                "refusal_code": refusal_code,
+                "decision": decision_value,
+                "receipt": receipt_value,
+                "predecessor": predecessor_value,
+                "accepted_cursors": accepted_value,
+            },
+            "recovery": null,
+        }))
+    }
+
+    /// Puts back Kernel-owned progress continuity after one renewal evaluation
+    /// and records the submitted observation and the expiry mark. Continuity
+    /// is never dropped: refusals keep their miss accounting and renewals
+    /// keep their recorded cursors.
+    #[cfg(windows)]
+    fn retain_supervision_progress(
+        &self,
+        progress: DaemonSupervisionProgressState,
+        observation: Option<DaemonProgressObservation>,
+        expired: Option<bool>,
+    ) -> Result<(), TransportError> {
+        let mut state = self
+            .daemon_runtime
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        state.supervision_progress = progress;
+        if observation.is_some() {
+            state.last_progress_observation = observation;
+        }
+        if let Some(expired) = expired {
+            state.supervision_expired = expired;
+        }
+        Ok(())
+    }
+
+    /// Answers a refused renewal with its stable code plus the exact durable
+    /// head. A refusal never mints authority and never asserts process death;
+    /// terminal lease expiry additionally marks the supervision claim so the
+    /// expired lease stays visibly degraded until a new admitted generation
+    /// rebinds.
+    #[cfg(windows)]
+    fn progress_refusal_answer(
+        &self,
+        lease_id: &str,
+        error: &DaemonSupervisionHeartbeatError,
+    ) -> Result<serde_json::Value, TransportError> {
+        let authority = self
+            .supervision_lease_authority
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let head = authority
+            .current_snapshot(lease_id)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::SessionFenced)?;
+        let proof = Self::supervision_head_proof(&head)?;
+        let accepted = self
+            .daemon_runtime
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .supervision_progress
+            .accepted_cursors
+            .clone();
+        Self::progress_answer_envelope(None, None, Some(error.code()), &proof, &accepted)
+    }
+
+    /// Drives one per-tick progress submit from observed daemon evidence
+    /// through the typed renewal route (Implements #88, wave 3).
+    ///
+    /// The request is joined against the exact durable head through the
+    /// single timing owner. `Renewed` commits exactly one successor and
+    /// completes its receipt only after live-receipt publication, so a
+    /// renewal never ships without publication evidence. Every other decided
+    /// outcome returns the unchanged head with its complete receipt and no
+    /// commit. Typed join refusals answer with the refusal code and the
+    /// current head; durable authority failures fence the operation. The
+    /// producer halts itself on terminal expiry; the Kernel never revives an
+    /// expired lease from further heartbeats.
+    #[cfg(windows)]
+    fn daemon_supervision_progress_operation(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request_value = match payload {
+            serde_json::Value::Object(mut object) => object
+                .remove("request")
+                .ok_or(TransportError::SessionFenced)?,
+            _ => return Err(TransportError::SessionFenced),
+        };
+        let request: DaemonSupervisionRenewalRequest =
+            serde_json::from_value(request_value).map_err(|_| TransportError::SessionFenced)?;
+        request
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let lease_id = request.observation.lease_id.clone();
+        let (contour, process, ready, launch, mut progress) = {
+            let mut state = self
+                .daemon_runtime
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if state.status != DaemonRuntimeStatus::Ready {
+                return Err(TransportError::SessionFenced);
+            }
+            let contour = state
+                .supervision
+                .clone()
+                .ok_or(TransportError::SessionFenced)?;
+            let process = state.receipt.clone().ok_or(TransportError::SessionFenced)?;
+            let ready = state
+                .live_ready
+                .clone()
+                .ok_or(TransportError::SessionFenced)?;
+            let progress = std::mem::replace(
+                &mut state.supervision_progress,
+                DaemonSupervisionProgressState::unbound(),
+            );
+            drop(state);
+            let launch = self
+                .active_daemon_launch()
+                .map_err(|_| TransportError::SessionFenced)?
+                .ok_or(TransportError::SessionFenced)?;
+            (contour, process, ready, launch, progress)
+        };
+        let authority = self
+            .supervision_lease_authority
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let renewal = Self::renew_current_supervision_with_progress(
+            authority.as_ref(),
+            &contour,
+            &request,
+            &mut progress,
+            &SUPERVISION_LEASE_RENEWAL_POLICY,
+            unix_ms(),
+        );
+        let (snapshot, decision, receipt) = match renewal {
+            Ok(decided) => decided,
+            Err(SupervisionProgressRenewalError::Heartbeat(error)) => {
+                let expired = error == DaemonSupervisionHeartbeatError::SupervisionLeaseExpired;
+                self.retain_supervision_progress(
+                    progress,
+                    Some(request.observation.clone()),
+                    Some(expired),
+                )?;
+                return self.progress_refusal_answer(&lease_id, &error);
+            }
+            Err(SupervisionProgressRenewalError::Authority(_)) => {
+                self.retain_supervision_progress(progress, None, None)?;
+                return Err(TransportError::SessionFenced);
+            }
+        };
+        self.retain_supervision_progress(progress, Some(request.observation.clone()), Some(false))?;
+        let receipt = if decision.outcome == DaemonSupervisionRenewalOutcome::Renewed {
+            let published = self
+                .publish_eliotd_live_receipt(&launch, &process, &ready, &contour, Some(&snapshot))
+                .map_err(|_| TransportError::SessionFenced)?;
+            let live_sha256 = sha256_hex(
+                &canonical_json_bytes(&published).map_err(|_| TransportError::SessionFenced)?,
+            );
+            daemon_renewal_receipt_for_decision(
+                &decision,
+                Some(snapshot.receipt.receipt_sha256.clone()),
+                Some(live_sha256),
+            )
+            .map_err(|_| TransportError::SessionFenced)?
+        } else {
+            receipt.ok_or(TransportError::SessionFenced)?
+        };
+        let proof = Self::supervision_head_proof(&snapshot)?;
+        let accepted = self
+            .daemon_runtime
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .supervision_progress
+            .accepted_cursors
+            .clone();
+        Self::progress_answer_envelope(Some(&decision), Some(&receipt), None, &proof, &accepted)
     }
 
     #[cfg(windows)]

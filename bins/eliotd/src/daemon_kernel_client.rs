@@ -83,6 +83,23 @@ pub struct OwnerSessionFacts {
     pub(crate) protected_snapshot_digest: String,
 }
 
+impl OwnerSessionFacts {
+    /// Returns the validated `sid=..;session=..` binding string: the daemon's
+    /// transport-session evidence for supervision progress (identity refs
+    /// only, never a secret).
+    #[must_use]
+    pub fn session_binding(&self) -> &str {
+        &self.session_binding
+    }
+
+    /// Returns the local connection correlation id: diagnostic transport
+    /// evidence only, never renewal identity.
+    #[must_use]
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
+}
+
 #[cfg(windows)]
 pub(super) async fn retry_pre_admission<T, F, Fut>(
     timeout: Duration,
@@ -436,7 +453,7 @@ impl DaemonKernelClient {
         }
     }
 
-    pub fn report_ready(&self) -> Result<(), super::DaemonError> {
+    pub fn report_ready(&self) -> Result<super::DaemonReadySupervision, super::DaemonError> {
         // #740: readiness span, distinct from the handshake span above.
         let _span = tracing::info_span!("eliotd.daemon_readiness").entered();
         #[cfg(windows)]
@@ -445,10 +462,14 @@ impl DaemonKernelClient {
                 .enable_all()
                 .build()
                 .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-            runtime
+            let value = runtime
                 .block_on(self.report_ready_with_pre_admission_retry())
-                .map(|_| ())
-                .map_err(|error| super::DaemonError::Kernel(error.to_string()))
+                .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+            // Issue #88, wave 3: the Kernel answers `daemon_ready` with the
+            // once-per-generation supervision bundle (authority lineage plus
+            // the exact current lease head). The per-tick producer cites this
+            // bundle verbatim; a missing bundle fails readiness closed.
+            super::parse_daemon_ready_supervision(&value).map_err(super::DaemonError::Kernel)
         }
         #[cfg(not(windows))]
         {
@@ -456,6 +477,32 @@ impl DaemonKernelClient {
                 KernelClientError::Unsupported.to_string(),
             ))
         }
+    }
+
+    /// Submits one per-tick supervision-progress renewal request on the
+    /// authenticated daemon channel (Implements #88, wave 3).
+    ///
+    /// The request carries only daemon-observed evidence plus the last
+    /// Kernel-answered predecessor; the Kernel decides renewal and always
+    /// answers with its exact durable head so the producer converges after
+    /// renewals on any path. Typed refusals arrive as parsed answers, never
+    /// as transport errors; only delivery/contract failures error here.
+    #[cfg(windows)]
+    pub async fn submit_supervision_progress(
+        &self,
+        request: &eliot_runtime_contracts::DaemonSupervisionRenewalRequest,
+    ) -> Result<super::SupervisionProgressAnswer, super::DaemonError> {
+        request
+            .validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async(
+                super::DAEMON_SUPERVISION_PROGRESS_OPERATION,
+                super::progress_submit_payload(request),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        super::parse_progress_answer(&value).map_err(super::DaemonError::Kernel)
     }
 
     pub fn report_degraded(&self, reason: impl Into<String>) -> Result<(), super::DaemonError> {

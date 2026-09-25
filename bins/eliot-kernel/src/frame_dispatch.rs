@@ -883,6 +883,7 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "health"
             | "daemon_degraded"
             | "daemon_fatal"
+            | "daemon_supervision_progress"
             | "agent_activation_claim"
             | "agent_activation_submit"
             | "agent_activation_reconcile"
@@ -921,6 +922,9 @@ mod daemon_operation_tests {
             ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION
         ));
         assert!(is_daemon_operation(DAEMON_STARTUP_EVIDENCE_OPERATION));
+        assert!(is_daemon_operation(
+            super::super::daemon_request_dispatch::DAEMON_SUPERVISION_PROGRESS_OPERATION
+        ));
         assert!(!is_daemon_operation(
             "daemon_generation_registry_active_query"
         ));
