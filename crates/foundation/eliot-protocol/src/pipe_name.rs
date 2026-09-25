@@ -2,6 +2,10 @@
 //!
 //! This module only validates and formats identity.  It does not open, list,
 //! connect to, delete, or authenticate a named pipe.
+//!
+//! [`EliotPipeOwner`] is the single typed owner enforcing the complete
+//! current and legacy namespace; every constructor and parser funnels
+//! through it.
 
 use std::{fmt, str::FromStr};
 
@@ -34,6 +38,264 @@ pub const PIPE_NAME_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 
 /// version; future Unicode admission requires a profile version bump, never
 /// silent aliasing or lowercasing of arbitrary Unicode.
 pub const PIPE_NAME_UNICODE_PROFILE: &str = "ascii-lowercase-v1";
+
+/// The single typed owner enforcing the complete ELIOT named-pipe namespace.
+///
+/// Every current parse, segment check, legacy parse, and legacy-mapping
+/// decision funnels through this type: [`EliotPipeName::parse`],
+/// [`EliotPipeSegment::new`], [`LegacyEliotPipeName::parse`], and
+/// [`LegacyEliotPipeName::map_to_current`] all delegate here, and the
+/// generation-carrying constructors validate through the same checks. No
+/// second enforcement table or unchecked construction path exists. Validity
+/// is identity only: it never authenticates a peer, admits an ACL, binds a
+/// session, or grants permission to connect.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct EliotPipeOwner;
+
+impl EliotPipeOwner {
+    /// Parses one exact current canonical name.
+    ///
+    /// This is the single enforcement entry for the complete current
+    /// namespace: exact prefix, closed canonical family, family-specific
+    /// typed suffix shape, segment count/order, and owner identity.
+    pub fn parse_current(value: &str) -> Result<EliotPipeName, EliotPipeNameError> {
+        if value.len() > MAX_PIPE_NAME_BYTES {
+            return Err(EliotPipeNameError::NameTooLong {
+                actual: value.len(),
+                maximum: MAX_PIPE_NAME_BYTES,
+            });
+        }
+        let Some(rest) = value.strip_prefix(ELIOT_PIPE_PREFIX) else {
+            return Err(EliotPipeNameError::InvalidPrefix);
+        };
+        if rest.is_empty() {
+            return Err(EliotPipeNameError::InvalidFamily {
+                offset: ELIOT_PIPE_PREFIX.len(),
+            });
+        }
+        let parts: Vec<_> = rest.split('\\').collect();
+        if parts.iter().any(|part| part.is_empty()) {
+            return Err(EliotPipeNameError::InvalidSegment {
+                offset: ELIOT_PIPE_PREFIX.len(),
+                field: "segment",
+                reason: EliotPipeSegmentReason::Empty,
+            });
+        }
+        if parts.iter().any(|part| part.contains('/')) {
+            return Err(EliotPipeNameError::InvalidSegment {
+                offset: ELIOT_PIPE_PREFIX.len(),
+                field: "segment",
+                reason: EliotPipeSegmentReason::Separator,
+            });
+        }
+
+        match parts.as_slice() {
+            ["kernel", "frontdoor"] => Ok(EliotPipeName::kernel_frontdoor()),
+            ["kernel", "store"] => Ok(EliotPipeName::kernel_store()),
+            ["kernel", "daemon", generation] => {
+                let generation = Self::parse_generation(generation, ELIOT_PIPE_PREFIX.len() + 14)?;
+                EliotPipeName::kernel_daemon(generation)
+            }
+            ["module", module_id, generation] => {
+                let module_offset = ELIOT_PIPE_PREFIX.len() + "module\\".len();
+                Self::validate_segment(module_id, module_offset, "module_id")?;
+                let module_id = ContractId::new(module_id.to_owned()).map_err(|_| {
+                    EliotPipeNameError::InvalidSegment {
+                        offset: module_offset,
+                        field: "module_id",
+                        reason: EliotPipeSegmentReason::OwnerIdentity,
+                    }
+                })?;
+                let generation = Self::parse_generation(
+                    generation,
+                    module_offset + module_id.as_str().len() + 1,
+                )?;
+                EliotPipeName::module(module_id, generation)
+            }
+            ["watchdog", "signals"] => Ok(EliotPipeName::watchdog_signals()),
+            _ => Err(EliotPipeNameError::InvalidFamily {
+                offset: ELIOT_PIPE_PREFIX.len(),
+            }),
+        }
+    }
+
+    /// Validates one canonical owner segment.
+    pub fn parse_segment(value: &str) -> Result<EliotPipeSegment, EliotPipeNameError> {
+        Self::validate_segment(value, 0, "segment")?;
+        Ok(EliotPipeSegment(value.to_owned()))
+    }
+
+    /// Parses the inventoried historical `eliot-governor-<20 hex>` shape.
+    ///
+    /// This is the single enforcement entry for legacy identities; unknown
+    /// or ambiguous legacy stays refused.
+    pub fn parse_legacy(value: &str) -> Result<LegacyEliotPipeName, EliotPipeNameError> {
+        const PREFIX: &str = "\\\\.\\pipe\\eliot-governor-";
+        let Some(suffix) = value.strip_prefix(PREFIX) else {
+            return Err(EliotPipeNameError::LegacyUnsupported);
+        };
+        if suffix.len() != 20
+            || !suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(EliotPipeNameError::LegacyUnsupported);
+        }
+        Ok(LegacyEliotPipeName {
+            governor_digest_prefix: suffix.to_owned(),
+        })
+    }
+
+    /// Refuses conversion until the actual endpoint owner supplies a mapping.
+    ///
+    /// The single legacy-mapping decision point: only an explicitly
+    /// inventoried old identity with an owner-approved versioned mapping may
+    /// convert, and no such mapping exists yet.
+    pub const fn map_legacy_to_current(
+        _legacy: &LegacyEliotPipeName,
+    ) -> Result<EliotPipeName, EliotPipeNameError> {
+        Err(EliotPipeNameError::LegacyMappingUnavailable)
+    }
+
+    fn validate_segment(
+        value: &str,
+        offset: usize,
+        field: &'static str,
+    ) -> Result<(), EliotPipeNameError> {
+        if value.is_empty() {
+            return Err(EliotPipeNameError::InvalidSegment {
+                offset,
+                field,
+                reason: EliotPipeSegmentReason::Empty,
+            });
+        }
+        if value.len() > MAX_PIPE_SEGMENT_BYTES {
+            return Err(EliotPipeNameError::InvalidSegment {
+                offset,
+                field,
+                reason: EliotPipeSegmentReason::TooLong,
+            });
+        }
+        if value == "." || value == ".." || value.ends_with('.') {
+            return Err(EliotPipeNameError::InvalidSegment {
+                offset,
+                field,
+                reason: EliotPipeSegmentReason::DotSegment,
+            });
+        }
+        if value.chars().any(char::is_control) {
+            return Err(EliotPipeNameError::InvalidSegment {
+                offset,
+                field,
+                reason: EliotPipeSegmentReason::Control,
+            });
+        }
+        if value.chars().any(char::is_whitespace) {
+            return Err(EliotPipeNameError::InvalidSegment {
+                offset,
+                field,
+                reason: EliotPipeSegmentReason::Whitespace,
+            });
+        }
+        if value.contains(['\\', '/']) {
+            return Err(EliotPipeNameError::InvalidSegment {
+                offset,
+                field,
+                reason: EliotPipeSegmentReason::Separator,
+            });
+        }
+        if value.contains(':') {
+            return Err(EliotPipeNameError::InvalidSegment {
+                offset,
+                field,
+                reason: EliotPipeSegmentReason::Delimiter,
+            });
+        }
+        // Windows device-name policy scoped to this namespace: refuse CON/PRN/
+        // AUX/NUL/COM1-9/LPT1-9 (case-insensitive, stem before `.`) before the
+        // ASCII-case check so `CON` reports ReservedDevice, not NonCanonical.
+        if Self::is_reserved_device_name(value) {
+            return Err(EliotPipeNameError::InvalidSegment {
+                offset,
+                field,
+                reason: EliotPipeSegmentReason::ReservedDevice,
+            });
+        }
+        // Admitted alphabet pinned by PIPE_NAME_UNICODE_PROFILE: lowercase ASCII
+        // only. Non-ASCII (including confusables) falls here as NonCanonical.
+        if !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        }) || value.starts_with('-')
+            || value.ends_with('-')
+        {
+            return Err(EliotPipeNameError::InvalidSegment {
+                offset,
+                field,
+                reason: EliotPipeSegmentReason::NonCanonical,
+            });
+        }
+        Ok(())
+    }
+
+    fn is_reserved_device_name(value: &str) -> bool {
+        let stem = value.split('.').next().unwrap_or(value);
+        matches!(
+            stem.to_ascii_lowercase().as_str(),
+            "con"
+                | "prn"
+                | "aux"
+                | "nul"
+                | "com1"
+                | "com2"
+                | "com3"
+                | "com4"
+                | "com5"
+                | "com6"
+                | "com7"
+                | "com8"
+                | "com9"
+                | "lpt1"
+                | "lpt2"
+                | "lpt3"
+                | "lpt4"
+                | "lpt5"
+                | "lpt6"
+                | "lpt7"
+                | "lpt8"
+                | "lpt9"
+        )
+    }
+
+    fn validate_generation(
+        generation: ResourceGeneration,
+        offset: usize,
+    ) -> Result<(), EliotPipeNameError> {
+        if generation.value() == 0 {
+            Err(EliotPipeNameError::InvalidGeneration { offset })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn parse_generation(
+        value: &str,
+        offset: usize,
+    ) -> Result<ResourceGeneration, EliotPipeNameError> {
+        if value.is_empty()
+            || (value.len() > 1 && value.starts_with('0'))
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(EliotPipeNameError::InvalidGeneration { offset });
+        }
+        let numeric = value
+            .parse::<u64>()
+            .map_err(|_| EliotPipeNameError::InvalidGeneration { offset })?;
+        let generation = ResourceGeneration::new(numeric)
+            .map_err(|_| EliotPipeNameError::InvalidGeneration { offset })?;
+        Self::validate_generation(generation, offset)?;
+        Ok(generation)
+    }
+}
 
 /// A closed family in the current ELIOT namespace.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -72,10 +334,11 @@ pub struct EliotPipeSegment(String);
 
 impl EliotPipeSegment {
     /// Validates one canonical owner segment.
+    ///
+    /// Delegates to the single namespace owner ([`EliotPipeOwner::parse_segment`]).
     pub fn new(value: impl Into<String>) -> Result<Self, EliotPipeNameError> {
         let value = value.into();
-        validate_segment(&value, 0, "segment")?;
-        Ok(Self(value))
+        EliotPipeOwner::parse_segment(&value)
     }
 
     /// Returns the canonical segment text.
@@ -170,7 +433,7 @@ impl EliotPipeName {
 
     /// Constructs a generation-specific Kernel daemon identity.
     pub fn kernel_daemon(generation: ResourceGeneration) -> Result<Self, EliotPipeNameError> {
-        validate_generation(generation, 0)?;
+        EliotPipeOwner::validate_generation(generation, 0)?;
         Ok(Self(EliotPipeEndpoint::KernelDaemon { generation }))
     }
 
@@ -193,7 +456,7 @@ impl EliotPipeName {
                 }
                 other => other,
             })?;
-        validate_generation(generation, 0)?;
+        EliotPipeOwner::validate_generation(generation, 0)?;
         let name = Self(EliotPipeEndpoint::Module {
             module_id,
             module_segment,
@@ -287,63 +550,10 @@ impl EliotPipeName {
     }
 
     /// Parses one exact current canonical name.
+    ///
+    /// Delegates to the single namespace owner ([`EliotPipeOwner::parse_current`]).
     pub fn parse(value: &str) -> Result<Self, EliotPipeNameError> {
-        if value.len() > MAX_PIPE_NAME_BYTES {
-            return Err(EliotPipeNameError::NameTooLong {
-                actual: value.len(),
-                maximum: MAX_PIPE_NAME_BYTES,
-            });
-        }
-        let Some(rest) = value.strip_prefix(ELIOT_PIPE_PREFIX) else {
-            return Err(EliotPipeNameError::InvalidPrefix);
-        };
-        if rest.is_empty() {
-            return Err(EliotPipeNameError::InvalidFamily {
-                offset: ELIOT_PIPE_PREFIX.len(),
-            });
-        }
-        let parts: Vec<_> = rest.split('\\').collect();
-        if parts.iter().any(|part| part.is_empty()) {
-            return Err(EliotPipeNameError::InvalidSegment {
-                offset: ELIOT_PIPE_PREFIX.len(),
-                field: "segment",
-                reason: EliotPipeSegmentReason::Empty,
-            });
-        }
-        if parts.iter().any(|part| part.contains('/')) {
-            return Err(EliotPipeNameError::InvalidSegment {
-                offset: ELIOT_PIPE_PREFIX.len(),
-                field: "segment",
-                reason: EliotPipeSegmentReason::Separator,
-            });
-        }
-
-        match parts.as_slice() {
-            ["kernel", "frontdoor"] => Ok(Self::kernel_frontdoor()),
-            ["kernel", "store"] => Ok(Self::kernel_store()),
-            ["kernel", "daemon", generation] => {
-                let generation = parse_generation(generation, ELIOT_PIPE_PREFIX.len() + 14)?;
-                Self::kernel_daemon(generation)
-            }
-            ["module", module_id, generation] => {
-                let module_offset = ELIOT_PIPE_PREFIX.len() + "module\\".len();
-                validate_segment(module_id, module_offset, "module_id")?;
-                let module_id = ContractId::new(module_id.to_owned()).map_err(|_| {
-                    EliotPipeNameError::InvalidSegment {
-                        offset: module_offset,
-                        field: "module_id",
-                        reason: EliotPipeSegmentReason::OwnerIdentity,
-                    }
-                })?;
-                let generation =
-                    parse_generation(generation, module_offset + module_id.as_str().len() + 1)?;
-                Self::module(module_id, generation)
-            }
-            ["watchdog", "signals"] => Ok(Self::watchdog_signals()),
-            _ => Err(EliotPipeNameError::InvalidFamily {
-                offset: ELIOT_PIPE_PREFIX.len(),
-            }),
-        }
+        EliotPipeOwner::parse_current(value)
     }
 }
 
@@ -424,21 +634,10 @@ pub struct LegacyEliotPipeName {
 
 impl LegacyEliotPipeName {
     /// Parses the inventoried historical `eliot-governor-<20 hex>` shape.
+    ///
+    /// Delegates to the single namespace owner ([`EliotPipeOwner::parse_legacy`]).
     pub fn parse(value: &str) -> Result<Self, EliotPipeNameError> {
-        const PREFIX: &str = "\\\\.\\pipe\\eliot-governor-";
-        let Some(suffix) = value.strip_prefix(PREFIX) else {
-            return Err(EliotPipeNameError::LegacyUnsupported);
-        };
-        if suffix.len() != 20
-            || !suffix
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(EliotPipeNameError::LegacyUnsupported);
-        }
-        Ok(Self {
-            governor_digest_prefix: suffix.to_owned(),
-        })
+        EliotPipeOwner::parse_legacy(value)
     }
 
     /// Returns the historical digest prefix without exposing a raw wire name.
@@ -447,8 +646,11 @@ impl LegacyEliotPipeName {
     }
 
     /// Refuses conversion until the actual endpoint owner supplies a mapping.
+    ///
+    /// Delegates to the single namespace owner
+    /// ([`EliotPipeOwner::map_legacy_to_current`]).
     pub const fn map_to_current(&self) -> Result<EliotPipeName, EliotPipeNameError> {
-        Err(EliotPipeNameError::LegacyMappingUnavailable)
+        EliotPipeOwner::map_legacy_to_current(self)
     }
 }
 
@@ -538,140 +740,4 @@ pub enum EliotPipeNameError {
     /// No owner-approved versioned mapping exists yet.
     #[error("legacy named-pipe identity has no owner-approved current mapping")]
     LegacyMappingUnavailable,
-}
-
-fn validate_segment(
-    value: &str,
-    offset: usize,
-    field: &'static str,
-) -> Result<(), EliotPipeNameError> {
-    if value.is_empty() {
-        return Err(EliotPipeNameError::InvalidSegment {
-            offset,
-            field,
-            reason: EliotPipeSegmentReason::Empty,
-        });
-    }
-    if value.len() > MAX_PIPE_SEGMENT_BYTES {
-        return Err(EliotPipeNameError::InvalidSegment {
-            offset,
-            field,
-            reason: EliotPipeSegmentReason::TooLong,
-        });
-    }
-    if value == "." || value == ".." || value.ends_with('.') {
-        return Err(EliotPipeNameError::InvalidSegment {
-            offset,
-            field,
-            reason: EliotPipeSegmentReason::DotSegment,
-        });
-    }
-    if value.chars().any(char::is_control) {
-        return Err(EliotPipeNameError::InvalidSegment {
-            offset,
-            field,
-            reason: EliotPipeSegmentReason::Control,
-        });
-    }
-    if value.chars().any(char::is_whitespace) {
-        return Err(EliotPipeNameError::InvalidSegment {
-            offset,
-            field,
-            reason: EliotPipeSegmentReason::Whitespace,
-        });
-    }
-    if value.contains(['\\', '/']) {
-        return Err(EliotPipeNameError::InvalidSegment {
-            offset,
-            field,
-            reason: EliotPipeSegmentReason::Separator,
-        });
-    }
-    if value.contains(':') {
-        return Err(EliotPipeNameError::InvalidSegment {
-            offset,
-            field,
-            reason: EliotPipeSegmentReason::Delimiter,
-        });
-    }
-    // Windows device-name policy scoped to this namespace: refuse CON/PRN/
-    // AUX/NUL/COM1-9/LPT1-9 (case-insensitive, stem before `.`) before the
-    // ASCII-case check so `CON` reports ReservedDevice, not NonCanonical.
-    if is_reserved_device_name(value) {
-        return Err(EliotPipeNameError::InvalidSegment {
-            offset,
-            field,
-            reason: EliotPipeSegmentReason::ReservedDevice,
-        });
-    }
-    // Admitted alphabet pinned by PIPE_NAME_UNICODE_PROFILE: lowercase ASCII
-    // only. Non-ASCII (including confusables) falls here as NonCanonical.
-    if !value.bytes().all(|byte| {
-        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
-    }) || value.starts_with('-')
-        || value.ends_with('-')
-    {
-        return Err(EliotPipeNameError::InvalidSegment {
-            offset,
-            field,
-            reason: EliotPipeSegmentReason::NonCanonical,
-        });
-    }
-    Ok(())
-}
-
-fn is_reserved_device_name(value: &str) -> bool {
-    let stem = value.split('.').next().unwrap_or(value);
-    matches!(
-        stem.to_ascii_lowercase().as_str(),
-        "con"
-            | "prn"
-            | "aux"
-            | "nul"
-            | "com1"
-            | "com2"
-            | "com3"
-            | "com4"
-            | "com5"
-            | "com6"
-            | "com7"
-            | "com8"
-            | "com9"
-            | "lpt1"
-            | "lpt2"
-            | "lpt3"
-            | "lpt4"
-            | "lpt5"
-            | "lpt6"
-            | "lpt7"
-            | "lpt8"
-            | "lpt9"
-    )
-}
-
-fn validate_generation(
-    generation: ResourceGeneration,
-    offset: usize,
-) -> Result<(), EliotPipeNameError> {
-    if generation.value() == 0 {
-        Err(EliotPipeNameError::InvalidGeneration { offset })
-    } else {
-        Ok(())
-    }
-}
-
-fn parse_generation(value: &str, offset: usize) -> Result<ResourceGeneration, EliotPipeNameError> {
-    if value.is_empty()
-        || (value.len() > 1 && value.starts_with('0'))
-        || !value.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err(EliotPipeNameError::InvalidGeneration { offset });
-    }
-    let numeric = value
-        .parse::<u64>()
-        .map_err(|_| EliotPipeNameError::InvalidGeneration { offset })?;
-    let generation = ResourceGeneration::new(numeric)
-        .map_err(|_| EliotPipeNameError::InvalidGeneration { offset })?;
-    validate_generation(generation, offset)?;
-    Ok(generation)
 }
