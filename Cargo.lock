@@ -2522,8 +2522,14 @@ name = "eliot-mod-research"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-ipc",
+ "eliot-kernel-service",
+ "eliot-platform",
+ "eliot-platform-windows",
  "eliot-process",
  "eliot-process-executor",
+ "eliot-protocol",
+ "eliot-receipts",
  "eliot-research-exchange",
  "eliot-research-exchange-api",
  "eliot-researcher",
@@ -2531,6 +2537,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

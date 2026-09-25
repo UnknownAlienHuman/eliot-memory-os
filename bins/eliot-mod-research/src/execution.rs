@@ -14,7 +14,7 @@
 //! otherwise.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -27,8 +27,9 @@ use eliot_research_exchange_api::ResearchQueryRequest;
 use thiserror::Error;
 
 use crate::BridgeError;
+use crate::SubmissionRecord;
 use crate::admission::ProviderAdmission;
-use crate::evidence::{RawProviderEvidence, sha256_hex};
+use crate::evidence::{CancellationEvidence, RawProviderEvidence, sha256_hex};
 use crate::protocol::{
     RESEARCH_PROVIDER_WIRE_VERSION, ResultFrame, SubmitAck, SubmitEnvelope, scan_result_frame,
 };
@@ -64,9 +65,12 @@ pub enum RequestPortError {
 /// Composition-root seam minting authorized [`ProcessRequest`] values.
 ///
 /// Dispatch permits are Kernel-issued authority, so the bridge never mints
-/// requests itself. `request_sha256` binds the exact canonical request bytes
-/// the minted request must execute for; the bridge re-validates the returned
-/// request against the admission before the executor is contacted.
+/// requests itself. The first element of `submit_binding` is the exact
+/// canonical request digest the minted request must execute for; the second is
+/// the digest of the bounded submit projection that the minted request's argv
+/// must carry, so the provider can verify exactly which request it answers.
+/// The bridge re-validates the returned request against both before the
+/// executor is contacted.
 pub trait ResearchRequestPort: Send + Sync {
     /// Binds one admitted operation to exactly one authorized process request.
     ///
@@ -77,7 +81,7 @@ pub trait ResearchRequestPort: Send + Sync {
     fn bind(
         &self,
         admission: &ProviderAdmission,
-        request_sha256: &str,
+        submit_binding: &(String, String),
     ) -> Result<ProcessRequest, RequestPortError>;
 }
 
@@ -99,8 +103,9 @@ pub enum ProviderOutcome {
 }
 
 /// One executed provider attempt: the stable job identity, the typed outcome,
-/// the immutable raw evidence, the provider-local job reference, and the
-/// terminal result frame when the provider emitted one.
+/// the immutable raw evidence, the provider-local job reference, the
+/// cancellation receipt when one was actually issued, and the terminal result
+/// frame when the provider emitted one.
 #[derive(Clone, Debug)]
 pub struct ProviderExecution {
     /// Stable admitted operation identity (the only identity the exchange
@@ -112,19 +117,25 @@ pub struct ProviderExecution {
     pub evidence: RawProviderEvidence,
     /// Provider-local job reference (correlation only, never identity).
     pub provider_job_ref: String,
+    /// Cancellation receipt, retained when cancellation was actually issued.
+    pub cancellation: Option<CancellationEvidence>,
     /// Terminal result frame when present in provider output.
     pub result_frame: Option<ResultFrame>,
-    /// Canonical submit wire bytes sent to the port binding.
+    /// Canonical submit wire bytes retained as the exact reconciliation
+    /// record.
     pub wire_bytes: Vec<u8>,
+    /// Bounded submit-binding digest projected into the admitted argv.
+    pub submit_binding_sha256: String,
 }
 
 /// One started operation with its sealed bindings: the stable operation
-/// identity, the invocation digest every observation must preserve, and the
-/// canonical submit wire bytes.
+/// identity, the invocation digest every observation must preserve, the
+/// canonical submit wire bytes, and the delivered submit-binding digest.
 struct BoundOperation {
     operation: OperationId,
     digest: String,
     wire_bytes: Vec<u8>,
+    submit_binding_sha256: String,
 }
 
 /// Stateless shared-executor runner for admitted research operations.
@@ -139,6 +150,8 @@ pub struct ProviderBridge {
     port: Arc<dyn ResearchRequestPort>,
     sink: Arc<dyn ProcessEvidenceSink>,
     deadline: Duration,
+    bound_identity: Mutex<Option<OperationId>>,
+    submission: Mutex<Option<SubmissionRecord>>,
 }
 
 impl ProviderBridge {
@@ -154,7 +167,22 @@ impl ProviderBridge {
             port,
             sink,
             deadline: BOUND_RUN_DEADLINE,
+            bound_identity: Mutex::new(None),
+            submission: Mutex::new(None),
         }
+    }
+
+    /// Returns the exact submit reconciliation record of the last sealed
+    /// submit, whether or not the attempt reached a terminal outcome.
+    ///
+    /// A failure after the submit was sealed still leaves a reconciliation
+    /// record; reporting it is what lets an unknown outcome be resolved
+    /// byte-for-byte instead of retried.
+    pub fn last_submission(&self) -> Option<crate::SubmissionRecord> {
+        self.submission
+            .lock()
+            .ok()
+            .and_then(|record| record.clone())
     }
 
     /// Overrides the terminal-lifecycle wait bound.
@@ -172,51 +200,42 @@ impl ProviderBridge {
 
     /// Executes one admitted request through the shared governed contour.
     ///
-    /// Order (all fail-closed): request/admission binding, port minting,
-    /// minted-request re-validation (artifact, operation, generation, epoch,
-    /// no ambient environment inheritance), executor start with receipt
-    /// checks, terminal wait with deadline, stream readback with immutable
-    /// evidence materialization, typed ack decode. A provider terminal state
-    /// that cannot be classified returns [`ProviderOutcome::Unknown`] with
-    /// the evidence preserved, and must be reconciled by operation identity
-    /// before any retry.
+    /// Order (all fail-closed): request/admission binding, submit-binding
+    /// projection, port minting, minted-request re-validation (artifact,
+    /// operation, generation, epoch, no ambient environment inheritance,
+    /// delivered submit binding), executor start with receipt checks, terminal
+    /// wait with deadline, stream readback with immutable evidence
+    /// materialization, typed ack decode. A provider terminal state that
+    /// cannot be classified returns [`ProviderOutcome::Unknown`] with the
+    /// evidence preserved, and must be reconciled by operation identity before
+    /// any retry.
     pub fn execute(
         &self,
         admission: &ProviderAdmission,
         request: &ResearchQueryRequest,
     ) -> Result<ProviderExecution, BridgeError> {
-        let bound = self.bind_operation(admission, request)?;
+        let binding = build_submit_binding_digests(admission, request)?;
+        let process_request = self
+            .port
+            .bind(admission, &binding)
+            .map_err(|_| BridgeError::ProviderUnavailable)?;
+        let bound = self.bind_operation(admission, request, &binding, process_request)?;
         let view = self.await_terminal(&bound)?;
         self.finish_terminal(bound, &view)
     }
 
-    /// Validates the request/admission binding, mints the process request
-    /// through the port, re-validates the minted binding, and starts the
-    /// operation with receipt checks. Everything here happens before any
-    /// provider output exists.
+    /// Re-validates the minted binding, seals the canonical submit envelope,
+    /// and starts the operation with receipt checks. Everything here happens
+    /// before any provider output exists.
     fn bind_operation(
         &self,
         admission: &ProviderAdmission,
         request: &ResearchQueryRequest,
+        binding: &(String, String),
+        process_request: ProcessRequest,
     ) -> Result<BoundOperation, BridgeError> {
-        request.validate().map_err(|_| BridgeError::NotAdmitted {
-            reason: "research request failed validation",
-        })?;
-        admission
-            .validate_request(request)
-            .map_err(|refusal| BridgeError::NotAdmitted {
-                reason: refusal.reason(),
-            })?;
-        let request_bytes =
-            serde_json::to_vec(request).map_err(|_| BridgeError::ProtocolViolation {
-                reason: "research request is not canonical wire JSON",
-            })?;
-        let request_sha256 = sha256_hex(&request_bytes);
-        let process_request = self
-            .port
-            .bind(admission, &request_sha256)
-            .map_err(|_| BridgeError::ProviderUnavailable)?;
-        check_minted_request(admission, &process_request)?;
+        let (request_sha256, submit_binding_sha256) = binding;
+        check_minted_request(admission, &process_request, submit_binding_sha256)?;
         let operation = process_request.operation_id().clone();
         let digest = process_request.invocation_digest().to_owned();
         let generation = process_request.generation();
@@ -228,15 +247,16 @@ impl ProviderBridge {
             invocation_digest: digest.clone(),
             protocol_revision: request.protocol_revision,
             required_schema: request.required_schema.clone(),
-            request_sha256,
+            request_sha256: request_sha256.clone(),
         };
         let wire_bytes = envelope
             .encode()
             .map_err(|refusal| BridgeError::ProtocolViolation {
                 reason: refusal.reason(),
             })?;
-        // Fail-closed serializer check: the wire we hand to the port binding
-        // must decode back to the same operation and invocation binding.
+        // Fail-closed serializer check: the retained reconciliation record must
+        // decode back to the same operation, and its delivered projection must
+        // be the exact binding the port put in argv.
         let round_trip = SubmitEnvelope::decode(&wire_bytes).map_err(|refusal| {
             BridgeError::ProtocolViolation {
                 reason: refusal.reason(),
@@ -244,6 +264,8 @@ impl ProviderBridge {
         })?;
         if round_trip.operation_id != envelope.operation_id
             || round_trip.invocation_digest != envelope.invocation_digest
+            || round_trip.request_sha256 != envelope.request_sha256
+            || round_trip.binding().digest().ok().as_deref() != Some(submit_binding_sha256.as_str())
         {
             return Err(BridgeError::ProtocolViolation {
                 reason: "submit envelope failed its round-trip binding check",
@@ -259,16 +281,38 @@ impl ProviderBridge {
                 reason: "executor start receipt does not preserve the bound request",
             });
         }
+        // Record the started operation identity so a later cancellation can
+        // prove ownership at cancel time, not only at start time, and record
+        // the sealed submit so any later failure is still reconcilable.
+        *self
+            .bound_identity
+            .lock()
+            .map_err(|_| BridgeError::EvidenceIncomplete {
+                reason: "bound operation identity lock poisoned",
+            })? = Some(operation.clone());
+        *self
+            .submission
+            .lock()
+            .map_err(|_| BridgeError::EvidenceIncomplete {
+                reason: "submit reconciliation lock poisoned",
+            })? = Some(crate::SubmissionRecord {
+            submit_binding_sha256: submit_binding_sha256.clone(),
+            envelope_sha256: sha256_hex(&wire_bytes),
+            envelope_bytes: wire_bytes.clone(),
+        });
         Ok(BoundOperation {
             operation,
             digest,
             wire_bytes,
+            submit_binding_sha256: submit_binding_sha256.clone(),
         })
     }
 
     /// Waits for the terminal lifecycle of one started operation, preserving
     /// the request binding on every observation. A deadline overrun attempts
-    /// cancellation and stays explicit: the outcome is unconfirmed.
+    /// cancellation, retains the cancellation receipt on the typed timeout, and
+    /// stays explicit: the outcome is unconfirmed and reconciliation by
+    /// operation identity is required before any retry.
     fn await_terminal(
         &self,
         bound: &BoundOperation,
@@ -286,8 +330,14 @@ impl ProviderBridge {
                 return Ok(view);
             }
             if started.elapsed() >= self.deadline {
-                let _ = block_on(self.executor.cancel(bound.operation.clone()));
-                return Err(BridgeError::TimedOut);
+                // The cancellation receipt is the only proof a cancellation
+                // was attempted and what it achieved. Discarding it (the
+                // previous `let _ = ...`) destroyed that proof, so it is now
+                // retained and reported with the timeout.
+                let cancellation = block_on(self.executor.cancel(bound.operation.clone()))
+                    .map(|receipt| Box::new(CancellationEvidence::from_receipt(&receipt)))
+                    .map_err(BridgeError::Process)?;
+                return Err(BridgeError::TimedOut { cancellation });
             }
             std::thread::sleep(BOUND_RUN_POLL);
         }
@@ -321,7 +371,9 @@ impl ProviderBridge {
         );
         let outcome = classify_terminal(view.lifecycle(), exit, descendants_complete);
         if outcome == ProviderOutcome::Unknown {
-            return Err(BridgeError::UnknownOutcome);
+            return Err(BridgeError::UnknownOutcome {
+                evidence: Some(Box::new(evidence)),
+            });
         }
         let ack_line = stdout
             .bytes
@@ -341,9 +393,32 @@ impl ProviderBridge {
             outcome,
             evidence,
             provider_job_ref: ack.provider_job_id,
+            cancellation: None,
             result_frame,
             wire_bytes: bound.wire_bytes,
+            submit_binding_sha256: bound.submit_binding_sha256,
         })
+    }
+
+    /// Observes the stored operation record for the bound operation identity.
+    ///
+    /// Used before a cancellation so ownership is proven at cancel time, not
+    /// only at start time: a stored operation that no longer answers to the
+    /// admitted identity or Authority Epoch is refused rather than cancelled.
+    pub fn observe_bound_operation(
+        &self,
+    ) -> Result<eliot_process::ProcessExecutionView, BridgeError> {
+        let operation = self
+            .bound_identity
+            .lock()
+            .map_err(|_| BridgeError::EvidenceIncomplete {
+                reason: "bound operation identity lock poisoned",
+            })?
+            .clone()
+            .ok_or(BridgeError::NotAdmitted {
+                reason: "no started operation is bound to this bridge",
+            })?;
+        block_on(self.executor.inspect(operation)).map_err(BridgeError::Process)
     }
 
     /// Requests cancellation of the bound operation through the executor.
@@ -363,14 +438,97 @@ impl ProviderBridge {
     }
 }
 
+/// Builds the bounded submit projection and the exact request digest for one
+/// admitted operation.
+///
+/// Both the bridge and the request-minting port compute this from the same
+/// admitted inputs, independently. The bridge then re-checks that the minted
+/// argv carries the digest it computed itself, so a port that projected a
+/// different binding is refused before the executor is contacted.
+///
+/// A coverage or absence claim must name its scope, revision, and the method
+/// by which the denominator can be checked independently (A05.07). The frozen
+/// inquiry's exact source-role portfolio / coverage denominator digest is bound
+/// into the admission and re-checked here, so no admitted acquisition can run
+/// against an undeclared denominator.
+///
+/// # Errors
+///
+/// Returns [`BridgeError::NotAdmitted`] when the request or the admission fails
+/// validation, the coverage denominator digest is malformed, or the two
+/// disagree on a bound dimension; and [`BridgeError::ProtocolViolation`] when
+/// the request or the projection cannot be encoded.
+pub fn build_submit_binding(
+    admission: &ProviderAdmission,
+    request: &ResearchQueryRequest,
+) -> Result<(String, crate::protocol::SubmitBinding), BridgeError> {
+    request.validate().map_err(|_| BridgeError::NotAdmitted {
+        reason: "research request failed validation",
+    })?;
+    admission
+        .validate_request(request)
+        .map_err(|refusal| BridgeError::NotAdmitted {
+            reason: refusal.reason(),
+        })?;
+    if !crate::is_lowercase_sha256(admission.denominator_digest())
+        || !crate::is_lowercase_sha256(admission.inquiry_digest())
+    {
+        return Err(BridgeError::NotAdmitted {
+            reason: "admitted inquiry or coverage denominator digest is malformed",
+        });
+    }
+    let request_bytes =
+        serde_json::to_vec(request).map_err(|_| BridgeError::ProtocolViolation {
+            reason: "research request is not canonical wire JSON",
+        })?;
+    let request_sha256 = sha256_hex(&request_bytes);
+    let binding = crate::protocol::SubmitBinding {
+        wire_version: RESEARCH_PROVIDER_WIRE_VERSION,
+        operation_id: admission.operation_id().as_str().to_owned(),
+        exchange_id: request.exchange_id.clone(),
+        idempotency_key: request.idempotency_key.clone(),
+        protocol_revision: request.protocol_revision,
+        required_schema: request.required_schema.clone(),
+        request_sha256: request_sha256.clone(),
+    };
+    Ok((request_sha256, binding))
+}
+
+/// Returns the exact request digest and delivered submit-binding digest for one
+/// admitted operation.
+///
+/// This runs before the process request exists, which is exactly why the
+/// delivered projection is the envelope *minus* the process-request digest (see
+/// `protocol`). The pair is the exact material the request-minting port embeds
+/// and the bridge re-checks.
+///
+/// # Errors
+///
+/// Propagates every refusal from [`build_submit_binding`], plus
+/// [`BridgeError::ProtocolViolation`] when the projection cannot be encoded.
+pub fn build_submit_binding_digests(
+    admission: &ProviderAdmission,
+    request: &ResearchQueryRequest,
+) -> Result<(String, String), BridgeError> {
+    let (request_sha256, binding) = build_submit_binding(admission, request)?;
+    let binding_sha256 = binding
+        .digest()
+        .map_err(|refusal| BridgeError::ProtocolViolation {
+            reason: refusal.reason(),
+        })?;
+    Ok((request_sha256, binding_sha256))
+}
+
 /// Re-validates a port-minted request against the admission before the
 /// executor is contacted: exact artifact identity, exact operation identity,
-/// exact process generation, epoch agreement, structural validity, and no
-/// ambient environment inheritance (the child receives only explicit values,
-/// so credentials, proxy configuration, and user resources cannot leak in).
+/// exact process generation, epoch agreement, structural validity, the exact
+/// delivered submit binding in argv, and no ambient environment inheritance
+/// (the child receives only explicit values, so credentials, proxy
+/// configuration, and user resources cannot leak in).
 fn check_minted_request(
     admission: &ProviderAdmission,
     request: &ProcessRequest,
+    submit_binding_sha256: &str,
 ) -> Result<(), BridgeError> {
     request.validate().map_err(|_| BridgeError::NotAdmitted {
         reason: "minted process request failed validation",
@@ -406,7 +564,30 @@ fn check_minted_request(
             reason: "minted process request does not restrict environment inheritance",
         });
     }
+    if !carries_submit_binding(request, submit_binding_sha256) {
+        return Err(BridgeError::NotAdmitted {
+            reason: "minted process request does not carry the delivered submit binding",
+        });
+    }
     Ok(())
+}
+
+/// Returns whether the admitted argv carries exactly the delivered submit
+/// binding and the admitted operation identity.
+///
+/// The argv is inside the intent's sealed `effect_digest`, so a provider that
+/// answers a different operation, or a binding that was tampered with after
+/// admission, cannot reach the executor.
+fn carries_submit_binding(request: &ProcessRequest, submit_binding_sha256: &str) -> bool {
+    let argv = request.argv();
+    let value_after = |selector: &str| {
+        argv.windows(2)
+            .find(|pair| pair[0] == selector)
+            .map(|pair| pair[1].as_str())
+    };
+    value_after(crate::dispatch_authority::SUBMIT_BINDING_ARGV) == Some(submit_binding_sha256)
+        && value_after(crate::dispatch_authority::OPERATION_ARGV)
+            == Some(request.operation_id().as_str())
 }
 
 /// Classifies one terminal observation into a provider-local outcome.
@@ -499,7 +680,7 @@ mod tests {
         fn bind(
             &self,
             _admission: &ProviderAdmission,
-            _request_sha256: &str,
+            _submit_binding: &(String, String),
         ) -> Result<ProcessRequest, RequestPortError> {
             panic!("binding validation must refuse before the port is contacted");
         }
@@ -594,7 +775,7 @@ mod tests {
         fn bind(
             &self,
             _admission: &ProviderAdmission,
-            _request_sha256: &str,
+            _submit_binding: &(String, String),
         ) -> Result<ProcessRequest, RequestPortError> {
             Ok(mint_request(
                 &self.exe,
@@ -615,7 +796,7 @@ mod tests {
         fn bind(
             &self,
             _admission: &ProviderAdmission,
-            _request_sha256: &str,
+            _submit_binding: &(String, String),
         ) -> Result<ProcessRequest, RequestPortError> {
             Err(RequestPortError::NoAuthority)
         }

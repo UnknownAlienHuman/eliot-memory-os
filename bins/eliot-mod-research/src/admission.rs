@@ -57,6 +57,11 @@ impl AdmissionRefusal {
 ///   evidence *references* (cf. `EliotdLiveSupervisionEvidence`): they
 ///   correlate the operation with a catalogued generation without granting
 ///   authority or re-issuing admission.
+/// - `inquiry_digest` / `denominator_digest` bind the frozen Researcher
+///   inquiry and its exact source-role portfolio / coverage denominator. A
+///   coverage or absence claim must name its scope, revision, and the method
+///   by which the denominator can be checked independently (A05.07), so an
+///   admitted acquisition can never run against an undeclared denominator.
 /// - `operation_id` is the stable identity for cancel/reconcile and the only
 ///   identity the exchange ever keys on; the provider-local job reference
 ///   stays outcome evidence, never canonical identity.
@@ -77,6 +82,9 @@ pub struct ProviderAdmission {
     required_schema: String,
     bridge_generation: String,
     operation_id: OperationId,
+    inquiry_digest: String,
+    denominator_digest: String,
+    coverage_goal: String,
 }
 
 impl ProviderAdmission {
@@ -100,21 +108,32 @@ impl ProviderAdmission {
         required_schema: impl Into<String>,
         bridge_generation: impl Into<String>,
         operation_id: OperationId,
+        inquiry_digest: impl Into<String>,
+        denominator_digest: impl Into<String>,
+        coverage_goal: impl Into<String>,
     ) -> Result<Self, AdmissionRefusal> {
         let config_digest = config_digest.into();
         let protocol_digest = protocol_digest.into();
-        if !is_lowercase_sha256(&config_digest) || !is_lowercase_sha256(&protocol_digest) {
+        let inquiry_digest = inquiry_digest.into();
+        let denominator_digest = denominator_digest.into();
+        if !is_lowercase_sha256(&config_digest)
+            || !is_lowercase_sha256(&protocol_digest)
+            || !is_lowercase_sha256(&inquiry_digest)
+            || !is_lowercase_sha256(&denominator_digest)
+        {
             return Err(AdmissionRefusal::MalformedDigest);
         }
         let module_id = module_id.into();
         let module_generation_id = module_generation_id.into();
         let required_schema = required_schema.into();
         let bridge_generation = bridge_generation.into();
+        let coverage_goal = coverage_goal.into();
         for value in [
             &module_id,
             &module_generation_id,
             &required_schema,
             &bridge_generation,
+            &coverage_goal,
         ] {
             if value.trim().is_empty() || value.chars().any(char::is_control) {
                 return Err(AdmissionRefusal::MalformedText);
@@ -142,6 +161,9 @@ impl ProviderAdmission {
             required_schema,
             bridge_generation,
             operation_id,
+            inquiry_digest,
+            denominator_digest,
+            coverage_goal,
         })
     }
 
@@ -235,13 +257,37 @@ impl ProviderAdmission {
         &self.operation_id
     }
 
+    /// Returns the digest of the frozen Researcher inquiry this acquisition
+    /// answers.
+    #[must_use]
+    pub fn inquiry_digest(&self) -> &str {
+        &self.inquiry_digest
+    }
+
+    /// Returns the digest of the admitted source portfolio / coverage
+    /// denominator.
+    ///
+    /// A coverage or absence claim is only checkable against a declared
+    /// denominator (A05-07, I21.6). This is that handle.
+    #[must_use]
+    pub fn denominator_digest(&self) -> &str {
+        &self.denominator_digest
+    }
+
+    /// Returns the admitted coverage goal.
+    #[must_use]
+    pub fn coverage_goal(&self) -> &str {
+        &self.coverage_goal
+    }
+
     /// Binds one request to this admitted operation.
     ///
     /// Every bound dimension must agree exactly: fence (exact, both
     /// directions), bridge generation echo, disclosure (no silent privacy
-    /// widening), budget/deadline within ceiling, protocol revision and
-    /// required schema (route binding). Privacy, cost, or route expansion is
-    /// a mismatch, never a fallback. Returns the stable refusal otherwise.
+    /// widening), budget/deadline within ceiling, protocol revision, required
+    /// schema (route binding), and the coverage goal. Privacy, cost, or route
+    /// expansion is a mismatch, never a fallback. Returns the stable refusal
+    /// otherwise.
     pub fn validate_request(&self, request: &ResearchQueryRequest) -> Result<(), AdmissionRefusal> {
         if !fences_match_exact(&request.state_fence, &self.fence)
             || request.bridge_generation != self.bridge_generation
@@ -252,6 +298,7 @@ impl ProviderAdmission {
             || request.deadline_ms > self.deadline_ms
             || request.protocol_revision != self.protocol_revision
             || request.required_schema != self.required_schema
+            || request.coverage_goal != self.coverage_goal
         {
             return Err(AdmissionRefusal::RequestMismatch);
         }
@@ -328,6 +375,9 @@ mod tests {
                         "research-evidence-bundle/v1",
                         "gen-24-slice-a",
                         crate::support::test_operation_id(),
+                        DIGEST_A,
+                        DIGEST_B,
+                        crate::support::COVERAGE_GOAL,
                     ),
                     Err(AdmissionRefusal::MalformedDigest)
                 ),
@@ -357,6 +407,9 @@ mod tests {
                         "research-evidence-bundle/v1",
                         "gen-24-slice-a",
                         crate::support::test_operation_id(),
+                        DIGEST_A,
+                        DIGEST_B,
+                        crate::support::COVERAGE_GOAL,
                     ),
                     Err(AdmissionRefusal::MalformedText)
                 ),
@@ -394,6 +447,9 @@ mod tests {
                     "research-evidence-bundle/v1",
                     "gen-24-slice-a",
                     crate::support::test_operation_id(),
+                    DIGEST_A,
+                    DIGEST_B,
+                    crate::support::COVERAGE_GOAL,
                 ),
                 Err(AdmissionRefusal::EpochFenceConflict)
             ),
@@ -422,6 +478,9 @@ mod tests {
                         "research-evidence-bundle/v1",
                         "gen-24-slice-a",
                         crate::support::test_operation_id(),
+                        DIGEST_A,
+                        DIGEST_B,
+                        crate::support::COVERAGE_GOAL,
                     ),
                     Err(AdmissionRefusal::NonPositiveCeiling)
                 ),

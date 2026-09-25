@@ -369,6 +369,32 @@ async fn serve_connection(
                     return Err(error);
                 }
             }
+            KernelFrameAction::Research {
+                request_id,
+                operation,
+                payload,
+            } => {
+                // #24 bounded research-provider dispatch/reconcile: one
+                // request/response through the closed route handler
+                // (`KernelComposition::handle_research_provider`). Frames are
+                // served strictly in receive order on this connection, so a
+                // second dispatch can never run concurrently with the first;
+                // unknown operations never reach this arm (dispatch fences
+                // them) and any handler failure fences the session instead of
+                // silently dropping the submit. No provider process is spawned
+                // here: the admitted operation runs in `eliot-mod-research`
+                // through the shared governed process contour.
+                let reply = kernel.research_provider_reply_frame(
+                    &session,
+                    &request_id,
+                    &operation,
+                    &payload,
+                )?;
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    session.fence();
+                    return Err(error);
+                }
+            }
             KernelFrameAction::Fence(rejection) => {
                 let result = send_checked(&mut front_door, &rejection, limits).await;
                 session.fence();
@@ -529,15 +555,18 @@ async fn serve_admitted_bridge_host_requests(
             | KernelFrameAction::Daemon { .. }
             | KernelFrameAction::Doctor { .. }
             | KernelFrameAction::Testd { .. }
+            | KernelFrameAction::Research { .. }
             | KernelFrameAction::Dreamer { .. } => {
                 // Bridge transports never carry process, daemon, Doctor,
-                // testd, or Dreamer authority: the Doctor serves only its own
-                // admitted generation-bound session/connection (T6-D2 P-07),
-                // testd serves only its own admitted generation-bound
-                // session/connection (T6-X1 P-07), and Dreamer serves only
-                // its own admitted eliotd requester session/connection
-                // (T12-05 K2), never the bridge's. Revoke and fence exactly
-                // as for the other kinds.
+                // testd, research-provider, or Dreamer authority: the Doctor
+                // serves only its own admitted generation-bound
+                // session/connection (T6-D2 P-07), testd serves only its own
+                // admitted generation-bound session/connection (T6-X1 P-07),
+                // the research-provider route serves only its own admitted
+                // module-generation session/connection (#24), and Dreamer
+                // serves only its own admitted eliotd requester
+                // session/connection (T12-05 K2), never the bridge's. Revoke
+                // and fence exactly as for the other kinds.
                 kernel.revoke_agent_bridge(&connection_id);
                 return Err(TransportError::SessionFenced);
             }

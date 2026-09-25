@@ -448,6 +448,7 @@ impl KernelComposition {
                     KernelFrameAction::Doctor { .. } => "doctor_admitted",
                     KernelFrameAction::Testd { .. } => "testd_admitted",
                     KernelFrameAction::Dreamer { .. } => "dreamer_admitted",
+                    KernelFrameAction::Research { .. } => "research_provider_admitted",
                     KernelFrameAction::Fence(_) => "fenced_reply",
                 };
                 observe_frame("kernel.frame_validated", "success");
@@ -637,6 +638,32 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 return self.dispatch_provider_capability_frame(session, frame);
+            }
+            if super::research_provider_route::is_research_provider_operation(native_operation) {
+                // Bounded research-provider dispatch/reconcile (#24) delegates
+                // to the research-provider route file. Same Ready-gating and
+                // peer authentication as the capability branch; per-call
+                // session authentication, the fresh live-epoch query, the
+                // session State-Fence join, and the owner delegation live in
+                // the route. The admitted action is served only on a control
+                // connection: the front-door driver fences it on a bridge
+                // connection, so an agent bridge can never carry research
+                // provider admission.
+                if self
+                    .service_state()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    != KernelServiceState::Ready
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                session
+                    .peer
+                    .validate()
+                    .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+                if frame.request_id.is_none() || frame.request_identity.is_none() {
+                    return Err(TransportError::SessionFenced);
+                }
+                return self.dispatch_research_provider_frame(session, frame);
             }
             #[cfg(windows)]
             if super::host_request_route::is_host_request_operation(native_operation) {
