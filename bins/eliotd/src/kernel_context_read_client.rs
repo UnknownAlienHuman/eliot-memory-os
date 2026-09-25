@@ -7,7 +7,8 @@
 //! four task-bound reconstruction reads (`GetTaskState`,
 //! `GetAttentionAndProblems`, `GetUnderstandingProjectionInputs`,
 //! `GetCapabilityEvidenceState`) through the same fresh
-//! operation/scope/fence-bound capability.
+//! operation/scope/fence-bound capability, each carrying exactly the closed
+//! selectors the store catalogue declares for it (issue #2563).
 //!
 //! This module owns only the read-only [`CanonicalReadClient`] adapter over
 //! the already-authenticated [`DaemonKernelClient`]: a fresh
@@ -47,6 +48,21 @@
 //! only the closed [`NamedReadOperation`] crosses), no second consistency
 //! implementation, no fake full [`CanonicalStoreClient`] with
 //! always-unavailable writes, no catalogue/parameter widening.
+//!
+//! Reconstruction selector contract (issue #2563): the four task-bound
+//! reconstruction reads carry the exact closed selectors the store catalogue
+//! declares — `task_id`+`max_records` for `GetTaskState`, optional
+//! `problem_id`+`max_records` for `GetAttentionAndProblems`,
+//! `selector`+`max_records` for `GetUnderstandingProjectionInputs`, and
+//! `skill_id`+`max_records` for `GetCapabilityEvidenceState` — with every
+//! `max_records` a **decimal string** in `1..=EVIDENCE_PACK_MAX_RECORDS`.
+//! Membership, required presence and text shape come from the shared
+//! [`eliot_store_api::validate_typed_read_parameters`] declaration, so no
+//! second catalogue or per-read parameter list lives here; this module adds
+//! only the numeric bound. Admitting these selectors is a transport fact, not a
+//! domain promotion: a passed plan is still a retained authority-record
+//! envelope, not an admitted Cue array, a qualified capability or a ready
+//! packet.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -62,6 +78,7 @@ use eliot_store_api::{
     NamedReadResponse, REVOCATION_HISTORY_MAX_RECORDS, ReadConsistency, RevisionHead, RevisionKey,
     ScopeId, StoreError,
 };
+use serde_json::Value;
 
 use super::{DaemonKernelClient, SERVICE_NAME};
 
@@ -122,12 +139,9 @@ impl KernelContextReadClient {
     /// `GetEvidencePack` (scope-bound, structurally valid),
     /// `GetCurrentEpistemicPosition` (scope-bound, `ExactFence`, `position`
     /// Subject required, structurally valid), one of the four task-bound
-    /// reconstruction reads (scope-bound, `ExactFence`, currently no
-    /// parameters: this pre-transport gate is deliberately stricter than the
-    /// store catalogue, which declares bounded exact selectors for these
-    /// reads — parameter-carrying requests fail here until a follow-up
-    /// threads the closed selectors, and parameter-free requests fail
-    /// downstream at the catalogue; either way no unvalidated read crosses),
+    /// reconstruction reads (scope-bound, `ExactFence`, carrying exactly the
+    /// catalogue-declared closed selectors — see
+    /// [`check_reconstruction_capability`](Self::check_reconstruction_capability)),
     /// or the `#2100` owner-feed `GetAuthorityRevocationHistory`
     /// (scope-bound, `Eventual`, exactly the catalogue-declared
     /// `origin_ref`/`max_records` selectors), or the #1780
@@ -532,22 +546,20 @@ impl KernelContextReadClient {
 
     /// Checks one T11.3 task-bound reconstruction read before any transport.
     ///
-    /// Three operations (`GetTaskState`, `GetAttentionAndProblems`,
-    /// `GetUnderstandingProjectionInputs`) admit only parameter-free plans
-    /// and reject any supplied parameter here. `GetCapabilityEvidenceState`
-    /// additionally admits its closed catalogue selectors (`skill_id` +
-    /// `max_records`, issue #1957): the daemon evidence bridge plans exactly
-    /// that shape, so the follow-up threading the closed selectors lands
-    /// here first, for this one operation only. The store catalogue remains
-    /// the downstream authority, so neither shape executes end-to-end until
-    /// the Kernel admits the query route: a parameter-free evidence plan
-    /// still fails at the catalogue, and a selector-carrying plan still
-    /// fails closed here on any non-closed shape. Until then an unadmitted
-    /// role reports `Unsupported`, distinctly from an authoritative
-    /// `KnownEmpty`.
-    /// `ExactFence` is required because a reconstruction closure binds one
-    /// compatible read generation: a fence change must surface as a mismatch,
-    /// never as a previous generation served as current.
+    /// All four operations are scope-bound and `ExactFence`: a reconstruction
+    /// closure binds one compatible read generation, so a fence change must
+    /// surface as a mismatch, never as a previous generation served as current.
+    ///
+    /// Each operation then passes its OWN closed catalogue-shaped check:
+    /// `GetTaskState`, `GetAttentionAndProblems` and
+    /// `GetUnderstandingProjectionInputs` are checked against the store
+    /// catalogue's declared selector set (exact membership, required presence,
+    /// declared text shape) plus the numeric `max_records` bound, and
+    /// `GetCapabilityEvidenceState` keeps the existing closed capability
+    /// validator. Parameter-free requests are now refused here too: the
+    /// catalogue requires the selectors, so an empty map could only fail
+    /// downstream, and a selector-carrying request that is not exactly
+    /// catalogue-shaped fails closed before any transport.
     fn check_reconstruction_capability(request: &NamedReadRequest) -> Result<(), StoreError> {
         if request.scope_id.is_none() {
             return Err(StoreError::InvalidField {
@@ -561,18 +573,57 @@ impl KernelContextReadClient {
                 reason: "reconstruction read requires ExactFence",
             });
         }
-        if request.operation == NamedReadOperation::GetCapabilityEvidenceState
-            && !request.parameters.is_empty()
-        {
-            Self::check_capability_evidence_selectors(request)?;
-        } else if !request.parameters.is_empty() {
-            return Err(StoreError::InvalidField {
-                field: "operation.parameter",
-                reason: "reconstruction read declares no parameters",
-            });
-        }
+        match request.operation {
+            NamedReadOperation::GetTaskState => Self::check_task_state_selectors(request),
+            NamedReadOperation::GetAttentionAndProblems => {
+                Self::check_attention_and_problems_selectors(request)
+            }
+            NamedReadOperation::GetUnderstandingProjectionInputs => {
+                Self::check_projection_input_selectors(request)
+            }
+            NamedReadOperation::GetCapabilityEvidenceState => {
+                Self::check_capability_evidence_selectors(request)
+            }
+            _ => Err(StoreError::UnknownOperation),
+        }?;
         request.validate()?;
         Ok(())
+    }
+
+    /// Checks the closed `GetTaskState` selectors before any transport.
+    ///
+    /// The store catalogue declares exactly `task_id` (required) plus
+    /// `max_records` (required). Membership, required presence and the text
+    /// shape come from that shared declaration, so this gate keeps no second
+    /// parameter list; only the numeric bound the declaration does not carry is
+    /// added here, using the same range every owner handler parses.
+    fn check_task_state_selectors(request: &NamedReadRequest) -> Result<(), StoreError> {
+        check_declared_read_selectors(request.operation, &request.parameters)
+    }
+
+    /// Checks the closed `GetAttentionAndProblems` selectors before any
+    /// transport.
+    ///
+    /// The catalogue declares `max_records` (required) plus an OPTIONAL
+    /// `problem_id`: the key is absent when no specific problem is requested, so
+    /// a present key must still be a non-blank string and a null value is
+    /// refused here rather than sent as a substitute identity.
+    fn check_attention_and_problems_selectors(
+        request: &NamedReadRequest,
+    ) -> Result<(), StoreError> {
+        check_declared_read_selectors(request.operation, &request.parameters)
+    }
+
+    /// Checks the closed `GetUnderstandingProjectionInputs` selectors before any
+    /// transport.
+    ///
+    /// The catalogue declares exactly `selector` (required, the exact source
+    /// selector the handler matches against retained authority-record parameter
+    /// values) plus `max_records` (required). This is a transport selector only:
+    /// admitting it promotes nothing into an admitted Cue array or a
+    /// `cue|negative_memory` enum.
+    fn check_projection_input_selectors(request: &NamedReadRequest) -> Result<(), StoreError> {
+        check_declared_read_selectors(request.operation, &request.parameters)
     }
 
     /// Checks the closed `GetCapabilityEvidenceState` selectors before any
@@ -581,11 +632,19 @@ impl KernelContextReadClient {
     /// mirroring the store catalogue declaration and the memory/Surreal
     /// handler bounds. Any other key, blank skill, or out-of-range bound
     /// fails closed here before transport.
+    ///
+    /// The shared catalogue declaration is also applied, so this validator
+    /// cannot drift from the store's own required/typed view: a numeric
+    /// (non-string) bound is refused by the declared `Subject` shape before the
+    /// decimal parse below. A parameter-free plan is refused too — the
+    /// reconstruction supplies the affordance selectors, and an empty map could
+    /// only fail downstream.
     fn check_capability_evidence_selectors(request: &NamedReadRequest) -> Result<(), StoreError> {
         const SELECTOR_ERROR: StoreError = StoreError::InvalidField {
             field: "operation.parameter",
             reason: "GetCapabilityEvidenceState declares exactly skill_id and max_records",
         };
+        eliot_store_api::validate_typed_read_parameters(request.operation, &request.parameters)?;
         if request.parameters.len() != 2
             || !request.parameters.contains_key("skill_id")
             || !request.parameters.contains_key("max_records")
@@ -655,6 +714,43 @@ impl KernelContextReadClient {
             }
             KernelPortError::NotAdmitted(_) => StoreError::Unavailable,
         }
+    }
+}
+
+/// Checks one reconstruction read against the store catalogue's own declared
+/// selector set, before any transport.
+///
+/// [`eliot_store_api::validate_typed_read_parameters`] is the single authority:
+/// exact membership (an extra or unknown key fails), required presence (a
+/// missing required selector fails) and the declared text shape (a JSON number,
+/// `null`, a blank or a control-bearing string fails). This gate therefore keeps
+/// no second catalogue and no per-read parameter list — it only adds the
+/// numeric restriction the declaration does not carry: `max_records` is a
+/// **decimal string** within `1..=EVIDENCE_PACK_MAX_RECORDS`, the exact range
+/// every owner handler parses.
+///
+/// A parameter-free request fails here: the catalogue declares required
+/// selectors, so an empty map could only be rejected downstream and never
+/// represents a read the owner can serve.
+fn check_declared_read_selectors(
+    operation: NamedReadOperation,
+    parameters: &BTreeMap<String, serde_json::Value>,
+) -> Result<(), StoreError> {
+    eliot_store_api::validate_typed_read_parameters(operation, parameters)?;
+    let raw = parameters
+        .get("max_records")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "reconstruction read declares a required max_records",
+        })?;
+    match raw.parse::<u32>() {
+        Ok(bound) if bound != 0 && bound <= EVIDENCE_PACK_MAX_RECORDS => Ok(()),
+        Ok(_) => Err(StoreError::PayloadTooLarge),
+        Err(_) => Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "max_records must be a positive decimal bound",
+        }),
     }
 }
 
@@ -752,12 +848,12 @@ impl CanonicalReadClient for KernelContextReadClient {
     /// Fresh capability per call: the operation must be `GetEvidencePack`
     /// (scope-bound), `GetCurrentEpistemicPosition` (scope-bound,
     /// `ExactFence`, `position` Subject required), or one of the four
-    /// task-bound reconstruction reads (scope-bound, `ExactFence`, no
-    /// parameters), the request must validate, and its fence must equal the
-    /// currently admitted snapshot fence — otherwise this fails closed before
-    /// transport. The response validates exactly and must echo the requested
-    /// operation and fence. Consistency (stable / exact re-read, churn
-    /// detection) stays with the Governor `ReadService` or
+    /// task-bound reconstruction reads (scope-bound, `ExactFence`, exactly the
+    /// catalogue-declared closed selectors), the request must validate, and its
+    /// fence must equal the currently admitted snapshot fence — otherwise this
+    /// fails closed before transport. The response validates exactly and must
+    /// echo the requested operation and fence. Consistency (stable / exact
+    /// re-read, churn detection) stays with the Governor `ReadService` or
     /// epistemic/reconstruction-composition caller; this method performs no
     /// second implementation.
     async fn execute_named(
@@ -793,9 +889,8 @@ impl CanonicalReadClient for KernelContextReadClient {
 /// surfaces as an exact fence mismatch instead of silent divergence.
 ///
 /// Planning of evidence/position selectors stays with the daemon runtime
-/// planners; this borrow plans only the four parameter-free reconstruction
-/// reads (which do not satisfy the store catalogue's bounded exact selectors
-/// yet — see [`KernelContextReadClient`]'s capability gate) and validates
+/// planners; this borrow plans the four reconstruction reads from the
+/// owner-resolved selectors the caller supplies (issue #2563) and validates
 /// their responses against the borrow-time fence. The borrow-time pin is a
 /// [`KernelContextReadClient::execute_named`]'s call-time fence check: a
 /// response matching neither fails closed, so a previous generation is never
@@ -849,18 +944,23 @@ impl<'a, K: ?Sized, R: ?Sized> ReconstructionReadComposition<'a, K, R> {
         &self.scope
     }
 
-    /// Plans one parameter-free reconstruction read against the pinned fence.
+    /// Plans one T11.3 reconstruction read against the pinned fence, carrying
+    /// the catalogue's exact closed selectors for that operation.
     ///
     /// Only the four T11.3 reconstruction operations plan here; every other
     /// operation fails closed as [`StoreError::UnknownOperation`] before any
-    /// transport. The request carries the borrow-time fence with `ExactFence`
-    /// consistency and no parameters. That shape satisfies this borrow's
-    /// pre-transport gate but not the store catalogue's bounded exact
-    /// selectors, so it reports unadmitted downstream until a follow-up
-    /// threads the closed selectors.
+    /// transport. `parameters` is the owner-resolved selector map the caller
+    /// built (the producer owns the resolved identities; this borrow owns the
+    /// pinned scope and fence), and the request is passed through this client's
+    /// own capability gate before it is returned, so a map that is not exactly
+    /// catalogue-shaped — an extra key, a missing selector, a non-decimal or
+    /// out-of-range `max_records` — is refused by the planner instead of
+    /// travelling. A parameter-free map is refused too: the catalogue requires
+    /// the selectors.
     pub fn plan_role_request(
         &self,
         operation: NamedReadOperation,
+        parameters: BTreeMap<String, Value>,
     ) -> Result<NamedReadRequest, StoreError> {
         if !matches!(
             operation,
@@ -876,9 +976,9 @@ impl<'a, K: ?Sized, R: ?Sized> ReconstructionReadComposition<'a, K, R> {
             scope_id: Some(self.scope.clone()),
             consistency: ReadConsistency::ExactFence,
             state_fence: self.admitted_fence.clone(),
-            parameters: BTreeMap::new(),
+            parameters,
         };
-        request.validate()?;
+        KernelContextReadClient::check_execute_capability(&request)?;
         Ok(request)
     }
 
@@ -989,16 +1089,39 @@ mod tests {
         })
     }
 
+    /// Builds the exact closed catalogue selector set for one reconstruction
+    /// read, so the fixture plans the same shape the real producer sends.
     fn reconstruction_request(
         operation: NamedReadOperation,
         fence: &StateFence,
     ) -> Result<NamedReadRequest, Box<dyn std::error::Error>> {
+        let mut parameters = BTreeMap::new();
+        let bound = json!("8");
+        match operation {
+            NamedReadOperation::GetTaskState => {
+                parameters.insert("task_id".to_owned(), json!("task-one"));
+                parameters.insert("max_records".to_owned(), bound);
+            }
+            NamedReadOperation::GetAttentionAndProblems => {
+                parameters.insert("problem_id".to_owned(), json!("problem-one"));
+                parameters.insert("max_records".to_owned(), bound);
+            }
+            NamedReadOperation::GetUnderstandingProjectionInputs => {
+                parameters.insert("selector".to_owned(), json!("selector-one"));
+                parameters.insert("max_records".to_owned(), bound);
+            }
+            NamedReadOperation::GetCapabilityEvidenceState => {
+                parameters.insert("skill_id".to_owned(), json!("skill-one"));
+                parameters.insert("max_records".to_owned(), bound);
+            }
+            _ => {}
+        }
         Ok(NamedReadRequest {
             operation,
             scope_id: Some(ScopeId::new("governor")?),
             consistency: ReadConsistency::ExactFence,
             state_fence: fence.clone(),
-            parameters: BTreeMap::new(),
+            parameters,
         })
     }
 
@@ -1034,7 +1157,7 @@ mod tests {
     }
 
     #[test]
-    fn reconstruction_capability_requires_scope_exact_fence_and_no_parameters()
+    fn reconstruction_capability_requires_scope_exact_fence_and_closed_selectors()
     -> Result<(), Box<dyn std::error::Error>> {
         let fence = test_fence(1)?;
         for operation in [
@@ -1155,7 +1278,8 @@ mod tests {
             Err(StoreError::PayloadTooLarge)
         ));
 
-        // The other three reconstruction reads still admit no parameters.
+        // The other three reconstruction reads admit only their own closed
+        // selector sets, so the capability pair is refused for them too.
         for operation in [
             NamedReadOperation::GetTaskState,
             NamedReadOperation::GetAttentionAndProblems,
@@ -1328,7 +1452,8 @@ mod tests {
             NamedReadOperation::GetUnderstandingProjectionInputs,
             NamedReadOperation::GetCapabilityEvidenceState,
         ] {
-            let planned = composition.plan_role_request(operation)?;
+            let selectors = reconstruction_request(operation, &fence)?.parameters;
+            let planned = composition.plan_role_request(operation, selectors.clone())?;
             assert_eq!(planned.operation, operation);
             assert_eq!(planned.consistency, ReadConsistency::ExactFence);
             assert_eq!(planned.state_fence, fence);
@@ -1336,7 +1461,16 @@ mod tests {
                 planned.scope_id.as_ref().map(ScopeId::as_str),
                 Some("governor")
             );
-            assert!(planned.parameters.is_empty());
+            // The plan carries the catalogue's closed selector set, not an
+            // empty map, and `max_records` travels as a decimal string.
+            assert_eq!(planned.parameters, selectors);
+            assert!(!planned.parameters.is_empty());
+            assert!(
+                planned
+                    .parameters
+                    .get("max_records")
+                    .is_some_and(serde_json::Value::is_string)
+            );
             KernelContextReadClient::check_execute_capability(&planned)?;
         }
         for operation in [
@@ -1345,10 +1479,27 @@ mod tests {
             NamedReadOperation::GetMailbox,
         ] {
             assert!(matches!(
-                composition.plan_role_request(operation),
+                composition.plan_role_request(operation, BTreeMap::new()),
                 Err(StoreError::UnknownOperation)
             ));
         }
+        // A parameter-free or non-closed map never leaves the planner.
+        assert!(
+            composition
+                .plan_role_request(NamedReadOperation::GetTaskState, BTreeMap::new())
+                .is_err()
+        );
+        assert!(
+            composition
+                .plan_role_request(
+                    NamedReadOperation::GetUnderstandingProjectionInputs,
+                    BTreeMap::from([
+                        ("selector".to_owned(), json!("selector-one")),
+                        ("max_records".to_owned(), json!(8)),
+                    ]),
+                )
+                .is_err()
+        );
         Ok(())
     }
 

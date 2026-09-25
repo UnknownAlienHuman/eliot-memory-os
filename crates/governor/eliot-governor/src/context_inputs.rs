@@ -25,22 +25,42 @@
 //! dependency closure instead of failing the intent gate. Every read uses
 //! `ReadConsistency::ExactFence` with caller-supplied dependency revisions.
 //!
+//! Selector discipline: every role carries the exact closed selector set the
+//! store catalogue declares for its read (issue #2563). The four task-bound
+//! reads are activated in both owner adapters
+//! (`eliot_store_memory::{task_state_payload, attention_problems_payload,
+//! understanding_inputs_payload, capability_evidence_payload}` and their
+//! Surreal twins), so the three repaired reads and the affordances role now
+//! reach real handlers instead of resolving to per-role `Unavailable`. The
+//! request carries no caller-selected scope override, no fabricated `all`
+//! selector and no empty default: a missing required selector is refused by
+//! [`ContextInputsError::RequestInvalid`] before any read is planned.
+//!
 //! Closure discipline (T11.md:77): the dependency heads (`ScopeRevisionView`)
 //! are captured before acquisition and re-read afterwards; bounded churn
 //! fails closed as [`ContextInputsError::SourceHeadsChanged`] rather than
-//! exposing a silently mixed snapshot. There is no retry here.
+//! exposing a silently mixed snapshot. The whole reconstruction is bounded to
+//! one read per role slot (six physical reads, seven slots when the cue and
+//! negative-memory slots deliberately share one source snapshot); there is no
+//! retry loop and no continuation field here — #1729 owns broader coherent
+//! assembly.
 //!
 //! Disposition discipline (`eliot_context_candidates::ProjectionState`):
 //! `KnownEmpty` requires an authoritative completed lookup (an explicit empty
 //! result with an exact truncation/coverage statement). Transport failure,
 //! an unactivated (known-but-unsupported) operation, and a bounded partial
 //! scan are reported as `Unavailable`/`Unknown`/`Partial` — never as empty.
-//! At base only six reads are catalogue-activated (see
-//! `eliot_store_api::operation_catalogue`); `GetTaskState`,
-//! `GetAttentionAndProblems`, `GetUnderstandingProjectionInputs`, and
-//! `GetCapabilityEvidenceState` have no proven handler triple, so those roles
-//! report `Unavailable` distinctly from `KnownEmpty` until the Store-owned
-//! slice (part B/C) activates them.
+//! Each role response is bound to the requested operation, scope, selector and
+//! payload version before it becomes a disposition, so a response answering a
+//! different task/problem/skill is never adopted just because its operation
+//! and fence match.
+//!
+//! Downstream limit, kept explicit: a successful retrieval of a versioned
+//! source envelope is NOT proof of Cue admission, capability qualification or
+//! packet readiness. The four handlers return retained authority-record
+//! envelopes (`{version, <selector>, scope_id, records, provenance}`), not
+//! admitted Cue arrays or qualified capability; binding those envelopes to the
+//! typed cue families and to #1773's capability work is a separate slice.
 
 use std::collections::BTreeMap;
 
@@ -106,21 +126,41 @@ pub enum ContextInputsError {
 /// Closed request for one seven-role reconstruction.
 ///
 /// The fence travels only in the caller [`RequestMetadata`]; dependency
-/// revisions bind the exact-fence reads. Selectors are the exact closed
-/// named-read parameters: `epistemic_position` is the required `position`
-/// selector of `GetCurrentEpistemicPosition`, and `evidence_subject` plus
-/// `evidence_max_records` are the required `subject`/`max_records` selectors
-/// of `GetEvidencePack`. The store catalogue (T11.3 store activation) declares
-/// bounded exact selectors for the remaining reconstruction reads
-/// (`task_id`+`max_records` for `GetTaskState`, optional
-/// `problem_id`+`max_records` for `GetAttentionAndProblems`,
-/// `selector`+`max_records` for `GetUnderstandingProjectionInputs`,
-/// `skill_id`+`max_records` for `GetCapabilityEvidenceState`); this
-/// reconstruction currently acquires those roles with no parameters, so
-/// against the real catalogue they resolve to per-role `Unavailable`
-/// (fail-closed) until a follow-up threads the closed selectors. Cue and
-/// negative-memory roles share the one understanding-projection acquisition;
-/// only the candidate-stage interpretation differs.
+/// revisions bind the exact-fence reads. Every field is an owner-resolved exact
+/// selector taken from the already admitted scope/task/capability request, and
+/// every one maps 1:1 onto the store catalogue's closed parameter set for its
+/// read:
+///
+/// | field | read | catalogue parameters |
+/// |---|---|---|
+/// | `epistemic_position` | `GetCurrentEpistemicPosition` | `position` |
+/// | `evidence_subject`, `evidence_max_records` | `GetEvidencePack` | `subject`, `max_records` |
+/// | `task_id`, `task_max_records` | `GetTaskState` | `task_id`, `max_records` |
+/// | `attention_problem_id`, `attention_max_records` | `GetAttentionAndProblems` | `problem_id` (omitted when no specific problem is requested), `max_records` |
+/// | `projection_selector`, `projection_max_records` | `GetUnderstandingProjectionInputs` (cue activation) | `selector`, `max_records` |
+/// | `negative_memory_selector`, `negative_memory_max_records` | `GetUnderstandingProjectionInputs` (negative memory) | `selector`, `max_records` |
+/// | `affordance_skill_id`, `affordance_max_records` | `GetCapabilityEvidenceState` | `skill_id`, `max_records` |
+///
+/// Each `max_records` is the explicit owner bound
+/// `1..=EVIDENCE_PACK_MAX_RECORDS` and travels as its decimal **string**,
+/// exactly as every owner handler parses it; a JSON number is not a valid
+/// bound.
+///
+/// There is deliberately no caller-selected scope override, no fabricated `all`
+/// selector and no empty default. A required selector the caller cannot resolve
+/// is a typed [`ContextInputsError::RequestInvalid`] prerequisite failure
+/// raised by [`validate`](Self::validate) before any read is planned, never a
+/// permissive fallback.
+///
+/// Wire compatibility and explicit migration: `epistemic_position`,
+/// `evidence_subject` and `evidence_max_records` keep their existing names and
+/// meanings unchanged. The task/attention/projection/affordance members are new
+/// REQUIRED members, so a request serialized before this shape is REFUSED at
+/// this `deny_unknown_fields`/required-member boundary instead of being
+/// silently defaulted to a fabricated selector. No permissive compatibility
+/// path accepts the old wire shape; `attention_problem_id` is the only
+/// member with a default, and its absent value is a declared contract option
+/// ("no specific problem is requested"), not a substituted selector.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextReconstructionRequest {
@@ -134,10 +174,47 @@ pub struct ContextReconstructionRequest {
     pub evidence_subject: String,
     /// Explicit evidence bound (`1..=EVIDENCE_PACK_MAX_RECORDS`).
     pub evidence_max_records: u32,
+    /// Exact task identity for `GetTaskState` (`task_id`).
+    pub task_id: String,
+    /// Explicit task-state bound (`1..=EVIDENCE_PACK_MAX_RECORDS`).
+    pub task_max_records: u32,
+    /// Exact problem identity for `GetAttentionAndProblems`, or `None` when no
+    /// specific problem is requested (the `problem_id` key is then omitted
+    /// rather than sent as null).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_problem_id: Option<String>,
+    /// Explicit attention bound (`1..=EVIDENCE_PACK_MAX_RECORDS`).
+    pub attention_max_records: u32,
+    /// Exact source selector for the cue-activation projection (`selector`).
+    pub projection_selector: String,
+    /// Explicit cue-projection bound (`1..=EVIDENCE_PACK_MAX_RECORDS`).
+    pub projection_max_records: u32,
+    /// Exact source selector for the negative-memory projection (`selector`).
+    ///
+    /// Resolved separately from the cue selector because the two roles may
+    /// address different source sets. It is a required member, never a
+    /// default: when it equals the cue selector (and the cue bound) both roles
+    /// deliberately address one exact source snapshot and a single response may
+    /// serve both slots.
+    pub negative_memory_selector: String,
+    /// Explicit negative-memory-projection bound
+    /// (`1..=EVIDENCE_PACK_MAX_RECORDS`).
+    pub negative_memory_max_records: u32,
+    /// Exact skill identity for the affordances read (`skill_id`).
+    pub affordance_skill_id: String,
+    /// Explicit capability-evidence bound (`1..=EVIDENCE_PACK_MAX_RECORDS`).
+    pub affordance_max_records: u32,
 }
 
 impl ContextReconstructionRequest {
     /// Validates the closed request shape without performing any read.
+    ///
+    /// Every owner-resolved selector must be non-blank text without control
+    /// characters, every explicit bound must be within
+    /// `1..=EVIDENCE_PACK_MAX_RECORDS`, and every dependency revision must be
+    /// non-zero. A refusal here is a typed prerequisite/request failure: the
+    /// reconstruction stops before any transport rather than planning a read
+    /// that could only be rejected downstream.
     pub fn validate(&self) -> Result<(), ContextInputsError> {
         if self
             .dependency_revisions
@@ -148,24 +225,31 @@ impl ContextReconstructionRequest {
                 "dependency revisions must be non-zero".to_owned(),
             ));
         }
-        if self.epistemic_position.trim().is_empty()
-            || self.epistemic_position.chars().any(char::is_control)
-        {
-            return Err(ContextInputsError::RequestInvalid(
-                "epistemic_position must be non-blank text".to_owned(),
-            ));
+        check_text_selector("epistemic_position", &self.epistemic_position)?;
+        check_text_selector("evidence_subject", &self.evidence_subject)?;
+        check_text_selector("task_id", &self.task_id)?;
+        check_text_selector("projection_selector", &self.projection_selector)?;
+        check_text_selector("negative_memory_selector", &self.negative_memory_selector)?;
+        check_text_selector("affordance_skill_id", &self.affordance_skill_id)?;
+        if let Some(problem_id) = &self.attention_problem_id {
+            check_text_selector("attention_problem_id", problem_id)?;
         }
-        if self.evidence_subject.trim().is_empty()
-            || self.evidence_subject.chars().any(char::is_control)
-        {
-            return Err(ContextInputsError::RequestInvalid(
-                "evidence_subject must be non-blank text".to_owned(),
-            ));
-        }
-        if self.evidence_max_records == 0 || self.evidence_max_records > EVIDENCE_PACK_MAX_RECORDS {
-            return Err(ContextInputsError::RequestInvalid(format!(
-                "evidence_max_records must be within 1..={EVIDENCE_PACK_MAX_RECORDS}"
-            )));
+        for (field, bound) in [
+            ("evidence_max_records", self.evidence_max_records),
+            ("task_max_records", self.task_max_records),
+            ("attention_max_records", self.attention_max_records),
+            ("projection_max_records", self.projection_max_records),
+            (
+                "negative_memory_max_records",
+                self.negative_memory_max_records,
+            ),
+            ("affordance_max_records", self.affordance_max_records),
+        ] {
+            if bound == 0 || bound > EVIDENCE_PACK_MAX_RECORDS {
+                return Err(ContextInputsError::RequestInvalid(format!(
+                    "{field} must be within 1..=EVIDENCE_PACK_MAX_RECORDS"
+                )));
+            }
         }
         Ok(())
     }
@@ -296,6 +380,12 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
     ///
     /// Per-role provider failures become per-role dispositions; only a bad
     /// request, a missing closure, or observed churn fails the whole call.
+    ///
+    /// The whole request is bounded: one read per role slot, no retry loop and
+    /// no continuation field. Seven role slots are served by six physical reads
+    /// only when the cue and negative-memory slots deliberately address one
+    /// exact source snapshot; a differing selector gets its own read so one
+    /// unrelated result is never relabelled into both roles.
     pub async fn reconstruct(
         &self,
         ctx: &RequestMetadata,
@@ -319,7 +409,17 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                 ContextInputsError::ClosureUnavailable(format!("closure order heads: {error}"))
             })?;
         let task_frame = self
-            .acquire_state(ctx, request, &ordering, NamedReadOperation::GetTaskState)
+            .acquire_state(
+                ctx,
+                request,
+                &ordering,
+                NamedReadOperation::GetTaskState,
+                task_state_parameters(request)?,
+                SelectorBinding {
+                    key: "task_id",
+                    expected: Some(&request.task_id),
+                },
+            )
             .await?;
         let attention = self
             .acquire_state(
@@ -327,19 +427,44 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                 request,
                 &ordering,
                 NamedReadOperation::GetAttentionAndProblems,
+                attention_parameters(request)?,
+                SelectorBinding {
+                    key: "problem_id",
+                    expected: request.attention_problem_id.as_deref(),
+                },
             )
             .await?;
-        let (epistemic, epistemic_readback) =
-            self.acquire_epistemic(ctx, request, &ordering).await?;
+        let (epistemic, epistemic_readback) = self.acquire_epistemic(ctx, request, &ordering).await?;
         let cue = self
-            .acquire_projection_inputs(ctx, request, &ordering)
+            .acquire_projection_inputs(
+                ctx,
+                request,
+                &ordering,
+                ROLE_CUE_ACTIVATION,
+                &request.projection_selector,
+                request.projection_max_records,
+            )
             .await?;
-        // Negative memory reads the same closed projection; only the
-        // candidate-stage interpretation differs (kept separate so the two
-        // slots stay statically identifiable per inputs.rs:1-13).
-        let negative_memory = self
-            .acquire_projection_inputs(ctx, request, &ordering)
-            .await?;
+        // Negative memory reuses the cue read only when it deliberately
+        // addresses the SAME exact source snapshot — identical selector and
+        // bound. A different source set is read separately, so the two slots
+        // stay separately identified (inputs.rs:1-13) without one unrelated
+        // result being relabelled into both roles.
+        let negative_memory = if request.negative_memory_selector == request.projection_selector
+            && request.negative_memory_max_records == request.projection_max_records
+        {
+            cue.clone()
+        } else {
+            self.acquire_projection_inputs(
+                ctx,
+                request,
+                &ordering,
+                ROLE_NEGATIVE_MEMORY,
+                &request.negative_memory_selector,
+                request.negative_memory_max_records,
+            )
+            .await?
+        };
         let evidence = self.acquire_evidence(ctx, request, &ordering).await?;
         let affordances = self
             .acquire_state(
@@ -347,6 +472,11 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                 request,
                 &ordering,
                 NamedReadOperation::GetCapabilityEvidenceState,
+                affordance_parameters(request)?,
+                SelectorBinding {
+                    key: "skill_id",
+                    expected: Some(&request.affordance_skill_id),
+                },
             )
             .await?;
         let heads_after = self.scope_heads(ctx, request).await?;
@@ -412,12 +542,22 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         Ok(heads)
     }
 
+    /// Acquires one `ReadApi::state` role with its exact closed selectors.
+    ///
+    /// `parameters` is the catalogue's own selector set for `operation`, built
+    /// from the owner-resolved request. `binding` names the selector the
+    /// handler must echo back, so the response is bound to the requested
+    /// operation, scope, selector and payload version before it becomes a
+    /// disposition: a response answering a different task, problem or skill is
+    /// `Unavailable` even when its operation and fence match.
     async fn acquire_state(
         &self,
         ctx: &RequestMetadata,
         request: &ContextReconstructionRequest,
         ordering: &ReadOrderingBinding,
         operation: NamedReadOperation,
+        parameters: NamedParameters,
+        binding: SelectorBinding<'_>,
     ) -> Result<RoleAcquisition, ContextInputsError> {
         match self
             .reads
@@ -429,15 +569,15 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                     consistency: ReadConsistency::ExactFence,
                     dependency_revisions: request.dependency_revisions.clone(),
                     ordering: ordering.clone(),
-                    parameters: NamedParameters::new(),
+                    parameters,
                     provenance_handles: Vec::new(),
                 },
             )
             .await
         {
             Ok(response) => Ok(RoleAcquisition {
-                operation: response.view.operation,
-                state: classify_opaque_payload(&response.view.payload),
+                operation,
+                state: classify_role_envelope(&response.view.payload, &request.scope_id, binding),
                 payload: Some(response.view.payload),
                 revision_heads: response.view.revision_heads,
                 identity: Some(response.identity),
@@ -452,13 +592,24 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         }
     }
 
+    /// Acquires one `GetUnderstandingProjectionInputs` role through the
+    /// admitted `ContextReconstruction` query intent.
+    ///
+    /// The cue-activation and negative-memory slots call this separately with
+    /// their own owner-resolved source selector; only a deliberately identical
+    /// selector is served from one physical read. The echoed `selector` binds
+    /// the response to the exact source snapshot it was asked for.
     async fn acquire_projection_inputs(
         &self,
         ctx: &RequestMetadata,
         request: &ContextReconstructionRequest,
         ordering: &ReadOrderingBinding,
+        role: &'static str,
+        selector: &str,
+        max_records: u32,
     ) -> Result<RoleAcquisition, ContextInputsError> {
         let operation = NamedReadOperation::GetUnderstandingProjectionInputs;
+        let parameters = projection_parameters(role, selector, max_records)?;
         match self
             .reads
             .bound_query(
@@ -470,15 +621,22 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                     consistency: ReadConsistency::ExactFence,
                     dependency_revisions: request.dependency_revisions.clone(),
                     ordering: ordering.clone(),
-                    parameters: NamedParameters::new(),
+                    parameters,
                     provenance_handles: Vec::new(),
                 },
             )
             .await
         {
             Ok(response) => Ok(RoleAcquisition {
-                operation: response.view.operation,
-                state: classify_opaque_payload(&response.view.payload),
+                operation,
+                state: classify_role_envelope(
+                    &response.view.payload,
+                    &request.scope_id,
+                    SelectorBinding {
+                        key: "selector",
+                        expected: Some(selector),
+                    },
+                ),
                 payload: Some(response.view.payload),
                 revision_heads: response.view.revision_heads,
                 identity: Some(response.identity),
@@ -617,6 +775,137 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             identity: Some(response.identity),
         })
     }
+}
+
+/// Binds one role's response to the exact selector it was requested with.
+///
+/// Every task-bound owner handler echoes the selector it matched
+/// (`task_id`, `problem_id`, `selector`, `skill_id`), so the echoed value is
+/// the response's own proof of which source snapshot it answers. `expected:
+/// None` requires the handler's exact null — the declared "no specific problem
+/// requested" result of `GetAttentionAndProblems` — and never a substituted
+/// identity.
+#[derive(Clone, Copy, Debug)]
+struct SelectorBinding<'a> {
+    /// Payload member the owner handler echoes.
+    key: &'static str,
+    /// Exact value that member must carry for the requested selector.
+    expected: Option<&'a str>,
+}
+
+/// The single versioned source-envelope version the four task-bound read
+/// handlers emit (`TASK_STATE_PAYLOAD_VERSION`,
+/// `ATTENTION_PROBLEMS_PAYLOAD_VERSION`,
+/// `UNDERSTANDING_INPUTS_PAYLOAD_VERSION` and
+/// `CAPABILITY_EVIDENCE_PAYLOAD_VERSION` in both the memory and Surreal owner
+/// adapters). A different version is `Unavailable`, never coerced.
+const ROLE_ENVELOPE_VERSION: u64 = 1;
+
+/// Renders one explicit bound as the decimal string every owner handler parses.
+///
+/// The store catalogue declares `max_records` as text
+/// ([`eliot_store_api::operation_parameters`]); a JSON number is refused
+/// downstream, so the producer never emits one.
+fn decimal_bound(max_records: u32) -> Value {
+    Value::String(max_records.to_string())
+}
+
+/// Wraps one exact owner-resolved selector map as closed named selectors.
+///
+/// The map is the catalogue's own selector set for the read; the wrapper proves
+/// the entries are bounded closed scalars and never a nested filter. A refusal
+/// is a typed caller-shape rejection ([`ContextInputsError::RequestRejected`]),
+/// not a role disposition.
+fn closed_parameters(
+    role: &'static str,
+    parameters: BTreeMap<String, Value>,
+) -> Result<NamedParameters, ContextInputsError> {
+    NamedParameters::from_map(parameters)
+        .map_err(|error| ContextInputsError::RequestRejected(bounded_reason(role, error)))
+}
+
+/// Builds the exact `GetTaskState` selector map (`task_id`, `max_records`).
+fn task_state_parameters(
+    request: &ContextReconstructionRequest,
+) -> Result<NamedParameters, ContextInputsError> {
+    closed_parameters(
+        "invalid task frame selectors",
+        BTreeMap::from([
+            ("task_id".to_owned(), Value::String(request.task_id.clone())),
+            (
+                "max_records".to_owned(),
+                decimal_bound(request.task_max_records),
+            ),
+        ]),
+    )
+}
+
+/// Builds the exact `GetAttentionAndProblems` selector map.
+///
+/// `max_records` is always present; the optional `problem_id` key is OMITTED
+/// entirely when no specific problem is requested, because the catalogue
+/// declares it optional and a null value is not a closed selector.
+fn attention_parameters(
+    request: &ContextReconstructionRequest,
+) -> Result<NamedParameters, ContextInputsError> {
+    let mut parameters = BTreeMap::from([(
+        "max_records".to_owned(),
+        decimal_bound(request.attention_max_records),
+    )]);
+    if let Some(problem_id) = &request.attention_problem_id {
+        parameters.insert("problem_id".to_owned(), Value::String(problem_id.clone()));
+    }
+    closed_parameters("invalid critical attention selectors", parameters)
+}
+
+/// Builds the exact `GetUnderstandingProjectionInputs` selector map
+/// (`selector`, `max_records`) for one resolved source set.
+fn projection_parameters(
+    role: &'static str,
+    selector: &str,
+    max_records: u32,
+) -> Result<NamedParameters, ContextInputsError> {
+    closed_parameters(
+        role,
+        BTreeMap::from([
+            ("selector".to_owned(), Value::String(selector.to_owned())),
+            ("max_records".to_owned(), decimal_bound(max_records)),
+        ]),
+    )
+}
+
+/// Builds the exact `GetCapabilityEvidenceState` selector map (`skill_id`,
+/// `max_records`) that the Kernel capability-evidence check already validates.
+fn affordance_parameters(
+    request: &ContextReconstructionRequest,
+) -> Result<NamedParameters, ContextInputsError> {
+    closed_parameters(
+        "invalid affordance selectors",
+        BTreeMap::from([
+            (
+                "skill_id".to_owned(),
+                Value::String(request.affordance_skill_id.clone()),
+            ),
+            (
+                "max_records".to_owned(),
+                decimal_bound(request.affordance_max_records),
+            ),
+        ]),
+    )
+}
+
+/// Rejects a blank or control-bearing owner-resolved selector.
+///
+/// Applied before any read is planned so a caller that cannot resolve a
+/// required identity gets a typed prerequisite failure instead of a request
+/// that would only be refused downstream.
+fn check_text_selector(field: &'static str, value: &str) -> Result<(), ContextInputsError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(ContextInputsError::RequestInvalid(format!(
+            "{field} must be non-blank text"
+        )));
+    }
+    Ok(())
 }
 
 /// Fixed explicit intent for every `ContextReconstruction` query.
@@ -763,13 +1052,64 @@ fn classify_read_outcome(outcome: ReadOutcome) -> ProjectionState {
     }
 }
 
-/// Classifies an opaque role payload: only an explicit null is an
-/// authoritative empty; any present value is complete.
-fn classify_opaque_payload(payload: &Value) -> ProjectionState {
-    if payload.is_null() {
-        ProjectionState::KnownEmpty
-    } else {
-        ProjectionState::Complete
+/// Classifies one task-bound role payload against the exact selector it answers.
+///
+/// The four activated handlers return a versioned source envelope
+/// (`{version, <selector>, scope_id, records, provenance}`) over retained
+/// authority records — not an admitted Cue array, a qualified capability view or
+/// a ready packet. A successful retrieval is therefore bound but not promoted.
+///
+/// `KnownEmpty` requires an authoritative completed lookup for the REQUESTED
+/// selector: zero records with `truncated: false` and matching totals. A bound
+/// the store truncated is `Partial`, records without a describing provenance
+/// are `Unknown`, and a substituted scope, selector or payload version is
+/// `Unavailable` — a matching operation and fence are never enough.
+fn classify_role_envelope(
+    payload: &Value,
+    scope: &ScopeId,
+    binding: SelectorBinding<'_>,
+) -> ProjectionState {
+    let unavailable = |detail: &str| ProjectionState::Unavailable {
+        reason: bounded_reason("role payload fails its contract", detail),
+    };
+    if payload.get("version").and_then(Value::as_u64) != Some(ROLE_ENVELOPE_VERSION) {
+        return unavailable("unsupported role payload version");
+    }
+    if payload.get("scope_id").and_then(Value::as_str) != Some(scope.as_str()) {
+        return unavailable("role scope mismatch");
+    }
+    match (payload.get(binding.key), binding.expected) {
+        (Some(echoed), Some(expected)) if echoed.as_str() == Some(expected) => {}
+        (Some(Value::Null), None) => {}
+        _ => return unavailable("role selector mismatch"),
+    }
+    let Some(records) = payload.get("records").and_then(Value::as_array) else {
+        return unavailable("role payload has no records array");
+    };
+    let provenance = payload.get("provenance");
+    let truncated = provenance
+        .and_then(|provenance| provenance.get("truncated"))
+        .and_then(Value::as_bool);
+    let matched = provenance
+        .and_then(|provenance| provenance.get("matched_total"))
+        .and_then(Value::as_u64);
+    let returned = provenance
+        .and_then(|provenance| provenance.get("returned"))
+        .and_then(Value::as_u64);
+    let count = u64::try_from(records.len()).unwrap_or(u64::MAX);
+    match (truncated, matched, returned) {
+        (Some(false), Some(0), Some(0)) if records.is_empty() => ProjectionState::KnownEmpty,
+        (Some(false), Some(matched), Some(returned))
+            if matched == returned && returned == count =>
+        {
+            ProjectionState::Complete
+        }
+        (Some(true), _, _) => ProjectionState::Partial {
+            reason: "role payload truncated at the declared bound".to_owned(),
+        },
+        _ => ProjectionState::Unknown {
+            reason: "role provenance does not authoritatively describe the records".to_owned(),
+        },
     }
 }
 
@@ -1001,6 +1341,16 @@ mod reconstruction_tests {
             epistemic_position: "position-a".to_owned(),
             evidence_subject: "subject-a".to_owned(),
             evidence_max_records: 8,
+            task_id: "task-a".to_owned(),
+            task_max_records: 8,
+            attention_problem_id: Some("problem-a".to_owned()),
+            attention_max_records: 8,
+            projection_selector: "selector-a".to_owned(),
+            projection_max_records: 8,
+            negative_memory_selector: "selector-a".to_owned(),
+            negative_memory_max_records: 8,
+            affordance_skill_id: "skill-a".to_owned(),
+            affordance_max_records: 8,
         })
     }
 
