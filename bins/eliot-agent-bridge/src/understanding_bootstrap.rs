@@ -156,6 +156,29 @@ pub struct BootstrapContext {
     pub role_lease_ref: String,
     pub state_fence_ref: String,
     pub governance: GovernanceEvidence,
+    /// Workspace instance identity carried from the canonical receipt.
+    ///
+    /// Opaque owner handle identifying the exact workspace instance the
+    /// receipt was compiled for (I4.4.1 `repository_lineage_and_workspace_
+    /// instance`). Carried verbatim so a changed worktree stays
+    /// representable in the projection; instance agreement itself is
+    /// enforced by the Governor compiler and the attach seal, never by
+    /// parsing this handle at the bridge.
+    #[serde(default)]
+    pub workspace_instance_ref: String,
+    /// Projection source identity carried from the canonical receipt.
+    ///
+    /// Opaque owner handle naming the source whose generation below was
+    /// observed; carried verbatim, never parsed.
+    #[serde(default)]
+    pub projection_source_ref: String,
+    /// Projection generation carried from the canonical receipt.
+    ///
+    /// Zero when an older producer did not state one; carried verbatim so
+    /// projection lag stays representable. Freshness adjudication stays
+    /// with the Governor readiness owner.
+    #[serde(default)]
+    pub projection_generation: u64,
     /// Selected qualified route profile reference (opaque owner handle).
     ///
     /// Carried so the default bootstrap preserves the route profile the
@@ -208,6 +231,9 @@ impl BootstrapContext {
         governance: GovernanceEvidence,
         route_profile_ref: String,
         decision_safety_floor_refs: Vec<String>,
+        workspace_instance_ref: String,
+        projection_source_ref: String,
+        projection_generation: u64,
         supported_count: u32,
         verified_count: u32,
         candidate_count: u32,
@@ -229,6 +255,9 @@ impl BootstrapContext {
             governance,
             route_profile_ref,
             decision_safety_floor_refs,
+            workspace_instance_ref,
+            projection_source_ref,
+            projection_generation,
             supported_count,
             verified_count,
             candidate_count,
@@ -278,6 +307,15 @@ pub struct UnderstandingBootstrap {
     pub role_lease_ref: String,
     pub state_fence_ref: String,
     pub current_assessment: CurrentAssessment,
+    /// Workspace instance identity projected from the composed context.
+    #[serde(default)]
+    pub workspace_instance_ref: String,
+    /// Projection source identity projected from the composed context.
+    #[serde(default)]
+    pub projection_source_ref: String,
+    /// Projection generation projected from the composed context.
+    #[serde(default)]
+    pub projection_generation: u64,
     pub route_profile_ref: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decision_safety_floor_refs: Vec<String>,
@@ -384,6 +422,27 @@ fn validate_context(context: &BootstrapContext) -> Result<(), BootstrapError> {
     }
     if !context.route_profile_ref.is_empty() {
         non_blank(&context.route_profile_ref, "ROUTE_PROFILE_MISSING")?;
+    }
+    if context.workspace_instance_ref.len() > MAX_HANDLE_LEN {
+        return Err(BootstrapError::new(
+            "WORKSPACE_INSTANCE_BOUND",
+            "workspace instance reference exceeds bound",
+        ));
+    }
+    if !context.workspace_instance_ref.is_empty() {
+        non_blank(
+            &context.workspace_instance_ref,
+            "WORKSPACE_INSTANCE_MISSING",
+        )?;
+    }
+    if context.projection_source_ref.len() > MAX_HANDLE_LEN {
+        return Err(BootstrapError::new(
+            "PROJECTION_SOURCE_BOUND",
+            "projection source reference exceeds bound",
+        ));
+    }
+    if !context.projection_source_ref.is_empty() {
+        non_blank(&context.projection_source_ref, "PROJECTION_SOURCE_MISSING")?;
     }
     bounded_list(
         &context.decision_safety_floor_refs,
@@ -655,6 +714,9 @@ pub fn get_understanding_bootstrap(
         role_lease_ref: context.role_lease_ref.clone(),
         state_fence_ref: context.state_fence_ref.clone(),
         current_assessment,
+        workspace_instance_ref: context.workspace_instance_ref.clone(),
+        projection_source_ref: context.projection_source_ref.clone(),
+        projection_generation: context.projection_generation,
         route_profile_ref: context.route_profile_ref.clone(),
         decision_safety_floor_refs: context.decision_safety_floor_refs.clone(),
         supported_count: context.supported_count,
@@ -741,6 +803,9 @@ mod tests {
                 "floor:goal-scope-authority".to_owned(),
                 "floor:task-selection-proof".to_owned(),
             ],
+            workspace_instance_ref: "instance:a".to_owned(),
+            projection_source_ref: "projection-source-1".to_owned(),
+            projection_generation: 9,
             supported_count: 4,
             verified_count: 3,
             candidate_count: 1,
@@ -1129,6 +1194,9 @@ mod tests {
                 "floor:goal-scope-authority".to_owned(),
                 "floor:task-selection-proof".to_owned(),
             ],
+            "instance:a".to_owned(),
+            "projection-source-1".to_owned(),
+            9,
             4,
             3,
             1,

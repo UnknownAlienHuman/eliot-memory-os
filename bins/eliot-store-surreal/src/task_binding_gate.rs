@@ -22,8 +22,21 @@
 //!   different task than the admitted context, or carries no exact handle
 //!   rejects with the same stable codes instead of passing as
 //!   `NotTaskRelative`.
+//! - Every remaining task-bearing transition — any other activated operation
+//!   whose transition names a task (`ApplyEpistemicRevision`, whose Governor
+//!   envelope always carries the task plus evidence records, and
+//!   `ApplyLifecyclePolicy`, whose envelope carries the admitted task plus
+//!   the verifier/approval refs, or any future task-naming family) —
+//!   requires the general task binding: the context and transition task
+//!   identities agree, the fences agree, and at least one exact evidence
+//!   handle is present. A bare `task_id` with no exact handle, a task the
+//!   admitted context does not name, or a fence move rejects with the same
+//!   stable codes instead of passing as `NotTaskRelative`.
 //! - There is no latest-task, open-task, or resolver-guess fallback: ambiguity
-//!   stays cold, mismatch fails closed.
+//!   stays cold, mismatch fails closed. Task-free writes (no task identity on
+//!   the transition) stay [`GateDisposition::NotTaskRelative`]: capture-first
+//!   candidate rows, audit appends, and the sealed reserved-write mechanism
+//!   (issue #991, separate path) are not task-bound writes.
 //!
 //! This module is pure and store-neutral. It never touches the provider; the
 //! composition calls [`gate_apply`] at the top of its canonical write path and
@@ -159,14 +172,16 @@ fn has_exact_binding_refs(transition: &PreparedTransition) -> bool {
     seen.len() >= 2
 }
 
-/// Requires at least one exact Governor finish-authority handle.
+/// Requires at least one exact task-selection evidence handle.
 ///
 /// Finish envelopes carry exactly one finish-authority handle (not the
-/// revision/digest pair of capture/control writes), so the pair rule of
-/// [`has_exact_binding_refs`] cannot apply here: one exact handle plus task
-/// and fence agreement is the finish binding. Every carried handle must still
-/// be exact; a blank, untrimmed, or control-bearing handle fails the binding.
-fn has_finish_authority_ref(transition: &PreparedTransition) -> bool {
+/// revision/digest pair of capture/control writes), and the general
+/// task-bearing families carry their single-class authority handles the same
+/// way — so the pair rule of [`has_exact_binding_refs`] cannot apply here:
+/// one exact handle plus task and fence agreement is the binding. Every
+/// carried handle must still be exact; a blank, untrimmed, or
+/// control-bearing handle fails the binding.
+fn has_single_authority_ref(transition: &PreparedTransition) -> bool {
     if transition.required_proof_and_approval_refs.is_empty() {
         return false;
     }
@@ -195,7 +210,17 @@ fn has_finish_authority_ref(transition: &PreparedTransition) -> bool {
 ///   names a different task than the admitted context, or carries no exact
 ///   handle rejects with the same stable codes; it never passes as
 ///   `NotTaskRelative`.
-/// - All other operations are [`GateDisposition::NotTaskRelative`].
+/// - Any remaining transition that names a task is a task-bearing write in a
+///   family without a dedicated pair rule (`ApplyEpistemicRevision` always
+///   carries the task plus evidence records; `ApplyLifecyclePolicy` carries
+///   the admitted task plus verifier/approval refs) and requires the general
+///   task binding: context/transition task identities present and equal,
+///   fences equal, and at least one exact evidence handle present. A bare
+///   `task_id` with no exact handle, a task the admitted context does not
+///   name, or a fence move rejects with the same stable codes; it never
+///   passes as `NotTaskRelative`.
+/// - All other operations (no task identity on the transition) are
+///   [`GateDisposition::NotTaskRelative`].
 ///
 /// A transition that mixes operation families answers the strictest
 /// applicable rule: a finish piggybacked on a control or task-bound capture
@@ -273,6 +298,29 @@ pub fn gate_apply(
         }
     }
 
+    // Any remaining task-bearing write: the transition names a task in a
+    // family without a dedicated rule above. Task-bound reusable memory,
+    // epistemic revisions, and lifecycle actions require exact current
+    // TaskSelectionEvidence just like capture, control, and finish — a bare
+    // task identity with no exact evidence handle is never enough to
+    // promote, and a task the admitted context does not name (or a moved
+    // fence) fails closed. Task-free transitions fall through to
+    // `NotTaskRelative` below.
+    if let Some(task) = transition.task_id.as_deref() {
+        let Some(ctx) = context.task_id.as_ref().map(TaskId::as_str) else {
+            return Err(TaskBindingRejection::selection_required(
+                "task-bearing write requires current TaskSelectionEvidence",
+            ));
+        };
+        if task != ctx {
+            return Err(TaskBindingRejection::scope_incompatible(
+                "task-bearing write names a different task or WorkScope than the admitted context",
+            ));
+        }
+        require_general_task_binding(context, transition, task)?;
+        return Ok(GateDisposition::TaskBound);
+    }
+
     Ok(GateDisposition::NotTaskRelative)
 }
 
@@ -325,9 +373,44 @@ fn require_finish_binding(
             "finish binding handle is blank",
         ));
     }
-    if !has_finish_authority_ref(transition) {
+    if !has_single_authority_ref(transition) {
         return Err(TaskBindingRejection::selection_required(
             "finish write requires the exact Governor finish-authority evidence handle",
+        ));
+    }
+    Ok(())
+}
+
+/// Requires the exact binding for one task-bearing write in a family without
+/// a dedicated pair rule.
+///
+/// `ApplyEpistemicRevision` envelopes always carry the task plus the evidence
+/// records observed upstream, and `ApplyLifecyclePolicy` envelopes always
+/// carry the admitted task plus the verifier (and optional human-approval)
+/// refs: neither family carries the revision/digest handle pair of
+/// capture/control writes, so the pair rule of [`has_exact_binding_refs`]
+/// cannot apply here. One exact evidence handle plus task and fence agreement
+/// is the general binding — the same grade as the finish binding — so a bare
+/// `task_id` can never promote a write the dedicated arms do not cover.
+/// Handle *values* stay verified upstream, as for every other family.
+fn require_general_task_binding(
+    context: &RequestMeta,
+    transition: &PreparedTransition,
+    task_id: &str,
+) -> Result<(), TaskBindingRejection> {
+    if context.state_fence != transition.state_fence {
+        return Err(TaskBindingRejection::selection_required(
+            "task binding fence is not the current State Fence",
+        ));
+    }
+    if task_id.trim().is_empty() {
+        return Err(TaskBindingRejection::selection_required(
+            "task binding handle is blank",
+        ));
+    }
+    if !has_single_authority_ref(transition) {
+        return Err(TaskBindingRejection::selection_required(
+            "task-bearing write requires at least one exact task-selection evidence handle",
         ));
     }
     Ok(())
