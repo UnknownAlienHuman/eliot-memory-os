@@ -6,8 +6,18 @@ use crate::{CueBinding, ProjectId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Decoder: derived adjacently tagged (`kind`/`body`) enum. Unknown envelope
+/// keys are refused; duplicate `kind`/`body` keys were already refused by the
+/// derived visitor, as were unknown variants. Nine variants retained with the
+/// existing layout and accessors; nested bodies stay with their
+/// behavior/concept owners (#941).
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "body", rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum UlArtifact {
     MiningRun(MiningRun),
     HotspotScore(HotspotScore),
