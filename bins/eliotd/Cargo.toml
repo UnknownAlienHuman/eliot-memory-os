@@ -62,6 +62,7 @@ eliot-runtime-contracts.workspace = true
 eliot-security-contracts.workspace = true
 eliot-skill.workspace = true
 eliot-store-api.workspace = true
+eliot-swarm.workspace = true
 eliot-understanding-assessment.workspace = true
 eliot-watchdog-core.workspace = true
 eliot-workscope.workspace = true
