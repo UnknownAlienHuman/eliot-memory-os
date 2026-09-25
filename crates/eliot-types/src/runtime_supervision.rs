@@ -1,11 +1,67 @@
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use time::OffsetDateTime;
 
 pub const OPERATION_RUNTIME_CHECKPOINT_SCHEMA_VERSION: &str = "eliot-operation-runtime-v1";
 pub const OPERATION_RESTART_WINDOW_SCHEMA_VERSION: &str = "eliot-operation-restart-window-v1";
 pub const SEAL_STAGING_CHECKPOINT_SCHEMA_VERSION: &str = "eliot-seal-staging-checkpoint-v1";
 pub const RUNTIME_INTEGRITY_REPORT_SCHEMA_VERSION: &str = "eliot-runtime-integrity-v1";
+
+/// Bounded refusal for a control-wal schema version this build does not own.
+///
+/// The durable control wal is reloaded verbatim on restart, so a record written
+/// under an incompatible schema must fail closed at the decoder instead of
+/// being read as a current generation, phase, dispatch or staging state. The
+/// message is fixed and never echoes the received version back onto an
+/// operator surface.
+fn unsupported_schema_version<E>(expected: &str) -> E
+where
+    E: de::Error,
+{
+    E::custom(format!("unsupported schema version; expected {expected}"))
+}
+
+fn deserialize_operation_runtime_schema_version<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value == OPERATION_RUNTIME_CHECKPOINT_SCHEMA_VERSION {
+        Ok(value)
+    } else {
+        Err(unsupported_schema_version(
+            OPERATION_RUNTIME_CHECKPOINT_SCHEMA_VERSION,
+        ))
+    }
+}
+
+fn deserialize_restart_window_schema_version<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value == OPERATION_RESTART_WINDOW_SCHEMA_VERSION {
+        Ok(value)
+    } else {
+        Err(unsupported_schema_version(
+            OPERATION_RESTART_WINDOW_SCHEMA_VERSION,
+        ))
+    }
+}
+
+fn deserialize_seal_staging_schema_version<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value == SEAL_STAGING_CHECKPOINT_SCHEMA_VERSION {
+        Ok(value)
+    } else {
+        Err(unsupported_schema_version(
+            SEAL_STAGING_CHECKPOINT_SCHEMA_VERSION,
+        ))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +136,7 @@ pub enum AdapterCircuitState {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationRuntimeCheckpoint {
+    #[serde(deserialize_with = "deserialize_operation_runtime_schema_version")]
     pub schema_version: String,
     pub operation_id: String,
     pub invocation_id: Option<String>,
@@ -128,6 +185,7 @@ impl OperationRuntimeCheckpoint {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationRestartWindow {
+    #[serde(deserialize_with = "deserialize_restart_window_schema_version")]
     pub schema_version: String,
     pub key: String,
     pub restart_timestamps: Vec<String>,
@@ -156,6 +214,7 @@ pub enum SealStagingState {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SealStagingCheckpoint {
+    #[serde(deserialize_with = "deserialize_seal_staging_schema_version")]
     pub schema_version: String,
     pub seal_attempt_id: String,
     pub run_id: String,
