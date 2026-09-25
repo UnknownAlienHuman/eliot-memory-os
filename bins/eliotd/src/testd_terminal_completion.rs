@@ -25,6 +25,24 @@ fn completion_error(error: impl std::fmt::Display) -> DaemonError {
     DaemonError::Lifecycle(format!("TestD terminal completion: {error}"))
 }
 
+/// Denies one terminal material commit when the admitted identity carries no
+/// task (issue #1789 A1, task-binding leg production consult).
+///
+/// Both terminal legs publish canonical Material effects, so the task-binding
+/// leg of the material-readiness gate is enforced with the gate's own typed
+/// directive before anything launches. This mirrors the full evaluator's
+/// no-task verdict (`TASK_SELECTION_REQUIRED`, missing
+/// `current_task_contract`); the remaining legs (coverage, truth surface,
+/// verifier, authority route, lease, guard currency) have no production
+/// producer yet and stay with the existing authorities (admitted identity,
+/// task owner, `#1787` guard).
+fn no_task_material_denial(context: &str) -> DaemonError {
+    completion_error(format!(
+        "material readiness denies {context}: {}; missing: current_task_contract",
+        eliot_workscope::MaterialReadinessDirective::TaskSelectionRequired.kind_str()
+    ))
+}
+
 fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -218,7 +236,7 @@ impl DaemonComposition {
             .metadata
             .task_id
             .clone()
-            .ok_or_else(|| completion_error("admitted request has no task id"))?;
+            .ok_or_else(|| no_task_material_denial("TestD terminal publication"))?;
         let task_revision = binding
             .request_identity
             .request
@@ -354,6 +372,12 @@ impl DaemonComposition {
     ) -> Result<WriteReceipt, DaemonError> {
         let identity = &evidence.request_identity;
         let job = &evidence.job;
+        // Issue #1789 A1: both legs below publish canonical Material effects,
+        // so a missing admitted task denies the whole completion here with
+        // the readiness gate's typed directive before either leg launches.
+        if identity.request.metadata.task_id.is_none() {
+            return Err(no_task_material_denial("TestD terminal completion"));
+        }
         // Boxed: the committed receipt carries the full issue-#18 digest
         // bindings and is held across the finish await, so keeping it inline
         // would push this future past the large-future bound. Same value, same
