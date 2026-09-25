@@ -158,35 +158,34 @@ pub(crate) fn build_task_controller_history_record(
 /// must present an owner-validated native document and the exact read fence;
 /// this type computes the content and read digests instead of trusting a
 /// caller-supplied projection envelope.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub struct CampaignOwnerSourceInput {
     /// Closed owner-specific publisher selected by the owning transition.
-    pub publisher: CampaignSourcePublisher,
+    publisher: CampaignSourcePublisher,
     /// Exact source role.
-    pub role: CampaignSourceRole,
+    role: CampaignSourceRole,
     /// Exact owner identity.
-    pub owner_id: OwnerId,
+    owner_id: OwnerId,
     /// Exact owner-native record identity.
-    pub record_id: CampaignOwnerRecordId,
+    record_id: CampaignOwnerRecordId,
     /// Exact owner-native revision.
-    pub revision: CampaignOwnerRevision,
+    revision: CampaignOwnerRevision,
     /// Fence captured by the owner row.
-    pub state_fence: StateFence,
+    state_fence: StateFence,
     /// Exact owner document after its native validator ran.
-    pub document: CampaignSourceDocument,
+    document: CampaignSourceDocument,
     /// Slot projections emitted by the owner.
-    pub slot_projections: Vec<SlotProjection>,
+    slot_projections: Vec<SlotProjection>,
     /// Required handles emitted by the owner.
-    pub required_references: Vec<ArtifactId>,
+    required_references: Vec<ArtifactId>,
     /// Owner disagreements retained verbatim.
-    pub disagreements: Vec<OwnerDisagreement>,
+    disagreements: Vec<OwnerDisagreement>,
     /// Existing owner-produced history records, never synthesized here.
-    pub history_plans: Vec<CampaignHistoryPlanRecord>,
+    history_plans: Vec<CampaignHistoryPlanRecord>,
     /// Exact current head observed immediately before CAS, if any.
-    pub expected_head: Option<CampaignSourceHead>,
+    expected_head: Option<CampaignSourceHead>,
     /// Authenticated read fence used to obtain this row.
-    pub read_state_fence: StateFence,
+    read_state_fence: StateFence,
 }
 
 impl CampaignOwnerSourceInput {
@@ -245,39 +244,6 @@ impl CampaignOwnerSourceInput {
             expected_head: None,
             read_state_fence,
         })
-    }
-
-    /// Construct a typed input from an owner-validated document and its
-    /// authenticated read fence.  This is the only generic boundary; callers
-    /// cannot provide a self-declared digest or projection envelope.
-    pub fn from_document(
-        publisher: CampaignSourcePublisher,
-        role: CampaignSourceRole,
-        owner_id: OwnerId,
-        record_id: CampaignOwnerRecordId,
-        revision: CampaignOwnerRevision,
-        state_fence: StateFence,
-        read_state_fence: StateFence,
-        document: CampaignSourceDocument,
-        slot_projections: Vec<SlotProjection>,
-        required_references: Vec<ArtifactId>,
-        disagreements: Vec<OwnerDisagreement>,
-        history_plans: Vec<CampaignHistoryPlanRecord>,
-    ) -> Result<Self, CampaignSourcePublisherError> {
-        Self::from_authenticated_read(
-            publisher,
-            role,
-            owner_id,
-            record_id,
-            revision,
-            state_fence,
-            read_state_fence,
-            document,
-            slot_projections,
-            required_references,
-            disagreements,
-            history_plans,
-        )
     }
 
     /// Attach the exact head observed by the owner immediately before CAS.
@@ -393,9 +359,19 @@ impl CampaignSourcePublicationBundle {
             publication
                 .validate()
                 .map_err(|error| CampaignSourcePublisherError::Invalid(error.to_string()))?;
+            if publication.read_receipt.read_state_fence != recipe.binding.state_fence {
+                return Err(CampaignSourcePublisherError::Invalid(format!(
+                    "source {:?} is not bound to the authenticated current read fence",
+                    publication.record.role
+                )));
+            }
             for plan in &publication.record.history_plans {
-                plan.validate_for_source(recipe.campaign_id.as_str(), &publication.record.owner_id)
-                    .map_err(|error| CampaignSourcePublisherError::Invalid(error.to_string()))?;
+                plan.validate_for_source_at_fence(
+                    recipe.campaign_id.as_str(),
+                    &publication.record.owner_id,
+                    &recipe.binding.state_fence,
+                )
+                .map_err(|error| CampaignSourcePublisherError::Invalid(error.to_string()))?;
             }
             let role = publication.record.role;
             let requirement = requirements.get(&role).ok_or_else(|| {
