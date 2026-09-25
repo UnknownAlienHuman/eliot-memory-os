@@ -10,15 +10,12 @@ use serde::{Deserialize, Serialize};
 use eliot_contracts::{StateFence, TaskId, canonical_json_bytes, sha256_hex};
 use eliot_epistemic_contracts::ClaimAuditOutcome;
 use eliot_research_exchange_api::{
-    AllowedReferenceManifest, DisclosureClass, ResearchClaim, ResearchQueryRequest,
-    SourceClass,
+    AllowedReferenceManifest, DisclosureClass, ResearchClaim, ResearchQueryRequest, SourceClass,
 };
-use eliot_task::{
-    TaskError, TaskGraphCompilationReceipt, TaskGraphCompilationRequest, TaskLifecycleOwner,
-};
+use eliot_task::{TaskError, TaskGraphCompilationRequest};
 
 use super::inquiry_obligations::{
-    InquiryObligation, InquiryObligationInput, compile_obligation_inputs, task_graph_request,
+    InquiryObligation, InquiryObligationInput, compile_obligation_inputs,
     task_graph_request_for_binding,
 };
 use super::source_admissibility::{SourceAdmissibilityRecord, SourceProposal};
@@ -1053,6 +1050,8 @@ pub struct InquiryExecutionBinding {
     pub profile: InquiryProtocolProfile,
     pub query: ResearchQueryRequest,
     pub provider_admission_digest: String,
+    pub provider_generation: String,
+    pub provider_operation_id: String,
     pub bridge_identity_digest: String,
     pub provenance_digest: String,
     pub evidence_set_id: String,
@@ -1068,12 +1067,18 @@ pub struct InquiryExecutionBinding {
 }
 
 impl InquiryExecutionBinding {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::match_same_arms
+    )]
     pub fn new(
         inquiry_id: impl Into<String>,
         profile: InquiryProtocolProfile,
         query: ResearchQueryRequest,
         provider_admission_digest: impl Into<String>,
+        provider_generation: impl Into<String>,
+        provider_operation_id: impl Into<String>,
         bridge_identity_digest: impl Into<String>,
         provenance_digest: impl Into<String>,
         evidence_set_id: impl Into<String>,
@@ -1088,6 +1093,8 @@ impl InquiryExecutionBinding {
     ) -> Result<Self, InquiryGovernanceError> {
         let inquiry_id = inquiry_id.into();
         let provider_admission_digest = provider_admission_digest.into();
+        let provider_generation = provider_generation.into();
+        let provider_operation_id = provider_operation_id.into();
         let bridge_identity_digest = bridge_identity_digest.into();
         let provenance_digest = provenance_digest.into();
         let evidence_set_id = evidence_set_id.into();
@@ -1095,14 +1102,28 @@ impl InquiryExecutionBinding {
         let manifest_digest = manifest_digest.into();
         text(&inquiry_id, "execution.inquiry_id")?;
         profile.validate_integrity()?;
-        query.validate().map_err(|_| InquiryGovernanceError::InvalidField {
-            field: "execution.query",
-        })?;
+        query
+            .validate()
+            .map_err(|_| InquiryGovernanceError::InvalidField {
+                field: "execution.query",
+            })?;
+        let mut profile_source_classes = profile.admissible_source_classes.clone();
+        profile_source_classes.sort_by_key(|class| format!("{class:?}"));
+        let mut query_source_classes = query.source_classes.clone();
+        query_source_classes.sort_by_key(|class| format!("{class:?}"));
         let disclosure_allowed = match (query.disclosure, profile.disclosure_ceiling) {
             (DisclosureClass::Private, _) => true,
             (DisclosureClass::ProjectBound, DisclosureClass::Private) => false,
-            (DisclosureClass::ExportableRedacted, DisclosureClass::Private | DisclosureClass::ProjectBound) => false,
-            (DisclosureClass::Public, DisclosureClass::Private | DisclosureClass::ProjectBound | DisclosureClass::ExportableRedacted) => false,
+            (
+                DisclosureClass::ExportableRedacted,
+                DisclosureClass::Private | DisclosureClass::ProjectBound,
+            ) => false,
+            (
+                DisclosureClass::Public,
+                DisclosureClass::Private
+                | DisclosureClass::ProjectBound
+                | DisclosureClass::ExportableRedacted,
+            ) => false,
             _ => true,
         };
         if !disclosure_allowed
@@ -1113,7 +1134,7 @@ impl InquiryExecutionBinding {
             || query.question_scope != profile.scope
             || query.allowed_references.state_fence != profile.state_fence
             || query.allowed_references.digest != profile.reference_manifest_digest
-            || query.source_classes != profile.admissible_source_classes
+            || query_source_classes != profile_source_classes
             || disclosure != profile.disclosure_ceiling
             || budget_units != profile.budget_and_deadline_and_stop_rule.budget_units
             || deadline_ms != profile.budget_and_deadline_and_stop_rule.deadline_ms
@@ -1127,11 +1148,13 @@ impl InquiryExecutionBinding {
             &provider_admission_digest,
             "execution.provider_admission_digest",
         )?;
+        text(&provider_generation, "execution.provider_generation")?;
+        text(&provider_operation_id, "execution.provider_operation_id")?;
         digest(&bridge_identity_digest, "execution.bridge_identity_digest")?;
         digest(&provenance_digest, "execution.provenance_digest")?;
         digest(&portfolio_digest, "execution.portfolio_digest")?;
         digest(&manifest_digest, "execution.manifest_digest")?;
-        text(&evidence_set_id, "execution.evidence_set_id")?;
+        digest(&evidence_set_id, "execution.evidence_set_id")?;
         unique_texts(&routes, "execution.routes")?;
         if routes.is_empty() || source_classes.is_empty() {
             return Err(InquiryGovernanceError::Blank {
@@ -1143,32 +1166,39 @@ impl InquiryExecutionBinding {
         let mut source_classes = source_classes;
         source_classes.sort_by_key(|class| format!("{class:?}"));
         let shape = (
-            &inquiry_id,
-            &profile,
-            &query,
-            &provider_admission_digest,
-            &bridge_identity_digest,
-            &provenance_digest,
-            &evidence_set_id,
-            &portfolio_digest,
-            &manifest_digest,
-            &routes,
-            &source_classes,
-            &disclosure,
-            budget_units,
-            deadline_ms,
-            &state_fence,
+            (
+                &inquiry_id,
+                &profile,
+                &query,
+                &provider_admission_digest,
+                &provider_generation,
+                &provider_operation_id,
+                &bridge_identity_digest,
+                &provenance_digest,
+            ),
+            (
+                &evidence_set_id,
+                &portfolio_digest,
+                &manifest_digest,
+                &routes,
+                &source_classes,
+                &disclosure,
+                budget_units,
+                deadline_ms,
+                &state_fence,
+            ),
         );
-        let bytes = canonical_json_bytes(&shape).map_err(|_| {
-            InquiryGovernanceError::InvalidField {
+        let bytes =
+            canonical_json_bytes(&shape).map_err(|_| InquiryGovernanceError::InvalidField {
                 field: "execution.digest",
-            }
-        })?;
+            })?;
         Ok(Self {
             inquiry_id,
             profile,
             query,
             provider_admission_digest,
+            provider_generation,
+            provider_operation_id,
             bridge_identity_digest,
             provenance_digest,
             evidence_set_id,
@@ -1185,33 +1215,26 @@ impl InquiryExecutionBinding {
     }
 
     pub fn validate_integrity(&self) -> Result<(), InquiryGovernanceError> {
-        self.profile.validate_integrity()?;
-        self.query.validate().map_err(|_| InquiryGovernanceError::InvalidField {
-            field: "execution.query",
-        })?;
-        let shape = (
-            &self.inquiry_id,
-            &self.profile,
-            &self.query,
-            &self.provider_admission_digest,
-            &self.bridge_identity_digest,
-            &self.provenance_digest,
-            &self.evidence_set_id,
-            &self.portfolio_digest,
-            &self.manifest_digest,
-            &self.routes,
-            &self.source_classes,
-            &self.disclosure,
+        let expected = Self::new(
+            self.inquiry_id.clone(),
+            self.profile.clone(),
+            self.query.clone(),
+            self.provider_admission_digest.clone(),
+            self.provider_generation.clone(),
+            self.provider_operation_id.clone(),
+            self.bridge_identity_digest.clone(),
+            self.provenance_digest.clone(),
+            self.evidence_set_id.clone(),
+            self.portfolio_digest.clone(),
+            self.manifest_digest.clone(),
+            self.routes.clone(),
+            self.source_classes.clone(),
+            self.disclosure,
             self.budget_units,
             self.deadline_ms,
-            &self.state_fence,
-        );
-        let bytes = canonical_json_bytes(&shape).map_err(|_| {
-            InquiryGovernanceError::InvalidField {
-                field: "execution.digest",
-            }
-        })?;
-        if self.digest != sha256_hex(&bytes) {
+            self.state_fence.clone(),
+        )?;
+        if expected != *self {
             return Err(InquiryGovernanceError::InvalidField {
                 field: "execution.digest",
             });
@@ -1352,34 +1375,6 @@ impl InquiryGovernance {
         Ok(request)
     }
 
-    pub fn compile_obligations(
-        &mut self,
-        profile_id: &str,
-        profile_revision: u64,
-        inputs: &[InquiryObligationInput],
-        task_owner: &TaskLifecycleOwner,
-    ) -> Result<TaskGraphCompilationReceipt, InquiryGovernanceError> {
-        let profile = self
-            .profile(profile_id, profile_revision)
-            .cloned()
-            .ok_or_else(|| InquiryGovernanceError::UnknownProfile {
-                profile_id: profile_id.to_owned(),
-                revision: profile_revision,
-            })?;
-        profile.validate_integrity()?;
-        let obligations = compile_obligation_inputs(&profile, inputs)?;
-        let request = task_graph_request(&profile, &obligations, &profile.task_id)?;
-        let receipt = task_owner
-            .compile_inquiry_obligations(request.clone())
-            .map_err(|error| InquiryGovernanceError::TaskOwnerRejected { error })?;
-        receipt
-            .validate_against(&request)
-            .map_err(|error| InquiryGovernanceError::TaskOwnerRejected { error })?;
-        self.obligations
-            .insert((profile_id.to_owned(), profile_revision), obligations);
-        Ok(receipt)
-    }
-
     #[must_use]
     pub fn obligations(
         &self,
@@ -1499,6 +1494,9 @@ pub struct InquiryDispositionRecord {
     pub next_probe: Option<String>,
     pub narrower_claim: Option<String>,
     pub explicit_unknown: Option<String>,
+    /// Whether a new owner-admitted evidence revision is required before this
+    /// inquiry can be reconsidered.
+    pub reopen_required: bool,
     pub digest: String,
 }
 
@@ -1589,6 +1587,12 @@ impl InquiryDispositionRecord {
                 push_field(&mut p, tag, value);
             }
         }
+        let reopen_required = !disposition.may_close();
+        push_field(
+            &mut p,
+            "reopen_required",
+            if reopen_required { "true" } else { "false" },
+        );
         let digest = freeze(&p);
         Ok(Self {
             inquiry_id,
@@ -1605,6 +1609,195 @@ impl InquiryDispositionRecord {
             next_probe,
             narrower_claim,
             explicit_unknown,
+            reopen_required,
+            digest,
+        })
+    }
+
+    /// Revalidates the immutable disposition digest and its close/reopen
+    /// invariants before it is used as prior state for a new inquiry attempt.
+    pub fn validate_integrity(&self) -> Result<(), InquiryGovernanceError> {
+        text(&self.inquiry_id, "disposition.inquiry_id")?;
+        text(&self.profile_id, "disposition.profile_id")?;
+        text(&self.evidence_set_id, "disposition.evidence_set_id")?;
+        digest(&self.profile_digest, "disposition.profile_digest")?;
+        for value in [
+            self.portfolio_digest.as_ref(),
+            self.manifest_digest.as_ref(),
+            self.coverage_receipt_digest.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            digest(value, "disposition.digest")?;
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| InquiryGovernanceError::InvalidField {
+                field: "disposition.state_fence",
+            })?;
+        if self.disposition.may_close()
+            && (self.portfolio_digest.is_none()
+                || self.manifest_digest.is_none()
+                || self.coverage_receipt_digest.is_none())
+        {
+            return Err(InquiryGovernanceError::InvalidField {
+                field: "disposition.coverage_receipt_digest",
+            });
+        }
+        if !self.disposition.may_close() && !self.reopen_required {
+            return Err(InquiryGovernanceError::InvalidField {
+                field: "disposition.reopen_required",
+            });
+        }
+        for value in [
+            self.next_probe.as_ref(),
+            self.narrower_claim.as_ref(),
+            self.explicit_unknown.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            text(value, "disposition.reopen_condition")?;
+        }
+        let mut p = String::from("inquiry-disposition/v1;");
+        push_field(&mut p, "inquiry_id", &self.inquiry_id);
+        push_field(&mut p, "task_id", self.task_id.as_str());
+        push_field(&mut p, "profile_id", &self.profile_id);
+        push_field(
+            &mut p,
+            "profile_revision",
+            &self.profile_revision.to_string(),
+        );
+        push_field(&mut p, "profile_digest", &self.profile_digest);
+        push_field(&mut p, "evidence_set_id", &self.evidence_set_id);
+        if let Some(value) = &self.portfolio_digest {
+            push_field(&mut p, "portfolio_digest", value);
+        }
+        if let Some(value) = &self.manifest_digest {
+            push_field(&mut p, "manifest_digest", value);
+        }
+        if let Some(value) = &self.coverage_receipt_digest {
+            push_field(&mut p, "coverage_receipt_digest", value);
+        }
+        push_field(
+            &mut p,
+            "state_fence_digest",
+            &fence_digest(&self.state_fence)?,
+        );
+        push_field(&mut p, "disposition", self.disposition.wire_name());
+        for (tag, value) in [
+            ("next_probe", self.next_probe.as_deref()),
+            ("narrower_claim", self.narrower_claim.as_deref()),
+            ("explicit_unknown", self.explicit_unknown.as_deref()),
+        ] {
+            if let Some(value) = value {
+                push_field(&mut p, tag, value);
+            }
+        }
+        push_field(
+            &mut p,
+            "reopen_required",
+            if self.reopen_required {
+                "true"
+            } else {
+                "false"
+            },
+        );
+        if self.digest != freeze(&p) {
+            return Err(InquiryGovernanceError::InvalidField {
+                field: "disposition.digest",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Explicit reopen gate for a non-closing or previously closed inquiry.
+/// Reopening is evidence-backed and must name one of the profile's declared
+/// reopen conditions; a caller cannot simply retry the same provider result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InquiryReopenGate {
+    pub inquiry_id: String,
+    pub task_id: TaskId,
+    pub profile_id: String,
+    pub profile_revision: u64,
+    pub profile_digest: String,
+    pub prior_disposition_digest: String,
+    pub new_evidence_refs: Vec<String>,
+    pub reason: String,
+    pub state_fence: StateFence,
+    pub digest: String,
+}
+
+impl InquiryReopenGate {
+    pub fn authorize(
+        profile: &InquiryProtocolProfile,
+        prior: &InquiryDispositionRecord,
+        new_evidence_refs: Vec<String>,
+        reason: impl Into<String>,
+    ) -> Result<Self, InquiryGovernanceError> {
+        profile.validate_integrity()?;
+        prior.validate_integrity()?;
+        if prior.task_id != profile.task_id
+            || prior.profile_id != profile.profile_id
+            || prior.profile_revision != profile.revision
+            || prior.profile_digest != profile.digest
+            || prior.state_fence != profile.state_fence
+        {
+            return Err(InquiryGovernanceError::InvalidField {
+                field: "reopen.prior_profile_binding",
+            });
+        }
+        if !prior.disposition.may_close() && !prior.reopen_required {
+            return Err(InquiryGovernanceError::InvalidField {
+                field: "reopen.prior_disposition",
+            });
+        }
+        let inquiry_id = prior.inquiry_id.clone();
+        let reason = reason.into();
+        text(&reason, "reopen.reason")?;
+        if !profile
+            .output_contract_and_reopen_conditions
+            .reopen_conditions
+            .iter()
+            .any(|condition| condition == &reason)
+        {
+            return Err(InquiryGovernanceError::InvalidField {
+                field: "reopen.reason",
+            });
+        }
+        if new_evidence_refs.is_empty() {
+            return Err(InquiryGovernanceError::InvalidField {
+                field: "reopen.new_evidence_refs",
+            });
+        }
+        unique_texts(&new_evidence_refs, "reopen.new_evidence_refs")?;
+        let state_fence = profile.state_fence.clone();
+        let mut p = String::from("inquiry-reopen/v1;");
+        push_field(&mut p, "inquiry_id", &inquiry_id);
+        push_field(&mut p, "task_id", profile.task_id.as_str());
+        push_field(&mut p, "profile_id", &profile.profile_id);
+        push_field(&mut p, "profile_revision", &profile.revision.to_string());
+        push_field(&mut p, "profile_digest", &profile.digest);
+        push_field(&mut p, "prior_disposition_digest", &prior.digest);
+        push_count(&mut p, "new_evidence", new_evidence_refs.len());
+        for reference in &new_evidence_refs {
+            push_field(&mut p, "new_evidence", reference);
+        }
+        push_field(&mut p, "reason", &reason);
+        push_field(&mut p, "state_fence_digest", &fence_digest(&state_fence)?);
+        let digest = freeze(&p);
+        Ok(Self {
+            inquiry_id,
+            task_id: profile.task_id.clone(),
+            profile_id: profile.profile_id.clone(),
+            profile_revision: profile.revision,
+            profile_digest: profile.digest.clone(),
+            prior_disposition_digest: prior.digest.clone(),
+            new_evidence_refs,
+            reason,
+            state_fence,
             digest,
         })
     }
@@ -1865,13 +2058,17 @@ impl ResearchDebt {
         for reference in &evidence_refs {
             push_field(&mut p, "evidence_ref", reference);
         }
+        push_field(&mut p, "state_fence_digest", &fence_digest(state_fence)?);
         push_field(
             &mut p,
-            "state_fence_digest",
-            &fence_digest(state_fence)?,
+            "active",
+            if self.blocks_closure { "true" } else { "false" },
         );
-        push_field(&mut p, "active", if self.blocks_closure { "true" } else { "false" });
-        push_field(&mut p, "blocks_closure", if self.blocks_closure { "true" } else { "false" });
+        push_field(
+            &mut p,
+            "blocks_closure",
+            if self.blocks_closure { "true" } else { "false" },
+        );
         Ok(ResearchDebtProblemBinding {
             problem_id,
             debt_id: self.debt_id.clone(),

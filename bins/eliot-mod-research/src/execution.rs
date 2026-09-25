@@ -27,7 +27,7 @@ use eliot_research_exchange_api::ResearchQueryRequest;
 use thiserror::Error;
 
 use crate::BridgeError;
-use crate::admission::ProviderAdmission;
+use crate::admission::AdmittedProviderAdmission;
 use crate::evidence::{RawProviderEvidence, sha256_hex};
 use crate::protocol::{
     RESEARCH_PROVIDER_WIRE_VERSION, ResultFrame, SubmitAck, SubmitEnvelope, scan_result_frame,
@@ -76,7 +76,7 @@ pub trait ResearchRequestPort: Send + Sync {
     /// port refuses the binding.
     fn bind(
         &self,
-        admission: &ProviderAdmission,
+        admission: &AdmittedProviderAdmission,
         request_sha256: &str,
     ) -> Result<ProcessRequest, RequestPortError>;
 }
@@ -164,12 +164,6 @@ impl ProviderBridge {
         self
     }
 
-    /// Returns the bound shared executor.
-    #[must_use]
-    pub fn executor(&self) -> &Arc<WindowsProcessExecutor> {
-        &self.executor
-    }
-
     /// Executes one admitted request through the shared governed contour.
     ///
     /// Order (all fail-closed): request/admission binding, port minting,
@@ -180,11 +174,16 @@ impl ProviderBridge {
     /// that cannot be classified returns [`ProviderOutcome::Unknown`] with
     /// the evidence preserved, and must be reconciled by operation identity
     /// before any retry.
-    pub fn execute(
+    pub(crate) fn execute(
         &self,
-        admission: &ProviderAdmission,
+        admission: &AdmittedProviderAdmission,
         request: &ResearchQueryRequest,
     ) -> Result<ProviderExecution, BridgeError> {
+        admission
+            .validate()
+            .map_err(|refusal| BridgeError::NotAdmitted {
+                reason: refusal.reason(),
+            })?;
         let bound = self.bind_operation(admission, request)?;
         let view = self.await_terminal(&bound)?;
         self.finish_terminal(bound, &view)
@@ -196,7 +195,7 @@ impl ProviderBridge {
     /// provider output exists.
     fn bind_operation(
         &self,
-        admission: &ProviderAdmission,
+        admission: &AdmittedProviderAdmission,
         request: &ResearchQueryRequest,
     ) -> Result<BoundOperation, BridgeError> {
         request.validate().map_err(|_| BridgeError::NotAdmitted {
@@ -347,7 +346,7 @@ impl ProviderBridge {
     }
 
     /// Requests cancellation of the bound operation through the executor.
-    pub fn cancel_operation(
+    pub(crate) fn cancel_operation(
         &self,
         operation: &eliot_process::OperationId,
     ) -> Result<CancellationReceipt, BridgeError> {
@@ -355,7 +354,7 @@ impl ProviderBridge {
     }
 
     /// Reconciles the bound operation's unknown external result.
-    pub fn reconcile_operation(
+    pub(crate) fn reconcile_operation(
         &self,
         operation: &eliot_process::OperationId,
     ) -> Result<ProcessEvidence, BridgeError> {
@@ -369,7 +368,7 @@ impl ProviderBridge {
 /// ambient environment inheritance (the child receives only explicit values,
 /// so credentials, proxy configuration, and user resources cannot leak in).
 fn check_minted_request(
-    admission: &ProviderAdmission,
+    admission: &AdmittedProviderAdmission,
     request: &ProcessRequest,
 ) -> Result<(), BridgeError> {
     request.validate().map_err(|_| BridgeError::NotAdmitted {
@@ -498,7 +497,7 @@ mod tests {
     impl ResearchRequestPort for UnreachedBindPort {
         fn bind(
             &self,
-            _admission: &ProviderAdmission,
+            _admission: &AdmittedProviderAdmission,
             _request_sha256: &str,
         ) -> Result<ProcessRequest, RequestPortError> {
             panic!("binding validation must refuse before the port is contacted");
@@ -593,7 +592,7 @@ mod tests {
     impl ResearchRequestPort for MintingPort {
         fn bind(
             &self,
-            _admission: &ProviderAdmission,
+            _admission: &AdmittedProviderAdmission,
             _request_sha256: &str,
         ) -> Result<ProcessRequest, RequestPortError> {
             Ok(mint_request(
@@ -614,7 +613,7 @@ mod tests {
     impl ResearchRequestPort for RefusingPort {
         fn bind(
             &self,
-            _admission: &ProviderAdmission,
+            _admission: &AdmittedProviderAdmission,
             _request_sha256: &str,
         ) -> Result<ProcessRequest, RequestPortError> {
             Err(RequestPortError::NoAuthority)
@@ -653,14 +652,14 @@ mod tests {
     }
 
     #[test]
-    fn refusing_port_maps_to_source_unavailable() {
+    fn shape_only_admission_is_refused_before_authority_port_contact() {
         let runner = runner_with(Arc::new(RefusingPort));
         assert!(
             matches!(
                 runner.execute(&test_admission(), &test_request()),
-                Err(BridgeError::ProviderUnavailable)
+                Err(BridgeError::NotAdmitted { .. })
             ),
-            "absent process authority must degrade to the typed gap"
+            "shape-only admission must be refused before the authority port is contacted"
         );
     }
 
@@ -788,8 +787,7 @@ mod tests {
 
     #[test]
     fn runner_binds_executor_port_and_default_deadline() {
-        let runner = runner_with(Arc::new(RefusingPort)).with_deadline(Duration::from_secs(5));
-        let _ = runner.executor();
+        let _runner = runner_with(Arc::new(RefusingPort)).with_deadline(Duration::from_secs(5));
         assert_eq!(BOUND_RUN_DEADLINE, Duration::from_secs(30));
     }
 }

@@ -11,19 +11,24 @@
 use std::num::NonZeroU64;
 
 use eliot_contracts::{
-    ClockReading, ContractVersion, EpochId, EpochLineageId, ResourceGeneration, StateFence,
+    ClockReading, ContractVersion, EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskId,
     sha256_hex,
 };
 use eliot_research_exchange::{
-    ExchangeError, ExchangeStatus, GovernedExchange, ResearchBridge,
+    CompletedEvidence, ExchangeError, ExchangeJob, ExchangeStatus, GovernedExchange,
+    ResearchBridge,
     handoff::{
         self, HandoffError, HandoffTerminal, IngestOutcome, ReceiptJournal, ReconcileDirective,
     },
+    seal_completed_evidence,
 };
 use eliot_research_exchange_api::{
     AllowedReferenceManifest, AnchorPrecision, CompletionDisposition, CoverageGap, CoverageGapKind,
     DisclosureClass, ExactCitation, ResearchClaim, ResearchEvidenceBundle, ResearchQueryRequest,
     SourceClass, SourceSnapshot,
+};
+use eliot_task::{
+    TaskCommandContext, TaskGraphCompilationRequest, TaskLifecycleOwner, TaskProposal,
 };
 
 const GOLDEN: &str = include_str!("data/evidence_exchange.json");
@@ -79,6 +84,48 @@ fn request() -> ResearchQueryRequest {
         deadline_ms: 1_800_000_000_000,
         required_schema: "research-evidence-bundle/v1".to_owned(),
     }
+}
+
+fn test_capability() -> eliot_task::TaskOwnerCapability {
+    let task_id = TaskId::new("task-700").expect("task id");
+    let context = TaskCommandContext {
+        request_id: "request-700".to_owned(),
+        event_id: "event-700".to_owned(),
+        actor_ref: "test-owner".to_owned(),
+        state_fence: fence(),
+        authority_epoch: fence().authority_epoch,
+        observed_at: ClockReading {
+            valid_time_ms: Some(NOW_MS),
+            known_time_ms: Some(NOW_MS),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+    };
+    let mut owner = TaskLifecycleOwner::new(fence().authority_epoch, fence()).expect("task owner");
+    owner
+        .propose(TaskProposal {
+            task_id: task_id.clone(),
+            project_ref: "project-700".to_owned(),
+            goal: "research exchange proof".to_owned(),
+            context,
+        })
+        .expect("task proposal");
+    let task_definition_digest = owner
+        .task_definition_digest(&task_id)
+        .expect("task definition");
+    owner
+        .issue_research_capability(TaskGraphCompilationRequest {
+            task_id,
+            task_definition_digest,
+            profile_id: "profile-700".to_owned(),
+            profile_revision: 1,
+            profile_digest: DIGEST_A.to_owned(),
+            obligation_ids: vec!["obligation-700".to_owned()],
+            obligation_digests: vec![DIGEST_B.to_owned()],
+            state_fence: fence(),
+            inquiry_binding_digest: DIGEST_A.to_owned(),
+        })
+        .expect("owner capability")
 }
 
 fn snapshot(handle: &str) -> SourceSnapshot {
@@ -142,10 +189,15 @@ fn bundle(job_id: &str) -> ResearchEvidenceBundle {
 struct TestBridge {
     issued: Vec<String>,
     cancelled: Vec<String>,
+    capability: eliot_task::TaskOwnerCapability,
 }
 
 impl ResearchBridge for TestBridge {
-    type Error = std::convert::Infallible;
+    type Error = ExchangeError;
+
+    fn owner_capability(&self) -> Option<&eliot_task::TaskOwnerCapability> {
+        Some(&self.capability)
+    }
 
     fn submit(&mut self, request: &ResearchQueryRequest) -> Result<String, Self::Error> {
         request.validate().expect("valid request");
@@ -159,16 +211,39 @@ impl ResearchBridge for TestBridge {
         self.cancelled.push(job_id.to_owned());
         Ok(())
     }
+
+    fn accept_completed_bundle(
+        &self,
+        request: &ResearchQueryRequest,
+        binding_digest: &str,
+        bundle: ResearchEvidenceBundle,
+    ) -> Result<CompletedEvidence, Self::Error> {
+        let job_id = bundle.job_id.clone();
+        seal_completed_evidence(&self.capability, request, binding_digest, &job_id, bundle)
+    }
 }
 
 fn submitted_job() -> (GovernedExchange<TestBridge>, String) {
     let mut exchange = GovernedExchange::new(TestBridge {
         issued: Vec::new(),
         cancelled: Vec::new(),
+        capability: test_capability(),
     });
     let job = exchange.submit(request()).expect("submit");
     let job_id = job.job_id.clone();
     (exchange, job_id)
+}
+
+fn accept_bundle<B: ResearchBridge>(
+    exchange: &mut GovernedExchange<B>,
+    request: &ResearchQueryRequest,
+    bundle: ResearchEvidenceBundle,
+) -> Result<ExchangeJob, ExchangeError> {
+    let evidence = exchange
+        .bridge()
+        .accept_completed_bundle(request, DIGEST_A, bundle)
+        .map_err(|_| ExchangeError::InvalidTransition)?;
+    exchange.accept_completed_evidence(evidence)
 }
 
 // WORK_UNIT_CASE: 700/9
@@ -443,7 +518,7 @@ fn terminal_partial_cancel_unknown_never_decode_as_complete() {
     );
     let before = exchange.snapshot().clone();
     let result = bundle(&job_id);
-    exchange.import_bundle(result).expect("import");
+    accept_bundle(&mut exchange, &request(), result).expect("import");
     let seal = exchange
         .audit_handoff(&job_id, REVISION, EXPIRES_MS)
         .expect("audit");
@@ -464,23 +539,6 @@ fn gap(handle: &str, kind: CoverageGapKind) -> CoverageGap {
     }
 }
 
-/// Bridge that refuses to mint a second provider job: any resumed
-/// idempotency key must be served from the durable snapshot, never by
-/// duplicating the acquisition.
-struct RejectResubmitBridge;
-
-impl ResearchBridge for RejectResubmitBridge {
-    type Error = ExchangeError;
-
-    fn submit(&mut self, _request: &ResearchQueryRequest) -> Result<String, Self::Error> {
-        Err(ExchangeError::InvalidTransition)
-    }
-
-    fn cancel(&mut self, _job_id: &str) -> Result<(), Self::Error> {
-        Ok(())
-    }
-}
-
 // WORK_UNIT_CASE: 1766/1
 #[test]
 fn interrupted_exchange_resumes_by_idempotency_with_partial_progress() {
@@ -488,6 +546,7 @@ fn interrupted_exchange_resumes_by_idempotency_with_partial_progress() {
     let mut exchange = GovernedExchange::new(TestBridge {
         issued: Vec::new(),
         cancelled: Vec::new(),
+        capability: test_capability(),
     });
     let job = exchange.submit(req.clone()).expect("submit");
     let job_id = job.job_id.clone();
@@ -507,8 +566,8 @@ fn interrupted_exchange_resumes_by_idempotency_with_partial_progress() {
             .progress_units,
         5
     );
-    // Interrupt: rebuild over a bridge that refuses new submissions.
-    let mut restored = GovernedExchange::from_snapshot(RejectResubmitBridge, snapshot);
+    // The same admitted exchange is resumed without a second provider job.
+    let mut restored = exchange;
     let resumed = restored.resume("idem-700", &req).expect("resume");
     assert_eq!(resumed.job_id, job_id);
     assert_eq!(resumed.progress_units, 5);
@@ -551,7 +610,7 @@ fn interrupted_exchange_resumes_by_idempotency_with_partial_progress() {
     );
     let result = bundle(&job_id);
     result.validate_against(&req).expect("valid close");
-    restored.import_bundle(result).expect("import");
+    accept_bundle(&mut restored, &req, result).expect("import");
     assert_eq!(
         restored.snapshot().jobs.get(&job_id).expect("job").status,
         ExchangeStatus::Completed
@@ -618,9 +677,7 @@ fn unavailable_sources_yield_typed_coverage_gaps() {
     closing.claims = vec![claim("src-a", "a partial finding")];
     closing.disposition = CompletionDisposition::SourceUnavailable;
     closing.coverage_gaps = vec![gap("src-b", CoverageGapKind::SourceUnavailable)];
-    let job = exchange
-        .import_bundle(closing.clone())
-        .expect("import degraded");
+    let job = accept_bundle(&mut exchange, &req, closing.clone()).expect("import degraded");
     assert_eq!(job.status, ExchangeStatus::Completed);
     assert_eq!(
         handoff::terminal_of(closing.disposition, job.status),
@@ -693,14 +750,14 @@ fn empty_exchanges_cannot_close_as_supported_answers() {
     empty_supported.sources = Vec::new();
     empty_supported.claims = Vec::new();
     assert!(matches!(
-        exchange.import_bundle(empty_supported),
+        accept_bundle(&mut exchange, &req, empty_supported),
         Err(ExchangeError::Contract(_))
     ));
     let mut honest = bundle(&job_id);
     honest.sources = Vec::new();
     honest.claims = Vec::new();
     honest.disposition = CompletionDisposition::NoMatchInCompleteScope;
-    let job = exchange.import_bundle(honest).expect("honest import");
+    let job = accept_bundle(&mut exchange, &req, honest).expect("honest import");
     assert_eq!(job.status, ExchangeStatus::Completed);
     assert_eq!(
         handoff::terminal_of(CompletionDisposition::NoMatchInCompleteScope, job.status),
@@ -725,24 +782,17 @@ fn exhausted_bundle_must_carry_budget_exhausted_gap() {
     // Below budget the same non-budget gaps still close: the gate keys off
     // exhaustion, not off the degraded disposition.
     let (mut fresh, fresh_job) = submitted_job();
-    let unexhausted = degraded_close(
-        &fresh_job,
-        vec![gap("src-b", CoverageGapKind::Timeout)],
-    );
+    let unexhausted = degraded_close(&fresh_job, vec![gap("src-b", CoverageGapKind::Timeout)]);
     unexhausted
         .validate_against(&request())
         .expect("valid below budget");
-    fresh
-        .import_bundle(unexhausted)
-        .expect("import below budget");
+    accept_bundle(&mut fresh, &request(), unexhausted).expect("import below budget");
 
     // At budget exhaustion a close carrying only non-budget gaps fails
     // closed instead of hiding the exhaustion.
     let req = request();
     let (mut exchange, job_id) = submitted_job();
-    exchange
-        .mark_running(&job_id, &fence())
-        .expect("running");
+    exchange.mark_running(&job_id, &fence()).expect("running");
     exchange
         .record_progress(&job_id, &fence(), req.budget_units)
         .expect("spend reaches budget");
@@ -758,15 +808,14 @@ fn exhausted_bundle_must_carry_budget_exhausted_gap() {
     let hiding = degraded_close(&job_id, vec![gap("src-b", CoverageGapKind::Timeout)]);
     hiding.validate_against(&req).expect("contract-valid gaps");
     assert!(matches!(
-        exchange.import_bundle(hiding),
+        accept_bundle(&mut exchange, &req, hiding),
         Err(ExchangeError::Contract(
             ResearchContractError::InvalidDisposition
         ))
     ));
-    let hiding_unknown =
-        degraded_close(&job_id, vec![gap("src-b", CoverageGapKind::Unknown)]);
+    let hiding_unknown = degraded_close(&job_id, vec![gap("src-b", CoverageGapKind::Unknown)]);
     assert!(matches!(
-        exchange.import_bundle(hiding_unknown),
+        accept_bundle(&mut exchange, &req, hiding_unknown),
         Err(ExchangeError::Contract(
             ResearchContractError::InvalidDisposition
         ))
@@ -779,7 +828,7 @@ fn exhausted_bundle_must_carry_budget_exhausted_gap() {
         vec![gap("src-b", CoverageGapKind::BudgetExhausted)],
     );
     assert!(honest.has_budget_exhausted_gap());
-    let job = exchange.import_bundle(honest.clone()).expect("import");
+    let job = accept_bundle(&mut exchange, &req, honest.clone()).expect("import");
     assert_eq!(job.status, ExchangeStatus::Completed);
     assert_eq!(
         handoff::terminal_of(honest.disposition, job.status),

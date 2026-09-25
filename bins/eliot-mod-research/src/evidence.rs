@@ -23,7 +23,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Why a captured stream is absent or incomplete. Omission is typed and
 /// reversible (the variant names what is missing); it never poses as data.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum StreamOmission {
     /// The executor supplied no stream handle.
     NoHandle,
@@ -34,7 +34,7 @@ pub enum StreamOmission {
 }
 
 /// Immutable record of one captured provider stream.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StreamRecord {
     /// SHA-256 of the retained prefix bytes.
     pub sha256: String,
@@ -71,7 +71,7 @@ impl StreamRecord {
 }
 
 /// Immutable raw evidence for one bounded provider execution.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RawProviderEvidence {
     /// Stable admitted operation identity.
     pub operation_id: String,
@@ -120,6 +120,13 @@ impl RawProviderEvidence {
             exit_code,
             descendants_complete,
         }
+    }
+
+    /// Returns the canonical digest of the complete immutable raw-evidence
+    /// record, including both streams and process lineage.
+    pub fn digest(&self) -> Result<String, serde_json::Error> {
+        let bytes = serde_json::to_vec(self)?;
+        Ok(sha256_hex(&bytes))
     }
 }
 

@@ -70,6 +70,15 @@ fn digest(value: &str, field: &'static str) -> Result<(), ResearchContractError>
     }
 }
 
+fn disclosure_rank(value: DisclosureClass) -> u8 {
+    match value {
+        DisclosureClass::Private => 0,
+        DisclosureClass::ProjectBound => 1,
+        DisclosureClass::ExportableRedacted => 2,
+        DisclosureClass::Public => 3,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceClass {
@@ -339,6 +348,7 @@ impl ResearchEvidenceBundle {
         if self.exchange_id != request.exchange_id
             || self.state_fence != request.state_fence
             || !self.synthesis_is_candidate
+            || disclosure_rank(self.disclosure) > disclosure_rank(request.disclosure)
         {
             return Err(ResearchContractError::InvalidDisposition);
         }
@@ -349,15 +359,42 @@ impl ResearchEvidenceBundle {
         text(&self.job_id, "bundle.job_id")?;
         text(&self.system_generation, "bundle.system_generation")?;
         text(&self.origin_authentication, "bundle.origin_authentication")?;
+        let mut seen_unknowns = BTreeSet::new();
         for unknown in &self.coverage_unknowns {
             text(unknown, "bundle.coverage_unknowns")?;
+            if !seen_unknowns.insert(unknown) {
+                return Err(ResearchContractError::DuplicateIdentity {
+                    field: "bundle.coverage_unknowns",
+                });
+            }
         }
+        let mut seen_failed = BTreeSet::new();
         for failed in &self.failed_acquisition {
             text(failed, "bundle.failed_acquisition")?;
+            if !seen_failed.insert(failed) {
+                return Err(ResearchContractError::DuplicateIdentity {
+                    field: "bundle.failed_acquisition",
+                });
+            }
+        }
+        if let Some(invalidation) = &self.invalidation {
+            text(invalidation, "bundle.invalidation")?;
+        }
+        let mut seen_excerpts = BTreeSet::new();
+        for excerpt in &self.bounded_excerpts {
+            text(excerpt, "bundle.bounded_excerpts")?;
+            if !seen_excerpts.insert(excerpt) {
+                return Err(ResearchContractError::DuplicateIdentity {
+                    field: "bundle.bounded_excerpts",
+                });
+            }
         }
         let mut seen_gaps = BTreeSet::new();
         for gap in &self.coverage_gaps {
             gap.validate()?;
+            if !request.allowed_references.allows(&gap.source_handle) {
+                return Err(ResearchContractError::CitationNotAllowed);
+            }
             if !seen_gaps.insert(&gap.source_handle) {
                 return Err(ResearchContractError::DuplicateIdentity {
                     field: "bundle.coverage_gaps",
@@ -386,28 +423,51 @@ impl ResearchEvidenceBundle {
             return Err(ResearchContractError::InvalidDisposition);
         }
         if self.disposition == CompletionDisposition::NoMatchInCompleteScope
-            && (!self.sources.is_empty()
-                || !self.claims.is_empty()
+            && (!self.claims.is_empty()
                 || !self.coverage_gaps.is_empty()
                 || !self.coverage_unknowns.is_empty()
                 || !self.failed_acquisition.is_empty())
         {
             // A negative closure is meaningful only over a complete, declared
-            // scope. The exchange layer cannot infer that scope from an empty
-            // result, so the R6 consumer additionally joins the exact
+            // scope. Source snapshots may represent checked-but-unhelpful
+            // sources; the R6 consumer additionally joins the exact
             // denominator before accepting this disposition.
             return Err(ResearchContractError::InvalidDisposition);
         }
+        let mut seen_sources = BTreeSet::new();
         for source in &self.sources {
             text(&source.source_handle, "source.source_handle")?;
+            text(&source.title, "source.title")?;
+            text(&source.locator, "source.locator")?;
+            text(&source.coverage, "source.coverage")?;
+            if !request.allowed_references.allows(&source.source_handle)
+                || !request.source_classes.contains(&source.class)
+                || disclosure_rank(source.disclosure) > disclosure_rank(request.disclosure)
+                || !seen_sources.insert(&source.source_handle)
+            {
+                return Err(ResearchContractError::CitationNotAllowed);
+            }
             digest(&source.snapshot_digest, "source.snapshot_digest")?;
             source
                 .captured_at
                 .validate()
                 .map_err(|_| ResearchContractError::InvalidDisposition)?;
         }
+        let mut seen_artifacts = BTreeSet::new();
+        for handle in &self.artifact_handles {
+            text(handle, "bundle.artifact_handles")?;
+            if !request.allowed_references.allows(handle) || !seen_artifacts.insert(handle) {
+                return Err(ResearchContractError::CitationNotAllowed);
+            }
+        }
+        let mut seen_claim_ids = BTreeSet::new();
         for claim in &self.claims {
             text(&claim.claim_id, "claim.claim_id")?;
+            if !seen_claim_ids.insert(&claim.claim_id) {
+                return Err(ResearchContractError::DuplicateIdentity {
+                    field: "claim.claim_id",
+                });
+            }
             text(&claim.statement, "claim.statement")?;
             text(&claim.confidence_note, "claim.confidence_note")?;
             if claim.citations.is_empty()

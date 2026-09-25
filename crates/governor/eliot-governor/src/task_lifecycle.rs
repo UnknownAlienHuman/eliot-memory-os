@@ -363,7 +363,21 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         &self,
         request: TaskGraphCompilationRequest,
     ) -> Result<TaskGraphCompilationReceipt, TaskLifecycleError> {
-        self.task.compile_inquiry_obligations(request).map_err(TaskLifecycleError::Owner)
+        self.task
+            .compile_inquiry_obligations(request)
+            .map_err(TaskLifecycleError::Owner)
+    }
+
+    /// Issues the opaque R6 execution capability from the same live task owner
+    /// that issued the compilation receipt. The capability is re-derived here;
+    /// a provider-side copy cannot substitute its own authority.
+    pub fn issue_research_capability(
+        &self,
+        request: TaskGraphCompilationRequest,
+    ) -> Result<eliot_task::TaskOwnerCapability, TaskLifecycleError> {
+        self.task
+            .issue_research_capability(request)
+            .map_err(TaskLifecycleError::Owner)
     }
 
     /// Persists an owner-issued inquiry compilation receipt through the
@@ -385,6 +399,13 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         if &identity.request.state_fence != fence
             || self.canonical.state_fence() != fence
             || request.state_fence != *fence
+            || identity
+                .request
+                .metadata
+                .task_id
+                .as_ref()
+                .map(eliot_contracts::TaskId::as_str)
+                != Some(request.task_id.as_str())
         {
             return Err(TaskLifecycleError::Owner(TaskError::FenceMismatch));
         }
@@ -444,7 +465,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             manifest_digest,
             TransitionClass::CaptureCandidate,
         )
-            .await
+        .await
     }
 
     /// Admits one task proposal and commits it through the canonical path.
@@ -500,7 +521,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             manifest_digest,
             TransitionClass::TaskControl,
         )
-            .await
+        .await
     }
 
     /// Applies one guarded task command and commits it through the canonical path.
@@ -567,7 +588,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             manifest_digest,
             TransitionClass::TaskControl,
         )
-            .await
+        .await
     }
 
     /// Commits one admitted envelope and validates the returned receipt.

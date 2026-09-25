@@ -8,6 +8,7 @@ description = "Governed asynchronous ELIOT Research federation exchange"
 
 [dependencies]
 eliot-contracts.workspace = true
+eliot-task.workspace = true
 eliot-research-exchange-api.workspace = true
 serde.workspace = true
 thiserror.workspace = true

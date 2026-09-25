@@ -12,11 +12,10 @@
 //! one exact [`ResearchQueryRequest`] to one admitted operation before any
 //! executor contact.
 
-use serde::{Deserialize, Serialize};
-
 use eliot_contracts::{ContractVersion, EpochId, StateFence, fences_match_exact};
 use eliot_process::{Generation, OperationId};
 use eliot_research_exchange_api::{DisclosureClass, ResearchQueryRequest};
+use eliot_task::TaskOwnerCapability;
 
 use crate::{BridgeIdentity, is_lowercase_sha256};
 
@@ -33,6 +32,8 @@ pub enum AdmissionRefusal {
     NonPositiveCeiling,
     /// The request disagrees with the admission on a bound dimension.
     RequestMismatch,
+    /// The canonical owner receipt is absent or not a committed capture.
+    NotAdmitted,
 }
 
 impl AdmissionRefusal {
@@ -45,6 +46,7 @@ impl AdmissionRefusal {
             Self::EpochFenceConflict => "admission epoch disagrees with fence authority epoch",
             Self::NonPositiveCeiling => "admission ceiling is not a positive bound",
             Self::RequestMismatch => "request disagrees with the admitted operation binding",
+            Self::NotAdmitted => "provider admission lacks a committed canonical owner receipt",
         }
     }
 }
@@ -62,8 +64,8 @@ impl AdmissionRefusal {
 /// - `operation_id` is the stable identity for cancel/reconcile and the only
 ///   identity the exchange ever keys on; the provider-local job reference
 ///   stays outcome evidence, never canonical identity.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ProviderAdmission {
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct ProviderAdmission {
     bridge: BridgeIdentity,
     config_digest: String,
     protocol_digest: String,
@@ -86,7 +88,7 @@ impl ProviderAdmission {
     /// epoch must equal the fence authority epoch, and ceilings must be
     /// positive. Returns the stable refusal otherwise.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new_shape(
         bridge: BridgeIdentity,
         config_digest: impl Into<String>,
         protocol_digest: impl Into<String>,
@@ -237,6 +239,42 @@ impl ProviderAdmission {
         &self.operation_id
     }
 
+    fn validate_shape(&self) -> Result<(), AdmissionRefusal> {
+        if self.bridge.executable().trim().is_empty()
+            || self.bridge.executable().chars().any(char::is_control)
+            || !is_lowercase_sha256(self.bridge.executable_sha256())
+        {
+            return Err(AdmissionRefusal::MalformedText);
+        }
+        if !is_lowercase_sha256(&self.config_digest) || !is_lowercase_sha256(&self.protocol_digest)
+        {
+            return Err(AdmissionRefusal::MalformedDigest);
+        }
+        for value in [
+            &self.module_id,
+            &self.module_generation_id,
+            &self.required_schema,
+            &self.bridge_generation,
+        ] {
+            if value.trim().is_empty() || value.chars().any(char::is_control) {
+                return Err(AdmissionRefusal::MalformedText);
+            }
+        }
+        if !self.epoch.is_same_authority(&self.fence.authority_epoch) {
+            return Err(AdmissionRefusal::EpochFenceConflict);
+        }
+        if self.budget_units == 0 || self.deadline_ms <= 0 {
+            return Err(AdmissionRefusal::NonPositiveCeiling);
+        }
+        Ok(())
+    }
+
+    /// Revalidates the immutable admission shape, including a deserialized
+    /// shape-only record. Owner authority is checked separately at execution.
+    pub fn validate(&self) -> Result<(), AdmissionRefusal> {
+        self.validate_shape()
+    }
+
     /// Binds one request to this admitted operation.
     ///
     /// Every bound dimension must agree exactly: fence (exact, both
@@ -245,6 +283,7 @@ impl ProviderAdmission {
     /// required schema (route binding). Privacy, cost, or route expansion is
     /// a mismatch, never a fallback. Returns the stable refusal otherwise.
     pub fn validate_request(&self, request: &ResearchQueryRequest) -> Result<(), AdmissionRefusal> {
+        self.validate_shape()?;
         if !fences_match_exact(&request.state_fence, &self.fence)
             || request.bridge_generation != self.bridge_generation
             || request.disclosure != self.disclosure
@@ -258,6 +297,165 @@ impl ProviderAdmission {
             return Err(AdmissionRefusal::RequestMismatch);
         }
         Ok(())
+    }
+}
+
+/// Opaque provider admission paired with a live Task Controller capability.
+///
+/// The shape-only [`ProviderAdmission`] is deliberately insufficient. The
+/// public owner-material constructor requires the opaque capability issued by
+/// the live Task Controller owner; the shape itself cannot enter an admitted
+/// bridge. The wrapper carries no boolean admission flag.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedProviderAdmission {
+    manifest: ProviderAdmission,
+    owner_capability: TaskOwnerCapability,
+}
+
+impl AdmittedProviderAdmission {
+    /// Constructs an admitted provider operation only when the caller supplies
+    /// the opaque capability issued by the live Task Controller owner. The
+    /// shape-only [`ProviderAdmission`] constructor remains crate-private.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_owner_material(
+        bridge: BridgeIdentity,
+        config_digest: impl Into<String>,
+        protocol_digest: impl Into<String>,
+        module_id: impl Into<String>,
+        module_generation_id: impl Into<String>,
+        process_generation: Generation,
+        epoch: EpochId,
+        fence: StateFence,
+        disclosure: DisclosureClass,
+        budget_units: u64,
+        deadline_ms: i64,
+        protocol_revision: ContractVersion,
+        required_schema: impl Into<String>,
+        bridge_generation: impl Into<String>,
+        operation_id: OperationId,
+        owner_capability: TaskOwnerCapability,
+    ) -> Result<Self, AdmissionRefusal> {
+        let manifest = ProviderAdmission::new_shape(
+            bridge,
+            config_digest,
+            protocol_digest,
+            module_id,
+            module_generation_id,
+            process_generation,
+            epoch,
+            fence,
+            disclosure,
+            budget_units,
+            deadline_ms,
+            protocol_revision,
+            required_schema,
+            bridge_generation,
+            operation_id,
+        )?;
+        Self::from_owner_capability(manifest, owner_capability)
+    }
+
+    pub(crate) fn from_owner_capability(
+        manifest: ProviderAdmission,
+        owner_capability: TaskOwnerCapability,
+    ) -> Result<Self, AdmissionRefusal> {
+        manifest.validate_shape()?;
+        owner_capability
+            .validate_self()
+            .map_err(|_| AdmissionRefusal::NotAdmitted)?;
+        if !fences_match_exact(&manifest.fence, owner_capability.state_fence()) {
+            return Err(AdmissionRefusal::NotAdmitted);
+        }
+        Ok(Self {
+            manifest,
+            owner_capability,
+        })
+    }
+
+    pub(crate) const fn manifest(&self) -> &ProviderAdmission {
+        &self.manifest
+    }
+
+    pub const fn owner_capability(&self) -> &TaskOwnerCapability {
+        &self.owner_capability
+    }
+
+    pub const fn bridge(&self) -> &BridgeIdentity {
+        self.manifest.bridge()
+    }
+
+    pub const fn operation_id(&self) -> &OperationId {
+        self.manifest.operation_id()
+    }
+
+    pub const fn process_generation(&self) -> Generation {
+        self.manifest.process_generation()
+    }
+
+    pub const fn epoch(&self) -> &EpochId {
+        self.manifest.epoch()
+    }
+
+    pub fn module_generation_id(&self) -> &str {
+        self.manifest.module_generation_id()
+    }
+
+    pub fn config_digest(&self) -> &str {
+        self.manifest.config_digest()
+    }
+
+    pub fn protocol_digest(&self) -> &str {
+        self.manifest.protocol_digest()
+    }
+
+    pub fn module_id(&self) -> &str {
+        self.manifest.module_id()
+    }
+
+    pub fn fence(&self) -> &StateFence {
+        self.manifest.fence()
+    }
+
+    pub fn disclosure(&self) -> DisclosureClass {
+        self.manifest.disclosure()
+    }
+
+    pub fn budget_units(&self) -> u64 {
+        self.manifest.budget_units()
+    }
+
+    pub fn deadline_ms(&self) -> i64 {
+        self.manifest.deadline_ms()
+    }
+
+    pub fn protocol_revision(&self) -> &ContractVersion {
+        self.manifest.protocol_revision()
+    }
+
+    pub fn required_schema(&self) -> &str {
+        self.manifest.required_schema()
+    }
+
+    pub fn bridge_generation(&self) -> &str {
+        self.manifest.bridge_generation()
+    }
+
+    pub fn validate(&self) -> Result<(), AdmissionRefusal> {
+        self.manifest.validate()?;
+        self.owner_capability
+            .validate_self()
+            .map_err(|_| AdmissionRefusal::NotAdmitted)
+    }
+
+    pub fn validate_request(&self, request: &ResearchQueryRequest) -> Result<(), AdmissionRefusal> {
+        self.validate()?;
+        self.owner_capability
+            .validate_binding(
+                &request.state_fence,
+                self.owner_capability.inquiry_binding_digest(),
+            )
+            .map_err(|_| AdmissionRefusal::NotAdmitted)?;
+        self.manifest.validate_request(request)
     }
 }
 
@@ -314,7 +512,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    ProviderAdmission::new(
+                    ProviderAdmission::new_shape(
                         test_identity(),
                         config,
                         protocol,
@@ -343,7 +541,7 @@ mod tests {
         for module in ["", "   "] {
             assert!(
                 matches!(
-                    ProviderAdmission::new(
+                    ProviderAdmission::new_shape(
                         test_identity(),
                         DIGEST_B,
                         DIGEST_C,
@@ -380,7 +578,7 @@ mod tests {
         };
         assert!(
             matches!(
-                ProviderAdmission::new(
+                ProviderAdmission::new_shape(
                     test_identity(),
                     DIGEST_B,
                     DIGEST_C,
@@ -408,7 +606,7 @@ mod tests {
         for (budget, deadline) in [(0, 1_800_000_000_000), (10, 0), (10, -5)] {
             assert!(
                 matches!(
-                    ProviderAdmission::new(
+                    ProviderAdmission::new_shape(
                         test_identity(),
                         DIGEST_B,
                         DIGEST_C,

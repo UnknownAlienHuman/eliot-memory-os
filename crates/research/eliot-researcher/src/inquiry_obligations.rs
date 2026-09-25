@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use eliot_contracts::{StateFence, TaskId};
+use eliot_contracts::{StateFence, TaskId, canonical_json_bytes, sha256_hex};
 use eliot_task::TaskGraphCompilationRequest;
 
 use super::inquiry_governance::{
@@ -112,6 +112,12 @@ impl AcceptanceCertificate {
         push_field(&mut p, "profile_digest", &profile_digest);
         push_field(&mut p, "kind", kind.wire_name());
         push_field(&mut p, "issuer", &issuer);
+        let fence_digest = sha256_hex(&canonical_json_bytes(&state_fence).map_err(|_| {
+            InquiryGovernanceError::InvalidField {
+                field: "certificate.state_fence",
+            }
+        })?);
+        push_field(&mut p, "state_fence_digest", &fence_digest);
         let digest = freeze(&p);
         Ok(Self {
             certificate_id,
@@ -122,6 +128,39 @@ impl AcceptanceCertificate {
             issuer,
             digest,
         })
+    }
+
+    /// Revalidates the certificate digest before an obligation can be marked
+    /// verified. A serialized caller cannot replace the issuer or evidence
+    /// kind while retaining a stale digest.
+    pub fn validate_integrity(&self) -> Result<(), InquiryGovernanceError> {
+        text(&self.certificate_id, "certificate.certificate_id")?;
+        text(&self.obligation_id, "certificate.obligation_id")?;
+        digest(&self.profile_digest, "certificate.profile_digest")?;
+        text(&self.issuer, "certificate.issuer")?;
+        self.state_fence
+            .validate()
+            .map_err(|_| InquiryGovernanceError::InvalidField {
+                field: "certificate.state_fence",
+            })?;
+        let mut p = String::from("inquiry-acceptance-certificate/v1;");
+        push_field(&mut p, "certificate_id", &self.certificate_id);
+        push_field(&mut p, "obligation_id", &self.obligation_id);
+        push_field(&mut p, "profile_digest", &self.profile_digest);
+        push_field(&mut p, "kind", self.kind.wire_name());
+        push_field(&mut p, "issuer", &self.issuer);
+        let fence_digest = sha256_hex(&canonical_json_bytes(&self.state_fence).map_err(|_| {
+            InquiryGovernanceError::InvalidField {
+                field: "certificate.state_fence",
+            }
+        })?);
+        push_field(&mut p, "state_fence_digest", &fence_digest);
+        if self.digest != freeze(&p) {
+            return Err(InquiryGovernanceError::InvalidField {
+                field: "certificate.digest",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -224,6 +263,17 @@ impl InquiryObligation {
                     reason: "VERIFIED requires an acceptance certificate",
                 });
             };
+            certificate.validate_integrity().map_err(|error| {
+                InquiryGovernanceError::InvalidObligation {
+                    obligation_id: input.obligation_id.clone(),
+                    reason: match error {
+                        InquiryGovernanceError::InvalidField { .. } => {
+                            "acceptance certificate integrity is invalid"
+                        }
+                        _ => "acceptance certificate validation failed",
+                    },
+                }
+            })?;
             if certificate.obligation_id != input.obligation_id
                 || certificate.profile_digest != profile.digest
                 || certificate.kind != input.acceptance_certificate_kind
@@ -322,20 +372,9 @@ impl InquiryObligation {
 }
 
 /// Projects validated Researcher obligations into the existing Task
-/// Controller request contract. The owner, not Researcher, validates and
-/// issues the successful receipt.
-pub(crate) fn task_graph_request(
-    profile: &InquiryProtocolProfile,
-    obligations: &[InquiryObligation],
-    task_id: &TaskId,
-) -> Result<TaskGraphCompilationRequest, InquiryGovernanceError> {
-    task_graph_request_for_binding(profile, obligations, task_id, &profile.digest)
-}
-
-/// Projects the same validated obligation set while binding it to one
-/// complete inquiry execution record. The profile digest is retained as a
-/// compatibility default only for older in-memory callers; production
-/// compilation uses this explicit binding seam.
+/// Controller request contract while binding them to one complete inquiry
+/// execution record. The owner, not Researcher, validates and issues the
+/// successful receipt.
 pub(crate) fn task_graph_request_for_binding(
     profile: &InquiryProtocolProfile,
     obligations: &[InquiryObligation],

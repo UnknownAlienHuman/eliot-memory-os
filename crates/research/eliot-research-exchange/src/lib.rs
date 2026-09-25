@@ -6,10 +6,11 @@ pub mod handoff;
 
 use std::collections::BTreeMap;
 
-use eliot_contracts::{ContractVersion, StateFence};
+use eliot_contracts::{ContractVersion, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_research_exchange_api::{
     ResearchContractError, ResearchEvidenceBundle, ResearchExportBundle, ResearchQueryRequest,
 };
+use eliot_task::TaskOwnerCapability;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -57,24 +58,77 @@ pub enum ExchangeError {
     ExportDenied,
 }
 
+/// A completed provider candidate sealed by an owner capability.
+///
+/// The bundle is kept private so a caller cannot manufacture exchange
+/// completion by constructing a public value. The seal binds the exact request
+/// bytes, job identity, and owner capability; only the governed exchange may
+/// consume it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletedEvidence {
+    bundle: ResearchEvidenceBundle,
+    request_digest: String,
+    capability_digest: String,
+    job_id: String,
+}
+
+/// Seals one provider candidate after the bridge has authenticated the exact
+/// terminal provider frame.
+///
+/// This is not a public closure constructor: it requires the opaque
+/// [`TaskOwnerCapability`] issued by the live Task Controller owner, and the
+/// exchange still checks the resulting seal against its own job and request.
+pub fn seal_completed_evidence(
+    capability: &TaskOwnerCapability,
+    request: &ResearchQueryRequest,
+    binding_digest: &str,
+    job_id: &str,
+    bundle: ResearchEvidenceBundle,
+) -> Result<CompletedEvidence, ExchangeError> {
+    capability
+        .validate_binding(&request.state_fence, binding_digest)
+        .map_err(|_| ExchangeError::InvalidTransition)?;
+    bundle
+        .validate_against(request)
+        .map_err(ExchangeError::Contract)?;
+    if bundle.job_id != job_id {
+        return Err(ExchangeError::InvalidTransition);
+    }
+    let request_digest =
+        sha256_hex(&canonical_json_bytes(request).map_err(|_| ExchangeError::InvalidTransition)?);
+    Ok(CompletedEvidence {
+        bundle,
+        request_digest,
+        capability_digest: capability.digest().to_owned(),
+        job_id: job_id.to_owned(),
+    })
+}
+
+/// The only bridge contract accepted by the governed exchange.
+///
+/// Authority is represented by an opaque, owner-issued capability rather than
+/// a boolean method. Implementations must revalidate that capability at every
+/// operation and must seal provider output through
+/// [`seal_completed_evidence`]; the exchange never imports a caller-shaped
+/// bundle directly.
 pub trait ResearchBridge {
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Returns the live owner capability carried by this bridge, if this
+    /// bridge has one. Absence is a typed unadmitted state; it is never
+    /// interpreted as authority.
+    fn owner_capability(&self) -> Option<&TaskOwnerCapability>;
+
     fn submit(&mut self, request: &ResearchQueryRequest) -> Result<String, Self::Error>;
     fn cancel(&mut self, job_id: &str) -> Result<(), Self::Error>;
 
-    /// Whether this bridge carries a live, owner-issued provider admission.
-    /// Arbitrary implementations default to false; production construction
-    /// must opt in only after the admission has been authenticated.
-    fn is_admitted(&self) -> bool {
-        false
-    }
-
-    /// Whether this bridge is the explicit no-admission provider gap. Other
-    /// bridges must leave the default false so an execution/transport failure
-    /// is not mislabeled as source unavailability.
-    fn provider_unavailable(&self) -> bool {
-        false
-    }
+    /// Authenticates and seals one completed provider candidate.
+    fn accept_completed_bundle(
+        &self,
+        request: &ResearchQueryRequest,
+        binding_digest: &str,
+        bundle: ResearchEvidenceBundle,
+    ) -> Result<CompletedEvidence, Self::Error>;
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -88,15 +142,12 @@ pub struct GovernedExchange<B> {
     snapshot: ExchangeSnapshot,
 }
 
-impl<B> GovernedExchange<B> {
+impl<B: ResearchBridge> GovernedExchange<B> {
     pub fn new(bridge: B) -> Self {
         Self {
             bridge,
             snapshot: ExchangeSnapshot::default(),
         }
-    }
-    pub fn from_snapshot(bridge: B, snapshot: ExchangeSnapshot) -> Self {
-        Self { bridge, snapshot }
     }
     #[must_use]
     pub fn snapshot(&self) -> &ExchangeSnapshot {
@@ -108,14 +159,19 @@ impl<B> GovernedExchange<B> {
     pub fn bridge(&self) -> &B {
         &self.bridge
     }
-    pub fn into_parts(self) -> (B, ExchangeSnapshot) {
-        (self.bridge, self.snapshot)
+    fn require_live_admission(&self) -> Result<(), ExchangeError> {
+        self.bridge
+            .owner_capability()
+            .ok_or(ExchangeError::InvalidTransition)?
+            .validate_self()
+            .map_err(|_| ExchangeError::InvalidTransition)
     }
 
     /// Returns a job only when its terminal result has actually been
     /// imported. In particular, an `Accepted` acknowledgement is never a
     /// consumable evidence result.
     pub fn completed_job(&self, job_id: &str) -> Result<ExchangeJob, ExchangeError> {
+        self.require_live_admission()?;
         let job = self
             .snapshot
             .jobs
@@ -150,6 +206,7 @@ impl<B> GovernedExchange<B> {
         request: &ResearchQueryRequest,
     ) -> Result<ExchangeJob, ExchangeError> {
         request.validate()?;
+        self.require_live_admission()?;
         let job = self
             .job_by_idempotency(idempotency_key)
             .ok_or(ExchangeError::NotFound)?;
@@ -167,9 +224,7 @@ impl<B: ResearchBridge> GovernedExchange<B> {
     /// per identity.
     pub fn submit(&mut self, request: ResearchQueryRequest) -> Result<ExchangeJob, ExchangeError> {
         request.validate()?;
-        if !self.bridge.is_admitted() && !self.bridge.provider_unavailable() {
-            return Err(ExchangeError::InvalidTransition);
-        }
+        self.require_live_admission()?;
         if let Some(job_id) = self.snapshot.idempotency.get(&request.idempotency_key) {
             let existing = self
                 .snapshot
@@ -210,6 +265,7 @@ impl<B: ResearchBridge> GovernedExchange<B> {
         job_id: &str,
         fence: &StateFence,
     ) -> Result<ExchangeJob, ExchangeError> {
+        self.require_live_admission()?;
         self.transition(job_id, fence, ExchangeStatus::Running)
     }
 
@@ -219,6 +275,7 @@ impl<B: ResearchBridge> GovernedExchange<B> {
         fence: &StateFence,
         units: u64,
     ) -> Result<ExchangeJob, ExchangeError> {
+        self.require_live_admission()?;
         let job = self
             .snapshot
             .jobs
@@ -237,10 +294,42 @@ impl<B: ResearchBridge> GovernedExchange<B> {
         Ok(job.clone())
     }
 
-    pub fn import_bundle(
+    /// Accepts only an owner-sealed completed candidate. Raw bundles never
+    /// enter this state machine directly.
+    pub fn accept_completed_evidence(
+        &mut self,
+        evidence: CompletedEvidence,
+    ) -> Result<ExchangeJob, ExchangeError> {
+        self.require_live_admission()?;
+        let capability = self
+            .bridge
+            .owner_capability()
+            .ok_or(ExchangeError::InvalidTransition)?;
+        if evidence.capability_digest != capability.digest() {
+            return Err(ExchangeError::InvalidTransition);
+        }
+        let request_digest = {
+            let job = self
+                .snapshot
+                .jobs
+                .get(&evidence.job_id)
+                .ok_or(ExchangeError::NotFound)?;
+            sha256_hex(
+                &canonical_json_bytes(&job.request)
+                    .map_err(|_| ExchangeError::InvalidTransition)?,
+            )
+        };
+        if request_digest != evidence.request_digest {
+            return Err(ExchangeError::IdempotencyConflict);
+        }
+        self.import_bundle(evidence.bundle)
+    }
+
+    fn import_bundle(
         &mut self,
         bundle: ResearchEvidenceBundle,
     ) -> Result<ExchangeJob, ExchangeError> {
+        self.require_live_admission()?;
         let job = self
             .snapshot
             .jobs
@@ -274,6 +363,7 @@ impl<B: ResearchBridge> GovernedExchange<B> {
         job_id: &str,
         fence: &StateFence,
     ) -> Result<ExchangeJob, ExchangeError> {
+        self.require_live_admission()?;
         let job = self
             .snapshot
             .jobs
@@ -304,6 +394,7 @@ impl<B: ResearchBridge> GovernedExchange<B> {
         job_id: &str,
         export: ResearchExportBundle,
     ) -> Result<ResearchExportBundle, ExchangeError> {
+        self.require_live_admission()?;
         let job = self
             .snapshot
             .jobs
@@ -332,6 +423,7 @@ impl<B: ResearchBridge> GovernedExchange<B> {
         fence: &StateFence,
         status: ExchangeStatus,
     ) -> Result<ExchangeJob, ExchangeError> {
+        self.require_live_admission()?;
         let job = self
             .snapshot
             .jobs

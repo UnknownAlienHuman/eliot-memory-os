@@ -559,9 +559,14 @@ impl TaskGraphCompilationRequest {
             return Err(TaskError::InvalidField("task_graph.obligation_set"));
         }
         let mut ids = std::collections::BTreeSet::new();
+        let mut previous_id: Option<&str> = None;
         for (id, digest) in self.obligation_ids.iter().zip(&self.obligation_digests) {
             text(id, "task_graph.obligation_id")?;
             digest_text(digest, "task_graph.obligation_digest")?;
+            if previous_id.is_some_and(|previous| previous >= id.as_str()) {
+                return Err(TaskError::InvalidField("task_graph.obligation_order"));
+            }
+            previous_id = Some(id.as_str());
             if !ids.insert(id) {
                 return Err(TaskError::InvalidField("task_graph.obligation_id"));
             }
@@ -733,6 +738,157 @@ impl TaskGraphCompilationReceipt {
             return Err(TaskError::InvalidField("task_graph.receipt_binding"));
         }
         Ok(())
+    }
+}
+
+/// Opaque, owner-issued capability for one live inquiry execution.
+///
+/// The capability is deliberately not a boolean or a caller-filled receipt. It
+/// is minted only by [`TaskLifecycleOwner::issue_research_capability`] after
+/// the owner re-reads the current task, derives its task-definition identity,
+/// and checks the exact profile/obligation/fence binding. Consumers may
+/// inspect and revalidate the capability, but cannot construct or deserialize a
+/// successful one. It carries no graph state and grants no canonical write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskOwnerCapability {
+    owner: String,
+    version: String,
+    task_id: TaskId,
+    task_revision: u64,
+    task_definition_digest: String,
+    profile_id: String,
+    profile_revision: u64,
+    profile_digest: String,
+    state_fence: StateFence,
+    inquiry_binding_digest: String,
+    digest: String,
+}
+
+impl TaskOwnerCapability {
+    fn compute_digest(&self) -> Result<String, TaskError> {
+        let bytes = canonical_json_bytes(&(
+            &self.owner,
+            &self.version,
+            &self.task_id,
+            self.task_revision,
+            &self.task_definition_digest,
+            &self.profile_id,
+            self.profile_revision,
+            &self.profile_digest,
+            &self.state_fence,
+            &self.inquiry_binding_digest,
+        ))
+        .map_err(|_| TaskError::InvalidField("task_owner_capability.digest"))?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    fn from_receipt(receipt: &TaskGraphCompilationReceipt) -> Result<Self, TaskError> {
+        let mut capability = Self {
+            owner: receipt.owner.clone(),
+            version: receipt.version.clone(),
+            task_id: receipt.task_id.clone(),
+            task_revision: receipt.task_revision,
+            task_definition_digest: receipt.task_definition_digest.clone(),
+            profile_id: receipt.profile_id.clone(),
+            profile_revision: receipt.profile_revision,
+            profile_digest: receipt.profile_digest.clone(),
+            state_fence: receipt.state_fence.clone(),
+            inquiry_binding_digest: receipt.inquiry_binding_digest.clone(),
+            digest: String::new(),
+        };
+        capability.digest = capability.compute_digest()?;
+        Ok(capability)
+    }
+
+    /// Revalidates the capability against the exact owner compilation request.
+    /// A current task/profile/fence binding is required at every consumer edge;
+    /// an opaque token is not treated as self-authenticating evidence.
+    pub fn validate_against(&self, request: &TaskGraphCompilationRequest) -> Result<(), TaskError> {
+        request.validate()?;
+        if self.owner != TASK_GRAPH_COMPILER_OWNER
+            || self.version != TASK_GRAPH_COMPILATION_RECEIPT_VERSION
+            || self.task_id != request.task_id
+            || self.task_revision == 0
+            || self.task_definition_digest != request.task_definition_digest
+            || self.profile_id != request.profile_id
+            || self.profile_revision != request.profile_revision
+            || self.profile_digest != request.profile_digest
+            || !fences_match_exact(&self.state_fence, &request.state_fence)
+            || self.inquiry_binding_digest != request.inquiry_binding_digest
+            || self.digest != self.compute_digest()?
+        {
+            return Err(TaskError::InvalidField("task_owner_capability.binding"));
+        }
+        Ok(())
+    }
+
+    /// Revalidates the capability's own immutable owner binding.
+    pub fn validate_self(&self) -> Result<(), TaskError> {
+        self.validate_binding(&self.state_fence, &self.inquiry_binding_digest.clone())
+    }
+
+    /// Revalidates the opaque capability against the exact fence and inquiry
+    /// binding without reconstructing a caller-owned task graph.
+    pub fn validate_binding(
+        &self,
+        state_fence: &StateFence,
+        inquiry_binding_digest: &str,
+    ) -> Result<(), TaskError> {
+        if self.owner != TASK_GRAPH_COMPILER_OWNER
+            || self.version != TASK_GRAPH_COMPILATION_RECEIPT_VERSION
+            || self.task_revision == 0
+            || !fences_match_exact(&self.state_fence, state_fence)
+            || self.inquiry_binding_digest != inquiry_binding_digest
+            || self.digest != self.compute_digest()?
+        {
+            return Err(TaskError::InvalidField("task_owner_capability.binding"));
+        }
+        Ok(())
+    }
+
+    /// Returns the exact task identity covered by the capability.
+    #[must_use]
+    pub const fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+
+    /// Returns the task revision observed by the live owner.
+    #[must_use]
+    pub const fn task_revision(&self) -> u64 {
+        self.task_revision
+    }
+
+    /// Returns the exact fence covered by the capability.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+
+    /// Returns the complete inquiry binding digest covered by the owner.
+    #[must_use]
+    pub fn inquiry_binding_digest(&self) -> &str {
+        &self.inquiry_binding_digest
+    }
+
+    /// Returns the recomputed capability digest.
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+}
+
+impl TaskLifecycleOwner {
+    /// Issues the opaque capability consumed by the R6 exchange seam.
+    ///
+    /// This is the only successful construction path. It reuses the live
+    /// compilation checks, so a snapshot-shaped or caller-authored request
+    /// cannot mint execution authority by itself.
+    pub fn issue_research_capability(
+        &self,
+        request: TaskGraphCompilationRequest,
+    ) -> Result<TaskOwnerCapability, TaskError> {
+        let receipt = self.compile_inquiry_obligations(request)?;
+        TaskOwnerCapability::from_receipt(&receipt)
     }
 }
 

@@ -2854,6 +2854,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-contracts",
  "eliot-research-exchange-api",
+ "eliot-task",
  "serde",
  "thiserror",
 ]

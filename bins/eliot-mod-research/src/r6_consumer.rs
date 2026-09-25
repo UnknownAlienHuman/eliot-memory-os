@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use eliot_epistemic_contracts::ClaimAuditOutcome;
 use eliot_research_exchange::{ExchangeJob, ExchangeStatus};
@@ -19,27 +19,30 @@ use eliot_research_exchange_api::{
 };
 use eliot_researcher::{
     ClaimAudit, EvidenceFreeze, EvidenceGrade, InquiryDisposition, InquiryDispositionRecord,
-    InquiryLane, ResearchDebt, ResearchDebtKind, ResearchDebtProblemBinding,
-    SourceAdmissibilityRecord,
-    SourceEligibility, SourceIndependence, SourceLimits, SourceProposal, SourceProvenance,
-    SourceTaint, TaskGraphCompilationReceipt, UnsupportedPrecisionItem,
+    InquiryLane, InquiryReopenGate, ResearchDebt, ResearchDebtKind, ResearchDebtProblemBinding,
+    SourceAdmissibilityRecord, SourceEligibility, SourceIndependence, SourceLimits, SourceProposal,
+    SourceProvenance, SourceTaint, TaskGraphCompilationReceipt, TaskGraphCompilationRequest,
+    UnsupportedPrecisionItem,
 };
+use eliot_store_api::WriteReceiptStatus;
 
 use super::{R6CompositionError, R6SubmissionOutput, canonical_digest, sha256_hex};
 
 /// Coverage accounting derived only from the completed provider bundle and
 /// its owner-bound request. No caller-provided coverage projection is
 /// accepted.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct R6CoverageReceipt {
-    pub expected_handles: Vec<String>,
-    pub observed_handles: Vec<String>,
-    pub gap_handles: Vec<String>,
-    pub unknown_handles: Vec<String>,
-    pub failed_acquisition: Vec<String>,
-    pub complete_scope: bool,
-    pub denominator_digest: String,
-    pub digest: String,
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct R6CoverageReceipt {
+    expected_handles: Vec<String>,
+    observed_handles: Vec<String>,
+    gap_handles: Vec<String>,
+    unknown_handles: Vec<String>,
+    failed_acquisition: Vec<String>,
+    invalidation: Option<String>,
+    complete_scope: bool,
+    denominator_kind: String,
+    denominator_digest: String,
+    digest: String,
 }
 
 fn derive_r6_coverage(
@@ -50,12 +53,15 @@ fn derive_r6_coverage(
         .allowed_references
         .source_handles
         .iter()
+        .chain(query.allowed_references.evidence_handles.iter())
+        .chain(query.allowed_references.artifact_handles.iter())
         .cloned()
         .collect();
     let observed: BTreeSet<String> = bundle
         .sources
         .iter()
         .map(|source| source.source_handle.clone())
+        .chain(bundle.artifact_handles.iter().cloned())
         .collect();
     let gaps: BTreeSet<String> = bundle
         .coverage_gaps
@@ -64,6 +70,7 @@ fn derive_r6_coverage(
         .collect();
     let unknown: BTreeSet<String> = bundle.coverage_unknowns.iter().cloned().collect();
     let failed: BTreeSet<String> = bundle.failed_acquisition.iter().cloned().collect();
+    let invalidation = bundle.invalidation.clone();
     if observed.intersection(&gaps).next().is_some()
         || observed.intersection(&unknown).next().is_some()
         || !expected.is_superset(&observed)
@@ -78,6 +85,7 @@ fn derive_r6_coverage(
     let complete_scope = expected == accounted
         && unknown.is_empty()
         && failed.is_empty()
+        && invalidation.is_none()
         && bundle.coverage_gaps.is_empty();
     let denominator_digest = canonical_digest(&(
         &query.exchange_id,
@@ -95,7 +103,13 @@ fn derive_r6_coverage(
         &gap_handles,
         &unknown_handles,
         &failed_acquisition,
+        &invalidation,
         complete_scope,
+        if complete_scope {
+            "complete_scope"
+        } else {
+            "unknown"
+        },
         &denominator_digest,
     ))?;
     Ok(R6CoverageReceipt {
@@ -104,7 +118,13 @@ fn derive_r6_coverage(
         gap_handles,
         unknown_handles,
         failed_acquisition,
+        invalidation,
         complete_scope,
+        denominator_kind: if complete_scope {
+            "complete_scope".to_owned()
+        } else {
+            "unknown".to_owned()
+        },
         denominator_digest,
         digest,
     })
@@ -114,37 +134,77 @@ fn derive_r6_coverage(
 /// required to be `Completed` with a result; an `Accepted` job is never
 /// interpreted as an answer.
 #[derive(Clone, Debug, Serialize)]
-pub struct R6CompletedOutput {
-    pub inquiry_id: String,
-    pub binding: eliot_researcher::InquiryExecutionBinding,
-    pub task_compilation: TaskGraphCompilationReceipt,
-    pub exchange_job: ExchangeJob,
-    pub source_records: Vec<SourceAdmissibilityRecord>,
-    pub coverage: R6CoverageReceipt,
-    pub evidence_freeze: Option<EvidenceFreeze>,
-    pub claim_audits: Vec<ClaimAudit>,
-    pub research_debts: Vec<ResearchDebt>,
-    pub problem_bindings: Vec<ResearchDebtProblemBinding>,
-    pub unsupported_precision: Vec<UnsupportedPrecisionItem>,
-    pub disposition: InquiryDispositionRecord,
-    pub candidate_only: bool,
-    pub canonical_write_authorized: bool,
+pub(crate) struct R6CompletedOutput {
+    inquiry_id: String,
+    binding: eliot_researcher::InquiryExecutionBinding,
+    task_compilation: TaskGraphCompilationReceipt,
+    canonical_compilation_receipt: eliot_store_api::WriteReceipt,
+    exchange_job: ExchangeJob,
+    source_records: Vec<SourceAdmissibilityRecord>,
+    coverage: R6CoverageReceipt,
+    evidence_freeze: Option<EvidenceFreeze>,
+    claim_audits: Vec<ClaimAudit>,
+    research_debts: Vec<ResearchDebt>,
+    problem_bindings: Vec<ResearchDebtProblemBinding>,
+    unsupported_precision: Vec<UnsupportedPrecisionItem>,
+    disposition: InquiryDispositionRecord,
+    /// Candidate reopen authorization for a non-closing result. The Task
+    /// Controller/Governor still owns the actual reopen transition.
+    reopen_gate: Option<InquiryReopenGate>,
+    candidate_only: bool,
+    canonical_write_authorized: bool,
+}
+
+/// Read-only production projection of the completed R6 consumer. It has no
+/// public constructor and exposes only serialization/audit access to the
+/// private candidate record.
+#[derive(Clone, Debug, Serialize)]
+pub struct R6CompletionProjection {
+    completed: R6CompletedOutput,
+}
+
+impl R6CompletionProjection {
+    pub(crate) fn from_completed(completed: R6CompletedOutput) -> Self {
+        Self { completed }
+    }
+
+    /// Serializes the immutable candidate projection for an authenticated
+    /// owner surface; this does not create a canonical write.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(&self.completed)
+    }
+
+    /// Returns whether the projection is candidate-only.
+    #[must_use]
+    pub const fn candidate_only(&self) -> bool {
+        self.completed.candidate_only
+    }
+
+    /// Returns whether canonical writing is authorized (always false for this
+    /// candidate record).
+    #[must_use]
+    pub const fn canonical_write_authorized(&self) -> bool {
+        self.completed.canonical_write_authorized
+    }
 }
 
 fn source_proposal(
     source: &SourceSnapshot,
-    bundle: &ResearchEvidenceBundle,
     submission: &R6SubmissionOutput,
     route: &str,
-) -> SourceProposal {
+) -> Result<SourceProposal, R6CompositionError> {
     let profile = &submission.binding.profile;
     let query = &submission.binding.query;
     let captured = source
         .captured_at
         .valid_time_ms
         .or(source.captured_at.known_time_ms)
-        .unwrap_or(1);
-    SourceProposal {
+        .ok_or_else(|| {
+            R6CompositionError::InvalidBinding(
+                "provider source has no observed capture time".to_owned(),
+            )
+        })?;
+    Ok(SourceProposal {
         task_id: profile.task_id.clone(),
         task_definition_digest: profile.task_definition_digest.clone(),
         profile_id: profile.profile_id.clone(),
@@ -155,10 +215,10 @@ fn source_proposal(
             source_class: source.class,
             locator: source.locator.clone(),
             content_digest: source.snapshot_digest.clone(),
-            operation_id: submission.binding.provider_admission_digest.clone(),
-            receipt_handle: bundle.immutable_bundle_digest.clone(),
+            operation_id: submission.binding.provider_operation_id.clone(),
+            receipt_handle: submission.raw_evidence_digest.clone(),
             route_id: route.to_owned(),
-            provider_generation: submission.binding.provider_admission_digest.clone(),
+            provider_generation: submission.binding.provider_generation.clone(),
             state_fence: submission.binding.state_fence.clone(),
             // A provider source snapshot does not prove common lineage. Keeping
             // this unknown prevents repeated/derived sources from receiving
@@ -178,27 +238,31 @@ fn source_proposal(
             retrieved_at_ms: Some(captured),
             disclosure: query.disclosure,
         },
-    }
+    })
 }
 
 fn derive_source_records(
     bundle: &ResearchEvidenceBundle,
     submission: &R6SubmissionOutput,
 ) -> Result<Vec<SourceAdmissibilityRecord>, R6CompositionError> {
-    let route = submission
-        .binding
-        .routes
-        .first()
-        .cloned()
-        .ok_or_else(|| R6CompositionError::InvalidBinding("owner binding has no admitted route".to_owned()))?;
+    if submission.binding.routes.len() != 1 {
+        return Err(R6CompositionError::InvalidBinding(
+            "provider evidence does not carry an exact route projection for multiple routes"
+                .to_owned(),
+        ));
+    }
+    let route = submission.binding.routes.first().cloned().ok_or_else(|| {
+        R6CompositionError::InvalidBinding("owner binding has no admitted route".to_owned())
+    })?;
     bundle
         .sources
         .iter()
         .map(|source| {
+            let proposal = source_proposal(source, submission, &route)?;
             SourceAdmissibilityRecord::evaluate(
                 &submission.binding.profile,
                 &submission.binding.evidence_set_id,
-                &source_proposal(source, bundle, submission, &route),
+                &proposal,
             )
             .map_err(R6CompositionError::Governance)
         })
@@ -221,7 +285,7 @@ fn derive_audits(
             .map_err(R6CompositionError::Governance)?,
         );
         for citation in &claim.citations {
-            if citation.excerpt.is_none()
+            if citation.excerpt.as_deref().is_none_or(str::is_empty)
                 || submission
                     .binding
                     .query
@@ -254,6 +318,8 @@ fn derive_audits(
 fn derive_debts(
     bundle: &ResearchEvidenceBundle,
     submission: &R6SubmissionOutput,
+    audits: &[ClaimAudit],
+    unsupported: &[UnsupportedPrecisionItem],
 ) -> Result<Vec<ResearchDebt>, R6CompositionError> {
     let mut debts = Vec::new();
     for gap in &bundle.coverage_gaps {
@@ -282,6 +348,60 @@ fn derive_debts(
             .map_err(R6CompositionError::Governance)?,
         );
     }
+    for failed in &bundle.failed_acquisition {
+        debts.push(
+            ResearchDebt::new(
+                format!("debt-failed-{failed}"),
+                ResearchDebtKind::Provenance,
+                failed.clone(),
+                "Researcher",
+                "reconcile failed acquisition with immutable raw evidence",
+                Some(submission.binding.query.deadline_ms),
+            )
+            .map_err(R6CompositionError::Governance)?,
+        );
+    }
+    if let Some(invalidation) = &bundle.invalidation {
+        debts.push(
+            ResearchDebt::new(
+                format!("debt-invalidation-{}", sha256_hex(invalidation.as_bytes())),
+                ResearchDebtKind::Authority,
+                invalidation.clone(),
+                "Researcher",
+                "reconcile invalidated provider evidence before any release",
+                Some(submission.binding.query.deadline_ms),
+            )
+            .map_err(R6CompositionError::Governance)?,
+        );
+    }
+    for audit in audits {
+        if audit.canonical_outcome != ClaimAuditOutcome::Supported {
+            debts.push(
+                ResearchDebt::new(
+                    format!("debt-audit-{}", audit.claim_id),
+                    ResearchDebtKind::Verification,
+                    format!("claim audit is {:?}", audit.canonical_outcome),
+                    "Researcher",
+                    "resolve the claim audit before release",
+                    Some(submission.binding.query.deadline_ms),
+                )
+                .map_err(R6CompositionError::Governance)?,
+            );
+        }
+    }
+    for item in unsupported {
+        debts.push(
+            ResearchDebt::new(
+                format!("debt-precision-{}", item.asserted),
+                ResearchDebtKind::Fidelity,
+                format!("unsupported precision: {}", item.risk),
+                "Researcher",
+                "obtain exact admitted evidence or narrow the claim",
+                Some(submission.binding.query.deadline_ms),
+            )
+            .map_err(R6CompositionError::Governance)?,
+        );
+    }
     Ok(debts)
 }
 
@@ -294,11 +414,20 @@ fn build_freeze(
     if bundle.sources.is_empty() {
         return Ok(None);
     }
-    let frozen_at_ms = bundle
-        .sources
-        .first()
-        .and_then(|source| source.captured_at.valid_time_ms)
-        .unwrap_or(1);
+    let mut frozen_at_ms: Option<i64> = None;
+    for source in &bundle.sources {
+        let Some(observed_at) = source
+            .captured_at
+            .valid_time_ms
+            .or(source.captured_at.known_time_ms)
+        else {
+            return Ok(None);
+        };
+        frozen_at_ms = Some(frozen_at_ms.map_or(observed_at, |current| current.max(observed_at)));
+    }
+    let frozen_at_ms = frozen_at_ms.ok_or_else(|| {
+        R6CompositionError::InvalidBinding("evidence freeze has no observed source time".to_owned())
+    })?;
     Ok(Some(
         EvidenceFreeze::new(
             format!("freeze-{}", submission.binding.evidence_set_id),
@@ -328,11 +457,12 @@ fn build_freeze(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn disposition_for(
     bundle: &ResearchEvidenceBundle,
     coverage: &R6CoverageReceipt,
     source_records: &[SourceAdmissibilityRecord],
-    freeze: &Option<EvidenceFreeze>,
+    freeze: Option<&EvidenceFreeze>,
     audits: &[ClaimAudit],
     debts: &[ResearchDebt],
     unsupported: &[UnsupportedPrecisionItem],
@@ -352,34 +482,62 @@ fn disposition_for(
                     .any(|audit| audit.canonical_outcome != ClaimAuditOutcome::Supported)
                 || !debts.is_empty()
                 || !unsupported.is_empty()
+                || bundle.invalidation.is_some()
             {
                 return Err(R6CompositionError::InvalidBinding(
                     "answered disposition lacks eligible sources, a freeze, audits, or complete coverage"
                         .to_owned(),
                 ));
             }
-            if profile.evidence_grade == EvidenceGrade::ScienceGrade
-                && !matches!(
+            if profile.evidence_grade == EvidenceGrade::ScienceGrade {
+                if !matches!(
                     profile.lane,
                     InquiryLane::Confirmatory | InquiryLane::MixedWithDeclaredSplit
+                ) {
+                    return Err(R6CompositionError::InvalidBinding(
+                        "E3/ScienceGrade output requires a confirmatory or declared-split lane"
+                            .to_owned(),
+                    ));
+                }
+                let independent_families = source_records
+                    .iter()
+                    .filter(|record| record.independence == SourceIndependence::Known)
+                    .count();
+                let minimum_independent_families = usize::try_from(
+                    profile
+                        .independence_and_blinding_policy
+                        .minimum_independent_families,
                 )
-            {
-                return Err(R6CompositionError::InvalidBinding(
-                    "E3/ScienceGrade output requires a confirmatory or declared-split lane"
-                        .to_owned(),
-                ));
+                .map_err(|_| {
+                    R6CompositionError::InvalidBinding(
+                        "E3 independent-family floor is not representable".to_owned(),
+                    )
+                })?;
+                if independent_families < minimum_independent_families {
+                    return Err(R6CompositionError::InvalidBinding(
+                        "E3/ScienceGrade output lacks the declared independent-family floor"
+                            .to_owned(),
+                    ));
+                }
             }
             Ok(InquiryDisposition::AnsweredWithSupportedResult)
         }
         CompletionDisposition::NoMatchInCompleteScope => {
             if !coverage.complete_scope
-                || !bundle.sources.is_empty()
+                || bundle.sources.is_empty()
+                || source_records.is_empty()
+                || source_records
+                    .iter()
+                    .any(|record| record.eligibility != SourceEligibility::Eligible)
+                || freeze.is_none()
                 || !bundle.claims.is_empty()
-                || !bundle.coverage_unknowns.is_empty()
-                || !bundle.failed_acquisition.is_empty()
+                || !audits.is_empty()
+                || !debts.is_empty()
+                || !unsupported.is_empty()
+                || bundle.invalidation.is_some()
             {
                 return Err(R6CompositionError::InvalidBinding(
-                    "negative disposition requires a complete denominator with no unknown or partial result"
+                    "negative disposition requires a complete denominator with eligible frozen evidence and no unknown or partial result"
                         .to_owned(),
                 ));
             }
@@ -397,12 +555,62 @@ fn disposition_for(
     }
 }
 
+fn validate_submission(submission: &R6SubmissionOutput) -> Result<(), R6CompositionError> {
+    submission
+        .binding
+        .validate_integrity()
+        .map_err(R6CompositionError::Governance)?;
+    if submission.raw_evidence_digest.len() != 64
+        || submission
+            .raw_evidence_digest
+            .bytes()
+            .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(R6CompositionError::InvalidBinding(
+            "R6 completion has no canonical raw provider evidence binding".to_owned(),
+        ));
+    }
+    if !submission.candidate_only() || submission.canonical_write_authorized() {
+        return Err(R6CompositionError::InvalidBinding(
+            "R6 submission is not candidate-only".to_owned(),
+        ));
+    }
+    if submission.canonical_compilation_receipt.validate().is_err()
+        || submission.canonical_compilation_receipt.status != WriteReceiptStatus::Committed
+        || submission.canonical_compilation_receipt.transition_class
+            != eliot_store_api::TransitionClass::CaptureCandidate
+        || submission.canonical_compilation_receipt.state_fence != submission.binding.state_fence
+    {
+        return Err(R6CompositionError::InvalidBinding(
+            "R6 compiler receipt was not durably committed before evidence consumption".to_owned(),
+        ));
+    }
+    let request = TaskGraphCompilationRequest {
+        task_id: submission.binding.profile.task_id.clone(),
+        task_definition_digest: submission.binding.profile.task_definition_digest.clone(),
+        profile_id: submission.binding.profile.profile_id.clone(),
+        profile_revision: submission.binding.profile.revision,
+        profile_digest: submission.binding.profile.digest.clone(),
+        obligation_ids: submission.task_compilation.obligation_ids().to_vec(),
+        obligation_digests: submission.task_compilation.obligation_digests().to_vec(),
+        state_fence: submission.binding.state_fence.clone(),
+        inquiry_binding_digest: submission.binding.digest.clone(),
+    };
+    submission
+        .task_compilation
+        .validate_against(&request)
+        .map_err(|error| R6CompositionError::InvalidBinding(error.to_string()))?;
+    Ok(())
+}
+
 /// Consumes one completed admitted provider result and derives all R6
 /// candidate artifacts from it. This is the only closure-bearing consumer;
 /// submission and provider acknowledgement are intentionally insufficient.
-pub fn compose_r6_completed(
+#[allow(clippy::too_many_lines)]
+pub(crate) fn compose_r6_completed(
     submission: &R6SubmissionOutput,
 ) -> Result<R6CompletedOutput, R6CompositionError> {
+    validate_submission(submission)?;
     if submission.exchange_job.status != ExchangeStatus::Completed
         || submission.exchange_job.result.is_none()
     {
@@ -419,6 +627,9 @@ pub fn compose_r6_completed(
     if bundle.exchange_id != submission.binding.query.exchange_id
         || bundle.job_id != submission.exchange_job.job_id
         || bundle.state_fence != submission.binding.state_fence
+        || bundle.system_generation != submission.binding.provider_generation
+        || (bundle.origin_authentication != submission.binding.provider_operation_id
+            && bundle.origin_authentication != submission.binding.provider_admission_digest)
     {
         return Err(R6CompositionError::InvalidBinding(
             "provider result is not bound to the owner-issued exchange job/fence".to_owned(),
@@ -427,7 +638,16 @@ pub fn compose_r6_completed(
     let coverage = derive_r6_coverage(bundle, &submission.binding.query)?;
     let source_records = derive_source_records(bundle, submission)?;
     let (claim_audits, unsupported_precision) = derive_audits(bundle, submission)?;
-    let research_debts = derive_debts(bundle, submission)?;
+    let research_debts = derive_debts(bundle, submission, &claim_audits, &unsupported_precision)?;
+    let problem_evidence_refs: BTreeSet<String> = bundle
+        .coverage_gaps
+        .iter()
+        .map(|gap| gap.source_handle.clone())
+        .chain(bundle.coverage_unknowns.iter().cloned())
+        .chain(bundle.failed_acquisition.iter().cloned())
+        .chain(std::iter::once(bundle.immutable_bundle_digest.clone()))
+        .chain(bundle.invalidation.clone())
+        .collect();
     let problem_bindings = research_debts
         .iter()
         .map(|debt| {
@@ -436,12 +656,7 @@ pub fn compose_r6_completed(
                 &submission.binding.profile.task_id,
                 &submission.binding.profile.digest,
                 &submission.binding.state_fence,
-                bundle
-                    .coverage_gaps
-                    .iter()
-                    .map(|gap| gap.source_handle.clone())
-                    .chain(bundle.coverage_unknowns.iter().cloned())
-                    .collect(),
+                problem_evidence_refs.iter().cloned().collect(),
             )
             .map_err(R6CompositionError::Governance)
         })
@@ -451,7 +666,7 @@ pub fn compose_r6_completed(
         bundle,
         &coverage,
         &source_records,
-        &evidence_freeze,
+        evidence_freeze.as_ref(),
         &claim_audits,
         &research_debts,
         &unsupported_precision,
@@ -486,10 +701,44 @@ pub fn compose_r6_completed(
         },
     )
     .map_err(R6CompositionError::Governance)?;
+    let reopen_gate = if disposition.may_close() {
+        None
+    } else {
+        let evidence_refs: BTreeSet<String> = bundle
+            .coverage_gaps
+            .iter()
+            .map(|gap| gap.source_handle.clone())
+            .chain(bundle.coverage_unknowns.iter().cloned())
+            .chain(bundle.failed_acquisition.iter().cloned())
+            .chain(std::iter::once(bundle.immutable_bundle_digest.clone()))
+            .collect();
+        let reason = submission
+            .binding
+            .profile
+            .output_contract_and_reopen_conditions
+            .reopen_conditions
+            .first()
+            .cloned()
+            .ok_or_else(|| {
+                R6CompositionError::InvalidBinding(
+                    "non-closing R6 profile has no declared reopen condition".to_owned(),
+                )
+            })?;
+        Some(
+            InquiryReopenGate::authorize(
+                &submission.binding.profile,
+                &disposition_record,
+                evidence_refs.into_iter().collect(),
+                reason,
+            )
+            .map_err(R6CompositionError::Governance)?,
+        )
+    };
     Ok(R6CompletedOutput {
         inquiry_id: submission.inquiry_id.clone(),
         binding: submission.binding.clone(),
         task_compilation: submission.task_compilation.clone(),
+        canonical_compilation_receipt: submission.canonical_compilation_receipt.clone(),
         exchange_job: submission.exchange_job.clone(),
         source_records,
         coverage,
@@ -499,6 +748,7 @@ pub fn compose_r6_completed(
         problem_bindings,
         unsupported_precision,
         disposition: disposition_record,
+        reopen_gate,
         candidate_only: true,
         canonical_write_authorized: false,
     })
