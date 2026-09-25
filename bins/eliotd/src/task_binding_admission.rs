@@ -538,12 +538,12 @@ pub fn admit_canonical_write(
                 "task-relative write names no task binding",
             ));
         };
-        if let Some(context_task) = context.task_id.as_ref().map(TaskId::as_str) {
-            if context_task != expected_task_ref {
-                return Err(TaskBindingError::scope_incompatible(
-                    "task-relative write names a different task than the admitted context",
-                ));
-            }
+        if let Some(context_task) = context.task_id.as_ref().map(TaskId::as_str)
+            && context_task != expected_task_ref
+        {
+            return Err(TaskBindingError::scope_incompatible(
+                "task-relative write names a different task than the admitted context",
+            ));
         }
         admit_task_bound(
             selection,
