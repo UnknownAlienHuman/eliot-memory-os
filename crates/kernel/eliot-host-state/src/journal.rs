@@ -6,10 +6,10 @@ use sha2::{Digest, Sha256};
 
 use crate::backend::{BackendReconcileState, CommittedAppend, DurableImage, PreparedAppend};
 use crate::model::{
-    AppliedOperation, EpochEvidence, HostInstallationEpoch, HostState, HostStateRecord,
-    IdempotencyIdentity, RecoveryLineageReason, activation_transition, dependency_transition,
-    drain_transition, epoch_transition_is_direct_child_of, kernel_transition,
-    store_rebind_transition, wake_transition,
+    AppliedOperation, CutoverIntentState, EpochEvidence, HostInstallationEpoch, HostState,
+    HostStateRecord, IdempotencyIdentity, RecoveryLineageReason, activation_transition,
+    dependency_transition, drain_transition, epoch_transition_is_direct_child_of,
+    kernel_transition, store_rebind_transition, wake_transition,
 };
 use crate::reactive_context::{
     ReactiveContextEnqueueReceipt, ReactiveContextJournalAction, ReactiveContextOperationQuery,
@@ -579,6 +579,16 @@ fn apply(
                 && state.observations.is_empty()
                 && state.readiness_observations.is_empty()
                 && state.store_rebinds.is_empty();
+            // A durable `Pending` cutover intent is an outstanding owner
+            // effect: a clean marker would licence a new Host epoch lineage
+            // while an activation is authorized but unapplied, which is
+            // exactly the "activation without a durable intent" hazard the
+            // intent record exists to close. A terminal intent is settled
+            // history and does not block shutdown.
+            let cutover_settled = state
+                .pending_cutover
+                .as_ref()
+                .is_none_or(|intent| intent.state != CutoverIntentState::Pending);
             let reactive_context_clean = state
                 .reactive_context
                 .as_ref()
@@ -591,6 +601,7 @@ fn apply(
                     != Some(crate::ActivationState::StoppedClean)
                     && !genesis_without_runtime_contour)
                 || !reactive_context_clean
+                || !cutover_settled
             {
                 return Err(JournalError::Invalid(
                     "clean marker does not cover a cleanly stopped journal".into(),
@@ -613,6 +624,76 @@ fn apply(
                 }
             }
             state.retired_epochs.push(next.retired_host.clone());
+            state.clean_marker = None;
+        }
+        HostStateRecord::CutoverIntent(next) => {
+            // A durable cutover intent is a small state machine: `Pending`
+            // authorizes the activation CAS, and exactly one terminal
+            // disposition (`Committed`/`Failed`) closes it. The rules, in
+            // order:
+            //  * a terminal disposition is only accepted after a durable
+            //    `Pending` for the same operation, installation, request
+            //    digest, fence and bindings;
+            //  * a `Pending` for the *same* operation must match the
+            //    outstanding intent exactly;
+            //  * a `Pending` for a *distinct* operation replaces the
+            //    projection only once the previous intent is terminal, so an
+            //    outstanding authorized-but-unapplied intent is never
+            //    discarded by another cutover;
+            //  * a terminal disposition is never revised: a refused operation
+            //    stays refused, and a new attempt is a new operation identity.
+            if let Some(current) = state.pending_cutover.as_ref() {
+                let same_operation = current.cutover_operation == next.cutover_operation
+                    && current.installation == next.installation
+                    && current.request_digest == next.request_digest;
+                if next.state == CutoverIntentState::Pending {
+                    if same_operation {
+                        if current.fence != next.fence {
+                            return Err(JournalError::IdempotencyConflict);
+                        }
+                        if current.state != CutoverIntentState::Pending {
+                            return Err(JournalError::Invalid(
+                                "cutover intent disposition is already terminal".into(),
+                            ));
+                        }
+                        if current.expected_predecessor != next.expected_predecessor
+                            || current.target_generation != next.target_generation
+                            || current.target_build_digest != next.target_build_digest
+                            || current.target_config_digest != next.target_config_digest
+                            || current.user_broker_ref != next.user_broker_ref
+                        {
+                            return Err(JournalError::IdempotencyConflict);
+                        }
+                    } else if current.state == CutoverIntentState::Pending {
+                        return Err(JournalError::IdempotencyConflict);
+                    }
+                } else {
+                    if !same_operation || current.fence != next.fence {
+                        return Err(JournalError::IdempotencyConflict);
+                    }
+                    if current.state != CutoverIntentState::Pending {
+                        return Err(JournalError::Invalid(
+                            "cutover intent disposition is already terminal".into(),
+                        ));
+                    }
+                    if current.expected_predecessor != next.expected_predecessor
+                        || current.target_generation != next.target_generation
+                        || current.target_build_digest != next.target_build_digest
+                        || current.target_config_digest != next.target_config_digest
+                        || current.user_broker_ref != next.user_broker_ref
+                    {
+                        return Err(JournalError::IdempotencyConflict);
+                    }
+                }
+            } else if next.state != CutoverIntentState::Pending {
+                // The activation CAS may only run after a `Pending` record is
+                // durable, so a terminal disposition with no durable intent is
+                // refused at this boundary rather than trusted.
+                return Err(JournalError::Invalid(
+                    "cutover intent terminal disposition without a durable intent".into(),
+                ));
+            }
+            state.pending_cutover = Some(next.clone());
             state.clean_marker = None;
         }
     }
