@@ -73,6 +73,7 @@ mod skill_surface_adapters;
 pub mod staffing_policy;
 pub mod startup_evidence_producer;
 mod store_failure_projection;
+pub mod supervision_progress;
 pub mod swarm_composition;
 pub mod task_binding_admission;
 mod task_lifecycle_adapters;
@@ -185,6 +186,13 @@ pub use startup_evidence_producer::{
     publish_daemon_startup_evidence, summarize_retained_capabilities,
 };
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
+pub use supervision_progress::{
+    DAEMON_SUPERVISION_PROGRESS_OPERATION, DaemonReadySupervision, STORE_DEPENDENCY_WAIT_NAME,
+    SupervisionProducerDeps, SupervisionProgressAnswer, SupervisionProgressHead,
+    SupervisionProgressLineage, SupervisionProgressProducer, SupervisionTickInputs,
+    parse_daemon_ready_supervision, parse_progress_answer, progress_submit_payload,
+    store_dependency_dimension,
+};
 
 /// Builds the production P-07 authority adapter over an already-connected
 /// authenticated Kernel client.
