@@ -98,12 +98,25 @@ struct RetainedActivationIdentity {
     result_sha256: String,
 }
 
-/// Completion of one in-flight activation step. Claim and dispatch share one
-/// flight branch so health and shutdown stay pollable while either is
-/// outstanding.
+/// Completion of one in-flight activation step. Claim, resolve-wait and
+/// dispatch share one flight branch so health and shutdown stay pollable
+/// while any of them is outstanding. The resolve wait lives inside this
+/// polled flight (issue #2559): the completion handler only installs the
+/// next future and returns to `select!`, never awaiting a lock or another
+/// flight there.
 enum ActivationCompletion {
     Claim(Result<ActivationClaim, String>),
+    Resolve(Result<Option<Box<ActivationResolvedTicket>>, String>),
     Dispatch(Result<(), ActivationDispatchError>),
+}
+
+/// One resolved ticket waiting for its submit step. Produced once by the
+/// resolve-wait flight; the dispatch step reuses it verbatim and never
+/// re-resolves, so a lost acknowledgement reconciles under the same
+/// identity instead of invoking the resolver again.
+struct ActivationResolvedTicket {
+    ticket: AgentActivationResolutionTicket,
+    result: AgentActivationResolutionResult,
 }
 
 struct ActivationFlightState {
@@ -146,6 +159,71 @@ fn start_activation_claim(
             .map_err(|error| format!("Kernel activation ticket claim: {error}"));
         ActivationCompletion::Claim(outcome)
     })
+}
+
+/// Polls the one in-flight activation step, pending forever while idle so
+/// health and shutdown stay pollable with no step outstanding. Claim,
+/// resolve-wait and dispatch all ride this one branch.
+async fn next_activation_completion(flight: &mut ActivationFlight) -> ActivationCompletion {
+    match flight {
+        ActivationFlight::Idle => std::future::pending::<ActivationCompletion>().await,
+        ActivationFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+/// Installs the resolve-wait flight for one validated ticket and returns
+/// immediately to `select!` (issue #2559). The composition lock wait and the
+/// clock read live inside that polled flight, so a suspended local-read,
+/// `Skill`, `TestD` or owner-feed step holding the lock keeps being polled
+/// while this one queues. No drain-before-lock workaround: the `TestD` drain
+/// is its own independently polled flight with short guarded phases.
+fn install_activation_resolve(
+    composition: &SharedComposition,
+    flight: &mut ActivationFlight,
+    ticket: AgentActivationResolutionTicket,
+) {
+    *flight = ActivationFlight::InFlight(ActivationFlightState {
+        future: start_activation_resolve(Arc::clone(composition), ticket),
+        retained: None,
+    });
+}
+
+/// Starts the resolve-wait step for one validated ticket. The returned future
+/// acquires the composition guard, reads the clock after that wait and
+/// immediately before resolution, then resolves once through the v2 spine.
+fn start_activation_resolve(
+    composition: SharedComposition,
+    ticket: AgentActivationResolutionTicket,
+) -> Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>> {
+    Box::pin(async move {
+        let guard = composition.lock().await;
+        let now = match unix_ms(SystemTime::now()) {
+            Ok(now) => now,
+            Err(error) => return ActivationCompletion::Resolve(Err(error)),
+        };
+        ActivationCompletion::Resolve(resolve_valid_ticket(&guard, ticket, now))
+    })
+}
+
+/// Settles one completed resolve-wait step: Kernel-owned expiry idles the
+/// flight with no resolve and no submit, otherwise the dispatch step starts
+/// carrying the retained result identity for submission/reconciliation.
+fn settle_activation_resolve_completion(
+    kernel: &Arc<DaemonKernelClient>,
+    flight: &mut ActivationFlight,
+    outcome: Result<Option<Box<ActivationResolvedTicket>>, String>,
+) -> Result<(), String> {
+    match outcome {
+        Err(error) => Err(error),
+        Ok(None) => {
+            *flight = ActivationFlight::Idle;
+            Ok(())
+        }
+        Ok(Some(resolved)) => {
+            *flight = ActivationFlight::InFlight(start_activation_dispatch(kernel, *resolved));
+            Ok(())
+        }
+    }
 }
 
 /// Settles one invalid activation claim (issue #202, owner decision ii).
@@ -878,7 +956,14 @@ async fn run_loop(
     // revision advance or a recovery re-presentation republishes through the
     // full read->publish->readback exchange. Degradation never fails the
     // loop: pending grants stay pending until a later pass binds them.
-    let mut owner_feed = eliotd::OwnerFeedTrigger::new();
+    // Issue #2559: the trigger travels with its own polled flight below, so
+    // a stalled exchange never stalls health or shutdown polling.
+    let mut owner_feed = Some(eliotd::OwnerFeedTrigger::new());
+    // Sole owner of owner-feed sync state. One bounded read->publish->readback
+    // exchange is outstanding at most; the health tick starts it when idle
+    // and its completion branch settles it back, exactly like the other
+    // flights. No second owner and no untracked spawn exist.
+    let mut owner_feed_flight = OwnerFeedFlight::Idle;
     // Sole owner of TestD owner drain state (issue #325). The same tick
     // drives it independently of the other flights: one bounded drain step
     // binds pending verifier dispatches, publishes terminal verifier facts,
@@ -886,16 +971,33 @@ async fn run_loop(
     // the Kernel owner routes.
     let mut testd_owner_flight = TestdOwnerFlight::Idle;
     // Recovery re-presentation at loop start: rebind the Kernel P-07 owner
-    // from live Governor state before any activation work is claimed. No
-    // drain can be outstanding this early, so nothing settles it first.
-    sync_owner_feed(&kernel, &composition, &mut owner_feed).await;
+    // from live Governor state before any activation work is claimed. The
+    // exchange starts as the owner-feed flight's first bounded step and is
+    // polled by the loop below; it is never awaited here, so the loop stays
+    // pollable from its first pass.
+    maybe_start_owner_feed_sync(
+        &kernel,
+        &composition,
+        &mut owner_feed,
+        &mut owner_feed_flight,
+    );
     loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|error| format!("daemon shutdown signal: {error}"))?;
-                let exit = drain_activation_on_shutdown(&mut flight).await?;
-                drain_local_read_on_shutdown(&mut local_read_flight).await?;
-                drain_testd_owner_on_shutdown(&mut testd_owner_flight).await?;
+                // Issue #2559: already-started flights drain together inside
+                // one finite budget while every one of them stays polled; no
+                // new claim starts here.
+                let exit = drain_flights_on_shutdown(
+                    &kernel,
+                    &composition,
+                    &mut flight,
+                    &mut local_read_flight,
+                    &mut testd_owner_flight,
+                    &mut owner_feed_flight,
+                    &mut owner_feed,
+                )
+                .await?;
                 return Ok(exit);
             }
             _ = cadence.activation_poll.tick() => {
@@ -914,55 +1016,14 @@ async fn run_loop(
                 // health-heartbeat admitted-observation trigger below.
                 note_idle_maintenance_trigger(&composition, &flight).await;
             }
-            completion = async {
-                match &mut flight {
-                    ActivationFlight::Idle => {
-                        std::future::pending::<ActivationCompletion>().await
-                    }
-                    ActivationFlight::InFlight(state) => (&mut state.future).await,
-                }
-            } => {
-                match completion {
-                    ActivationCompletion::Claim(claim_outcome) => {
-                        let claim = match claim_outcome {
-                            Err(error) => return Err(error),
-                            Ok(claim) => claim,
-                        };
-                        // Issue #202 (owner decision ii), validate-first.
-                        let ticket = match settle_activation_claim(claim, &mut supervision_progress)? {
-                            ActivationClaimStep::Idle => {
-                                flight = ActivationFlight::Idle;
-                                continue;
-                            }
-                            ActivationClaimStep::Valid(ticket) => *ticket,
-                        };
-                        let state = start_claimed_activation_step(
-                            &kernel,
-                            &composition,
-                            &mut testd_owner_flight,
-                            ticket,
-                        )
-                        .await?;
-                        match state {
-                            Some(state) => {
-                                flight = ActivationFlight::InFlight(state);
-                            }
-                            None => {
-                                flight = ActivationFlight::Idle;
-                            }
-                        }
-                    }
-                    ActivationCompletion::Dispatch(dispatch_outcome) => match dispatch_outcome {
-                        Ok(()) => {
-                            note_supervision_applied(supervision_progress.as_mut());
-                            flight = ActivationFlight::Idle;
-                        }
-                        Err(ActivationDispatchError::Hard(error)) => return Err(error),
-                        Err(ActivationDispatchError::Unknown { detail, .. }) => {
-                            return Err(detail);
-                        }
-                    },
-                }
+            completion = next_activation_completion(&mut flight) => {
+                settle_activation_completion(
+                    &kernel,
+                    &composition,
+                    &mut supervision_progress,
+                    &mut flight,
+                    completion,
+                )?;
             }
             local_read_completion = next_local_read_completion(&mut local_read_flight) => {
                 settle_local_read_completion(local_read_completion, &mut local_read_flight)?;
@@ -970,13 +1031,20 @@ async fn run_loop(
             testd_owner_completion = next_testd_owner_completion(&mut testd_owner_flight) => {
                 settle_testd_owner_completion(testd_owner_completion, &mut testd_owner_flight)?;
             }
+            owner_feed_trigger = next_owner_feed_completion(&mut owner_feed_flight) => {
+                settle_owner_feed_completion(
+                    owner_feed_trigger,
+                    &mut owner_feed,
+                    &mut owner_feed_flight,
+                );
+            }
             _ = cadence.health_heartbeat.tick() => {
                 run_health_heartbeat_tick(
                     &kernel,
                     &composition,
                     &mut owner_feed,
+                    &mut owner_feed_flight,
                     &mut supervision_progress,
-                    &mut testd_owner_flight,
                     &flight,
                 )
                 .await?;
@@ -1022,6 +1090,54 @@ fn settle_activation_claim(
             note_supervision_claim(supervision_progress.as_mut());
             Ok(ActivationClaimStep::Valid(Box::new(*ticket)))
         }
+    }
+}
+
+/// Settles one completed activation step for the live loop.
+///
+/// A completed claim installs the resolve-wait flight, a completed
+/// resolve-wait installs the dispatch flight or idles on Kernel-owned
+/// expiry, and a completed dispatch idles after noting supervision work.
+/// Every arm installs synchronously and returns to `select!` (issue #2559):
+/// no lock wait and no other flight is awaited here, so activation,
+/// local-read, `TestD`, health and shutdown stay pollable throughout.
+fn settle_activation_completion(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
+    flight: &mut ActivationFlight,
+    completion: ActivationCompletion,
+) -> Result<(), String> {
+    match completion {
+        ActivationCompletion::Claim(claim_outcome) => {
+            let claim = claim_outcome?;
+            // Issue #202 (owner decision ii), validate-first.
+            match settle_activation_claim(claim, supervision_progress)? {
+                ActivationClaimStep::Idle => {
+                    *flight = ActivationFlight::Idle;
+                }
+                ActivationClaimStep::Valid(ticket) => {
+                    // Issue #2559: the validated ticket is retained by the
+                    // new resolve-wait flight; the lock wait inside that
+                    // flight stays polled alongside every other flight
+                    // instead of stalling the loop here.
+                    install_activation_resolve(composition, flight, *ticket);
+                }
+            }
+            Ok(())
+        }
+        ActivationCompletion::Resolve(resolve_outcome) => {
+            settle_activation_resolve_completion(kernel, flight, resolve_outcome)
+        }
+        ActivationCompletion::Dispatch(dispatch_outcome) => match dispatch_outcome {
+            Ok(()) => {
+                note_supervision_applied(supervision_progress.as_mut());
+                *flight = ActivationFlight::Idle;
+                Ok(())
+            }
+            Err(ActivationDispatchError::Hard(error)) => Err(error),
+            Err(ActivationDispatchError::Unknown { detail, .. }) => Err(detail),
+        },
     }
 }
 
@@ -1128,15 +1244,19 @@ async fn note_idle_maintenance_trigger(composition: &SharedComposition, flight: 
 /// progress built from observed work. The poll's Store dimension is reused as
 /// the observation's `store_dependency` evidence, never as renewal authority.
 ///
+/// Issue #2559: the tick never waits for the owner-feed exchange. The
+/// exchange rides its own polled flight started below when idle, so a
+/// stalled owner-feed step cannot stall health or supervision polling.
+///
 /// #18 item A: the health poll runs unconditionally, so liveness stays observed
 /// even for a generation that never reported ready; only the progress renewal
 /// is absent, because the Kernel authored no supervision lineage for it.
 async fn run_health_heartbeat_tick(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
-    owner_feed: &mut eliotd::OwnerFeedTrigger,
+    owner_feed: &mut Option<eliotd::OwnerFeedTrigger>,
+    owner_feed_flight: &mut OwnerFeedFlight,
     supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
-    testd_owner_flight: &mut TestdOwnerFlight,
     flight: &ActivationFlight,
 ) -> Result<(), String> {
     let health: StoreHealth = KernelTransitionPort::health(kernel.as_ref())
@@ -1167,13 +1287,10 @@ async fn run_health_heartbeat_tick(
     }
     // #2100: revision-advance trigger for the Kernel P-07 owner feed.
     // Unchanged providers perform no IO here; an advanced provider
-    // republishes with readback proof.
-    //
-    // Item B: settle the outstanding TestD drain first, so the owner feed does
-    // not wait on the composition lock while the drain holds it across a
-    // Governor-owned canonical exchange.
-    settle_testd_owner_before_lock(testd_owner_flight).await?;
-    sync_owner_feed(kernel, composition, owner_feed).await;
+    // republishes with readback proof. The exchange starts on its own
+    // polled flight when idle and is never awaited here: its pending
+    // publication may gate dependent grants but never health polling.
+    maybe_start_owner_feed_sync(kernel, composition, owner_feed, owner_feed_flight);
     Ok(())
 }
 
@@ -1238,38 +1355,20 @@ async fn submit_supervision_heartbeat(
     Ok(())
 }
 
-/// Settles one claimed activation ticket into the next dispatch step or an
-/// idle flight.
-///
-/// Item B: the outstanding TestD drain is settled *before* this function takes
-/// the composition lock, so the loop never queues behind — and never blocks — a
-/// guarded Kernel exchange inside the drain. The clock is read first, exactly
-/// as before, so an invalid wall clock still fails closed before any lock.
-async fn start_claimed_activation_step(
-    kernel: &Arc<DaemonKernelClient>,
-    composition: &SharedComposition,
-    testd_owner_flight: &mut TestdOwnerFlight,
-    ticket: AgentActivationResolutionTicket,
-) -> Result<Option<ActivationFlightState>, String> {
-    let now = unix_ms(SystemTime::now())?;
-    settle_testd_owner_before_lock(testd_owner_flight).await?;
-    let guard = composition.lock().await;
-    start_valid_claim_step(kernel, &guard, ticket, now)
-}
-
-/// Starts the dispatch step for one validated ticket, or idles on
-/// Kernel-owned expiry.
+/// Resolves one validated ticket under the already-held composition guard.
 ///
 /// Returns `None` when the ticket expired at or after the Kernel deadline:
 /// the resolver is never called and nothing is submitted or reconciled for
-/// an expired ticket. Otherwise resolves once through the v2 spine and
-/// returns the in-flight dispatch state carrying the retained identity.
-fn start_valid_claim_step(
-    kernel: &Arc<DaemonKernelClient>,
+/// an expired ticket. Issue #2559: the caller reads the clock after its lock
+/// wait and immediately before calling here, so expiry while waiting
+/// prevents semantic resolution, including at the exact deadline boundary.
+/// Otherwise resolves once through the v2 spine for the dispatch step to
+/// submit verbatim.
+fn resolve_valid_ticket(
     composition: &DaemonComposition,
     ticket: AgentActivationResolutionTicket,
     now: u64,
-) -> Result<Option<ActivationFlightState>, String> {
+) -> Result<Option<Box<ActivationResolvedTicket>>, String> {
     if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
         // Kernel owns the typed expiry outcome.  Do not call the resolver
         // at or after its exact deadline, and do not submit or reconcile an
@@ -1288,85 +1387,227 @@ fn start_valid_claim_step(
                 ticket.ticket_id
             )
         })?;
+    Ok(Some(Box::new(ActivationResolvedTicket { ticket, result })))
+}
+
+/// Starts the dispatch step for one resolved ticket, carrying the retained
+/// result identity for submission and lost-acknowledgement reconciliation.
+/// The retained bytes/digest are reused verbatim and never recomputed, and
+/// the resolver is never invoked again under a new identity.
+fn start_activation_dispatch(
+    kernel: &Arc<DaemonKernelClient>,
+    resolved: ActivationResolvedTicket,
+) -> ActivationFlightState {
     let retained = RetainedActivationIdentity {
-        ticket_id: ticket.ticket_id.clone(),
-        result_sha256: result.result_sha256.clone(),
+        ticket_id: resolved.ticket.ticket_id.clone(),
+        result_sha256: resolved.result.result_sha256.clone(),
     };
     let kernel_clone = Arc::clone(kernel);
     let future: Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>> =
         Box::pin(async move {
-            let outcome = dispatch_agent_activation_result(&kernel_clone, &ticket, result).await;
+            let outcome =
+                dispatch_agent_activation_result(&kernel_clone, &resolved.ticket, resolved.result)
+                    .await;
             ActivationCompletion::Dispatch(outcome)
         });
-    Ok(Some(ActivationFlightState {
+    ActivationFlightState {
         future,
         retained: Some(retained),
-    }))
+    }
 }
 
-/// Bounded shutdown drain for one in-flight activation. Never starts new
-/// work, never recomputes under a new id, and never silently drops an
-/// ambiguous submit: the original ticket/result identity is retained and a
-/// timeout or unknown retention surfaces a typed unknown outcome.
-async fn drain_activation_on_shutdown(
+/// Stage-aware shutdown drain for every already-started flight (issue
+/// #2559). No new claim starts here; already-started claim, resolve-wait,
+/// dispatch, local-read, `TestD` owner and owner-feed steps keep being polled
+/// together inside one declared finite budget.
+///
+/// A claimed/waiting ticket carries no result digest yet, so exhausting the
+/// budget while waiting or resolving settles as a clean shutdown: nothing
+/// was submitted and the Kernel-owned ticket simply expires. A resolved and
+/// submitting result keeps its retained identity instead: an unknown
+/// acknowledgement or a budget exhausted mid-submit settles as a typed
+/// unknown carrying the original ticket/result verbatim, never a fabricated
+/// hash. Local-read, `TestD` owner and owner-feed steps always settle as plain
+/// shutdown: an un-submitted pair's attempt capability is revoked on
+/// disconnect, an already-persisted `TestD` decision exact-replays, and a
+/// pending owner-feed publication leaves dependent grants pending. Only a
+/// step failure fails closed. Dropping every flight here also releases all
+/// owned composition references before the existing final shutdown, without
+/// leaking detached work.
+async fn drain_flights_on_shutdown(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
     flight: &mut ActivationFlight,
+    local_read_flight: &mut LocalReadFlight,
+    testd_owner_flight: &mut TestdOwnerFlight,
+    owner_feed_flight: &mut OwnerFeedFlight,
+    owner_feed: &mut Option<eliotd::OwnerFeedTrigger>,
 ) -> Result<RunLoopExit, String> {
     // #740: drain span. Idle drains and unknown-retention drains emit
     // distinct dispositions with the original identity verbatim.
     let _span = tracing::info_span!("eliotd.activation_drain").entered();
-    let previous = std::mem::replace(flight, ActivationFlight::Idle);
-    let ActivationFlight::InFlight(state) = previous else {
-        let _ = eliotd::diagnostics::emit_drain(eliotd::diagnostics::DrainOutcome::Idle, "", "");
-        return Ok(RunLoopExit::Shutdown);
-    };
-    let retained = state.retained;
-    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
-        Ok(ActivationCompletion::Claim(claim_outcome)) => match claim_outcome {
-            Ok(
-                ActivationClaim::Empty
-                | ActivationClaim::Valid(_)
-                | ActivationClaim::Invalid { .. },
-            ) => Ok(RunLoopExit::Shutdown),
-            Err(error) => Err(error),
-        },
-        Ok(ActivationCompletion::Dispatch(dispatch_outcome)) => match dispatch_outcome {
-            Ok(()) => Ok(RunLoopExit::Shutdown),
-            Err(ActivationDispatchError::Hard(error)) => Err(error),
-            Err(ActivationDispatchError::Unknown {
-                ticket_id,
-                result_sha256,
-                detail,
-            }) => {
-                let _ = eliotd::diagnostics::emit_drain(
-                    eliotd::diagnostics::DrainOutcome::ActivationUnknown,
-                    &ticket_id,
-                    &result_sha256,
-                );
-                Ok(RunLoopExit::ShutdownActivationUnknown {
-                    ticket_id,
-                    result_sha256,
-                    detail,
-                })
+    let deadline = Instant::now() + SHUTDOWN_ACTIVATION_DRAIN;
+    let mut no_supervision: Option<eliotd::SupervisionProgressProducer> = None;
+    let mut activation_exit = RunLoopExit::Shutdown;
+    loop {
+        if matches!(flight, ActivationFlight::Idle)
+            && matches!(local_read_flight, LocalReadFlight::Idle)
+            && matches!(testd_owner_flight, TestdOwnerFlight::Idle)
+            && matches!(owner_feed_flight, OwnerFeedFlight::Idle)
+        {
+            return Ok(activation_exit);
+        }
+        tokio::select! {
+            completion = next_activation_completion(flight) => {
+                match completion {
+                    ActivationCompletion::Claim(claim_outcome) => {
+                        let claim = match claim_outcome {
+                            Err(error) => return Err(error),
+                            Ok(claim) => claim,
+                        };
+                        match settle_activation_claim(claim, &mut no_supervision)? {
+                            ActivationClaimStep::Idle => {
+                                *flight = ActivationFlight::Idle;
+                            }
+                            ActivationClaimStep::Valid(ticket) => {
+                                install_activation_resolve(composition, flight, *ticket);
+                            }
+                        }
+                    }
+                    ActivationCompletion::Resolve(resolve_outcome) => {
+                        settle_activation_resolve_completion(kernel, flight, resolve_outcome)?;
+                    }
+                    ActivationCompletion::Dispatch(dispatch_outcome) => {
+                        *flight = ActivationFlight::Idle;
+                        match dispatch_outcome {
+                            Ok(()) => {}
+                            Err(ActivationDispatchError::Hard(error)) => return Err(error),
+                            Err(ActivationDispatchError::Unknown {
+                                ticket_id,
+                                result_sha256,
+                                detail,
+                            }) => {
+                                let _ = eliotd::diagnostics::emit_drain(
+                                    eliotd::diagnostics::DrainOutcome::ActivationUnknown,
+                                    &ticket_id,
+                                    &result_sha256,
+                                );
+                                activation_exit = RunLoopExit::ShutdownActivationUnknown {
+                                    ticket_id,
+                                    result_sha256,
+                                    detail,
+                                };
+                            }
+                        }
+                    }
+                }
             }
-        },
-        Err(_) => {
-            if let Some(identity) = retained {
-                let _ = eliotd::diagnostics::emit_drain(
-                    eliotd::diagnostics::DrainOutcome::ActivationUnknown,
-                    &identity.ticket_id,
-                    &identity.result_sha256,
-                );
-                Ok(RunLoopExit::ShutdownActivationUnknown {
-                    ticket_id: identity.ticket_id,
-                    result_sha256: identity.result_sha256,
-                    detail: "daemon shutdown drain timed out with activation submit outstanding; original ticket/result identity retained, no recompute"
-                        .to_owned(),
-                })
-            } else {
-                Ok(RunLoopExit::Shutdown)
+            local_read_completion = next_local_read_completion(local_read_flight) => {
+                settle_local_read_completion(local_read_completion, local_read_flight)?;
+            }
+            testd_owner_completion = next_testd_owner_completion(testd_owner_flight) => {
+                settle_testd_owner_completion(testd_owner_completion, testd_owner_flight)?;
+            }
+            owner_feed_trigger = next_owner_feed_completion(owner_feed_flight) => {
+                settle_owner_feed_completion(owner_feed_trigger, owner_feed, owner_feed_flight);
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                // Budget exhausted with work still outstanding: drop every
+                // flight without starting anything new. The activation phase
+                // decides the exit: a retained result means an uncertain
+                // submission, while a claim or resolve-wait in flight means
+                // no digest exists yet and shutdown stays clean.
+                let exit = match std::mem::replace(flight, ActivationFlight::Idle) {
+                    ActivationFlight::Idle => activation_exit,
+                    ActivationFlight::InFlight(state) => match state.retained {
+                        Some(identity) => {
+                            let _ = eliotd::diagnostics::emit_drain(
+                                eliotd::diagnostics::DrainOutcome::ActivationUnknown,
+                                &identity.ticket_id,
+                                &identity.result_sha256,
+                            );
+                            RunLoopExit::ShutdownActivationUnknown {
+                                ticket_id: identity.ticket_id,
+                                result_sha256: identity.result_sha256,
+                                detail: "daemon shutdown drain timed out with activation submit outstanding; original ticket/result identity retained, no recompute"
+                                    .to_owned(),
+                            }
+                        }
+                        None => activation_exit,
+                    },
+                };
+                *local_read_flight = LocalReadFlight::Idle;
+                *testd_owner_flight = TestdOwnerFlight::Idle;
+                *owner_feed_flight = OwnerFeedFlight::Idle;
+                return Ok(exit);
             }
         }
     }
+}
+
+/// The trigger travels with its in-flight sync step and returns on
+/// completion, so exactly one trigger exists across passes: no clone of
+/// mutable state and no renewal race.
+struct OwnerFeedFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = eliotd::OwnerFeedTrigger>>>,
+}
+
+/// Sole owner of owner-feed sync state in `run_loop`, mirroring
+/// [`LocalReadFlight`]. `Idle` means no sync work is outstanding; `InFlight`
+/// holds the one pending bounded exchange. No second owner and no second
+/// concurrent exchange exist.
+enum OwnerFeedFlight {
+    Idle,
+    InFlight(OwnerFeedFlightState),
+}
+
+/// Starts one O1 owner-feed synchronization pass (issue #2100) on its own
+/// polled flight. The pass keeps its composition borrow inside the flight
+/// future (issue #2559): when the owner borrow must span the Kernel
+/// read->publish->readback exchange, that bounded future is retained as a
+/// polled flight rather than awaited inside the health tick.
+fn maybe_start_owner_feed_sync(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    owner_feed: &mut Option<eliotd::OwnerFeedTrigger>,
+    flight: &mut OwnerFeedFlight,
+) {
+    if !matches!(flight, OwnerFeedFlight::Idle) {
+        return;
+    }
+    let Some(trigger) = owner_feed.take() else {
+        return;
+    };
+    let kernel_clone = Arc::clone(kernel);
+    let composition_clone = Arc::clone(composition);
+    *flight = OwnerFeedFlight::InFlight(OwnerFeedFlightState {
+        future: Box::pin(async move {
+            run_owner_feed_sync(&kernel_clone, composition_clone, trigger).await
+        }),
+    });
+}
+
+/// Polls the one in-flight owner-feed step, pending forever while idle so
+/// health and shutdown stay pollable with no step outstanding.
+async fn next_owner_feed_completion(flight: &mut OwnerFeedFlight) -> eliotd::OwnerFeedTrigger {
+    match flight {
+        OwnerFeedFlight::Idle => std::future::pending::<eliotd::OwnerFeedTrigger>().await,
+        OwnerFeedFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+/// Settles one completed owner-feed sync step back to idle, returning its
+/// trigger for the next pass. Every outcome idles until the next trigger:
+/// a proven publish was already recorded, and a degraded pass leaves grants
+/// pending for a later pass. The feed never gates readiness and never fails
+/// the daemon.
+fn settle_owner_feed_completion(
+    trigger: eliotd::OwnerFeedTrigger,
+    owner_feed: &mut Option<eliotd::OwnerFeedTrigger>,
+    flight: &mut OwnerFeedFlight,
+) {
+    *owner_feed = Some(trigger);
+    *flight = OwnerFeedFlight::Idle;
 }
 
 /// Runs one O1 owner-feed synchronization pass (issue #2100) and records
@@ -1377,13 +1618,13 @@ async fn drain_activation_on_shutdown(
 /// continues, retrying on a later tick. The feed never gates readiness and
 /// never fails the daemon: an unbound Kernel owner only leaves grants
 /// pending, exactly like an absent P-07 port.
-async fn sync_owner_feed(
+async fn run_owner_feed_sync(
     kernel: &Arc<DaemonKernelClient>,
-    composition: &SharedComposition,
-    trigger: &mut eliotd::OwnerFeedTrigger,
-) {
+    composition: SharedComposition,
+    mut trigger: eliotd::OwnerFeedTrigger,
+) -> eliotd::OwnerFeedTrigger {
     let guard = composition.lock().await;
-    match eliotd::maintain_owner_feed(&guard, kernel, trigger).await {
+    match eliotd::maintain_owner_feed(&guard, kernel, &mut trigger).await {
         Ok(Some(revision)) => {
             tracing::info!(
                 target: "eliotd::diagnostics",
@@ -1401,6 +1642,7 @@ async fn sync_owner_feed(
             .emit();
         }
     }
+    trigger
 }
 
 /// Starts one local-read poll step for the outbound-only poller (Implements
@@ -1482,7 +1724,12 @@ async fn run_local_read_poll(
     let Some((envelope, tool, attempt)) = pair else {
         return Ok(LocalReadPollOutcome::IdleBackoff);
     };
-    let guard = composition.lock().await;
+    // Issue #2559: the composition guard is held only around the Skill
+    // drive, which borrows the Governor owner. Ordinary forwarded reads use
+    // no composition state, so no guard crosses the Kernel forward leg or
+    // either submit leg. The Skill borrow spans its IO inside this already
+    // polled flight; the loop keeps polling every other flight while it is
+    // outstanding instead of queueing behind it in a branch body.
     // #1882: Skill pairs serve locally through the composition Skill driver
     // instead of forwarding on the Kernel `local_read` leg (which serves
     // store reads only). Recognition is the shared Skill tool predicate over
@@ -1491,9 +1738,11 @@ async fn run_local_read_poll(
     // idempotent leg below, so claimed skill pairs settle exactly like
     // forwarded ones.
     if eliotd::skill_dispatch::is_skill_tool(&tool) {
-        let body =
+        let body = {
+            let guard = composition.lock().await;
             eliotd::skill_dispatch::serve_skill_pair(&guard, kernel, &envelope, &tool, &attempt)
-                .await;
+                .await
+        };
         return match submit_local_read_result_idempotent(kernel, &body).await? {
             LocalReadSubmitOutcome::Accepted => Ok(LocalReadPollOutcome::Accepted),
             LocalReadSubmitOutcome::Expired => Ok(LocalReadPollOutcome::Expired),
@@ -1532,24 +1781,6 @@ async fn submit_local_read_result_idempotent(
             .map_err(|error| {
                 format!("Kernel local-read result submit: {first_error}; retry: {error}")
             }),
-    }
-}
-
-/// Bounded shutdown drain for one in-flight local-read poll. Never starts
-/// new work and retains no local identity: an un-submitted pair's attempt
-/// capability is revoked on disconnect (the Kernel drops the queue record,
-/// so no time lease has to expire first) and the next loop claims the
-/// current generation anew, while an already-persisted body exact-replays
-/// idempotently on the next submit — so the drain always settles as plain
-/// `Shutdown`, never unknown.
-async fn drain_local_read_on_shutdown(flight: &mut LocalReadFlight) -> Result<RunLoopExit, String> {
-    let previous = std::mem::replace(flight, LocalReadFlight::Idle);
-    let LocalReadFlight::InFlight(state) = previous else {
-        return Ok(RunLoopExit::Shutdown);
-    };
-    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
-        Ok(LocalReadCompletion::Settled(Err(error))) => Err(error),
-        _ => Ok(RunLoopExit::Shutdown),
     }
 }
 
@@ -1648,30 +1879,6 @@ fn settle_testd_owner_completion(
         }
         TestdOwnerCompletion::Settled(Err(error)) => Err(error),
     }
-}
-
-/// Settles an outstanding TestD owner drain step before this task takes the
-/// composition lock for itself (#18 item B).
-///
-/// The drain is the one flight that legitimately holds the composition guard
-/// across a Kernel exchange: publishing a verifier-execution fact and deriving
-/// its finish decision are `&mut GovernorComposition` operations on the single
-/// Governor owner, reachable only through this guard, and moving them out would
-/// require a second handle to that owner. Every other Kernel exchange in the
-/// step therefore runs with no guard at all (see
-/// [`run_testd_owner_drain`]), and this function makes the ordering total for
-/// the arms the loop itself drives: the loop settles the drain first and then
-/// takes the lock, so neither side can queue behind the other. The local-read
-/// poller takes the same lock inside its own flight; that is a pre-existing
-/// path outside this issue and is not made to wait here. No new work is started
-/// and no state machine is duplicated — the flight stays the single owner of
-/// drain state.
-async fn settle_testd_owner_before_lock(flight: &mut TestdOwnerFlight) -> Result<(), String> {
-    if let TestdOwnerFlight::Idle = flight {
-        return Ok(());
-    }
-    let completion = next_testd_owner_completion(flight).await;
-    settle_testd_owner_completion(completion, flight)
 }
 
 /// Runs one TestD owner drain step through the production finish caller.
@@ -1777,25 +1984,6 @@ async fn run_testd_owner_drain(
 async fn testd_owner_drain_admitted(composition: &SharedComposition) -> bool {
     let guard = composition.lock().await;
     guard.readiness() == eliot_governor::CompositionReadiness::Ready
-}
-
-/// Bounded shutdown drain for one in-flight TestD owner step. Never starts
-/// new work: an in-flight step runs to its bounded end (its rows are
-/// idempotent owner-side, so a repeated poll replays rather than
-/// duplicates), while an already-persisted decision exact-replays on the
-/// next submit — so the drain always settles as plain `Shutdown`, never
-/// unknown.
-async fn drain_testd_owner_on_shutdown(
-    flight: &mut TestdOwnerFlight,
-) -> Result<RunLoopExit, String> {
-    let previous = std::mem::replace(flight, TestdOwnerFlight::Idle);
-    let TestdOwnerFlight::InFlight(state) = previous else {
-        return Ok(RunLoopExit::Shutdown);
-    };
-    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
-        Ok(TestdOwnerCompletion::Settled(Err(error))) => Err(error),
-        _ => Ok(RunLoopExit::Shutdown),
-    }
 }
 
 /// Submits one already-resolved v2 result through the existing authenticated
