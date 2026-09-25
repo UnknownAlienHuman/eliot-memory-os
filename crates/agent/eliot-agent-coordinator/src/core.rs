@@ -1979,7 +1979,19 @@ impl AgentCoordinator {
         }
         let expected_events = snapshot.events.clone();
         let mut coordinator = Self::with_provider(live_config, provider)?;
-        for event in expected_events.clone() {
+        coordinator.replay_snapshot_events(&expected_events)?;
+        if coordinator.events != expected_events {
+            return Err(CoordinatorError::SnapshotDigest);
+        }
+        Ok(coordinator)
+    }
+
+    fn replay_snapshot_events(
+        &mut self,
+        expected_events: &[CoordinatorEvent],
+    ) -> Result<(), CoordinatorError> {
+        let coordinator = &mut *self;
+        for event in expected_events.iter().cloned() {
             match event {
                 CoordinatorEvent::PlanCreated { request } => {
                     coordinator.plan(*request)?;
@@ -2063,7 +2075,7 @@ impl AgentCoordinator {
         if coordinator.events != expected_events {
             return Err(CoordinatorError::SnapshotDigest);
         }
-        Ok(coordinator)
+        Ok(())
     }
 
     fn deliver_message(
@@ -2375,7 +2387,6 @@ fn select_route(
     let policy_revision = request
         .state_fence
         .policy_revision
-        .clone()
         .unwrap_or_else(PolicyRevision::genesis);
     let capability = role.required_competence.join("+");
     let query_intent = request.candidate_id.as_str().to_owned();
@@ -2608,8 +2619,7 @@ fn selected_route_key(candidate: &RouteSelectionCandidate) -> String {
     candidate
         .selected
         .as_ref()
-        .map(route_key)
-        .unwrap_or_else(|| "<no-route>".to_owned())
+        .map_or_else(|| "<no-route>".to_owned(), route_key)
 }
 
 fn canonical(value: &impl Serialize) -> Result<String, CoordinatorError> {
