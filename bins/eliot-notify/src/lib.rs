@@ -1020,7 +1020,7 @@ where
             "authenticated notification reference read clock rejected: {error}"
         ))
     })?;
-    let issued = issuer
+    let read_identity = issuer
         .lock()
         .map_err(|_| {
             NotifyBuildError::Kernel(
@@ -1034,7 +1034,7 @@ where
             ))
         })?;
     let result = exchange.transact_with_identity(
-        &issued.identity,
+        &read_identity.identity,
         eliot_notify_core::NOTIFICATION_STATE_SELECTOR,
         payload,
     );
