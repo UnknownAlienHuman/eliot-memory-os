@@ -632,6 +632,11 @@ fn probe_exchange(
         activation_receipt: None,
         store_rebind_receipt: None,
         supervision_lease: Some(supervision_lease),
+        // #961 read-only retirement projections; a readiness fixture authors
+        // neither, and `KernelControlResponse::validate` refuses a response
+        // that mixes them with a readiness receipt.
+        runtime_lease_census: None,
+        introduction_rows: None,
         error: None,
         payload_digest: String::new(),
     }
