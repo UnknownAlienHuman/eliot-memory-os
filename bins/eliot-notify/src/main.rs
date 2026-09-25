@@ -4,7 +4,7 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use eliot_notify::{
-    NotificationComposition, PROTOCOL_VERSION, SERVICE_NAME, UnsatisfiedObligation,
+    DeliveryOutcome, NotificationComposition, PROTOCOL_VERSION, SERVICE_NAME, UnsatisfiedObligation,
 };
 use eliot_notify_core::{
     NotificationEnvelope, NotificationStateReadRequest, NotifyError,
@@ -333,8 +333,7 @@ fn dispatch_deliver(
     envelope: &NotificationEnvelope,
     request: &NotificationRequest,
 ) -> Response {
-    let (outcome, obligation) = composition.deliver_with_obligation(envelope, request);
-    degraded_response(outcome, obligation)
+    degraded_response(composition.deliver_with_obligation(envelope, request))
 }
 
 fn dispatch_user_automation_failure(
@@ -342,9 +341,7 @@ fn dispatch_user_automation_failure(
     failure: UserAutomationFailureRequest,
     request: &NotificationRequest,
 ) -> Response {
-    let (outcome, obligation) =
-        composition.deliver_user_automation_failure_with_obligation(failure, request);
-    degraded_response(outcome, obligation)
+    degraded_response(composition.deliver_user_automation_failure_with_obligation(failure, request))
 }
 
 fn dispatch_user_automation(
@@ -411,9 +408,7 @@ fn dispatch_fallback(
     envelope: &SignedWatchdogFallbackEnvelope,
     request: &NotificationRequest,
 ) -> Response {
-    let (outcome, obligation) =
-        composition.deliver_watchdog_fallback_with_obligation(envelope, request);
-    degraded_response(outcome, obligation)
+    degraded_response(composition.deliver_watchdog_fallback_with_obligation(envelope, request))
 }
 
 /// Projects one delivery outcome plus its durable obligation onto the wire.
@@ -421,13 +416,16 @@ fn dispatch_fallback(
 /// `Some(obligation)` means the adapter returned no observed OS acceptance; the
 /// response then reports a delivery degradation carrying the persisted Event
 /// Log / spool record and the canonical obligation read back from its owner,
-/// never a resolution and never a claimed toast.
-fn degraded_response(
-    outcome: Result<eliot_notify_core::DeliveryObservation, NotifyError>,
-    obligation: Option<UnsatisfiedObligation>,
-) -> Response {
+/// never a resolution and never a claimed toast. The composition already
+/// persisted that obligation before handing the pair over, so this projection
+/// only decides what the caller is told.
+fn degraded_response(outcome: DeliveryOutcome) -> Response {
+    let DeliveryOutcome {
+        delivery,
+        obligation,
+    } = outcome;
     let Some(obligation) = obligation else {
-        return match outcome {
+        return match delivery {
             Ok(observation) => Response::Delivered {
                 service: SERVICE_NAME,
                 protocol: PROTOCOL_VERSION,
@@ -436,7 +434,7 @@ fn degraded_response(
             Err(error) => notify_error(&error),
         };
     };
-    let (code, detail) = match outcome {
+    let (code, detail) = match delivery {
         Ok(observation) => {
             let confidence = &observation.confidence;
             let delivered = &observation.delivered;

@@ -346,12 +346,7 @@ impl ProtectedFallbackKeyBinding {
         let derived = SigningKey::from_bytes(&signing_key)
             .verifying_key()
             .to_bytes();
-        if derived
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-            != public_key
-        {
+        if hex_encode_lower(&derived) != public_key {
             return Err(FallbackCompositionError::KeyBindingMismatch);
         }
         Ok(Self {
@@ -385,6 +380,20 @@ impl ControlLossFallbackBinding for ProtectedFallbackKeyBinding {
     fn destination(&self) -> std::path::PathBuf {
         self.destination.clone()
     }
+}
+
+/// Lowercase-hex encodes derived key bytes for the declared-key comparison.
+///
+/// Same fixed-width encoding as the rest of the Watchdog fallback contour, so
+/// the derived public key is compared byte-for-byte against the installed
+/// declaration instead of through a re-parsed intermediate value.
+fn hex_encode_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len().checked_mul(2).unwrap_or(0));
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Reads one bounded protected record and decodes it as a JSON object.

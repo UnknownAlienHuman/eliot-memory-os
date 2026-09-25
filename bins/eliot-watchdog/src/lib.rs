@@ -768,7 +768,7 @@ async fn report_gap_nonfatal(kernel: &dyn KernelWatchdogPort, reason: GapRecover
     };
     // A spool/provider failure is itself only an observation gap. Never turn
     // it into TaskFailure: the SCM process stays alive for the next tick.
-    let _ = kernel.report_gap(disposition.clone()).await;
+    let _ = kernel.report_gap(disposition).await;
     // I11.6:9-11: after a control loss the Watchdog publishes the signed
     // minimal fallback envelope so the separately registered Task Scheduler
     // task (or the next `eliot` launch) can read it without the User Broker.

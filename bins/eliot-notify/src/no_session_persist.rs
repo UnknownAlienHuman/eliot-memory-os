@@ -5,7 +5,7 @@
 //! I11.6:19 (adapter loss degrades delivery only), I11.7:7-8 (a suppressed
 //! delivery never resolves its item).
 //!
-//! [`record_no_session`] is called from three production contours, all of them
+//! [`record_no_session`] is called from four production contours, all of them
 //! real delivery outcomes rather than identity-lookup failures:
 //!
 //! - the fail-closed no-session branches of the Watchdog fallback composition
@@ -13,7 +13,13 @@
 //! - the normal and fallback delivery contours of
 //!   [`crate::NotificationComposition`], whenever the adapter returned no
 //!   observed OS acceptance (a missing interactive session, an unavailable
-//!   adapter, or a provider failure).
+//!   adapter, or a provider failure);
+//! - the two quiet-hours contours of that same composition, where the session
+//!   was present and the policy decided not to pop up
+//!   (`deliver:quiet-hours-suppressed`) or refused the request before any
+//!   delivery attempt (`deliver:quiet-hours-rejected`). These record their own
+//!   codes and their own Event Log sentence, so a policy decision is never
+//!   persisted as a lost session.
 //!
 //! It never claims a toast, never resolves an item, and never echoes payloads,
 //! identities, or secrets: every persisted value is a fixed code.
@@ -42,6 +48,12 @@ use serde_json::Value;
 /// Delivery-degradation code recorded when the no-session marker durably
 /// persists. Delivery is degraded; the item stays unresolved.
 const DELIVERY_SUPPRESSED_NO_SESSION: &str = "DELIVERY_SUPPRESSED_NO_SESSION";
+/// Delivery-degradation code carried by a spool marker whose condition is a
+/// canonical quiet-hours policy decision rather than a session loss. The
+/// session was present and the adapter was reached; the policy withheld the
+/// popup, so the marker must not claim a missing session. The persistent
+/// canonical item stays on the board either way (I11.7:7,23).
+const DELIVERY_SUPPRESSED_QUIET_HOURS: &str = "DELIVERY_SUPPRESSED_QUIET_HOURS";
 /// Code recorded when the Event Log write is deferred but the spool marker
 /// persists. Delivery is still suppressed; nothing is resolved.
 const EVENTLOG_DEFERRED: &str = "EVENTLOG_DEFERRED";
@@ -49,11 +61,20 @@ const EVENTLOG_DEFERRED: &str = "EVENTLOG_DEFERRED";
 /// Delivery is still suppressed; nothing is resolved.
 const DELIVERY_SUPPRESSED_SPOOL_UNAVAILABLE: &str = "DELIVERY_SUPPRESSED_SPOOL_UNAVAILABLE";
 
-/// Fixed, already-redacted Event Log insertion. It carries codes only and
-/// never echoes request payloads, identities, or secrets, so it passes the
-/// Event Log port's pre-FFI redaction screen.
+/// Fixed, already-redacted Event Log insertion for a missing interactive
+/// session. It carries codes only and never echoes request payloads,
+/// identities, or secrets, so it passes the Event Log port's pre-FFI
+/// redaction screen.
 const NO_SESSION_EVENT_INSERTION: &str =
     "eliot-notify: no interactive session; delivery suppressed; item unresolved";
+
+/// Fixed, already-redacted Event Log insertion for a canonical quiet-hours
+/// policy decision. It is deliberately a *different* sentence from
+/// [`NO_SESSION_EVENT_INSERTION`]: the session existed and the adapter was
+/// reached, so an operator reading the log must not be told the session was
+/// missing. Codes only, no payload, identities, or secrets.
+const QUIET_HOURS_EVENT_INSERTION: &str =
+    "eliot-notify: quiet-hours policy suppressed delivery; item unresolved";
 
 /// Scope file published by [`WindowsPlatform::publish_atomic`], matching the
 /// fallback-ledger scope used by the composition root.
@@ -94,7 +115,7 @@ pub fn record_no_session(condition: &str) -> NoSessionOutcome {
     let condition_code = classify_condition(condition);
     let event_logged = report_local_event(
         AdmittedEventLogEvent::ServiceFailure,
-        NO_SESSION_EVENT_INSERTION,
+        event_insertion(condition_code),
     )
     .is_ok();
     let spool_persisted = append_no_session_marker(condition_code);
@@ -115,6 +136,41 @@ pub fn record_no_session(condition: &str) -> NoSessionOutcome {
     }
 }
 
+/// The fixed, already-redacted Event Log sentence for one classified condition.
+///
+/// A quiet-hours policy decision gets its own sentence: the interactive
+/// session was present and the adapter was reached, so logging the no-session
+/// sentence would misreport a policy decision as a lost session. Both
+/// sentences are module constants — no caller text, payload, identity, or
+/// secret can reach the Event Log through this seam.
+fn event_insertion(condition_code: &str) -> &'static str {
+    if is_quiet_hours_condition(condition_code) {
+        QUIET_HOURS_EVENT_INSERTION
+    } else {
+        NO_SESSION_EVENT_INSERTION
+    }
+}
+
+/// The delivery-degradation code a spool marker carries for one condition.
+///
+/// The marker is a durable operator-facing record, so it names the same class
+/// of condition as the Event Log sentence: a quiet-hours policy decision is
+/// never recorded as a no-session delivery.
+fn marker_disposition(condition_code: &str) -> &'static str {
+    if is_quiet_hours_condition(condition_code) {
+        DELIVERY_SUPPRESSED_QUIET_HOURS
+    } else {
+        DELIVERY_SUPPRESSED_NO_SESSION
+    }
+}
+
+/// Whether one classified condition is a canonical quiet-hours policy decision
+/// rather than an observed session condition.
+fn is_quiet_hours_condition(condition_code: &str) -> bool {
+    condition_code == crate::DELIVER_QUIET_HOURS_SUPPRESSED
+        || condition_code == crate::DELIVER_QUIET_HOURS_REJECTED
+}
+
 /// Maps a caller-supplied condition to a fixed code. Unknown input (and any
 /// embedded payload or secret text) is never echoed into a persisted record.
 fn classify_condition(condition: &str) -> &'static str {
@@ -126,6 +182,8 @@ fn classify_condition(condition: &str) -> &'static str {
         "deliver:adapter-unavailable" => "deliver:adapter-unavailable",
         "fallback:no-session" => "fallback:no-session",
         "fallback:adapter-unavailable" => "fallback:adapter-unavailable",
+        "deliver:quiet-hours-suppressed" => "deliver:quiet-hours-suppressed",
+        "deliver:quiet-hours-rejected" => "deliver:quiet-hours-rejected",
         _ => "unknown-no-session",
     }
 }
@@ -238,7 +296,7 @@ fn append_no_session_marker(condition_code: &'static str) -> bool {
         let mut record = serde_json::Map::new();
         record.insert(
             String::from("claim_digest"),
-            Value::String(String::from(DELIVERY_SUPPRESSED_NO_SESSION)),
+            Value::String(String::from(marker_disposition(condition_code))),
         );
         record.insert(String::from("observation"), Value::Null);
         entries.insert(key.clone(), Value::Object(record));
