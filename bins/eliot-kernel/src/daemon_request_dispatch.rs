@@ -93,6 +93,25 @@ const NOTIFICATION_STATE_RESPONSE_KIND: &str = "notification_state";
 #[cfg(windows)]
 const NOTIFICATION_STATE_PAGE_RESPONSE_KIND: &str = "notification_state_page";
 
+/// Authenticated P-07 read route answering the completed canonical second
+/// phases of one authority root (issue #2100, `R6`).
+///
+/// The Kernel commits the immutable first-phase grant-closure row and the
+/// canonical receipt identity as two separate ORS records, and it owns ORS in
+/// its own process. Without this route the daemon can observe that a closure
+/// was fenced but can never learn whether its canonical second phase already
+/// completed, so it can neither complete a pending one nor avoid re-presenting
+/// a completed one. The route is read-only: it never links, never fences, and
+/// never mints authority, and it requires no bound P-07 owner so the very first
+/// feed pass can learn the links of a lineage whose owner is not bound yet.
+pub(crate) const QUERY_GRANT_CLOSURE_LINKS_OPERATION: &str =
+    "query_grant_closure_canonical_receipts";
+/// Typed receipt kind answered by the canonical second-phase read arm.
+const GRANT_CLOSURE_LINKS_KIND: &str = "grant_closure_canonical_receipts";
+/// Typed refusal kind answered by the same arm, carrying the durable reason a
+/// read could not be served. A refusal is never an empty link set.
+const GRANT_CLOSURE_LINKS_REFUSAL_KIND: &str = "grant_closure_canonical_receipts_refused";
+
 const STARTUP_EVIDENCE_FIELDS: [&str; 8] = [
     "transport_binding",
     "state_fence",
@@ -418,6 +437,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "revoke_grant" => "revoke_grant",
         "activate_introduction" => "activate_introduction",
         "revoke_introduction" => "revoke_introduction",
+        QUERY_GRANT_CLOSURE_LINKS_OPERATION => QUERY_GRANT_CLOSURE_LINKS_OPERATION,
         "publish_wasm_dispatch_bundle" => "publish_wasm_dispatch_bundle",
         "bind_notify_launch_grant" => "bind_notify_launch_grant",
         "agent_host_request_reconcile" => "agent_host_request_reconcile",
@@ -1489,6 +1509,34 @@ impl KernelComposition {
                         "digest": digest,
                     },
                 }))
+            }
+            QUERY_GRANT_CLOSURE_LINKS_OPERATION => {
+                let query: eliot_kernel_service::GrantClosureCanonicalLinksQuery =
+                    serde_json::from_value(payload.clone())
+                        .map_err(|_| TransportError::SessionFenced)?;
+                // The live session fence binds the served view, exactly as the
+                // authority-history read binds it: a query presented under any
+                // other fence is refused before the durable store is touched.
+                if query.state_fence != session.module_generation.state_fence {
+                    return Err(TransportError::SessionFenced);
+                }
+                match eliot_kernel_service::grant_closure_canonical_links(
+                    self.p07_ors.as_ref(),
+                    &query,
+                    &session.module_generation.state_fence,
+                ) {
+                    Ok(links) => Ok(serde_json::json!({
+                        "kind": GRANT_CLOSURE_LINKS_KIND,
+                        "value": links,
+                    })),
+                    // A refusal keeps its durable reason and stays a refusal:
+                    // the daemon must never read it as "no second phase
+                    // completed here".
+                    Err(error) => Ok(serde_json::json!({
+                        "kind": GRANT_CLOSURE_LINKS_REFUSAL_KIND,
+                        "value": { "reason": error.to_string() },
+                    })),
+                }
             }
             "activate_grant" => {
                 let operation: GrantActivationOperation =
