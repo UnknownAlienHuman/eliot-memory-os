@@ -35,7 +35,7 @@ pub use eliot_agent_bridge_core::{
     DeliveryStatus, HotResourceView, MAX_CONTENT_BYTES, MAX_PREVIEW_BYTES, MAX_REGISTRY_ENTRIES,
     MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
 };
-use eliot_mcp::{HostInvocationOutcome, KernelHostRequestPort, ResponseKind};
+use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
     AckPhase, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
     AgentBridgePeerChallenge, EventEnvelope,
@@ -57,7 +57,8 @@ use kernel_activation_client::KernelHostActivationPort;
 use kernel_activation_client::{
     activation_frame_for_request, build_neutral_activation_request, decode_activation_response,
 };
-use kernel_host_request_client::{KernelHostRequestClient, ReplayCacheEntry};
+pub use kernel_host_request_client::KernelHostRequestClient;
+use kernel_host_request_client::ReplayCacheEntry;
 pub use memory_handle_join::{ResolvedMemoryHandle, parse_memory_handle};
 pub use reactive_injection_receipts::{
     AdmissionBasis, AttentionItem, CueOrigin, DeliveryPoint, FiringEvidence, InjectionReceipt,
@@ -218,7 +219,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
 
 pub type KernelPorts = (
     Box<dyn HostActivationPort>,
-    Box<dyn KernelHostRequestPort>,
+    KernelHostRequestClient,
     Box<dyn McpForwardingPort>,
 );
 
@@ -364,8 +365,7 @@ pub fn kernel_ports_with_declaration(
     let host: Box<dyn HostActivationPort> = Box::new(KernelHostActivationPort {
         shared: owner.clone(),
     });
-    let host_request: Box<dyn KernelHostRequestPort> =
-        Box::new(KernelHostRequestClient { shared: owner });
+    let host_request = KernelHostRequestClient { shared: owner };
     let fwd: Box<dyn McpForwardingPort> = Box::new(KernelMcpForwardingPort);
     Ok((host, host_request, fwd))
 }
