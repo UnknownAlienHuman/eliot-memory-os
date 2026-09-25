@@ -857,6 +857,9 @@ pub fn fabric_rejection_of(error: &FabricError) -> (RejectionReason, OwningCompo
         FabricError::UnknownChild(_) => {
             (RejectionReason::UnknownChild, OwningComponent::AgentFabric)
         }
+        FabricError::ProviderEvidenceRequired => {
+            (RejectionReason::Contract, OwningComponent::AgentFabric)
+        }
     }
 }
 
@@ -871,6 +874,7 @@ pub fn daemon_error_owner(error: &DaemonError) -> OwningComponent {
         DaemonError::Kernel(_) => OwningComponent::Kernel,
         DaemonError::LaunchConfig(_) | DaemonError::Protected(_) => OwningComponent::DaemonConfig,
         DaemonError::Lifecycle(_) => OwningComponent::DaemonRuntime,
+        DaemonError::ProviderAdmission(error) => fabric_rejection_of(error).1,
     }
 }
 
@@ -1159,6 +1163,7 @@ impl ErrorRecord {
             DaemonError::LaunchConfig(_) => ("launch-config", error.to_string()),
             DaemonError::Protected(_) => ("protected-path", error.to_string()),
             DaemonError::Lifecycle(_) => ("lifecycle", error.to_string()),
+            DaemonError::ProviderAdmission(_) => ("provider-admission", error.to_string()),
         };
         Self::of(owner, code, &detail)
     }

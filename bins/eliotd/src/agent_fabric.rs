@@ -28,8 +28,8 @@ use eliot_agent_contracts::RevisionId;
 use eliot_agent_coordinator::{
     AdmissionId, AdmittedProviderCapability, AgentCoordinator, CandidateId, CoordinatorConfig,
     CoordinatorError, CoordinatorSnapshot, OwnerCurrentness, PlanGap, PresentedClaimMaterial,
-    ProviderIdentity, ProviderSelectionHealth, StaffingPlanCandidate, StaffingPlanRequest,
-    WorkClass,
+    ProviderBindingSnapshot, ProviderIdentity, ProviderSelectionHealth, StaffingPlanCandidate,
+    StaffingPlanRequest, WorkClass,
 };
 use eliot_contracts::{EpochId, StateFence, fences_match_exact};
 use eliot_kernel_service::ProviderCapabilityExpectation;
@@ -562,6 +562,16 @@ pub enum FabricError {
     /// operation.
     #[error("fabric terminal cancellation: {0}")]
     TerminalCancellation(String),
+    /// The snapshot carries a verified provider binding but no fresh owner
+    /// material was supplied. Restore stays blocked: re-resolve live
+    /// evidence through [`AgentFabric::restore_verified`]. A serialized
+    /// `Verified` label alone never restores effecting readiness, and
+    /// missing/stale/revoked evidence never downgrades silently to a
+    /// plan-only restore masquerading as recovery.
+    #[error(
+        "fabric restore blocked: snapshot holds a verified provider binding; supply fresh owner material through restore_verified"
+    )]
+    ProviderEvidenceRequired,
 }
 
 /// B-MOD model registry seam (#694). The fabric resolves routes only through
@@ -1551,10 +1561,18 @@ impl AgentFabric {
     /// unresolved reservations stay unresolved and no second coordinator is
     /// created.
     ///
+    /// A snapshot carrying a verified provider binding is rejected here
+    /// with [`FabricError::ProviderEvidenceRequired`]: without freshly
+    /// resolved owner material the restore stays blocked instead of
+    /// silently resuming as plan-only. Re-resolve live evidence through
+    /// [`AgentFabric::restore_verified`], or construct an explicitly fresh
+    /// plan-only fabric through [`AgentFabric::new`].
+    ///
     /// # Errors
     ///
-    /// Returns the coordinator owner restore rejection or a stale-config
-    /// conflict.
+    /// Returns [`FabricError::ProviderEvidenceRequired`] when the snapshot
+    /// holds a verified provider binding, the coordinator owner restore
+    /// rejection, or a stale-config conflict.
     pub fn restore(
         snapshot: FabricSnapshot,
         config: CoordinatorConfig,
@@ -1564,6 +1582,12 @@ impl AgentFabric {
             return Err(FabricError::IdentityConflict(
                 "restore config does not match the snapshotted coordinator config".to_owned(),
             ));
+        }
+        if matches!(
+            snapshot.coordinator_snapshot.provider_binding,
+            ProviderBindingSnapshot::Verified { .. }
+        ) {
+            return Err(FabricError::ProviderEvidenceRequired);
         }
         let coordinator = AgentCoordinator::restore(
             snapshot.coordinator_snapshot.clone(),
