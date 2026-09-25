@@ -4,9 +4,11 @@
 //! the authenticated Kernel client (session + service guard + ORS handle)
 //! and verifies one presented provider proof against the durable Kernel/ORS
 //! records bound to the exact attempt and operation, plus the presented
-//! route/capacity revision. No signing, no tokens, no cached `Verified`
-//! marker, no user authentication: every call re-queries ORS and the live
-//! authority epoch, so restore always observes fresh owner evidence.
+//! route/capacity revision, claiming-worker generation, and fence digest
+//! (wire contour `eliot-kernel-provider-capability/v2`). No signing, no
+//! tokens, no cached `Verified` marker, no user authentication: every call
+//! re-queries ORS and the live authority epoch, so restore always observes
+//! fresh owner evidence.
 //!
 //! The capability wire contract itself ([`ProviderProofKind`],
 //! [`ProviderCapabilityRequest`], [`ProviderCapabilityExpectation`],
@@ -173,11 +175,17 @@ impl ProviderCapabilityContext {
     /// Loads the durable claim row by exact claim identity, requires the
     /// presented attempt and operation to equal the row binding, then
     /// delegates to the capability owner with the presented proof, the
-    /// loaded row, and a freshly re-queried live-epoch expectation
-    /// (`revoked` stays false: no revocation feed exists on this path, so
-    /// withdrawal is observed only as digest/currentness disagreement).
-    /// Every call re-queries ORS and the live epoch; nothing is cached, so
-    /// restore always observes fresh owner evidence.
+    /// loaded row, and a freshly re-queried live-epoch expectation. A
+    /// terminal row revokes capability authority (same rule as the replay
+    /// route); a row carrying no valid generation never verifies. Every call
+    /// re-queries ORS and the live epoch; nothing is cached, so restore
+    /// always observes fresh owner evidence.
+    ///
+    /// Generation and fence digest travel here echoed from the loaded row:
+    /// the presented-versus-row binding for those two fields is established
+    /// by [`ProviderCapabilityContext::verify_claim_binding`], which the
+    /// dispatch path runs first on the wire-v2 presented values. Direct
+    /// callers of this method present row-coherent material by construction.
     #[allow(
         clippy::too_many_arguments,
         reason = "the presented proof is one flat wire tuple; grouping it would invent a second contract beside the owner request"
@@ -234,6 +242,14 @@ impl ProviderCapabilityContext {
                 ProviderCapabilityError::StaleEpoch,
             ));
         }
+        // Durable coherence: a row carrying no valid claiming-worker
+        // generation never verifies, mirroring the claim-route
+        // `load_and_bind` generation gate.
+        if row.worker_generation == 0 {
+            return Err(ProviderCapabilityRouteError::Capability(
+                ProviderCapabilityError::StaleGeneration,
+            ));
+        }
         let request = ProviderCapabilityRequest {
             claim_id: row.claim_id.as_str().to_owned(),
             attempt_id: row.attempt_id.as_str().to_owned(),
@@ -245,22 +261,31 @@ impl ProviderCapabilityContext {
             executable_binding_digest: executable_digest.to_owned(),
             route_revision: route_rev.to_owned(),
             capacity_revision: capacity_rev.to_owned(),
+            // Row-echoed: the presented-versus-row binding for generation
+            // and fence is established by `verify_claim_binding` on the
+            // dispatch path before this method runs.
+            worker_generation: row.worker_generation,
+            fence_digest: row.fence_digest.clone(),
         };
         let expectation = ProviderCapabilityExpectation {
             current_route_revision: route_rev.to_owned(),
             current_capacity_revision: capacity_rev.to_owned(),
             live_authority_epoch: live_epoch.clone(),
-            revoked: false,
+            // A terminal claim revokes capability authority: every proof
+            // under it fences until a new admission (same rule as the
+            // replay-route expectation).
+            revoked: row.state.is_terminal(),
         };
-        // W-A owner signature is the 7-parameter pure verifier
-        // (request, expectation, loaded attempt/operation/binding/executable,
-        // live epoch). The ORS claim row carries no executable-binding column
-        // by design in this slice (no write migration; see the owner module
-        // residual), so the presented executable digest rides per call: the
-        // owner shape-checks it as lowercase SHA-256 and the durable
-        // equality gate in this slice is the binding digest from the exact
-        // row above. The durable attempt/operation/binding come from the row
-        // and the epoch is the freshly re-queried live authority epoch.
+        // W-A owner signature is the 9-parameter pure verifier
+        // (request, expectation, loaded attempt/operation/binding/executable/
+        // generation/fence, live epoch). The ORS claim row carries no
+        // executable-binding column by design in this slice (no write
+        // migration; see the owner module residual), so the presented
+        // executable digest rides per call: the owner shape-checks it as
+        // lowercase SHA-256 and the durable equality gate in this slice is
+        // the binding digest from the exact row above. The durable
+        // attempt/operation/binding/generation/fence come from the row and
+        // the epoch is the freshly re-queried live authority epoch.
         verify_provider_capability(
             &request,
             &expectation,
@@ -268,8 +293,55 @@ impl ProviderCapabilityContext {
             row.operation_id.as_str(),
             row.binding_digest.as_str(),
             executable_digest,
+            row.worker_generation,
+            row.fence_digest.as_str(),
             &live_epoch,
         )?;
+        Ok(())
+    }
+
+    /// Binds wire-v2 presented claiming-worker generation and fence digest
+    /// to the durable claim row before [`ProviderCapabilityContext::verify`]
+    /// runs.
+    ///
+    /// Loads the row by exact claim identity (unknown identities stay
+    /// `UnknownClaim`), then requires the presented generation to equal the
+    /// durable generation and the presented fence digest to equal the
+    /// durable fence digest. A stale generation or a proof presented under
+    /// a different fence fails closed here even when every digest still
+    /// matches; a row carrying no valid generation is incoherent and never
+    /// binds. Terminal revocation itself is enforced by `verify` through
+    /// the owner expectation.
+    pub fn verify_claim_binding(
+        &self,
+        claim_id: &str,
+        presented_generation: u64,
+        presented_fence_digest: &str,
+    ) -> Result<(), ProviderCapabilityRouteError> {
+        let claim_identity = OperationIdentity::new(claim_id).map_err(|_| {
+            ProviderCapabilityRouteError::Session("claim identity is malformed".to_owned())
+        })?;
+        let row = self
+            .ors
+            .load_native_worker_claim(&claim_identity)
+            .map_err(|_| {
+                ProviderCapabilityRouteError::Store(
+                    "durable claim record is unavailable".to_owned(),
+                )
+            })?
+            .ok_or_else(|| {
+                ProviderCapabilityRouteError::UnknownClaim(bounded_identity(claim_id))
+            })?;
+        if row.worker_generation == 0 || presented_generation != row.worker_generation {
+            return Err(ProviderCapabilityRouteError::Capability(
+                ProviderCapabilityError::StaleGeneration,
+            ));
+        }
+        if presented_fence_digest != row.fence_digest {
+            return Err(ProviderCapabilityRouteError::Capability(
+                ProviderCapabilityError::DigestMismatch,
+            ));
+        }
         Ok(())
     }
 }
@@ -441,7 +513,15 @@ impl KernelComposition {
             require_capability_text(payload, "route_revision", MAX_CAPABILITY_TEXT_LEN)?;
         let capacity_rev =
             require_capability_text(payload, "capacity_revision", MAX_CAPABILITY_TEXT_LEN)?;
+        // Wire v2 binds generation and fence: the presented claiming-worker
+        // generation must equal the durable row generation and the presented
+        // fence digest must equal the durable fence digest, so a stale
+        // generation or a retained proof under a different fence fails
+        // before the owner tuple runs.
+        let worker_generation = require_capability_generation(payload, "worker_generation")?;
+        let fence_digest = require_capability_digest(payload, "fence_digest")?;
         let context = self.provider_capability_for_session(session)?;
+        context.verify_claim_binding(&claim_id, worker_generation, &fence_digest)?;
         context.verify(
             proof_kind,
             &attempt_id,
@@ -463,6 +543,8 @@ impl KernelComposition {
             "proof_kind": proof_kind_value,
             "route_revision": route_rev,
             "capacity_revision": capacity_rev,
+            "worker_generation": worker_generation,
+            "fence_digest": fence_digest,
             "verified_at_unix_ms": unix_ms(),
         });
         seal_capability_receipt(body)
@@ -519,6 +601,23 @@ fn require_capability_digest(
         })
         .ok_or_else(|| ProviderCapabilityRouteError::Session(field.to_owned()))?;
     Ok(value.to_owned())
+}
+
+/// Requires one nonzero claiming-worker generation from the frame payload
+/// (wire v2).
+///
+/// Zero is never a valid generation: it fails closed as a session rejection
+/// before any owner lookup, mirroring the owner shape gate.
+fn require_capability_generation(
+    payload: &serde_json::Value,
+    field: &'static str,
+) -> Result<u64, ProviderCapabilityRouteError> {
+    let value = payload
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value != 0)
+        .ok_or_else(|| ProviderCapabilityRouteError::Session(field.to_owned()))?;
+    Ok(value)
 }
 
 /// Seals one capability receipt body with its canonical digest.
