@@ -22,6 +22,20 @@
 //! known operation fails as [`PortFailure::IdempotencyConflict`] from the ORS
 //! identity check. No per-connection shadow ledger exists here.
 //!
+//! Because the canonical operation handle is `hostreq:` plus the exact
+//! envelope digest, and the envelope digest is proven over the presented
+//! bytes, a per-operation row alone cannot see one identity spent on two
+//! operations. This binder therefore also writes the durable identity
+//! dimension: one immutable ORS row per presented idempotency key, keyed by
+//! that key and carrying the exact operation bytes (issue #74 W7). A reused
+//! idempotency key under different canonical bytes, or a reused
+//! request/cancellation identity across two operations, is rejected by ORS's
+//! own identity check as
+//! [`OrsError::HostRequestIdentityConflict`] — mapped to
+//! [`PortFailure::IdempotencyConflict`] by [`ors_failure`] — before any
+//! operation row, dispatch, or effect exists. An identical replay is
+//! byte-identical and resolves to the same operation.
+//!
 //! The canonical operation handle is
 //! [`host_request_operation_id`](eliot_protocol::host_request_operation_id)
 //! (`"hostreq:"` plus the exact envelope digest), the same key ORS stores.
@@ -67,6 +81,27 @@ use crate::{KernelService, KernelServiceError, KernelServiceState};
 /// SHA-256 before any store lookup, so a malformed reference is an unknown
 /// operation rather than a fence failure.
 const HOST_REQUEST_OPERATION_ID_PREFIX: &str = "hostreq:";
+
+/// Namespace prefix of the durable per-idempotency-key identity binding row
+/// (issue #74 W7).
+///
+/// The canonical operation handle is `hostreq:` plus the exact envelope
+/// digest, and `HostRequestEnvelope::validate` proves that digest over the
+/// presented bytes. A per-operation row is therefore a pure function of the
+/// presented bytes and cannot observe the *same* idempotency key arriving
+/// under two different sets of canonical bytes. This namespace is the missing
+/// dimension: one immutable row per presented idempotency key, whose durable
+/// key half is the key itself and whose ORS binding carries the exact
+/// operation bytes, so ORS's own `same_binding` check is what rejects a
+/// cross-operation reuse. No `hostreq:` handle can address this row, so it is
+/// never a cancellation, status, or reconciliation target.
+const HOST_REQUEST_IDENTITY_BINDING_PREFIX: &str = "hostreq-identity:";
+
+/// Domain-separation label of the durable per-idempotency-key identity
+/// binding row. It is hashed, never interpreted, and is the fixed key half of
+/// that row.
+const HOST_REQUEST_IDENTITY_BINDING_LABEL: &str =
+    "eliot.kernel.host-request.operation-identity-binding.v1";
 
 /// Authenticated bridge session derived from Kernel Ready state.
 ///
@@ -500,12 +535,43 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
         Ok(())
     }
 
+    /// Binds the presented request identity to the exact operation it is
+    /// submitted for, before the per-operation row exists (issue #74 W7).
+    ///
+    /// The canonical operation handle is a pure function of the presented
+    /// envelope digest, so a second *different* operation that reuses an
+    /// already-spent idempotency key, request id, or cancellation id would
+    /// otherwise be staged as a brand new operation with no conflict at all.
+    /// This writes the missing dimension: one immutable ORS row per presented
+    /// idempotency key, keyed so that a repeat presentation collides on it,
+    /// and carrying the exact operation bytes in the fields ORS compares.
+    ///
+    /// An identical replay presents byte-identical fields, so ORS returns the
+    /// retained row unchanged and the same operation proceeds. A reuse under
+    /// different canonical bytes makes ORS's own identity check raise
+    /// [`OrsError::HostRequestIdentityConflict`], which
+    /// [`ors_failure`] already maps to [`PortFailure::IdempotencyConflict`].
+    /// No new error code, no shadow ledger, and no dispatch happen here.
+    fn bind_operation_identity(&self, envelope: &HostRequestEnvelope) -> Result<(), PortFailure> {
+        let binding = operation_identity_binding_record(envelope)?;
+        self.store
+            .stage_host_request(&binding)
+            .map_err(|error| ors_failure(&error))?;
+        Ok(())
+    }
+
     /// Runs the admission gate and the persist-before-ack ORS staging.
     ///
     /// A fresh envelope is advanced `Requested -> Admitted` before any
     /// dispatch. An exact replay of a live operation is returned for a
     /// dispatch-free acknowledgement; a replay of closed work maps to its
     /// terminal disposition instead of a blind retry.
+    ///
+    /// The presented request identity is bound durably *before* the
+    /// per-operation row is staged: a reused idempotency key under different
+    /// canonical bytes, or a reused request/cancellation identity across two
+    /// operations, is rejected as [`PortFailure::IdempotencyConflict`] with
+    /// no operation row, no dispatch, and no effect.
     fn admit_and_stage(
         &self,
         service: &KernelService,
@@ -522,6 +588,7 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
         let receipt: HostRequestAdmissionReceipt = service
             .admit_host_request(envelope, self.session.descriptor(), &binding, resolution)
             .map_err(|error| kernel_service_failure(&error))?;
+        self.bind_operation_identity(envelope)?;
         let staged = requested_host_request_record(envelope)?;
         let stored = self
             .store
@@ -884,6 +951,50 @@ fn requested_host_request_record(
         result_response: None,
         commit_order: 0,
     })
+}
+
+/// Builds the durable per-idempotency-key identity binding row for one
+/// presented envelope (issue #74 W7).
+///
+/// The row is the presented [`HostRequestRecord`] with exactly one difference:
+/// its `operation_id` is the presented idempotency key under the
+/// `hostreq-identity:` namespace, and its `request_digest` is the fixed
+/// domain-separation digest of
+/// [`HOST_REQUEST_IDENTITY_BINDING_LABEL`]. That makes the durable key a
+/// function of the idempotency key alone, so a second presentation of that
+/// key — under any operation — collides on the same row. Everything else is
+/// the exact presented operation, so ORS's `same_binding` comparison covers
+/// the request id, cancellation id, payload, capability, fence, epoch,
+/// generation, deadline, parent, and correlation refs: any difference is a
+/// cross-operation identity reuse and ORS raises the existing
+/// [`OrsError::HostRequestIdentityConflict`].
+///
+/// The row is never advanced past `Requested`, never carries a result, and
+/// never carries a commit order. It is an immutable identity binding, not
+/// dispatchable work, and no `hostreq:` handle can address it.
+fn operation_identity_binding_record(
+    envelope: &HostRequestEnvelope,
+) -> Result<HostRequestRecord, PortFailure> {
+    let mut record = requested_host_request_record(envelope)?;
+    record.operation_id = OperationIdentity::new(format!(
+        "{HOST_REQUEST_IDENTITY_BINDING_PREFIX}{}",
+        envelope.identity.idempotency_key
+    ))
+    .map_err(|_| PortFailure::TransportBindingRejected {
+        reason: "presented idempotency key cannot be bound to a durable operation identity"
+            .to_owned(),
+    })?;
+    record.request_digest = sha256_hex(
+        &canonical_json_bytes(HOST_REQUEST_IDENTITY_BINDING_LABEL).map_err(|_| {
+            PortFailure::TransportBindingRejected {
+                reason: "operation identity binding label cannot be canonicalized".to_owned(),
+            }
+        })?,
+    );
+    record.validate().map_err(|_| PortFailure::TransportBindingRejected {
+        reason: "durable operation identity binding is not well-formed".to_owned(),
+    })?;
+    Ok(record)
 }
 
 /// Requires the presented tool to be the exact admitted operation.

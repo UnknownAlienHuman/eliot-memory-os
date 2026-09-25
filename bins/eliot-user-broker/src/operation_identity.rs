@@ -23,6 +23,16 @@
 //! Kernel owner; this module provides the full broker side plus local
 //! fail-closed guards.
 //!
+//! The spent-identity ledger is durable (issue #74 A4). Every issued identity
+//! is projected through [`OperationIdentityIssuer::issued_identities`] into
+//! the broker snapshot, and a restarted broker re-seeds this issuer through
+//! [`OperationIdentityIssuer::restore_issued`] before any Kernel call can
+//! mint. A restart therefore continues from the protected launch/caller
+//! identity plus a new registration operation and can never revive a
+//! historical request id, cancellation id, or idempotency key: reusing one for
+//! a different operation is an [`OperationIdentityError::IdentityConflict`]
+//! rather than a fresh mint.
+//!
 //! Dependency note: `Cargo.lock` is owned outside this broker scope, so this
 //! module names no foundation contract types directly. Fences and epochs
 //! travel as exact JSON values and every minted identity is constructed and
@@ -180,6 +190,37 @@ pub(crate) struct ProcessLineageEntry {
     pub(crate) process_request_digest: String,
 }
 
+/// One issued operation identity as it is retained across a broker restart
+/// (issue #74 A4).
+///
+/// The retained shape is deliberately the *transport* half of the minted
+/// [`RequestIdentity`]: operation selector, canonical payload digest, the
+/// three identity strings, the absolute deadline, and the mint instant. The
+/// state fence is deliberately absent — it is re-bound from the live
+/// installation declaration and the Kernel-issued registration epoch on every
+/// restart, so a durable row can never pin a historical authority fence.
+/// Nothing here is authority: the row proves only which request, cancellation,
+/// and idempotency strings were already spent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DurableIssuedIdentity {
+    /// Closed Kernel operation selector that owns the identity.
+    pub(crate) operation: String,
+    /// Lowercase SHA-256 of the canonical payload bytes it is bound to.
+    pub(crate) canonical_digest: String,
+    /// Exact transport request id.
+    pub(crate) request_id: String,
+    /// Exact transport idempotency key.
+    pub(crate) idempotency_key: String,
+    /// Exact transport cancellation id.
+    pub(crate) cancellation_id: String,
+    /// Absolute transport deadline the identity was minted with.
+    pub(crate) deadline_unix_ms: u64,
+    /// Observation instant the identity was minted at.
+    pub(crate) issued_at_ms: u64,
+    /// Caller request id when a launch caller link owned this issuance.
+    pub(crate) caller_request_id: Option<String>,
+}
+
 /// Typed fail-closed issuance failures. No stub or default identity exists.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub(crate) enum OperationIdentityError {
@@ -240,6 +281,7 @@ pub(crate) struct OperationIdentityIssuer {
     caller_launch_keys: BTreeMap<String, String>,
     launch_lineage: Vec<LaunchLineageEntry>,
     process_lineage: Vec<ProcessLineageEntry>,
+    issued: BTreeMap<LedgerKey, DurableIssuedIdentity>,
 }
 
 /// Shared issuer handle between the composition and its authority/process ports.
@@ -264,6 +306,7 @@ impl OperationIdentityIssuer {
             caller_launch_keys: BTreeMap::new(),
             launch_lineage: Vec::new(),
             process_lineage: Vec::new(),
+            issued: BTreeMap::new(),
         })
     }
 
@@ -284,6 +327,7 @@ impl OperationIdentityIssuer {
             caller_launch_keys: BTreeMap::new(),
             launch_lineage: Vec::new(),
             process_lineage: Vec::new(),
+            issued: BTreeMap::new(),
         }
     }
 
@@ -330,6 +374,133 @@ impl OperationIdentityIssuer {
     #[must_use]
     pub(crate) fn launch_lineage(&self) -> &[LaunchLineageEntry] {
         &self.launch_lineage
+    }
+
+    /// Returns every identity this issuer spent, in a deterministic order.
+    ///
+    /// This is the durable half of the ledger. It is published into the
+    /// broker snapshot together with the registration state, so a restart
+    /// re-seeds the same spent request ids, cancellation ids, and idempotency
+    /// keys instead of starting from an empty ledger.
+    #[must_use]
+    pub(crate) fn issued_identities(&self) -> Vec<DurableIssuedIdentity> {
+        self.issued.values().cloned().collect()
+    }
+
+    /// Returns the most recent identity this issuer spent for one operation
+    /// kind.
+    ///
+    /// This is what a lost acknowledgement is reconciled against: the caller
+    /// names the exact transport identity whose outcome is unknown instead of
+    /// minting a second one for the same logical operation.
+    #[must_use]
+    pub(crate) fn last_issued(
+        &self,
+        operation: BrokerOperation,
+    ) -> Option<DurableIssuedIdentity> {
+        self.issued
+            .values()
+            .filter(|issued| issued.operation == operation.selector())
+            .max_by_key(|issued| (issued.issued_at_ms, issued.request_id.clone()))
+            .cloned()
+    }
+
+    /// Re-seeds one durably retained identity into this issuer (issue #74 A4).
+    ///
+    /// The historical request id, cancellation id, and idempotency key become
+    /// spent before any new issuance: a fresh mint can never reuse them, a
+    /// replayed key under different canonical bytes is an
+    /// [`OperationIdentityError::IdentityConflict`], and an exact retry of the
+    /// same revision resolves to that same historical identity. A retained
+    /// row that contradicts an already-issued identity, or that is internally
+    /// inconsistent, fails closed instead of overwriting live state.
+    pub(crate) fn restore_issued(
+        &mut self,
+        retained: &DurableIssuedIdentity,
+    ) -> Result<(), OperationIdentityError> {
+        validate_retained_identity(retained)?;
+        let fence = self.current_fence.clone().ok_or_else(|| {
+            if self.binding_digest.is_none() {
+                OperationIdentityError::MissingBinding
+            } else {
+                OperationIdentityError::MissingFence
+            }
+        })?;
+        // The retained transport half is rebuilt against the *live* fence: a
+        // durable row can never pin a historical authority fence, and the
+        // absolute deadline and mint instant stay exactly as they were.
+        let identity = build_identity(
+            &retained.request_id,
+            &retained.idempotency_key,
+            retained.deadline_unix_ms,
+            &retained.cancellation_id,
+            &fence,
+            retained.issued_at_ms,
+        )?;
+        let key = (retained.operation.clone(), retained.canonical_digest.clone());
+        if let Some(live) = self.issued.get(&key) {
+            return if live == retained {
+                Ok(())
+            } else {
+                Err(OperationIdentityError::IdentityConflict(format!(
+                    "retained ledger row for {} contradicts the identity already issued",
+                    retained.operation
+                )))
+            };
+        }
+        if self
+            .by_request
+            .get(&retained.request_id)
+            .is_some_and(|owner| owner != &key)
+            || self
+                .by_cancellation
+                .get(&retained.cancellation_id)
+                .is_some_and(|owner| owner != &key)
+            || self
+                .by_idempotency
+                .get(&retained.idempotency_key)
+                .is_some_and(|owner| owner != &key)
+        {
+            return Err(OperationIdentityError::IdentityConflict(format!(
+                "retained request/cancellation/idempotency identity of {} is already bound to another operation",
+                retained.operation
+            )));
+        }
+        if retained.caller_request_id.as_deref().is_some_and(|caller| {
+            self.by_caller_request.get(caller).is_some_and(|owner| owner != &key)
+                || self
+                    .caller_launch_keys
+                    .get(&retained.idempotency_key)
+                    .is_some_and(|digest| digest != &retained.canonical_digest)
+        }) {
+            return Err(OperationIdentityError::IdentityConflict(format!(
+                "retained caller launch binding of {} is already bound to another launch",
+                retained.operation
+            )));
+        }
+        self.by_idempotency
+            .insert(retained.idempotency_key.clone(), key.clone());
+        self.by_request
+            .insert(retained.request_id.clone(), key.clone());
+        self.by_cancellation
+            .insert(retained.cancellation_id.clone(), key.clone());
+        if let Some(caller) = retained.caller_request_id.clone() {
+            self.by_caller_request.insert(caller, key.clone());
+            self.caller_launch_keys.insert(
+                retained.idempotency_key.clone(),
+                retained.canonical_digest.clone(),
+            );
+        }
+        self.ledger.insert(
+            key.clone(),
+            LedgerEntry {
+                identity,
+                request_id: retained.request_id.clone(),
+                caller_request_id: retained.caller_request_id.clone(),
+            },
+        );
+        self.issued.insert(key, retained.clone());
+        Ok(())
     }
 
     /// Returns the process/effect lineage log (grant to invocation digest).
@@ -595,10 +766,23 @@ impl OperationIdentityIssuer {
             self.by_request.insert(request_id.clone(), key.clone());
             self.by_cancellation.insert(cancellation_id, key.clone());
             self.ledger.insert(
-                key,
+                key.clone(),
                 LedgerEntry {
                     identity: identity.clone(),
                     request_id: request_id.clone(),
+                    caller_request_id: caller_request_id.clone(),
+                },
+            );
+            self.issued.insert(
+                key,
+                DurableIssuedIdentity {
+                    operation: operation.selector().to_owned(),
+                    canonical_digest: canonical_digest.to_owned(),
+                    request_id: request_id.clone(),
+                    idempotency_key: idempotency_key.to_owned(),
+                    cancellation_id: identity.cancellation_id.clone(),
+                    deadline_unix_ms,
+                    issued_at_ms: now_unix_ms,
                     caller_request_id: caller_request_id.clone(),
                 },
             );
@@ -661,6 +845,54 @@ fn sha256_hex(bytes: &[u8]) -> String {
         output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     output
+}
+
+/// Returns whether a value is a lowercase 64-hex SHA-256 digest.
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Validates one durably retained identity before it is re-seeded.
+///
+/// A retained row is written by this issuer, so a row that fails these checks
+/// is a corrupt or foreign durable file: it is rejected before any index is
+/// touched, so a bad row can never partially bind a historical request id.
+fn validate_retained_identity(
+    retained: &DurableIssuedIdentity,
+) -> Result<(), OperationIdentityError> {
+    for value in [
+        retained.operation.as_str(),
+        retained.request_id.as_str(),
+        retained.idempotency_key.as_str(),
+        retained.cancellation_id.as_str(),
+    ] {
+        if value.trim().is_empty() || value.chars().any(char::is_control) {
+            return Err(OperationIdentityError::InvalidIdentity(
+                "retained operation identity field is blank".to_owned(),
+            ));
+        }
+    }
+    if !is_lowercase_sha256(&retained.canonical_digest) {
+        return Err(OperationIdentityError::InvalidIdentity(
+            "retained canonical payload digest is not a lowercase sha-256".to_owned(),
+        ));
+    }
+    if retained.issued_at_ms == 0 || retained.deadline_unix_ms <= retained.issued_at_ms {
+        return Err(OperationIdentityError::InvalidIdentity(
+            "retained operation identity clock is not exact".to_owned(),
+        ));
+    }
+    if let Some(caller) = retained.caller_request_id.as_deref()
+        && (caller.trim().is_empty() || caller.chars().any(char::is_control))
+    {
+        return Err(OperationIdentityError::InvalidIdentity(
+            "retained caller request id is blank".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Validates a fence JSON value through the owning [`RequestIdentity`]
