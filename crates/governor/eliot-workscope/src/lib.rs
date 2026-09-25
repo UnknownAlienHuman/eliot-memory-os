@@ -141,10 +141,15 @@ pub struct WorkspaceInstanceIdentity {
 }
 
 /// Evidence-backed candidate, not an authenticated authority binding.
+///
+/// `descriptor_revision` is the `WorkScopeDescriptor` revision this candidate
+/// was observed at; the binding-token tier (I4.2 step 2) names exactly this
+/// revision, so a token for a superseded revision never resolves here.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkScopeCandidate {
     pub scope: ScopeIdentity,
+    pub descriptor_revision: u64,
     pub lineage: Option<RepositoryLineageIdentity>,
     pub instance: WorkspaceInstanceIdentity,
     pub privacy_class: PrivacyClass,
@@ -546,6 +551,10 @@ impl WorkScopeCandidateSet {
         text(&observed_root_ref, "observed_root_ref")?;
         for candidate in &candidates {
             candidate.scope.validate()?;
+            counter(
+                candidate.descriptor_revision,
+                "candidate.descriptor_revision",
+            )?;
             candidate.instance.validate()?;
             if let Some(lineage) = &candidate.lineage {
                 lineage.validate()?;
@@ -1613,6 +1622,7 @@ mod tests {
                 generation: 1,
             },
             scope,
+            descriptor_revision: 1,
             lineage: Some(RepositoryLineageIdentity {
                 lineage_ref: "lineage:one".into(),
                 object_store_ref: "store:one".into(),
@@ -2223,5 +2233,192 @@ mod tests {
         assert_eq!(code, SCAN_PRIVACY_BOUNDARY_REQUIRED);
         assert!(!question.trim().is_empty());
         assert_eq!(lease.consumed, 0);
+    }
+
+    fn two_instance_bindings() -> (ScopeBinding, ScopeBinding) {
+        let scope_a = ScopeIdentity {
+            scope_ref: "scope:work".into(),
+            kind: ScopeKind::GitRepo,
+            lineage_ref: Some("lineage:one".into()),
+            instance_ref: "instance:a".into(),
+            root_identity: "root:a".into(),
+            generation: 1,
+        };
+        let mut scope_b = scope_a.clone();
+        scope_b.instance_ref = "instance:b".into();
+        scope_b.root_identity = "root:b".into();
+        let expected = ScopeBinding {
+            scope: scope_a,
+            privacy_class: PrivacyClass::Internal,
+            governing_source_generation: 1,
+        };
+        let observed = ScopeBinding {
+            scope: scope_b,
+            privacy_class: PrivacyClass::Internal,
+            governing_source_generation: 1,
+        };
+        (expected, observed)
+    }
+
+    fn descriptor_for_a(fence: &StateFence) -> WorkScopeDescriptor {
+        WorkScopeDescriptor {
+            scope_ref: "scope:work".into(),
+            descriptor_revision: 1,
+            kind: ScopeKind::GitRepo,
+            display_name: "work".into(),
+            lineage: Some(RepositoryLineageIdentity {
+                lineage_ref: "lineage:one".into(),
+                object_store_ref: "store:one".into(),
+                initial_history_ref: "history:one".into(),
+                normalized_remote_ref: Some("remote:one".into()),
+                manifest_identity_ref: Some("manifest:one".into()),
+            }),
+            instances: vec![WorkspaceInstanceIdentity {
+                instance_ref: "instance:a".into(),
+                root_identity: "root:a".into(),
+                vcs_identity_ref: Some("vcs:one".into()),
+                generation: 1,
+            }],
+            owner_refs: vec!["owner:one".into()],
+            canonical_resource_refs: vec!["resource:one".into()],
+            root_identities: vec!["root:a".into()],
+            external_resource_refs: Vec::new(),
+            truth_surface_refs: Vec::new(),
+            verifier_refs: Vec::new(),
+            privacy: PrivacyProfile {
+                admitted_classes: vec![PrivacyClass::Internal],
+            },
+            authority_profile_ref: None,
+            execution_identity: ResourceExecutionIdentity::Service,
+            generation: GenerationEvidence {
+                branch_ref: None,
+                commit_ref: None,
+                dirty_summary_ref: None,
+                task_revision: None,
+                resource_generation: ResourceGeneration::genesis(),
+            },
+            state_fence: fence.clone(),
+            available_capabilities: Vec::new(),
+            missing_capabilities: Vec::new(),
+            lifecycle: ScopeLifecycle::Active,
+        }
+    }
+
+    fn fence_at_generation_one() -> StateFence {
+        StateFence::new(
+            test_epoch(TEST_LINEAGE_A, 1),
+            match ResourceGeneration::new(1) {
+                Ok(value) => value,
+                Err(error) => panic!("fence fixture is invalid: {error}"),
+            },
+        )
+    }
+
+    #[test]
+    fn a1_attach_at_foreign_cwd_quarantines_and_withholds_write() {
+        let (expected, observed) = two_instance_bindings();
+        let retained = expected.clone();
+        let report = check_at_trigger(
+            &expected,
+            &observed,
+            None,
+            GuardTrigger::SessionAttachResume,
+        );
+        assert_eq!(report.identity, IdentityLegOutcome::DifferentInstance);
+        assert_eq!(report.verdict, GuardVerdict::Quarantine);
+        assert_eq!(report.receipt, None);
+        assert_eq!(expected, retained);
+        assert_eq!(expected.scope.instance_ref, "instance:a");
+
+        let fence = fence_at_generation_one();
+        let descriptor = descriptor_for_a(&fence);
+        let receipt = WorkScopeResolutionReceipt {
+            receipt_ref: "receipt:foreign".into(),
+            proposal_ref: "proposal:foreign".into(),
+            selected: observed.scope.clone(),
+            fingerprint: ScopeFingerprint::derive_for(&descriptor),
+            authentication: ResolutionAuthentication::Authenticated,
+            supporting_evidence: Vec::new(),
+            rejected_candidate_refs: Vec::new(),
+            unresolved_candidate_refs: Vec::new(),
+            authority_ref: "authority:one".into(),
+            state_fence: fence.clone(),
+        };
+        let observed_generation = GenerationEvidence {
+            branch_ref: None,
+            commit_ref: None,
+            dirty_summary_ref: None,
+            task_revision: None,
+            resource_generation: ResourceGeneration::genesis(),
+        };
+        assert_eq!(
+            verify_receipt_for_admission(&receipt, &descriptor, &observed_generation, &fence),
+            Ok(ReceiptAdmission::Withheld(WithholdReason::IdentityMismatch))
+        );
+    }
+
+    #[test]
+    fn a2_authorized_rebind_admits_only_rebound_instance_and_fence() {
+        let (expected, observed_b) = two_instance_bindings();
+        let fence = fence_at_generation_one();
+        let receipt = ScopeRelocationOrAttachReceipt {
+            receipt_ref: "receipt:attach-b".into(),
+            kind: ScopeRelocationKind::Attach,
+            scope_ref: "scope:work".into(),
+            scope_kind: ScopeKind::GitRepo,
+            lineage: RepositoryLineageIdentity {
+                lineage_ref: "lineage:one".into(),
+                object_store_ref: "store:one".into(),
+                initial_history_ref: "history:one".into(),
+                normalized_remote_ref: None,
+                manifest_identity_ref: None,
+            },
+            prior_instance: WorkspaceInstanceIdentity {
+                instance_ref: "instance:a".into(),
+                root_identity: "root:a".into(),
+                vcs_identity_ref: Some("vcs:one".into()),
+                generation: 1,
+            },
+            observed_instance: WorkspaceInstanceIdentity {
+                instance_ref: "instance:b".into(),
+                root_identity: "root:b".into(),
+                vcs_identity_ref: Some("vcs:two".into()),
+                generation: 1,
+            },
+            authorizing_ref: "authority:one".into(),
+            state_fence: fence.clone(),
+        };
+        let rebound =
+            match rebind_with_receipt(&receipt, "scope:work", PrivacyClass::Internal, 1, &fence) {
+                Ok(value) => value,
+                Err(error) => panic!("authorized rebind failed: {error}"),
+            };
+        assert_eq!(rebound.scope.instance_ref, "instance:b");
+        assert_eq!(rebound.scope.root_identity, "root:b");
+        assert_eq!(rebound.scope.generation, fence.resource_generation.value());
+
+        let clear = check_at_trigger(&rebound, &observed_b, None, GuardTrigger::CanonicalWrite);
+        assert_eq!(clear.identity, IdentityLegOutcome::IdentityClear);
+        let stale_a = check_at_trigger(&rebound, &expected, None, GuardTrigger::CanonicalWrite);
+        assert_eq!(stale_a.identity, IdentityLegOutcome::DifferentInstance);
+        assert_eq!(stale_a.verdict, GuardVerdict::Quarantine);
+
+        let moved_fence = StateFence::new(
+            test_epoch(TEST_LINEAGE_A, 1),
+            match ResourceGeneration::new(2) {
+                Ok(value) => value,
+                Err(error) => panic!("fence fixture is invalid: {error}"),
+            },
+        );
+        assert_eq!(
+            rebind_with_receipt(
+                &receipt,
+                "scope:work",
+                PrivacyClass::Internal,
+                1,
+                &moved_fence
+            ),
+            Err(WorkScopeError::StateFenceMismatch)
+        );
     }
 }

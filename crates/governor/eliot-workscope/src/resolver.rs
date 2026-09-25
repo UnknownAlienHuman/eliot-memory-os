@@ -383,6 +383,7 @@ impl WorkScopeResolver {
     fn tier_binding_token(set: &WorkScopeCandidateSet, token: &BindingToken) -> ResolutionOutcome {
         let matched = filter_candidates(set, |candidate| {
             candidate.scope.scope_ref == token.named_scope_ref
+                && candidate.descriptor_revision == token.named_revision
         });
         ResolutionOutcome {
             resolution: unique_or_ambiguous(matched, set, ScopeResolution::StaleBinding),

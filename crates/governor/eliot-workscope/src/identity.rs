@@ -304,11 +304,16 @@ impl ScopeFingerprint {
     /// Derives the deterministic identity fingerprint for one descriptor.
     ///
     /// Only stable resource identities enter the derivation: scope reference,
-    /// kind, lineage evidence, workspace-instance evidence, and
-    /// canonical/external resource references. Display name, generation
-    /// evidence, descriptor revision, lifecycle, privacy, authority,
-    /// capabilities, and fence are excluded, so none of them can merge, split,
-    /// or rename a scope.
+    /// kind, lineage object-store and initial-history evidence,
+    /// workspace-instance references with root and VCS identity, and
+    /// canonical/external resource references. Generation evidence, descriptor
+    /// revision, lifecycle, privacy, authority, capabilities, and fence are
+    /// excluded, so none of them can merge, split, or rename a scope (I4.1:
+    /// "Git branch and commit belong to the generation, but do not define the
+    /// `WorkScope` alone"). Normalized remote references and manifest identity
+    /// references are likewise excluded: remote URLs, folder names, and a
+    /// matching `Cargo.toml` are evidence only and cannot grant scope
+    /// authority (I4.1).
     #[must_use]
     pub fn derive_for(descriptor: &WorkScopeDescriptor) -> Self {
         const DOMAIN: &str = "workscope-identity-v1";
@@ -325,12 +330,6 @@ impl ScopeFingerprint {
             parts.push(format!("lineage_ref={lineage_ref}"));
             parts.push(format!("object_store_ref={object_store_ref}"));
             parts.push(format!("initial_history_ref={initial_history_ref}"));
-            if let Some(remote) = &lineage.normalized_remote_ref {
-                parts.push(format!("normalized_remote_ref={remote}"));
-            }
-            if let Some(manifest) = &lineage.manifest_identity_ref {
-                parts.push(format!("manifest_identity_ref={manifest}"));
-            }
         }
         let mut instances = descriptor.instances.clone();
         instances.sort_by(|left, right| left.instance_ref.cmp(&right.instance_ref));
@@ -338,9 +337,8 @@ impl ScopeFingerprint {
             let instance_ref = instance.instance_ref.as_str();
             let root_identity = instance.root_identity.as_str();
             let vcs_identity = instance.vcs_identity_ref.as_deref().unwrap_or("");
-            let generation = instance.generation;
             parts.push(format!(
-                "instance={instance_ref}\u{1f}{root_identity}\u{1f}{vcs_identity}\u{1f}{generation}"
+                "instance={instance_ref}\u{1f}{root_identity}\u{1f}{vcs_identity}"
             ));
         }
         let mut canonical = descriptor.canonical_resource_refs.clone();
@@ -360,11 +358,32 @@ impl ScopeFingerprint {
 
     /// Validates that a fingerprint value is present and well-formed.
     ///
+    /// Accepts exactly what [`ScopeFingerprint::derive_for`] emits: blank
+    /// values fail, and control characters fail except the newline and unit
+    /// separators the derivation uses as structural delimiters (caller-owned
+    /// references can never contain control characters, so the delimiters
+    /// stay unambiguous).
+    ///
     /// # Errors
     ///
-    /// Returns an error when the value is blank or contains control characters.
+    /// Returns an error when the value is blank or contains a control
+    /// character other than the derivation's structural separators.
     pub fn validate(&self) -> Result<(), WorkScopeError> {
-        text(&self.value, "fingerprint.value")
+        if self.value.trim().is_empty() {
+            return Err(WorkScopeError::InvalidText {
+                field: "fingerprint.value",
+            });
+        }
+        if self
+            .value
+            .chars()
+            .any(|character| character.is_control() && character != '\n' && character != '\u{1f}')
+        {
+            return Err(WorkScopeError::InvalidText {
+                field: "fingerprint.value",
+            });
+        }
+        Ok(())
     }
 }
 

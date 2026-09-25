@@ -295,17 +295,20 @@ pub fn produce_attach_receipt(
 /// Admits an authorized relocation/attach receipt as the new expected binding.
 ///
 /// Validates the receipt, requires it to name the expected scope, and requires
-/// its fence to match the admission fence exactly. The returned binding
-/// carries the observed workspace-instance identity and generation, so the
-/// same operation is admitted afterwards only with that instance and fence.
-/// The prior identity stays preserved inside the receipt; nothing rewrites
-/// history.
+/// its fence to match the admission fence exactly. The observed instance
+/// generation must equal the admission fence generation, so the new binding
+/// carries the fence it is admitted under and a stale receipt cannot admit a
+/// superseded generation. The returned binding carries the observed
+/// workspace-instance identity and generation, so the same operation is
+/// admitted afterwards only with that instance and fence. The prior identity
+/// stays preserved inside the receipt; nothing rewrites history.
 ///
 /// # Errors
 ///
 /// Returns an error when the receipt is malformed, names another scope, or
-/// its fence does not match the admission fence, or when the derived binding
-/// is malformed.
+/// its fence does not match the admission fence, when the observed instance
+/// generation disagrees with the admission fence generation, or when the
+/// derived binding is malformed.
 pub fn rebind_with_receipt(
     receipt: &ScopeRelocationOrAttachReceipt,
     expected_scope_ref: &str,
@@ -320,6 +323,9 @@ pub fn rebind_with_receipt(
         return Err(WorkScopeError::BindingReceiptMismatch);
     }
     if !fences_match_exact(&receipt.state_fence, fence) {
+        return Err(WorkScopeError::StateFenceMismatch);
+    }
+    if receipt.observed_instance.generation != fence.resource_generation.value() {
         return Err(WorkScopeError::StateFenceMismatch);
     }
     let binding = ScopeBinding {
