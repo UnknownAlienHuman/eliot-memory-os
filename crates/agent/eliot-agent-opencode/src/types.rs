@@ -1527,43 +1527,19 @@ pub struct OpenCodeHostEventInput<'a> {
     pub admission: Option<&'a AdmittedRouteReceipt>,
 }
 
-/// Normalizes one OpenCode wire event into the closed v7 host-event schema
-/// (issue #371 T4 S7), mirroring `eliot-agent-acp::normalize_acp_event`.
-///
-/// The adapter identity/version (`eliot-agent-opencode` /
-/// [`OPENCODE_NORMALIZER_VERSION`]) is bound by this function, never supplied
-/// by the caller; the input source digest names the single decoded wire event
-/// (canonical SHA-256 over the decoded bytes, so whitespace/key-order
-/// variants verify), and the supplied event must equal the decoded bytes
-/// canonically before any receipt is issued; undecodable bytes bind the exact
-/// bytes under the raw-bytes qualifier and seal typed quarantine instead of
-/// the supplied event. Unknown `extra` fields are declared loss-visibly in
-/// `omitted_fields` (empty exactly when coverage is `Complete`); every public
-/// string is sanitized before sealing; and the sealed envelope is validated
-/// before return (execution-unit lineage against the exact binding plus the
-/// #369 admission, session lineage on the session path).
-///
-/// Classification is fail-closed and authority-free: known session wire events
-/// under session lineage become [`NormalizedHostEventPayload::SessionLifecycle`];
-/// known execution wire events under execution-unit lineage become bounded
-/// size/error/warning/terminal summaries; everything else (including
-/// session-scoped wire events under execution lineage and vice versa) becomes
-/// [`NormalizedHostEventPayload::UnsupportedQuarantined`]. Raw provider text,
-/// prompts, tool data, and errors never enter the public payload; they stay
-/// behind the restricted handle bound by digest. No candidate result, usage
-/// proof, route authority, or task completion is synthesized here.
-///
-/// The returned pair feeds
-/// `eliot-agent-coordinator::AgentCoordinator::observe_provider_event`
-/// directly: the receipt equals the envelope's embedded normalization receipt
-/// (`envelope.normalization == receipt`), and both validate under the same
-/// closed schema with [`eliot_receipts::ProofCeiling::Observation`] only.
-pub fn normalize_opencode_event(
-    input: OpenCodeHostEventInput<'_>,
-) -> Result<
-    (NormalizedHostEventEnvelope, HostEventNormalizationReceipt),
-    OpenCodeObservationConversionError,
-> {
+/// Shared classification triple: typed payload, privacy class, base warnings.
+type ClassifiedOpenCodeEvent = (
+    NormalizedHostEventPayload,
+    HostEventPrivacyClass,
+    Vec<String>,
+);
+
+/// Validate sequence bounds plus admission/lineage pairing before any
+/// receipt is issued: execution-unit lineage requires admission,
+/// session-only lineage forbids it.
+fn validate_opencode_input(
+    input: &OpenCodeHostEventInput<'_>,
+) -> Result<(), OpenCodeObservationConversionError> {
     if input.sequence == 0 {
         return Err(OpenCodeObservationConversionError::InvalidInput("sequence"));
     }
@@ -1593,40 +1569,16 @@ pub fn normalize_opencode_event(
             }
         }
     }
-    // Source binding before classification (see [`bind_opencode_source`]):
-    // the raw bytes must decode to the supplied wire event, or no receipt is
-    // issued. Undecodable bytes replace the supplied event with typed
-    // quarantine below instead of minting it.
-    let bound_source = bind_opencode_source(input.event, input.raw_source_bytes)?;
-    let (source_event, input_digest) = match &bound_source {
-        BoundOpenCodeSource::Decoded { digest, event } => (event, digest.clone()),
-        BoundOpenCodeSource::Undecodable(digest) => (input.event, digest.clone()),
-    };
-    let raw_record = RawSourceRecord {
-        handle: input.raw_source_handle.clone(),
-        digest: input_digest,
-    };
-    raw_record
-        .validate()
-        .map_err(OpenCodeObservationConversionError::Contract)?;
-    let (payload, privacy_class, mut warnings) = match &bound_source {
-        BoundOpenCodeSource::Undecodable(_) => (
-            NormalizedHostEventPayload::UnsupportedQuarantined(UnsupportedEventObservation {
-                source_namespace: OPENCODE_NORMALIZER_IDENTITY.to_owned(),
-                source_version: None,
-                reason: UnsupportedEventReason::SourceDecodeFailure,
-                detail_ref: None,
-            }),
-            HostEventPrivacyClass::RestrictedHandleOnly,
-            Vec::new(),
-        ),
-        BoundOpenCodeSource::Decoded { .. } => {
-            classify_opencode_event(source_event, &input.lineage)
-        }
-    };
-    // Loss visibility: every unknown wire field stays declared. `extra` keys
-    // are never silently dropped; an empty manifest means complete coverage.
-    // Undecodable bytes additionally declare the withheld source event.
+    Ok(())
+}
+
+/// Build the loss manifest: every unknown wire field stays declared.
+/// `extra` keys are never silently dropped; an empty manifest means complete
+/// coverage. Undecodable bytes additionally declare the withheld source event.
+fn opencode_loss_manifest(
+    source_event: &OpenCodeEvent,
+    bound_source: &BoundOpenCodeSource,
+) -> (Vec<String>, NormalizationCoverage) {
     let mut omitted_source_fields: Vec<String> = source_event
         .extra
         .keys()
@@ -1646,6 +1598,23 @@ pub fn normalize_opencode_event(
     } else {
         NormalizationCoverage::LossyOmission
     };
+    (omitted_source_fields, coverage)
+}
+
+/// Sanitize public strings, build the receipt, seal the envelope, and
+/// validate lineage before return.
+fn finish_opencode_envelope(
+    input: OpenCodeHostEventInput<'_>,
+    payload: NormalizedHostEventPayload,
+    privacy_class: HostEventPrivacyClass,
+    mut warnings: Vec<String>,
+    omitted_source_fields: Vec<String>,
+    coverage: NormalizationCoverage,
+    raw_record: RawSourceRecord,
+) -> Result<
+    (NormalizedHostEventEnvelope, HostEventNormalizationReceipt),
+    OpenCodeObservationConversionError,
+> {
     // Quarantine carries an explicit bounded warning; typed observations carry
     // none. Warnings never embed raw provider content.
     if matches!(
@@ -1735,6 +1704,248 @@ pub fn normalize_opencode_event(
     Ok((envelope, receipt))
 }
 
+/// Normalizes one OpenCode wire event into the closed v7 host-event schema
+/// (issue #371 T4 S7), mirroring `eliot-agent-acp::normalize_acp_event`.
+///
+/// The adapter identity/version (`eliot-agent-opencode` /
+/// [`OPENCODE_NORMALIZER_VERSION`]) is bound by this function, never supplied
+/// by the caller; the input source digest names the single decoded wire event
+/// (canonical SHA-256 over the decoded bytes, so whitespace/key-order
+/// variants verify), and the supplied event must equal the decoded bytes
+/// canonically before any receipt is issued; undecodable bytes bind the exact
+/// bytes under the raw-bytes qualifier and seal typed quarantine instead of
+/// the supplied event. Unknown `extra` fields are declared loss-visibly in
+/// `omitted_fields` (empty exactly when coverage is `Complete`); every public
+/// string is sanitized before sealing; and the sealed envelope is validated
+/// before return (execution-unit lineage against the exact binding plus the
+/// #369 admission, session lineage on the session path).
+///
+/// Classification is fail-closed and authority-free: known session wire events
+/// under session lineage become [`NormalizedHostEventPayload::SessionLifecycle`];
+/// known execution wire events under execution-unit lineage become bounded
+/// size/error/warning/terminal summaries; everything else (including
+/// session-scoped wire events under execution lineage and vice versa) becomes
+/// [`NormalizedHostEventPayload::UnsupportedQuarantined`]. Raw provider text,
+/// prompts, tool data, and errors never enter the public payload; they stay
+/// behind the restricted handle bound by digest. No candidate result, usage
+/// proof, route authority, or task completion is synthesized here.
+///
+/// The returned pair feeds
+/// `eliot-agent-coordinator::AgentCoordinator::observe_provider_event`
+/// directly: the receipt equals the envelope's embedded normalization receipt
+/// (`envelope.normalization == receipt`), and both validate under the same
+/// closed schema with [`eliot_receipts::ProofCeiling::Observation`] only.
+pub fn normalize_opencode_event(
+    input: OpenCodeHostEventInput<'_>,
+) -> Result<
+    (NormalizedHostEventEnvelope, HostEventNormalizationReceipt),
+    OpenCodeObservationConversionError,
+> {
+    validate_opencode_input(&input)?;
+    // Source binding before classification (see [`bind_opencode_source`]):
+    // the raw bytes must decode to the supplied wire event, or no receipt is
+    // issued. Undecodable bytes replace the supplied event with typed
+    // quarantine below instead of minting it.
+    let bound_source = bind_opencode_source(input.event, input.raw_source_bytes)?;
+    let (source_event, input_digest) = match &bound_source {
+        BoundOpenCodeSource::Decoded { digest, event } => (event, digest.clone()),
+        BoundOpenCodeSource::Undecodable(digest) => (input.event, digest.clone()),
+    };
+    let raw_record = RawSourceRecord {
+        handle: input.raw_source_handle.clone(),
+        digest: input_digest,
+    };
+    raw_record
+        .validate()
+        .map_err(OpenCodeObservationConversionError::Contract)?;
+    let (payload, privacy_class, warnings) = match &bound_source {
+        BoundOpenCodeSource::Undecodable(_) => (
+            NormalizedHostEventPayload::UnsupportedQuarantined(UnsupportedEventObservation {
+                source_namespace: OPENCODE_NORMALIZER_IDENTITY.to_owned(),
+                source_version: None,
+                reason: UnsupportedEventReason::SourceDecodeFailure,
+                detail_ref: None,
+            }),
+            HostEventPrivacyClass::RestrictedHandleOnly,
+            Vec::new(),
+        ),
+        BoundOpenCodeSource::Decoded { .. } => {
+            classify_opencode_event(source_event, &input.lineage)
+        }
+    };
+    let (omitted_source_fields, coverage) = opencode_loss_manifest(source_event, &bound_source);
+    finish_opencode_envelope(
+        input,
+        payload,
+        privacy_class,
+        warnings,
+        omitted_source_fields,
+        coverage,
+        raw_record,
+    )
+}
+
+/// Classify `session.status` wire events by their inner status kind.
+fn classify_session_status_event(event: &OpenCodeEvent) -> ClassifiedOpenCodeEvent {
+    let warnings = Vec::new();
+    let status_kind = event
+        .properties
+        .pointer("/status/type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    match status_kind {
+        "idle" => (
+            NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+                transition: SessionLifecycleTransition::Suspended,
+                detail_ref: None,
+            }),
+            HostEventPrivacyClass::PublicSummary,
+            warnings,
+        ),
+        "busy" | "retry" => (
+            NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+                transition: SessionLifecycleTransition::Resumed,
+                detail_ref: None,
+            }),
+            HostEventPrivacyClass::PublicSummary,
+            warnings,
+        ),
+        _ => (
+            NormalizedHostEventPayload::UnsupportedQuarantined(UnsupportedEventObservation {
+                source_namespace: "opencode".to_owned(),
+                source_version: None,
+                reason: UnsupportedEventReason::UnknownMethod,
+                detail_ref: None,
+            }),
+            HostEventPrivacyClass::RestrictedHandleOnly,
+            warnings,
+        ),
+    }
+}
+
+/// Classify session-lineage wire events: lifecycle transitions stay
+/// session-scoped; everything else quarantines as typed session evidence.
+fn classify_session_opencode_event(event: &OpenCodeEvent) -> ClassifiedOpenCodeEvent {
+    let warnings = Vec::new();
+    match event.event_type.as_str() {
+        "server.connected" => (
+            NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+                transition: SessionLifecycleTransition::Started,
+                detail_ref: None,
+            }),
+            HostEventPrivacyClass::PublicSummary,
+            warnings,
+        ),
+        "session.idle" => (
+            NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+                transition: SessionLifecycleTransition::Suspended,
+                detail_ref: None,
+            }),
+            HostEventPrivacyClass::PublicSummary,
+            warnings,
+        ),
+        "session.status" => classify_session_status_event(event),
+        _ => (
+            NormalizedHostEventPayload::UnsupportedQuarantined(UnsupportedEventObservation {
+                source_namespace: "opencode".to_owned(),
+                source_version: None,
+                reason: UnsupportedEventReason::UnknownMethod,
+                detail_ref: None,
+            }),
+            HostEventPrivacyClass::RestrictedHandleOnly,
+            warnings,
+        ),
+    }
+}
+
+/// Classify `message.part.updated` wire events: exact step-finish/stop
+/// becomes terminal-observed; every other part becomes a bounded delta.
+fn classify_message_part_event(event: &OpenCodeEvent) -> ClassifiedOpenCodeEvent {
+    let warnings = Vec::new();
+    let part_type = event
+        .properties
+        .pointer("/part/type")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let reason = event
+        .properties
+        .pointer("/part/reason")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if part_type == "step-finish" && reason == "stop" {
+        (
+            NormalizedHostEventPayload::ProviderTerminalObserved(ProviderTerminalObservation {
+                status: ProviderTerminalStatus::CompletedObserved,
+                terminal_ref: "opencode:step-finish-stop".to_owned(),
+            }),
+            HostEventPrivacyClass::RedactedSummary,
+            warnings,
+        )
+    } else {
+        let delta_chars = serde_json::to_value(&event.properties)
+            .map(|value| value.to_string().chars().count() as u64)
+            .unwrap_or(0);
+        (
+            NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
+                delta_chars,
+                truncated: false,
+            }),
+            HostEventPrivacyClass::RedactedSummary,
+            warnings,
+        )
+    }
+}
+
+/// Classify execution-unit-lineage wire events as bounded summaries;
+/// session-scoped wire events under execution lineage quarantine.
+fn classify_execution_opencode_event(event: &OpenCodeEvent) -> ClassifiedOpenCodeEvent {
+    let warnings = Vec::new();
+    match event.event_type.as_str() {
+        "message.updated" => {
+            let delta_chars = serde_json::to_value(&event.properties)
+                .map(|value| value.to_string().chars().count() as u64)
+                .unwrap_or(0);
+            (
+                NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
+                    delta_chars,
+                    truncated: false,
+                }),
+                HostEventPrivacyClass::RedactedSummary,
+                warnings,
+            )
+        }
+        "message.part.updated" => classify_message_part_event(event),
+        "session.error" => (
+            NormalizedHostEventPayload::Error(ErrorObservation {
+                code: "OPENCODE_SESSION_ERROR".to_owned(),
+                safe_summary: "opencode session error observed; detail behind restricted handle"
+                    .to_owned(),
+            }),
+            HostEventPrivacyClass::RedactedSummary,
+            warnings,
+        ),
+        "permission.asked" => (
+            NormalizedHostEventPayload::Warning(WarningObservation {
+                code: "OPENCODE_PERMISSION_ASKED".to_owned(),
+                summary: "opencode permission request observed; detail behind restricted handle"
+                    .to_owned(),
+            }),
+            HostEventPrivacyClass::RedactedSummary,
+            warnings,
+        ),
+        _ => (
+            NormalizedHostEventPayload::UnsupportedQuarantined(UnsupportedEventObservation {
+                source_namespace: "opencode".to_owned(),
+                source_version: None,
+                reason: UnsupportedEventReason::UnknownMethod,
+                detail_ref: None,
+            }),
+            HostEventPrivacyClass::RestrictedHandleOnly,
+            warnings,
+        ),
+    }
+}
+
 /// Classifies one OpenCode wire event into the closed typed payload family.
 ///
 /// Returns the typed payload, its privacy class, and base warnings (the
@@ -1753,156 +1964,11 @@ fn classify_opencode_event(
     HostEventPrivacyClass,
     Vec<String>,
 ) {
-    let warnings = Vec::new();
     let is_session_lineage = matches!(lineage, ProviderObservationLineage::SessionObservation(_));
     if is_session_lineage {
-        match event.event_type.as_str() {
-            "server.connected" => (
-                NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
-                    transition: SessionLifecycleTransition::Started,
-                    detail_ref: None,
-                }),
-                HostEventPrivacyClass::PublicSummary,
-                warnings,
-            ),
-            "session.idle" => (
-                NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
-                    transition: SessionLifecycleTransition::Suspended,
-                    detail_ref: None,
-                }),
-                HostEventPrivacyClass::PublicSummary,
-                warnings,
-            ),
-            "session.status" => {
-                let status_kind = event
-                    .properties
-                    .pointer("/status/type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                match status_kind {
-                    "idle" => (
-                        NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
-                            transition: SessionLifecycleTransition::Suspended,
-                            detail_ref: None,
-                        }),
-                        HostEventPrivacyClass::PublicSummary,
-                        warnings,
-                    ),
-                    "busy" | "retry" => (
-                        NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
-                            transition: SessionLifecycleTransition::Resumed,
-                            detail_ref: None,
-                        }),
-                        HostEventPrivacyClass::PublicSummary,
-                        warnings,
-                    ),
-                    _ => (
-                        NormalizedHostEventPayload::UnsupportedQuarantined(
-                            UnsupportedEventObservation {
-                                source_namespace: "opencode".to_owned(),
-                                source_version: None,
-                                reason: UnsupportedEventReason::UnknownMethod,
-                                detail_ref: None,
-                            },
-                        ),
-                        HostEventPrivacyClass::RestrictedHandleOnly,
-                        warnings,
-                    ),
-                }
-            }
-            _ => (
-                NormalizedHostEventPayload::UnsupportedQuarantined(UnsupportedEventObservation {
-                    source_namespace: "opencode".to_owned(),
-                    source_version: None,
-                    reason: UnsupportedEventReason::UnknownMethod,
-                    detail_ref: None,
-                }),
-                HostEventPrivacyClass::RestrictedHandleOnly,
-                warnings,
-            ),
-        }
+        classify_session_opencode_event(event)
     } else {
-        match event.event_type.as_str() {
-            "message.updated" => {
-                let delta_chars = serde_json::to_value(&event.properties)
-                    .map(|value| value.to_string().chars().count() as u64)
-                    .unwrap_or(0);
-                (
-                    NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
-                        delta_chars,
-                        truncated: false,
-                    }),
-                    HostEventPrivacyClass::RedactedSummary,
-                    warnings,
-                )
-            }
-            "message.part.updated" => {
-                let part_type = event
-                    .properties
-                    .pointer("/part/type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let reason = event
-                    .properties
-                    .pointer("/part/reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if part_type == "step-finish" && reason == "stop" {
-                    (
-                        NormalizedHostEventPayload::ProviderTerminalObserved(
-                            ProviderTerminalObservation {
-                                status: ProviderTerminalStatus::CompletedObserved,
-                                terminal_ref: "opencode:step-finish-stop".to_owned(),
-                            },
-                        ),
-                        HostEventPrivacyClass::RedactedSummary,
-                        warnings,
-                    )
-                } else {
-                    let delta_chars = serde_json::to_value(&event.properties)
-                        .map(|value| value.to_string().chars().count() as u64)
-                        .unwrap_or(0);
-                    (
-                        NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
-                            delta_chars,
-                            truncated: false,
-                        }),
-                        HostEventPrivacyClass::RedactedSummary,
-                        warnings,
-                    )
-                }
-            }
-            "session.error" => (
-                NormalizedHostEventPayload::Error(ErrorObservation {
-                    code: "OPENCODE_SESSION_ERROR".to_owned(),
-                    safe_summary:
-                        "opencode session error observed; detail behind restricted handle"
-                            .to_owned(),
-                }),
-                HostEventPrivacyClass::RedactedSummary,
-                warnings,
-            ),
-            "permission.asked" => (
-                NormalizedHostEventPayload::Warning(WarningObservation {
-                    code: "OPENCODE_PERMISSION_ASKED".to_owned(),
-                    summary:
-                        "opencode permission request observed; detail behind restricted handle"
-                            .to_owned(),
-                }),
-                HostEventPrivacyClass::RedactedSummary,
-                warnings,
-            ),
-            _ => (
-                NormalizedHostEventPayload::UnsupportedQuarantined(UnsupportedEventObservation {
-                    source_namespace: "opencode".to_owned(),
-                    source_version: None,
-                    reason: UnsupportedEventReason::UnknownMethod,
-                    detail_ref: None,
-                }),
-                HostEventPrivacyClass::RestrictedHandleOnly,
-                warnings,
-            ),
-        }
+        classify_execution_opencode_event(event)
     }
 }
 
