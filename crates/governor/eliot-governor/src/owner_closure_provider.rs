@@ -1673,6 +1673,13 @@ mod owner_closure_provider_tests {
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
 
+    /// Test-fixed canonical request digest for the preserved exact use. The
+    /// admission path only proves the digest contour (lowercase SHA-256
+    /// shape), so this fixture pins one value instead of inventing a request
+    /// the test never builds.
+    const PRESERVED_REQUEST_HASH: &str =
+        "3f9a1c7d5e2b8a04c6d1f37e5b9042a8c6d0e3f75a1b2c3d4e5f60718293a4b5";
+
     fn test_fence() -> StateFence {
         let epoch = EpochId::new(
             EpochLineageId::new(TEST_LINEAGE).expect("lineage"),
@@ -1842,6 +1849,14 @@ mod owner_closure_provider_tests {
             grant_id: "grant:child".to_owned(),
             covering_grant_id: "grant:origin".to_owned(),
             covering_root_ref: "root:alpha".to_owned(),
+            operation_id: "op-admit-child".to_owned(),
+            operation_name: "op.read".to_owned(),
+            resource_ref: "res:1".to_owned(),
+            effect: EffectClass::Read,
+            holder_principal: "principal:holder".to_owned(),
+            session_id: "session-1".to_owned(),
+            scope_id: "scope-1".to_owned(),
+            canonical_request_hash: PRESERVED_REQUEST_HASH.to_owned(),
         })?;
         let restore = provider.serve_restore()?;
         assert_eq!(restore.members.len(), 1);

@@ -888,7 +888,10 @@ mod tests {
     use super::*;
     use eliot_authority::{GrantGraphRecoverySnapshot, GrantRecoveryRecord, GrantStatus};
     use eliot_contracts::{ContractId, EpochLineageId, ResourceGeneration, StateFence};
-    use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling};
+    use eliot_receipts::{
+        AuthorityBinding, EffectClass, GRANT_CLOSURE_SCHEMA, GRANT_CLOSURE_VERSION,
+        GrantClosureMemberDeclaration, ProofCeiling,
+    };
     use std::num::NonZeroU64;
 
     use crate::grant_activation_port::GrantActivationIntent;
@@ -1031,6 +1034,25 @@ mod tests {
             durable_record: hydration.durable_record.clone(),
             observed_at_ms: 1_000,
         };
+        // The one canonical owner declaration for the single restored graph
+        // grant. Every field is projected from the same durable material the
+        // restore carries: the snapshot revision/root/parent identity, the
+        // member intent's own ceiling, and the exact alternate-path set the
+        // owner declared (empty here, so the declaration and the projection
+        // agree byte for byte).
+        let declaration = GrantClosureDeclaration {
+            schema: GRANT_CLOSURE_SCHEMA.to_owned(),
+            version: GRANT_CLOSURE_VERSION,
+            target_grant_id: "grant-test-root".to_owned(),
+            authority_root_ref: "root-test".to_owned(),
+            grant_graph_revision: 5,
+            members: vec![GrantClosureMemberDeclaration {
+                grant_id: "grant-test-root".to_owned(),
+                parent_grant_id: None,
+            }],
+            preserved: Vec::new(),
+            proof_ceiling: ProofCeiling::ScopedVerification,
+        };
         Ok(GovernorClosureRestore {
             graph_snapshot: recovery_snapshot(&binding)?,
             revocation_history: Some(eliot_authority::RevocationHistoryEvidence {
@@ -1038,10 +1060,18 @@ mod tests {
                 source_revision: 5,
                 closures: Vec::new(),
             }),
+            // One admitted grant identity cannot be both a closure member and a
+            // single-root hydration, so this grant is admitted as the closure
+            // member the enumeration test reads back.
             members: vec![member],
-            roots: vec![hydration],
+            roots: Vec::new(),
             introductions: Vec::new(),
-            preserved: Vec::new(),
+            declarations: vec![declaration],
+            preserved: vec![("grant-test-root".to_owned(), Vec::new())],
+            // No canonical second phase has completed for this fixture, which
+            // is the honest empty state: an absent entry leaves the committed
+            // first phase explicitly pending rather than fabricating a receipt.
+            canonical_receipts: BTreeMap::new(),
         })
     }
 
