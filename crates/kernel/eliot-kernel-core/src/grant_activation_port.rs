@@ -1765,7 +1765,11 @@ impl GrantActivationPort {
     /// revocation-suppressed identities. ORS rows are read under their
     /// existing receipts; a missing member, stale graph head, malformed
     /// version, or incomplete coverage returns recovery-required and installs
-    /// no partial live state.
+    /// no partial live state. Rehydrated active introductions also recover
+    /// their activation intent records, so a post-restart exact replay
+    /// resolves to the read-only revalidation branch (row read-back, complete
+    /// closure introduction-fence re-enumeration, watermark check) and returns
+    /// the same committed disposition instead of refusing as a duplicate.
     #[allow(
         clippy::too_many_lines,
         reason = "restart rehydration validates every durable closure row before installing one coherent live projection"
@@ -2086,6 +2090,51 @@ impl GrantActivationPort {
                     status,
                 },
             );
+            if status == LiveStatus::Active {
+                // Post-restart exact replay (#2100 R4): the live install
+                // alone would make an exact replay resolve as `New` and
+                // refuse as an already-recorded identity. Restore the same
+                // activation intent record the commit path installed,
+                // derived from the same owner-presented inputs: the replay
+                // digest over intent plus opaque bytes, and the activation
+                // receipt over the operation identity, snapshot, and the
+                // binding epoch the commit gate proved equal to the active
+                // epoch. The replay branch still re-reads the row,
+                // re-enumerates the complete closure introduction-fence set,
+                // and re-checks the watermark read-only before returning it.
+                let digest = hydrated_introduction_digest(&hydration)?;
+                let receipt = runtime_introduction_activation_receipt(
+                    &hydration.intent,
+                    &hydration.intent.binding.authority_epoch,
+                )?;
+                let operation_id = hydration.intent.operation_id.clone();
+                if let Some(existing) = candidate.intents.get(&operation_id) {
+                    let same = existing.digest == digest
+                        && existing.kind == IntentKind::IntroductionActivation
+                        && existing.disposition
+                            == IntentDisposition::Committed(CommittedReceipt::Activation(
+                                receipt.clone(),
+                            ));
+                    if !same {
+                        return Err(KernelError::IdempotencyConflict);
+                    }
+                } else {
+                    candidate.intents.insert(
+                        operation_id.clone(),
+                        PortIntentRecord {
+                            operation_id,
+                            digest,
+                            kind: IntentKind::IntroductionActivation,
+                            disposition: IntentDisposition::Committed(
+                                CommittedReceipt::Activation(receipt),
+                            ),
+                            fenced: Vec::new(),
+                            closure_receipt: None,
+                            closure_member_receipts: Vec::new(),
+                        },
+                    );
+                }
+            }
         }
         if !required.is_subset(&covered) {
             return Err(KernelError::RecoveryUnavailable(
