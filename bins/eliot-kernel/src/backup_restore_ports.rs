@@ -1272,6 +1272,7 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
         OrsError::DuplicateConflict
         | OrsError::HostRequestIdentityConflict { .. }
         | OrsError::ActivationResultRetentionIdentityConflict { .. }
+        | OrsError::ActivationLifecycleIdentityConflict { .. }
         | OrsError::NativeWorkerClaimIdentityConflict { .. }
         | OrsError::WorkerReplayIdentityConflict { .. }
         | OrsError::WorkerReplayStaleStream { .. } => BackupError::Duplicate {
@@ -1329,6 +1330,18 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
         OrsError::InvalidTransition | OrsError::ScopeRecoveryRequired | OrsError::UnsafeExpiry => {
             BackupError::RestorePhaseMismatch
         }
+        // The activation lifecycle vocabulary (#1115) keeps the same per-class
+        // discipline as the supervision-ticket group above: a ticket whose
+        // deadline closed before result admission is a named lifecycle record
+        // that cannot satisfy the request, never a generic target failure, and
+        // a ticket found in the wrong durable state is the same invalid
+        // phase/state transition `InvalidTransition` already reports. They are
+        // deliberately two arms rather than one so an expiry never reads as a
+        // state conflict on this seam.
+        OrsError::ActivationLifecycleExpired { .. } => BackupError::IntegrityMismatch {
+            subject: "restore journal activation ticket expiry".to_owned(),
+        },
+        OrsError::ActivationLifecycleStateConflict { .. } => BackupError::RestorePhaseMismatch,
         OrsError::ActiveExecutableReplacement
         | OrsError::IncompatibleArtifact
         | OrsError::VersionedArtifactConflict

@@ -184,6 +184,46 @@ fn activation_result_record(
     }
 }
 
+fn activation_lifecycle_record(
+    record: &ActivationResultRetentionRecord,
+) -> ActivationLifecycleRecord {
+    ActivationLifecycleRecord {
+        ticket_id: record.ticket_id.clone(),
+        ticket_sha256: record.ticket_sha256.clone(),
+        ticket_payload: record.ticket_payload.clone(),
+        activation_request_id: format!("request-{}", record.ticket_id),
+        activation_request_sha256: "c".repeat(64),
+        connection_id: record.connection_id.clone(),
+        state_fence: record.state_fence.clone(),
+        kernel_deadline_unix_ms: 10_000,
+        cancellation_id: format!("cancel-{}", record.ticket_id),
+        state: ActivationLifecycleState::Pending,
+        lifecycle_order: 0,
+        result_sha256: None,
+        claim_owner: None,
+        claim_expires_at_unix_ms: None,
+        successor_of: None,
+        successor_ticket_id: None,
+        terminal_reason: None,
+    }
+}
+
+fn retain_activation_result(
+    store: &RedbRecoveryStore,
+    record: &ActivationResultRetentionRecord,
+) -> Result<ActivationResultRetentionRecord, OrsError> {
+    if store
+        .load_all_activation_results()?
+        .into_iter()
+        .any(|existing| existing.ticket_id == record.ticket_id)
+    {
+        return store.commit_activation_result(record, "eliotd", None, 2);
+    }
+    store.stage_activation_ticket(&activation_lifecycle_record(record), 1)?;
+    store.claim_activation_ticket(&record.ticket_id, "eliotd", 2, 3)?;
+    store.commit_activation_result(record, "eliotd", None, 2)
+}
+
 #[test]
 fn activation_result_retention_round_trips_replays_conflicts_and_reopens() -> TestResult {
     let path = database_path("activation-result-retention-round-trip");
@@ -195,20 +235,22 @@ fn activation_result_retention_round_trips_replays_conflicts_and_reopens() -> Te
         "opaque-result-payload",
         ActivationResultRetentionPhase::AcceptedTerminal,
     );
-    let retained = store.retain_activation_result(&record)?;
+    let retained = retain_activation_result(&store, &record)?;
     assert!(retained.retention_order > 0);
-    assert_eq!(store.retain_activation_result(&record)?, retained);
+    assert_eq!(retain_activation_result(&store, &record)?, retained);
     let mut changed_connection = record.clone();
     changed_connection.connection_id = "connection-2".to_owned();
     assert!(matches!(
-        store.retain_activation_result(&changed_connection),
-        Err(OrsError::ActivationResultRetentionIdentityConflict { .. })
+        retain_activation_result(&store, &changed_connection),
+        Err(OrsError::ActivationResultRetentionIdentityConflict { .. }
+            | OrsError::ActivationLifecycleIdentityConflict { .. })
     ));
     let mut changed_fence = record.clone();
     changed_fence.state_fence = "state-fence-2".to_owned();
     assert!(matches!(
-        store.retain_activation_result(&changed_fence),
-        Err(OrsError::ActivationResultRetentionIdentityConflict { .. })
+        retain_activation_result(&store, &changed_fence),
+        Err(OrsError::ActivationResultRetentionIdentityConflict { .. }
+            | OrsError::ActivationLifecycleIdentityConflict { .. })
     ));
     assert_eq!(
         store.load_activation_result("ticket-1", &"b".repeat(64))?,
@@ -217,14 +259,16 @@ fn activation_result_retention_round_trips_replays_conflicts_and_reopens() -> Te
     assert_eq!(store.load_all_activation_results()?, vec![retained.clone()]);
     assert!(matches!(
         store.load_activation_result("ticket-1", &"c".repeat(64)),
-        Err(OrsError::ActivationResultRetentionIdentityConflict { .. })
+        Err(OrsError::ActivationResultRetentionIdentityConflict { .. }
+            | OrsError::ActivationLifecycleIdentityConflict { .. })
     ));
 
     let mut conflict = record.clone();
     conflict.result_payload = "changed-result".to_owned();
     assert!(matches!(
-        store.retain_activation_result(&conflict),
-        Err(OrsError::ActivationResultRetentionIdentityConflict { .. })
+        retain_activation_result(&store, &conflict),
+        Err(OrsError::ActivationResultRetentionIdentityConflict { .. }
+            | OrsError::ActivationLifecycleIdentityConflict { .. })
     ));
     drop(store);
 
@@ -316,9 +360,9 @@ fn activation_result_retention_prunes_count_and_payload_bounds() -> TestResult {
             &format!("{index:064x}"),
             &payload[..32 * 1024],
             &payload[..32 * 1024],
-            ActivationResultRetentionPhase::DeferredNotReady,
+            ActivationResultRetentionPhase::AcceptedTerminal,
         );
-        store.retain_activation_result(&record)?;
+        retain_activation_result(&store, &record)?;
     }
     assert!(
         store

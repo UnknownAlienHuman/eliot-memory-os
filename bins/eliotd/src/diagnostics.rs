@@ -978,7 +978,10 @@ pub fn daemon_error_owner(error: &DaemonError) -> OwningComponent {
         | DaemonError::Finish(_)
         | DaemonError::Maintenance(_)
         | DaemonError::TaskBinding(_) => OwningComponent::Governor,
-        DaemonError::Kernel(_) => OwningComponent::Kernel,
+        // Issue #1115: a typed v2 receiver whose activation deadline elapsed is
+        // a kernel lifecycle failure, so it reports with the kernel owner
+        // instead of being folded into the Governor admission owner above.
+        DaemonError::Kernel(_) | DaemonError::ActivationExpired => OwningComponent::Kernel,
         DaemonError::LaunchConfig(_) | DaemonError::Protected(_) => OwningComponent::DaemonConfig,
         DaemonError::Lifecycle(_) => OwningComponent::DaemonRuntime,
         DaemonError::ProviderAdmission(error) => fabric_rejection_of(error).1,
@@ -1267,6 +1270,7 @@ impl ErrorRecord {
             DaemonError::Composition(_) => ("composition", error.to_string()),
             DaemonError::Finish(_) => ("finish-attempt", error.to_string()),
             DaemonError::Kernel(_) => ("kernel-transport", error.to_string()),
+            DaemonError::ActivationExpired => ("activation-expired", error.to_string()),
             DaemonError::LaunchConfig(_) => ("launch-config", error.to_string()),
             DaemonError::Protected(_) => ("protected-path", error.to_string()),
             DaemonError::Lifecycle(_) => ("lifecycle", error.to_string()),
@@ -1385,10 +1389,10 @@ impl KernelDisconnect {
 
 /// Emits the Kernel activation-result acknowledgement record.
 ///
-/// The acknowledgement outcome (`accepted`, `exact-replay`, `reconciled`,
-/// `unknown`) is correlation only: an acknowledgement is never completed
-/// work, so the record carries no completion claim. `Unknown` preserves the
-/// original ticket/result identity verbatim for the shutdown drain.
+/// The stable acknowledgement outcome (`accepted` or `unknown`) is correlation
+/// only: an acknowledgement is never completed work, so the record carries no
+/// completion claim. `Unknown` preserves the original ticket/result identity
+/// verbatim for the shutdown drain.
 pub fn emit_activation_ack(
     ticket_id: &str,
     result_sha256: &str,
@@ -1398,8 +1402,6 @@ pub fn emit_activation_ack(
     let result = sanitize_identity(result_sha256);
     let outcome_text = match outcome {
         AgentActivationResultAckOutcome::Accepted => "accepted",
-        AgentActivationResultAckOutcome::ExactReplay => "exact-replay",
-        AgentActivationResultAckOutcome::Reconciled => "reconciled",
         AgentActivationResultAckOutcome::Unknown => STATE_UNKNOWN,
     };
     emit_line(

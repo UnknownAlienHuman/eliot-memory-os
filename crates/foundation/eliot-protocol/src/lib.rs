@@ -1773,6 +1773,55 @@ impl AgentBridgeActivationRequest {
     }
 }
 
+/// Immutable predecessor binding carried by one fresh successor ticket.
+///
+/// The predecessor result remains immutable. This evidence lets the trusted
+/// semantic owner observe the exact named dependency on a later read and lets
+/// Kernel reject early or unchanged-revision reconsideration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentActivationTicketPredecessor {
+    pub predecessor_ticket_id: String,
+    pub predecessor_ticket_sha256: String,
+    pub predecessor_result_sha256: String,
+    pub dependency_ref: String,
+    pub observed_dependency_revision: String,
+    pub not_before_unix_ms: u64,
+}
+
+impl AgentActivationTicketPredecessor {
+    /// Validates the bounded predecessor identity and due-time shape.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        text(
+            &self.predecessor_ticket_id,
+            "agent_activation_resolution_ticket.predecessor_ticket_id",
+        )?;
+        lowercase_sha256(
+            &self.predecessor_ticket_sha256,
+            "agent_activation_resolution_ticket.predecessor_ticket_sha256",
+        )?;
+        lowercase_sha256(
+            &self.predecessor_result_sha256,
+            "agent_activation_resolution_ticket.predecessor_result_sha256",
+        )?;
+        text(
+            &self.dependency_ref,
+            "agent_activation_resolution_ticket.dependency_ref",
+        )?;
+        text(
+            &self.observed_dependency_revision,
+            "agent_activation_resolution_ticket.observed_dependency_revision",
+        )?;
+        if self.not_before_unix_ms == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_resolution_ticket.not_before_unix_ms",
+                reason: "must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Correlation-only ticket handed from Kernel to the trusted eliotd resolver.
 ///
 /// This binds the exact pre-semantic request and transport receipt without
@@ -1789,16 +1838,27 @@ pub struct AgentActivationResolutionTicket {
     pub ticket_id: String,
     /// Exact activation request identity.
     pub activation_request_id: RequestId,
+    /// Opaque demand identity carried by the exact activation request. It is
+    /// used only to bind a fresh successor to the same bridge demand; it grants
+    /// no semantic task, scope, or Session authority.
+    pub demand_id: String,
     /// Digest of the exact activation request.
     pub activation_request_sha256: String,
     /// Digest of the exact Kernel peer-admission receipt.
     pub peer_admission_receipt_sha256: String,
     /// Kernel-created transport connection identity.
     pub connection_id: String,
+    /// Exact cancellation identity from the original activation request.
+    /// It is inert semantic data, but remains part of the immutable ticket
+    /// join so a result cannot outlive a cancelled request identity.
+    pub cancellation_id: String,
     /// Exact transport fence retained for semantic resolution.
     pub state_fence: StateFence,
     /// Kernel-owned absolute resolution deadline.
     pub kernel_deadline_unix_ms: u64,
+    /// Exact durable predecessor evidence when this is a fresh successor.
+    #[serde(default)]
+    pub successor_of: Option<AgentActivationTicketPredecessor>,
     /// Lowercase SHA-256 over every ticket field except this field.
     pub ticket_sha256: String,
 }
@@ -1849,6 +1909,11 @@ impl AgentActivationResolutionTicket {
                 reason: "exceeds the bounded wire length",
             });
         }
+        bounded_text(
+            &self.demand_id,
+            "agent_activation_resolution_ticket.demand_id",
+            512,
+        )?;
         lowercase_sha256(
             &self.activation_request_sha256,
             "agent_activation_resolution_ticket.activation_request_sha256",
@@ -1862,6 +1927,11 @@ impl AgentActivationResolutionTicket {
             "agent_activation_resolution_ticket.connection_id",
             512,
         )?;
+        bounded_text(
+            &self.cancellation_id,
+            "agent_activation_resolution_ticket.cancellation_id",
+            512,
+        )?;
         self.state_fence
             .validate()
             .map_err(ProtocolError::Foundation)?;
@@ -1870,6 +1940,15 @@ impl AgentActivationResolutionTicket {
                 field: "agent_activation_resolution_ticket.kernel_deadline_unix_ms",
                 reason: "must be greater than zero",
             });
+        }
+        if let Some(predecessor) = &self.successor_of {
+            predecessor.validate()?;
+            if predecessor.not_before_unix_ms >= self.kernel_deadline_unix_ms {
+                return Err(ProtocolError::InvalidField {
+                    field: "agent_activation_resolution_ticket.successor_of",
+                    reason: "successor due time must precede the fresh ticket deadline",
+                });
+            }
         }
         lowercase_sha256(
             &self.ticket_sha256,
@@ -1894,9 +1973,11 @@ impl AgentActivationResolutionTicket {
         request.validate_admission(receipt)?;
         receipt.validate()?;
         if self.activation_request_id != request.request_identity.request.metadata.request_id
+            || self.demand_id != request.demand_id
             || self.activation_request_sha256 != request.request_sha256
             || self.peer_admission_receipt_sha256 != receipt.receipt_sha256
             || self.connection_id != receipt.connection_id
+            || self.cancellation_id != request.request_identity.cancellation_id
             || self.state_fence != receipt.state_fence
             || self.kernel_deadline_unix_ms != receipt.activation_deadline_unix_ms
         {
@@ -4344,11 +4425,14 @@ mod tests {
             wire_version: AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
             ticket_id: "activation-ticket-1".to_owned(),
             activation_request_id: request.request_identity.request.metadata.request_id.clone(),
+            demand_id: request.demand_id.clone(),
             activation_request_sha256: request.request_sha256.clone(),
             peer_admission_receipt_sha256: receipt.receipt_sha256.clone(),
             connection_id: receipt.connection_id.clone(),
+            cancellation_id: request.request_identity.cancellation_id.clone(),
             state_fence: receipt.state_fence.clone(),
             kernel_deadline_unix_ms: receipt.activation_deadline_unix_ms,
+            successor_of: None,
             ticket_sha256: String::new(),
         }
         .with_computed_digest()

@@ -978,21 +978,19 @@ impl KernelComposition {
     /// Loads the exact retained typed resolution result for an Activation
     /// envelope without invoking the semantic resolver.
     ///
-    /// The canonical v2 envelope ledger (`pending.results`, retained with its
-    /// submission phase by the production submit path) is authoritative and is
-    /// read first; the unenveloped P-04 raw map is a compatibility fallback.
-    /// A changed same-ticket entry across the two ledgers is an identity
-    /// conflict instead of a silent preference: one ticket owns at most one
-    /// result identity. An exact digest match across both legs stays
-    /// idempotent. A projected entry stays answerable: the pending
-    /// entry is consumed after bridge projection but the retained record keeps
-    /// the exact ticket connection, so a retried envelope for the same ticket
-    /// answers from the known result instead of falling back to unknown. A
-    /// missing ticket or a ticket without a retained result is an unknown
-    /// operation; a result bound to another connection fails closed; a digest
-    /// or fence mismatch is an identity conflict; a non-resolved disposition
-    /// fails closed without yielding any binding.
-    #[cfg(test)]
+    /// The durable ORS lifecycle/result pair is the sole authority. A
+    /// projected entry stays answerable because the exact ticket connection,
+    /// lifecycle, and result payload remain in ORS. A missing ticket or a
+    /// result-less lifecycle is an unknown operation; a result bound to
+    /// another connection fails closed; a digest/fence mismatch is an identity
+    /// conflict; a non-resolved disposition fails closed without yielding a
+    /// binding.
+    ///
+    /// Every existing caller of this test-support wrapper is `#[cfg(windows)]`,
+    /// so the gate matches the callers rather than the wider `#[cfg(test)]`
+    /// main carried: on a non-Windows test build this wrapper would otherwise
+    /// exist with no caller at all.
+    #[cfg(all(test, windows))]
     pub(super) fn host_request_activation_resolution(
         &self,
         envelope: &HostRequestEnvelope,
@@ -1009,64 +1007,40 @@ impl KernelComposition {
             .activation_binding
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
-        let (entry_connection, retained) = {
-            let pending = self
-                .agent_activation_pending
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            let entry_connection = pending
-                .entries
-                .get(&activation_binding.ticket_id)
-                .map(|entry| entry.ticket.connection_id.clone());
-            let retained = pending.results.get(&activation_binding.ticket_id).cloned();
-            (entry_connection, retained)
-        };
-        if let Some(ticket_connection) = entry_connection {
-            if ticket_connection != envelope.connection_id {
-                return Err(TransportError::SessionFenced);
-            }
-        } else if let Some(record) = retained.as_ref() {
-            // Projected entry consumed: fail closed on the retained ticket
-            // connection before answering from the known result.
-            if record.ticket_connection != envelope.connection_id {
-                return Err(TransportError::SessionFenced);
-            }
-        } else {
-            // No pending entry and no canonical retention: the raw
-            // compatibility leg stays entry-gated so a cross-connection
-            // replay cannot fabricate a result.
-            return Err(TransportError::UnknownRequest);
+        let lifecycle = self
+            .generation_gateway
+            .ors
+            .load_activation_lifecycle(&activation_binding.ticket_id)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        if lifecycle.connection_id != envelope.connection_id {
+            return Err(TransportError::SessionFenced);
         }
-        let result: AgentActivationResolutionResult = if let Some(record) = retained {
-            // Cross-ledger conflict check: one ticket owns at most one
-            // result identity across the canonical v2 retention and the raw
-            // P-04 compatibility leg. A changed same-ticket entry in the raw
-            // leg conflicts instead of double-applying by silent preference;
-            // an exact digest match across both legs stays idempotent.
-            let raw_conflicts = {
-                let results = self
-                    .agent_activation_results
-                    .lock()
-                    .map_err(|_| TransportError::SessionFenced)?;
-                results
-                    .get(&activation_binding.ticket_id)
-                    .is_some_and(|raw| raw.result.result_sha256 != record.result.result_sha256)
-            };
-            if raw_conflicts {
-                return Err(TransportError::IdentityConflict);
-            }
-            record.result
-        } else {
-            let results = self
-                .agent_activation_results
-                .lock()
+        let result_sha256 = lifecycle
+            .result_sha256
+            .as_deref()
+            .ok_or(TransportError::UnknownRequest)?;
+        let retained = self
+            .generation_gateway
+            .ors
+            .load_activation_result(&activation_binding.ticket_id, result_sha256)
+            .map_err(|error| match error {
+                OrsError::ActivationResultRetentionIdentityConflict { .. } => {
+                    TransportError::IdentityConflict
+                }
+                _ => TransportError::SessionFenced,
+            })?
+            .ok_or(TransportError::UnknownRequest)?;
+        let result: AgentActivationResolutionResult =
+            serde_json::from_str(&retained.result_payload)
                 .map_err(|_| TransportError::SessionFenced)?;
-            results
-                .get(&activation_binding.ticket_id)
-                .cloned()
-                .map(|record| record.result)
-                .ok_or(TransportError::UnknownRequest)?
-        };
+        result
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if result.ticket_id != activation_binding.ticket_id || result.result_sha256 != result_sha256
+        {
+            return Err(TransportError::IdentityConflict);
+        }
         if result.resolved_binding().is_none() {
             return Err(TransportError::SessionFenced);
         }

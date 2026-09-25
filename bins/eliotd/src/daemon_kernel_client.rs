@@ -17,6 +17,7 @@ use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, Sourc
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 use eliot_protocol::{
+    AgentActivationClaimRequest, AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionResult, AgentActivationResultAck, AgentActivationResultReconcile,
     AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
@@ -48,6 +49,32 @@ use super::{
     KERNEL_OPERATION_TIMEOUT, KernelLaunchBinding, PRE_ADMISSION_RETRY_DELAY, SERVICE_NAME,
     unix_ms, unix_ms_i64,
 };
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerBundleReadbackWire {
+    bound: bool,
+    revision: Option<u64>,
+    digest: Option<String>,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivationSubmitResponse {
+    accepted: bool,
+    #[serde(default)]
+    expired: bool,
+    #[serde(default)]
+    ack: Option<AgentActivationResultAck>,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivationReconcileResponse {
+    ack: AgentActivationResultAck,
+}
 
 pub struct DaemonKernelClient {
     launch: GovernorLaunchConfig,
@@ -256,9 +283,19 @@ impl DaemonKernelClient {
     #[cfg(windows)]
     pub async fn claim_agent_activation_ticket(
         &self,
+        dependency_revision: &str,
     ) -> Result<super::ActivationClaim, super::DaemonError> {
+        let claim = AgentActivationClaimRequest::new(
+            "governor.readiness".to_owned(),
+            dependency_revision.to_owned(),
+            unix_ms(),
+        )
+        .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         let value = self
-            .transact_async("agent_activation_claim", serde_json::json!({}))
+            .transact_async(
+                "agent_activation_claim",
+                serde_json::json!({ "claim": claim }),
+            )
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         let ticket = value.get("ticket").cloned().ok_or_else(|| {
@@ -274,13 +311,55 @@ impl DaemonKernelClient {
         Ok(super::classify_claimed_ticket_value(&ticket_bytes))
     }
 
+    /// Reads the exact P-07 owner projection currently retained by Kernel.
+    /// An unbound owner is represented as `None`; a bound owner must carry
+    /// both its monotonic revision and canonical bundle digest.
+    pub async fn query_owner_bundle_readback(
+        &self,
+    ) -> Result<Option<AgentActivationKernelOwnerReadback>, super::DaemonError> {
+        let value = self
+            .transact_async("query_owner_bundle", serde_json::json!({}))
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = super::kind_value(&value, "owner_bundle_readback")
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let wire: OwnerBundleReadbackWire = serde_json::from_value(value)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        match (wire.bound, wire.revision, wire.digest) {
+            (false, None, None) => Ok(None),
+            (true, Some(revision), Some(bundle_sha256)) => {
+                AgentActivationKernelOwnerReadback::new(revision, bundle_sha256)
+                    .map(Some)
+                    .map_err(|error| super::DaemonError::Kernel(error.to_string()))
+            }
+            _ => Err(super::DaemonError::Kernel(
+                "Kernel owner readback has an incoherent bound/revision/digest shape".to_owned(),
+            )),
+        }
+    }
+
     #[cfg(windows)]
     pub async fn submit_agent_activation_result(
         &self,
         result: &AgentActivationResolutionResult,
+        owner_readback: Option<AgentActivationOwnerReadback>,
     ) -> Result<AgentActivationResultAck, super::DaemonError> {
-        let submit = AgentActivationResultSubmit::new(result.clone())
-            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        if matches!(
+            result.disposition,
+            eliot_protocol::AgentActivationResolutionDisposition::Resolved { .. }
+        ) && owner_readback
+            .as_ref()
+            .and_then(|readback| readback.kernel_owner.as_ref())
+            .is_none()
+        {
+            return Err(super::DaemonError::Kernel(
+                "Resolved activation submission requires the current Kernel owner readback"
+                    .to_owned(),
+            ));
+        }
+        let submit =
+            AgentActivationResultSubmit::new_with_owner_readback(result.clone(), owner_readback)
+                .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         let value = self
             .transact_async(
                 "agent_activation_submit",
@@ -288,12 +367,20 @@ impl DaemonKernelClient {
             )
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        let ack_value = value.get("ack").cloned().ok_or_else(|| {
+        let response: ActivationSubmitResponse = serde_json::from_value(value)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        if response.expired {
+            return Err(super::DaemonError::ActivationExpired);
+        }
+        if !response.accepted {
+            return Err(super::DaemonError::Kernel(
+                "Kernel submit response was not accepted".to_owned(),
+            ));
+        }
+        let ack = response.ack.ok_or_else(|| {
             super::DaemonError::Kernel("Kernel submit response omitted acknowledgement".to_owned())
         })?;
-        let ack: AgentActivationResultAck = serde_json::from_value(ack_value)
-            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        ack.validate()
+        ack.validate_against_result(result)
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         Ok(ack)
     }
@@ -313,16 +400,18 @@ impl DaemonKernelClient {
             )
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        let ack_value = value.get("ack").cloned().ok_or_else(|| {
-            super::DaemonError::Kernel(
-                "Kernel reconcile response omitted acknowledgement".to_owned(),
-            )
-        })?;
-        let ack: AgentActivationResultAck = serde_json::from_value(ack_value)
+        let response: ActivationReconcileResponse = serde_json::from_value(value)
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        ack.validate()
+        response
+            .ack
+            .validate()
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        Ok(ack)
+        if response.ack.replay_key() != (query.ticket_id.as_str(), query.result_sha256.as_str()) {
+            return Err(super::DaemonError::Kernel(
+                "Kernel reconcile response identity mismatch".to_owned(),
+            ));
+        }
+        Ok(response.ack)
     }
 
     pub fn connect(config: &super::DaemonConfig) -> Result<Arc<Self>, super::DaemonError> {

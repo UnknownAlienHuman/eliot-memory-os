@@ -105,11 +105,14 @@ fn valid_ticket(id: &str) -> TestResult<AgentActivationResolutionTicket> {
         wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
         ticket_id: id.to_owned(),
         activation_request_id: RequestId::new(format!("{id}:request"))?,
+        demand_id: format!("{id}:demand"),
         activation_request_sha256: "a".repeat(64),
         peer_admission_receipt_sha256: "b".repeat(64),
         connection_id: format!("{id}:connection"),
+        cancellation_id: format!("{id}:cancellation"),
         state_fence: test_fence(1)?,
         kernel_deadline_unix_ms: 100,
+        successor_of: None,
         ticket_sha256: String::new(),
     }
     .with_computed_digest()
@@ -193,11 +196,14 @@ fn ticket_bound_to_admission(
         wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
         ticket_id: "ticket-binding:ticket".to_owned(),
         activation_request_id: request.request_identity.request.metadata.request_id.clone(),
+        demand_id: request.demand_id.clone(),
         activation_request_sha256: request.request_sha256.clone(),
         peer_admission_receipt_sha256: receipt.receipt_sha256.clone(),
         connection_id: receipt.connection_id.clone(),
+        cancellation_id: request.request_identity.cancellation_id.clone(),
         state_fence: receipt.state_fence.clone(),
         kernel_deadline_unix_ms: receipt.activation_deadline_unix_ms,
+        successor_of: None,
         ticket_sha256: String::new(),
     }
     .with_computed_digest()?)
@@ -295,11 +301,11 @@ fn current_ingress_maps_to_typed_submit_and_receiver_contract() -> TestResult {
     assert_ordered(
         submit,
         &[
-            "AgentActivationResultSubmit::new(result.clone())",
+            "AgentActivationResultSubmit::new_with_owner_readback",
             "\"agent_activation_submit\"",
             "value.get(\"ack\")",
             "AgentActivationResultAck",
-            "ack.validate()",
+            "ack.validate_against_result(result)",
         ],
     )?;
 
@@ -345,7 +351,7 @@ fn valid_ticket_reaches_actual_daemon_v2_dispatch_path() -> TestResult {
         &[
             "resolve_agent_activation_v2",
             "let retained = RetainedActivationIdentity",
-            "dispatch_agent_activation_result(&kernel_clone, &ticket, result)",
+            "dispatch_agent_activation_result(&kernel_clone, &ticket, result, owner_readback)",
         ],
     )?;
     assert!(!claim_step.contains("map_activation_snapshot"));
@@ -366,8 +372,10 @@ fn accepted_exact_replay_reuses_one_resolution_identity() -> TestResult {
             failure_handle: "activation:test-failure".to_owned(),
         },
     )?;
-    let replay = AgentActivationResultAck::replayed(&result)?;
+    let replay = AgentActivationResultAck::accepted(&result)?;
+    let initial = AgentActivationResultAck::accepted(&result)?;
     replay.validate()?;
+    assert_eq!(replay, initial);
     assert_eq!(replay.ticket_id, ticket.ticket_id);
     assert_eq!(replay.result_sha256, result.result_sha256);
     assert_eq!(replay.result.as_ref(), Some(&result));
@@ -412,7 +420,7 @@ fn every_disposition_uses_the_accepted_v2_submit_envelope() -> TestResult {
         "pub async fn submit_agent_activation_result(",
         "pub async fn reconcile_agent_activation_result(",
     )?;
-    assert!(submit.contains("AgentActivationResultSubmit::new(result.clone())"));
+    assert!(submit.contains("AgentActivationResultSubmit::new_with_owner_readback"));
     assert!(submit.contains("serde_json::json!({ \"result\": submit })"));
     Ok(())
 }
@@ -612,7 +620,8 @@ fn required_activation_functions_are_production_reachable() -> TestResult {
         "async fn dispatch_agent_activation_result(",
         "/// Builds the lost-acknowledgement reconcile query",
     )?;
-    assert!(dispatch.contains("kernel.submit_agent_activation_result(&result)"));
+    assert!(dispatch.contains("submit_agent_activation_result"));
+    assert!(dispatch.contains("owner_readback"));
     assert!(dispatch.contains("reconcile_agent_activation_result(&query)"));
     Ok(())
 }

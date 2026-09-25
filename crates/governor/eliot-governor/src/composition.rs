@@ -48,7 +48,9 @@ use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId,
     ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
 };
-use eliot_coordination::CoordinationOwner;
+use eliot_coordination::{
+    ActiveWorkLeaseProjection, ActiveWorkLeaseSelection, CoordinationError, CoordinationOwner,
+};
 use eliot_diagnostic::{
     CONTRACT_NAME as DIAGNOSTIC_CONTRACT, DiagnosticClassifier, DiagnosticEvent, DiagnosticInput,
     DiagnosticSeverity, DiagnosticStatus,
@@ -81,7 +83,7 @@ use eliot_store_api::{
     CanonicalReadClient, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
     ScopeRevisionView, StoreHealth, WriteReceipt,
 };
-use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskState};
+use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskRecord, TaskState};
 use eliot_testd_core::{
     JobState, RawArtifactStream, ReceiptBinding, TestJob, TestdSourceObservation,
     TestdSourceObservationRange, TestdStore, TestdTerminalCompletionEvidence, VerificationReceipt,
@@ -95,9 +97,9 @@ use eliot_workscope::{
     ScopeResolution, SourceAdmissionRequest, TaskBindingInput, TaskBindingState,
     TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
     WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidateSet, WorkScopeDescriptor,
-    WorkScopeResolutionReceipt, WorkScopeResolver, admit_at_trigger, admit_initial_binding,
-    check_at_trigger, evaluate_material_request, issue_resolution_receipt, produce_attach_receipt,
-    rebind_with_receipt,
+    WorkScopeError, WorkScopeResolutionReceipt, WorkScopeResolver, admit_at_trigger,
+    admit_initial_binding, check_at_trigger, evaluate_material_request, issue_resolution_receipt,
+    produce_attach_receipt, rebind_with_receipt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -832,6 +834,18 @@ pub enum CompositionError {
     /// The composition is not ready for semantic work.
     #[error("Governor is not ready")]
     NotReady,
+    /// No exact active task binding is available for activation.
+    #[error("activation task selection is required")]
+    ActivationTaskSelectionRequired,
+    /// More than one exact active task binding was observed.
+    #[error("activation scope is ambiguous")]
+    ActivationScopeAmbiguous { candidate_handles: Vec<String> },
+    /// The exact `WorkScope` binding is not currently selected.
+    #[error("activation scope selection is required")]
+    ActivationScopeSelectionRequired,
+    /// The semantic owner read was fenced or no longer current.
+    #[error("activation owner fence is stale")]
+    ActivationStaleFence,
     /// Canonical admission rejected the envelope.
     #[error("canonical admission: {0}")]
     Canonical(#[from] CanonicalError),
@@ -2528,6 +2542,8 @@ pub struct CanonicalAdmissionOwner {
 #[serde(deny_unknown_fields)]
 pub struct GovernorActivationSnapshot {
     pub state_fence: StateFence,
+    /// Current canonical owner revision observed with this snapshot.
+    pub owner_revision: u64,
     pub principal_id: String,
     pub session_id: String,
     pub task_id: TaskId,
@@ -2667,6 +2683,31 @@ impl CanonicalAdmissionOwner {
                 "canonical current plan is absent; semantic activation is unavailable".to_owned(),
             )
         })
+    }
+
+    /// Reads the current plan for activation through typed failure classes.
+    /// Unlike the general finish/recovery reader, this boundary never exposes
+    /// human error text as a semantic classifier.
+    pub(crate) fn read_current_activation_plan(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<CanonicalPlanBinding, CompositionError> {
+        state_fence
+            .validate()
+            .map_err(|_| CompositionError::ActivationStaleFence)?;
+        if self.state_fence != *state_fence
+            || self.scope.state_fence != *state_fence
+            || self.snapshot.state_fence != *state_fence
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        self.snapshot
+            .validate()
+            .map_err(|_| CompositionError::ActivationStaleFence)?;
+        self.snapshot
+            .current_plan
+            .clone()
+            .ok_or(CompositionError::ActivationScopeSelectionRequired)
     }
 
     /// Returns the durable canonical owner revision used by a finish-evidence
@@ -5860,6 +5901,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// No semantic identity is accepted from the caller: coordination first
     /// proves one unique live work lease, then task, `WorkScope` and Canonical
     /// owners must agree on its exact fence and linked identities.
+    ///
+    /// Split note: activation admission validates one coherent semantic owner
+    /// projection before binding. The seam is still one ordered admission
+    /// cascade; each owner agreement is now a named private function, so every
+    /// guard still runs in the same order over the same effects.
     pub fn read_unique_agent_activation(
         &self,
         now: u64,
@@ -5868,102 +5914,201 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(CompositionError::NotReady);
         }
         let state_fence = self.snapshot.state_fence();
-        let work = self
-            .owners
-            .coordination
-            .read_unique_active_work_lease(now, state_fence.authority_epoch.clone(), &state_fence)
-            .map_err(|error| {
-                CompositionError::Recovery(format!(
-                    "unique coordination activation read failed: {error}"
-                ))
-            })?;
+        let work = self.prove_unique_activation_work(now, &state_fence)?;
+        let task_id = self.admit_activation_lifecycle_session(now, &state_fence, &work)?;
+        let task = self.admit_activation_task(&task_id, &state_fence)?;
+        let (work_scope_id, plan) = self.admit_activation_plan(&task_id, &state_fence)?;
+        Ok(GovernorActivationSnapshot {
+            state_fence,
+            owner_revision: self.owners.canonical.owner_revision(),
+            principal_id: work.session.principal_id,
+            session_id: work.session.session_id,
+            task_id,
+            work_unit_id: work.work_item.work_item_id,
+            work_scope_id,
+            task_revision: task.revision,
+            plan_id: plan.plan_id,
+            plan_revision: plan.plan_revision,
+        })
+    }
+
+    /// Proves exactly one live work lease for this exact fence.
+    ///
+    /// No selection, more than one selection and any coordination read failure
+    /// are three distinct typed refusals; only the unique validated projection
+    /// is ever handed to the rest of the admission cascade.
+    fn prove_unique_activation_work(
+        &self,
+        now: u64,
+        state_fence: &StateFence,
+    ) -> Result<ActiveWorkLeaseProjection, CompositionError> {
+        let work = match self.owners.coordination.read_active_work_lease_selection(
+            now,
+            state_fence.authority_epoch.clone(),
+            state_fence,
+        ) {
+            Ok(ActiveWorkLeaseSelection::None) => {
+                return Err(CompositionError::ActivationTaskSelectionRequired);
+            }
+            Ok(ActiveWorkLeaseSelection::Unique { projection }) => *projection,
+            Ok(ActiveWorkLeaseSelection::Ambiguous { projections }) => {
+                return Err(CompositionError::ActivationScopeAmbiguous {
+                    candidate_handles: projections
+                        .into_iter()
+                        .map(|projection| projection.work_item.work_item_id)
+                        .collect(),
+                });
+            }
+            Err(error) => return Err(map_activation_coordination_error(error)),
+        };
+        Ok(work)
+    }
+
+    /// Proves the one live owner session named by the unique work lease and
+    /// returns the exact task id that session is bound to.
+    ///
+    /// The semantic ids are rebuilt from the lease itself, the stored session
+    /// must be that same active session under the same authority epoch and the
+    /// same fence, its lease window must still be live, and any task scope it
+    /// names must be the same task.
+    fn admit_activation_lifecycle_session(
+        &self,
+        now: u64,
+        state_fence: &StateFence,
+        work: &ActiveWorkLeaseProjection,
+    ) -> Result<TaskId, CompositionError> {
         let task_id = TaskId::new(work.work_item.task_id.clone())
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            .map_err(|_| CompositionError::ActivationTaskSelectionRequired)?;
         let lifecycle_session_id = SessionId::new(work.session.session_id.clone())
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            .map_err(|_| CompositionError::ActivationTaskSelectionRequired)?;
         let lifecycle_session = self
             .owners
             .session
             .session(&lifecycle_session_id)
-            .ok_or_else(|| {
-                CompositionError::Recovery(format!(
-                    "missing session lifecycle record for {lifecycle_session_id}"
-                ))
-            })?;
+            .ok_or(CompositionError::ActivationTaskSelectionRequired)?;
         if lifecycle_session.session_id != lifecycle_session_id
             || lifecycle_session.status != SessionState::Active
             || !lifecycle_session
                 .authority_epoch
                 .is_same_authority(&state_fence.authority_epoch)
-            || lifecycle_session.state_fence != state_fence
-            || lifecycle_session.started_at == 0
+            || lifecycle_session.state_fence != *state_fence
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        if lifecycle_session.started_at == 0
             || lifecycle_session.heartbeat_at < lifecycle_session.started_at
             || lifecycle_session.expires_at == 0
             || lifecycle_session.expires_at < lifecycle_session.heartbeat_at
             || lifecycle_session.heartbeat_at > now
             || now > lifecycle_session.expires_at
         {
-            return Err(CompositionError::Recovery(
-                "session lifecycle record is not an exact active activation match".to_owned(),
-            ));
+            return Err(CompositionError::NotReady);
         }
         if let Some(scoped_task_id) = &lifecycle_session.task_scope
             && scoped_task_id != task_id.as_str()
         {
-            return Err(CompositionError::Recovery(
-                "session lifecycle task scope disagrees with the selected task".to_owned(),
-            ));
+            return Err(CompositionError::ActivationTaskSelectionRequired);
         }
-        let task = self.owners.task.task(&task_id).ok_or_else(|| {
-            CompositionError::Recovery(format!("missing task owner record for {task_id}"))
-        })?;
-        if task.task_id != task_id
-            || task.state_fence != state_fence
-            || task.revision == 0
+        Ok(task_id)
+    }
+
+    /// Proves the durable task owner agrees with the admitted session.
+    ///
+    /// The task must be the same task under the same fence, must be at a
+    /// nonzero revision in an authorized or running state, and must be the
+    /// exact revision the fence names when the fence names one.
+    fn admit_activation_task(
+        &self,
+        task_id: &TaskId,
+        state_fence: &StateFence,
+    ) -> Result<&TaskRecord, CompositionError> {
+        let task = self
+            .owners
+            .task
+            .task(task_id)
+            .ok_or(CompositionError::ActivationTaskSelectionRequired)?;
+        if task.task_id != *task_id || task.state_fence != *state_fence {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        if task.revision == 0
             || !matches!(
                 task.state,
                 TaskState::ActionAuthorized | TaskState::Executing | TaskState::Verifying
             )
         {
-            return Err(CompositionError::Recovery(
-                "task owner record is not an exact actionable activation match".to_owned(),
-            ));
+            return Err(CompositionError::ActivationTaskSelectionRequired);
         }
         if let Some(expected_revision) = state_fence.task_revision
             && expected_revision.value() != task.revision
         {
-            return Err(CompositionError::Recovery(
-                "task revision does not match the activation fence".to_owned(),
-            ));
+            return Err(CompositionError::ActivationStaleFence);
         }
-        let scope_owner = self.owners.work_scope.as_ref().ok_or_else(|| {
-            CompositionError::Recovery(
-                "WorkScope binding is unbound; semantic activation is unavailable".to_owned(),
-            )
-        })?;
+        Ok(task)
+    }
+
+    /// Proves the `WorkScope` and Canonical owners agree with the admitted
+    /// task, and returns the bound work scope id with the current plan.
+    ///
+    /// The scope must be installed, freshly `MATCHED`, and the plan must name
+    /// the same task and the same bound work scope, so a drifted scope is
+    /// never paired with a plan the #1115 v2 resolution would publish.
+    fn admit_activation_plan(
+        &self,
+        task_id: &TaskId,
+        state_fence: &StateFence,
+    ) -> Result<(String, CanonicalPlanBinding), CompositionError> {
+        let scope_owner = self
+            .owners
+            .work_scope
+            .as_ref()
+            .ok_or(CompositionError::ActivationScopeSelectionRequired)?;
         let scope = scope_owner
-            .read_current(&state_fence)
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            .read_current(state_fence)
+            // #1115: the activation boundary maps every `WorkScopeError` into a
+            // typed `CompositionError` class, so a scope failure is a semantic
+            // classifier here and never human error text.
+            .map_err(map_activation_scope_error)?;
         // Issue #1787: activation cannot proceed on a stale or drifted guard
-        // receipt; a generation change requires a fresh `MATCHED` receipt.
+        // receipt; a generation change requires a fresh `MATCHED` receipt. The
+        // freshness gate runs before the plan read, so a drifted scope is never
+        // paired with a plan the #1115 v2 resolution would publish.
         ensure_snapshot_fresh(&scope, "activation work scope is not freshly matched")?;
-        let plan = self.owners.canonical.read_current_plan(&state_fence)?;
-        if plan.task_id != task_id || plan.work_scope_id != scope.binding.scope.scope_ref {
-            return Err(CompositionError::Recovery(
-                "canonical active plan does not match the selected task and WorkScope".to_owned(),
-            ));
+        // #1115: activation reads the plan through the typed reader, which
+        // fails closed on a stale fence and on a missing selection rather than
+        // surfacing the general reader's recovery text.
+        let plan = self
+            .owners
+            .canonical
+            .read_current_activation_plan(state_fence)?;
+        if plan.task_id != *task_id || plan.work_scope_id != scope.binding.scope.scope_ref {
+            return Err(CompositionError::ActivationScopeSelectionRequired);
         }
-        Ok(GovernorActivationSnapshot {
-            state_fence,
-            principal_id: work.session.principal_id,
-            session_id: work.session.session_id,
-            task_id,
-            work_unit_id: work.work_item.work_item_id,
-            work_scope_id: scope.binding.scope.scope_ref,
-            task_revision: task.revision,
-            plan_id: plan.plan_id,
-            plan_revision: plan.plan_revision,
-        })
+        Ok((scope.binding.scope.scope_ref, plan))
+    }
+
+    /// Returns the current canonical owner revision used by activation
+    /// dependency observations.
+    #[must_use]
+    pub fn activation_owner_revision(&self) -> u64 {
+        self.owners.canonical.owner_revision()
+    }
+
+    /// Returns the current revision of the named activation-readiness
+    /// dependency. The value combines the canonical owner revision with the
+    /// live readiness phase, so a successor cannot claim material change from
+    /// elapsed time alone.
+    #[must_use]
+    pub fn activation_dependency_revision(&self) -> String {
+        let readiness_revision = match self.readiness {
+            CompositionReadiness::Constructing => "constructing",
+            CompositionReadiness::Ready => "ready",
+            CompositionReadiness::Stopped => "stopped",
+        };
+        format!(
+            "{}:{}",
+            self.owners.canonical.owner_revision(),
+            readiness_revision
+        )
     }
 
     /// Governor-internal typed semantic outcome for activation resolution.
@@ -5973,12 +6118,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// map losslessly to the protocol v2 result; dropping an error variant is a
     /// composition defect.
     pub fn resolve_activation_outcome(&self, now: u64) -> GovernorActivationOutcome {
+        let dependency_revision = self.activation_dependency_revision();
         if self.readiness != CompositionReadiness::Ready {
             return GovernorActivationOutcome::NotReady {
                 recovery_handle: "governor.readiness:not-ready".to_owned(),
                 retry: GovernorRetryDirective::new(
                     "governor.readiness",
-                    format!("{:?}", self.readiness),
+                    dependency_revision,
                     now.saturating_add(1).max(1),
                 ),
             };
@@ -5987,15 +6133,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             Ok(snapshot) => GovernorActivationOutcome::Resolved(snapshot),
             Err(error) => {
                 // #66 A2: an ambiguity finding must name the actual competing
-                // bindings. The unique-read error discards them, so re-read
+                // bindings. The unique-read error may discard them, so re-read
                 // the live selection here instead of manufacturing handles.
-                let message = error.to_string();
-                if message.contains("AmbiguousActiveBinding")
-                    || message.contains("multiple active work bindings")
-                {
+                if matches!(error, CompositionError::ActivationScopeAmbiguous { .. }) {
                     return self.scope_ambiguous_outcome_from_selection(now);
                 }
-                classify_activation_error(&error, now)
+                classify_activation_error(&error, now, &dependency_revision)
             }
         }
     }
@@ -6211,73 +6354,87 @@ fn validate_service_observations(
     Ok(())
 }
 
-fn classify_activation_error(error: &CompositionError, now: u64) -> GovernorActivationOutcome {
-    let message = error.to_string();
-    // NotReady is the only transient retry signal.
-    if matches!(error, CompositionError::NotReady)
-        || message.contains("not ready")
-        || message.contains("NotReady")
-    {
-        return GovernorActivationOutcome::NotReady {
+fn map_activation_coordination_error(error: CoordinationError) -> CompositionError {
+    match error {
+        CoordinationError::NoActiveBinding => CompositionError::ActivationTaskSelectionRequired,
+        CoordinationError::AmbiguousActiveBinding => CompositionError::ActivationScopeAmbiguous {
+            candidate_handles: Vec::new(),
+        },
+        CoordinationError::FenceMismatch
+        | CoordinationError::EpochMismatch
+        | CoordinationError::LeaseOwnerMismatch { .. } => CompositionError::ActivationStaleFence,
+        CoordinationError::SessionExpired
+        | CoordinationError::LeaseExpired
+        | CoordinationError::LeaseNotYetValid => CompositionError::NotReady,
+        other => {
+            CompositionError::Recovery(format!("coordination activation read failed: {other}"))
+        }
+    }
+}
+
+fn map_activation_scope_error(error: WorkScopeError) -> CompositionError {
+    match error {
+        WorkScopeError::StateFenceMismatch => CompositionError::ActivationStaleFence,
+        WorkScopeError::BindingReceiptNotMatched
+        | WorkScopeError::BindingReceiptMismatch
+        | WorkScopeError::InvalidStateFence => CompositionError::ActivationScopeSelectionRequired,
+        other => CompositionError::Recovery(format!("WorkScope activation read failed: {other}")),
+    }
+}
+
+fn classify_activation_error(
+    error: &CompositionError,
+    now: u64,
+    dependency_revision: &str,
+) -> GovernorActivationOutcome {
+    match error {
+        CompositionError::NotReady => GovernorActivationOutcome::NotReady {
             recovery_handle: "governor.readiness:not-ready".to_owned(),
             retry: GovernorRetryDirective::new(
                 "governor.readiness",
-                message.clone(),
+                dependency_revision.to_owned(),
                 now.saturating_add(1).max(1),
             ),
-        };
-    }
-    if message.contains("NoActiveBinding")
-        || message.contains("no active work binding")
-        || message.contains("missing task owner record")
-        || message.contains("canonical current plan is absent")
-    {
-        return GovernorActivationOutcome::TaskSelectionRequired {
-            selection: GovernorSelectionDirective::new(
-                Vec::new(),
-                GovernorCandidateCoverage::Unknown,
-                "governor.task-selection:recovery",
-            ),
-        };
-    }
-    // #66 A2: ambiguity without a live selection read carries no candidate
-    // identities, so the string classifier cannot name them. Such an error
-    // reaching this pure function means the selection denominator was lost
-    // between reads; it is an internal failure, never a manufactured
-    // placeholder pair and never task selection. The production resolver
-    // (`resolve_activation_outcome`) names the actual competing bindings from
-    // the live selection before this classifier is consulted.
-    if message.contains("AmbiguousActiveBinding")
-        || message.contains("multiple active work bindings")
-    {
-        return GovernorActivationOutcome::FailedInternal {
-            failure_handle: format!("governor.internal:{message}"),
-        };
-    }
-    if message.contains("WorkScope binding is unbound")
-        || message.contains("scope") && message.contains("unbound")
-    {
-        return GovernorActivationOutcome::ScopeSelectionRequired {
-            selection: GovernorSelectionDirective::new(
-                Vec::new(),
-                GovernorCandidateCoverage::Unknown,
-                "governor.scope-selection:recovery",
-            ),
-        };
-    }
-    if message.contains("stale")
-        || message.contains("StateFence")
-        || message.contains("state_fence")
-        || message.contains("fence")
-        || message.contains("FenceMismatch")
-    {
-        return GovernorActivationOutcome::StaleFence {
+        },
+        CompositionError::ActivationTaskSelectionRequired => {
+            GovernorActivationOutcome::TaskSelectionRequired {
+                selection: GovernorSelectionDirective::new(
+                    Vec::new(),
+                    GovernorCandidateCoverage::Unknown,
+                    "governor.task-selection:recovery",
+                ),
+            }
+        }
+        CompositionError::ActivationScopeAmbiguous { candidate_handles } => {
+            let coverage = if candidate_handles.is_empty() {
+                GovernorCandidateCoverage::Unknown
+            } else {
+                GovernorCandidateCoverage::Complete
+            };
+            GovernorActivationOutcome::ScopeAmbiguous {
+                selection: GovernorSelectionDirective::new(
+                    candidate_handles.clone(),
+                    coverage,
+                    "governor.scope-ambiguous:recovery",
+                ),
+            }
+        }
+        CompositionError::ActivationScopeSelectionRequired => {
+            GovernorActivationOutcome::ScopeSelectionRequired {
+                selection: GovernorSelectionDirective::new(
+                    Vec::new(),
+                    GovernorCandidateCoverage::Unknown,
+                    "governor.scope-selection:recovery",
+                ),
+            }
+        }
+        CompositionError::ActivationStaleFence => GovernorActivationOutcome::StaleFence {
             recovery_handle: "governor.stale-fence:recovery".to_owned(),
             observed_state_fence: None,
-        };
-    }
-    GovernorActivationOutcome::FailedInternal {
-        failure_handle: format!("governor.internal:{message}"),
+        },
+        _ => GovernorActivationOutcome::FailedInternal {
+            failure_handle: "governor.internal:activation-resolution-failed".to_owned(),
+        },
     }
 }
 
@@ -6384,7 +6541,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
-    const TEST_LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
 
     fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
         EpochId::new(
@@ -6392,13 +6548,6 @@ mod tests {
             std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
         )
         .expect("valid test epoch")
-    }
-
-    fn test_fence(sequence: u64) -> StateFence {
-        StateFence::new(
-            test_epoch(TEST_LINEAGE_A, sequence),
-            ResourceGeneration::genesis(),
-        )
     }
 
     struct FakeKernel {
@@ -8042,6 +8191,7 @@ mod tests {
                 "task revision does not match the activation fence".to_owned(),
             ),
             20,
+            "1:Ready",
         );
         assert_eq!(stale.kind_str(), "STALE_FENCE");
         assert!(!stale.is_resolved());
@@ -8052,6 +8202,7 @@ mod tests {
                 "session lifecycle record is not an exact active activation match".to_owned(),
             ),
             20,
+            "1:Ready",
         );
         // This particular message is treated as FailedInternal by the classifier
         // (it does not match the narrow TaskSelection pattern), proving that

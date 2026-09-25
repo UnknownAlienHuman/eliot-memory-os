@@ -15,16 +15,16 @@
 //! Public construction semantics remain on `KernelComposition`; this ordinary
 //! module only houses their implementation.
 use super::{
-    AgentActivationPendingState, ArtifactId, AuthorityDescriptorContour, AuthorityHandoffBegin,
-    AuthorityHandoffRecord, AuthorityHandoffState, AuthorityPreparationError,
-    AuthoritySnapshotBinding, BlobStoreController, BoundCanonicalOwner, ContractId,
-    DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId, DispatchSnapshotCodec,
-    GenerationRoute, GenerationRouter, GovernorClosureRestore, HealthVector, IpcImplementation,
-    KernelBackupCapture, KernelBackupRestore, KernelBuildError, KernelComposition, KernelConfig,
-    KernelDispatchKey, KernelError, KernelPathAdmission, KernelService,
-    KernelStoreRebindProductionBoundary, KernelSupervisionLeaseAuthority, ModuleGeneration,
-    ModuleGenerationState, OperationalRecoveryStore, OrsError, OrsGenerationCoordinator,
-    PROTOCOL_VERSION, PreparedAuthorityMaterial, ProcessAuthorityHandoffDescriptor,
+    ArtifactId, AuthorityDescriptorContour, AuthorityHandoffBegin, AuthorityHandoffRecord,
+    AuthorityHandoffState, AuthorityPreparationError, AuthoritySnapshotBinding,
+    BlobStoreController, BoundCanonicalOwner, ContractId, DaemonRuntimeState, DaemonRuntimeStatus,
+    DispatchAuthorityId, DispatchSnapshotCodec, GenerationRoute, GenerationRouter,
+    GovernorClosureRestore, HealthVector, IpcImplementation, KernelBackupCapture,
+    KernelBackupRestore, KernelBuildError, KernelComposition, KernelConfig, KernelDispatchKey,
+    KernelError, KernelPathAdmission, KernelService, KernelStoreRebindProductionBoundary,
+    KernelSupervisionLeaseAuthority, ModuleGeneration, ModuleGenerationState,
+    OperationalRecoveryStore, OrsError, OrsGenerationCoordinator, PROTOCOL_VERSION,
+    PreparedAuthorityMaterial, ProcessAuthorityHandoffDescriptor,
     ProcessDispatchAuthorityController, ProcessExecutionAuthorityConfig, ProcessExecutionGateway,
     RedbRecoveryStore, RouteScope, Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy,
     StartupCoordinator, StateFence, USER_AUTOMATION_KERNEL_CAPABILITY, UserOwnedPathLease,
@@ -371,6 +371,17 @@ impl KernelComposition {
         restore: GovernorClosureRestore,
         expected_revision: u64,
     ) -> Result<u64, KernelBuildError> {
+        let _transition = self.p07_owner_transition.write().map_err(|_| {
+            KernelBuildError::Service("P-07 owner transition lock poisoned".to_owned())
+        })?;
+        self.bind_p07_owner_locked(restore, expected_revision)
+    }
+
+    fn bind_p07_owner_locked(
+        &self,
+        restore: GovernorClosureRestore,
+        expected_revision: u64,
+    ) -> Result<u64, KernelBuildError> {
         observe_entrypoint_with_detail(
             EntrypointStage::Composition,
             "kernel.composition.p07_owner_bind_started",
@@ -425,12 +436,24 @@ impl KernelComposition {
         restore: GovernorClosureRestore,
         expected_revision: u64,
     ) -> Result<u64, KernelBuildError> {
+        let _transition = self.p07_owner_transition.write().map_err(|_| {
+            KernelBuildError::Service("P-07 owner transition lock poisoned".to_owned())
+        })?;
+        self.refresh_p07_owner_locked(restore, expected_revision)
+    }
+
+    fn refresh_p07_owner_locked(
+        &self,
+        restore: GovernorClosureRestore,
+        expected_revision: u64,
+    ) -> Result<u64, KernelBuildError> {
         let store: Arc<dyn OperationalRecoveryStore> =
             Arc::clone(&self.p07_ors) as Arc<dyn OperationalRecoveryStore>;
         let mut guard = self
             .p07_owner
             .lock()
             .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?;
+        let current_revision = guard.as_ref().map(BoundCanonicalOwner::bound_revision);
         let Some(bound) = guard.as_mut() else {
             return Err(KernelBuildError::Service(
                 "P-07 owner refresh requires a bound owner".to_owned(),
@@ -444,17 +467,12 @@ impl KernelComposition {
                 .lock()
                 .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
                 .clone();
-            if expected_revision == bound.bound_revision()
-                && retained_digest.as_deref() != Some(digest.as_str())
-            {
-                observe_entrypoint_with_detail(
-                    EntrypointStage::Composition,
-                    "kernel.composition.p07_owner_digest_conflict",
-                );
-                return Err(KernelBuildError::Core(
-                    "same-revision owner bundle digest disagreement".to_owned(),
-                ));
-            }
+            Self::check_owner_digest_agreement(
+                current_revision,
+                retained_digest.as_deref(),
+                expected_revision,
+                &digest,
+            )?;
             bound
                 .refresh(restore, expected_revision, &store)
                 .map_err(|error| KernelBuildError::Core(error.to_string()))?;
@@ -488,15 +506,18 @@ impl KernelComposition {
         restore: GovernorClosureRestore,
         expected_revision: u64,
     ) -> Result<u64, KernelBuildError> {
+        let _transition = self.p07_owner_transition.write().map_err(|_| {
+            KernelBuildError::Service("P-07 owner transition lock poisoned".to_owned())
+        })?;
         let bound = self
             .p07_owner
             .lock()
             .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
             .is_some();
         if bound {
-            self.refresh_p07_owner(restore, expected_revision)
+            self.refresh_p07_owner_locked(restore, expected_revision)
         } else {
-            self.bind_p07_owner(restore, expected_revision)
+            self.bind_p07_owner_locked(restore, expected_revision)
         }
     }
 
@@ -515,6 +536,9 @@ impl KernelComposition {
     /// what it served before claiming a publish committed.
     #[must_use]
     pub fn p07_owner_readback(&self) -> (bool, Option<u64>, Option<String>) {
+        let Ok(_transition) = self.p07_owner_transition.read() else {
+            return (false, None, None);
+        };
         let owner = self.p07_owner.lock().ok();
         let digest = self.p07_owner_digest.lock().ok();
         match (owner, digest) {
@@ -525,6 +549,33 @@ impl KernelComposition {
             }
             _ => (false, None, None),
         }
+    }
+
+    /// Refuses a same-revision presentation carrying different bytes.
+    ///
+    /// Rotation is proven by revision advance or exact-digest equality;
+    /// a matching revision with a disagreeing digest is a conflicting
+    /// presentation, never a silent replacement. Unbound compositions
+    /// have nothing to disagree with and pass through to bind.
+    fn check_owner_digest_agreement(
+        current_revision: Option<u64>,
+        current_digest: Option<&str>,
+        expected_revision: u64,
+        digest: &str,
+    ) -> Result<(), KernelBuildError> {
+        if current_revision.is_some()
+            && current_revision == Some(expected_revision)
+            && current_digest != Some(digest)
+        {
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.p07_owner_digest_conflict",
+            );
+            return Err(KernelBuildError::Core(
+                "same-revision owner bundle digest disagreement".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn assemble_with_process_authority(
@@ -1290,7 +1341,7 @@ impl KernelComposition {
         #[cfg(not(windows))]
         let store_handoff_init = None;
         #[cfg(windows)]
-        let agent_activation_results = Self::rehydrate_agent_activation_results(&ors)?;
+        let agent_activation_pending = Self::rehydrate_agent_activation_state(&ors)?;
         // Implements #1967: start the ordered I1.11 coordinator at step zero.
         // Composition construction alone does not prove Host-owned startup,
         // Blob manifest, Store readiness, reconciliation, handshake, mirror,
@@ -1368,6 +1419,7 @@ impl KernelComposition {
         Ok(Self {
             p07_owner: Mutex::new(None),
             p07_owner_digest: Mutex::new(None),
+            p07_owner_transition: std::sync::RwLock::new(()),
             p07_ors: Arc::clone(&ors),
             store_rebind_boundary: KernelStoreRebindProductionBoundary,
             work_root,
@@ -1434,11 +1486,9 @@ impl KernelComposition {
             #[cfg(windows)]
             agent_bridge_connections: Mutex::new(BTreeMap::new()),
             #[cfg(windows)]
-            agent_activation_pending: Mutex::new(AgentActivationPendingState::default()),
+            agent_activation_pending: Mutex::new(agent_activation_pending),
             #[cfg(windows)]
             agent_activation_changed: tokio::sync::Notify::new(),
-            #[cfg(windows)]
-            agent_activation_results: Mutex::new(agent_activation_results),
             #[cfg(windows)]
             host_request_connection_index: Mutex::new(BTreeMap::new()),
             #[cfg(windows)]

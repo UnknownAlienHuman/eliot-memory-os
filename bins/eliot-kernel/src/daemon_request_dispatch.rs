@@ -31,8 +31,8 @@ use eliot_process::{
     ProcessExecutionView, ProcessLifecycle,
 };
 use eliot_protocol::{
-    HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt, RequestIdentity,
-    host_request_operation_id,
+    AgentActivationClaimRequest, HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
+    RequestIdentity, host_request_operation_id,
 };
 #[cfg(windows)]
 use eliot_runtime_contracts::{
@@ -483,6 +483,7 @@ struct StoreRecoveryOperation {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OwnerPublishOperation {
+    operation: String,
     bundle: super::GovernorClosureRestore,
     expected_revision: u64,
 }
@@ -1001,6 +1002,36 @@ impl KernelComposition {
         result
     }
 
+    #[cfg(windows)]
+    pub(crate) fn validate_activation_submitter(
+        session: &Session,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<(), TransportError> {
+        let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if identity.request.metadata.product_id.as_str() != ACTIVE_DAEMON_CALLER
+            || identity.request.metadata.source_id.as_str() != ACTIVE_DAEMON_CALLER
+            || identity.request.metadata.session_id.is_some()
+            || identity.request.metadata.task_id.is_some()
+            || identity.request.state_fence != session.module_generation.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let (owner, _) =
+            super::caller_binding(session).map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        if owner.module_id() != ACTIVE_DAEMON_CALLER
+            || owner.generation().get() != session.module_generation.generation.value()
+            || !owner
+                .authority_epoch()
+                .is_same_authority(&session.authority_epoch)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the closed daemon dispatcher keeps authenticated lifecycle operations and their exact response projection in one audited gateway"
@@ -1208,15 +1239,41 @@ impl KernelComposition {
             "agent_activation_claim" => {
                 #[cfg(windows)]
                 {
-                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                    let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
+                    if object.len() != 2
+                        || object.get("operation").and_then(serde_json::Value::as_str)
+                            != Some("agent_activation_claim")
+                        || !object.contains_key("claim")
+                    {
                         return Err(TransportError::SessionFenced);
                     }
+                    // Issue #1115: the closed claim operation carries exactly
+                    // one typed `AgentActivationClaimRequest` naming the
+                    // dependency the claimant is bound to; the shape was already
+                    // closed above by the exact two-key envelope check.
+                    // Main's material-authority admission still runs first, so a
+                    // claimant without fresh material authority never reaches
+                    // the claim step at all.
                     self.admit_material_authority_for_fence(
                         GovernanceProfile::full(),
                         &session.module_generation.state_fence,
                     )
                     .map_err(|_| TransportError::SessionFenced)?;
-                    self.claim_agent_activation_ticket().map(|ticket| {
+                    let claim: AgentActivationClaimRequest = serde_json::from_value(
+                        object
+                            .get("claim")
+                            .cloned()
+                            .ok_or(TransportError::SessionFenced)?,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+                    claim
+                        .validate()
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    self.claim_agent_activation_ticket(
+                        &claim.dependency_ref,
+                        &claim.dependency_revision,
+                    )
+                    .map(|ticket| {
                         serde_json::json!({
                             "status": "known",
                             "value": { "ticket": ticket },
@@ -1233,69 +1290,50 @@ impl KernelComposition {
             "agent_activation_submit" => {
                 #[cfg(windows)]
                 {
-                    // Result submission is a terminal observation/recovery
-                    // leg for an already-issued ticket. Its retained-result
-                    // and exact-replay checks remain authoritative even when
-                    // fresh material admission is unavailable.
-                    // The closed submit operation carries exactly one resolver
-                    // outcome in one of two result shapes: the production v2
-                    // typed submit envelope carrying one
-                    // AgentActivationResolutionResult (unknown envelope
-                    // versions are rejected before adoption), or the
-                    // unenveloped P-04 typed result shape covering the same
-                    // seven closed dispositions. The v2 envelope is trial-decoded first so
-                    // production traffic keeps its typed acknowledgement and
-                    // reconcile support; the two result shapes share the
-                    // ticket ledger but keep independent
-                    // exact-replay/conflict accounting. The legacy
-                    // success-only `decision` key is no longer accepted
-                    // (#204 v1 removal): a payload carrying it, or carrying
-                    // no `result`, is fail-closed.
-                    let has_legacy_decision = payload
-                        .get("decision")
-                        .is_some_and(|value| !value.is_null());
-                    let has_result = payload.get("result").is_some_and(|value| !value.is_null());
-                    if has_legacy_decision || !has_result {
+                    // The production operation is exactly one closed v2
+                    // envelope. There is no bare-result fallback and a legacy
+                    // `decision` key is rejected even when it is null.
+                    //
+                    // This is main's fail-closed `#204` v1 removal, kept whole
+                    // and made stricter: main rejected a *non-null* `decision`
+                    // or a missing/non-null `result`; rejecting the key whenever
+                    // it is present covers the non-null case, and the exact
+                    // two-key envelope check below covers a missing `result`.
+                    let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
+                    if object.contains_key("decision") {
+                        // Historical v1 bytes are decoded only by the
+                        // namespaced import module. Production dispatch rejects
+                        // the key without invoking that decoder, including when
+                        // its value is null, so v1 can never become a fallback.
                         return Err(TransportError::SessionFenced);
                     }
+                    if object.len() != 2
+                        || object.get("operation").and_then(serde_json::Value::as_str)
+                            != Some("agent_activation_submit")
+                        || !object.contains_key("result")
                     {
-                        let result_value = payload
-                            .get("result")
-                            .cloned()
-                            .ok_or(TransportError::SessionFenced)?;
-                        if let Ok(submit) = serde_json::from_value::<AgentActivationResultSubmit>(
-                            result_value.clone(),
-                        ) {
-                            match self.submit_agent_activation_result(submit) {
-                                Ok(ack) => Ok(Self::activation_result_daemon_response(&ack)),
-                                // Deadline expiry is an expected race at this
-                                // boundary, not a daemon-fatal transport failure.
-                                // Return an explicit known outcome so the caller can
-                                // retain liveness without parsing error strings.
-                                // A retained terminal result never takes this
-                                // path: exact replay stays idempotent across the
-                                // deadline.
-                                Err(TransportError::Timeout) => {
-                                    Ok(Self::expired_activation_daemon_response())
-                                }
-                                Err(error) => Err(error),
-                            }
-                        } else {
-                            let result: AgentActivationResolutionResult =
-                                serde_json::from_value(result_value)
-                                    .map_err(|_| TransportError::SessionFenced)?;
-                            match self.submit_agent_activation_resolution_result(result) {
-                                Ok(()) => Ok(Self::accepted_daemon_response()),
-                                // Same deadline-expiry race as the v2 path:
-                                // the ticket lapsed before the typed result
-                                // arrived, so the caller observes expiry without
-                                // losing daemon liveness.
-                                Err(TransportError::Timeout) => {
-                                    Ok(Self::expired_activation_daemon_response())
-                                }
-                                Err(error) => Err(error),
-                            }
+                        return Err(TransportError::SessionFenced);
+                    }
+                    let submit = eliot_protocol::decode_agent_activation_result_submit(
+                        object.get("result").ok_or(TransportError::SessionFenced)?,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+                    Self::validate_activation_submitter(session, request_identity)?;
+                    let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                    match self.submit_agent_activation_result_authenticated(
+                        submit,
+                        Some(session),
+                        Some(identity),
+                    ) {
+                        Ok(ack) => Ok(Self::activation_result_daemon_response(&ack)),
+                        // Deadline expiry is an expected race at this
+                        // boundary, not a daemon-fatal transport failure.
+                        // A retained terminal result never takes this path:
+                        // exact replay stays idempotent across the deadline.
+                        Err(TransportError::Timeout) => {
+                            Ok(Self::expired_activation_daemon_response())
                         }
+                        Err(error) => Err(error),
                     }
                 }
                 #[cfg(not(windows))]
@@ -1307,20 +1345,32 @@ impl KernelComposition {
             "agent_activation_reconcile" => {
                 #[cfg(windows)]
                 {
-                    // Lost-acknowledgement reconcile: answered purely from
-                    // the retained per-ticket record, never by recomputing
-                    // semantics or reading the Governor a second time. An
-                    // unknown ticket yields a typed Unknown acknowledgement
-                    // (the daemon then resubmits its retained result); a
-                    // digest mismatch is an identity conflict.
-                    let query_value = payload
-                        .get("reconcile")
-                        .cloned()
-                        .ok_or(TransportError::SessionFenced)?;
-                    let query: AgentActivationResultReconcile = serde_json::from_value(query_value)
-                        .map_err(|_| TransportError::SessionFenced)?;
-                    self.reconcile_agent_activation_result(&query)
-                        .map(|ack| Self::reconciled_activation_daemon_response(&ack))
+                    // Reconcile is a closed, typed query and is answered only
+                    // from durable retention. No result payload or alternate
+                    // decoder is admitted on this route.
+                    let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
+                    if object.len() != 2
+                        || object.get("operation").and_then(serde_json::Value::as_str)
+                            != Some("agent_activation_reconcile")
+                        || !object.contains_key("reconcile")
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    let query: AgentActivationResultReconcile = serde_json::from_value(
+                        object
+                            .get("reconcile")
+                            .cloned()
+                            .ok_or(TransportError::SessionFenced)?,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+                    Self::validate_activation_submitter(session, request_identity)?;
+                    let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                    self.reconcile_agent_activation_result_authenticated(
+                        &query,
+                        Some(session),
+                        Some(identity),
+                    )
+                    .map(|ack| Self::reconciled_activation_daemon_response(&ack))
                 }
                 #[cfg(not(windows))]
                 {
@@ -1463,7 +1513,8 @@ impl KernelComposition {
             "publish_owner_bundle" => {
                 let operation: OwnerPublishOperation = serde_json::from_value(payload.clone())
                     .map_err(|_| TransportError::SessionFenced)?;
-                if operation.expected_revision == 0 {
+                if operation.operation != "publish_owner_bundle" || operation.expected_revision == 0
+                {
                     return Err(TransportError::SessionFenced);
                 }
                 // Session-authority agreement under the existing session
@@ -1488,8 +1539,12 @@ impl KernelComposition {
                 // strictly.
                 match self.recover_p07_owner(operation.bundle, operation.expected_revision) {
                     Ok(revision) => Ok(serde_json::json!({
-                        "kind": "owner_bundle_receipt",
-                        "value": { "revision": revision, "status": "bound" },
+                        "status": "known",
+                        "value": {
+                            "kind": "owner_bundle_receipt",
+                            "value": { "revision": revision, "status": "bound" },
+                        },
+                        "recovery": null,
                     })),
                     // The presented bundle or a durable row disagrees with
                     // Kernel owner state (stale revision, disagreeing
@@ -1500,14 +1555,25 @@ impl KernelComposition {
                 }
             }
             "query_owner_bundle" => {
+                let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
+                if object.len() != 1
+                    || object.get("operation").and_then(serde_json::Value::as_str)
+                        != Some("query_owner_bundle")
+                {
+                    return Err(TransportError::SessionFenced);
+                }
                 let (bound, revision, digest) = self.p07_owner_readback();
                 Ok(serde_json::json!({
-                    "kind": "owner_bundle_readback",
+                    "status": "known",
                     "value": {
-                        "bound": bound,
-                        "revision": revision,
-                        "digest": digest,
+                        "kind": "owner_bundle_readback",
+                        "value": {
+                            "bound": bound,
+                            "revision": revision,
+                            "digest": digest,
+                        },
                     },
+                    "recovery": null,
                 }))
             }
             QUERY_GRANT_CLOSURE_LINKS_OPERATION => {

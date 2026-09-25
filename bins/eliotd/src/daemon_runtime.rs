@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_governor::KernelTransitionPort;
 use eliot_protocol::{
+    AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionDisposition, AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultAckOutcome,
     AgentActivationResultReconcile,
@@ -38,9 +39,10 @@ use eliotd::testd_terminal_completion::{
     query_testd_owner_terminal_evidence,
 };
 use eliotd::{
-    ActivationClaim, DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus,
-    LocalReadSubmitOutcome, MaintenanceObservation, MaintenanceTriggerOrigin, PROTOCOL_VERSION,
-    SELF_OBSERVED_FAMILY, SERVICE_NAME, forward_admitted_local_read, terminal_for_invalid_ticket,
+    ActivationClaim, DaemonComposition, DaemonConfig, DaemonError, DaemonKernelClient,
+    DaemonStatus, LocalReadSubmitOutcome, MaintenanceObservation, MaintenanceTriggerOrigin,
+    PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME, forward_admitted_local_read,
+    terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -85,6 +87,9 @@ enum RunLoopExit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ActivationDispatchError {
     Hard(String),
+    /// Kernel linearized a result-less deadline expiry. The daemon retires
+    /// this ticket without retrying or attempting reconciliation.
+    Expired,
     Unknown {
         ticket_id: String,
         result_sha256: String,
@@ -119,6 +124,11 @@ enum ActivationCompletion {
 struct ActivationResolvedTicket {
     ticket: AgentActivationResolutionTicket,
     result: AgentActivationResolutionResult,
+    /// Issue #1115: the semantic Governor binding combined with the P-07
+    /// revision/digest, both captured before this flight was published. The
+    /// submit path reuses this pair verbatim and never performs a second
+    /// Governor read; a negative disposition carries no pair at all.
+    owner_readback: Option<AgentActivationOwnerReadback>,
 }
 
 struct ActivationFlightState {
@@ -150,13 +160,24 @@ fn decide_activation_tick(flight: &ActivationFlight) -> ActivationTickDecision {
 }
 
 /// Starts one activation ticket claim step on the shared tick.
+///
+/// The daemon reads its current named dependency discriminator before the
+/// claim request. Kernel uses that authenticated observation to keep a
+/// `NotReady` successor in Pending until due time and a changed discriminator
+/// are both present; lease expiry alone cannot cross this gate.
 fn start_activation_claim(
     kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
 ) -> Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>> {
     let kernel_clone = Arc::clone(kernel);
+    let composition_clone = Arc::clone(composition);
     Box::pin(async move {
+        let dependency_revision = {
+            let guard = composition_clone.lock().await;
+            guard.activation_dependency_revision()
+        };
         let outcome: Result<ActivationClaim, String> = kernel_clone
-            .claim_agent_activation_ticket()
+            .claim_agent_activation_ticket(&dependency_revision)
             .await
             .map_err(|error| format!("Kernel activation ticket claim: {error}"));
         ActivationCompletion::Claim(outcome)
@@ -180,30 +201,43 @@ async fn next_activation_completion(flight: &mut ActivationFlight) -> Activation
 /// while this one queues. No drain-before-lock workaround: the `TestD` drain
 /// is its own independently polled flight with short guarded phases.
 fn install_activation_resolve(
+    kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
     flight: &mut ActivationFlight,
     ticket: AgentActivationResolutionTicket,
 ) {
     *flight = ActivationFlight::InFlight(ActivationFlightState {
-        future: start_activation_resolve(Arc::clone(composition), ticket),
+        future: start_activation_resolve(Arc::clone(kernel), Arc::clone(composition), ticket),
         retained: None,
     });
 }
 
 /// Starts the resolve-wait step for one validated ticket. The returned future
-/// acquires the composition guard, reads the clock after that wait and
-/// immediately before resolution, then resolves once through the v2 spine.
+/// captures the P-07 owner projection, acquires the composition guard, reads
+/// the clock after that wait and immediately before resolution, then resolves
+/// once through the v2 spine.
+///
+/// Issue #1115: the P-07 readback is taken *before* the guard is acquired, so
+/// a rotation after that read is refused by Kernel at Session publication
+/// rather than being silently re-read under the semantic lock. A readback
+/// failure is carried into the resolve step rather than raised here, so a
+/// negative disposition stays independently reportable.
 fn start_activation_resolve(
+    kernel: Arc<DaemonKernelClient>,
     composition: SharedComposition,
     ticket: AgentActivationResolutionTicket,
 ) -> Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>> {
     Box::pin(async move {
+        let kernel_owner = kernel
+            .query_owner_bundle_readback()
+            .await
+            .map_err(|error| error.to_string());
         let guard = composition.lock().await;
         let now = match unix_ms(SystemTime::now()) {
             Ok(now) => now,
             Err(error) => return ActivationCompletion::Resolve(Err(error)),
         };
-        ActivationCompletion::Resolve(resolve_valid_ticket(&guard, ticket, now))
+        ActivationCompletion::Resolve(resolve_valid_ticket(&guard, kernel_owner, ticket, now))
     })
 }
 
@@ -1048,6 +1082,11 @@ async fn run_loop(
                 return Ok(exit);
             }
             _ = cadence.activation_poll.tick() => {
+                // The per-tick poller and drain gates, and the activation
+                // claim's own idle gate, all live in `start_tick_work` so the
+                // ordering those comments describe is stated once. The claim
+                // carries the composition handle it needs to read the named
+                // dependency discriminator before the request.
                 start_tick_work(
                     &kernel,
                     &composition,
@@ -1174,7 +1213,7 @@ fn settle_activation_completion(
                     // new resolve-wait flight; the lock wait inside that
                     // flight stays polled alongside every other flight
                     // instead of stalling the loop here.
-                    install_activation_resolve(composition, flight, *ticket);
+                    install_activation_resolve(kernel, composition, flight, *ticket);
                 }
             }
             Ok(())
@@ -1183,7 +1222,11 @@ fn settle_activation_completion(
             settle_activation_resolve_completion(kernel, flight, resolve_outcome)
         }
         ActivationCompletion::Dispatch(dispatch_outcome) => match dispatch_outcome {
-            Ok(()) => {
+            // #1115: a Kernel-owned deadline expiry is a completed step, not a
+            // dispatch this daemon applied. It retires the ticket exactly like
+            // an accepted dispatch — idle, no retry, no reconcile — so both
+            // settle through the same supervision note.
+            Ok(()) | Err(ActivationDispatchError::Expired) => {
                 note_supervision_applied(supervision_progress.as_mut());
                 *flight = ActivationFlight::Idle;
                 Ok(())
@@ -1212,7 +1255,11 @@ fn start_tick_work(
     maybe_start_testd_owner_drain(kernel, composition, testd_owner_flight);
     if decide_activation_tick(flight) == ActivationTickDecision::StartClaim {
         *flight = ActivationFlight::InFlight(ActivationFlightState {
-            future: start_activation_claim(kernel),
+            // #1115: the claim reads the daemon's current named dependency
+            // discriminator from the composition before requesting, so the
+            // Kernel-side `NotReady` supersede gate sees an authenticated
+            // observation instead of an implicit one.
+            future: start_activation_claim(kernel, composition),
             retained: None,
         });
     }
@@ -1445,8 +1492,16 @@ async fn submit_supervision_heartbeat(
 /// prevents semantic resolution, including at the exact deadline boundary.
 /// Otherwise resolves once through the v2 spine for the dispatch step to
 /// submit verbatim.
+///
+/// Issue #1115: `kernel_owner` is the P-07 projection the caller captured
+/// *before* this lock was taken, so a rotation after that read is refused by
+/// Kernel at Session publication instead of being re-read under the semantic
+/// lock. A readback failure is deferred for negative dispositions, which do
+/// not create a Session and must remain independently reportable, so it is
+/// surfaced only once a `Resolved` result actually needs the pair.
 fn resolve_valid_ticket(
     composition: &DaemonComposition,
+    kernel_owner: Result<Option<AgentActivationKernelOwnerReadback>, String>,
     ticket: AgentActivationResolutionTicket,
     now: u64,
 ) -> Result<Option<Box<ActivationResolvedTicket>>, String> {
@@ -1456,10 +1511,11 @@ fn resolve_valid_ticket(
         // expired ticket.
         return Ok(None);
     }
-    // Single v2 resolution per newly admitted ticket.  The v2 resolver maps
-    // all seven Governor outcomes to typed results; any Err is a real
-    // validation/readiness failure and must fail closed rather than silently
-    // discarding a disposition.
+    // Single v2 result resolution per newly admitted ticket. The v2 resolver
+    // maps all seven Governor outcomes to typed results; the Resolved arm
+    // then obtains one independent current-owner readback below. Any Err is a
+    // real validation/readiness failure and must fail closed rather than
+    // silently discarding a disposition.
     let result = composition
         .resolve_agent_activation_v2(&ticket, now)
         .map_err(|error| {
@@ -1468,13 +1524,73 @@ fn resolve_valid_ticket(
                 ticket.ticket_id
             )
         })?;
-    Ok(Some(Box::new(ActivationResolvedTicket { ticket, result })))
+    let semantic_owner = if matches!(
+        &result.disposition,
+        AgentActivationResolutionDisposition::Resolved { .. }
+    ) {
+        Some(
+            composition
+                .current_activation_owner_readback(now)
+                .map_err(|error| {
+                    format!(
+                        "daemon activation owner readback ticket {}: {error}",
+                        ticket.ticket_id
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    // A Resolved result is submitted only with two current owner projections:
+    // the semantic Governor binding and the exact P-07 revision/digest. The
+    // P-07 pair was captured before this lock was taken and is checked under
+    // the Kernel owner lock at submit time.
+    let owner_readback = if matches!(
+        &result.disposition,
+        AgentActivationResolutionDisposition::Resolved { .. }
+    ) {
+        let semantic = semantic_owner.ok_or_else(|| {
+            "Resolved activation result is missing its semantic owner readback".to_owned()
+        })?;
+        let kernel_owner = kernel_owner
+            .map_err(|error| {
+                format!(
+                    "daemon activation Kernel owner readback ticket {}: {error}",
+                    ticket.ticket_id
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "daemon activation Kernel owner is unbound for ticket {}",
+                    ticket.ticket_id
+                )
+            })?;
+        Some(
+            semantic
+                .with_kernel_owner_readback(kernel_owner)
+                .map_err(|error| {
+                    format!(
+                        "daemon activation owner projection ticket {}: {error}",
+                        ticket.ticket_id
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    Ok(Some(Box::new(ActivationResolvedTicket {
+        ticket,
+        result,
+        owner_readback,
+    })))
 }
 
 /// Starts the dispatch step for one resolved ticket, carrying the retained
 /// result identity for submission and lost-acknowledgement reconciliation.
 /// The retained bytes/digest are reused verbatim and never recomputed, and
-/// the resolver is never invoked again under a new identity.
+/// the resolver is never invoked again under a new identity. Issue #1115: the
+/// owner pair captured by the resolve step travels with the ticket, so this
+/// flight performs no second Governor read.
 fn start_activation_dispatch(
     kernel: &Arc<DaemonKernelClient>,
     resolved: ActivationResolvedTicket,
@@ -1486,9 +1602,13 @@ fn start_activation_dispatch(
     let kernel_clone = Arc::clone(kernel);
     let future: Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>> =
         Box::pin(async move {
-            let outcome =
-                dispatch_agent_activation_result(&kernel_clone, &resolved.ticket, resolved.result)
-                    .await;
+            let outcome = dispatch_agent_activation_result(
+                &kernel_clone,
+                &resolved.ticket,
+                resolved.result,
+                resolved.owner_readback,
+            )
+            .await;
             ActivationCompletion::Dispatch(outcome)
         });
     ActivationFlightState {
@@ -1551,7 +1671,7 @@ async fn drain_flights_on_shutdown(
                                 *flight = ActivationFlight::Idle;
                             }
                             ActivationClaimStep::Valid(ticket) => {
-                                install_activation_resolve(composition, flight, *ticket);
+                                install_activation_resolve(kernel, composition, flight, *ticket);
                             }
                         }
                     }
@@ -1561,7 +1681,12 @@ async fn drain_flights_on_shutdown(
                     ActivationCompletion::Dispatch(dispatch_outcome) => {
                         *flight = ActivationFlight::Idle;
                         match dispatch_outcome {
-                            Ok(()) => {}
+                            // #1115: a Kernel-owned deadline expiry carries no
+                            // uncertain retention — the Kernel linearized the
+                            // result-less expiry — so a drain that observes it
+                            // settles as a clean shutdown exactly like an
+                            // accepted dispatch, never as an unknown identity.
+                            Ok(()) | Err(ActivationDispatchError::Expired) => {}
                             Err(ActivationDispatchError::Hard(error)) => return Err(error),
                             Err(ActivationDispatchError::Unknown {
                                 ticket_id,
@@ -2194,6 +2319,7 @@ async fn dispatch_agent_activation_result(
     kernel: &DaemonKernelClient,
     ticket: &AgentActivationResolutionTicket,
     result: AgentActivationResolutionResult,
+    owner_readback: Option<eliot_protocol::AgentActivationOwnerReadback>,
 ) -> Result<(), ActivationDispatchError> {
     // #740: dispatch span over the submit-then-reconcile path. The retained
     // result is reused verbatim; only bounded ticket identity is carried.
@@ -2203,8 +2329,15 @@ async fn dispatch_agent_activation_result(
     )
     .entered();
     observe_transient_deferral(&result);
-    match kernel.submit_agent_activation_result(&result).await {
+    // The semantic and P-07 owner readbacks were captured before this
+    // asynchronous flight was published. The submit path reuses both values
+    // verbatim; it never performs a second Governor read.
+    match kernel
+        .submit_agent_activation_result(&result, owner_readback)
+        .await
+    {
         Ok(ack) => classify_submit_ack(ticket, &result, &ack),
+        Err(DaemonError::ActivationExpired) => Err(ActivationDispatchError::Expired),
         Err(submit_error) => {
             // The submit may have committed before the acknowledgement was
             // lost. Retain the exact ticket/result identity and reconcile
@@ -2259,12 +2392,15 @@ fn classify_submit_ack(
             ticket.ticket_id
         )));
     }
+    ack.validate_against_result(result).map_err(|error| {
+        ActivationDispatchError::Hard(format!(
+            "Kernel activation result ack payload mismatch: {error}"
+        ))
+    })?;
     match ack.outcome {
-        AgentActivationResultAckOutcome::Accepted
-        | AgentActivationResultAckOutcome::ExactReplay
-        | AgentActivationResultAckOutcome::Reconciled => {
-            // #740: ack record. Accepted/replayed/reconciled correlation is
-            // not completed work; no completion is claimed here.
+        AgentActivationResultAckOutcome::Accepted => {
+            // #740: ack record. Stable retained-result correlation is not
+            // completed work; no completion is claimed here.
             let _ = eliotd::diagnostics::emit_activation_ack(
                 &ticket.ticket_id,
                 &result.result_sha256,
@@ -2293,9 +2429,12 @@ fn classify_reconcile_ack(
     submit_detail: &str,
 ) -> Result<(), ActivationDispatchError> {
     match ack.outcome {
-        AgentActivationResultAckOutcome::Accepted
-        | AgentActivationResultAckOutcome::ExactReplay
-        | AgentActivationResultAckOutcome::Reconciled => {
+        AgentActivationResultAckOutcome::Accepted => {
+            ack.validate_against_result(result).map_err(|error| {
+                ActivationDispatchError::Hard(format!(
+                    "Kernel activation reconcile ack payload mismatch: {error}"
+                ))
+            })?;
             // #740: reconcile-ack record. Reconciled retention is not
             // completed work; no completion is claimed here.
             let _ = eliotd::diagnostics::emit_activation_ack(
@@ -2322,15 +2461,12 @@ fn classify_reconcile_ack(
     }
 }
 
-/// Observes the transient `NotReady` deferral coupling without adding retry
-/// policy. Reconsideration requires the declared due time (`not_before`) plus
-/// fresh Governor evidence (changed named dependency revision); Kernel owns
-/// that gate (`bins/eliot-kernel/src/agent_bridge.rs::not_ready_supersede_allowed`,
-/// `bins/eliot-kernel/src/lib.rs::AgentActivationResultPhase::DeferredNotReady`).
-/// Claim-lease expiry alone never triggers a daemon retry, and this loop keeps
-/// no cache or timer for it: the next Kernel-issued claim drives any gated
-/// supersede, and a changed same-ticket result that misses the gate conflicts
-/// on the submit path.
+/// Observes the transient `NotReady` deferral without adding retry policy.
+/// The predecessor result remains immutable. Reconsideration is possible only
+/// through a fresh Kernel-issued successor ticket after the declared due time
+/// (`not_before`) and only when the named dependency revision has materially
+/// changed; Kernel owns that gate. Claim-lease expiry never triggers reuse, and
+/// any changed result under the predecessor ticket is an identity conflict.
 fn observe_transient_deferral(result: &AgentActivationResolutionResult) {
     if result.is_transient_retry() {
         if let Some(not_before) = transient_not_before(result) {
@@ -3246,11 +3382,14 @@ mod tests {
             wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
             ticket_id: "ticket-1".to_owned(),
             activation_request_id: RequestId::new("activation-request-1").expect("request id"),
+            demand_id: "demand-1".to_owned(),
             activation_request_sha256: "a".repeat(64),
             peer_admission_receipt_sha256: "b".repeat(64),
             connection_id: "connection-1".to_owned(),
+            cancellation_id: "cancellation-1".to_owned(),
             state_fence: fence,
             kernel_deadline_unix_ms: 100,
+            successor_of: None,
             ticket_sha256: String::new(),
         }
         .with_computed_digest()
@@ -3320,11 +3459,14 @@ mod tests {
             wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
             ticket_id: "ticket-23".to_owned(),
             activation_request_id: RequestId::new("activation-request-23").expect("request id"),
+            demand_id: "demand-23".to_owned(),
             activation_request_sha256: "a".repeat(64),
             peer_admission_receipt_sha256: "b".repeat(64),
             connection_id: "connection-23".to_owned(),
+            cancellation_id: "cancellation-23".to_owned(),
             state_fence: fence,
             kernel_deadline_unix_ms: 100,
+            successor_of: None,
             ticket_sha256: String::new(),
         }
         .with_computed_digest()
@@ -3404,11 +3546,14 @@ mod tests {
             wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
             ticket_id: "ticket-24".to_owned(),
             activation_request_id: RequestId::new("activation-request-24").expect("request id"),
+            demand_id: "demand-24".to_owned(),
             activation_request_sha256: "a".repeat(64),
             peer_admission_receipt_sha256: "b".repeat(64),
             connection_id: "connection-24".to_owned(),
+            cancellation_id: "cancellation-24".to_owned(),
             state_fence: fence,
             kernel_deadline_unix_ms: 100,
+            successor_of: None,
             ticket_sha256: String::new(),
         }
         .with_computed_digest()
@@ -3454,11 +3599,11 @@ mod tests {
             other => panic!("expected typed Unknown, got {other:?}"),
         }
 
-        // A durable retained record surviving the reconnect answers the same
-        // query as Reconciled. The daemon settles the original result
-        // identity verbatim; it never asks Governor to resolve the ticket a
-        // second time.
-        let reconciled = AgentActivationResultAck::reconciled(&result).expect("reconciled ack");
+        // A durable retained record surviving the reconnect answers with the
+        // same stable positive acknowledgement. The daemon settles the
+        // original result identity verbatim and never asks Governor to resolve
+        // the ticket a second time.
+        let reconciled = AgentActivationResultAck::accepted(&result).expect("reconciled ack");
         classify_reconcile_ack(
             &ticket,
             &result,
@@ -3501,11 +3646,14 @@ mod tests {
             wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
             ticket_id: "ticket-25".to_owned(),
             activation_request_id: RequestId::new("activation-request-25").expect("request id"),
+            demand_id: "demand-25".to_owned(),
             activation_request_sha256: "a".repeat(64),
             peer_admission_receipt_sha256: "b".repeat(64),
             connection_id: "connection-25".to_owned(),
+            cancellation_id: "cancellation-25".to_owned(),
             state_fence: fence,
             kernel_deadline_unix_ms: 100,
+            successor_of: None,
             ticket_sha256: String::new(),
         }
         .with_computed_digest()
@@ -3520,21 +3668,20 @@ mod tests {
         .expect("valid test result");
         let original_sha = result.result_sha256.clone();
 
-        // Every positive acknowledgement settles with unit and echoes the
-        // retained result verbatim. The classifier takes only the ticket,
-        // the retained result, and the ack: no composition or session
-        // handle enters, so no Session, authority, or Finish can be minted
-        // on this path.
-        for ack in [
-            AgentActivationResultAck::accepted(&result).expect("accept ack"),
-            AgentActivationResultAck::replayed(&result).expect("replay ack"),
-            AgentActivationResultAck::reconciled(&result).expect("reconcile ack"),
-        ] {
-            classify_submit_ack(&ticket, &result, &ack).expect("positive ack settles");
-            assert_eq!(ack.ticket_id, ticket.ticket_id);
-            assert_eq!(ack.result_sha256, result.result_sha256);
-            assert_eq!(ack.result.as_ref(), Some(&result));
-        }
+        // The single positive acknowledgement shape settles with unit and
+        // echoes the retained result verbatim. Fresh commit, exact replay,
+        // and reconcile all use these identical bytes. The classifier takes
+        // only the ticket, retained result, and ack: no composition or Session
+        // handle enters, so no Session, authority, or Finish can be minted.
+        let ack = AgentActivationResultAck::accepted(&result).expect("accept ack");
+        let replay_ack = AgentActivationResultAck::accepted(&result).expect("replay ack");
+        let reconcile_ack = AgentActivationResultAck::accepted(&result).expect("reconcile ack");
+        assert_eq!(ack, replay_ack);
+        assert_eq!(ack, reconcile_ack);
+        classify_submit_ack(&ticket, &result, &ack).expect("positive ack settles");
+        assert_eq!(ack.ticket_id, ticket.ticket_id);
+        assert_eq!(ack.result_sha256, result.result_sha256);
+        assert_eq!(ack.result.as_ref(), Some(&result));
 
         // Unknown is not a settlement: it preserves the original identity
         // in a typed outcome instead of minting anything.
