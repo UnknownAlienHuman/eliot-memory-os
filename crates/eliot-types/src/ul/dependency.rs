@@ -18,12 +18,14 @@ pub enum UlDependencyKind {
 #[derive(
     Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
+#[serde(deny_unknown_fields)]
 pub struct UlDependencyRef {
     pub kind: UlDependencyKind,
     pub key: String,
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlReverseDependencyRow {
     pub project_id: ProjectId,
     pub dependency: UlDependencyRef,
@@ -33,6 +35,7 @@ pub struct UlReverseDependencyRow {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlDirtyReason {
     pub dependency: UlDependencyRef,
     pub expected_fingerprint: Option<String>,
@@ -41,6 +44,7 @@ pub struct UlDirtyReason {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlArtifactDirtyState {
     pub project_id: ProjectId,
     pub target_kind: PyramidTargetKind,
@@ -57,6 +61,7 @@ pub struct UlArtifactDirtyState {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlDependencyRebuildReport {
     pub project_id: ProjectId,
     pub artifacts_indexed: u32,
@@ -64,6 +69,7 @@ pub struct UlDependencyRebuildReport {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlMaintenanceReport {
     pub project_id: ProjectId,
     pub requested: u16,

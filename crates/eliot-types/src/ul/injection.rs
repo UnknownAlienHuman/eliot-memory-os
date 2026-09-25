@@ -10,6 +10,7 @@ pub struct ObservedCue {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PendingInjectionItem {
     pub item_ref: String,
     pub record_kind: String,
@@ -27,12 +28,14 @@ pub struct PendingInjectionItem {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlFiredBlock {
     pub items: Vec<UlFiredItem>,
     pub overflow: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlFiredItem {
     pub item_ref: String,
     pub kind: String,
@@ -46,6 +49,7 @@ pub struct UlFiredItem {
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InjectionReceipt {
     pub injection_id: String,
     pub session_id: SessionId,
