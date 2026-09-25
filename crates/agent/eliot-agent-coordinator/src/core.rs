@@ -114,6 +114,49 @@ fn retains_ownership_on_unknown_execution(result: &AgentResult) -> bool {
     result.disposition == ResultDisposition::UnknownOutcome || result.execution_unknown()
 }
 
+/// Binding-gated result intake checks shared by `submit_result` (issue
+/// #370 S5 closure + #361 exact execution-unit binding): requested must
+/// equal the admitted route; attempt identity must match; an exact stored
+/// binding must match exactly while a missing stored binding still requires
+/// presented attempt/lease/fence/route agreement; the stored
+/// externally-issued admission must exist and the full triple must close
+/// via `validate_for_binding`. No state mutation here.
+fn validate_result_intake_binding(
+    current: &AttemptRecord,
+    result: &AgentResult,
+    effect_ceiling: &EffectCeiling,
+) -> Result<(), CoordinatorError> {
+    let actual = &result.actual_route;
+    if actual.requested_route != current.route {
+        return Err(CoordinatorError::RouteMismatch);
+    }
+    if actual.attempt_id != current.attempt_id {
+        return Err(CoordinatorError::IdentityConflict("attempt_id"));
+    }
+    if let Some(stored) = &current.provider_binding {
+        if &actual.binding != stored {
+            return Err(CoordinatorError::IdentityConflict("execution_binding"));
+        }
+    } else if actual.binding.attempt_id != current.attempt_id
+        || actual.binding.lease_id != current.lease_id
+        || actual.binding.state_fence != current.state_fence
+        || actual.binding.route != current.route
+    {
+        return Err(CoordinatorError::IdentityConflict("execution_binding"));
+    }
+    if actual.state_fence != current.state_fence {
+        return Err(CoordinatorError::IdentityConflict("execution_binding"));
+    }
+    let stored_admission = current
+        .admitted_route
+        .as_ref()
+        .ok_or(CoordinatorError::IdentityConflict("admitted_route"))?;
+    result
+        .validate_for_binding(&actual.binding, stored_admission, effect_ceiling)
+        .map_err(binding_contract)?;
+    Ok(())
+}
+
 /// Accepted v7 host-event observation entry (issue #371 S7). The canonical
 /// input binds the exact envelope plus presented-receipt bytes for durable
 /// replay; the stored envelope supports the typed
@@ -1225,50 +1268,7 @@ impl AgentCoordinator {
             .result
             .validate(&work_unit.effect_ceiling)
             .map_err(provider_contract)?;
-        let actual = &submission.result.actual_route;
-        // Requested must equal the admitted/assigned route; a mismatch is an
-        // invalid candidate selection and rejects. Observed divergence or
-        // absence is retained evidence (DIVERGED/UNOBSERVED) at a capped
-        // ceiling, never a mismatch rejection.
-        if actual.requested_route != current.route {
-            return Err(CoordinatorError::RouteMismatch);
-        }
-        if actual.attempt_id != current.attempt_id {
-            return Err(CoordinatorError::IdentityConflict("attempt_id"));
-        }
-        // Binding-gated intake: an exact stored binding must match exactly;
-        // without a stored binding, the presented binding must still agree on
-        // attempt/lease/fence/route, otherwise it is forged and rejects.
-        if let Some(stored) = &current.provider_binding {
-            if &actual.binding != stored {
-                return Err(CoordinatorError::IdentityConflict("execution_binding"));
-            }
-        } else if actual.binding.attempt_id != current.attempt_id
-            || actual.binding.lease_id != current.lease_id
-            || actual.binding.state_fence != current.state_fence
-            || actual.binding.route != current.route
-        {
-            return Err(CoordinatorError::IdentityConflict("execution_binding"));
-        }
-        if actual.state_fence != current.state_fence {
-            return Err(CoordinatorError::IdentityConflict("execution_binding"));
-        }
-        // S5 binding closure (issue #370): the stored externally-issued
-        // admitted decision must exist and the result must close the full
-        // triple via the shared S5 validator. Stored-only, never
-        // provider-supplied: the observation already carries the digest link
-        // (`admitted_route_digest`), and equality against stored is enforced
-        // inside `validate_for_binding`. Missing stored admission fails
-        // closed as `admitted_route`; validator mismatches map via the
-        // existing binding convention (`execution_binding`).
-        let stored_admission = current
-            .admitted_route
-            .as_ref()
-            .ok_or(CoordinatorError::IdentityConflict("admitted_route"))?;
-        submission
-            .result
-            .validate_for_binding(&actual.binding, stored_admission, &work_unit.effect_ceiling)
-            .map_err(binding_contract)?;
+        validate_result_intake_binding(&current, &submission.result, &work_unit.effect_ceiling)?;
         if submission.result.disposition == ResultDisposition::CandidateSucceeded {
             self.require_descendant_closure(&current.attempt_id)?;
         }

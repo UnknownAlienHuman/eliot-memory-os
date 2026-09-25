@@ -1627,9 +1627,7 @@ fn codex_result_disposition(input: &CodexResultInput) -> (ResultDisposition, Opt
                 input
                     .unknown_reason
                     .clone()
-                    .unwrap_or_else(|| {
-                        "terminal observation carries no observed wall time".into()
-                    }),
+                    .unwrap_or_else(|| "terminal observation carries no observed wall time".into()),
             ),
         )
     }
@@ -1714,8 +1712,8 @@ fn codex_observation_receipt(
     execution_outcome: ExecutionOutcome,
     cancellation: Option<CancellationState>,
     recovery_ref: Option<String>,
-    terminal: ClockReading,
 ) -> Result<PhysicalRouteObservationReceipt, CodexAdapterError> {
+    let terminal = codex_terminal_reading(input, execution_outcome);
     let mut actual_route = PhysicalRouteObservationReceipt {
         schema_version: CONTRACT_VERSION.to_owned(),
         attempt_id: binding.attempt_id.clone(),
@@ -1800,7 +1798,6 @@ pub fn translate_result(
     // invented); every other outcome stays unknown with its recovery handle.
     let (execution_outcome, cancellation, recovery_ref) =
         codex_execution_outcome(&input, unknown_reason.as_ref());
-    let terminal = codex_terminal_reading(&input, execution_outcome);
     let actual_route = codex_observation_receipt(
         &input,
         binding,
@@ -1809,7 +1806,6 @@ pub fn translate_result(
         execution_outcome,
         cancellation,
         recovery_ref,
-        terminal,
     )?;
     let result = AgentResult {
         attempt_id: binding.attempt_id.clone(),
