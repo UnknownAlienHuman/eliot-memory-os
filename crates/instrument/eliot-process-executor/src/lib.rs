@@ -50,6 +50,10 @@ use eliot_platform_windows::{
 /// See [`wasm_p03_adapter`] for the authority stance and proof entrypoint.
 pub mod wasm_p03_adapter;
 
+/// Outer Host/OS guardian scenario checks for `ProcessExecutor`
+/// self-changes (I18.31 special case).
+pub mod outer_guardian;
+
 const DEFAULT_CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
 const EVIDENCE_PREVIEW_CEILING: usize = 16 * 1024 * 1024;
 const JOB_TERMINATION_CODE: u32 = 0xE1_04;

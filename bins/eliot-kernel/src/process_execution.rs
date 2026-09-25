@@ -963,6 +963,38 @@ impl ProcessExecutionGateway {
         );
     }
 
+    /// Starts a process only after the outer guardian scenario holds.
+    ///
+    /// This is the strict [`ProcessExecutionGateway::start`] path for use
+    /// while the `ProcessExecutor` surface itself ships a new generation
+    /// through the I18.31 bootstrap: the outer Host/OS guardian scenario
+    /// (tree cleanup + evidence) is re-verified from the machine first,
+    /// then the real bounded executor handoff runs. Ordinary launches keep
+    /// using [`ProcessExecutionGateway::start`] directly; the protocol
+    /// binds only the changed surface.
+    ///
+    /// Residual: the dispatch composition switches to this entry when it
+    /// ships a new executor-surface generation (no caller migrates yet).
+    /// The allow below covers only that pending migration, not a fake
+    /// caller.
+    #[allow(dead_code)]
+    pub(crate) async fn start_with_guardian(
+        &self,
+        owner: &ProcessOwnerBinding,
+        admission: ProcessExecutionAdmissionRequest,
+        path_proof: ProcessPathProof,
+        scenario: &eliot_process_executor::outer_guardian::OuterGuardianScenario,
+    ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        eliot_process_executor::outer_guardian::verify_outer_guardian(scenario).map_err(
+            |error| {
+                ProcessExecutionError::Unavailable(format!(
+                    "outer guardian scenario rejected: {error}"
+                ))
+            },
+        )?;
+        self.start(owner, admission, path_proof).await
+    }
+
     pub(crate) async fn start(
         &self,
         owner: &ProcessOwnerBinding,

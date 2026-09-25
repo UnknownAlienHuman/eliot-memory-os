@@ -31,6 +31,7 @@ $docsShardVerifier = Join-Path $PSScriptRoot 'docs_shards.py'
 $docsRouter = Join-Path $PSScriptRoot 'docs_router.py'
 $docsReader = Join-Path $PSScriptRoot 'docs_read.py'
 $docCodeConformanceVerifier = Join-Path $PSScriptRoot 'verify-doc-code-conformance.py'
+$docsEvidenceCheck = Join-Path $PSScriptRoot 'documentation_evidence_check.py'
 $codeNavigation = Join-Path $PSScriptRoot 'code_navigation.py'
 $docsClosureAudit = Join-Path $PSScriptRoot 'docs_closure_audit.py'
 $standaloneCrates = Join-Path $PSScriptRoot 'verify-standalone-crates.py'
@@ -55,6 +56,7 @@ $allGates = @(
     [pscustomobject]@{ Name = 'code-navigation-self-test'; Profiles = @('Quick', 'Review'); Command = { python $codeNavigation self-test } },
     [pscustomobject]@{ Name = 'code-navigation'; Profiles = @('Quick', 'Review'); Command = { python $codeNavigation check --root $repoRoot } },
     [pscustomobject]@{ Name = 'documentation-closure-audit'; Profiles = @('Quick', 'Review'); Command = { python $docsClosureAudit --root $repoRoot } },
+    [pscustomobject]@{ Name = 'documentation-evidence-check-self-test'; Profiles = @('Quick', 'Review'); Command = { python $docsEvidenceCheck --self-test } },
     [pscustomobject]@{ Name = 'standalone-crates'; Profiles = @('Quick', 'Review'); Command = { python $standaloneCrates --root $repoRoot } },
     [pscustomobject]@{ Name = 'core-daemon-inventory-self-test'; Profiles = @('Quick', 'Review'); Command = { python $coreDaemonInventoryVerifier --self-test } },
     [pscustomobject]@{ Name = 'core-daemon-inventory'; Profiles = @('Quick', 'Review'); Command = { python $coreDaemonInventoryVerifier --root $repoRoot } },
