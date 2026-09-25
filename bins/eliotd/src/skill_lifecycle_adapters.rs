@@ -271,13 +271,11 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// binding. Synchronous: the guard is taken and dropped in a closed
     /// scope and never crosses an await.
     ///
-    /// No in-tree production flow drives the runtime population path yet:
-    /// the composition seam
+    /// Composition population entry: the composition seam
     /// ([`DaemonComposition::skill_install_package`](super::DaemonComposition::skill_install_package))
-    /// carries the exact call for the Governor-owned driver. The allowance
-    /// covers exactly that pending adoption; it expires when the driver
-    /// lands. Tests drive all three runtime callers.
-    #[allow(dead_code)]
+    /// drives this with the accepted candidate, validated package claim,
+    /// actual materialization inputs and explicit install context for the
+    /// runtime population driver.
     pub(crate) fn install_package(
         &self,
         candidate: &PortableSkillPackageCandidate,
@@ -302,12 +300,11 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// Skill-owned alias table resolves provider renames to canonical names
     /// first. Synchronous: the guard is taken and dropped in a closed scope.
     ///
-    /// No in-tree Governor driver calls the versioned population path yet;
-    /// the composition seam
+    /// Versioned population entry: the composed delivery act
+    /// ([`run_install_to_receipt`](Self::run_install_to_receipt)) drives
+    /// this after candidate rehydration, and the composition seam
     /// ([`DaemonComposition::skill_install_package_versioned`](super::DaemonComposition::skill_install_package_versioned))
-    /// has landed for that driver. The allowance covers exactly that pending
-    /// adoption; it expires when the driver lands.
-    #[allow(dead_code)]
+    /// carries the same call for the versioned population driver.
     // The install boundary carries every owner term explicitly (candidate,
     // package, inputs, context, source, aliases, admitted version) so no
     // authority term hides inside a bundle; the arity lint is allowed for
@@ -376,12 +373,11 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// so a refreshed Governor never inherits a catalogue write plus receipt
     /// bound to a fence it already fenced.
     ///
-    /// No in-tree Governor driver calls the composed delivery act yet; the
-    /// composition seam
+    /// Composed delivery act: the injector call
+    /// ([`inject_hotset`](Self::inject_hotset)) drives this with the
+    /// driver-assembled act, and the composition seam
     /// ([`DaemonComposition::skill_run_install_to_receipt`](super::DaemonComposition::skill_run_install_to_receipt))
-    /// has landed for that driver. The allowance covers exactly that pending
-    /// adoption; it expires when the driver lands.
-    #[allow(dead_code)]
+    /// carries the same call for the delivery-act driver.
     pub(crate) fn run_install_to_receipt(
         &self,
         act: VersionedDeliveryAct<'_>,
@@ -437,11 +433,12 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// injector carries to the receiver. Synchronous: each step takes and
     /// drops the guard in a closed scope.
     ///
-    /// No in-tree Hotset transport calls this yet; the composition seam
+    /// Injector call entry: the decoded-intake drive
+    /// ([`ingest_wire_intake`](Self::ingest_wire_intake)) assembles the act
+    /// from the intake plus driver-observed terms and drives it here, and
+    /// the composition seam
     /// ([`DaemonComposition::skill_inject_hotset`](super::DaemonComposition::skill_inject_hotset))
-    /// has landed for that lane. The allowance covers exactly that pending
-    /// adoption; it expires when the lane lands.
-    #[allow(dead_code)]
+    /// carries the same call for the Hotset transport lane.
     pub(crate) fn inject_hotset(
         &self,
         request: SkillHotsetRequest<'_>,
@@ -525,7 +522,6 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// Driven by the runtime Hotset injector caller with its own approval
     /// handle: a non-blank approval never comes from a Hotset identity alone.
     /// Synchronous: the guard is taken and dropped in a closed scope.
-    #[allow(dead_code)]
     pub(crate) fn deliver_hotset(
         &self,
         hotset_id: String,
@@ -595,7 +591,6 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// left untouched; already-stale entries report no change. Returns the
     /// count of newly staled entries. Synchronous: each guard is taken and
     /// dropped in a closed scope and never crosses an await.
-    #[allow(dead_code)]
     pub(crate) fn reconcile_tool_basis(
         &self,
         source: &dyn CanonicalToolSource,
@@ -670,7 +665,7 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// Receipt and ack travel by value, mirroring the `SkillLifecycleApi`
     /// display boundary: the injector caller relinquishes the pair it acted
     /// on instead of retaining an alias into the guarded display.
-    #[allow(dead_code, clippy::needless_pass_by_value)]
+    #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn acknowledge_and_display(
         &self,
         skill_id: &str,
@@ -705,12 +700,12 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// is never synthesized here. Synchronous: the guard never crosses an
     /// await.
     ///
-    /// No in-tree Governor driver calls the drift-gated display yet; the
-    /// composition seam
-    /// ([`DaemonComposition::skill_acknowledge_and_display_versioned`](super::DaemonComposition::skill_acknowledge_and_display_versioned))
-    /// has landed for that driver. The allowance covers exactly that pending
-    /// adoption; it expires when the driver lands.
-    #[allow(dead_code, clippy::needless_pass_by_value)]
+    /// Drift-gated display entry: the receiver-ack drive
+    /// ([`DaemonComposition::skill_carry_receipt_to_display`](super::DaemonComposition::skill_carry_receipt_to_display),
+    /// reached from the skill-pair poller) and the agent-bridge port
+    /// (`BridgeSkillForwarder::display_skill`) drive this with the issued
+    /// receipt plus receiver ack under the live tool-owner view.
+    #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn acknowledge_and_display_versioned(
         &self,
         skill_id: &str,
