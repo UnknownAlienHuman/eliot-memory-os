@@ -373,6 +373,8 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "agent_activation_reconcile" => "agent_activation_reconcile",
         "local_read_claim" => "local_read_claim",
         "local_read_result" => "local_read_result",
+        "campaign_packet_claim" => "campaign_packet_claim",
+        "campaign_packet_result" => "campaign_packet_result",
         "task_controller_claim" => "task_controller_claim",
         "task_controller_result" => "task_controller_result",
         "agent_host_request_submit" => "agent_host_request_submit",
@@ -729,6 +731,11 @@ fn campaign_source_publications_for_transition(
     let mut by_role = BTreeMap::new();
     for publication in &publications {
         publication.validate().map_err(|error| error.to_string())?;
+        if publication.read_receipt.read_state_fence != transition.state_fence {
+            return Err(
+                "campaign source publication is not bound to the admitted read fence".into(),
+            );
+        }
         let record = &publication.record;
         match &publication.state {
             eliot_store_api::CampaignSourcePublicationState::NewRevision { .. }
@@ -845,7 +852,11 @@ fn campaign_source_publications_for_transition(
             history_count = history_count.saturating_add(publication.record.history_plans.len());
             for history in &publication.record.history_plans {
                 history
-                    .validate_for_source(recipe.campaign_id.as_str(), &publication.record.owner_id)
+                    .validate_for_source_at_fence(
+                        recipe.campaign_id.as_str(),
+                        &publication.record.owner_id,
+                        &transition.state_fence,
+                    )
                     .map_err(|error| error.to_string())?;
             }
         }
@@ -1430,6 +1441,72 @@ impl KernelComposition {
                     let body: HostRequestResultBody = serde_json::from_value(result_value)
                         .map_err(|_| TransportError::SessionFenced)?;
                     match self.submit_local_read_result(session, &body) {
+                        Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
+                            Ok(Self::accepted_daemon_response())
+                        }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
+                            observation,
+                        )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Err(TransportError::Timeout) => {
+                            Ok(Self::expired_activation_daemon_response())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "campaign_packet_claim" => {
+                // Campaign packets have their own closed queue and attempt
+                // ledger. This route never scans the `eliot.query` queue and
+                // never derives evidence-pack selectors from packet material.
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_campaign_packet_pair(session)
+                        .map(|pair| match pair {
+                            Some((envelope, tool, attempt)) => serde_json::json!({
+                                "status": "known",
+                                "value": {
+                                    "pair": {
+                                        "envelope": envelope,
+                                        "tool": tool,
+                                        "attempt": attempt,
+                                    }
+                                },
+                                "recovery": null,
+                            }),
+                            None => serde_json::json!({
+                                "status": "known",
+                                "value": { "pair": null },
+                                "recovery": null,
+                            }),
+                        })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "campaign_packet_result" => {
+                // A packet result is submitted through the packet queue only;
+                // the shared result gate still proves the exact attempt,
+                // envelope fence, owner publication binding, and digest.
+                #[cfg(windows)]
+                {
+                    let result_value = payload
+                        .get("result")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let body: HostRequestResultBody = serde_json::from_value(result_value)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    match self.submit_campaign_packet_result(session, &body) {
                         Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
                             Ok(Self::accepted_daemon_response())
                         }
@@ -3323,25 +3400,22 @@ impl KernelComposition {
         // validation is pure, so a changed payload digest, a forged
         // descriptor, or a malformed selector never reaches Gateway IO.
         let admission = host_request_route::check_local_read_admission(&envelope, &tool)?;
+        let selectors = match admission {
+            host_request_route::LocalReadAdmission::Query(selectors) => selectors,
+            host_request_route::LocalReadAdmission::CampaignPacket { .. } => {
+                // `local_read` is the query-only Gateway leg. A campaign
+                // packet is served only by the dedicated packet claim/compile/
+                // result flight; admitting it here would risk reinterpreting
+                // packet material as `GetEvidencePack` selectors.
+                return Err(TransportError::SessionFenced);
+            }
+        };
         let (receipt, record) = self.admit_host_request_envelope(&envelope)?;
         if let Some(replayed) =
             host_request_route::local_read_replay_response(&receipt, &record, &envelope)?
         {
             return Ok(replayed);
         }
-        let selectors = match admission {
-            host_request_route::LocalReadAdmission::Query(selectors) => selectors,
-            host_request_route::LocalReadAdmission::CampaignPacket { .. } => {
-                // The packet compiler is a daemon-owned, task-bound step. A
-                // direct synchronous local_read request still receives an
-                // honest admission response and is queued for the production
-                // poller; it never becomes a GetEvidencePack request.
-                self.enqueue_local_read_pair(&envelope, &tool)?;
-                return Ok(host_request_route::host_request_admitted_response(
-                    &receipt, &record,
-                ));
-            }
-        };
         // No bypass: the presented attempt must be the live claim-record
         // attempt owned by the presenting session before any Gateway IO. A
         // replaced, retired, or revoked attempt fails closed here. Full

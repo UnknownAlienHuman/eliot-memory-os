@@ -200,13 +200,7 @@ pub fn validate_campaign_packet_pair(
     }
     .validate()
     .map_err(|_| CampaignPacketError::InvalidInvocation)?;
-    if envelope.identity.capability != "eliot.packet"
-        || tool
-            .as_object()
-            .and_then(|object| object.get("name"))
-            .and_then(Value::as_str)
-            != Some("eliot.packet")
-    {
+    if envelope.identity.capability != "eliot.packet" || !is_campaign_packet_tool(tool) {
         return Err(CampaignPacketError::InvalidInvocation);
     }
     if envelope.state_fence != *retained_kernel_fence {
@@ -388,30 +382,31 @@ async fn resolve_compile_and_bind_result(
             );
         }
     };
-    let history_plan_set = match build_history_plan_set(&recipe, &resolved.current_records) {
-        Ok(history) => history,
-        Err(_) => {
-            return campaign_packet_result_body(
-                envelope,
-                attempt,
-                CampaignPacketResponse {
-                    outcome: CampaignPacketOutcome::Blocked,
-                    completeness: Completeness::Blocked,
-                    view: None,
-                    compiled_context: None,
-                    gaps: vec![CampaignPacketGap {
-                        code: CampaignPacketGapCode::HistoryPlanUnavailable,
-                        role: None,
-                    }],
-                    missing_roles: missing_roles(&resolved.resolutions),
-                    stale_roles: stale_roles(&resolved.resolutions),
-                    blocked_roles: blocked_roles(&resolved.resolutions),
-                    prior_view_reused: false,
-                    prior_view_rejected_stale: false,
-                },
-            );
-        }
-    };
+    let history_plan_set =
+        match build_history_plan_set(&recipe, &resolved.current_records, &binding.state_fence) {
+            Ok(history) => history,
+            Err(_) => {
+                return campaign_packet_result_body(
+                    envelope,
+                    attempt,
+                    CampaignPacketResponse {
+                        outcome: CampaignPacketOutcome::Blocked,
+                        completeness: Completeness::Blocked,
+                        view: None,
+                        compiled_context: None,
+                        gaps: vec![CampaignPacketGap {
+                            code: CampaignPacketGapCode::HistoryPlanUnavailable,
+                            role: None,
+                        }],
+                        missing_roles: missing_roles(&resolved.resolutions),
+                        stale_roles: stale_roles(&resolved.resolutions),
+                        blocked_roles: blocked_roles(&resolved.resolutions),
+                        prior_view_reused: false,
+                        prior_view_rejected_stale: false,
+                    },
+                );
+            }
+        };
     let current_history_plans = history_plan_set.compiler_inputs();
     let observed_at_ms = current_unix_ms()?;
     if u64::try_from(observed_at_ms).unwrap_or(u64::MAX) >= attempt.expires_at_unix_ms {
@@ -1125,12 +1120,17 @@ fn collect_positions(resolved: &ResolvedCampaignSources) -> Vec<CampaignPosition
 fn build_history_plan_set(
     recipe: &LearningStateViewRecipe,
     current_records: &[CampaignSourceRecord],
+    state_fence: &StateFence,
 ) -> Result<ValidatedHistoryPlans, String> {
     let mut records = Vec::new();
     for source in current_records {
         for record in &source.history_plans {
             record
-                .validate_for_source(recipe.campaign_id.as_str(), &source.owner_id)
+                .validate_for_source_at_fence(
+                    recipe.campaign_id.as_str(),
+                    &source.owner_id,
+                    state_fence,
+                )
                 .map_err(|_| CampaignPacketError::OwnerReadUnavailable.to_string())?;
             records.push(record.clone());
         }

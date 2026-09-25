@@ -2211,6 +2211,10 @@ impl RedbRecoveryStore {
 
     /// Atomically reserves one or more source-head CAS operations before the
     /// corresponding canonical owner transition is applied.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "source-head reservation keeps CAS, replay, and pending-state joins in one transaction"
+    )]
     pub fn reserve_campaign_source_publications(
         &self,
         operation_id: &eliot_contracts::OperationId,
@@ -2340,6 +2344,10 @@ impl RedbRecoveryStore {
 
     /// Commits all reserved immutable source rows and current heads in one
     /// ORS transaction after exact canonical receipt validation.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "source-head commit keeps receipt, reservation, row, and head joins atomic"
+    )]
     pub fn commit_campaign_source_publications(
         &self,
         operation_id: &eliot_contracts::OperationId,
@@ -2418,7 +2426,6 @@ impl RedbRecoveryStore {
                         // A current reference is an observation only. The
                         // exact head and immutable row are already durable;
                         // neither table is advanced or rewritten here.
-                        continue;
                     }
                     eliot_store_api::CampaignSourcePublicationState::NewRevision { .. } => {
                         if current_head.as_ref() == Some(&publication.next_head())
@@ -2504,6 +2511,10 @@ impl RedbRecoveryStore {
     /// Loads a requested immutable source row and its current head under one
     /// durable read snapshot. Old exact references return `STALE` together
     /// with the newer head; request selectors never create owner evidence.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "source readback keeps row, head, digest, and read-receipt joins under one snapshot"
+    )]
     pub fn load_campaign_source_revision(
         &self,
         lookup: &eliot_store_api::CampaignSourceRevisionLookup,
@@ -2554,6 +2565,7 @@ impl RedbRecoveryStore {
             record.role == lookup.role
                 && record.owner_id == lookup.owner_id
                 && record.record_id == lookup.record_id
+                && record.content_digest == requested_digest
                 && lookup
                     .expected_revision
                     .as_ref()
@@ -2577,6 +2589,12 @@ impl RedbRecoveryStore {
         head_record
             .validate()
             .map_err(|error| OrsError::Contract(error.to_string()))?;
+        if !campaign_record_matches_head(&head_record, &head) {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "campaign_source_record",
+                reason: "current source head does not match its immutable owner row".to_owned(),
+            });
+        }
         let read_receipt = source
             .as_ref()
             .map(|record| {
@@ -9394,6 +9412,19 @@ fn campaign_source_key_parts(
 
 fn campaign_source_record_key(source_key: &str, content_digest: &str) -> String {
     format!("{source_key}::{content_digest}")
+}
+
+fn campaign_record_matches_head(
+    record: &eliot_store_api::CampaignSourceRecord,
+    head: &eliot_store_api::CampaignSourceHead,
+) -> bool {
+    record.role == head.role
+        && record.owner_id == head.owner_id
+        && record.record_id == head.record_id
+        && record.revision == head.revision
+        && record.content_digest == head.content_digest
+        && record.recorded_state_fence == head.recorded_state_fence
+        && record.slot_projection_digests == head.slot_projection_digests
 }
 
 fn campaign_source_identity_conflict(key: &str) -> OrsError {

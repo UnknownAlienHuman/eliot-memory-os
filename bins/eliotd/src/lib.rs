@@ -46,7 +46,7 @@ pub mod campaign_task_controller;
 
 pub use campaign_context_owner::build_context_owner_publications;
 pub use campaign_evaluation_owner::build_product_evaluation_publications;
-pub use campaign_owner_matrix::assemble_campaign_owner_publications;
+pub use campaign_owner_matrix::assemble_authenticated_campaign_owner_publications;
 pub use campaign_task_controller::serve_task_controller_claim;
 pub mod canonical_config_precedence;
 mod capability_admission;

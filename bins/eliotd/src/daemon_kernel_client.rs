@@ -1080,7 +1080,44 @@ impl DaemonKernelClient {
             )
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        parse_local_read_claimed_pair(&value).map_err(super::DaemonError::Kernel)
+        let pair = parse_local_read_claimed_pair(&value).map_err(super::DaemonError::Kernel)?;
+        if pair.as_ref().is_some_and(|(envelope, tool, _)| {
+            envelope.identity.capability != "eliot.query"
+                || tool.get("name").and_then(serde_json::Value::as_str) != Some("eliot.query")
+        }) {
+            return Err(super::DaemonError::Kernel(
+                "Kernel local_read_claim returned a non-query pair".to_owned(),
+            ));
+        }
+        Ok(pair)
+    }
+
+    /// Claims one queued admitted `eliot.packet` pair from the dedicated
+    /// campaign-packet queue. The query poller cannot consume this claim.
+    #[cfg(windows)]
+    pub async fn claim_campaign_packet_pair_async(
+        &self,
+    ) -> Result<
+        Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>,
+        super::DaemonError,
+    > {
+        let value = self
+            .transact_async(
+                "campaign_packet_claim",
+                serde_json::json!({ "operation": "campaign_packet_claim" }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let pair = parse_local_read_claimed_pair(&value).map_err(super::DaemonError::Kernel)?;
+        if pair.as_ref().is_some_and(|(envelope, tool, _)| {
+            envelope.identity.capability != "eliot.packet"
+                || tool.get("name").and_then(serde_json::Value::as_str) != Some("eliot.packet")
+        }) {
+            return Err(super::DaemonError::Kernel(
+                "Kernel campaign_packet_claim returned a non-packet pair".to_owned(),
+            ));
+        }
+        Ok(pair)
     }
 
     /// Claims one queued admitted Task Controller invocation and its distinct
@@ -1123,6 +1160,25 @@ impl DaemonKernelClient {
     }
 
     /// Submits one result for the exact admitted Task Controller attempt.
+    /// Submits a compiled campaign-packet result through its dedicated queue
+    /// route. The query result operation cannot consume this body.
+    #[cfg(windows)]
+    pub async fn submit_campaign_packet_result_async(
+        &self,
+        body: &HostRequestResultBody,
+    ) -> Result<LocalReadSubmitOutcome, super::DaemonError> {
+        body.validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async(
+                "campaign_packet_result",
+                serde_json::json!({ "result": body }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_local_read_submit_outcome(&value).map_err(super::DaemonError::Kernel)
+    }
+
     #[cfg(windows)]
     pub async fn submit_task_controller_result_async(
         &self,
@@ -1183,6 +1239,11 @@ impl DaemonKernelClient {
         };
         pair.validate()
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if pair.envelope.identity.capability != "eliot.query" {
+            return Err(KernelPortError::Contract(
+                "campaign packets cannot use the query-only local_read leg".to_owned(),
+            ));
+        }
         attempt
             .validate()
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;

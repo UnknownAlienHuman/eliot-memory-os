@@ -99,14 +99,17 @@ pub enum TaskControllerAction {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TaskControllerCampaignOwnerMaterials {
-    /// Exact prior Context delivery snapshot selected by the owner route.
+    /// Optional selector/body slot for the Context owner. It is never used as
+    /// publication authority; the daemon reads the current owner row instead.
     pub prior_delivery: Value,
-    /// Exact product-evaluation publication bundle emitted by its owner.
+    /// Optional selector/body slot for the evaluator owner. It is never used
+    /// as publication authority; the daemon reads the current owner row instead.
     pub evaluation: Value,
-    /// Current owner heads observed immediately before publication. A missing
-    /// entry is an authenticated absence observation, never a guessed head.
+    /// Reserved owner-head selector slot. It must be empty: the daemon reads
+    /// current heads through its authenticated Kernel route.
     pub source_heads: Vec<Value>,
-    /// Remaining owner-issued source inputs for the closed role denominator.
+    /// Reserved owner-row selector slot. It must be empty: caller rows cannot
+    /// become owner evidence.
     pub remaining_owner_inputs: Vec<Value>,
 }
 
@@ -210,6 +213,12 @@ impl TaskControllerInvocation {
                     head,
                     "task_controller_invocation.campaign_owner_materials.source_heads",
                 )?;
+            }
+            if !materials.source_heads.is_empty() || !materials.remaining_owner_inputs.is_empty() {
+                return Err(ProtocolError::InvalidField {
+                    field: "task_controller_invocation.campaign_owner_materials",
+                    reason: "caller-supplied owner heads and rows are not authenticated evidence",
+                });
             }
             if materials.remaining_owner_inputs.len() > 26 {
                 return Err(ProtocolError::InvalidField {

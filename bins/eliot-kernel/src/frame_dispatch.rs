@@ -894,6 +894,8 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "local_read"
             | "local_read_claim"
             | "local_read_result"
+            | "campaign_packet_claim"
+            | "campaign_packet_result"
             | "task_controller_claim"
             | "task_controller_result"
     )

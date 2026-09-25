@@ -972,6 +972,10 @@ impl CampaignSourceDocument {
     /// owner crates before publication, while the remaining owner families use
     /// the closed [`CampaignOwnerProjectionBody`] envelope here. A schema tag
     /// alone is never owner proof.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the closed schema validator keeps owner-specific identity checks in one auditable dispatch"
+    )]
     pub fn validate_for_role(&self, role: CampaignSourceRole) -> Result<(), StoreError> {
         use CampaignSourceDocumentSchema as D;
         self.validate()?;
@@ -1054,7 +1058,6 @@ impl CampaignSourceDocument {
                 })?;
                 let required = match self.schema {
                     D::EvaluationResults => "report_id",
-                    D::EvaluatorHoldout => "plan_id",
                     _ => "plan_id",
                 };
                 if object.get(required).is_none() {
@@ -1105,6 +1108,10 @@ impl CampaignSourceDocument {
     /// owner documents are checked at their neutral identity boundary here;
     /// their owner crate performs the deeper native contract validation before
     /// constructing the document.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "owner-row binding is validated as one closed cross-schema identity proof"
+    )]
     pub fn validate_owner_binding(
         &self,
         role: CampaignSourceRole,
@@ -1218,14 +1225,11 @@ impl CampaignSourceDocument {
                         });
                     }
                 };
-                let expected_revision = match revision {
-                    CampaignOwnerRevision::Task(value) => value,
-                    _ => {
-                        return Err(StoreError::InvalidField {
-                            field: "campaign_source.learning_state_view_recipe.revision",
-                            reason: "TaskPlan requires a Task revision",
-                        });
-                    }
+                let CampaignOwnerRevision::Task(expected_revision) = revision else {
+                    return Err(StoreError::InvalidField {
+                        field: "campaign_source.learning_state_view_recipe.revision",
+                        reason: "TaskPlan requires a Task revision",
+                    });
                 };
                 if owner_id.as_str() != TASK_CONTROLLER_CAMPAIGN_OWNER_ID
                     || recipe.binding.task_id.as_str() != expected_task
@@ -1385,7 +1389,7 @@ impl CampaignSourceDocument {
                 let expected_fence: Option<StateFence> = object
                     .get("state_fence")
                     .cloned()
-                    .map(|value| serde_json::from_value(value))
+                    .map(serde_json::from_value)
                     .transpose()
                     .map_err(|error| StoreError::Serialization(error.to_string()))?;
                 let record_text = campaign_record_id_text(record_id);
@@ -1855,6 +1859,10 @@ impl CampaignHistoryPlanRecord {
     }
 
     /// Validate exact plan bytes and bounded result handles/digests.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "history validation keeps plan, bounded-result, and digest joins together"
+    )]
     pub fn validate(&self) -> Result<(), StoreError> {
         if !self.plan.is_object() {
             return Err(StoreError::InvalidField {
@@ -2606,10 +2614,7 @@ impl CampaignSourcePublication {
 
     /// Attach an exact predecessor CAS head to a new-revision publication.
     /// A current-reference publication cannot be rewritten.
-    pub fn with_expected_head(
-        self,
-        expected_head: CampaignSourceHead,
-    ) -> Result<Self, StoreError> {
+    pub fn with_expected_head(self, expected_head: CampaignSourceHead) -> Result<Self, StoreError> {
         match self.state {
             CampaignSourcePublicationState::CurrentReference { current_head } => {
                 if current_head != expected_head {
@@ -2618,8 +2623,10 @@ impl CampaignSourcePublication {
                         reason: "a current reference cannot be rewritten as a new revision",
                     });
                 }
-                let read_receipt =
-                    CampaignOwnerReadReceipt::from_record(&self.record, &self.read_receipt.read_state_fence)?;
+                let read_receipt = CampaignOwnerReadReceipt::from_record(
+                    &self.record,
+                    &self.read_receipt.read_state_fence,
+                )?;
                 let publication = Self {
                     state: CampaignSourcePublicationState::CurrentReference { current_head },
                     read_receipt,
@@ -2628,14 +2635,12 @@ impl CampaignSourcePublication {
                 publication.validate()?;
                 Ok(publication)
             }
-            CampaignSourcePublicationState::NewRevision { .. } => {
-                Self::from_observed_head(
-                    self.publisher,
-                    self.record,
-                    Some(expected_head),
-                    &self.read_receipt.read_state_fence,
-                )
-            }
+            CampaignSourcePublicationState::NewRevision { .. } => Self::from_observed_head(
+                self.publisher,
+                self.record,
+                Some(expected_head),
+                &self.read_receipt.read_state_fence,
+            ),
         }
     }
 
@@ -2957,7 +2962,11 @@ fn campaign_source_identity_matches(
                 CampaignOwnerRevision::Task(_)
             )
         ),
-        R::ContextDelivery => matches!(
+        R::ContextDelivery
+        | R::FrozenAnchor
+        | R::StableHarness
+        | R::TaskFamilyHarness
+        | R::ActiveOverlay => matches!(
             (record_id, revision),
             (
                 CampaignOwnerRecordId::Resource(_),
@@ -2968,13 +2977,6 @@ fn campaign_source_identity_matches(
             (record_id, revision),
             (
                 CampaignOwnerRecordId::Contract(_),
-                CampaignOwnerRevision::ResourceSnapshot(_)
-            )
-        ),
-        R::FrozenAnchor | R::StableHarness | R::TaskFamilyHarness | R::ActiveOverlay => matches!(
-            (record_id, revision),
-            (
-                CampaignOwnerRecordId::Resource(_),
                 CampaignOwnerRevision::ResourceSnapshot(_)
             )
         ),
@@ -3003,6 +3005,7 @@ fn campaign_identity_matches(record: &CampaignSourceRecord) -> bool {
         R::AttemptLineageLatestOutcomes
         | R::MemoryProjection
         | R::ArtifactProjection
+        | R::ExperienceProjection
         | R::CurrentPosition
         | R::ExperiencePosition
         | R::AdaptationPosition
@@ -3042,7 +3045,11 @@ fn campaign_identity_matches(record: &CampaignSourceRecord) -> bool {
                 CampaignOwnerRevision::Task(_)
             )
         ),
-        R::ContextDelivery => matches!(
+        R::ContextDelivery
+        | R::FrozenAnchor
+        | R::StableHarness
+        | R::TaskFamilyHarness
+        | R::ActiveOverlay => matches!(
             (&record.record_id, &record.revision),
             (
                 CampaignOwnerRecordId::Resource(_),
@@ -3053,20 +3060,6 @@ fn campaign_identity_matches(record: &CampaignSourceRecord) -> bool {
             (&record.record_id, &record.revision),
             (
                 CampaignOwnerRecordId::Contract(_),
-                CampaignOwnerRevision::ResourceSnapshot(_)
-            )
-        ),
-        R::ExperienceProjection => matches!(
-            (&record.record_id, &record.revision),
-            (
-                CampaignOwnerRecordId::Resource(_),
-                CampaignOwnerRevision::Counter(_)
-            )
-        ),
-        R::FrozenAnchor | R::StableHarness | R::TaskFamilyHarness | R::ActiveOverlay => matches!(
-            (&record.record_id, &record.revision),
-            (
-                CampaignOwnerRecordId::Resource(_),
                 CampaignOwnerRevision::ResourceSnapshot(_)
             )
         ),
@@ -3219,10 +3212,15 @@ impl CampaignSourceRevisionRead {
                     (Some(source), Some(receipt)) => {
                         if !receipt.binds_record(source)
                             || receipt.read_state_fence != self.read_state_fence
+                            || self.current_head.as_ref().is_none_or(|head| {
+                                source.role != head.role
+                                    || source.owner_id != head.owner_id
+                                    || source.record_id != head.record_id
+                            })
                         {
                             return Err(StoreError::InvalidField {
                                 field: "campaign_source_read.read_receipt",
-                                reason: "STALE source and read receipt do not agree",
+                                reason: "STALE source, current head, and read receipt do not agree",
                             });
                         }
                     }
