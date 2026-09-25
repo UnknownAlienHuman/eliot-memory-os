@@ -25,7 +25,11 @@ pub enum MemoryLifecycleState {
     Stale,
 }
 
+/// Decoder: derived and closed. The kept `#[serde(default)]` fields are optional
+/// effectiveness/approval data that decode as absent; every identity, reason,
+/// operator, scope and admission-effect field stays required.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForgettingPolicy {
     pub policy_id: String,
     pub project_id: ProjectId,
@@ -130,6 +134,7 @@ pub enum MemoryEcologyDecision {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReactivationCondition {
     pub condition_id: String,
     pub description: String,
@@ -140,6 +145,7 @@ pub struct ReactivationCondition {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecisionDeltaRecord {
     pub decision_ref: String,
     pub changed_outcome: bool,
@@ -148,7 +154,12 @@ pub struct DecisionDeltaRecord {
     pub observed_at: OffsetDateTime,
 }
 
+/// Decoder: derived and closed. `decision` stays required on the wire: a missing
+/// field must not decode into `KeepHot` admission. The zero `#[serde(default)]`
+/// counters keep historical records readable and can only understate observed
+/// benefit, never fabricate it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryVitalityScore {
     pub memory_ref: String,
     pub project_id: ProjectId,
@@ -182,7 +193,6 @@ pub struct MemoryVitalityScore {
     pub utility_millis: i64,
     #[serde(default)]
     pub harm_millis: i64,
-    #[serde(default)]
     pub decision: MemoryEcologyDecision,
     // Compatibility projections for older lifecycle reports. Current decisions use the fixed
     // point fields above.
@@ -194,12 +204,16 @@ pub struct MemoryVitalityScore {
     pub computed_at: OffsetDateTime,
 }
 
+/// Decoder: derived and closed. `decision` stays required on the wire: a missing
+/// field must not decode into `KeepHot` admission. The zero
+/// `activation_pressure_millis` default keeps older records readable and can
+/// only understate pressure, never fabricate it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryGravity {
     pub memory_ref: String,
     #[serde(default)]
     pub activation_pressure_millis: i64,
-    #[serde(default)]
     pub decision: MemoryEcologyDecision,
     // Compatibility projection for I0 reports.
     pub activation_pressure: f64,
@@ -212,6 +226,7 @@ pub struct MemoryGravity {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryStateTransition {
     pub transition_id: String,
     pub project_id: ProjectId,
@@ -237,6 +252,7 @@ pub struct MemoryStateTransition {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SupersessionReceipt {
     pub supersession_id: String,
     pub project_id: ProjectId,
@@ -249,6 +265,7 @@ pub struct SupersessionReceipt {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SuppressionReceipt {
     pub suppression_id: String,
     pub project_id: ProjectId,
@@ -261,6 +278,7 @@ pub struct SuppressionReceipt {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DemotionReceipt {
     pub demotion_id: String,
     pub project_id: ProjectId,
@@ -274,6 +292,7 @@ pub struct DemotionReceipt {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArchiveReceipt {
     pub archive_id: String,
     pub project_id: ProjectId,
@@ -284,7 +303,11 @@ pub struct ArchiveReceipt {
     pub created_at: OffsetDateTime,
 }
 
+/// Decoder: derived and closed. The kept `#[serde(default)]` fields only preserve
+/// protection for older records (`Open`, pinned) or decode release data as
+/// absent; none of them can resolve pressure or admit suppression.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MinorityPressureRecord {
     pub minority_record_id: String,
     pub project_id: ProjectId,
@@ -322,6 +345,7 @@ pub enum MinorityPressureStatus {
 pub type MemoryAuditSuspension = MinorityPressureRecord;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryTrajectoryCorrectness {
     pub trajectory_id: String,
     pub target_ref: String,
@@ -335,6 +359,7 @@ pub struct MemoryTrajectoryCorrectness {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilityMemoryIndex {
     pub index_id: String,
     pub project_id: ProjectId,
@@ -354,6 +379,7 @@ pub struct CapabilityMemoryIndex {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryInfluenceReport {
     pub report_id: String,
     pub project_id: ProjectId,
@@ -397,6 +423,7 @@ pub enum MemoryLifecycleDecision {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryLifecyclePacketView {
     pub suppressed_refs: Vec<String>,
     pub demoted_refs: Vec<String>,
@@ -420,6 +447,7 @@ impl Default for MemoryLifecyclePacketView {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryLifecycleStatusReport {
     pub component: String,
     pub project_id: ProjectId,
@@ -431,6 +459,7 @@ pub struct MemoryLifecycleStatusReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryLifecycleProposalReport {
     pub component: String,
     pub policy: ForgettingPolicy,
@@ -438,6 +467,7 @@ pub struct MemoryLifecycleProposalReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryLifecycleApplyReport {
     pub component: String,
     pub decision: MemoryLifecycleDecision,
@@ -446,6 +476,7 @@ pub struct MemoryLifecycleApplyReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryLifecycleReport {
     pub component: String,
     pub statuses: Vec<MemoryLifecycleStatusReport>,
@@ -456,6 +487,7 @@ pub struct MemoryLifecycleReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryPressureReport {
     pub duplicate_pressure: String,
     pub stale_activation_pressure: String,
