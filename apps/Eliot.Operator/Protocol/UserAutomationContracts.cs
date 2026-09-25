@@ -1,3 +1,6 @@
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace Eliot.Operator.Protocol;
@@ -19,6 +22,12 @@ namespace Eliot.Operator.Protocol;
 public abstract record UserAutomationOperation
 {
     public abstract void Validate();
+
+    /// True when the operation is an effect rather than a read. Effects
+    /// follow the owner's admission and approval policy and retain one
+    /// operation identity until a terminal receipt; reads execute immediately
+    /// inside existing authority and retain nothing.
+    public abstract bool IsEffect { get; }
 }
 
 public sealed record UserAutomationCreateOperation(
@@ -26,6 +35,8 @@ public sealed record UserAutomationCreateOperation(
     : UserAutomationOperation
 {
     public override void Validate() => Revision.Validate();
+
+    public override bool IsEffect => true;
 }
 
 public sealed record UserAutomationListOperation(
@@ -33,6 +44,8 @@ public sealed record UserAutomationListOperation(
     : UserAutomationOperation
 {
     public override void Validate() { }
+
+    public override bool IsEffect => false;
 }
 
 public sealed record UserAutomationStatusOperation(
@@ -40,6 +53,8 @@ public sealed record UserAutomationStatusOperation(
     : UserAutomationOperation
 {
     public override void Validate() => UserAutomationContract.RequireText(AutomationId, "automation_id");
+
+    public override bool IsEffect => false;
 }
 
 public sealed record UserAutomationHistoryOperation(
@@ -47,6 +62,8 @@ public sealed record UserAutomationHistoryOperation(
     : UserAutomationOperation
 {
     public override void Validate() => UserAutomationContract.RequireText(AutomationId, "automation_id");
+
+    public override bool IsEffect => false;
 }
 
 public sealed record UserAutomationPauseOperation(
@@ -55,6 +72,8 @@ public sealed record UserAutomationPauseOperation(
     : UserAutomationOperation
 {
     public override void Validate() => UserAutomationContract.RequireIdentity(AutomationId, AutomationRevision);
+
+    public override bool IsEffect => true;
 }
 
 public sealed record UserAutomationResumeOperation(
@@ -63,6 +82,8 @@ public sealed record UserAutomationResumeOperation(
     : UserAutomationOperation
 {
     public override void Validate() => UserAutomationContract.RequireIdentity(AutomationId, AutomationRevision);
+
+    public override bool IsEffect => true;
 }
 
 public sealed record UserAutomationEditOperation(
@@ -81,6 +102,8 @@ public sealed record UserAutomationEditOperation(
             throw new InvalidOperationException("UserAutomation edit must supersede one distinct revision of the same automation.");
         }
     }
+
+    public override bool IsEffect => true;
 }
 
 public sealed record UserAutomationRunNowOperation(
@@ -94,6 +117,8 @@ public sealed record UserAutomationRunNowOperation(
         UserAutomationContract.RequireIdentity(AutomationId, AutomationRevision);
         UserAutomationContract.RequireText(Nonce, "nonce");
     }
+
+    public override bool IsEffect => true;
 }
 
 public sealed record UserAutomationRemoveOperation(
@@ -102,6 +127,8 @@ public sealed record UserAutomationRemoveOperation(
     : UserAutomationOperation
 {
     public override void Validate() => UserAutomationContract.RequireIdentity(AutomationId, AutomationRevision);
+
+    public override bool IsEffect => true;
 }
 
 public sealed record UserAutomationInspectLastFailureOperation(
@@ -109,6 +136,8 @@ public sealed record UserAutomationInspectLastFailureOperation(
     : UserAutomationOperation
 {
     public override void Validate() => UserAutomationContract.RequireText(AutomationId, "automation_id");
+
+    public override bool IsEffect => false;
 }
 
 /// Exact authenticated UserAutomation front-door payload. The named route
@@ -119,13 +148,33 @@ public sealed record UserAutomationOperatorRequest(
     [property: JsonPropertyName("operation")] UserAutomationOperation Operation,
     [property: JsonPropertyName("idempotency_key")] string IdempotencyKey)
 {
+    /// The retry-stable identity of one typed operation. It is derived from
+    /// the exact canonical operation bytes, so a lost response, a transport
+    /// reconnect or an operator resubmission of the same typed operation
+    /// carries the SAME identity and cannot create a second logical mutation.
+    /// Two genuinely different operations always differ, because the
+    /// distinguishing field is part of the canonical bytes.
+    public static string DeriveIdempotencyKey(UserAutomationOperation operation)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        operation.Validate();
+        var canonical = JsonSerializer.Serialize(operation, OperatorJson.Writer);
+        var bytes = Encoding.UTF8.GetBytes(canonical);
+        if (bytes.Length > OperatorProtocol.MaxRetainedInputChars)
+        {
+            throw new InvalidOperationException("typed UserAutomation operation exceeds the canonical input bound");
+        }
+        var digest = SHA256.HashData(bytes);
+        return Convert.ToHexString(digest.AsSpan(0, 16)).ToLowerInvariant();
+    }
+
     public static UserAutomationOperatorRequest Create(UserAutomationOperation operation) =>
-        new(operation, Guid.NewGuid().ToString("N"));
+        new(operation, DeriveIdempotencyKey(operation));
 
     public void Validate()
     {
         Operation.Validate();
-        UserAutomationContract.RequireText(IdempotencyKey, "idempotency_key");
+        OperatorIntentContract.RequireOperationId(IdempotencyKey);
     }
 }
 
