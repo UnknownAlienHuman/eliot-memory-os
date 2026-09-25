@@ -394,10 +394,7 @@ impl OperationIdentityIssuer {
     /// names the exact transport identity whose outcome is unknown instead of
     /// minting a second one for the same logical operation.
     #[must_use]
-    pub(crate) fn last_issued(
-        &self,
-        operation: BrokerOperation,
-    ) -> Option<DurableIssuedIdentity> {
+    pub(crate) fn last_issued(&self, operation: BrokerOperation) -> Option<DurableIssuedIdentity> {
         self.issued
             .values()
             .filter(|issued| issued.operation == operation.selector())
@@ -437,7 +434,10 @@ impl OperationIdentityIssuer {
             &fence,
             retained.issued_at_ms,
         )?;
-        let key = (retained.operation.clone(), retained.canonical_digest.clone());
+        let key = (
+            retained.operation.clone(),
+            retained.canonical_digest.clone(),
+        );
         if let Some(live) = self.issued.get(&key) {
             return if live == retained {
                 Ok(())
@@ -467,7 +467,9 @@ impl OperationIdentityIssuer {
             )));
         }
         if retained.caller_request_id.as_deref().is_some_and(|caller| {
-            self.by_caller_request.get(caller).is_some_and(|owner| owner != &key)
+            self.by_caller_request
+                .get(caller)
+                .is_some_and(|owner| owner != &key)
                 || self
                     .caller_launch_keys
                     .get(&retained.idempotency_key)

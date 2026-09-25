@@ -671,7 +671,10 @@ pub struct IssuedOperationIdentity {
 impl IssuedOperationIdentity {
     fn validate(&self) -> Result<(), BrokerError> {
         text(&self.operation, "operation_identity.operation")?;
-        hex_digest(&self.canonical_digest, "operation_identity.canonical_digest")?;
+        hex_digest(
+            &self.canonical_digest,
+            "operation_identity.canonical_digest",
+        )?;
         text(&self.request_id, "operation_identity.request_id")?;
         text(&self.idempotency_key, "operation_identity.idempotency_key")?;
         text(&self.cancellation_id, "operation_identity.cancellation_id")?;
@@ -958,9 +961,7 @@ impl UserBroker {
                 .insert(identity.request_id.clone(), identity)
                 .is_some()
             {
-                return Err(BrokerError::Duplicate(
-                    "operation_identity.request_id",
-                ));
+                return Err(BrokerError::Duplicate("operation_identity.request_id"));
             }
         }
         self.issued_operations = issued_operations;
@@ -1489,17 +1490,14 @@ impl UserBroker {
         status: RegistrationStatus,
     ) -> Result<RegistrationReconciliation, BrokerError> {
         let durable = self.load_durable_registration()?;
-        let reconciled = durable
-            .as_ref()
-            .is_some_and(|durable| durable.registration_digest == fenced.registration_digest && durable.status == status);
+        let reconciled = durable.as_ref().is_some_and(|durable| {
+            durable.registration_digest == fenced.registration_digest && durable.status == status
+        });
         if !reconciled {
             return Ok(RegistrationReconciliation::Unresolved(fenced.clone()));
         }
-        let adopted = self.adopt_durable_registration(
-            durable
-                .as_ref()
-                .ok_or(BrokerError::UnknownOutcome)?,
-        )?;
+        let adopted =
+            self.adopt_durable_registration(durable.as_ref().ok_or(BrokerError::UnknownOutcome)?)?;
         self.persist()?;
         Ok(RegistrationReconciliation::Reconciled(adopted))
     }
@@ -1527,11 +1525,8 @@ impl UserBroker {
         if !advanced {
             return Ok(RegistrationReconciliation::Unresolved(current.clone()));
         }
-        let adopted = self.adopt_durable_registration(
-            durable
-                .as_ref()
-                .ok_or(BrokerError::UnknownOutcome)?,
-        )?;
+        let adopted =
+            self.adopt_durable_registration(durable.as_ref().ok_or(BrokerError::UnknownOutcome)?)?;
         self.persist()?;
         Ok(RegistrationReconciliation::Reconciled(adopted))
     }
@@ -1541,9 +1536,7 @@ impl UserBroker {
     /// The durable broker-local epoch only ever moves forward: a snapshot
     /// written before a crash cannot lower the monotonic guard that
     /// [`Self::register`] enforces.
-    fn load_durable_registration(
-        &mut self,
-    ) -> Result<Option<RegistrationReceipt>, BrokerError> {
+    fn load_durable_registration(&mut self) -> Result<Option<RegistrationReceipt>, BrokerError> {
         let snapshot = self
             .durable
             .as_mut()
@@ -1575,7 +1568,9 @@ impl UserBroker {
         let same_identity = current.installation_id == durable.installation_id
             && current.windows_sid == durable.windows_sid
             && current.interactive_session_id == durable.interactive_session_id
-            && current.authority_epoch.is_same_authority(&durable.authority_epoch)
+            && current
+                .authority_epoch
+                .is_same_authority(&durable.authority_epoch)
             && current.fence_id == durable.fence_id;
         if !same_identity {
             return Err(BrokerError::GrantBindingMismatch);

@@ -985,15 +985,17 @@ fn operation_identity_binding_record(
             .to_owned(),
     })?;
     record.request_digest = sha256_hex(
-        &canonical_json_bytes(HOST_REQUEST_IDENTITY_BINDING_LABEL).map_err(|_| {
+        &canonical_json_bytes(&HOST_REQUEST_IDENTITY_BINDING_LABEL).map_err(|_| {
             PortFailure::TransportBindingRejected {
                 reason: "operation identity binding label cannot be canonicalized".to_owned(),
             }
         })?,
     );
-    record.validate().map_err(|_| PortFailure::TransportBindingRejected {
-        reason: "durable operation identity binding is not well-formed".to_owned(),
-    })?;
+    record
+        .validate()
+        .map_err(|_| PortFailure::TransportBindingRejected {
+            reason: "durable operation identity binding is not well-formed".to_owned(),
+        })?;
     Ok(record)
 }
 

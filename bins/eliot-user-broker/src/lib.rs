@@ -36,8 +36,8 @@ use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_user_broker_core::{
     AuthorityPort, BrokerError, BrokerSnapshot, DurableRegistrationPort, HeartbeatReceipt,
     HeartbeatRequest, IssuedOperationIdentity, IssuedOperationIdentityLedger, LaunchGrant,
-    LaunchRequest, LostOperation, PortError, ProcessPort, ProcessStartOutcome,
-    RegistrationReceipt, RequiredProvider, UserBroker,
+    LaunchRequest, LostOperation, PortError, ProcessPort, ProcessStartOutcome, RegistrationReceipt,
+    RequiredProvider, UserBroker,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
