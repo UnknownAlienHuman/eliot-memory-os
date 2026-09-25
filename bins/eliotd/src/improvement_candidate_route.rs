@@ -79,7 +79,7 @@ pub fn route_improvement_candidate(
 ///
 /// Production caller of [`ImprovementOperation::owner`]: Propose/Admit/Promote
 /// resolve to Governor maintenance, Execute/Measure to Testd, Evaluate to the
-/// independent Instrument verifier, CanaryActivate to Kernel (handoff only),
+/// independent Instrument verifier, `CanaryActivate` to Kernel (handoff only),
 /// and Rollback to the bound rollback-contract owner.
 #[must_use]
 pub fn improvement_operation_owners(rollback_owner_id: &str) -> [(&'static str, String); 8] {
