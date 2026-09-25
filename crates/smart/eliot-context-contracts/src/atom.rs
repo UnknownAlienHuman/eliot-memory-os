@@ -1,6 +1,6 @@
 //! Whole atom, recipe and representation contracts.
 
-use eliot_contracts::{ArtifactId, ContractVersion};
+use eliot_contracts::{ArtifactId, ContractVersion, LearningRecordKind, StateFence};
 use eliot_evidence::{Assertability, EpistemicStatus};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -451,6 +451,77 @@ impl CapacityLimits {
     }
 }
 
+/// Exact durable record evidence carried by a behavioral learning atom.
+///
+/// This is deliberately separate from the legacy influence-only ticket. The
+/// record-bound Governor gate compares every field with the verified durable
+/// record and its wire ticket; a bare campaign/subject string is therefore not
+/// sufficient to make a learning atom effective.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LearningRecordProvenance {
+    /// Closed durable record kind.
+    pub record_kind: LearningRecordKind,
+    /// Exact durable record handle.
+    pub record_handle: String,
+    /// SHA-256 digest of the exact canonical `record_json` bytes.
+    pub record_digest: String,
+    /// Exact canonical scope identity.
+    pub scope_id: String,
+    /// Exact State Fence under which the record was admitted.
+    pub state_fence: StateFence,
+    /// Absolute record/admission expiry in Unix milliseconds.
+    pub expires_at_unix_ms: u64,
+    /// Campaign which issued the behavioral admission.
+    pub source_campaign_id: String,
+    /// Task for which the behavioral admission was issued.
+    pub target_task_id: String,
+    /// Closure evidence, when the record is a reusable candidate.
+    pub closure_ref: Option<String>,
+    /// Owning decision authority, when the record is reusable.
+    pub owner: Option<String>,
+}
+
+impl LearningRecordProvenance {
+    /// Validate the exact record evidence carried inside an atom.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        // The shared enum is the closed kind authority; no string fallback or
+        // wildcard spelling is admitted at this boundary.
+        let _kind = self.record_kind;
+        for (field, value) in [
+            ("learning.record_handle", &self.record_handle),
+            ("learning.record_digest", &self.record_digest),
+            ("learning.scope_id", &self.scope_id),
+            ("learning.source_campaign_id", &self.source_campaign_id),
+            ("learning.target_task_id", &self.target_task_id),
+        ] {
+            validate_text(value, field)?;
+            if value.trim() != value {
+                return Err(ContextError::InvalidField(field));
+            }
+        }
+        validate_digest(&self.record_digest, "learning.record_digest")?;
+        self.state_fence
+            .validate()
+            .map_err(|_| ContextError::InvalidFence)?;
+        if self.expires_at_unix_ms == 0 {
+            return Err(ContextError::InvalidField("learning.expires_at_unix_ms"));
+        }
+        for (field, value) in [
+            ("learning.closure_ref", self.closure_ref.as_deref()),
+            ("learning.owner", self.owner.as_deref()),
+        ] {
+            if let Some(value) = value {
+                validate_text(value, field)?;
+                if value.trim() != value {
+                    return Err(ContextError::InvalidField(field));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Intrinsic learning provenance bound to one Governor-issued admission.
 ///
 /// Attached by the legitimate learning pipeline when it emits a
@@ -480,6 +551,11 @@ pub struct LearningProvenance {
     pub expires_at_unix_secs: Option<u64>,
     /// Digest of the exact Governor-issued permit this mark cites.
     pub permit_digest: String,
+    /// Exact durable record evidence for behavioral learning. Legacy
+    /// influence-only marks may omit it, but the record-bound carriage gate
+    /// refuses them.
+    #[serde(default)]
+    pub record: Option<LearningRecordProvenance>,
 }
 
 impl LearningProvenance {
@@ -498,6 +574,9 @@ impl LearningProvenance {
             return Err(ContextError::MissingField("learning.subject"));
         }
         validate_digest(&self.permit_digest, "learning.permit_digest")?;
+        if let Some(record) = &self.record {
+            record.validate()?;
+        }
         Ok(())
     }
 }

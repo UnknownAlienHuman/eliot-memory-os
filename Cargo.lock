@@ -3058,9 +3058,12 @@ name = "eliot-store-api"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "eliot-agent-contracts",
  "eliot-contracts",
  "eliot-epistemic-contracts",
  "eliot-evidence",
+ "eliot-learning-contracts",
+ "eliot-learning-delta",
  "eliot-protocol",
  "eliot-receipts",
  "eliot-security-contracts",

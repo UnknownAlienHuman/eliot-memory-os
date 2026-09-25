@@ -372,6 +372,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "store_recovery" => "store_recovery",
         "store_initialize_genesis" => "store_initialize_genesis",
         "apply_prepared" => "apply_prepared",
+        "record_learning_record" => "record_learning_record",
         "receipt" => "receipt",
         "store_named" => "store_named",
         "local_read" => "local_read",
@@ -636,6 +637,15 @@ struct StoreInitializeGenesisOperation {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoreApplyOperation {
+    context: RequestMeta,
+    transition: PreparedTransition,
+    expected_revision_heads: Vec<RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<OrderingHeadExpectation>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoreLearningRecordOperation {
     context: RequestMeta,
     transition: PreparedTransition,
     expected_revision_heads: Vec<RevisionHeadExpectation>,
@@ -927,6 +937,14 @@ impl KernelComposition {
             "apply_prepared" => {
                 Box::pin(self.store_apply_operation(session, request_id.clone(), payload.clone()))
                     .await
+            }
+            "record_learning_record" => {
+                Box::pin(self.store_learning_record_operation(
+                    session,
+                    request_id.clone(),
+                    payload.clone(),
+                ))
+                .await
             }
             "receipt" => store_receipt_dispatch::dispatch(self, session, payload.clone()).await,
             "store_named" => self.store_named_operation(session, payload.clone()).await,
@@ -2978,6 +2996,107 @@ impl KernelComposition {
 
     #[cfg(not(windows))]
     async fn store_apply_operation(
+        &self,
+        _session: &Session,
+        _request_id: RequestId,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let _ = payload;
+        Err(TransportError::SessionFenced)
+    }
+
+    #[cfg(windows)]
+    async fn store_learning_record_operation(
+        &self,
+        session: &Session,
+        request_id: RequestId,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: StoreLearningRecordOperation =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        if operation.context.request_id != request_id {
+            return Err(TransportError::SessionFenced);
+        }
+        operation
+            .context
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if operation.transition.named_operations.len() != 1
+            || operation.transition.named_operations[0].operation
+                != eliot_store_api::NamedMutationOperation::RecordLearningRecord
+        {
+            return Ok(Self::store_error_response_text(
+                "write_receipt",
+                "dedicated learning route requires exactly one learning operation",
+            ));
+        }
+        if let Err(error) = operation.transition.validate() {
+            return Ok(Self::store_error_response_text(
+                "write_receipt",
+                &error.to_string(),
+            ));
+        }
+        validate_store_session_fence(session, &operation.context.state_fence)?;
+        if operation.transition.state_fence != operation.context.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        for head in &operation.expected_revision_heads {
+            if let Err(error) = head.validate() {
+                return Ok(Self::store_error_response_text(
+                    "write_receipt",
+                    &error.to_string(),
+                ));
+            }
+            if head.state_fence != operation.context.state_fence {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        for head in &operation.expected_ordering_heads {
+            if let Err(error) = head.validate() {
+                return Ok(Self::store_error_response_text(
+                    "write_receipt",
+                    &error.to_string(),
+                ));
+            }
+            if head.state_fence != operation.context.state_fence {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        let view = CanonicalRequestView::from_apply(
+            &operation.context,
+            &operation.transition,
+            &operation.expected_revision_heads,
+            &operation.expected_ordering_heads,
+        );
+        if let Err(error) = verify_canonical_request_hash(
+            &view,
+            &operation.transition.identity.canonical_request_hash,
+        ) {
+            return Ok(Self::store_error_response_text(
+                "write_receipt",
+                &error.to_string(),
+            ));
+        }
+        if let Some(rejection) = self.normal_write_admission_response() {
+            return Ok(rejection);
+        }
+        let gateway = self.retained_store_gateway()?;
+        match gateway
+            .record_learning_record(
+                &operation.context,
+                operation.transition,
+                operation.expected_revision_heads,
+                operation.expected_ordering_heads,
+            )
+            .await
+        {
+            Ok(receipt) => Ok(store_apply_response(&receipt)),
+            Err(error) => Ok(Self::store_error_response_text("write_receipt", &error)),
+        }
+    }
+
+    #[cfg(not(windows))]
+    async fn store_learning_record_operation(
         &self,
         _session: &Session,
         _request_id: RequestId,

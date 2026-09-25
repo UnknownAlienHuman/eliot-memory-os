@@ -32,7 +32,8 @@ use eliot_context_contracts::{
 };
 use eliot_contracts::fences_match_exact;
 use eliot_improvement::{
-    CarriageMark, PresentedLearning, bounds_to_context_error, check_governed_carriage,
+    CarriageMark, PresentedLearning, PresentedRecordLearning, bounds_to_context_error,
+    check_governed_record_carriage,
 };
 
 use crate::{ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, assemble_active_view};
@@ -61,8 +62,45 @@ where
     ) {
         return Err(AssemblyError::Contract(ContextError::InvalidFence));
     }
+    if admitted
+        .records
+        .iter()
+        .any(|record| record.candidate.learning.is_some())
+    {
+        // Influence-only presentation cannot prove a durable record ticket.
+        // Behavioral delivery must use the record-bound entrypoint below.
+        return Err(AssemblyError::Contract(ContextError::IdentityConflict));
+    }
+    assemble_active_view(admitted, recipe, quality, policy, measure)
+}
+
+/// Record-bound delivery/effect gate for the production Context Compiler
+/// carriage. The legacy entrypoint above cannot authorize a marked set with
+/// an influence-only permit; this path additionally re-verifies the exact
+/// durable record ticket and correlates every mark with that record's
+/// kind/handle before rendering anything.
+pub fn assemble_active_view_with_record_learning<F>(
+    admitted: &AdmittedContextSet,
+    recipe: &ContextRecipe,
+    quality: QualityScorecard,
+    policy: &AssemblyPolicy,
+    measure: F,
+    presented: PresentedRecordLearning<'_>,
+) -> Result<ActiveUnderstandingViewResult, AssemblyError>
+where
+    F: FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
+{
+    if !fences_match_exact(
+        &admitted.binding.state_fence,
+        presented.verified.permit().fence(),
+    ) {
+        return Err(AssemblyError::Contract(ContextError::InvalidFence));
+    }
     let mut marks = Vec::new();
     for record in &admitted.records {
+        if record.candidate.binding.scope_id != admitted.binding.scope_id {
+            return Err(AssemblyError::Contract(ContextError::IdentityConflict));
+        }
         if let Some(provenance) = &record.candidate.learning {
             provenance.validate().map_err(AssemblyError::Contract)?;
             marks.push(CarriageMark {
@@ -75,11 +113,17 @@ where
                 expires_at_unix_secs: provenance.expires_at_unix_secs,
                 permit_digest: provenance.permit_digest.as_str(),
                 binding_task_id: record.candidate.binding.task_id.as_str(),
+                record: provenance.record.as_ref(),
             });
         }
     }
-    check_governed_carriage(&presented, &admitted.binding.state_fence, &marks)
-        .map_err(bounds_to_context_error)
-        .map_err(AssemblyError::Contract)?;
+    check_governed_record_carriage(
+        &presented,
+        admitted.binding.scope_id.as_str(),
+        &admitted.binding.state_fence,
+        &marks,
+    )
+    .map_err(bounds_to_context_error)
+    .map_err(AssemblyError::Contract)?;
     assemble_active_view(admitted, recipe, quality, policy, measure)
 }

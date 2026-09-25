@@ -25,6 +25,8 @@ mod reactive_session;
 mod readback;
 mod view;
 
+pub use eliot_contracts::LearningRecordKind;
+
 pub use admission::{
     AdmissionRecord, AdmittedContextSet, ContextCandidateSet, DecisionSafetyFloor,
     SafetyFloorMember,
@@ -37,9 +39,9 @@ pub use admission_input::{
 };
 pub use atom::{
     AdmissionDisposition, AdmittedAtom, AtomAvailability, AtomRepresentation, AuthorityClass,
-    CapacityLimits, ContextCandidate, ContextRecipe, LearningProvenance, LossPolicy,
-    MeasurementRef, PrivacyClass, ProviderDisposition, ProviderRoleDenominator, RepresentationKind,
-    RoleLossRule,
+    CapacityLimits, ContextCandidate, ContextRecipe, LearningProvenance, LearningRecordProvenance,
+    LossPolicy, MeasurementRef, PrivacyClass, ProviderDisposition, ProviderRoleDenominator,
+    RepresentationKind, RoleLossRule,
 };
 pub use canonical_projections::{
     AffordanceProjection, CANONICAL_PROJECTIONS_SCHEMA_VERSION, CanonicalProjectionSet,

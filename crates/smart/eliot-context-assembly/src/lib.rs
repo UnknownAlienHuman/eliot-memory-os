@@ -22,7 +22,9 @@ pub use assemble::{
 pub use cite::project_citation;
 pub use error::AssemblyError;
 #[cfg(not(target_arch = "wasm32"))]
-pub use learning_gate::assemble_active_view_with_learning;
+pub use learning_gate::{
+    assemble_active_view_with_learning, assemble_active_view_with_record_learning,
+};
 pub use readback::{ReopenedSource, gate_citation};
 
 pub use eliot_context_contracts::{

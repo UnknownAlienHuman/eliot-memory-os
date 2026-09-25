@@ -83,6 +83,7 @@ fn marked_candidate(context: &ContextBinding, permit_digest: &str) -> ContextCan
             draft: false,
             expires_at_unix_secs: Some(1_800_003_600),
             permit_digest: permit_digest.to_string(),
+            record: None,
         }),
         loss_policy: LossPolicy::Summarizable,
         availability: AtomAvailability::PresentCurrent,

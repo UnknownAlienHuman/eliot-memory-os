@@ -55,4 +55,4 @@ pub use governed_compose::{
     compose_governed_compilation,
 };
 #[cfg(not(target_arch = "wasm32"))]
-pub use host::compile_learning_context;
+pub use host::{compile_learning_context, compile_record_learning_context};

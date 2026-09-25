@@ -6,10 +6,10 @@
 //! compilation refuses before any value surfaces:
 //!
 //! ```text
-//! produce_learning_candidate (owner-verified permit + ACTIVE backlog entry)
+//! produce_learning_candidate (record-bound owner-verified permit + ACTIVE backlog entry)
 //! → retrieve_governed (overlay liveness, backlog backing, cross-task admission)
-//! → admit_context_with_learning (ticket re-verification + per-mark screen + admit)
-//! → assemble_active_view_with_learning (delivery re-verification + project)
+//! → admit_context_with_record_learning (record ticket + per-mark screen + admit)
+//! → assemble_active_view_with_record_learning (delivery re-verification + project)
 //! → GovernedCompilation (retrieval decision + admission + optional view)
 //! ```
 //!
@@ -29,10 +29,10 @@
 //! is gated with `#[cfg(not(target_arch = "wasm32"))]` at the crate root.
 
 use crate::conversion::{GuestRequest, GuestResponse};
-use eliot_context_admission::admit_context_with_learning;
+use eliot_context_admission::admit_context_with_record_learning;
 use eliot_context_assembly::{
     ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy,
-    assemble_active_view_with_learning,
+    assemble_active_view_with_record_learning,
 };
 use eliot_context_contracts::{
     AdmissionInput, AdmissionResult, ContextError, ContextOutcome, ContextRecipe, QualityScorecard,
@@ -42,8 +42,8 @@ use eliot_improvement::candidate_bounds::{
     BoundsError, GovernedRetrieval, RetrievalDecision, ReusableCandidateRef, retrieve_governed,
 };
 use eliot_improvement::{
-    CarriageMark, LearningProduction, PresentedLearning, bounds_to_context_error,
-    check_governed_carriage, datetime_from_unix, produce_learning_candidate,
+    CarriageMark, LearningProduction, PresentedRecordLearning, bounds_to_context_error,
+    check_governed_record_carriage, datetime_from_unix, produce_learning_candidate,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -93,7 +93,7 @@ pub enum ComposeError {
 /// requester values.
 pub fn compose_governed_compilation<F>(
     production: LearningProduction<'_>,
-    presented: PresentedLearning<'_>,
+    presented: PresentedRecordLearning<'_>,
     mut input: AdmissionInput,
     recipe: &ContextRecipe,
     quality: QualityScorecard,
@@ -103,13 +103,19 @@ pub fn compose_governed_compilation<F>(
 where
     F: FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
 {
-    if production.verified.permit().digest() != presented.verified.permit().digest() {
+    if production.verified.permit().digest() != presented.verified.permit().digest()
+        || production.verified.record_identity() != presented.verified.record_identity()
+    {
         return Err(ComposeError::PermitMismatch);
     }
     let live_now_secs = u64::try_from(OffsetDateTime::now_utc().unix_timestamp().max(0))
         .map_err(|_| ComposeError::ClockUnavailable)?;
-    let presented = PresentedLearning {
+    let live_now_ms =
+        u64::try_from((OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).max(0))
+            .map_err(|_| ComposeError::ClockUnavailable)?;
+    let presented = PresentedRecordLearning {
         now_unix_secs: live_now_secs,
+        now_unix_ms: live_now_ms,
         ..presented
     };
     let overlay = presented.overlay.ok_or(ComposeError::OverlayRequired)?;
@@ -148,11 +154,13 @@ where
     input.candidates.candidates.push(produced);
     input.learning_tickets.push(presented.ticket.clone());
     let admission =
-        admit_context_with_learning(&input, presented).map_err(ComposeError::Admission)?;
+        admit_context_with_record_learning(&input, presented).map_err(ComposeError::Admission)?;
     let view = match &admission.outcome {
         ContextOutcome::Complete(set) => Some(
-            assemble_active_view_with_learning(set, recipe, quality, policy, measure, presented)
-                .map_err(ComposeError::Assembly)?,
+            assemble_active_view_with_record_learning(
+                set, recipe, quality, policy, measure, presented,
+            )
+            .map_err(ComposeError::Assembly)?,
         ),
         ContextOutcome::Incomplete(_) => None,
     };
@@ -199,7 +207,7 @@ pub enum HonorError {
 ///    response to these bytes — substitution refused);
 /// 4. when the result carries learning-marked atoms (or the request
 ///    carried tickets), the full owner carriage gate
-///    ([`check_governed_carriage`]) runs with the live Governor,
+///    ([`check_governed_record_carriage`]) runs with the live Governor,
 ///    registry, overlay, and cross-task admission — epoch/generation
 ///    rotation, dead overlays, revoked backlog entries, and unadmitted
 ///    cross-task use refuse here even if the producing contour passed
@@ -212,7 +220,7 @@ pub enum HonorError {
 pub fn check_honored_output(
     request: &GuestRequest,
     response: &GuestResponse,
-    presented: PresentedLearning<'_>,
+    presented: PresentedRecordLearning<'_>,
 ) -> Result<(), HonorError> {
     if response.abi_version != request.abi_version
         || response.handler_subtype != request.handler_subtype
@@ -253,6 +261,9 @@ pub fn check_honored_output(
     let mut marks = Vec::new();
     if let ContextOutcome::Complete(set) = &admission.outcome {
         for record in &set.records {
+            if record.candidate.binding.scope_id != admission.binding.scope_id {
+                return Err(HonorError::Carriage(ContextError::IdentityConflict));
+            }
             if let Some(provenance) = &record.candidate.learning {
                 provenance.validate().map_err(HonorError::Carriage)?;
                 marks.push(CarriageMark {
@@ -265,11 +276,17 @@ pub fn check_honored_output(
                     expires_at_unix_secs: provenance.expires_at_unix_secs,
                     permit_digest: provenance.permit_digest.as_str(),
                     binding_task_id: record.candidate.binding.task_id.as_str(),
+                    record: provenance.record.as_ref(),
                 });
             }
         }
     }
-    check_governed_carriage(&presented, &admission.binding.state_fence, &marks)
-        .map_err(bounds_to_context_error)
-        .map_err(HonorError::Carriage)
+    check_governed_record_carriage(
+        &presented,
+        admission.binding.scope_id.as_str(),
+        &admission.binding.state_fence,
+        &marks,
+    )
+    .map_err(bounds_to_context_error)
+    .map_err(HonorError::Carriage)
 }

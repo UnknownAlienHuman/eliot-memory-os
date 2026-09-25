@@ -252,6 +252,11 @@ impl KernelStoreGateway {
             &expected_revision_heads,
             &expected_ordering_heads,
         )?;
+        if transition.named_operations.iter().any(|command| {
+            command.operation == eliot_store_api::NamedMutationOperation::RecordLearningRecord
+        }) {
+            return Err("generic Kernel apply cannot carry learning records".to_owned());
+        }
 
         let lease = {
             let service = self
@@ -340,7 +345,103 @@ impl KernelStoreGateway {
         result
     }
 
-    /// Lists the currently paused ordering scopes with the idempotency key
+    /// Applies one learning transition through the dedicated authenticated
+    /// capability. Generic `apply` remains closed to learning operations.
+    pub async fn record_learning_record(
+        &self,
+        context: &RequestMetadata,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<WriteReceipt, String> {
+        if transition.named_operations.len() != 1
+            || transition.named_operations[0].operation
+                != eliot_store_api::NamedMutationOperation::RecordLearningRecord
+        {
+            return Err(
+                "dedicated learning route requires exactly one learning operation".to_owned(),
+            );
+        }
+        let _flight = self.flight.enter()?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
+            return Err("transition caller is not the active daemon".to_owned());
+        }
+        admit_prepared_transition(
+            context,
+            &transition,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+        )?;
+        let lease = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+            if service.generation_fenced() || self.is_fenced() {
+                return Err("Kernel generation is fenced".to_owned());
+            }
+            let live_epoch = service.authority_epoch();
+            if self
+                .route_epoch
+                .as_ref()
+                .is_none_or(|bound| !bound.is_same_authority(&live_epoch))
+                || self.route.active_generation() != transition.state_fence.resource_generation
+            {
+                return Err(
+                    "canonical-store route is outside the active Kernel generation".to_owned(),
+                );
+            }
+            let lease = service
+                .acquire_admission()
+                .map_err(|error| error.to_string())?;
+            if !lease
+                .authority_epoch()
+                .is_same_authority(&transition.state_fence.authority_epoch)
+            {
+                return Err("canonical-store route authority epoch is stale".to_owned());
+            }
+            lease
+        };
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        let identity = transition.identity.clone();
+        let ordering_scopes: Vec<String> = transition
+            .ordering_scopes
+            .iter()
+            .map(|scope| scope.as_str().to_owned())
+            .collect();
+        let send = || {
+            self.store.record_learning_record(
+                context,
+                transition.clone(),
+                expected_revision_heads.clone(),
+                expected_ordering_heads.clone(),
+            )
+        };
+        let query = || {
+            self.store.receipt_exact(
+                identity.operation_id.clone(),
+                identity.canonical_request_hash.as_str(),
+            )
+        };
+        let result = recover_commit(
+            self.commit_ors.as_deref(),
+            &self.paused_scopes,
+            &identity,
+            &ordering_scopes,
+            send,
+            query,
+        )
+        .await
+        .map_err(|error| error.to_string());
+        drop(lease);
+        result
+    }
+
     /// pausing each: the visible Problem State surface for Doctor/Human
     /// disposition (I14.21, issue #1690). The durable open set in ORS is
     /// authoritative; this mirrors it for admission gating.

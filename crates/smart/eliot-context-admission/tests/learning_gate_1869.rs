@@ -155,6 +155,7 @@ fn learning_mark(permit_digest: &str, expires: Option<u64>) -> LearningProvenanc
         draft: false,
         expires_at_unix_secs: expires,
         permit_digest: permit_digest.to_string(),
+        record: None,
     }
 }
 
@@ -581,6 +582,7 @@ fn unclosed_reusable_refused() {
         draft: false,
         expires_at_unix_secs: Some(NOW_1869 + 3600),
         permit_digest: permit.digest().to_string(),
+        record: None,
     });
     // Rebind the measurement to the remarked candidate.
     for measurement in &mut input.measurements {

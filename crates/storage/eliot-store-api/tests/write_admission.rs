@@ -23,26 +23,33 @@ use std::future::Future;
 use std::num::NonZeroU64;
 use std::task::{Context, Poll, Waker};
 
+use eliot_agent_contracts::AgentAttemptId;
 use eliot_contracts::{
-    ArtifactId, ClockReading, EpochId, EpochLineageId, OperationId, ProductId, RequestId,
-    ResourceGeneration, SourceId, StateFence, TaskId,
+    ArtifactId, ClockReading, EpochId, EpochLineageId, OperationId, PolicyRevision, ProductId,
+    RequestId, ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision,
+};
+use eliot_learning_contracts::identity::SourceLineage;
+use eliot_learning_contracts::{
+    AttemptLearningDeltaCandidate, ChangeOperation, ChangeSurface, ContractBinding, InverseChange,
+    ProofCeiling, TargetId, ValueState,
 };
 use eliot_protocol::{
     DurableJobRequest, DurableRequestIdentity, JobOperation, JobRole, RequestIdentity,
 };
-use eliot_receipts::{OperationBinding, RequestBinding};
+use eliot_receipts::{OperationBinding, RequestBinding, WorkScopeId};
 use eliot_store_api::{
     CAPABILITIES, CONTRACT_VERSION, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
-    EffectClass, ErrorCode, EventProjectionRelationIntents, MAX_WRITE_ADMISSION_LABEL_BYTES,
-    MAX_WRITE_ADMISSION_SCOPES, NamedMutationOperation, NamedMutationRequest, NamedReadOperation,
-    NamedReadRequest, NamedReadResponse, OperationIdentity, OperationManifestDigest,
-    OrderingHeadExpectation, OrderingScopeId, ReadConsistency, RecoveryRecord, RequestMeta,
-    ReservedScopeBinding, ReservedWriteRequest, Resubmission, RevisionHeadExpectation, RevisionKey,
-    ScopeId, ScopeRevisionView, SecurityContext, StoreBackupOperation, StoreBackupRequest,
-    StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus, StoreRecoveryRequest,
-    StoreRequest, TransitionClass, WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams,
-    WriteAdmissionProjection, WriteReceipt, WriteReceiptStatus, WriterEpochBinding,
-    bind_issue18_digests, render_semantic_source_revisions, sha256_hex,
+    EffectClass, ErrorCode, EventProjectionRelationIntents, LearningRecordKind,
+    MAX_WRITE_ADMISSION_LABEL_BYTES, MAX_WRITE_ADMISSION_SCOPES, NamedMutationOperation,
+    NamedMutationRequest, NamedReadOperation, NamedReadRequest, NamedReadResponse,
+    OperationIdentity, OperationManifestDigest, OrderingHeadExpectation, OrderingScopeId,
+    ReadConsistency, RecoveryRecord, RequestMeta, ReservedScopeBinding, ReservedWriteRequest,
+    Resubmission, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView,
+    SecurityContext, StoreBackupOperation, StoreBackupRequest, StoreError, StoreGenesisRequest,
+    StoreHealth, StoreHealthStatus, StoreRecoveryRequest, StoreRequest, TransitionClass,
+    WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt,
+    WriteReceiptStatus, WriterEpochBinding, bind_issue18_digests, render_semantic_source_revisions,
+    sha256_hex,
 };
 use serde_json::{Value, json};
 
@@ -809,6 +816,96 @@ fn backup_wire_request() -> StoreRequest {
     }
 }
 
+/// Minimal dedicated learning-record wire request.
+///
+/// The dedicated wrapper is part of the closed Store request catalogue, so
+/// the generic `Apply` path cannot be used to smuggle a learning operation
+/// through a legacy transport shape.
+fn learning_wire_request() -> StoreRequest {
+    let target = TargetId::new("learning-target-1").unwrap();
+    let before = ValueState {
+        present: true,
+        digest: Some("a".repeat(64)),
+    };
+    let after = ValueState {
+        present: true,
+        digest: Some("b".repeat(64)),
+    };
+    let mut candidate = AttemptLearningDeltaCandidate {
+        binding: ContractBinding {
+            schema_version: 1,
+            policy_revision: PolicyRevision::new(1).unwrap(),
+            request_id: RequestId::new("request-admit-learning-1").unwrap(),
+            operation_id: OperationId::new("op-admit-learning-1").unwrap(),
+            product_id: ProductId::new("product-admit").unwrap(),
+            task_id: TaskId::new("task-admit-learning-1").unwrap(),
+            scope: WorkScopeId::new("scope-admit-1").unwrap(),
+            state_fence: fence(),
+            source: SourceLineage {
+                owner: SourceId::new("source-admit").unwrap(),
+                snapshot: ArtifactId::new("snapshot-admit-learning-1").unwrap(),
+                revision: TaskRevision::new(1).unwrap(),
+                digest: "c".repeat(64),
+            },
+            proof_ceiling: ProofCeiling::CandidateArtifact,
+        },
+        attempt_id: AgentAttemptId::new("attempt-admit-learning-1").unwrap(),
+        delta_id: ArtifactId::new("learning-admit-1").unwrap(),
+        target: target.clone(),
+        base_view_digest: "d".repeat(64),
+        pre_observation_discriminator: ArtifactId::new("pre-observation-admit-1").unwrap(),
+        intended_strategy: ArtifactId::new("intended-strategy-admit-1").unwrap(),
+        attempted_strategy: ArtifactId::new("attempted-strategy-admit-1").unwrap(),
+        changes: vec![ChangeOperation::Add {
+            target: target.clone(),
+            surface: ChangeSurface::Strategy,
+            after: after.clone(),
+        }],
+        inverses: vec![InverseChange {
+            forward_target: target,
+            inverse: ChangeOperation::Remove {
+                target: TargetId::new("learning-target-1").unwrap(),
+                surface: ChangeSurface::Strategy,
+                before,
+            },
+        }],
+        evidence: vec![ArtifactId::new("evidence-admit-learning-1").unwrap()],
+        evaluator_receipts: vec![ArtifactId::new("evaluator-admit-learning-1").unwrap()],
+        baseline: Vec::new(),
+        control: Vec::new(),
+        confounders: Vec::new(),
+        dependencies: Vec::new(),
+        equivalent_retry: None,
+        proof_ceiling: ProofCeiling::CandidateArtifact,
+        canonical_digest: String::new(),
+    };
+    candidate.seal().unwrap();
+    let record_json =
+        String::from_utf8(eliot_store_api::canonical_json_bytes(&candidate).unwrap()).unwrap();
+    let record_digest = eliot_store_api::learning_record_document_digest(&record_json).unwrap();
+    let parameters = eliot_store_api::learning_record_commit_params(
+        LearningRecordKind::Candidate,
+        candidate.delta_id.as_str().to_owned(),
+        record_json,
+        record_digest,
+        eliot_store_api::learning_scope_digest("scope-admit-1").unwrap(),
+        eliot_store_api::learning_fence_digest(&fence()).unwrap(),
+        "idem-admit-learning-1".to_owned(),
+        1_700_000_060_000,
+    );
+    let mut transition = transition();
+    transition.named_operations = vec![eliot_store_api::learning_record_mutation_request(
+        parameters,
+    )];
+    bind_issue18_digests(&mut transition).unwrap();
+    StoreRequest::RecordLearningRecord {
+        context: context(),
+        transition,
+        expected_revision_heads: revision_heads(),
+        expected_ordering_heads: ordering_heads_for(&[("scope-admit-1".to_owned(), 6)]),
+    }
+}
+
 /// Fixed `op` tag for one wire variant.
 ///
 /// Exhaustive on purpose: adding a `StoreRequest` variant breaks this match
@@ -830,6 +927,7 @@ fn store_request_op_tag(request: &StoreRequest) -> &'static str {
         StoreRequest::OrderingHeads { .. } => "ordering_heads",
         StoreRequest::ValidationSnapshot => "validation_snapshot",
         StoreRequest::DreamerJob { .. } => "dreamer_job",
+        StoreRequest::RecordLearningRecord { .. } => "record_learning_record",
     }
 }
 
@@ -879,6 +977,7 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
             request: valid_request(),
         },
         backup_wire_request(),
+        learning_wire_request(),
     ];
     let mut tags = Vec::new();
     for variant in &catalogue {
@@ -922,6 +1021,7 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
             "ordering_heads",
             "readiness",
             "receipt",
+            "record_learning_record",
             "recovery",
             "reserved_write",
             "revision_heads",

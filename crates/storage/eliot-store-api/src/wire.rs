@@ -37,6 +37,11 @@ pub const CAPABILITY_HEALTH: &str = "store.health";
 pub const CAPABILITY_READINESS: &str = "store.readiness";
 pub const CAPABILITY_NAMED_READ: &str = "store.named_read";
 pub const CAPABILITY_APPLY: &str = "store.apply";
+/// Dedicated authenticated learning-record commit capability.
+///
+/// It is separate from the generic apply capability so a learning operation
+/// cannot enter the unrestricted transition surface.
+pub const CAPABILITY_LEARNING_RECORD: &str = "store.learning_record.record";
 /// Declared (not advertised) capability for the reserved-write operation
 /// (issue #991).
 ///
@@ -88,6 +93,7 @@ pub const CAPABILITIES: &[&str] = &[
     CAPABILITY_READINESS,
     CAPABILITY_NAMED_READ,
     CAPABILITY_APPLY,
+    CAPABILITY_LEARNING_RECORD,
     CAPABILITY_RECEIPT,
     CAPABILITY_REVISION_HEADS,
     CAPABILITY_ORDERING_HEADS,
@@ -231,6 +237,15 @@ pub enum StoreRequest {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     },
+    /// Dedicated learning-record commit. This variant is the only store
+    /// request allowed to carry `RecordLearningRecord`; generic `Apply`
+    /// rejects that operation before dispatch.
+    RecordLearningRecord {
+        context: RequestMeta,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    },
     /// Reserved-write operation carrying #990's sealed admission projection
     /// through the existing authenticated Store path (issue #991).
     ///
@@ -301,6 +316,14 @@ impl StoreRequest {
             } => {
                 context.validate().map_err(StoreError::Foundation)?;
                 transition.validate()?;
+                if transition.named_operations.iter().any(|command| {
+                    command.operation == crate::NamedMutationOperation::RecordLearningRecord
+                }) {
+                    return Err(StoreError::InvalidField {
+                        field: "learning.operation",
+                        reason: "learning records require the dedicated Kernel learning capability",
+                    });
+                }
                 if context.state_fence != transition.state_fence {
                     return Err(StoreError::FenceMismatch);
                 }
@@ -321,6 +344,46 @@ impl StoreRequest {
                     if head.state_fence != transition.state_fence {
                         return Err(StoreError::FenceMismatch);
                     }
+                }
+                Ok(())
+            }
+            Self::RecordLearningRecord {
+                context,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            } => {
+                context.validate().map_err(StoreError::Foundation)?;
+                transition.validate()?;
+                if context.state_fence != transition.state_fence {
+                    return Err(StoreError::FenceMismatch);
+                }
+                bounded_unique(expected_revision_heads, "expected_revision_heads", |head| {
+                    head.key.clone()
+                })?;
+                bounded_unique(expected_ordering_heads, "expected_ordering_heads", |head| {
+                    head.scope.clone()
+                })?;
+                for head in expected_revision_heads {
+                    head.validate()?;
+                    if head.state_fence != transition.state_fence {
+                        return Err(StoreError::FenceMismatch);
+                    }
+                }
+                for head in expected_ordering_heads {
+                    head.validate()?;
+                    if head.state_fence != transition.state_fence {
+                        return Err(StoreError::FenceMismatch);
+                    }
+                }
+                if transition.named_operations.len() != 1
+                    || transition.named_operations[0].operation
+                        != crate::NamedMutationOperation::RecordLearningRecord
+                {
+                    return Err(StoreError::InvalidField {
+                        field: "learning.operation",
+                        reason: "dedicated learning request must carry exactly one closed learning operation",
+                    });
                 }
                 Ok(())
             }
@@ -348,6 +411,7 @@ impl StoreRequest {
             Self::Readiness => CAPABILITY_READINESS,
             Self::Named { .. } => CAPABILITY_NAMED_READ,
             Self::Apply { .. } => CAPABILITY_APPLY,
+            Self::RecordLearningRecord { .. } => CAPABILITY_LEARNING_RECORD,
             Self::ReservedWrite { .. } => CAPABILITY_RESERVED_WRITE,
             Self::Backup { .. } => CAPABILITY_STORE_BACKUP,
             Self::Receipt { .. } => CAPABILITY_RECEIPT,
@@ -375,6 +439,12 @@ impl StoreRequest {
                 transition,
                 expected_revision_heads,
                 expected_ordering_heads,
+            }
+            | Self::RecordLearningRecord {
+                context,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
             } => Some(CanonicalRequestView::from_apply(
                 context,
                 transition,
@@ -394,13 +464,15 @@ impl StoreRequest {
     /// silently diverge from the admitted digest.
     pub fn verify_apply_canonical_hash(&self) -> Result<(), StoreError> {
         match self {
-            Self::Apply { transition, .. } => match self.apply_canonical_request_view() {
-                Some(view) => verify_canonical_request_hash(
-                    &view,
-                    &transition.identity.canonical_request_hash,
-                ),
-                None => Ok(()),
-            },
+            Self::Apply { transition, .. } | Self::RecordLearningRecord { transition, .. } => {
+                match self.apply_canonical_request_view() {
+                    Some(view) => verify_canonical_request_hash(
+                        &view,
+                        &transition.identity.canonical_request_hash,
+                    ),
+                    None => Ok(()),
+                }
+            }
             _ => Ok(()),
         }
     }
@@ -450,6 +522,12 @@ impl StoreRequest {
                 Ok(())
             }
             Self::Apply {
+                context,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            }
+            | Self::RecordLearningRecord {
                 context,
                 transition,
                 expected_revision_heads,
@@ -1255,7 +1333,8 @@ fn bind_payload_authorities(
     authorities: &[ExactJsonBytes],
 ) -> Result<(), StoreWireError> {
     match request {
-        StoreRequest::Apply { transition, .. } => {
+        StoreRequest::Apply { transition, .. }
+        | StoreRequest::RecordLearningRecord { transition, .. } => {
             if authorities.len() != transition.named_operations.len() {
                 return Err(StoreWireError::Payload(
                     "payload authority count does not match named operations".to_owned(),

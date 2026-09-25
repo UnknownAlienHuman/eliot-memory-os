@@ -26,7 +26,8 @@
 use blake3::Hasher;
 use eliot_context_contracts::{
     AtomRepresentation, AuthorityClass, ContextBinding, ContextCandidate, LearningProvenance,
-    LossPolicy, MeasurementRef, PrivacyClass, ProviderRole, SourceSnapshot,
+    LearningRecordProvenance, LossPolicy, MeasurementRef, PrivacyClass, ProviderRole,
+    SourceSnapshot,
 };
 use eliot_contracts::fences_match_exact;
 use eliot_evidence::EpistemicStatus;
@@ -106,6 +107,33 @@ pub fn produce_learning_candidate(
     request: LearningProduction<'_>,
 ) -> Result<ContextCandidate, BoundsError> {
     let permit = request.verified.permit();
+    // Behavioral production is record-bound. The legacy influence-only
+    // permit has no durable identity and must not manufacture a learning atom.
+    let record = request
+        .verified
+        .record_identity()
+        .ok_or(BoundsError::GovernorAuthorityUnconfirmed)?;
+    if request.binding.scope_id.as_str() != record.scope_id
+        || !fences_match_exact(&request.binding.state_fence, &record.state_fence)
+    {
+        return Err(BoundsError::StaleStateFence);
+    }
+    let record_subject_matches = match record.record_kind {
+        eliot_contracts::LearningRecordKind::Overlay => {
+            request.overlay_id == Some(record.handle.as_str())
+        }
+        eliot_contracts::LearningRecordKind::Delta
+        | eliot_contracts::LearningRecordKind::Candidate => request.candidate_id == record.handle,
+        eliot_contracts::LearningRecordKind::Closure
+        | eliot_contracts::LearningRecordKind::ActivationReceipt
+        | eliot_contracts::LearningRecordKind::ViewRef => {
+            request.overlay_id == Some(record.handle.as_str())
+                || request.candidate_id == record.handle
+        }
+    };
+    if !record_subject_matches {
+        return Err(BoundsError::ReusableBackingMismatch);
+    }
     // Registry proof: only an ACTIVE backlog entry admitted under the
     // permit-bound Governor authority may be (re)produced, and the
     // presented owner and source must equal those retained identities —
@@ -197,6 +225,18 @@ pub fn produce_learning_candidate(
             draft: false,
             expires_at_unix_secs: request.expires_at_unix_secs,
             permit_digest: permit.digest().to_string(),
+            record: Some(LearningRecordProvenance {
+                record_kind: record.record_kind,
+                record_handle: record.handle.clone(),
+                record_digest: record.record_digest.clone(),
+                scope_id: record.scope_id.clone(),
+                state_fence: record.state_fence.clone(),
+                expires_at_unix_ms: record.expires_at_unix_ms,
+                source_campaign_id: permit.source_campaign_id().to_owned(),
+                target_task_id: permit.target_task_id().to_owned(),
+                closure_ref: Some(request.closure_ref.to_owned()),
+                owner: Some(request.owner.to_owned()),
+            }),
         }),
         loss_policy: LossPolicy::Summarizable,
         availability: eliot_context_contracts::AtomAvailability::PresentCurrent,

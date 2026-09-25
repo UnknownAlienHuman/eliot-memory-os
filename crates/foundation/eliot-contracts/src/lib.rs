@@ -27,6 +27,60 @@ pub use epoch_identity::*;
 pub const CONTRACT_NAME: &str = "eliot.foundation.contracts";
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 
+/// Closed discriminator for an immutable learning-record revision.
+///
+/// This is a foundation vocabulary because the value is carried through
+/// Governor, Kernel, store, and context contracts. Keeping one enum at the
+/// shared boundary prevents a later string spelling from becoming a second
+/// kind authority.
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum LearningRecordKind {
+    /// A proposed behavioral delta record.
+    Delta,
+    /// A proposed overlay record (durable-but-inert without admission).
+    Overlay,
+    /// A closure record.
+    Closure,
+    /// An activation receipt record.
+    ActivationReceipt,
+    /// A candidate record (recording never performs promotion).
+    Candidate,
+    /// A reference to a rebuilt view revision (views never accept writes).
+    ViewRef,
+}
+
+impl LearningRecordKind {
+    /// Returns the closed wire spelling of this record kind.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Delta => "delta",
+            Self::Overlay => "overlay",
+            Self::Closure => "closure",
+            Self::ActivationReceipt => "activation_receipt",
+            Self::Candidate => "candidate",
+            Self::ViewRef => "view_ref",
+        }
+    }
+
+    /// Parses the closed wire spelling back into its record kind.
+    #[must_use]
+    pub const fn from_str(name: &str) -> Option<Self> {
+        match name.as_bytes() {
+            b"delta" => Some(Self::Delta),
+            b"overlay" => Some(Self::Overlay),
+            b"closure" => Some(Self::Closure),
+            b"activation_receipt" => Some(Self::ActivationReceipt),
+            b"candidate" => Some(Self::Candidate),
+            b"view_ref" => Some(Self::ViewRef),
+            _ => None,
+        }
+    }
+}
+
 /// A validation failure for a contract primitive.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ContractError {

@@ -148,6 +148,7 @@ fn mark(digest_value: &str) -> LearningProvenance {
         draft: false,
         expires_at_unix_secs: Some(1_800_003_600),
         permit_digest: digest_value.to_string(),
+        record: None,
     }
 }
 

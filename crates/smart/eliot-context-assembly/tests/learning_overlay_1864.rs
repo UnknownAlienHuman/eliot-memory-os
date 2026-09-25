@@ -164,6 +164,7 @@ fn admitted_with_learning(permit_digest: &str, mark_expires: Option<u64>) -> Adm
         draft: false,
         expires_at_unix_secs: mark_expires,
         permit_digest: permit_digest.to_string(),
+        record: None,
     });
     let atom_id = first.atom_id.clone();
     let provider = first.provider_role.clone();

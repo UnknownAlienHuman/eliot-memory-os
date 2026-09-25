@@ -130,7 +130,7 @@ impl KernelContextReadClient {
     /// or the `#2100` owner-feed `GetAuthorityRevocationHistory`
     /// (scope-bound, `Eventual`, exactly the catalogue-declared
     /// `origin_ref`/`max_records` selectors).
-    fn check_execute_capability(request: &NamedReadRequest) -> Result<(), StoreError> {
+    pub(crate) fn check_execute_capability(request: &NamedReadRequest) -> Result<(), StoreError> {
         match request.operation {
             NamedReadOperation::GetEvidencePack => {
                 if request.scope_id.is_none() {
@@ -165,6 +165,23 @@ impl KernelContextReadClient {
                         reason: "GetAuditRange takes no parameters",
                     });
                 }
+                request.validate()?;
+                Ok(())
+            }
+            NamedReadOperation::GetLearningRecordRange => {
+                if request.scope_id.is_none() {
+                    return Err(StoreError::InvalidField {
+                        field: "scope_id",
+                        reason: "GetLearningRecordRange requires an exact scope",
+                    });
+                }
+                if request.consistency != ReadConsistency::ExactFence {
+                    return Err(StoreError::InvalidField {
+                        field: "operation.consistency",
+                        reason: "GetLearningRecordRange requires ExactFence",
+                    });
+                }
+                eliot_store_api::decode_learning_read(request.operation, &request.parameters)?;
                 request.validate()?;
                 Ok(())
             }
@@ -576,7 +593,7 @@ impl KernelContextReadClient {
 
     /// Checks an execute response against the exact request it answers:
     /// structural validity plus operation identity and fence equality.
-    fn check_execute_response(
+    pub(crate) fn check_execute_response(
         request: &NamedReadRequest,
         response: &NamedReadResponse,
     ) -> Result<(), StoreError> {

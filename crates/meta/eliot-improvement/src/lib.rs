@@ -23,8 +23,8 @@ pub mod overlay_policy_routing;
 pub mod producer;
 
 pub use governed_screen::{
-    CarriageMark, PresentedLearning, bounds_to_context_error, check_governed_carriage,
-    datetime_from_unix,
+    CarriageMark, PresentedLearning, PresentedRecordLearning, bounds_to_context_error,
+    check_governed_carriage, check_governed_record_carriage, datetime_from_unix,
 };
 pub use overlay_policy_routing::{ImprovementCandidateDraft, route_rejected_surface};
 pub use producer::{

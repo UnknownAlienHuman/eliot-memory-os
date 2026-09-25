@@ -82,6 +82,9 @@ impl CandidateBoundPolicy {
         verified: &VerifiedLearningAdmission<'_>,
     ) -> Result<(), BoundsError> {
         self.validate()?;
+        verified
+            .record_identity()
+            .ok_or(BoundsError::GovernorAuthorityUnconfirmed)?;
         if self.governor_authority_ref.trim() != verified.permit().authority_ref() {
             return Err(BoundsError::GovernorAuthorityUnconfirmed);
         }
@@ -810,6 +813,10 @@ pub struct GovernedRetrieval<'a> {
 pub fn retrieve_governed(request: GovernedRetrieval<'_>) -> Result<RetrievalDecision, BoundsError> {
     let now = request.now;
     let permit = request.verified.permit();
+    request
+        .verified
+        .record_identity()
+        .ok_or(BoundsError::GovernorAuthorityUnconfirmed)?;
     if request.requesting_campaign_id.trim().is_empty() {
         return Err(BoundsError::MissingField("requesting_campaign_id"));
     }

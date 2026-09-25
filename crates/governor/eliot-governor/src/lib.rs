@@ -86,22 +86,25 @@ pub use composition::*;
 pub use controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardOwnerBinding, ControlBoardProjectionError,
 };
+pub use eliot_canonical::{CanonicalWriteEnvelope, FinishAttemptDraft, RequestedFinishOutcome};
+pub use eliot_finish::FinishDecisionReceipt;
 /// Canonical write envelope admitted by `commit_canonical`. Re-exported so
 /// the daemon composition root can name the exact envelope type without a
 /// second canonical dependency path.
-pub use eliot_canonical::{CanonicalWriteEnvelope, FinishAttemptDraft, RequestedFinishOutcome};
-pub use eliot_finish::FinishDecisionReceipt;
+pub use eliot_store_api::LearningRecordIdentity;
 /// Task lifecycle domain types re-exported so the daemon composition root
 /// can name the exact task-command types without a second task dependency
 /// path (same reason as the [`CanonicalWriteEnvelope`] re-export below).
 pub use eliot_task::{TaskCommand, TaskCommandContext, TaskProposal, TaskRecord};
 pub use learning_admission::{
-    LEARNING_ADMISSION_CONTRACT, LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim,
-    LearningAdmissionError, LearningAdmissionPermit, LearningRecordAdmissionBinding,
-    LearningRecordAdmissionClaim, VerifiedLearningAdmission, issue_learning_admission,
-    issue_learning_record_admission, issue_learning_record_ticket, issue_learning_ticket,
-    verify_learning_admission, verify_learning_record_admission, verify_learning_record_ticket,
-    verify_learning_ticket,
+    GovernorLearningEffectivenessReceipt, LEARNING_ADMISSION_CONTRACT,
+    LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim, LearningAdmissionError,
+    LearningAdmissionPermit, LearningRecordAdmissionBinding, LearningRecordAdmissionClaim,
+    LearningRecordDurabilityEvidence, VerifiedLearningAdmission,
+    admit_learning_record_after_commit, issue_learning_admission, issue_learning_record_admission,
+    issue_learning_record_admission_after_commit, issue_learning_record_ticket,
+    issue_learning_record_ticket_after_commit, issue_learning_ticket, verify_learning_admission,
+    verify_learning_record_admission, verify_learning_record_ticket, verify_learning_ticket,
 };
 pub use learning_delta_integration::{
     AttemptCloseError, admission_claim_for_delta, close_attempt_with_activation_receipt,
@@ -110,13 +113,11 @@ pub use learning_delta_integration::{
     retry_lineage_for_delta, store_derived_delta, verify_delta_delivery,
 };
 pub use learning_record_commit::{
-    LearningRecordPayload, LearningRecordProposal, commit_learning_record,
-    commit_learning_record_with_admission, learning_effective_under_admission,
-    learning_record_identity_from_request, learning_record_mutation_request_for_delta,
-    learning_record_proposal_for_activation_receipt, learning_record_proposal_for_candidate,
-    learning_record_proposal_for_closure, learning_record_proposal_for_delta,
-    learning_record_proposal_for_overlay, learning_record_proposal_for_view_ref,
-    learning_record_proposal_from_serializable,
+    LearningRecordPayload, LearningRecordProposal, learning_record_idempotency_key,
+    learning_record_operation_id, learning_record_proposal_for_activation_receipt,
+    learning_record_proposal_for_candidate, learning_record_proposal_for_closure,
+    learning_record_proposal_for_delta, learning_record_proposal_for_overlay,
+    learning_record_proposal_for_view_ref,
 };
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,

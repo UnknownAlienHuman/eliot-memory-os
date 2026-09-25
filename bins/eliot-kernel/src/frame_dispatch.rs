@@ -890,6 +890,7 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "store_recovery"
             | "store_initialize_genesis"
             | "apply_prepared"
+            | "record_learning_record"
             | "receipt"
             | "store_named"
             | "local_read"

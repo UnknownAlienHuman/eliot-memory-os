@@ -597,7 +597,20 @@ async fn apply_migration_direct(
     }
 }
 
-/// Atomically applies one exact S-01 transition and returns its immutable receipt.
+fn reject_generic_learning_path(
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    if transition.named_operations.iter().any(|command| {
+        command.operation == eliot_store_api::NamedMutationOperation::RecordLearningRecord
+    }) {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "learning.operation",
+            reason: "generic apply cannot carry learning records",
+        }));
+    }
+    Ok(())
+}
+
 /// Projection publications and outbox intents are derived by the shared
 /// transition planner, matching the in-memory reference implementation.
 ///
@@ -626,7 +639,52 @@ pub(crate) async fn apply_prepared(
     .await
 }
 
-/// Atomically applies one exact S-01 transition with per-operation payload
+/// Applies one learning record through the dedicated Kernel capability.
+///
+/// The request is still the exact prepared transition and the same canonical
+/// transaction/receipt machinery is used; only the dispatch path differs from
+/// unrestricted `Apply`.
+pub(crate) async fn apply_learning_record(
+    adapter: &SurrealStoreAdapter,
+    ctx: &eliot_store_api::RequestMeta,
+    transition: eliot_store_api::PreparedTransition,
+    expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
+) -> Result<WriteReceipt, AdapterError> {
+    validate_transition(ctx, &transition)?;
+    if transition.named_operations.len() != 1
+        || transition.named_operations[0].operation
+            != eliot_store_api::NamedMutationOperation::RecordLearningRecord
+    {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "learning.operation",
+            reason: "dedicated learning capability requires exactly one learning operation",
+        }));
+    }
+    if let Some(execution) = adapter.execution_handle()
+        && !execution.unreserved_apply_admission().allowed()
+    {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "store.write_path",
+            reason: "learning commit is not admitted under the concurrent execution generation",
+        }));
+    }
+    let db = client(adapter).await?;
+    ensure_ready(adapter, db).await?;
+    let authorities: Vec<Option<ExactJsonBytes>> = vec![None; transition.named_operations.len()];
+    Box::pin(apply_with_retry(
+        adapter,
+        db,
+        ctx,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+        &authorities,
+        TxLane::Facade,
+    ))
+    .await
+}
+
 /// authorities bound in (slice C2, issue #19).
 ///
 /// `authorities` aligns 1:1 with the transition's named operations and
@@ -673,6 +731,7 @@ pub(crate) async fn apply_prepared_with_authority(
         }));
     }
     validate_transition(ctx, &transition)?;
+    reject_generic_learning_path(&transition)?;
 
     let db = client(adapter).await?;
     ensure_ready(adapter, db).await?;
@@ -716,6 +775,7 @@ pub(crate) async fn apply_prepared_without_write_guard(
     // unguarded; fence and head predicates in the canonical transaction
     // remain the concurrency authority.
     validate_transition(ctx, &transition)?;
+    reject_generic_learning_path(&transition)?;
 
     let db = client(adapter).await?;
     ensure_ready(adapter, db).await?;

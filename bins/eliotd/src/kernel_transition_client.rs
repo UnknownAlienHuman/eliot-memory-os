@@ -30,11 +30,28 @@ use super::{DaemonKernelClient, kernel_port_error, kind_value};
 /// distinct from the initiating principal/session, so this check never
 /// requires the request source to be the daemon identity and never rewrites
 /// it.
+#[cfg(test)]
 fn check_identity_binding(
     identity: &RequestIdentity,
     transition: &PreparedTransition,
     expected_revision_heads: &[RevisionHeadExpectation],
     expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<(), KernelPortError> {
+    check_identity_binding_with_mode(
+        identity,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+        false,
+    )
+}
+
+fn check_identity_binding_with_mode(
+    identity: &RequestIdentity,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+    allow_learning: bool,
 ) -> Result<(), KernelPortError> {
     identity
         .validate()
@@ -45,6 +62,15 @@ fn check_identity_binding(
     if transition.state_fence != identity.request.metadata.state_fence {
         return Err(KernelPortError::Contract(
             "daemon transition fence does not match the admitted identity".to_owned(),
+        ));
+    }
+    if !allow_learning
+        && transition.named_operations.iter().any(|command| {
+            command.operation == eliot_store_api::NamedMutationOperation::RecordLearningRecord
+        })
+    {
+        return Err(KernelPortError::Contract(
+            "generic daemon transition cannot carry learning records".to_owned(),
         ));
     }
     if transition.identity.idempotency_key != identity.idempotency_key {
@@ -120,11 +146,12 @@ impl KernelTransitionPort for DaemonKernelClient {
         );
         Box::pin(
             async move {
-                check_identity_binding(
+                check_identity_binding_with_mode(
                     &identity,
                     &transition,
                     &expected_revision_heads,
                     &expected_ordering_heads,
+                    false,
                 )?;
                 let _ = super::diagnostics::emit_handoff(
                     super::diagnostics::HandoffKind::Prepared,
@@ -159,6 +186,65 @@ impl KernelTransitionPort for DaemonKernelClient {
                     identity.idempotency_key.as_str(),
                     receipt.operation_id.as_str(),
                 );
+                Ok(receipt)
+            }
+            .instrument(span),
+        )
+    }
+
+    fn record_learning_record<'a>(
+        &'a self,
+        identity: &'a RequestIdentity,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> KernelPortFuture<'a, WriteReceipt> {
+        let identity = identity.clone();
+        let span = tracing::info_span!(
+            "eliotd.learning_record_handoff",
+            operation = %super::diagnostics::sanitize_identity(&identity.idempotency_key)
+        );
+        Box::pin(
+            async move {
+                check_identity_binding_with_mode(
+                    &identity,
+                    &transition,
+                    &expected_revision_heads,
+                    &expected_ordering_heads,
+                    true,
+                )?;
+                if transition.named_operations.len() != 1
+                    || transition.named_operations[0].operation
+                        != eliot_store_api::NamedMutationOperation::RecordLearningRecord
+                {
+                    return Err(KernelPortError::Contract(
+                        "dedicated learning route requires exactly one learning operation"
+                            .to_owned(),
+                    ));
+                }
+                let expected_transition = transition.clone();
+                let value = self
+                    .transact_async_with_identity(
+                        "record_learning_record",
+                        serde_json::json!({
+                            "context": identity.request.metadata.clone(),
+                            "transition": transition,
+                            "expected_revision_heads": expected_revision_heads,
+                            "expected_ordering_heads": expected_ordering_heads,
+                        }),
+                        identity.clone(),
+                    )
+                    .await
+                    .map_err(kernel_port_error)?;
+                let value = kind_value(&value, "write_receipt")?;
+                let receipt: WriteReceipt = serde_json::from_value(value)
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                validate_store_receipt_envelope(
+                    &identity.request.metadata,
+                    &expected_transition,
+                    &receipt,
+                )
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
                 Ok(receipt)
             }
             .instrument(span),

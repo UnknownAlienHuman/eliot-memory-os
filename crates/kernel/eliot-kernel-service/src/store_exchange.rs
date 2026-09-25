@@ -237,7 +237,8 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             cancellation_id: format!("{request_id}:cancel"),
         };
         let operation_id = match &request {
-            StoreRequest::Apply { transition, .. } => {
+            StoreRequest::Apply { transition, .. }
+            | StoreRequest::RecordLearningRecord { transition, .. } => {
                 Some(transition.identity.operation_id.clone())
             }
             // Issue #991: the reserved-write family carries its stable

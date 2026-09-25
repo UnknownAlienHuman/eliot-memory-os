@@ -607,7 +607,55 @@ impl StoreComposition {
         outcome
     }
 
-    /// Applies one sealed reserved-write request through the sole canonical
+    /// Applies one learning record through the dedicated authenticated
+    /// capability. The ordinary `apply` path rejects this operation.
+    pub async fn record_learning_record(
+        &self,
+        context: &RequestMeta,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<WriteReceipt, StoreCompositionError> {
+        if transition.named_operations.len() != 1
+            || transition.named_operations[0].operation
+                != eliot_store_api::NamedMutationOperation::RecordLearningRecord
+        {
+            return Err(StoreCompositionError::Store(StoreError::InvalidField {
+                field: "learning.operation",
+                reason: "dedicated learning route requires exactly one learning operation",
+            }));
+        }
+        admit_prepared_for_execution(
+            context,
+            &transition,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+        )?;
+        let lease = self
+            .connections
+            .try_acquire(ClientClass::Write)
+            .map_err(StoreCompositionError::Store)?;
+        let _access = self.connections.validate_lease(&lease)?;
+        let outcome = self
+            .store
+            .record_learning_record(
+                context,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            )
+            .await
+            .map_err(map_adapter_error);
+        if matches!(
+            outcome,
+            Err(StoreCompositionError::Store(StoreError::Unavailable))
+        ) {
+            self.connections.mark_broken(ClientClass::Write);
+            self.store.note_connection_loss();
+        }
+        outcome
+    }
+
     /// write path and returns the immutable transport receipt (issue #991).
     ///
     /// Thin composition delegation: the closed #990 request shape is
@@ -1355,7 +1403,7 @@ fn enforce_admitted_operation(request: &Request) -> Result<(), String> {
                 .validate_against_catalogue(&entries)
                 .map_err(|error| error.to_string())
         }
-        Request::Apply { transition, .. } => {
+        Request::Apply { transition, .. } | Request::RecordLearningRecord { transition, .. } => {
             let entries = generated_operation_manifests().map_err(|error| error.to_string())?;
             transition
                 .validate_against_catalogue(&entries)

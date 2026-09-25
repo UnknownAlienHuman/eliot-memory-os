@@ -12,23 +12,24 @@
 //!    fence. Stale epoch/generation/fence or tampering refuses here.
 //! 3. Host preflight: [`screen_admission_input_learning`] screens every
 //!    learning-marked atom in the input. Any violation refuses here.
-//! 4. Only then the real consumer invocation
-//!    ([`handle_request_typed`]) runs.
+//! 4. Only then the real native admission invocation runs. The guest's
+//!    `handle_request_typed` closure is intentionally not used here: it
+//!    rejects marked input because it has no owner evidence.
 //!
 //! Refusals return a typed [`GuestResponse`] with `native_calls == 0`,
 //! proving `admit_context` never ran: nothing surfaces. This is the
 //! documented preflight the `eliot-wasm-host` composition root calls
 //! before guest invocation for inputs carrying learning marks.
 
-use eliot_context_admission::screen_admission_input_learning;
+use eliot_context_admission::{admit_context, screen_admission_input_learning};
+use eliot_context_contracts::LearningRecordAdmissionTicket;
 use eliot_contracts::fences_match_exact;
 use eliot_governor::{
-    Governor, LearningAdmissionError, LearningAdmissionPermit, verify_learning_admission,
+    Governor, LearningAdmissionError, LearningAdmissionPermit, LearningRecordIdentity,
+    verify_learning_admission, verify_learning_record_admission, verify_learning_record_ticket,
 };
 
-use crate::conversion::{
-    GuestError, GuestRequest, GuestResponse, check_envelope, handle_request_typed,
-};
+use crate::conversion::{GuestError, GuestRequest, GuestResponse, check_envelope};
 
 /// Map an owner verification failure onto the closed guest error set.
 fn admission_error_to_guest(error: &LearningAdmissionError) -> GuestError {
@@ -50,7 +51,12 @@ fn admission_error_to_guest(error: &LearningAdmissionError) -> GuestError {
         }
         LearningAdmissionError::StaleAuthorityEpoch
         | LearningAdmissionError::GenerationMismatch
-        | LearningAdmissionError::DigestMismatch => GuestError::IdentityConflict,
+        | LearningAdmissionError::DigestMismatch
+        | LearningAdmissionError::MissingRecordBinding
+        | LearningAdmissionError::RecordIdentityMismatch
+        | LearningAdmissionError::AdmissionExpired
+        | LearningAdmissionError::MissingDurabilityEvidence
+        | LearningAdmissionError::DurabilityEvidenceMismatch => GuestError::IdentityConflict,
     }
 }
 
@@ -61,6 +67,25 @@ fn refused(request: &GuestRequest, error: GuestError) -> GuestResponse {
         result: None,
         error: Some(error),
         native_calls: 0,
+    }
+}
+
+fn invoke_native_after_preflight(request: &GuestRequest) -> GuestResponse {
+    match admit_context(&request.input) {
+        Ok(result) => GuestResponse {
+            abi_version: request.abi_version,
+            handler_subtype: request.handler_subtype.clone(),
+            result: Some(result),
+            error: None,
+            native_calls: 1,
+        },
+        Err(error) => GuestResponse {
+            abi_version: request.abi_version,
+            handler_subtype: request.handler_subtype.clone(),
+            result: None,
+            error: Some(GuestError::from(&error)),
+            native_calls: 1,
+        },
     }
 }
 
@@ -77,6 +102,16 @@ pub fn compile_learning_context(
 ) -> GuestResponse {
     if let Err(error) = check_envelope(request) {
         return refused(request, error);
+    }
+    if !request.input.learning_tickets.is_empty()
+        || request
+            .input
+            .candidates
+            .candidates
+            .iter()
+            .any(|candidate| candidate.learning.is_some())
+    {
+        return refused(request, GuestError::LearningRequiresGovernedPath);
     }
     // Compilation-level binding: the served task and fence must be the
     // admitted ones. Per-atom bindings are re-checked in the screen below;
@@ -95,5 +130,81 @@ pub fn compile_learning_context(
     if let Err(error) = screen_admission_input_learning(&request.input, &verified, now_unix_secs) {
         return refused(request, GuestError::from(&error));
     }
-    handle_request_typed(request)
+    invoke_native_after_preflight(request)
+}
+
+/// Record-bound host preflight for the production Context Compiler path.
+///
+/// The opaque permit, exact record identity, and serializable record ticket
+/// must agree before any marked atom reaches native admission. This function
+/// is deliberately separate from the legacy influence-only entrypoint above;
+/// behavioral carriage cannot silently fall back to that contour.
+pub fn compile_record_learning_context(
+    governor: &Governor,
+    permit: &LearningAdmissionPermit,
+    record_identity: &LearningRecordIdentity,
+    record_ticket: &LearningRecordAdmissionTicket,
+    request: &GuestRequest,
+    now_unix_secs: u64,
+    now_unix_ms: u64,
+) -> GuestResponse {
+    if let Err(error) = check_envelope(request) {
+        return refused(request, error);
+    }
+    if request.input.binding.task_id.as_str() != permit.target_task_id() {
+        return refused(request, GuestError::IdentityConflict);
+    }
+    if !fences_match_exact(
+        &request.input.binding.state_fence,
+        &record_identity.state_fence,
+    ) || !fences_match_exact(&request.input.binding.state_fence, permit.fence())
+    {
+        return refused(request, GuestError::InvalidFence);
+    }
+    let verified = match verify_learning_record_admission(
+        governor,
+        permit,
+        &request.input.binding.state_fence,
+        record_identity,
+        now_unix_ms,
+    ) {
+        Ok(verified) => verified,
+        Err(error) => return refused(request, admission_error_to_guest(&error)),
+    };
+    let expected_ticket = match permit.record_ticket() {
+        Ok(ticket) => ticket,
+        Err(error) => return refused(request, admission_error_to_guest(&error)),
+    };
+    if expected_ticket.digest != record_ticket.digest {
+        return refused(request, GuestError::IdentityConflict);
+    }
+    let has_learning = request
+        .input
+        .candidates
+        .candidates
+        .iter()
+        .any(|candidate| candidate.learning.is_some());
+    if !request.input.learning_tickets.is_empty()
+        && (!has_learning
+            || request
+                .input
+                .learning_tickets
+                .iter()
+                .any(|ticket| ticket.digest != permit.digest()))
+    {
+        return refused(request, GuestError::IdentityConflict);
+    }
+    if let Err(error) = verify_learning_record_ticket(
+        governor,
+        record_ticket,
+        &request.input.binding.state_fence,
+        record_identity,
+        now_unix_ms,
+    ) {
+        return refused(request, admission_error_to_guest(&error));
+    }
+    if let Err(error) = screen_admission_input_learning(&request.input, &verified, now_unix_secs) {
+        return refused(request, GuestError::from(&error));
+    }
+    invoke_native_after_preflight(request)
 }

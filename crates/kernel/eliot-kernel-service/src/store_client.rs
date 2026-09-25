@@ -441,6 +441,61 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             .await?;
         Err(StoreError::MissingReceiptEnvelope)
     }
+
+    /// Sends the dedicated learning-record frame. This method is intentionally
+    /// separate from `apply_prepared`: the generic EBP apply surface refuses
+    /// learning before a frame is built.
+    pub(crate) async fn record_learning_record(
+        &self,
+        ctx: &RequestMeta,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<WriteReceipt, StoreError> {
+        let request = StoreRequest::RecordLearningRecord {
+            context: ctx.clone(),
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        };
+        request.validate()?;
+        let transition = match &request {
+            StoreRequest::RecordLearningRecord { transition, .. } => transition,
+            _ => return Err(StoreError::UnknownOperation),
+        };
+        ctx.validate().map_err(StoreError::Foundation)?;
+        self.validate_requirement_fence(&ctx.state_fence)?;
+        self.validate_requirement_fence(&transition.state_fence)?;
+        let view = request
+            .apply_canonical_request_view()
+            .ok_or(StoreError::UnknownOperation)?;
+        verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)?;
+        let operation_id = transition.identity.operation_id.clone();
+        let idempotency_key = transition.identity.idempotency_key.clone();
+        let canonical_request_hash = transition.identity.canonical_request_hash.clone();
+        let fault = self.take_fault();
+        if fault == StoreClientFault::PreCommitCrash {
+            return Err(StoreError::MissingReceiptEnvelope);
+        }
+        let result = self.execute_raw(request, Some(ctx), &idempotency_key).await;
+        match result {
+            Ok(StoreResponse::Transaction { receipt }) if receipt.operation_id == operation_id => {
+                if fault == StoreClientFault::PostCommitResponseLoss {
+                    return Err(StoreError::MissingReceiptEnvelope);
+                }
+                Ok(receipt)
+            }
+            Ok(_) => {
+                self.receipt_exact(operation_id, &canonical_request_hash)
+                    .await
+            }
+            Err(error) if error.is_unknown_outcome_failure() => {
+                self.receipt_exact(operation_id, &canonical_request_hash)
+                    .await
+            }
+            Err(error) => Err(error.into_store_error()),
+        }
+    }
 }
 
 impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreClient<T> {
@@ -452,6 +507,14 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, StoreError> {
         transition.validate()?;
+        if transition.named_operations.iter().any(|command| {
+            command.operation == eliot_store_api::NamedMutationOperation::RecordLearningRecord
+        }) {
+            return Err(StoreError::InvalidField {
+                field: "learning.operation",
+                reason: "generic EBP apply cannot carry learning records",
+            });
+        }
         ctx.validate().map_err(StoreError::Foundation)?;
         if ctx.state_fence != self.requirement.state_fence
             || transition.state_fence != self.requirement.state_fence
@@ -533,6 +596,22 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             }
             Err(error) => Err(error.into_store_error()),
         }
+    }
+
+    async fn record_learning_record(
+        &self,
+        ctx: &RequestMeta,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<WriteReceipt, StoreError> {
+        self.record_learning_record(
+            ctx,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .await
     }
 
     /// Applies one sealed reserved-write request through the existing

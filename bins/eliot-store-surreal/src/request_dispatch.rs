@@ -387,6 +387,29 @@ impl StoreDispatchBackend for StoreComposition {
                     Err(error) => map_composition_error(error, failure_context),
                 }
             }
+            Request::RecordLearningRecord {
+                context,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            } => {
+                let failure_context = failure_context_for_operation(
+                    &context,
+                    transition.identity.operation_id.clone(),
+                    transition.identity.idempotency_key.clone(),
+                );
+                match Box::pin(self.record_learning_record(
+                    &context,
+                    transition,
+                    expected_revision_heads,
+                    expected_ordering_heads,
+                ))
+                .await
+                {
+                    Ok(receipt) => response_for_transaction_receipt(receipt, failure_context),
+                    Err(error) => map_composition_error(error, failure_context),
+                }
+            }
             Request::Receipt { operation_id } => {
                 let context = StoreFailureIdentityContext {
                     operation_id: Some(operation_id.clone()),

@@ -38,7 +38,8 @@ use eliot_context_contracts::{AdmissionInput, AdmissionResult, ContextError, Lea
 use eliot_contracts::{ArtifactId, StateFence, fences_match_exact};
 use eliot_governor::VerifiedLearningAdmission;
 use eliot_improvement::{
-    CarriageMark, PresentedLearning, bounds_to_context_error, check_governed_carriage,
+    CarriageMark, PresentedLearning, PresentedRecordLearning, bounds_to_context_error,
+    check_governed_record_carriage,
 };
 
 use crate::admit_context_inner;
@@ -74,6 +75,9 @@ pub fn screen_learning_subjects(
         });
     }
     let permit = verified.permit();
+    if !subjects.is_empty() && verified.record_identity().is_none() {
+        return Err(ContextError::IdentityConflict);
+    }
     for subject in subjects {
         let mark = subject.provenance;
         if mark.campaign_id != permit.source_campaign_id() {
@@ -87,6 +91,28 @@ pub fn screen_learning_subjects(
         }
         if mark.permit_digest != permit.digest() {
             return Err(ContextError::IdentityConflict);
+        }
+        match verified.record_identity() {
+            Some(identity) => {
+                let Some(record) = mark.record.as_ref() else {
+                    return Err(ContextError::IdentityConflict);
+                };
+                if record.record_kind != identity.record_kind
+                    || record.record_handle != identity.handle
+                    || record.record_digest != identity.record_digest
+                    || record.scope_id != identity.scope_id
+                    || !fences_match_exact(&record.state_fence, &identity.state_fence)
+                    || record.expires_at_unix_ms != identity.expires_at_unix_ms
+                    || record.source_campaign_id != permit.source_campaign_id()
+                    || record.target_task_id != subject.binding_task_id
+                    || record.closure_ref.as_deref() != mark.closure_ref.as_deref()
+                    || record.owner.as_deref() != mark.owner.as_deref()
+                {
+                    return Err(ContextError::IdentityConflict);
+                }
+            }
+            None if mark.record.is_some() => return Err(ContextError::IdentityConflict),
+            None => {}
         }
         match (&mark.overlay_id, permit.overlay_id()) {
             (Some(marked), Some(bound)) if marked == bound => {}
@@ -171,26 +197,65 @@ pub fn admit_context_with_learning(
         .iter()
         .any(|candidate| candidate.learning.is_some());
     if marked || !input.learning_tickets.is_empty() {
-        let mut marks = Vec::new();
-        for candidate in &input.candidates.candidates {
-            if let Some(provenance) = &candidate.learning {
-                provenance.validate()?;
-                marks.push(CarriageMark {
-                    campaign_id: provenance.campaign_id.as_str(),
-                    overlay_id: provenance.overlay_id.as_deref(),
-                    candidate_id: provenance.candidate_id.as_deref(),
-                    closure_ref: provenance.closure_ref.as_deref(),
-                    owner: provenance.owner.as_deref(),
-                    draft: provenance.draft,
-                    expires_at_unix_secs: provenance.expires_at_unix_secs,
-                    permit_digest: provenance.permit_digest.as_str(),
-                    binding_task_id: candidate.binding.task_id.as_str(),
-                });
-            }
-        }
-        check_governed_carriage(&presented, &input.binding.state_fence, &marks)
-            .map_err(bounds_to_context_error)?;
+        // The influence-only presentation has no exact record ticket. Keep
+        // this compatibility entrypoint source-compatible, but never let it
+        // authorize behavioral learning; the record-bound entrypoint below
+        // is the only production carriage seam.
+        return Err(ContextError::IdentityConflict);
     }
+    screen_admission_input_learning(input, presented.verified, presented.now_unix_secs)?;
+    admit_context_inner(input)
+}
+
+/// Record-bound governed retrieval entrypoint used by the real Context
+/// Compiler carriage path.
+///
+/// The older [`admit_context_with_learning`] entrypoint intentionally remains
+/// fail-closed for a marked input because its influence-only ticket has no
+/// durable record identity. This parallel entrypoint carries the exact
+/// Governor-issued record ticket and record-bound verified handle, then
+/// applies the same candidate, fence, overlay, backlog, and cross-task gates.
+pub fn admit_context_with_record_learning(
+    input: &AdmissionInput,
+    presented: PresentedRecordLearning<'_>,
+) -> Result<AdmissionResult, ContextError> {
+    let mut marks = Vec::new();
+    for candidate in &input.candidates.candidates {
+        if candidate.binding.scope_id != input.binding.scope_id {
+            return Err(ContextError::IdentityConflict);
+        }
+        if let Some(provenance) = &candidate.learning {
+            provenance.validate()?;
+            marks.push(CarriageMark {
+                campaign_id: provenance.campaign_id.as_str(),
+                overlay_id: provenance.overlay_id.as_deref(),
+                candidate_id: provenance.candidate_id.as_deref(),
+                closure_ref: provenance.closure_ref.as_deref(),
+                owner: provenance.owner.as_deref(),
+                draft: provenance.draft,
+                expires_at_unix_secs: provenance.expires_at_unix_secs,
+                permit_digest: provenance.permit_digest.as_str(),
+                binding_task_id: candidate.binding.task_id.as_str(),
+                record: provenance.record.as_ref(),
+            });
+        }
+    }
+    if !input.learning_tickets.is_empty()
+        && (marks.is_empty()
+            || input
+                .learning_tickets
+                .iter()
+                .any(|ticket| ticket.digest != presented.ticket.digest))
+    {
+        return Err(ContextError::IdentityConflict);
+    }
+    check_governed_record_carriage(
+        &presented,
+        input.binding.scope_id.as_str(),
+        &input.binding.state_fence,
+        &marks,
+    )
+    .map_err(bounds_to_context_error)?;
     screen_admission_input_learning(input, presented.verified, presented.now_unix_secs)?;
     admit_context_inner(input)
 }

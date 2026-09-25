@@ -529,6 +529,25 @@ impl SurrealStoreAdapter {
         .await
     }
 
+    /// Applies one learning record through the dedicated authenticated
+    /// request/fence-bound capability.
+    pub async fn record_learning_record(
+        &self,
+        ctx: &RequestMeta,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<WriteReceipt, AdapterError> {
+        Box::pin(apply::apply_learning_record(
+            self,
+            ctx,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        ))
+        .await
+    }
+
     /// Applies one prepared S-01 transition with per-operation payload
     /// authorities bound in (slice C2, issue #19).
     ///
@@ -617,6 +636,23 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
             expected_revision_heads,
             expected_ordering_heads,
         ))
+        .await
+        .map_err(AdapterError::into_store_error)
+    }
+
+    async fn record_learning_record(
+        &self,
+        ctx: &RequestMeta,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<WriteReceipt, StoreError> {
+        self.record_learning_record(
+            ctx,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
         .await
         .map_err(AdapterError::into_store_error)
     }

@@ -173,6 +173,22 @@ pub(crate) async fn prepare_learning_writes(
             idempotency_key: _,
             expires_at_unix_ms,
         } = decoded;
+        let document = eliot_store_api::LearningRecordDocument::decode(record_kind, &record_json)
+            .map_err(AdapterError::Store)?;
+        document
+            .validate_handle(&handle)
+            .map_err(AdapterError::Store)?;
+        document
+            .validate_scope_fence(transition.scope_id.as_str(), &transition.state_fence)
+            .map_err(AdapterError::Store)?;
+        let document_digest = eliot_store_api::learning_record_document_digest(&record_json)
+            .map_err(AdapterError::Store)?;
+        if document_digest != record_digest {
+            return Err(AdapterError::Store(StoreError::InvalidField {
+                field: "learning.record_digest",
+                reason: "record digest does not match canonical record_json bytes",
+            }));
+        }
         let expected_scope_digest = learning_scope_digest(transition.scope_id.as_str())?;
         let expected_fence_digest = learning_fence_digest(&transition.state_fence)?;
         if scope_digest != expected_scope_digest || fence_digest != expected_fence_digest {
@@ -333,7 +349,44 @@ fn decode_record_row(
     })
 }
 
-/// Reads learning rows for the current query in key order.
+/// Counts the exact same-scope, same-fence, optional-kind learning set for the
+/// range response. A page without this proof is not considered complete.
+pub(crate) async fn count_learning_for_read(
+    db: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    scope_id: &str,
+    state_fence: &StateFence,
+    kind_filter: Option<&str>,
+) -> Result<u64, AdapterError> {
+    let predicate = if kind_filter.is_some() {
+        "scope_id = $learning_scope AND state_fence = $learning_state_fence AND record_kind = $learning_kind"
+    } else {
+        "scope_id = $learning_scope AND state_fence = $learning_state_fence"
+    };
+    let sql = format!(
+        "SELECT VALUE count() FROM {} WHERE {predicate} GROUP ALL;",
+        schema::table::LEARNING_RECORD
+    );
+    let mut bindings = Map::new();
+    bindings.insert("learning_scope".to_owned(), json!(scope_id));
+    bindings.insert("learning_state_fence".to_owned(), json!(state_fence));
+    if let Some(kind) = kind_filter {
+        bindings.insert("learning_kind".to_owned(), json!(kind));
+    }
+    let mut response = client::query(db, config, "learning.count_records", &sql, bindings).await?;
+    let errors = response.take_errors();
+    if missing_learning_table(&errors) {
+        return Ok(0);
+    }
+    if !errors.is_empty() {
+        return Err(AdapterError::Store(StoreError::Serialization(
+            "learning record total count failed".to_owned(),
+        )));
+    }
+    let values: Vec<Value> = response.take(0)?;
+    Ok(values.first().and_then(Value::as_u64).unwrap_or(0))
+}
+
 ///
 /// Rows are scope-gated in the query; the optional kind filter narrows
 /// to one closed record kind. The admission fence is arbitrated by the
@@ -342,22 +395,24 @@ pub(crate) async fn read_learning_for_read(
     db: &RpcTransport,
     config: &SurrealAdapterConfig,
     scope_id: &str,
+    state_fence: &StateFence,
     kind_filter: Option<&str>,
     limit: usize,
 ) -> Result<Vec<StoredLearningRecord>, AdapterError> {
     let sql = if kind_filter.is_some() {
         format!(
-            "SELECT * FROM {} WHERE scope_id = $learning_scope AND record_kind = $learning_kind ORDER BY record_kind, handle, record_digest, scope_digest, fence_digest, expires_at_unix_ms LIMIT {limit};",
+            "SELECT * FROM {} WHERE scope_id = $learning_scope AND state_fence = $learning_state_fence AND record_kind = $learning_kind ORDER BY record_kind, handle, record_digest, scope_digest, fence_digest, expires_at_unix_ms LIMIT {limit};",
             schema::table::LEARNING_RECORD
         )
     } else {
         format!(
-            "SELECT * FROM {} WHERE scope_id = $learning_scope ORDER BY record_kind, handle, record_digest, scope_digest, fence_digest, expires_at_unix_ms LIMIT {limit};",
+            "SELECT * FROM {} WHERE scope_id = $learning_scope AND state_fence = $learning_state_fence ORDER BY record_kind, handle, record_digest, scope_digest, fence_digest, expires_at_unix_ms LIMIT {limit};",
             schema::table::LEARNING_RECORD
         )
     };
     let mut bindings = Map::new();
     bindings.insert("learning_scope".to_owned(), json!(scope_id));
+    bindings.insert("learning_state_fence".to_owned(), json!(state_fence));
     if let Some(kind) = kind_filter {
         bindings.insert("learning_kind".to_owned(), json!(kind));
     }

@@ -23,8 +23,8 @@ pub use decision::{
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use learning_gate::{
-    LearningSubject, admit_context_with_learning, screen_admission_input_learning,
-    screen_learning_subjects,
+    LearningSubject, admit_context_with_learning, admit_context_with_record_learning,
+    screen_admission_input_learning, screen_learning_subjects,
 };
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

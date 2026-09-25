@@ -161,14 +161,14 @@ pub use wire::{
     CAPABILITY_DREAMER_JOB_REQUEST_CANCEL, CAPABILITY_DREAMER_JOB_RESUME,
     CAPABILITY_DREAMER_JOB_START, CAPABILITY_DREAMER_JOB_STATUS, CAPABILITY_DREAMER_JOB_SUBMIT,
     CAPABILITY_ERASURE_INTENT, CAPABILITY_HEALTH, CAPABILITY_INITIALIZE_GENESIS,
-    CAPABILITY_NAMED_READ, CAPABILITY_ORDERING_HEADS, CAPABILITY_READINESS, CAPABILITY_RECEIPT,
-    CAPABILITY_RECOVERY, CAPABILITY_RESERVED_WRITE, CAPABILITY_REVISION_HEADS,
-    CAPABILITY_STORE_BACKUP, CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS, ErasureSurfaceRequest,
-    ReadinessReceipt, ReadinessStatus, StoreBackupOperation, StoreBackupRequest,
-    StoreBackupResponse, StoreBackupStatus, StoreBackupStatusOutcome, StoreRequest, StoreResponse,
-    StoreWireError, decode_request_frame, decode_request_frame_with_authority,
-    decode_response_frame, dreamer_job_capability, request_frame,
-    request_frame_with_payload_authority, response_frame,
+    CAPABILITY_LEARNING_RECORD, CAPABILITY_NAMED_READ, CAPABILITY_ORDERING_HEADS,
+    CAPABILITY_READINESS, CAPABILITY_RECEIPT, CAPABILITY_RECOVERY, CAPABILITY_RESERVED_WRITE,
+    CAPABILITY_REVISION_HEADS, CAPABILITY_STORE_BACKUP, CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS,
+    ErasureSurfaceRequest, ReadinessReceipt, ReadinessStatus, StoreBackupOperation,
+    StoreBackupRequest, StoreBackupResponse, StoreBackupStatus, StoreBackupStatusOutcome,
+    StoreRequest, StoreResponse, StoreWireError, decode_request_frame,
+    decode_request_frame_with_authority, decode_response_frame, dreamer_job_capability,
+    request_frame, request_frame_with_payload_authority, response_frame,
 };
 
 mod operation_catalogue;
@@ -201,16 +201,19 @@ pub use experience_store::{
 
 pub use learning_store::{
     DecodedLearningMutation, DecodedLearningRead, LEARNING_PARAM_CURSOR,
-    LEARNING_PARAM_EXPIRES_AT_UNIX_MS, LEARNING_PARAM_FENCE_DIGEST, LEARNING_PARAM_HANDLE,
-    LEARNING_PARAM_IDEMPOTENCY_KEY, LEARNING_PARAM_MAX_RECORDS, LEARNING_PARAM_RECORD_DIGEST,
-    LEARNING_PARAM_RECORD_JSON, LEARNING_PARAM_RECORD_KIND, LEARNING_PARAM_SCOPE_DIGEST,
-    LEARNING_RECORD_MUTATION_NAME, LEARNING_RECORD_READ_NAME, LEARNING_STORE_SCHEMA_V1,
-    LearningRecordIdentity, LearningRecordKind, MAX_LEARNING_HANDLE_BYTES,
-    MAX_LEARNING_IDEMPOTENCY_BYTES, MAX_LEARNING_PAGE_RECORDS, MAX_LEARNING_RECORD_JSON_BYTES,
-    decode_learning_mutation, decode_learning_read, learning_fence_digest,
+    LEARNING_PARAM_END_OF_STREAM, LEARNING_PARAM_EXPIRES_AT_UNIX_MS, LEARNING_PARAM_FENCE_DIGEST,
+    LEARNING_PARAM_HANDLE, LEARNING_PARAM_IDEMPOTENCY_KEY, LEARNING_PARAM_MAX_RECORDS,
+    LEARNING_PARAM_RECORD_DIGEST, LEARNING_PARAM_RECORD_JSON, LEARNING_PARAM_RECORD_KIND,
+    LEARNING_PARAM_SCOPE_DIGEST, LEARNING_PARAM_TOTAL_MATCHED, LEARNING_RECORD_MUTATION_NAME,
+    LEARNING_RECORD_READ_NAME, LEARNING_STORE_SCHEMA_V1, LearningRecordDocument,
+    LearningRecordIdentity, LearningRecordKind, MAX_LEARNING_CURSOR_BYTES,
+    MAX_LEARNING_HANDLE_BYTES, MAX_LEARNING_IDEMPOTENCY_BYTES, MAX_LEARNING_PAGE_RECORDS,
+    MAX_LEARNING_RECORD_JSON_BYTES, MAX_LEARNING_SCAN_ROWS, decode_learning_mutation,
+    decode_learning_read, learning_cursor_issue, learning_cursor_parse, learning_fence_digest,
     learning_record_commit_params, learning_record_commit_params_from_identity,
-    learning_record_mutation_request, learning_record_read_request, learning_scope_digest,
-    reject_direct_learning_write, validate_learning_mutation_params, validate_learning_read_params,
+    learning_record_document_digest, learning_record_mutation_request,
+    learning_record_read_request, learning_record_read_request_page, learning_scope_digest,
+    validate_learning_mutation_params, validate_learning_read_params,
 };
 
 pub use write_admission::{
@@ -2896,6 +2899,26 @@ pub trait CanonicalStoreClient: Send + Sync {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, StoreError>;
+
+    /// Applies one learning-record transition through the dedicated,
+    /// request/fence-bound Kernel capability. The default refuses before
+    /// provider I/O; generic `apply_prepared` rejects learning operations.
+    async fn record_learning_record(
+        &self,
+        ctx: &RequestMeta,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<WriteReceipt, StoreError> {
+        let request = crate::wire::StoreRequest::RecordLearningRecord {
+            context: ctx.clone(),
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        };
+        request.validate()?;
+        Err(StoreError::UnknownOperation)
+    }
 
     /// Applies one sealed reserved-write request through the existing
     /// authenticated Store path (issue #991).

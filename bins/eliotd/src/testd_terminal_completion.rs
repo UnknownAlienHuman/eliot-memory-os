@@ -5,11 +5,22 @@
 //! and the exact pre-dispatch canonical verifier plan from the `TestD` owner,
 //! then re-reads the current Governor plan before publishing.
 
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{OperationId, TaskId, canonical_json_bytes};
+use crate::daemon_kernel_client::TESTD_OWNER_POLL_LIMIT;
+use crate::{DaemonComposition, DaemonError, DaemonKernelClient};
+use eliot_agent_contracts::AgentAttemptId;
+use eliot_contracts::{
+    ArtifactId, OperationId, PolicyRevision, TaskId, TaskRevision, canonical_json_bytes, sha256_hex,
+};
 use eliot_governor::{CanonicalPlanBinding, LearningRecordPayload};
 use eliot_instrument_api::InstrumentInvocation;
+use eliot_learning_contracts::identity::SourceLineage;
+use eliot_learning_contracts::{
+    AttemptLearningDeltaCandidate, ChangeOperation, ChangeSurface, ContractBinding, InverseChange,
+    ProofCeiling, TargetId, ValueState,
+};
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{LearningRecordKind, NamedReadResponse, ScopeId};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
@@ -18,31 +29,177 @@ use eliot_testd_core::{
     TestdTerminalCompletionEvidence, TestdTerminalCompletionNotice, TestdVerifierDispatchBinding,
     verification_receipt_sha256,
 };
-use serde::Serialize;
-
-use crate::daemon_kernel_client::TESTD_OWNER_POLL_LIMIT;
-use crate::{DaemonComposition, DaemonError, DaemonKernelClient};
-
-/// Typed, owner-separated observation emitted when the TestD terminal owner
-/// closes a job. It records what was observed; it does not claim activation,
-/// adherence, benefit, or Governor admission.
-#[derive(Serialize)]
-struct TestdTerminalLearningRecord {
-    job_id: String,
-    process_operation_id: String,
-    task_id: String,
-    task_revision: u64,
-    scope_id: String,
-    state_fence: eliot_contracts::StateFence,
-    terminal_state: String,
-    verifier_receipt_sha256: String,
-    finish_decision: eliot_governor::FinishDecisionReceipt,
-    observed_at_unix_ms: u64,
-    expires_at_unix_ms: u64,
-}
 
 fn completion_error(error: impl std::fmt::Display) -> DaemonError {
     DaemonError::Lifecycle(format!("TestD terminal completion: {error}"))
+}
+
+/// Build the real learning candidate contract from authenticated TestD
+/// terminal evidence. The daemon does not persist an owner-defined JSON blob:
+/// the stored document is the canonical `AttemptLearningDeltaCandidate`, with
+/// the durable verifier receipt and finish decision represented only by
+/// owner-issued evidence handles and lineage.
+fn terminal_learning_candidate(
+    job: &TestJob,
+    identity: &RequestIdentity,
+    decision: &eliot_governor::FinishDecisionReceipt,
+    scope_id: &ScopeId,
+    verifier_receipt_sha256: &str,
+    expires_at_unix_ms: u64,
+) -> Result<AttemptLearningDeltaCandidate, DaemonError> {
+    let task_id = identity
+        .request
+        .metadata
+        .task_id
+        .clone()
+        .ok_or_else(|| completion_error("learning candidate request has no task id"))?;
+    if decision.task_id != task_id.as_str() {
+        return Err(completion_error(
+            "learning candidate task differs from the authenticated finish decision",
+        ));
+    }
+    let source = SourceLineage {
+        owner: identity.request.metadata.source_id.clone(),
+        snapshot: ArtifactId::new(verifier_receipt_sha256).map_err(completion_error)?,
+        revision: TaskRevision::new(decision.task_revision).map_err(completion_error)?,
+        digest: verifier_receipt_sha256.to_owned(),
+    };
+    let binding = ContractBinding {
+        schema_version: 1,
+        policy_revision: PolicyRevision::new(1).map_err(completion_error)?,
+        request_id: identity.request.metadata.request_id.clone(),
+        operation_id: OperationId::new(format!("testd-learning-candidate-{}", job.job_id))
+            .map_err(completion_error)?,
+        product_id: identity.request.metadata.product_id.clone(),
+        task_id,
+        scope: eliot_receipts::WorkScopeId::new(scope_id.as_str()).map_err(completion_error)?,
+        state_fence: identity.request.state_fence.clone(),
+        source,
+        proof_ceiling: ProofCeiling::CandidateArtifact,
+    };
+    let target = TargetId::new(format!("testd-target-{}", job.job_id)).map_err(completion_error)?;
+    let after_digest = sha256_hex(
+        &canonical_json_bytes(&serde_json::json!({
+            "domain": "eliot.testd.learning-candidate.v1",
+            "job_id": job.job_id,
+            "verifier_receipt_sha256": verifier_receipt_sha256,
+            "task_id": decision.task_id,
+            "expires_at_unix_ms": expires_at_unix_ms,
+        }))
+        .map_err(completion_error)?,
+    );
+    let after = ValueState {
+        present: true,
+        digest: Some(after_digest),
+    };
+    let before = after.clone();
+    let mut candidate = AttemptLearningDeltaCandidate {
+        binding,
+        attempt_id: AgentAttemptId::new(format!("testd-attempt-{}", job.job_id))
+            .map_err(completion_error)?,
+        delta_id: ArtifactId::new(format!("testd-candidate-{}", job.job_id))
+            .map_err(completion_error)?,
+        target: target.clone(),
+        base_view_digest: verifier_receipt_sha256.to_owned(),
+        pre_observation_discriminator: ArtifactId::new(format!(
+            "testd-pre-observation-{}",
+            job.job_id
+        ))
+        .map_err(completion_error)?,
+        intended_strategy: ArtifactId::new(format!("testd-intended-{}", job.job_id))
+            .map_err(completion_error)?,
+        attempted_strategy: ArtifactId::new(format!("testd-attempted-{}", job.job_id))
+            .map_err(completion_error)?,
+        changes: vec![ChangeOperation::Add {
+            target: target.clone(),
+            surface: ChangeSurface::Strategy,
+            after: after.clone(),
+        }],
+        inverses: vec![InverseChange {
+            forward_target: target.clone(),
+            inverse: ChangeOperation::Remove {
+                target,
+                surface: ChangeSurface::Strategy,
+                before,
+            },
+        }],
+        evidence: vec![ArtifactId::new(verifier_receipt_sha256).map_err(completion_error)?],
+        evaluator_receipts: vec![
+            ArtifactId::new(format!("testd-evaluator-{}", job.job_id)).map_err(completion_error)?,
+        ],
+        baseline: Vec::new(),
+        control: Vec::new(),
+        confounders: Vec::new(),
+        dependencies: Vec::new(),
+        equivalent_retry: None,
+        proof_ceiling: ProofCeiling::CandidateArtifact,
+        canonical_digest: String::new(),
+    };
+    candidate.seal().map_err(completion_error)?;
+    if candidate.binding.state_fence != identity.request.state_fence
+        || candidate.binding.scope.as_str() != scope_id.as_str()
+        || expires_at_unix_ms == 0
+    {
+        return Err(completion_error(
+            "learning candidate binding drifted from the authenticated terminal request",
+        ));
+    }
+    Ok(candidate)
+}
+
+const TESTD_LEARNING_READ_PAGE_SIZE: u16 = 8;
+const TESTD_LEARNING_READ_MAX_PAGES: usize = 1024;
+
+fn learning_child_identity(
+    identity: &RequestIdentity,
+    record: &eliot_store_api::LearningRecordIdentity,
+) -> Result<RequestIdentity, DaemonError> {
+    identity.validate().map_err(completion_error)?;
+    let key = eliot_governor::learning_record_idempotency_key(
+        identity.request.metadata.request_id.as_str(),
+        record,
+    )
+    .map_err(completion_error)?;
+    let digest = sha256_hex(key.as_bytes());
+    let mut child = identity.clone();
+    child.idempotency_key = key;
+    child.cancellation_id = format!("learning-cancel-v1-{digest}");
+    child.validate().map_err(completion_error)?;
+    Ok(child)
+}
+
+fn validate_learning_commit_receipt(
+    receipt: &WriteReceipt,
+    request_id: &str,
+    proposal: &eliot_governor::LearningRecordProposal,
+) -> Result<(), DaemonError> {
+    receipt.validate().map_err(completion_error)?;
+    if receipt.status != WriteReceiptStatus::Committed {
+        return Err(completion_error(
+            "learning commit did not return a durable committed receipt",
+        ));
+    }
+    let expected_operation =
+        eliot_governor::learning_record_operation_id(request_id, &proposal.identity)
+            .map_err(completion_error)?;
+    if receipt.operation_id != expected_operation
+        || receipt.state_fence != proposal.identity.state_fence
+    {
+        return Err(completion_error(
+            "learning commit receipt identity or fence differs from the proposal",
+        ));
+    }
+    let decoded = eliot_store_api::decode_learning_mutation(
+        proposal.request.operation,
+        &proposal.request.parameters,
+    )
+    .map_err(completion_error)?;
+    if receipt.idempotency_key != decoded.idempotency_key {
+        return Err(completion_error(
+            "learning commit receipt idempotency differs from the named record request",
+        ));
+    }
+    Ok(())
 }
 
 fn readback_contains_identity(
@@ -78,6 +235,13 @@ fn readback_contains_identity(
                 .get("record_digest")
                 .and_then(serde_json::Value::as_str)
                 == Some(proposal.identity.record_digest.as_str())
+            && record
+                .get("record_json")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|document| {
+                    eliot_store_api::learning_record_document_digest(document)
+                        .is_ok_and(|digest| digest == proposal.identity.record_digest)
+                })
             && record
                 .get("expires_at_unix_ms")
                 .and_then(serde_json::Value::as_u64)
@@ -365,9 +529,44 @@ impl DaemonComposition {
         Ok(committed)
     }
 
-    /// Reads the exact same-scope, same-fence learning range through the
+    /// Reads one exact same-scope, same-fence learning page through the
     /// authenticated Kernel named-read route. This is the production read
     /// caller for the closed learning surface; it never opens a store client.
+    pub async fn read_learning_record_range_page(
+        &self,
+        kernel: &DaemonKernelClient,
+        scope_id: ScopeId,
+        record_kind: Option<LearningRecordKind>,
+        max_records: u16,
+        cursor: Option<String>,
+    ) -> Result<NamedReadResponse, DaemonError> {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(
+                eliot_governor::CompositionError::NotReady,
+            ));
+        }
+        let request = eliot_store_api::learning_record_read_request_page(
+            scope_id,
+            record_kind,
+            max_records,
+            self.governor.kernel_snapshot().state_fence().clone(),
+            cursor,
+        );
+        crate::KernelContextReadClient::check_execute_capability(&request)
+            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
+        let response = kernel
+            .store_named_async(request.clone())
+            .await
+            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
+        crate::KernelContextReadClient::check_execute_response(&request, &response)
+            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
+        Ok(response)
+    }
+
+    /// Reads the first learning page for compatibility callers that only need
+    /// a bounded observation. Durable owner confirmation uses
+    /// [`Self::read_learning_record_until_identity`] so a record on a later
+    /// page cannot be mistaken for a missing commit.
     pub async fn read_learning_record_range(
         &self,
         kernel: &DaemonKernelClient,
@@ -375,16 +574,133 @@ impl DaemonComposition {
         record_kind: Option<LearningRecordKind>,
         max_records: u16,
     ) -> Result<NamedReadResponse, DaemonError> {
-        let request = eliot_store_api::learning_record_read_request(
-            scope_id,
-            record_kind,
-            max_records,
-            self.governor.kernel_snapshot().state_fence().clone(),
-        );
-        kernel
-            .store_named_async(request)
+        self.read_learning_record_range_page(kernel, scope_id, record_kind, max_records, None)
             .await
-            .map_err(|error| DaemonError::Kernel(error.to_string()))
+    }
+
+    /// Paginates the authenticated learning read until the exact committed
+    /// identity is observed or the owner-minted continuation is exhausted.
+    /// A missing, malformed, repeating, or unbounded cursor fails closed;
+    /// acknowledgement is never based on a first-page assumption.
+    pub async fn read_learning_record_until_identity(
+        &self,
+        kernel: &DaemonKernelClient,
+        scope_id: ScopeId,
+        proposal: &eliot_governor::LearningRecordProposal,
+    ) -> Result<NamedReadResponse, DaemonError> {
+        let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+        let mut all_records = Vec::<serde_json::Value>::new();
+        let mut revision_heads = None;
+        let mut total_matched = None;
+        let mut found_identity = false;
+
+        for _ in 0..TESTD_LEARNING_READ_MAX_PAGES {
+            let response = self
+                .read_learning_record_range_page(
+                    kernel,
+                    scope_id.clone(),
+                    Some(proposal.identity.record_kind),
+                    TESTD_LEARNING_READ_PAGE_SIZE,
+                    cursor.clone(),
+                )
+                .await?;
+            let payload = response
+                .payload
+                .as_object()
+                .ok_or_else(|| completion_error("learning readback payload is not an object"))?;
+            let page_records = payload
+                .get("records")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| completion_error("learning readback records are not an array"))?;
+            let page_matched = payload
+                .get("matched_total")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| completion_error("learning readback omitted matched_total"))?;
+            if u64::try_from(page_records.len()).ok() != Some(page_matched) {
+                return Err(completion_error(
+                    "learning readback matched_total does not match the returned page",
+                ));
+            }
+            let page_total = payload
+                .get("total_matched")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| completion_error("learning readback omitted total_matched"))?;
+            if let Some(previous_total) = total_matched
+                && previous_total != page_total
+            {
+                return Err(completion_error(
+                    "learning readback total changed during fenced pagination",
+                ));
+            }
+            total_matched = Some(page_total);
+            if let Some(previous_heads) = &revision_heads
+                && previous_heads != &response.revision_heads
+            {
+                return Err(completion_error(
+                    "learning readback revision heads changed during fenced pagination",
+                ));
+            }
+            revision_heads = Some(response.revision_heads.clone());
+            all_records.extend(page_records.iter().cloned());
+            found_identity |= readback_contains_identity(&response, proposal);
+
+            let end_of_stream = payload
+                .get("end_of_stream")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| completion_error("learning readback omitted end_of_stream"))?;
+            let truncated = payload
+                .get("truncated")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| completion_error("learning readback omitted truncated"))?;
+            if end_of_stream == truncated {
+                return Err(completion_error(
+                    "learning readback has inconsistent end-of-stream/truncation proof",
+                ));
+            }
+            if end_of_stream {
+                if !found_identity {
+                    break;
+                }
+                let total = total_matched.ok_or_else(|| {
+                    completion_error("learning readback omitted its total stream proof")
+                })?;
+                if u64::try_from(all_records.len()).ok() != Some(total) {
+                    return Err(completion_error(
+                        "learning readback pages do not account for the exact stream total",
+                    ));
+                }
+                let mut merged = response;
+                let merged_payload = merged.payload.as_object_mut().ok_or_else(|| {
+                    completion_error("learning readback payload is not an object")
+                })?;
+                merged_payload.insert("records".to_owned(), serde_json::Value::Array(all_records));
+                merged_payload.insert("matched_total".to_owned(), serde_json::Value::from(total));
+                merged_payload.insert("end_of_stream".to_owned(), serde_json::Value::Bool(true));
+                merged_payload.insert("truncated".to_owned(), serde_json::Value::Bool(false));
+                merged_payload.insert("next_cursor".to_owned(), serde_json::Value::Null);
+                return Ok(merged);
+            }
+
+            let Some(next) = payload
+                .get("next_cursor")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            else {
+                return Err(completion_error(
+                    "learning readback ended without an explicit end-of-stream proof",
+                ));
+            };
+            if !seen_cursors.insert(next.to_owned()) {
+                return Err(completion_error(
+                    "learning readback returned a repeating continuation cursor",
+                ));
+            }
+            cursor = Some(next.to_owned());
+        }
+        Err(completion_error(
+            "learning readback exhausted before an exact committed identity and total proof were observed",
+        ))
     }
 
     /// Drives one bounded `TestD` owner step through the authenticated Kernel
@@ -552,49 +868,72 @@ impl DaemonComposition {
         let expires_at_unix_ms = observed_at_unix_ms.saturating_add(24 * 60 * 60 * 1_000);
         let verifier_receipt_sha256 =
             verification_receipt_sha256(verifier_receipt).map_err(completion_error)?;
-        let learning_record = TestdTerminalLearningRecord {
-            job_id: job.job_id.clone(),
-            process_operation_id: job.process.operation_id.clone(),
-            task_id: decision.task_id.clone(),
-            task_revision: decision.task_revision,
-            scope_id: scope_id.as_str().to_owned(),
-            state_fence: identity.request.state_fence.clone(),
-            terminal_state: terminal_state_name(job.state)?.to_owned(),
-            verifier_receipt_sha256,
-            finish_decision: decision,
-            observed_at_unix_ms,
-            expires_at_unix_ms,
-        };
-        let learning_record_json =
-            serde_json::to_value(&learning_record).map_err(completion_error)?;
-        let proposal = LearningRecordPayload::OwnerDefined {
-            kind: LearningRecordKind::Candidate,
-            handle: format!("testd-candidate-{}", job.job_id),
-            record: &learning_record_json,
-        }
-        .into_proposal(
-            &scope_id,
-            &identity.request.state_fence,
-            expires_at_unix_ms,
-            format!("learning-terminal-{}", job.job_id),
-        )
-        .map_err(completion_error)?;
-        self.commit_learning_record_proposal(
+        let _terminal_state = terminal_state_name(job.state)?;
+        let candidate = terminal_learning_candidate(
+            job,
             identity,
-            &proposal,
-            vec![learning_record.verifier_receipt_sha256.clone()],
-            None,
-            now_unix_ms,
-        )
-        .await?;
-        let readback = self
-            .read_learning_record_range(kernel, scope_id, Some(LearningRecordKind::Candidate), 8)
+            &decision,
+            &scope_id,
+            &verifier_receipt_sha256,
+            expires_at_unix_ms,
+        )?;
+        let provisional = LearningRecordPayload::Candidate(&candidate)
+            .into_proposal(
+                &scope_id,
+                &identity.request.state_fence,
+                expires_at_unix_ms,
+                format!("learning-terminal-{}", job.job_id),
+            )
+            .map_err(completion_error)?;
+        let learning_identity = learning_child_identity(identity, &provisional.identity)?;
+        let proposal = LearningRecordPayload::Candidate(&candidate)
+            .into_proposal(
+                &scope_id,
+                &identity.request.state_fence,
+                expires_at_unix_ms,
+                learning_identity.idempotency_key.clone(),
+            )
+            .map_err(completion_error)?;
+        let learning_receipt = self
+            .commit_learning_record_proposal(
+                &learning_identity,
+                &proposal,
+                vec![verifier_receipt_sha256.clone()],
+            )
             .await?;
-        if !readback_contains_identity(&readback, &proposal) {
-            return Err(completion_error(
-                "learning readback did not contain the exact committed identity",
-            ));
-        }
+        validate_learning_commit_receipt(
+            &learning_receipt,
+            learning_identity.request.metadata.request_id.as_str(),
+            &proposal,
+        )?;
+        let readback = self
+            .read_learning_record_until_identity(kernel, scope_id, &proposal)
+            .await?;
+        let claim = eliot_governor::LearningRecordAdmissionClaim {
+            admission: eliot_governor::LearningAdmissionClaim {
+                schema_version: eliot_governor::LEARNING_ADMISSION_SCHEMA_VERSION,
+                source_campaign_id: candidate.binding.source.owner.as_str().to_owned(),
+                target_task_id: decision.task_id.clone(),
+                fence: identity.request.state_fence.clone(),
+                overlay_id: None,
+                candidate_id: Some(candidate.delta_id.as_str().to_owned()),
+                scope_ref: proposal.identity.scope_id.clone(),
+                authority_ref: verifier_receipt_sha256.clone(),
+                retention_ref: format!("testd-retention-{}", job.job_id),
+                evaluator_ref: format!("testd-evaluator-{}", job.job_id),
+                rollback_ref: format!("testd-rollback-{}", job.job_id),
+            },
+            record: eliot_governor::LearningRecordAdmissionBinding::from_identity(
+                &proposal.identity,
+            ),
+        };
+        let (_permit, _effectiveness) = self.admit_learning_record_after_commit(
+            &proposal,
+            &claim,
+            &learning_receipt,
+            &readback,
+            now_unix_ms,
+        )?;
         kernel
             .acknowledge_testd_terminal_completion_async(&job.job_id, *committed)
             .await

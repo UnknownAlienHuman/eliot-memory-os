@@ -23,7 +23,9 @@
 //!   Stale-together full-compilation replays pass structural checks and rely
 //!   on contour fence freshness (I14.14 generation fencing).
 
-use eliot_contracts::{EpochId, ResourceGeneration, StateFence, fences_match_exact};
+use eliot_contracts::{
+    EpochId, LearningRecordKind, ResourceGeneration, StateFence, fences_match_exact,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -190,7 +192,7 @@ pub struct LearningRecordAdmissionTicket {
     /// Exact admission State Fence.
     pub fence: StateFence,
     /// Closed learning record kind.
-    pub record_kind: String,
+    pub record_kind: LearningRecordKind,
     /// Exact record handle.
     pub record_handle: String,
     /// Exact immutable record digest.
@@ -240,14 +242,8 @@ impl LearningRecordAdmissionTicket {
                 return Err(ContextError::InvalidField(field));
             }
         }
-        if !matches!(
-            self.record_kind.as_str(),
-            "delta" | "overlay" | "closure" | "activation_receipt" | "candidate" | "view_ref"
-        ) {
-            return Err(ContextError::InvalidField(
-                "learning_record_ticket.record_kind",
-            ));
-        }
+        // `LearningRecordKind` is the closed shared enum; no string match is
+        // needed or accepted here.
         validate_digest(&self.record_digest, "learning_record_ticket.record_digest")?;
         self.fence
             .validate()
@@ -269,7 +265,7 @@ struct RecordTicketDigestInput<'a> {
     source_campaign_id: &'a str,
     target_task_id: &'a str,
     fence: &'a StateFence,
-    record_kind: &'a str,
+    record_kind: LearningRecordKind,
     record_handle: &'a str,
     record_digest: &'a str,
     scope_id: &'a str,
@@ -290,7 +286,7 @@ pub fn learning_record_ticket_digest(
         source_campaign_id: ticket.source_campaign_id.trim(),
         target_task_id: ticket.target_task_id.trim(),
         fence: &ticket.fence,
-        record_kind: ticket.record_kind.trim(),
+        record_kind: ticket.record_kind,
         record_handle: ticket.record_handle.trim(),
         record_digest: ticket.record_digest.trim(),
         scope_id: ticket.scope_id.trim(),

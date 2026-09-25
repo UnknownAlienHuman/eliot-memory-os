@@ -266,6 +266,16 @@ impl MemoryStore {
         expected_ordering_heads: &[OrderingHeadExpectation],
     ) -> Result<WriteReceipt, StoreError> {
         validate_transaction(ctx, &transition)?;
+        if transition
+            .named_operations
+            .iter()
+            .any(|command| command.operation == NamedMutationOperation::RecordLearningRecord)
+        {
+            return Err(StoreError::InvalidField {
+                field: "learning.operation",
+                reason: "generic apply cannot carry learning records",
+            });
+        }
         // Recompute before any lookup or effect: supplied != recomputed is a
         // typed digest mismatch with no transaction and no lookup success.
         let view = CanonicalRequestView::from_apply(
@@ -1434,6 +1444,17 @@ fn apply_learning_record_command(
 ) -> Result<usize, StoreError> {
     let decoded =
         eliot_store_api::decode_learning_mutation(command.operation, &command.parameters)?;
+    let document =
+        eliot_store_api::LearningRecordDocument::decode(decoded.record_kind, &decoded.record_json)?;
+    document.validate_handle(&decoded.handle)?;
+    document.validate_scope_fence(transition.scope_id.as_str(), &transition.state_fence)?;
+    let record_digest = eliot_store_api::learning_record_document_digest(&decoded.record_json)?;
+    if record_digest != decoded.record_digest {
+        return Err(StoreError::InvalidField {
+            field: "learning.record_digest",
+            reason: "record digest does not match canonical record_json bytes",
+        });
+    }
     let record_kind = decoded.record_kind.as_str().to_owned();
     let scope_id = transition.scope_id.to_string();
     let expected_scope_digest =
@@ -1976,8 +1997,8 @@ fn experience_range_payload(
 /// Mirrors [`experience_range_payload`]: rows project in key order
 /// (record kind, then handle, then digest) with verbatim record documents
 /// plus presented digests, reusing the shared [`ExperienceRangePage`]
-/// projector (`records` / `matched_total` / `truncated` / `next_cursor` /
-/// `state_fence`); rows past the bound set `truncated` with
+/// projector. The dedicated learning cursor binds current fence, revision
+/// heads, scope, kind, and page bound; rows past the bound set `truncated` with
 /// `matched_total` counting only returned records, never a guess at the
 /// remainder. Zero matches are an exact empty result, not an error. The
 /// optional closed `record_kind` filter narrows to one kind; absent it
@@ -1990,6 +2011,15 @@ fn learning_range_payload(
     query: &NamedReadRequest,
     fence: &StateFence,
 ) -> Result<Value, StoreError> {
+    if query.state_fence != *fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    if query.consistency != eliot_store_api::ReadConsistency::ExactFence {
+        return Err(StoreError::InvalidField {
+            field: "operation.consistency",
+            reason: "learning range read requires ExactFence",
+        });
+    }
     if let Some(bound_raw) = query
         .parameters
         .get(eliot_store_api::LEARNING_PARAM_MAX_RECORDS)
@@ -2010,13 +2040,16 @@ fn learning_range_payload(
         .values()
         .map(|head| (head.key.as_str().to_owned(), head.revision))
         .collect();
-    let start: Option<u64> = match query
-        .parameters
-        .get(eliot_store_api::LEARNING_PARAM_CURSOR)
-        .and_then(Value::as_str)
-    {
+    let start: Option<u64> = match decoded.cursor.as_deref() {
         None => None,
-        Some(cursor) => Some(eliot_store_api::audit_cursor_parse(cursor, fence, &heads)?),
+        Some(cursor) => Some(eliot_store_api::learning_cursor_parse(
+            cursor,
+            fence,
+            &heads,
+            scope_id.as_str(),
+            decoded.record_kind,
+            decoded.max_records,
+        )?),
     };
     let mut records = Vec::new();
     let mut truncated = false;
@@ -2032,12 +2065,18 @@ fn learning_range_payload(
             continue;
         }
         ordinal = ordinal.saturating_add(1);
+        if ordinal > eliot_store_api::MAX_LEARNING_SCAN_ROWS {
+            return Err(StoreError::InvalidField {
+                field: "learning.range",
+                reason: "bounded learning scan is incomplete",
+            });
+        }
         if start.is_some_and(|start| ordinal <= start) {
             continue;
         }
-        if records.len() > limit {
+        if records.len() == limit {
             truncated = true;
-            break;
+            continue;
         }
         records.push(json!({
             "record_kind": row.record_kind,
@@ -2051,15 +2090,15 @@ fn learning_range_payload(
             "scope_id": row.scope_id,
         }));
     }
-    if records.len() > limit {
-        records.pop();
-        truncated = true;
-    }
     let matched_total = records.len();
+    let total_matched = ordinal;
     let next_cursor = if truncated {
-        Some(eliot_store_api::audit_cursor_issue(
+        Some(eliot_store_api::learning_cursor_issue(
             fence,
             &heads,
+            scope_id.as_str(),
+            decoded.record_kind,
+            decoded.max_records,
             start
                 .unwrap_or(0)
                 .saturating_add(u64::try_from(matched_total).unwrap_or(u64::MAX)),
@@ -2067,7 +2106,7 @@ fn learning_range_payload(
     } else {
         None
     };
-    serde_json::to_value(
+    let mut payload = serde_json::to_value(
         eliot_store_api::ExperienceRangePage {
             records,
             matched_total,
@@ -2076,7 +2115,18 @@ fn learning_range_payload(
         }
         .payload(fence),
     )
-    .map_err(|error| StoreError::Serialization(error.to_string()))
+    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            eliot_store_api::LEARNING_PARAM_TOTAL_MATCHED.to_owned(),
+            Value::from(total_matched),
+        );
+        object.insert(
+            eliot_store_api::LEARNING_PARAM_END_OF_STREAM.to_owned(),
+            Value::Bool(!truncated),
+        );
+    }
+    Ok(payload)
 }
 
 /// Builds the same-fence audit-range payload (issue #223).
@@ -3643,6 +3693,30 @@ impl CanonicalStoreClient for MemoryStore {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, StoreError> {
+        self.apply_transaction(
+            ctx,
+            transition,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+        )
+    }
+
+    async fn record_learning_record(
+        &self,
+        ctx: &RequestMeta,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<WriteReceipt, StoreError> {
+        if transition.named_operations.len() != 1
+            || transition.named_operations[0].operation
+                != NamedMutationOperation::RecordLearningRecord
+        {
+            return Err(StoreError::InvalidField {
+                field: "learning.operation",
+                reason: "dedicated learning capability requires exactly one learning operation",
+            });
+        }
         self.apply_transaction(
             ctx,
             transition,

@@ -14,11 +14,16 @@ eliot-epistemic-contracts = { path = "../../smart/eliot-epistemic-contracts", ve
 eliot-protocol = { workspace = true }
 eliot-receipts = { workspace = true }
 eliot-security-contracts = { workspace = true }
+eliot-learning-contracts = { workspace = true }
+eliot-learning-delta = { workspace = true }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+eliot-agent-contracts.workspace = true
 
 [lints]
 workspace = true

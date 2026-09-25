@@ -10,6 +10,8 @@
 //!   identical to the owner-verified permit, and freshly re-verified
 //!   against the live owner epoch/generation and the exact compilation
 //!   fence ([`verify_learning_ticket`]) — bare strings never authorize;
+//!   the legacy influence-only shape is retained only as a compatibility
+//!   contour and is refused for behavioral learning;
 //! - an overlay subject bound by the permit requires the exact live
 //!   `LOCAL_ADMITTED` overlay (expiry enforced with teeth via
 //!   [`GovernedOverlay::is_live_local_admitted_at_unix`]);
@@ -27,10 +29,13 @@
 //! never enter a `wasm32` guest closure. Depending crates gate it with
 //! `#[cfg(not(target_arch = "wasm32"))]`.
 
-use eliot_context_contracts::{ContextError, LearningAdmissionTicket};
+use eliot_context_contracts::{
+    ContextError, LearningAdmissionTicket, LearningRecordAdmissionTicket, LearningRecordProvenance,
+};
 use eliot_contracts::{StateFence, fences_match_exact};
 use eliot_governor::{
-    Governor, LearningAdmissionError, VerifiedLearningAdmission, verify_learning_ticket,
+    Governor, LearningAdmissionError, VerifiedLearningAdmission, verify_learning_record_ticket,
+    verify_learning_ticket,
 };
 use time::OffsetDateTime;
 
@@ -53,6 +58,8 @@ pub struct CarriageMark<'a> {
     pub expires_at_unix_secs: Option<u64>,
     pub permit_digest: &'a str,
     pub binding_task_id: &'a str,
+    /// Exact durable record evidence carried by the atom, when present.
+    pub record: Option<&'a LearningRecordProvenance>,
 }
 
 /// Everything a native screen must present for one governed retrieval.
@@ -78,6 +85,30 @@ pub struct PresentedLearning<'a> {
     pub now_unix_secs: u64,
 }
 
+/// Record-bound presentation for the production Context Compiler path.
+///
+/// This is deliberately parallel to [`PresentedLearning`]: the legacy shape
+/// remains source-compatible for non-behavioral context compatibility, but
+/// behavioral retrieval must present the exact record ticket as well as the
+/// owner-verified record identity. Keeping the record fields out of the old
+/// struct avoids a broad, easy-to-miss struct-literal migration while making
+/// the legacy entrance fail closed for marked candidates.
+#[derive(Clone, Copy, Debug)]
+pub struct PresentedRecordLearning<'a> {
+    pub governor: &'a Governor,
+    pub verified: &'a VerifiedLearningAdmission<'a>,
+    pub ticket: &'a LearningAdmissionTicket,
+    pub record_ticket: &'a LearningRecordAdmissionTicket,
+    pub overlay: Option<&'a GovernedOverlay>,
+    pub backlog: &'a BoundedBacklog,
+    pub cross_task_admission: Option<&'a CrossTaskAdmission>,
+    pub requesting_campaign_id: &'a str,
+    pub requesting_task_id: &'a str,
+    pub requesting_scope_id: &'a str,
+    pub now_unix_secs: u64,
+    pub now_unix_ms: u64,
+}
+
 fn map_admission_error(error: LearningAdmissionError) -> BoundsError {
     match error {
         LearningAdmissionError::StaleStateFence => BoundsError::StaleStateFence,
@@ -91,20 +122,31 @@ fn map_admission_error(error: LearningAdmissionError) -> BoundsError {
         | LearningAdmissionError::MissingRecordBinding
         | LearningAdmissionError::RecordIdentityMismatch
         | LearningAdmissionError::AdmissionExpired
+        | LearningAdmissionError::MissingDurabilityEvidence
+        | LearningAdmissionError::DurabilityEvidenceMismatch
         | LearningAdmissionError::DigestMismatch => BoundsError::GovernorAuthorityUnconfirmed,
     }
 }
 
-/// Governed carriage gate: ticket re-verification plus overlay, backlog,
-/// cross-task, and per-mark binding in one fail-closed pass.
-///
-/// `current_fence` is the compilation fence the retrieval is admitted
-/// under (the input's binding fence) — never a caller-supplied copy.
-///
-/// Order: requesting identity, ticket shape, wire-to-owner digest binding,
-/// live owner re-verification (epoch/generation/fence), per-mark binding,
-/// overlay liveness, reusable backlog backing, cross-task admission.
+/// Legacy influence-only carriage is intentionally not an authorization
+/// seam. It remains callable for source compatibility, but always refuses;
+/// behavioral callers must use [`check_governed_record_carriage`].
 pub fn check_governed_carriage(
+    _presented: &PresentedLearning<'_>,
+    _current_fence: &StateFence,
+    _marks: &[CarriageMark<'_>],
+) -> Result<(), BoundsError> {
+    Err(BoundsError::GovernorAuthorityUnconfirmed)
+}
+
+/// Internal overlay/backlog/cross-task checks shared only by the
+/// record-bound wrapper. `current_fence` is the compilation fence the
+/// retrieval is admitted under (the input's binding fence) — never a
+/// caller-supplied copy. The order is requesting identity, ticket shape,
+/// wire-to-owner digest binding, live owner re-verification, per-mark
+/// binding, overlay liveness, reusable backlog backing, and cross-task
+/// admission.
+fn check_governed_carriage_inner(
     presented: &PresentedLearning<'_>,
     current_fence: &StateFence,
     marks: &[CarriageMark<'_>],
@@ -116,6 +158,9 @@ pub fn check_governed_carriage(
         return Err(BoundsError::MissingField("requesting_task_id"));
     }
     let permit = presented.verified.permit();
+    if !marks.is_empty() && presented.verified.record_identity().is_none() {
+        return Err(BoundsError::GovernorAuthorityUnconfirmed);
+    }
     presented
         .ticket
         .validate()
@@ -234,6 +279,97 @@ pub fn check_governed_carriage(
         }
     } else if presented.cross_task_admission.is_some() {
         return Err(BoundsError::CrossTaskAdmissionMismatch);
+    }
+    Ok(())
+}
+
+/// Record-bound carriage gate used by the production Context Compiler path.
+///
+/// The ordinary gate remains the single implementation of overlay, backlog,
+/// cross-task, and per-mark checks. This wrapper adds the two facts that the
+/// legacy influence-only ticket cannot express: the owner-verified durable
+/// record identity and its exact wire ticket. It also correlates the record
+/// handle/kind with the overlay or candidate subject carried by every marked
+/// atom, so a valid record permit cannot be transplanted onto another
+/// learning subject.
+pub fn check_governed_record_carriage(
+    presented: &PresentedRecordLearning<'_>,
+    current_scope_id: &str,
+    current_fence: &StateFence,
+    marks: &[CarriageMark<'_>],
+) -> Result<(), BoundsError> {
+    let identity = presented
+        .verified
+        .record_identity()
+        .ok_or(BoundsError::GovernorAuthorityUnconfirmed)?;
+    if current_scope_id.trim() != identity.scope_id
+        || presented.requesting_scope_id.trim() != identity.scope_id
+    {
+        return Err(BoundsError::CrossTaskAdmissionMismatch);
+    }
+    let expected_ticket = presented
+        .verified
+        .permit()
+        .record_ticket()
+        .map_err(map_admission_error)?;
+    if expected_ticket.digest != presented.record_ticket.digest {
+        return Err(BoundsError::GovernorAuthorityUnconfirmed);
+    }
+    verify_learning_record_ticket(
+        presented.governor,
+        presented.record_ticket,
+        current_fence,
+        identity,
+        presented.now_unix_ms,
+    )
+    .map_err(map_admission_error)?;
+    let legacy = PresentedLearning {
+        governor: presented.governor,
+        verified: presented.verified,
+        ticket: presented.ticket,
+        overlay: presented.overlay,
+        backlog: presented.backlog,
+        cross_task_admission: presented.cross_task_admission,
+        requesting_campaign_id: presented.requesting_campaign_id,
+        requesting_task_id: presented.requesting_task_id,
+        now_unix_secs: presented.now_unix_secs,
+    };
+    check_governed_carriage_inner(&legacy, current_fence, marks)?;
+    for mark in marks {
+        let Some(record) = mark.record else {
+            return Err(BoundsError::GovernorAuthorityUnconfirmed);
+        };
+        if record.record_kind != identity.record_kind
+            || record.record_handle != identity.handle
+            || record.record_digest != identity.record_digest
+            || record.scope_id != identity.scope_id
+            || !fences_match_exact(&record.state_fence, &identity.state_fence)
+            || record.expires_at_unix_ms != identity.expires_at_unix_ms
+            || record.source_campaign_id != presented.verified.permit().source_campaign_id()
+            || record.target_task_id != mark.binding_task_id
+            || record.closure_ref.as_deref() != mark.closure_ref
+            || record.owner.as_deref() != mark.owner
+        {
+            return Err(BoundsError::GovernorAuthorityUnconfirmed);
+        }
+        let subject_matches = match identity.record_kind {
+            eliot_contracts::LearningRecordKind::Overlay => {
+                mark.overlay_id == Some(identity.handle.as_str())
+            }
+            eliot_contracts::LearningRecordKind::Delta
+            | eliot_contracts::LearningRecordKind::Candidate => {
+                mark.candidate_id == Some(identity.handle.as_str())
+            }
+            eliot_contracts::LearningRecordKind::Closure
+            | eliot_contracts::LearningRecordKind::ActivationReceipt
+            | eliot_contracts::LearningRecordKind::ViewRef => {
+                mark.overlay_id == Some(identity.handle.as_str())
+                    || mark.candidate_id == Some(identity.handle.as_str())
+            }
+        };
+        if !subject_matches {
+            return Err(BoundsError::ReusableBackingMismatch);
+        }
     }
     Ok(())
 }

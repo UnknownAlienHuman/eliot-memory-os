@@ -1,8 +1,9 @@
 //! Canonical learning-record wire contract (issue #1868, I12.24).
 //!
-//! This module owns the serialization-only wire boundary for durable
-//! learning records: the closed record-kind discriminator, per-record
-//! completeness validation on raw parameter maps, and request builders.
+//! This module owns the canonical wire boundary for durable learning
+//! records: the closed record-kind discriminator, typed document decoding,
+//! per-record completeness validation on raw parameter maps, and request
+//! builders.
 //! It contains no learning semantics, no revision authority, and no
 //! admission validation: Governor admission gating stays Governor-owned
 //! (`verify_learning_admission` re-check); durability never implies
@@ -35,18 +36,24 @@
 //! `CaptureCandidate` with a `Candidate` ceiling (no support, influence,
 //! lifecycle, or assertability change).
 //!
-//! Record documents travel as opaque strings: the store preserves them
-//! verbatim and validates shape/bounds/closed kind membership
-//! structurally. The complete kind/handle/record-digest/scope/fence/
-//! expiry tuple is the immutable revision identity at the backend. Owner
-//! data travels only as opaque reference digests (`scope_digest`,
-//! `fence_digest`); adapters write ONLY the learning tables and never
-//! rewrite owner records. The store never derives semantics from the
-//! document bytes. Read queries project bounded same-fence, same-scope
-//! record sets with explicit truncation.
+//! Record documents travel as canonical JSON strings, but the store still
+//! decodes and validates the closed first-party document for the declared
+//! kind before preserving it. The presented `record_digest` is bound to the
+//! exact canonical JSON bytes. The complete
+//! kind/handle/record-digest/scope/fence/expiry tuple is the immutable
+//! revision identity at the backend. Owner data travels only as
+//! opaque reference digests (`scope_digest`, `fence_digest`); adapters write
+//! ONLY the learning tables and never rewrite owner records. Read queries
+//! project bounded, cursor-paginated, same-fence/same-scope record sets with
+//! explicit truncation.
 
 use std::collections::BTreeMap;
 
+use eliot_learning_contracts::{
+    AttemptLearningDeltaCandidate, CampaignHarnessOverlayCandidate, CampaignLearningStateView,
+    ClosureHandoff, HarnessActivationReceiptCandidate,
+};
+use eliot_learning_delta::StoredLearningDelta;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -67,7 +74,7 @@ pub const LEARNING_PARAM_RECORD_KIND: &str = "record_kind";
 pub const LEARNING_PARAM_HANDLE: &str = "handle";
 /// Verbatim canonical record document (mutation).
 pub const LEARNING_PARAM_RECORD_JSON: &str = "record_json";
-/// Presented digest of the admitted record bytes (mutation).
+/// SHA-256 digest of the exact canonical record document bytes (mutation).
 pub const LEARNING_PARAM_RECORD_DIGEST: &str = "record_digest";
 /// Digest over the canonical admission-scope bytes (mutation).
 pub const LEARNING_PARAM_SCOPE_DIGEST: &str = "scope_digest";
@@ -94,57 +101,18 @@ pub const MAX_LEARNING_IDEMPOTENCY_BYTES: usize = 256;
 pub const MAX_LEARNING_RECORD_JSON_BYTES: usize = 262_144;
 /// Maximum records one learning range read may return.
 pub const MAX_LEARNING_PAGE_RECORDS: u16 = 64;
+/// Maximum accepted opaque continuation-cursor length in bytes.
+pub const MAX_LEARNING_CURSOR_BYTES: usize = 512;
+/// Maximum rows a provider may scan for one bounded learning page. A larger
+/// requested window is an explicit incomplete read, never a silent truncation.
+pub const MAX_LEARNING_SCAN_ROWS: u64 = 4_096;
+/// Wire keys for the explicit stream proof returned by learning range reads.
+pub const LEARNING_PARAM_END_OF_STREAM: &str = "end_of_stream";
+pub const LEARNING_PARAM_TOTAL_MATCHED: &str = "total_matched";
 
-/// Closed learning-record kind discriminator (issue #1868).
-///
-/// One closed set covers every durable learning record named in Work
-/// (view refs, activation receipts, deltas, overlays, closures,
-/// candidates) without a per-kind table/authority split.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LearningRecordKind {
-    /// A proposed behavioral delta record.
-    Delta,
-    /// A proposed overlay record (durable-but-inert without admission).
-    Overlay,
-    /// A closure record.
-    Closure,
-    /// An activation receipt record.
-    ActivationReceipt,
-    /// A candidate record (recording never performs promotion).
-    Candidate,
-    /// A reference to a rebuilt view revision (views never accept writes).
-    ViewRef,
-}
-
-impl LearningRecordKind {
-    /// Returns the closed wire spelling of this record kind.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Delta => "delta",
-            Self::Overlay => "overlay",
-            Self::Closure => "closure",
-            Self::ActivationReceipt => "activation_receipt",
-            Self::Candidate => "candidate",
-            Self::ViewRef => "view_ref",
-        }
-    }
-
-    /// Parses the closed wire spelling back into its record kind.
-    #[must_use]
-    pub const fn from_str(name: &str) -> Option<Self> {
-        match name.as_bytes() {
-            b"delta" => Some(Self::Delta),
-            b"overlay" => Some(Self::Overlay),
-            b"closure" => Some(Self::Closure),
-            b"activation_receipt" => Some(Self::ActivationReceipt),
-            b"candidate" => Some(Self::Candidate),
-            b"view_ref" => Some(Self::ViewRef),
-            _ => None,
-        }
-    }
-}
+/// The shared foundation kind vocabulary is re-exported by the store seam so
+/// every Kernel/store/Governor/context consumer uses the same closed enum.
+pub use eliot_contracts::LearningRecordKind;
 
 /// Exact immutable identity of one learning record revision.
 ///
@@ -159,7 +127,7 @@ pub struct LearningRecordIdentity {
     pub record_kind: LearningRecordKind,
     /// Exact canonical record handle.
     pub handle: String,
-    /// Presented immutable record revision digest.
+    /// SHA-256 digest of the exact canonical `record_json` document bytes.
     pub record_digest: String,
     /// Exact canonical scope identity.
     pub scope_id: String,
@@ -232,7 +200,7 @@ pub struct DecodedLearningMutation {
     pub handle: String,
     /// Verbatim canonical record document.
     pub record_json: String,
-    /// Presented digest of the admitted record bytes.
+    /// SHA-256 digest of the exact canonical record document bytes.
     pub record_digest: String,
     /// Digest over the canonical admission-scope bytes.
     pub scope_digest: String,
@@ -244,13 +212,184 @@ pub struct DecodedLearningMutation {
     pub expires_at_unix_ms: u64,
 }
 
-/// Decoded range read with its closed kind filter and page bound.
+/// Decoded range read with its closed kind filter, page bound, and
+/// owner-minted continuation cursor.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecodedLearningRead {
     /// Closed kind filter, or `None` for every kind.
     pub record_kind: Option<LearningRecordKind>,
     /// Page-size bound (range reads only).
     pub max_records: u16,
+    /// Opaque continuation cursor returned by the store owner, if any.
+    pub cursor: Option<String>,
+}
+
+/// Closed typed document accepted by the learning-record store boundary.
+///
+/// The wire keeps the canonical document bytes, but decoding never falls back
+/// to `serde_json::Value`: every kind has one first-party contract and one
+/// validating constructor. An owner-defined object is therefore not a valid
+/// Candidate/Delta/Overlay/Closure/ActivationReceipt/ViewRef record.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LearningRecordDocument {
+    /// Stored attempt delta.
+    Delta(StoredLearningDelta),
+    /// Campaign overlay candidate.
+    Overlay(CampaignHarnessOverlayCandidate),
+    /// Closure handoff.
+    Closure(ClosureHandoff),
+    /// Activation receipt candidate.
+    ActivationReceipt(HarnessActivationReceiptCandidate),
+    /// Reusable candidate.
+    Candidate(AttemptLearningDeltaCandidate),
+    /// Immutable view reference. The recipe remains an owner-side validation
+    /// input; the persisted view still has to decode as the closed view type.
+    ViewRef(CampaignLearningStateView),
+}
+
+impl LearningRecordDocument {
+    /// Decode one exact kind into its typed document contract.
+    pub fn decode(kind: LearningRecordKind, record_json: &str) -> Result<Self, StoreError> {
+        let invalid = |_error: serde_json::Error| StoreError::InvalidField {
+            field: "learning.record_json",
+            reason: "record is not the closed typed document for its declared kind",
+        };
+        match kind {
+            LearningRecordKind::Delta => serde_json::from_str::<StoredLearningDelta>(record_json)
+                .map(Self::Delta)
+                .map_err(invalid),
+            LearningRecordKind::Overlay => {
+                serde_json::from_str::<CampaignHarnessOverlayCandidate>(record_json)
+                    .map(Self::Overlay)
+                    .map_err(invalid)
+            }
+            LearningRecordKind::Closure => serde_json::from_str::<ClosureHandoff>(record_json)
+                .map(Self::Closure)
+                .map_err(invalid),
+            LearningRecordKind::ActivationReceipt => {
+                serde_json::from_str::<HarnessActivationReceiptCandidate>(record_json)
+                    .map(Self::ActivationReceipt)
+                    .map_err(invalid)
+            }
+            LearningRecordKind::Candidate => {
+                serde_json::from_str::<AttemptLearningDeltaCandidate>(record_json)
+                    .map(Self::Candidate)
+                    .map_err(invalid)
+            }
+            LearningRecordKind::ViewRef => {
+                serde_json::from_str::<CampaignLearningStateView>(record_json)
+                    .map(Self::ViewRef)
+                    .map_err(invalid)
+            }
+        }
+    }
+
+    /// Validate the decoded first-party contract, not just its JSON shape.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        let contract_error = |_error: String| StoreError::InvalidField {
+            field: "learning.record_json",
+            reason: "typed learning document failed its owning contract",
+        };
+        match self {
+            Self::Delta(record) => record
+                .validate()
+                .map_err(|error| contract_error(error.to_string())),
+            Self::Overlay(record) => record
+                .validate()
+                .map_err(|error| contract_error(error.to_string())),
+            Self::Closure(record) => record
+                .validate()
+                .map_err(|error| contract_error(error.to_string())),
+            Self::ActivationReceipt(record) => record
+                .validate()
+                .map_err(|error| contract_error(error.to_string())),
+            Self::Candidate(record) => record
+                .validate()
+                .map_err(|error| contract_error(error.to_string())),
+            Self::ViewRef(record) => {
+                // A view has no independent recipe authority in the store;
+                // its closed type and intrinsic canonical self-digest are
+                // still checked here. Governor/Context performs the recipe
+                // comparison.
+                let mut unsigned = record.clone();
+                unsigned.canonical_digest.clear();
+                unsigned
+                    .seal()
+                    .map_err(|error| contract_error(error.to_string()))?;
+                if unsigned.canonical_digest != record.canonical_digest {
+                    return Err(StoreError::InvalidField {
+                        field: "learning.view.canonical_digest",
+                        reason: "view intrinsic digest does not match its typed document",
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Validate that the wire handle is the intrinsic identity of the typed
+    /// document. A closed record kind without this correlation would allow a
+    /// valid document to be filed under a different immutable revision handle.
+    pub fn validate_handle(&self, handle: &str) -> Result<(), StoreError> {
+        let matches = match self {
+            Self::Delta(record) => record.delta_artifact.as_str() == handle,
+            Self::Overlay(record) => record.overlay_id.as_str() == handle,
+            Self::Closure(record) => record.assessment_id.as_str() == handle,
+            Self::ActivationReceipt(record) => record.activation_id.as_str() == handle,
+            Self::Candidate(record) => record.delta_id.as_str() == handle,
+            Self::ViewRef(record) => record.view_id.as_str() == handle,
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidField {
+                field: "learning.handle",
+                reason: "record handle does not match the typed document identity",
+            })
+        }
+    }
+
+    /// Validate the typed document's scope/fence binding against the
+    /// canonical transition. Stored deltas predate the shared binding object,
+    /// so they contribute their intrinsic fence but have no independent scope
+    /// field to compare.
+    pub fn validate_scope_fence(
+        &self,
+        scope_id: &str,
+        state_fence: &StateFence,
+    ) -> Result<(), StoreError> {
+        let matches = match self {
+            Self::Delta(record) => record.state_fence == *state_fence,
+            Self::Overlay(record) => {
+                record.binding.scope.as_str() == scope_id
+                    && record.binding.state_fence == *state_fence
+            }
+            Self::Closure(record) => {
+                record.binding.scope.as_str() == scope_id
+                    && record.binding.state_fence == *state_fence
+            }
+            Self::ActivationReceipt(record) => {
+                record.binding.scope.as_str() == scope_id
+                    && record.binding.state_fence == *state_fence
+            }
+            Self::Candidate(record) => {
+                record.binding.scope.as_str() == scope_id
+                    && record.binding.state_fence == *state_fence
+            }
+            Self::ViewRef(record) => {
+                record.binding.scope.as_str() == scope_id
+                    && record.binding.state_fence == *state_fence
+            }
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidField {
+                field: "learning.scope_fence_binding",
+                reason: "typed document binding differs from the canonical transition",
+            })
+        }
+    }
 }
 
 /// Builds a learning-record commit parameter map from Governor-produced parts.
@@ -327,6 +466,113 @@ pub fn learning_fence_digest(state_fence: &StateFence) -> Result<String, StoreEr
     Ok(crate::sha256_hex(&bytes))
 }
 
+/// Issues an owner-minted learning-range continuation cursor.
+///
+/// The cursor binds the exact fence, revision heads, scope, kind filter,
+/// page bound, and next ordinal. It is deliberately opaque to callers; the
+/// store parses and reissues it only when every binding still matches.
+pub fn learning_cursor_issue(
+    fence: &StateFence,
+    heads: &[(String, u64)],
+    scope_id: &str,
+    record_kind: Option<LearningRecordKind>,
+    max_records: u16,
+    ordinal: u64,
+) -> Result<String, StoreError> {
+    if max_records == 0 || max_records > MAX_LEARNING_PAGE_RECORDS {
+        return Err(StoreError::InvalidField {
+            field: "learning.max_records",
+            reason: "learning cursor page bound is out of range",
+        });
+    }
+    let fence_digest = learning_fence_digest(fence)?;
+    let heads_digest = crate::experience_store::audit_heads_digest(heads)?;
+    let query_digest = crate::sha256_hex(
+        &canonical_json_bytes(&(
+            scope_id,
+            record_kind.map(eliot_contracts::LearningRecordKind::as_str),
+        ))
+        .map_err(|error| StoreError::Serialization(error.to_string()))?,
+    );
+    Ok(format!(
+        "learning:{fence_digest}:{heads_digest}:{query_digest}:{ordinal:020}:{max_records}"
+    ))
+}
+
+/// Parses an owner-minted learning-range continuation cursor against the
+/// current query binding and returns its next ordinal.
+pub fn learning_cursor_parse(
+    cursor: &str,
+    fence: &StateFence,
+    heads: &[(String, u64)],
+    scope_id: &str,
+    record_kind: Option<LearningRecordKind>,
+    max_records: u16,
+) -> Result<u64, StoreError> {
+    let invalid = || StoreError::InvalidField {
+        field: "learning.cursor",
+        reason: "learning continuation cursor is malformed, foreign, or stale",
+    };
+    if max_records == 0 || max_records > MAX_LEARNING_PAGE_RECORDS {
+        return Err(invalid());
+    }
+    let fence_digest = learning_fence_digest(fence).map_err(|_| invalid())?;
+    let heads_digest = crate::experience_store::audit_heads_digest(heads).map_err(|_| invalid())?;
+    let query_digest = crate::sha256_hex(
+        &canonical_json_bytes(&(
+            scope_id,
+            record_kind.map(eliot_contracts::LearningRecordKind::as_str),
+        ))
+        .map_err(|_| invalid())?,
+    );
+    let parts = cursor.split(':').collect::<Vec<_>>();
+    if parts.len() != 6
+        || parts[0] != "learning"
+        || parts[1] != fence_digest
+        || parts[2] != heads_digest
+        || parts[3] != query_digest
+        || parts[5] != max_records.to_string()
+    {
+        return Err(invalid());
+    }
+    let ordinal = parts[4].parse::<u64>().map_err(|_| invalid())?;
+    if parts[4] != format!("{ordinal:020}") {
+        return Err(invalid());
+    }
+    Ok(ordinal)
+}
+
+/// Computes the authoritative immutable revision digest for a learning
+/// record document.
+///
+/// `record_json` is a wire string, but its bytes are a canonical JSON
+/// object. The digest is therefore computed over the exact canonical UTF-8
+/// document bytes that the store preserves. A caller cannot pair a valid
+/// looking hex digest with different document bytes. Non-object, non-JSON, or
+/// non-canonical documents are refused instead of being normalized silently.
+pub fn learning_record_document_digest(record_json: &str) -> Result<String, StoreError> {
+    let value: Value =
+        serde_json::from_str(record_json).map_err(|_error| StoreError::InvalidField {
+            field: "learning.record_json",
+            reason: "record document must be valid JSON",
+        })?;
+    if !value.is_object() {
+        return Err(StoreError::InvalidField {
+            field: "learning.record_json",
+            reason: "record document must be a JSON object",
+        });
+    }
+    let canonical = canonical_json_bytes(&value)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    if canonical != record_json.as_bytes() {
+        return Err(StoreError::InvalidField {
+            field: "learning.record_json",
+            reason: "record document must use canonical JSON bytes",
+        });
+    }
+    Ok(crate::sha256_hex(&canonical))
+}
+
 /// Builds the closed mutation parameters from an exact typed identity.
 pub fn learning_record_commit_params_from_identity(
     identity: &LearningRecordIdentity,
@@ -363,6 +609,19 @@ pub fn learning_record_read_request(
     max_records: u16,
     state_fence: StateFence,
 ) -> NamedReadRequest {
+    learning_record_read_request_page(scope_id, record_kind, max_records, state_fence, None)
+}
+
+/// Builds one page of the closed learning range read, optionally resuming
+/// from an owner-minted continuation cursor.
+#[must_use]
+pub fn learning_record_read_request_page(
+    scope_id: ScopeId,
+    record_kind: Option<LearningRecordKind>,
+    max_records: u16,
+    state_fence: StateFence,
+    cursor: Option<String>,
+) -> NamedReadRequest {
     let mut parameters = BTreeMap::new();
     parameters.insert(
         LEARNING_PARAM_MAX_RECORDS.to_owned(),
@@ -373,6 +632,9 @@ pub fn learning_record_read_request(
             LEARNING_PARAM_RECORD_KIND.to_owned(),
             Value::String(kind.as_str().to_owned()),
         );
+    }
+    if let Some(cursor) = cursor {
+        parameters.insert(LEARNING_PARAM_CURSOR.to_owned(), Value::String(cursor));
     }
     NamedReadRequest {
         operation: NamedReadOperation::GetLearningRecordRange,
@@ -385,14 +647,13 @@ pub fn learning_record_read_request(
 
 /// Validates closed mutation parameters for the learning-record operation.
 ///
-/// Value rules (closed kind membership, bounded non-blank text, hex
-/// digests) run here so every backend shares one acceptance boundary.
-/// Scope/fence digest recomputation and record-content semantics stay
-/// Governor-owned: the store checks the presented values against the
-/// canonical transition envelope, while the complete
+/// Value rules (closed kind membership, bounded non-blank text, canonical
+/// document bytes, and matching hex digests) run here so every backend shares
+/// one acceptance boundary. Scope/fence digest recomputation and semantic
+/// record validation stay Governor-owned: the store checks the presented
+/// values against the canonical transition envelope, while the complete
 /// kind/handle/digest/scope/fence/expiry tuple is the immutable revision
-/// identity. Record documents stay opaque strings; the store never derives
-/// semantics from them.
+/// identity.
 pub fn validate_learning_mutation_params(
     operation: NamedMutationOperation,
     parameters: &BTreeMap<String, Value>,
@@ -401,12 +662,10 @@ pub fn validate_learning_mutation_params(
         return Err(StoreError::UnknownOperation);
     }
     let kind = text_param(parameters, LEARNING_PARAM_RECORD_KIND)?;
-    if LearningRecordKind::from_str(kind).is_none() {
-        return Err(StoreError::InvalidField {
-            field: "learning.record_kind",
-            reason: "record kind must be a closed learning kind",
-        });
-    }
+    let record_kind = LearningRecordKind::from_str(kind).ok_or(StoreError::InvalidField {
+        field: "learning.record_kind",
+        reason: "record kind must be a closed learning kind",
+    })?;
     let handle = text_param(parameters, LEARNING_PARAM_HANDLE)?;
     if handle.len() > MAX_LEARNING_HANDLE_BYTES {
         return Err(StoreError::InvalidField {
@@ -425,6 +684,16 @@ pub fn validate_learning_mutation_params(
         text_param(parameters, LEARNING_PARAM_RECORD_DIGEST)?,
         "learning.record_digest",
     )?;
+    let expected_record_digest = learning_record_document_digest(record_json)?;
+    if text_param(parameters, LEARNING_PARAM_RECORD_DIGEST)? != expected_record_digest {
+        return Err(StoreError::InvalidField {
+            field: "learning.record_digest",
+            reason: "record digest does not match canonical record_json bytes",
+        });
+    }
+    let document = LearningRecordDocument::decode(record_kind, record_json)?;
+    document.validate()?;
+    document.validate_handle(handle)?;
     crate::validate_sha256_hex(
         text_param(parameters, LEARNING_PARAM_SCOPE_DIGEST)?,
         "learning.scope_digest",
@@ -531,9 +800,31 @@ pub fn validate_learning_read_params(
             });
         }
     };
+    let cursor = match parameters.get(LEARNING_PARAM_CURSOR) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(cursor)) => {
+            if cursor.trim().is_empty()
+                || cursor.len() > MAX_LEARNING_CURSOR_BYTES
+                || cursor.chars().any(char::is_control)
+            {
+                return Err(StoreError::InvalidField {
+                    field: "learning.cursor",
+                    reason: "continuation cursor is malformed or overlong",
+                });
+            }
+            Some(cursor.clone())
+        }
+        Some(_) => {
+            return Err(StoreError::InvalidField {
+                field: "learning.cursor",
+                reason: "continuation cursor must be text",
+            });
+        }
+    };
     Ok(DecodedLearningRead {
         record_kind,
         max_records,
+        cursor,
     })
 }
 
@@ -546,21 +837,6 @@ pub fn decode_learning_read(
         return Err(StoreError::UnknownOperation);
     }
     validate_learning_read_params(parameters)
-}
-
-/// Rejects any direct learning write that bypasses the named Kernel
-/// mutation boundary (issue #1868).
-///
-/// Only the closed `RecordLearningRecord` operation is admitted; every
-/// other operation fails closed with [`StoreError::UnknownOperation`].
-/// Governor and eliotd commit paths call this guard before reaching the
-/// neutral Kernel port.
-pub fn reject_direct_learning_write(request: &NamedMutationRequest) -> Result<(), StoreError> {
-    if request.operation == NamedMutationOperation::RecordLearningRecord {
-        Ok(())
-    } else {
-        Err(StoreError::UnknownOperation)
-    }
 }
 
 fn text_param<'a>(

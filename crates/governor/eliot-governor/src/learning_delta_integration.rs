@@ -9,7 +9,7 @@
 //! Only the nine consequential boundaries derive; ordinary reads
 //! (`read_file`/`grep`) are not consequential and never derive (line 181).
 
-use eliot_contracts::{ArtifactId, StateFence};
+use eliot_contracts::{ArtifactId, LearningRecordKind, StateFence};
 use eliot_learning_activation_assessment::{
     ActivationAssessmentError, AssessmentInput, AssessmentPolicy, AssessmentResultOrIncomplete,
     assess_learning_activation,
@@ -154,8 +154,10 @@ pub fn admission_claim_for_delta(
 
 /// Build the exact record-bound admission claim for a stored delta.
 ///
-/// The legacy [`admission_claim_for_delta`] remains the context-compat
-/// contour; behavioral delta delivery uses this typed binding instead.
+/// `delta_digest` is the immutable storage-document digest (the digest of the
+/// canonical record JSON), not merely an intrinsic contract field. The
+/// legacy [`admission_claim_for_delta`] remains the context-compat contour;
+/// behavioral delta delivery uses this typed binding instead.
 #[allow(clippy::too_many_arguments)]
 pub fn record_admission_claim_for_delta(
     campaign_id: &str,
@@ -186,7 +188,7 @@ pub fn record_admission_claim_for_delta(
             rollback_ref,
         ),
         record: LearningRecordAdmissionBinding {
-            record_kind: "delta".to_owned(),
+            record_kind: LearningRecordKind::Delta,
             record_handle: delta_artifact_id.to_owned(),
             record_digest: delta_digest.to_owned(),
             scope_id: scope_id.to_owned(),
@@ -208,7 +210,9 @@ pub fn issue_delta_admission(
     issue_learning_admission(governor, claim)
 }
 
-/// Issue the exact record-bound permit used by behavioral delta delivery.
+/// Legacy pre-commit record admission is hard-refused. Behavioral delta
+/// delivery must use the post-commit/readback admission seam in
+/// `learning_admission`.
 pub fn issue_record_delta_admission(
     governor: &Governor,
     claim: &LearningRecordAdmissionClaim,

@@ -17,6 +17,7 @@ use crate::activation_outcome::{
 use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
+use crate::learning_record_commit::LearningWriteCapability;
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
 use crate::owner_closure_feed::{OwnerPublishPort, synchronize_owner_feed};
@@ -68,8 +69,8 @@ use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationRec
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
-    CanonicalReadClient, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
-    ScopeRevisionView, StoreHealth, WriteReceipt,
+    CanonicalReadClient, NamedMutationOperation, OrderingHeadExpectation, PreparedTransition,
+    RevisionHeadExpectation, ScopeRevisionView, StoreHealth, WriteReceipt,
 };
 use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskState};
 use eliot_testd_core::{
@@ -125,7 +126,24 @@ pub trait KernelTransitionPort: Send + Sync {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> KernelPortFuture<'a, WriteReceipt>;
 
-    /// Reconciles one operation by its exact canonical identity.
+    /// Applies one learning-record transition through the dedicated
+    /// request/fence-bound Kernel capability. Generic `apply_prepared` must
+    /// reject learning operations.
+    fn record_learning_record<'a>(
+        &'a self,
+        _identity: &'a RequestIdentity,
+        _transition: PreparedTransition,
+        _expected_revision_heads: Vec<RevisionHeadExpectation>,
+        _expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> KernelPortFuture<'a, WriteReceipt> {
+        Box::pin(async {
+            Err(KernelPortError::NotAdmitted(
+                "dedicated learning record transition is not admitted by this Kernel port"
+                    .to_owned(),
+            ))
+        })
+    }
+
     fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>>;
 
     /// Returns a bounded Kernel-owned health observation.
@@ -2305,6 +2323,15 @@ impl CanonicalAdmissionOwner {
                 "immutable transition does not agree with the admitted request identity".to_owned(),
             ));
         }
+        if transition
+            .named_operations
+            .iter()
+            .any(|command| command.operation == NamedMutationOperation::RecordLearningRecord)
+        {
+            return Err(CompositionError::Owner(
+                "generic canonical commit cannot carry learning records".to_owned(),
+            ));
+        }
         Ok(port
             .apply_prepared(
                 identity,
@@ -2315,7 +2342,47 @@ impl CanonicalAdmissionOwner {
             .await?)
     }
 
-    /// Returns the active fence without exposing mutable canonical state.
+    /// Commits the exact learning transition through the dedicated Kernel
+    /// learning capability; it shares all identity/transition checks with the
+    /// ordinary owner commit but cannot use the generic apply port.
+    pub(crate) async fn commit_learning<P: KernelTransitionPort + ?Sized>(
+        &self,
+        port: &P,
+        identity: &RequestIdentity,
+        envelope: CanonicalWriteEnvelope,
+    ) -> Result<WriteReceipt, CompositionError> {
+        identity
+            .validate()
+            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+        if envelope.request != identity.request.metadata
+            || envelope.idempotency_key != identity.idempotency_key
+        {
+            return Err(CompositionError::Provider(
+                "learning request identity does not match the Canonical envelope".to_owned(),
+            ));
+        }
+        let expected_revision_heads = envelope.expected_revision_heads.clone();
+        let expected_ordering_heads = envelope.expected_ordering_heads.clone();
+        let transition = self.prepare(&envelope)?;
+        if transition.named_operations.len() != 1
+            || transition.named_operations[0].operation
+                != NamedMutationOperation::RecordLearningRecord
+        {
+            return Err(CompositionError::Owner(
+                "learning capability requires exactly one RecordLearningRecord operation"
+                    .to_owned(),
+            ));
+        }
+        Ok(port
+            .record_learning_record(
+                identity,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            )
+            .await?)
+    }
+
     #[must_use]
     pub const fn state_fence(&self) -> &StateFence {
         &self.state_fence
@@ -3098,6 +3165,8 @@ pub struct GovernorComposition<P: ?Sized> {
     /// Exact P-07 presentations retained with their owner snapshots until
     /// exact reconciliation, keyed by [`PresentedAuthorityRequest::ledger_key`].
     authority_presentations: BTreeMap<String, RetainedAuthorityRequest>,
+    /// Owner token for the single governed learning-write capability.
+    learning_write_owner: Arc<()>,
 }
 
 fn testd_finished_clock(job: &TestJob) -> ClockReading {
@@ -3501,6 +3570,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             service_observations,
             readiness: CompositionReadiness::Ready,
             authority_presentations: BTreeMap::new(),
+            learning_write_owner: Arc::new(()),
         })
     }
 
@@ -3508,6 +3578,45 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     #[must_use]
     pub const fn owners(&self) -> &GovernorOwners<P> {
         &self.owners
+    }
+
+    pub(crate) fn learning_write_owner(&self) -> Arc<()> {
+        self.learning_write_owner.clone()
+    }
+
+    /// Commit one typed learning-record proposal through the sole
+    /// capability-bound canonical owner path.
+    ///
+    /// This method is the public composition seam for the `eliotd` owner. It
+    /// deliberately accepts no raw `NamedMutationRequest` or caller-created
+    /// `CanonicalWriteEnvelope`; the capability is minted inside the
+    /// Governor composition and the learning module still re-validates the
+    /// proposal, idempotency identity, exact request fence, and receipt.
+    /// Behavioral admission is a separate post-commit/readback operation and
+    /// is never accepted as a pre-commit write grant.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the typed learning handoff carries the complete owner proof and receipt context"
+    )]
+    pub async fn commit_learning_record_with_admission(
+        &self,
+        request_identity: &RequestIdentity,
+        proposal: &crate::learning_record_commit::LearningRecordProposal,
+        proof_refs: Vec<String>,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<WriteReceipt, CompositionError> {
+        let capability = LearningWriteCapability::from_owner(self.learning_write_owner.clone());
+        crate::learning_record_commit::commit_learning_record_with_admission(
+            self,
+            &capability,
+            request_identity,
+            proposal,
+            proof_refs,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .await
     }
 
     /// Rehydrates one verifier execution fact from the current Governor task,
@@ -3852,6 +3961,66 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// arbitrary transition. The identity comes from admitted ingress;
     /// `prepare()` alone is not an authorization.
     pub async fn commit_canonical(
+        &self,
+        identity: &RequestIdentity,
+        envelope: CanonicalWriteEnvelope,
+    ) -> Result<WriteReceipt, CompositionError> {
+        self.commit_canonical_inner(identity, envelope).await
+    }
+
+    /// Internal non-learning canonical commit. The learning operation is
+    /// rejected here as well as at the public boundary, so another in-crate
+    /// caller cannot turn this generic helper into a second learning writer.
+    pub(crate) async fn commit_canonical_inner(
+        &self,
+        identity: &RequestIdentity,
+        envelope: CanonicalWriteEnvelope,
+    ) -> Result<WriteReceipt, CompositionError> {
+        if envelope
+            .semantic_commands
+            .iter()
+            .any(|command| command.operation == NamedMutationOperation::RecordLearningRecord)
+        {
+            return Err(CompositionError::Owner(
+                "learning records require the typed capability-bound owner seam".to_owned(),
+            ));
+        }
+        self.commit_canonical_unchecked(identity, envelope).await
+    }
+
+    /// Internal learning commit. The capability is checked here at the final
+    /// canonical boundary; no generic envelope path can reach the owner with
+    /// a `RecordLearningRecord` command.
+    pub(crate) async fn commit_learning_canonical_inner(
+        &self,
+        capability: &LearningWriteCapability,
+        identity: &RequestIdentity,
+        envelope: CanonicalWriteEnvelope,
+    ) -> Result<WriteReceipt, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        if !capability.is_owned_by(&self.learning_write_owner()) {
+            return Err(CompositionError::Owner(
+                "learning write capability is not owned by this Governor composition".to_owned(),
+            ));
+        }
+        if !envelope
+            .semantic_commands
+            .iter()
+            .any(|command| command.operation == NamedMutationOperation::RecordLearningRecord)
+        {
+            return Err(CompositionError::Owner(
+                "learning capability cannot submit a non-learning envelope".to_owned(),
+            ));
+        }
+        self.owners
+            .canonical
+            .commit_learning(self.kernel.as_ref(), identity, envelope)
+            .await
+    }
+
+    async fn commit_canonical_unchecked(
         &self,
         identity: &RequestIdentity,
         envelope: CanonicalWriteEnvelope,

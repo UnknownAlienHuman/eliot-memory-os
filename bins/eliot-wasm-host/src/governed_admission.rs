@@ -9,12 +9,13 @@
 //!
 //! ```text
 //! live owner clock (process clock, never requester envelopes)
-//! → issue_learning_admission(governor, claim): the claim must be
-//!   live-admissible RIGHT NOW (admitting state, live epoch/generation)
-//! → digest equality: caller-built verified handles must cite the exact
-//!   freshly minted issuance for this claim (no transplanted/stale permits)
-//! → produce → retrieve_governed → admit_context_with_learning
-//!   → assemble_active_view_with_learning (or fail closed)
+//! → issue_learning_record_admission_after_commit(governor, claim, evidence):
+//!   the exact durable record and authenticated readback must be live-admissible
+//!   RIGHT NOW
+//! → digest equality: caller-built verified handles and record ticket must
+//!   cite the exact freshly minted issuance (no transplanted/stale permits)
+//! → produce → retrieve_governed → admit_context_with_record_learning
+//!   → assemble_active_view_with_record_learning (or fail closed)
 //! ```
 //!
 //! Authority discipline (mirrors the [`GovernorGrant`] port-grant pattern
@@ -35,22 +36,25 @@
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_context_admission::admit_context_with_learning;
+use eliot_context_admission::admit_context_with_record_learning;
 use eliot_context_assembly::{
     ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy,
-    assemble_active_view_with_learning,
+    assemble_active_view_with_record_learning,
 };
 use eliot_context_contracts::{
     AdmissionInput, AdmissionResult, ContextError, ContextOutcome, ContextRecipe, QualityScorecard,
     SerializedContextMeasurement,
 };
-use eliot_governor::{Governor, LearningAdmissionClaim, issue_learning_admission};
+use eliot_governor::{
+    Governor, LearningRecordAdmissionClaim, LearningRecordDurabilityEvidence,
+    issue_learning_record_admission_after_commit,
+};
 use eliot_improvement::candidate_bounds::{
     BoundsError, GovernedRetrieval, RetrievalDecision, ReusableCandidateRef, retrieve_governed,
 };
-use eliot_improvement::{CarriageMark, bounds_to_context_error};
 use eliot_improvement::{
-    LearningProduction, PresentedLearning, datetime_from_unix, produce_learning_candidate,
+    CarriageMark, LearningProduction, PresentedRecordLearning, bounds_to_context_error,
+    check_governed_record_carriage, datetime_from_unix, produce_learning_candidate,
 };
 
 /// One host-composed governed learning compilation: retrieval decision,
@@ -113,24 +117,41 @@ fn live_now_secs() -> Result<u64, HostAdmitError> {
         .map_err(|_| HostAdmitError::ClockUnavailable)
 }
 
+fn live_now_ms() -> Result<u64, HostAdmitError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| {
+            u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX)
+        })
+        .map_err(|_| HostAdmitError::ClockUnavailable)
+}
+
 /// Re-anchor caller-built verified handles to the live issuance: mint the
 /// claim fresh under the current owner and require digest equality.
 /// Returns the live clock the caller must enforce with.
 fn live_issuance(
     governor: &Governor,
-    claim: &LearningAdmissionClaim,
+    claim: &LearningRecordAdmissionClaim,
+    evidence: &LearningRecordDurabilityEvidence,
     production: &LearningProduction<'_>,
-    presented: &PresentedLearning<'_>,
-) -> Result<u64, HostAdmitError> {
-    let now = live_now_secs()?;
-    let fresh = issue_learning_admission(governor, claim)
+    presented: &PresentedRecordLearning<'_>,
+) -> Result<(u64, u64), HostAdmitError> {
+    let now_secs = live_now_secs()?;
+    let now_ms = live_now_ms()?;
+    let fresh = issue_learning_record_admission_after_commit(governor, claim, evidence)
         .map_err(|error| HostAdmitError::ClaimRefused(error.to_string()))?;
     if production.verified.permit().digest() != fresh.digest()
         || presented.verified.permit().digest() != fresh.digest()
     {
         return Err(HostAdmitError::IssuanceMismatch);
     }
-    Ok(now)
+    let fresh_record_ticket = fresh
+        .record_ticket()
+        .map_err(|error| HostAdmitError::ClaimRefused(error.to_string()))?;
+    if presented.record_ticket.digest != fresh_record_ticket.digest {
+        return Err(HostAdmitError::IssuanceMismatch);
+    }
+    Ok((now_secs, now_ms))
 }
 
 /// Trusted native governed admission: run the complete owner-bound
@@ -145,9 +166,10 @@ fn live_issuance(
 #[allow(clippy::too_many_arguments)]
 pub fn admit_governed_host<F>(
     governor: &Governor,
-    claim: &LearningAdmissionClaim,
+    claim: &LearningRecordAdmissionClaim,
+    evidence: &LearningRecordDurabilityEvidence,
     production: LearningProduction<'_>,
-    presented: PresentedLearning<'_>,
+    presented: PresentedRecordLearning<'_>,
     mut input: AdmissionInput,
     recipe: &ContextRecipe,
     quality: QualityScorecard,
@@ -157,9 +179,10 @@ pub fn admit_governed_host<F>(
 where
     F: FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
 {
-    let now = live_issuance(governor, claim, &production, &presented)?;
-    let presented = PresentedLearning {
-        now_unix_secs: now,
+    let (now_secs, now_ms) = live_issuance(governor, claim, evidence, &production, &presented)?;
+    let presented = PresentedRecordLearning {
+        now_unix_secs: now_secs,
+        now_unix_ms: now_ms,
         ..presented
     };
     let overlay = presented.overlay.ok_or(HostAdmitError::OverlayRequired)?;
@@ -193,18 +216,20 @@ where
         cross_task_admission: presented.cross_task_admission,
         backlog: presented.backlog,
         verified: presented.verified,
-        now: datetime_from_unix(now)
+        now: datetime_from_unix(now_secs)
             .map_err(|error| HostAdmitError::Retrieval(error.to_string()))?,
     })
     .map_err(|error| HostAdmitError::Retrieval(error.to_string()))?;
     input.candidates.candidates.push(produced);
     input.learning_tickets.push(presented.ticket.clone());
-    let admission = admit_context_with_learning(&input, presented)
+    let admission = admit_context_with_record_learning(&input, presented)
         .map_err(|error| HostAdmitError::Admission(error.to_string()))?;
     let view = match &admission.outcome {
         ContextOutcome::Complete(set) => Some(
-            assemble_active_view_with_learning(set, recipe, quality, policy, measure, presented)
-                .map_err(|error: AssemblyError| HostAdmitError::Assembly(error.to_string()))?,
+            assemble_active_view_with_record_learning(
+                set, recipe, quality, policy, measure, presented,
+            )
+            .map_err(|error: AssemblyError| HostAdmitError::Assembly(error.to_string()))?,
         ),
         ContextOutcome::Incomplete(_) => None,
     };
@@ -226,15 +251,23 @@ where
 /// component/native retrieval output once the typed domain handoff lands.
 pub fn check_governed_host_output(
     governor: &Governor,
-    claim: &LearningAdmissionClaim,
-    presented: PresentedLearning<'_>,
+    claim: &LearningRecordAdmissionClaim,
+    evidence: &LearningRecordDurabilityEvidence,
+    presented: PresentedRecordLearning<'_>,
     input: &AdmissionInput,
     admission: &AdmissionResult,
 ) -> Result<(), HostAdmitError> {
-    let now = live_now_secs()?;
-    let fresh = issue_learning_admission(governor, claim)
+    let now_secs = live_now_secs()?;
+    let now_ms = live_now_ms()?;
+    let fresh = issue_learning_record_admission_after_commit(governor, claim, evidence)
         .map_err(|error| HostAdmitError::ClaimRefused(error.to_string()))?;
     if presented.verified.permit().digest() != fresh.digest() {
+        return Err(HostAdmitError::IssuanceMismatch);
+    }
+    let fresh_record_ticket = fresh
+        .record_ticket()
+        .map_err(|error| HostAdmitError::ClaimRefused(error.to_string()))?;
+    if presented.record_ticket.digest != fresh_record_ticket.digest {
         return Err(HostAdmitError::IssuanceMismatch);
     }
     if admission.binding.task_id.as_str() != input.binding.task_id.as_str()
@@ -268,6 +301,11 @@ pub fn check_governed_host_output(
     let mut marks = Vec::new();
     if let ContextOutcome::Complete(set) = &admission.outcome {
         for record in &set.records {
+            if record.candidate.binding.scope_id != admission.binding.scope_id {
+                return Err(HostAdmitError::HonorRefused(
+                    "admission binding scope drifted from the requested compilation".to_owned(),
+                ));
+            }
             if let Some(provenance) = &record.candidate.learning {
                 provenance
                     .validate()
@@ -282,15 +320,22 @@ pub fn check_governed_host_output(
                     expires_at_unix_secs: provenance.expires_at_unix_secs,
                     permit_digest: provenance.permit_digest.as_str(),
                     binding_task_id: record.candidate.binding.task_id.as_str(),
+                    record: provenance.record.as_ref(),
                 });
             }
         }
     }
-    let presented = PresentedLearning {
-        now_unix_secs: now,
+    let presented = PresentedRecordLearning {
+        now_unix_secs: now_secs,
+        now_unix_ms: now_ms,
         ..presented
     };
-    eliot_improvement::check_governed_carriage(&presented, &admission.binding.state_fence, &marks)
-        .map_err(bounds_to_context_error)
-        .map_err(|error| HostAdmitError::HonorRefused(error.to_string()))
+    check_governed_record_carriage(
+        &presented,
+        admission.binding.scope_id.as_str(),
+        &admission.binding.state_fence,
+        &marks,
+    )
+    .map_err(bounds_to_context_error)
+    .map_err(|error| HostAdmitError::HonorRefused(error.to_string()))
 }

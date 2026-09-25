@@ -18,9 +18,9 @@ use crate::schema;
 use eliot_store_api::{
     CanonicalValidationSnapshot, EVIDENCE_PACK_MAX_RECORDS, ExactJsonBytes, NamedReadOperation,
     NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingScopeId,
-    PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, RevisionHead, RevisionKey, ScopeId,
-    ScopeRevisionView, StateFence, StoreError, WriteReceipt, WriteReceiptStatus,
-    generated_operation_manifests, named_mutation_operation_name,
+    PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, ReadConsistency, RevisionHead,
+    RevisionKey, ScopeId, ScopeRevisionView, StateFence, StoreError, WriteReceipt,
+    WriteReceiptStatus, generated_operation_manifests, named_mutation_operation_name,
 };
 
 use super::{
@@ -2309,6 +2309,12 @@ async fn learning_record_range_payload(
     if query.state_fence != *state_fence {
         return Err(AdapterError::Store(StoreError::FenceMismatch));
     }
+    if query.consistency != ReadConsistency::ExactFence {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "operation.consistency",
+            reason: "learning range read requires ExactFence",
+        }));
+    }
     let decoded = eliot_store_api::decode_learning_read(query.operation, &query.parameters)
         .map_err(AdapterError::Store)?;
     let scope_id = query.scope_id.as_ref().ok_or(StoreError::InvalidField {
@@ -2325,25 +2331,44 @@ async fn learning_record_range_payload(
         .iter()
         .map(|head| (head.key.as_str().to_owned(), head.revision))
         .collect();
-    let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+    let start: Option<u64> = match decoded.cursor.as_deref() {
         None => None,
-        Some(cursor) => Some(
-            eliot_store_api::audit_cursor_parse(cursor, state_fence, &heads)
-                .map_err(AdapterError::Store)?,
-        ),
+        Some(cursor) => Some(eliot_store_api::learning_cursor_parse(
+            cursor,
+            state_fence,
+            &heads,
+            scope_id.as_str(),
+            decoded.record_kind,
+            decoded.max_records,
+        )?),
     };
     // Fetch covers the skip window plus one probe row: the row scan is
     // O(table) like every other range read on this contour, and the
     // probe decides truncation without a second query.
+    let total_matched = super::surreal_learning::count_learning_for_read(
+        db,
+        config,
+        scope_id.as_str(),
+        state_fence,
+        kind_filter.as_deref(),
+    )
+    .await?;
     let fetch = start
         .unwrap_or(0)
         .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
         .saturating_add(1);
+    if fetch > eliot_store_api::MAX_LEARNING_SCAN_ROWS {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "learning.range",
+            reason: "bounded learning scan is incomplete",
+        }));
+    }
     let fetch = usize::try_from(fetch).unwrap_or(usize::MAX);
     let rows = super::surreal_learning::read_learning_for_read(
         db,
         config,
         scope_id.as_str(),
+        state_fence,
         kind_filter.as_deref(),
         fetch,
     )
@@ -2359,9 +2384,9 @@ async fn learning_record_range_payload(
         if start.is_some_and(|start| ordinal <= start) {
             continue;
         }
-        if records.len() > limit {
+        if records.len() == limit {
             truncated = true;
-            break;
+            continue;
         }
         records.push(json!({
             "record_kind": row.record_kind,
@@ -2375,28 +2400,26 @@ async fn learning_record_range_payload(
             "scope_id": row.scope_id,
         }));
     }
-    if records.len() > limit {
-        records.pop();
-        truncated = true;
-    }
     let matched_total = projection_len(records.len())?;
     let next_cursor = if truncated {
-        Some(
-            eliot_store_api::audit_cursor_issue(
-                state_fence,
-                &heads,
-                start
-                    .unwrap_or(0)
-                    .saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX)),
-            )
-            .map_err(AdapterError::Store)?,
-        )
+        Some(eliot_store_api::learning_cursor_issue(
+            state_fence,
+            &heads,
+            scope_id.as_str(),
+            decoded.record_kind,
+            decoded.max_records,
+            start
+                .unwrap_or(0)
+                .saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX)),
+        )?)
     } else {
         None
     };
     Ok(json!({
         "records": records,
         "matched_total": matched_total,
+        "total_matched": total_matched,
+        "end_of_stream": !truncated,
         "truncated": truncated,
         "next_cursor": next_cursor,
         "state_fence": state_fence,
