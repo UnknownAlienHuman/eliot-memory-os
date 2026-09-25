@@ -19,8 +19,22 @@
 //! #694 / #696 / #698 / #839 / #837 remain OPEN), the fabric stays generic
 //! over the injected port and the inventory case freezes the missing-port
 //! expectation as a `ContractChallenge` residual instead of a local substitute.
+//!
+//! Issue #1700 carries that inventory further without replacing it: each
+//! injected port reports its own accepted-interface binding state through
+//! [`PortBindingState`] (default [`PortBindingState::Uncertain` — no absence
+//! conclusion follows from an open owning issue or a generic seam), and every
+//! dependent entrypoint checks the port it actually needs before the owner
+//! call. A port that reports [`PortBindingState::Missing`],
+//! [`PortBindingState::Unavailable`], [`PortBindingState::Incompatible`] or
+//! [`PortBindingState::StaleRevoked`] blocks only its dependent operations
+//! with a typed [`MissingPortResidual`] (exact port, owner, state, blocked
+//! operation/work, fence/epoch, disposition, next action) instead of a local
+//! substitute. Plan-only planning, read-only observation, recovery/status and
+//! independently admissible solo work never consult the broken port.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
@@ -62,6 +76,450 @@ pub const PREREQ_PORTS: [&str; 5] = [
 #[must_use]
 pub fn prereq_ports() -> Vec<String> {
     PREREQ_PORTS.iter().map(|port| (*port).to_owned()).collect()
+}
+
+/// Closed identity of one injected fabric port (issue #1700).
+///
+/// This is the runtime dependency map the fabric actually enforces: each
+/// public entrypoint that needs a live owner guarantee names exactly one
+/// port through [`FabricOperation::required_port`]. It is distinct from the
+/// frozen [`PREREQ_PORTS`] string inventory above, which the 872/1 case pins
+/// verbatim (including the D-WU-FINAL #837 development assignment gate).
+/// #837 stays outside this map: it gates development assignment, never
+/// runtime execution authority.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FabricPortId {
+    /// B-MOD model registry (#694): route resolution only.
+    ModelRegistry,
+    /// B-PEER coordination channel (#696): peer delivery only.
+    PeerChannel,
+    /// B-SWARM durable swarm control (#698): swarm entry only.
+    SwarmControl,
+    /// Governor admission authority: reservation staging plus admission
+    /// commit. The fabric composes both results and implements neither.
+    AdmissionAuthority,
+    /// Kernel activation authority (#839): launch activation only.
+    ActivationAuthority,
+    /// Dispatch egress: activated dispatch emission only.
+    DispatchEgress,
+}
+
+impl FabricPortId {
+    /// Returns the stable port code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelRegistry => "MODEL_REGISTRY",
+            Self::PeerChannel => "PEER_CHANNEL",
+            Self::SwarmControl => "SWARM_CONTROL",
+            Self::AdmissionAuthority => "ADMISSION_AUTHORITY",
+            Self::ActivationAuthority => "ACTIVATION_AUTHORITY",
+            Self::DispatchEgress => "DISPATCH_EGRESS",
+        }
+    }
+
+    /// Returns the stable load-bearing interface identity served by this port.
+    #[must_use]
+    pub const fn interface(self) -> &'static str {
+        match self {
+            Self::ModelRegistry => "b-mod-route-registry",
+            Self::PeerChannel => "b-peer-coordination-channel",
+            Self::SwarmControl => "b-swarm-durable-control",
+            Self::AdmissionAuthority => "governor-admission-authority",
+            Self::ActivationAuthority => "kernel-activation-authority",
+            Self::DispatchEgress => "dispatch-egress",
+        }
+    }
+
+    /// Returns the owning-contract reference for this port, which doubles as
+    /// the development `ContractChallenge` surface key where applicable
+    /// (I2.17). A static reference never confers execution authority; only
+    /// a [`PortBindingState::Bound`] report from the injected port admits
+    /// dependent use, and only the per-call owner verifier admits effects.
+    #[must_use]
+    pub const fn owner_ref(self) -> &'static str {
+        match self {
+            Self::ModelRegistry => "B-MOD #694",
+            Self::PeerChannel => "B-PEER #696",
+            Self::SwarmControl => "B-SWARM #698",
+            Self::AdmissionAuthority => "governor-admission",
+            Self::ActivationAuthority => "B-ACTIVATION-PROJECTION #839",
+            Self::DispatchEgress => "dispatch-egress",
+        }
+    }
+}
+
+/// Runtime ports the fabric may block on (issue #1700): exactly the six
+/// injected seams. D-WU-FINAL #837 is deliberately absent — it is a
+/// development assignment gate, not a runtime service dependency, unless an
+/// actual separately documented runtime contract requires it.
+pub const RUNTIME_PORTS: [FabricPortId; 6] = [
+    FabricPortId::ModelRegistry,
+    FabricPortId::PeerChannel,
+    FabricPortId::SwarmControl,
+    FabricPortId::AdmissionAuthority,
+    FabricPortId::ActivationAuthority,
+    FabricPortId::DispatchEgress,
+];
+
+/// Returns the runtime port identities the fabric enforces.
+#[must_use]
+pub fn runtime_ports() -> Vec<FabricPortId> {
+    RUNTIME_PORTS.to_vec()
+}
+
+/// How one injected port reports its own accepted-interface binding state
+/// (issue #1700). Missing, unavailable, incompatible, stale/revoked and
+/// uncertain stay distinct: only a positively reported non-bound state
+/// blocks dependent use. An accepted interface (owner-validated revision
+/// identity) stays distinct from a currently available/authorized provider —
+/// availability is decided per call by the owner verifier, never here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum PortBindingState {
+    /// The owner affirms an accepted interface binding at the named
+    /// revision. Dependent use proceeds to the per-call owner verifier,
+    /// which still decides. A nonempty revision, trait implementation,
+    /// self-hash or serialized `Verified` snapshot cannot establish
+    /// acceptance on its own: only the owner's affirmative report does,
+    /// and only through this variant.
+    Bound {
+        /// Accepted interface revision affirmed by the owner.
+        interface_revision: String,
+    },
+    /// The owner has no accepted revision for this interface.
+    Missing,
+    /// The owner is temporarily unreachable; carries no claim about
+    /// acceptance either way.
+    Unavailable,
+    /// The owner observes an interface revision the fabric cannot consume.
+    Incompatible {
+        /// Interface revision the fabric requires.
+        required_revision: String,
+        /// Interface revision the owner observes.
+        observed_revision: String,
+    },
+    /// The binding was accepted but is now stale or revoked by its owner.
+    StaleRevoked,
+    /// The port does not report binding state. The fabric draws no absence
+    /// conclusion from this state and proceeds to the per-call owner
+    /// verifier, which remains the authority. This is the default for every
+    /// injected seam, so generic injection stays a seam, not a defect.
+    Uncertain,
+}
+
+impl PortBindingState {
+    /// Reports an owner-affirmed accepted binding. Blank or control-bearing
+    /// revisions are rejected here: forged or empty acceptance evidence
+    /// cannot pass as [`PortBindingState::Bound`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] when the revision is blank or
+    /// control-bearing.
+    pub fn bound(interface_revision: String) -> Result<Self, FabricError> {
+        validate_text(&interface_revision, "interface_revision")?;
+        Ok(Self::Bound { interface_revision })
+    }
+
+    /// Reports an incompatible observed revision. Both revisions must be
+    /// well-formed text; blank evidence cannot pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] when either revision is blank or
+    /// control-bearing.
+    pub fn incompatible(
+        required_revision: String,
+        observed_revision: String,
+    ) -> Result<Self, FabricError> {
+        validate_text(&required_revision, "required_revision")?;
+        validate_text(&observed_revision, "observed_revision")?;
+        Ok(Self::Incompatible {
+            required_revision,
+            observed_revision,
+        })
+    }
+
+    /// Returns true only when dependent use may proceed past the pre-check:
+    /// [`PortBindingState::Bound`] proceeds to the per-call owner verifier,
+    /// and [`PortBindingState::Uncertain`] defers to it entirely. Every
+    /// other state blocks with a typed residual at the point of use.
+    #[must_use]
+    pub const fn admits_dependent_use(&self) -> bool {
+        matches!(self, Self::Bound { .. } | Self::Uncertain)
+    }
+}
+
+/// Stable I7.20 disposition carried by a missing-prerequisite residual.
+/// The disposition is derived from the reported binding state; it never
+/// widens into a generic internal error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ResidualDisposition {
+    /// The owner reports no accepted binding: further evidence is required.
+    NeedsEvidence,
+    /// The owner is unreachable: capacity/availability, not refusal.
+    UnavailableOrCapacity,
+    /// The observed revision cannot be consumed.
+    Denied,
+    /// The binding is stale or revoked.
+    StaleOrConflict,
+}
+
+impl ResidualDisposition {
+    /// Derives the disposition from the reported binding state. `Bound` and
+    /// `Uncertain` never reach a residual; they map here only for
+    /// completeness and keep the pre-check/refusal vocabulary closed.
+    #[must_use]
+    pub const fn of_state(state: &PortBindingState) -> Self {
+        match state {
+            PortBindingState::Missing => Self::NeedsEvidence,
+            PortBindingState::Unavailable => Self::UnavailableOrCapacity,
+            PortBindingState::Incompatible { .. } => Self::Denied,
+            PortBindingState::StaleRevoked => Self::StaleOrConflict,
+            PortBindingState::Bound { .. } | PortBindingState::Uncertain => {
+                Self::UnavailableOrCapacity
+            }
+        }
+    }
+
+    /// Returns the stable disposition code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NeedsEvidence => "NEEDS_EVIDENCE",
+            Self::UnavailableOrCapacity => "UNAVAILABLE_OR_CAPACITY",
+            Self::Denied => "DENIED",
+            Self::StaleOrConflict => "STALE_OR_CONFLICT",
+        }
+    }
+}
+
+/// Next permitted action carried by a missing-prerequisite residual. A
+/// newly accepted owner binding permits reevaluation of the retained
+/// operation under the current policy/fence; it never auto-activates old
+/// candidates, resumes unknown attempts, or rewrites refusal evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NextPermittedAction {
+    /// Restore the owner binding, then reevaluate the same retained
+    /// operation under the current fence. Never mint a replacement
+    /// identity and never implicitly retry: resolving the prerequisite
+    /// requires a fresh normal evaluation, not a replay with new IDs.
+    ReevaluateAfterOwnerAcceptance,
+    /// The blocked delivery is optional: skip it. Independently valid
+    /// solo/read-only work proceeds without the missing peer path.
+    ProceedWithoutBlockedDelivery,
+}
+
+impl NextPermittedAction {
+    /// Returns the stable action code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReevaluateAfterOwnerAcceptance => "REEVALUATE_AFTER_OWNER_ACCEPTANCE",
+            Self::ProceedWithoutBlockedDelivery => "PROCEED_WITHOUT_BLOCKED_DELIVERY",
+        }
+    }
+}
+
+/// Fabric operation that may block on a missing prerequisite port
+/// (issue #1700). Plan-only planning, read-only observation,
+/// recovery/status/control reads and snapshot/restore carry no entry here:
+/// they keep their own explicit dependency set and must not require the
+/// broken execution port merely to explain or contain its failure.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FabricOperation {
+    /// Candidate-only route resolution through the model registry.
+    ResolveModelRoute,
+    /// One peer delivery through the owning channel.
+    DeliverPeer,
+    /// Entry of one planned candidate through swarm control.
+    EnterSwarm,
+    /// Staging of one inactive Kernel reservation.
+    StageReservation,
+    /// Commit of one canonical Governor admission.
+    CommitAdmission,
+    /// Activation of launch authority for one admitted attempt.
+    Activate,
+    /// Emission of one built dispatch intent through the egress port.
+    Emit,
+}
+
+impl FabricOperation {
+    /// Returns the stable operation code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResolveModelRoute => "RESOLVE_MODEL_ROUTE",
+            Self::DeliverPeer => "DELIVER_PEER",
+            Self::EnterSwarm => "ENTER_SWARM",
+            Self::StageReservation => "STAGE_RESERVATION",
+            Self::CommitAdmission => "COMMIT_ADMISSION",
+            Self::Activate => "ACTIVATE",
+            Self::Emit => "EMIT",
+        }
+    }
+
+    /// Returns the single injected port this operation depends on. A peer
+    /// gap blocks only [`FabricOperation::DeliverPeer`]; every other
+    /// operation names its own port, so an optional missing peer path never
+    /// blocks an independently valid solo/read-only path.
+    #[must_use]
+    pub const fn required_port(self) -> FabricPortId {
+        match self {
+            Self::ResolveModelRoute => FabricPortId::ModelRegistry,
+            Self::DeliverPeer => FabricPortId::PeerChannel,
+            Self::EnterSwarm => FabricPortId::SwarmControl,
+            Self::StageReservation | Self::CommitAdmission => FabricPortId::AdmissionAuthority,
+            Self::Activate => FabricPortId::ActivationAuthority,
+            Self::Emit => FabricPortId::DispatchEgress,
+        }
+    }
+
+    /// Returns the next permitted action when this operation blocks. Only a
+    /// blocked peer delivery is skippable; every other block retains the
+    /// exact operation for reevaluation after owner acceptance.
+    #[must_use]
+    pub const fn next_permitted_action(self) -> NextPermittedAction {
+        match self {
+            Self::DeliverPeer => NextPermittedAction::ProceedWithoutBlockedDelivery,
+            Self::ResolveModelRoute
+            | Self::EnterSwarm
+            | Self::StageReservation
+            | Self::CommitAdmission
+            | Self::Activate
+            | Self::Emit => NextPermittedAction::ReevaluateAfterOwnerAcceptance,
+        }
+    }
+}
+
+/// Typed admission-blocking residual for an unresolved fabric port contract
+/// (issue #1700).
+///
+/// Source-derived facts (the port's own report, the owner reference, the
+/// fence/epoch observed at the failure) stay separate from unverified
+/// expectations: the residual never claims the port is absent beyond what
+/// the port itself reported, and it never confers execution authority.
+/// Propagated through the daemon response/status path via
+/// [`FabricError::MissingPrerequisite`] without string matching.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MissingPortResidual {
+    /// Injected port that reported no accepted binding.
+    pub port: FabricPortId,
+    /// Stable load-bearing interface identity that is missing.
+    pub interface: String,
+    /// Owning-contract reference (I2.17 `ContractChallenge` surface key).
+    pub owner_ref: String,
+    /// Non-bound binding state the port reported. Never `Bound` or
+    /// `Uncertain`: those admit dependent use and never build a residual.
+    pub state: PortBindingState,
+    /// Blocked fabric operation.
+    pub blocked_operation: FabricOperation,
+    /// Affected operation/work identity (definition, reservation,
+    /// admission/attempt, dispatch, role, or message identity).
+    pub work_identity: String,
+    /// Fence observed at the failure, when the operation carries one.
+    pub fence: Option<StateFence>,
+    /// Authority epoch observed at the failure, when the operation carries one.
+    pub epoch: Option<EpochId>,
+    /// Stable I7.20 disposition derived from the binding state.
+    pub disposition: ResidualDisposition,
+    /// Next permitted action for the blocked work.
+    pub next_action: NextPermittedAction,
+}
+
+impl MissingPortResidual {
+    /// Builds the residual from the port's own binding report. The port must
+    /// serve the blocked operation, the state must be a blocking one, and
+    /// the work identity must be well-formed text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] when the state admits dependent
+    /// use, the port does not serve the blocked operation, or the work
+    /// identity is blank or control-bearing.
+    pub fn new(
+        port: FabricPortId,
+        state: PortBindingState,
+        blocked_operation: FabricOperation,
+        work_identity: String,
+        fence: Option<StateFence>,
+        epoch: Option<EpochId>,
+    ) -> Result<Self, FabricError> {
+        if state.admits_dependent_use() {
+            return Err(FabricError::Contract(
+                "missing-prerequisite residual requires a blocking binding state".to_owned(),
+            ));
+        }
+        if blocked_operation.required_port() != port {
+            return Err(FabricError::Contract(
+                "residual port does not serve the blocked operation".to_owned(),
+            ));
+        }
+        validate_text(&work_identity, "blocked_work_identity")?;
+        Ok(Self {
+            port,
+            interface: port.interface().to_owned(),
+            owner_ref: port.owner_ref().to_owned(),
+            disposition: ResidualDisposition::of_state(&state),
+            next_action: blocked_operation.next_permitted_action(),
+            state,
+            blocked_operation,
+            work_identity,
+            fence,
+            epoch,
+        })
+    }
+}
+
+impl fmt::Display for MissingPortResidual {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "port=[{}] interface=[{}] owner=[{}] state=[{}] op=[{}] work=[{}] disposition=[{}] next=[{}]",
+            self.port.as_str(),
+            self.interface,
+            self.owner_ref,
+            self.state,
+            self.blocked_operation.as_str(),
+            self.work_identity,
+            self.disposition.as_str(),
+            self.next_action.as_str(),
+        )?;
+        if let Some(fence) = &self.fence {
+            write!(f, " fence=[{fence:?}]")?;
+        }
+        if let Some(epoch) = &self.epoch {
+            write!(f, " epoch=[{epoch:?}]")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for PortBindingState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bound { interface_revision } => {
+                write!(f, "BOUND revision=[{interface_revision}]")
+            }
+            Self::Missing => write!(f, "MISSING"),
+            Self::Unavailable => write!(f, "UNAVAILABLE"),
+            Self::Incompatible {
+                required_revision,
+                observed_revision,
+            } => write!(
+                f,
+                "INCOMPATIBLE required=[{required_revision}] observed=[{observed_revision}]"
+            ),
+            Self::StaleRevoked => write!(f, "STALE_REVOKED"),
+            Self::Uncertain => write!(f, "UNCERTAIN"),
+        }
+    }
 }
 
 fn validate_text(value: &str, _field: &'static str) -> Result<(), FabricError> {
@@ -572,6 +1030,14 @@ pub enum FabricError {
         "fabric restore blocked: snapshot holds a verified provider binding; supply fresh owner material through restore_verified"
     )]
     ProviderEvidenceRequired,
+    /// A load-bearing injected port reports no accepted interface binding
+    /// for the blocked operation (issue #1700). The boxed residual names
+    /// the exact port, owner, binding state, blocked operation/work,
+    /// fence/epoch, disposition and next permitted action. Boxed: the
+    /// residual rides every fallible fabric boundary, so the error itself
+    /// stays small.
+    #[error("missing prerequisite: {0}")]
+    MissingPrerequisite(Box<MissingPortResidual>),
 }
 
 /// B-MOD model registry seam (#694). The fabric resolves routes only through
@@ -583,6 +1049,17 @@ pub trait ModelRegistryPort: Send + Sync {
         &self,
         requirements: &RouteRequirements,
     ) -> Result<Option<RouteFingerprint>, FabricError>;
+
+    /// Reports this port's accepted-interface binding state (issue #1700).
+    ///
+    /// The default is [`PortBindingState::Uncertain`]: the port does not
+    /// report binding state, so the fabric proceeds to the per-call owner
+    /// verifier, which remains the authority. Override with an
+    /// owner-affirmed [`PortBindingState::Bound`] (or a positively known
+    /// non-bound state) once the owner tracks acceptance revisions.
+    fn interface_binding(&self) -> PortBindingState {
+        PortBindingState::Uncertain
+    }
 }
 
 /// B-PEER coordination channel seam (#696). The fabric delivers only through
@@ -590,6 +1067,12 @@ pub trait ModelRegistryPort: Send + Sync {
 pub trait PeerChannelPort: Send + Sync {
     /// Delivers one peer message through the owning channel.
     fn deliver(&self, message: &PeerMessage) -> Result<PeerReceipt, FabricError>;
+
+    /// Reports this port's accepted-interface binding state (issue #1700).
+    /// See [`ModelRegistryPort::interface_binding`].
+    fn interface_binding(&self) -> PortBindingState {
+        PortBindingState::Uncertain
+    }
 }
 
 /// B-SWARM durable swarm control seam (#698). The fabric enters the admitted
@@ -600,6 +1083,12 @@ pub trait SwarmControlPort: Send + Sync {
         &self,
         candidate: &StaffingPlanCandidate,
     ) -> Result<SwarmEntryReceipt, FabricError>;
+
+    /// Reports this port's accepted-interface binding state (issue #1700).
+    /// See [`ModelRegistryPort::interface_binding`].
+    fn interface_binding(&self) -> PortBindingState {
+        PortBindingState::Uncertain
+    }
 }
 
 /// Governor admission authority seam. Kernel stages the inactive reservation;
@@ -610,6 +1099,12 @@ pub trait AdmissionAuthorityPort: Send + Sync {
     fn stage_reservation(&self, definition: &SwarmDefinition) -> Result<Reservation, FabricError>;
     /// Commits one canonical admission referencing the staged reservation.
     fn commit_admission(&self, reservation: &Reservation) -> Result<FabricAdmission, FabricError>;
+
+    /// Reports this port's accepted-interface binding state (issue #1700).
+    /// See [`ModelRegistryPort::interface_binding`].
+    fn interface_binding(&self) -> PortBindingState {
+        PortBindingState::Uncertain
+    }
 }
 
 /// Kernel activation authority seam (#839). Activation is granted only after
@@ -621,6 +1116,12 @@ pub trait ActivationAuthorityPort: Send + Sync {
         admission: &FabricAdmission,
         attempt_id: &AttemptId,
     ) -> Result<ActivationEvidence, FabricError>;
+
+    /// Reports this port's accepted-interface binding state (issue #1700).
+    /// See [`ModelRegistryPort::interface_binding`].
+    fn interface_binding(&self) -> PortBindingState {
+        PortBindingState::Uncertain
+    }
 }
 
 /// Dispatch egress seam. The provider-neutral intent leaves the control
@@ -628,6 +1129,12 @@ pub trait ActivationAuthorityPort: Send + Sync {
 pub trait DispatchEgressPort: Send + Sync {
     /// Emits one activated dispatch intent.
     fn emit(&self, intent: &DispatchIntent) -> Result<DispatchAck, FabricError>;
+
+    /// Reports this port's accepted-interface binding state (issue #1700).
+    /// See [`ModelRegistryPort::interface_binding`].
+    fn interface_binding(&self) -> PortBindingState {
+        PortBindingState::Uncertain
+    }
 }
 
 /// Injected owner ports for one fabric instance.
@@ -854,6 +1361,56 @@ impl AgentFabric {
         });
     }
 
+    /// Checks the accepted-interface binding of the single port the given
+    /// operation depends on, before the owner call (issue #1700).
+    ///
+    /// [`PortBindingState::Bound`] proceeds to the per-call owner verifier
+    /// and [`PortBindingState::Uncertain`] defers to it entirely: this check
+    /// supplements, never replaces, the existing per-call
+    /// authority/fence/receipt verification. A positively reported
+    /// non-bound state stops before staging dependent capacity and returns
+    /// the typed [`MissingPortResidual`] at the point of use. Operations
+    /// without a map entry (plan-only planning, read-only observation,
+    /// recovery/status/control, snapshot/restore) never call this helper.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::MissingPrerequisite`] when the required port
+    /// reports a non-bound binding state, or [`FabricError::Contract`] when
+    /// the residual itself is malformed.
+    fn check_port_binding(
+        &mut self,
+        operation: FabricOperation,
+        work_identity: &str,
+        fence: Option<StateFence>,
+        epoch: Option<EpochId>,
+    ) -> Result<(), FabricError> {
+        let port = operation.required_port();
+        let state = match port {
+            FabricPortId::ModelRegistry => self.ports.model_registry.interface_binding(),
+            FabricPortId::PeerChannel => self.ports.peer_channel.interface_binding(),
+            FabricPortId::SwarmControl => self.ports.swarm_control.interface_binding(),
+            FabricPortId::AdmissionAuthority => self.ports.admission_authority.interface_binding(),
+            FabricPortId::ActivationAuthority => {
+                self.ports.activation_authority.interface_binding()
+            }
+            FabricPortId::DispatchEgress => self.ports.dispatch_egress.interface_binding(),
+        };
+        if state.admits_dependent_use() {
+            return Ok(());
+        }
+        let residual = MissingPortResidual::new(
+            port,
+            state,
+            operation,
+            work_identity.to_owned(),
+            fence,
+            epoch,
+        )?;
+        self.record("prerequisite_blocked", work_identity);
+        Err(FabricError::MissingPrerequisite(Box::new(residual)))
+    }
+
     /// Validates and freezes one Task-Controller definition, then compiles its
     /// deterministic candidate through the real coordinator owner.
     ///
@@ -913,6 +1470,16 @@ impl AgentFabric {
         requirements: &RouteRequirements,
     ) -> Result<Option<RouteFingerprint>, FabricError> {
         requirements.validate()?;
+        // #1700: a missing route binding prevents claiming an
+        // evidence-backed selected route. The registry is not consulted and
+        // no resolution is recorded when the port itself reports no accepted
+        // binding; an uncertain port defers to the owner call below.
+        self.check_port_binding(
+            FabricOperation::ResolveModelRoute,
+            &requirements.role,
+            None,
+            None,
+        )?;
         let route = self.ports.model_registry.resolve_route(requirements)?;
         self.record("model_route_resolved", &requirements.role);
         Ok(route)
@@ -968,6 +1535,15 @@ impl AgentFabric {
     /// Returns the channel owner rejection.
     pub fn deliver_peer(&mut self, message: &PeerMessage) -> Result<PeerReceipt, FabricError> {
         validate_text(&message.message_id, "peer_message_id")?;
+        // #1700: a peer gap blocks only this delivery. Solo/read-only paths
+        // never consult the peer port, so an optional missing peer path does
+        // not block independently valid work.
+        self.check_port_binding(
+            FabricOperation::DeliverPeer,
+            &message.message_id,
+            None,
+            None,
+        )?;
         let receipt = self.ports.peer_channel.deliver(message)?;
         self.record("peer_delivered", &message.message_id);
         Ok(receipt)
@@ -984,6 +1560,14 @@ impl AgentFabric {
         &mut self,
         candidate: &StaffingPlanCandidate,
     ) -> Result<SwarmEntryReceipt, FabricError> {
+        // #1700: stop before entering when the swarm port reports no accepted
+        // binding; the planned candidate is retained for reevaluation.
+        self.check_port_binding(
+            FabricOperation::EnterSwarm,
+            candidate.candidate_id.as_str(),
+            Some(candidate.state_fence.clone()),
+            None,
+        )?;
         let planned_digest = digest_json(candidate)?;
         let receipt = self.ports.swarm_control.enter_plan(candidate)?;
         if receipt.entered_digest != planned_digest
@@ -1018,6 +1602,15 @@ impl AgentFabric {
             .get(&key)
             .cloned()
             .ok_or_else(|| FabricError::Contract(format!("unknown definition {key}")))?;
+        // #1700: a missing admission prerequisite is already known here, so
+        // stop before staging dependent capacity unnecessarily. The frozen
+        // definition is retained for reevaluation after owner acceptance.
+        self.check_port_binding(
+            FabricOperation::StageReservation,
+            &key,
+            Some(definition.fence.clone()),
+            None,
+        )?;
         let reservation = self
             .ports
             .admission_authority
@@ -1108,6 +1701,16 @@ impl AgentFabric {
                 "definition {definition_key} already admitted under a different reservation"
             )));
         }
+        // #1700: unresolved admission binding prevents launch with a typed
+        // residual naming the exact prerequisite and the blocked operation.
+        // Exact replay above stays untouched: an already-committed admission
+        // is returned without consulting the port again.
+        self.check_port_binding(
+            FabricOperation::CommitAdmission,
+            reservation_id,
+            Some(reservation.fence.clone()),
+            None,
+        )?;
         let receipt = self
             .ports
             .admission_authority
@@ -1183,6 +1786,14 @@ impl AgentFabric {
             self.record("activation_replayed", &key);
             return Ok(existing);
         }
+        // #1700: unresolved activation binding prevents launch with a typed
+        // residual. Replay of already-committed evidence stays untouched.
+        self.check_port_binding(
+            FabricOperation::Activate,
+            &key,
+            Some(admission.fence.clone()),
+            Some(admission.epoch.clone()),
+        )?;
         let evidence = self
             .ports
             .activation_authority
@@ -1293,6 +1904,15 @@ impl AgentFabric {
             .get(dispatch_id)
             .cloned()
             .ok_or_else(|| FabricError::Contract(format!("unknown dispatch {dispatch_id}")))?;
+        // #1700: stop before emitting when the egress port reports no
+        // accepted binding. The built intent is retained (never recomputed
+        // under a new ID) for reevaluation after owner acceptance.
+        self.check_port_binding(
+            FabricOperation::Emit,
+            dispatch_id,
+            Some(intent.fence.clone()),
+            Some(intent.epoch.clone()),
+        )?;
         let ack = self.ports.dispatch_egress.emit(&intent)?;
         if ack.dispatch_id != dispatch_id {
             return Err(FabricError::IdentityConflict(
