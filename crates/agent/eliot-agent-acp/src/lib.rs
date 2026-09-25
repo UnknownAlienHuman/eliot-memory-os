@@ -33,11 +33,12 @@ use eliot_agent_api::{
     AdmittedRouteReceipt, AgentAttempt, AgentResult, AttemptId, AuthorityEnvelope,
     CONTRACT_VERSION, CancellationState, ClockReading, EffectKind, EventCursor, EventId,
     ExecutionOutcome, HostEventDeliveryDisposition, HostEventKind, HostEventNormalizationReceipt,
-    HostEventPrivacyClass, LowercaseSha256, NormalizationCoverage, NormalizedHostEventEnvelope,
-    NormalizedHostEventPayload, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
-    ProviderObservationLineage, QuotaKnowledge, RestrictedRawSourceHandle, ResultDisposition,
-    RouteFingerprint, RouteObservationState, TaskId, UnsupportedDisposition,
-    UnsupportedEventObservation, UnsupportedEventReason, UsageReceipt, sanitize_adapter_error,
+    HostEventPrivacyClass, LowercaseSha256, MAX_TEXT_REF_CHARS, NormalizationCoverage,
+    NormalizedHostEventEnvelope, NormalizedHostEventPayload, PhysicalRouteObservationReceipt,
+    ProviderExecutionBinding, ProviderObservationLineage, QuotaKnowledge,
+    RestrictedRawSourceHandle, ResultDisposition, RouteFingerprint, RouteObservationState, TaskId,
+    UnsupportedDisposition, UnsupportedEventObservation, UnsupportedEventReason, UsageReceipt,
+    sanitize_adapter_error,
 };
 use eliot_process::{
     ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest,
@@ -1593,9 +1594,30 @@ impl AcpResultEnvelope {
         }
     }
 
+    /// Owner-issued reconciliation handle for one ACP result (issue #2641):
+    /// the ELIOT operation identity under a fixed prefix, never provider
+    /// prose. A formatted explanation such as `acp-failed:{reason}` is not a
+    /// resolvable recovery handle, and a sanitized reason (up to
+    /// `MAX_SAFE_ERROR_CHARS`) plus a prefix can exceed the stricter
+    /// `recovery_ref` bound (`MAX_TEXT_REF_CHARS`), so the handle carries
+    /// only the bounded operation reference. Total by construction: a blank
+    /// operation identity yields the fixed unresolved handle rather than a
+    /// new failure mode.
+    fn acp_recovery_ref(operation_id: &str) -> String {
+        const PREFIX: &str = "acp-operation:";
+        let budget = MAX_TEXT_REF_CHARS.saturating_sub(PREFIX.len());
+        let operation: String = operation_id.chars().take(budget).collect();
+        let operation = operation.trim().to_owned();
+        if operation.is_empty() {
+            return "acp-operation-unresolved".to_owned();
+        }
+        format!("{PREFIX}{operation}")
+    }
+
     fn acp_result_execution_parts(
         disposition: ResultDisposition,
         unknown_reason: Option<&String>,
+        recovery_ref: &str,
     ) -> (
         ExecutionOutcome,
         Option<CancellationState>,
@@ -1612,13 +1634,13 @@ impl AcpResultEnvelope {
             (ResultDisposition::FailedVerification, Some(reason)) => (
                 ExecutionOutcome::UnknownOutcome,
                 None,
-                Some(format!("acp-failed:{reason}")),
+                Some(recovery_ref.to_owned()),
                 Some((*reason).clone()),
             ),
-            (ResultDisposition::UnknownOutcome, Some(reason)) => (
+            (ResultDisposition::UnknownOutcome, Some(_)) => (
                 ExecutionOutcome::UnknownOutcome,
                 None,
-                Some((*reason).clone()),
+                Some(recovery_ref.to_owned()),
                 None,
             ),
             _ => (
@@ -1639,11 +1661,13 @@ impl AcpResultEnvelope {
     ) -> Result<AgentResult, AcpAdapterError> {
         Self::check_acp_result_binding(&route, binding, self.session_id.as_ref())?;
         let (disposition, unknown_reason) = Self::acp_result_disposition(outcome);
-        // Adapter-boundary sanitization (issue #369 W20/A21): the provider
-        // failure reason is untrusted text. It is sanitized once here so the
-        // unknown reason, the quarantine/recovery handle, and the public
-        // error below never carry secrets or credentials. Plain operational
-        // reasons pass through verbatim.
+        // Adapter-boundary sanitization (issue #369 W20/A21, hardened by
+        // issue #2641): the provider failure reason is untrusted text. It is
+        // sanitized once here so the unknown reason and the public error below
+        // never carry secrets or credentials, and the quarantine/recovery
+        // handle below carries only the owner-issued operation reference, so
+        // all three emitted fields stay bounded public diagnostics. Plain
+        // operational reasons pass through verbatim.
         let unknown_reason = unknown_reason.map(|reason| sanitize_adapter_error(&reason));
         let usage = UsageReceipt {
             input_tokens: None,
@@ -1663,10 +1687,15 @@ impl AcpResultEnvelope {
         })?;
         // UNOBSERVED with explicit reason, never observed=requested.
         // Cancelled carries observed cancellation; Failed preserves the
-        // sanitized reason without claiming terminal time; all unknown
-        // outcomes quarantine with a recovery handle.
+        // sanitized reason in the public fields without claiming terminal
+        // time; all unknown outcomes quarantine under the owner-issued
+        // operation recovery handle.
         let (execution_outcome, cancellation, recovery_ref, safe_public_error) =
-            Self::acp_result_execution_parts(disposition, unknown_reason.as_ref());
+            Self::acp_result_execution_parts(
+                disposition,
+                unknown_reason.as_ref(),
+                &Self::acp_recovery_ref(&self.operation_id),
+            );
         let mut actual_route = PhysicalRouteObservationReceipt {
             schema_version: CONTRACT_VERSION.to_owned(),
             attempt_id: binding.attempt_id.clone(),
