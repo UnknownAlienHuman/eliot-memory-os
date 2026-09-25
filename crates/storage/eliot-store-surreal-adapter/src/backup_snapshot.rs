@@ -22,7 +22,8 @@ use std::sync::{Mutex, OnceLock};
 use eliot_store_api::{
     MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_MEMBERS, MAX_SNAPSHOT_PAGE_MEMBERS, MAX_SNAPSHOT_PAGES,
     RequestMeta, SnapshotBeginRequest, SnapshotCompleteness, SnapshotCursor, SnapshotEndReceipt,
-    SnapshotHandle, SnapshotMember, SnapshotPage, StoreError, canonical_json_bytes, sha256_hex,
+    SnapshotHandle, SnapshotMember, SnapshotPage, StateFence, StoreError, canonical_json_bytes,
+    sha256_hex,
 };
 use serde::Deserialize;
 use serde_json::Map;
@@ -42,6 +43,13 @@ const SNAPSHOT_PAGE_CHUNK: u64 = MAX_SNAPSHOT_PAGE_MEMBERS as u64;
 
 /// Static error field for a canonical source class composition defect.
 const SNAPSHOT_CLASS_FIELD: &str = "snapshot.classes";
+
+/// Enumeration revision bound into every end receipt.
+///
+/// The receipt's validation revision names the canonical-enumeration revision
+/// that produced the observed denominator, so a receipt can never be read as
+/// evidence of a later or earlier enumeration shape.
+const SNAPSHOT_VALIDATION_REVISION: u64 = 1;
 
 /// Domain separator for the owner-issued consistency point.
 ///
@@ -255,17 +263,40 @@ fn verify_canonical_source_classes() -> Result<(), StoreError> {
     Ok(())
 }
 
-/// One shape of the point-probe projection used for generation binding.
+/// The schema-meta projection of the bound point.
 #[derive(Deserialize)]
-struct GenerationProbe {
+struct PointSchemaMeta {
     generation: String,
+}
+
+/// The canonical-fence projection of the bound point.
+#[derive(Deserialize)]
+struct PointFence {
+    state_fence: StateFence,
+    next_commit_sequence: u64,
+    next_outbox_sequence: u64,
+}
+
+/// One frozen capture point: the exact owner-issued state a capture is bound to.
+///
+/// This replaces the previous bare generation string. I5.6 step 5 requires the
+/// admission gate to "verify State Fence, authority and expected current
+/// revisions", so every page and the end receipt re-verify the whole point: the
+/// fence, both allocated sequences, and the schema generation. A generation-only
+/// comparison let a committed transition between two pages pass unnoticed.
+#[derive(Clone, PartialEq)]
+struct CapturePoint {
+    state_fence: StateFence,
+    next_commit_sequence: u64,
+    next_outbox_sequence: u64,
+    schema_generation: String,
 }
 
 /// Frozen per-handle capture state. No `Debug` impl by design: registry
 /// contents never render into logs or errors.
 struct SnapshotState {
     begin: SnapshotBeginRequest,
-    observed_generation: String,
+    point: CapturePoint,
     ordered_members: Vec<SnapshotMember>,
     total_bytes: u64,
     total_pages: u64,
@@ -319,18 +350,20 @@ fn purge_expired(states: &mut HashMap<String, SnapshotState>, now_ms: u64) {
 }
 
 /// Gates on readiness/generation (no fallback client, no ambient DB) and then
-/// observes the live schema generation through the fixed adapter-owned
+/// reads the whole bound capture point through the fixed adapter-owned
 /// statement registered for `operation` in [`crate::client::backup_snapshot`].
 ///
 /// `operation` must be a member of the closed `snapshot.*` vocabulary: the
 /// registry is validated first, so an unlisted name can never reach the
 /// provider, and the statement is resolved from the registry rather than
 /// restated here. The statement takes no parameters; the binding map is empty
-/// so no caller value can reach the provider.
-async fn observe_live_generation(
+/// so no caller value can reach the provider. The schema generation and the
+/// canonical fence are read in the one transaction, so the two halves of the
+/// point are one observation.
+async fn observe_capture_point(
     adapter: &SurrealStoreAdapter,
     operation: &'static str,
-) -> Result<String, StoreError> {
+) -> Result<CapturePoint, StoreError> {
     let statement = crate::client::fixed_snapshot_statement(operation)
         .map_err(AdapterError::into_store_error)?;
     crate::client::validate_snapshot_operation(operation)
@@ -359,16 +392,84 @@ async fn observe_live_generation(
     // schema-meta projection is index 1 and the canonical-fence projection
     // index 2 — the same offsets `apply::read_boundary` uses for the identical
     // batch shape.
-    let probe: Option<GenerationProbe> =
-        response.take(1).map_err(AdapterError::into_store_error)?;
-    match probe {
-        Some(probe)
-            if !probe.generation.is_empty() && !probe.generation.chars().any(char::is_control) =>
-        {
-            Ok(probe.generation)
-        }
-        _ => Err(StoreError::Unavailable),
+    let meta: Option<PointSchemaMeta> = response.take(1).map_err(AdapterError::into_store_error)?;
+    let fence: Option<PointFence> = response.take(2).map_err(AdapterError::into_store_error)?;
+    parse_capture_point(meta, fence)
+}
+
+/// Decodes one point observation, failing closed on a blank or control-bearing
+/// generation and on an absent fence. A half-observed point is never a usable
+/// consistency point, so neither half is defaulted.
+fn parse_capture_point(
+    meta: Option<PointSchemaMeta>,
+    fence: Option<PointFence>,
+) -> Result<CapturePoint, StoreError> {
+    let generation = meta.map(|meta| meta.generation).unwrap_or_default();
+    if generation.is_empty() || generation.chars().any(char::is_control) {
+        return Err(StoreError::Unavailable);
     }
+    let fence = fence.ok_or(StoreError::Unavailable)?;
+    fence
+        .state_fence
+        .validate()
+        .map_err(StoreError::Foundation)?;
+    Ok(CapturePoint {
+        state_fence: fence.state_fence,
+        next_commit_sequence: fence.next_commit_sequence,
+        next_outbox_sequence: fence.next_outbox_sequence,
+        schema_generation: generation,
+    })
+}
+
+/// Binds the caller's claimed source identity to the admitted store identity.
+///
+/// I5.6 steps 2 and 5: validate the envelope and canonical request identity,
+/// then verify authority and expected current state. Each mismatch is a typed
+/// [`StoreError::InvalidField`] naming a static field and reason, so no caller
+/// text crosses the boundary.
+///
+/// `source.generation` is bound to the resource generation inside the
+/// owner-issued state fence that the same request carries and that the store
+/// has just verified live. That is the only honest binding available: this
+/// adapter owns no live resource-generation counter (`SurrealAdapterConfig`
+/// holds `SchemaGeneration`, a migration version *string*, not a counter), so
+/// the claim is anchored to the verified fence rather than compared against an
+/// invented provider counter.
+fn bind_source_identity(
+    adapter: &SurrealStoreAdapter,
+    point: &CapturePoint,
+    request: &SnapshotBeginRequest,
+) -> Result<(), StoreError> {
+    let (active_store, active_installation) =
+        crate::backup_restore::active_store_identity(&adapter.config);
+    if request.source.installation_id != active_installation {
+        return Err(StoreError::InvalidField {
+            field: "snapshot.installation_id",
+            reason: "source is not this installation",
+        });
+    }
+    if request.source.store_id != active_store {
+        return Err(StoreError::InvalidField {
+            field: "snapshot.store_id",
+            reason: "source is not the active store database",
+        });
+    }
+    if request.source.schema != point.schema_generation {
+        return Err(StoreError::InvalidField {
+            field: "snapshot.schema",
+            reason: "source is not the observed schema generation",
+        });
+    }
+    if request.source.generation != request.scope.state_fence.resource_generation {
+        return Err(StoreError::InvalidField {
+            field: "snapshot.generation",
+            reason: "source generation must match the bound state fence generation",
+        });
+    }
+    if request.scope.state_fence != point.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    Ok(())
 }
 
 /// Removes exactly the capture-owned entry. The map itself is never cleared.
@@ -387,17 +488,12 @@ pub(crate) async fn begin_snapshot(
     if ctx.state_fence != request.scope.state_fence {
         return Err(StoreError::FenceMismatch);
     }
-    if request.source.installation_id != adapter.config.installation_id {
-        return Err(StoreError::InvalidField {
-            field: "snapshot.installation_id",
-            reason: "source is not this installation",
-        });
-    }
     verify_canonical_source_classes()?;
-    let observed = observe_live_generation(adapter, SNAPSHOT_BEGIN_OPERATION).await?;
-    if observed != adapter.config.expected_schema_generation.as_str() {
+    let point = observe_capture_point(adapter, SNAPSHOT_BEGIN_OPERATION).await?;
+    if point.schema_generation != adapter.config.expected_schema_generation.as_str() {
         return Err(StoreError::Unavailable);
     }
+    bind_source_identity(adapter, &point, &request)?;
 
     let snapshot_digest = request.compute_digest()?;
     let mut ordered_members = request.denominator.members.clone();
@@ -441,7 +537,7 @@ pub(crate) async fn begin_snapshot(
         snapshot_digest.clone(),
         SnapshotState {
             begin: request,
-            observed_generation: observed,
+            point,
             ordered_members,
             total_bytes,
             total_pages,
@@ -605,7 +701,7 @@ pub(crate) async fn read_snapshot_page(
 
     // No registry lock is held across this provider await. A failed probe
     // releases only the capture-owned entry, never the whole map.
-    let observed = observe_live_generation(adapter, SNAPSHOT_PAGE_OPERATION)
+    let observed = observe_capture_point(adapter, SNAPSHOT_PAGE_OPERATION)
         .await
         .inspect_err(|_| {
             if let Ok(mut states) = registry().lock() {
@@ -620,8 +716,20 @@ pub(crate) async fn read_snapshot_page(
             reason: "unknown snapshot handle",
         });
     };
-    if observed != state.observed_generation {
+    if observed != state.point {
         // The source moved under the bound point: never mix a newer point.
+        release_owned(&mut states, &digest);
+        return Err(StoreError::Unavailable);
+    }
+    // The provider round trip is inside the capture's own duration bound, so
+    // the window is re-checked after the await. Without this a slow round trip
+    // served a page from a capture whose owner window had already closed.
+    if is_retired(
+        state.begin.expires_at_unix_ms,
+        state.opened_at_ms,
+        state.begin.bounds.max_duration_ms,
+        crate::write_execution::current_time_ms(),
+    ) {
         release_owned(&mut states, &digest);
         return Err(StoreError::Unavailable);
     }
@@ -664,7 +772,7 @@ pub(crate) async fn end_snapshot(
 
     // No registry lock is held across this provider await. A failed probe
     // releases only the capture-owned entry, never the whole map.
-    let observed = observe_live_generation(adapter, SNAPSHOT_END_OPERATION)
+    let observed = observe_capture_point(adapter, SNAPSHOT_END_OPERATION)
         .await
         .inspect_err(|_| {
             if let Ok(mut states) = registry().lock() {
@@ -679,10 +787,18 @@ pub(crate) async fn end_snapshot(
             reason: "unknown snapshot handle",
         });
     };
-    if observed != state.observed_generation {
+    if observed != state.point {
         release_owned(&mut states, &digest);
         return Err(StoreError::Unavailable);
     }
+    // The provider round trip is inside the capture's own duration bound, so
+    // the window is re-checked after the await before the receipt is issued.
+    let retired = is_retired(
+        state.begin.expires_at_unix_ms,
+        state.opened_at_ms,
+        state.begin.bounds.max_duration_ms,
+        crate::write_execution::current_time_ms(),
+    );
     let complete = state.members_served == state.ordered_members.len() as u64
         && state.bytes_served == state.total_bytes
         && state.pages_served == state.total_pages;
@@ -691,12 +807,12 @@ pub(crate) async fn end_snapshot(
         operation: state.begin.operation.clone(),
         member_count: state.members_served,
         byte_count: state.bytes_served,
-        completeness: if complete {
+        completeness: if complete && !retired {
             SnapshotCompleteness::Complete
         } else {
             SnapshotCompleteness::Partial
         },
-        validation_revision: 1,
+        validation_revision: SNAPSHOT_VALIDATION_REVISION,
     };
     receipt.validate()?;
     release_owned(&mut states, &digest);
