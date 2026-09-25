@@ -479,16 +479,18 @@ struct OwnerRevisionOperation {
 /// Closed P-07 grant activation operation (`#1110`).
 ///
 /// Mirrors the authenticated `KernelAuthorityClient` payload: string
-/// identities plus the exact presented authority binding. The dispatcher
-/// decodes, rechecks the binding against the authenticated session, and
-/// routes through the retained P-07 owner port; it never mints authority.
-/// Unknown fields fail closed.
+/// identities, the exact presented authority binding, and the presented
+/// principal/session/scope subject. The dispatcher decodes, rechecks both
+/// against the authenticated session, and routes through the retained P-07
+/// owner port; it never mints authority. Unknown or absent fields fail
+/// closed.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GrantActivationOperation {
     grant_id: String,
     snapshot_id: String,
     binding: eliot_receipts::AuthorityBinding,
+    subject: eliot_receipts::AuthorityRequestSubject,
 }
 
 /// Closed P-07 grant revocation operation (`#1110`). Same shape and
@@ -500,10 +502,11 @@ struct GrantRevocationOperation {
     grant_id: String,
     snapshot_id: String,
     binding: eliot_receipts::AuthorityBinding,
+    subject: eliot_receipts::AuthorityRequestSubject,
 }
 
-/// Closed P-07 introduction activation operation (`#1110`). Same shape and
-/// fail-closed contract as the grant activation operation, keyed by
+/// Closed P-07 introduction activation operation (`#1110`). Same shape
+/// and fail-closed contract as the grant activation operation, keyed by
 /// introduction identity.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -511,10 +514,11 @@ struct IntroductionActivationOperation {
     introduction_id: String,
     snapshot_id: String,
     binding: eliot_receipts::AuthorityBinding,
+    subject: eliot_receipts::AuthorityRequestSubject,
 }
 
-/// Closed P-07 introduction revocation operation (`#1110`). Same shape and
-/// fail-closed contract as the grant revocation operation, keyed by
+/// Closed P-07 introduction revocation operation (`#1110`). Same shape
+/// and fail-closed contract as the grant revocation operation, keyed by
 /// introduction identity.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -522,6 +526,7 @@ struct IntroductionRevocationOperation {
     introduction_id: String,
     snapshot_id: String,
     binding: eliot_receipts::AuthorityBinding,
+    subject: eliot_receipts::AuthorityRequestSubject,
 }
 
 /// Canonical installed WASM-host image filename pinned by the
@@ -607,17 +612,37 @@ fn owner_bundle_agrees_with_session(
     })
 }
 
-/// Rechecks one presented P-07 binding against the authenticated session
-/// before the dispatcher touches the retained owner: the fence must validate,
-/// the binding epoch must agree with the fence epoch, the binding authority
-/// must be the session authority, and the presented fence must be the session
-/// generation fence. Anything else fails closed before mutation.
+/// Rechecks one presented P-07 binding and subject against the authenticated
+/// session before the dispatcher touches the retained owner, and therefore
+/// before any authority mutation.
+///
+/// Four independent closed checks, none of them satisfied by caller material
+/// alone:
+///
+/// - the presented subject is a well-formed principal/session/scope triple
+///   (no blank or control-bearing identity, and no secret, provider detail,
+///   arbitrary payload or free prose);
+/// - the presented principal is exactly the caller the authenticated
+///   handshake proved, so a cross-principal presentation is refused;
+/// - the presented session is exactly the authenticated transport session, so
+///   a request replayed or forwarded on another session is refused;
+/// - the presented scope is one the authenticated session actually holds, so
+///   a cross-scope presentation is refused even on the right session;
+///
+/// plus the compact binding: the fence must validate, the binding epoch must
+/// agree with the fence epoch, the binding authority must be the session
+/// authority, and the presented fence must be the session generation fence.
+/// Anything else fails closed before mutation.
 fn p07_binding_agrees_with_session(
     binding: &eliot_receipts::AuthorityBinding,
+    subject: &eliot_receipts::AuthorityRequestSubject,
     session: &Session,
 ) -> Result<(), TransportError> {
     binding
         .state_fence
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    subject
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
     if binding.authority_epoch != binding.state_fence.authority_epoch
@@ -625,6 +650,15 @@ fn p07_binding_agrees_with_session(
             .authority_epoch
             .is_same_authority(&session.authority_epoch)
         || binding.state_fence != session.module_generation.state_fence
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    if !subject.is_principal(session.module_generation.module_id.as_str())
+        || !subject.is_session(session.connection_id.as_str())
+        || !session
+            .capabilities
+            .iter()
+            .any(|capability| subject.is_scope(capability.as_str()))
     {
         return Err(TransportError::SessionFenced);
     }
@@ -1424,14 +1458,23 @@ impl KernelComposition {
                     &session.module_generation.state_fence,
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
+                // Restart recovery (`#1110`): a process that retained an
+                // owner only rotates it through the exact-revision refresh
+                // gate, while a process that retained none is a Kernel/daemon
+                // restart and `bind_canonical_owner` rebuilds live authority
+                // state from ORS plus the canonical rehydration before the
+                // owner is retained. The receipt shape is unchanged: the
+                // readback route and the existing publisher decode it
+                // strictly.
                 match self.recover_p07_owner(operation.bundle, operation.expected_revision) {
                     Ok(revision) => Ok(serde_json::json!({
                         "kind": "owner_bundle_receipt",
                         "value": { "revision": revision, "status": "bound" },
                     })),
-                    // The presented bundle conflicts with Kernel owner
-                    // state (stale revision, disagreeing material): the
-                    // caller re-serves fresh state, never retries blindly.
+                    // The presented bundle or a durable row disagrees with
+                    // Kernel owner state (stale revision, disagreeing
+                    // material, an unprovable rehydration): the caller
+                    // re-serves fresh state, never retries blindly.
                     Err(KernelBuildError::Core(_)) => Err(TransportError::IdentityConflict),
                     Err(_) => Err(TransportError::SessionFenced),
                 }
@@ -1454,7 +1497,7 @@ impl KernelComposition {
                 if operation.grant_id.trim().is_empty() || operation.snapshot_id.trim().is_empty() {
                     return Err(TransportError::SessionFenced);
                 }
-                p07_binding_agrees_with_session(&operation.binding, session)?;
+                p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
                 self.admit_material_authority_for_fence(
                     GovernanceProfile::full(),
                     &session.module_generation.state_fence,
@@ -1486,7 +1529,7 @@ impl KernelComposition {
                 if operation.grant_id.trim().is_empty() || operation.snapshot_id.trim().is_empty() {
                     return Err(TransportError::SessionFenced);
                 }
-                p07_binding_agrees_with_session(&operation.binding, session)?;
+                p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
                 let request = eliot_authority::GrantRevocationRequest {
                     grant_id: eliot_authority::GrantId::new(operation.grant_id)
                         .map_err(|_| TransportError::SessionFenced)?,
@@ -1515,7 +1558,7 @@ impl KernelComposition {
                 {
                     return Err(TransportError::SessionFenced);
                 }
-                p07_binding_agrees_with_session(&operation.binding, session)?;
+                p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
                 self.admit_material_authority_for_fence(
                     GovernanceProfile::full(),
                     &session.module_generation.state_fence,
@@ -1553,7 +1596,7 @@ impl KernelComposition {
                 {
                     return Err(TransportError::SessionFenced);
                 }
-                p07_binding_agrees_with_session(&operation.binding, session)?;
+                p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
                 let request = eliot_authority::IntroductionRevocationRequest {
                     introduction_id: eliot_authority::IntroductionId::new(
                         operation.introduction_id,
@@ -1584,7 +1627,15 @@ impl KernelComposition {
             }
             _ => return Err(TransportError::SessionFenced),
         };
-        let value = result.map_err(|_| TransportError::SessionFenced)?;
+        // Typed refusal propagation (`#1110`): the arm already decided the
+        // closed disposition. Collapsing every one of them into
+        // `SessionFenced` here erased the typed P-07 `IdentityConflict` and
+        // `UnknownOutcome` observations (`map_p07_port_error`) and the owner
+        // publish/revision conflicts before they reached the operator
+        // observation (`daemon_terminal_code`) or the agent-facing surface, so
+        // a changed payload under one operation identity was indistinguishable
+        // from a missing owner. Propagate the decided variant unchanged.
+        let value = result?;
         let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
         frame.request_id = Some(request_id);
         frame.validate()?;
