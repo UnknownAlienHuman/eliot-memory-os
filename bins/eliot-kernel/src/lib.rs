@@ -3021,6 +3021,14 @@ impl KernelComposition {
             if state.status != DaemonRuntimeStatus::Ready {
                 return Err(KernelServiceError::ReadinessNotProven);
             }
+            if state.supervision_expired {
+                // Issue #88, A6: the progress route already reported terminal
+                // lease expiry for this contour. Fail readiness closed on the
+                // expired marker until a new admitted generation rebinds (the
+                // rebind clears the marker); the durable-head verify below
+                // would fail identically on the expired binding.
+                return Err(KernelServiceError::ReadinessNotProven);
+            }
             (
                 state
                     .supervision
