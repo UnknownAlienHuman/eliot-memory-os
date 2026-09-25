@@ -176,11 +176,23 @@ if (-not $SkipServices) {
     }
 }
 
-# 2. Installation root (system_service installation root only)
-# Note: %LOCALAPPDATA%\Eliot holds the owner's live legacy ELIOT data (data, blobs,
-# backups, .swarm) and is NEVER moved, deleted, or edited by an install reset.
-if (Test-Path -LiteralPath $pdEliot) {
-    $foundCount++
+function Reset-InstallationRoot {
+    <#
+    .SYNOPSIS
+        Moves the system_service installation root aside to a timestamped sibling.
+
+    .DESCRIPTION
+        Never a recursive delete: the previous state stays inspectable and nothing
+        half-installed is left in place. %LOCALAPPDATA%\Eliot is NEVER moved, deleted
+        or edited - it holds the owner's live legacy ELIOT data.
+
+    .OUTPUTS
+        [int] The number of installation-root artifacts found (0 or 1). The caller
+        owns the running total, because incrementing a script-scope counter from a
+        function would silently create a child-scope copy.
+    #>
+    if (-not (Test-Path -LiteralPath $pdEliot)) { return 0 }
+
     $timestamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
     $destPd = Join-Path $ProgramDataRoot "Eliot-reset-$timestamp"
     if (Test-Path -LiteralPath $destPd) {
@@ -190,31 +202,45 @@ if (Test-Path -LiteralPath $pdEliot) {
         }
         $destPd = "${destPd}_$suffix"
     }
+
     if ($WhatIf) {
         $stats.directories++
         Write-Host "RESET: would move directory `"$pdEliot`" to `"$destPd`""
-    } else {
-        $moved = $false
-        try {
-            Move-Item -LiteralPath $pdEliot -Destination $destPd
-            $moved = $true
-        } catch {
-            $failures.Add("cannot move installation root `"$pdEliot`" to `"$destPd`": $_")
-        }
-        if ($moved) {
-            if (Test-Path -LiteralPath $pdEliot) {
-                $failures.Add("installation root `"$pdEliot`" still exists after move to `"$destPd`"")
-            } else {
-                $stats.directories++
-                Write-Host "RESET: moved `"$pdEliot`" to `"$destPd`""
-            }
+        return 1
+    }
+
+    $moved = $false
+    try {
+        Move-Item -LiteralPath $pdEliot -Destination $destPd
+        $moved = $true
+    } catch {
+        $failures.Add("cannot move installation root `"$pdEliot`" to `"$destPd`": $_")
+    }
+    if ($moved) {
+        if (Test-Path -LiteralPath $pdEliot) {
+            $failures.Add("installation root `"$pdEliot`" still exists after move to `"$destPd`"")
+        } else {
+            $stats.directories++
+            Write-Host "RESET: moved `"$pdEliot`" to `"$destPd`""
         }
     }
+    return 1
 }
 
-# 3. Credentials (installer-root only; eliot/store/v1/* belongs to the legacy store
-#    and is NEVER deleted)
-if (-not $SkipCredentials) {
+function Remove-InstallerRootCredentials {
+    <#
+    .SYNOPSIS
+        Deletes only the installer-root credential targets and never the legacy store.
+
+    .DESCRIPTION
+        `eliot/installer-root/v1/*` targets belong to the installation and are deleted.
+        `eliot/store/v1/*` targets belong to the legacy Store and are NEVER deleted.
+
+    .OUTPUTS
+        [int] The number of installer-root credential targets found.
+    #>
+    if ($SkipCredentials) { return 0 }
+
     $cmdkeyOutput = & cmdkey.exe /list 2>$null
     $credTargets = @()
     if ($cmdkeyOutput) {
@@ -232,7 +258,6 @@ if (-not $SkipCredentials) {
         }
     }
     foreach ($cred in $credTargets) {
-        $foundCount++
         if ($WhatIf) {
             $stats.credentials++
             Write-Host "RESET: would delete credential target '$($cred.Clean)'"
@@ -251,13 +276,40 @@ if (-not $SkipCredentials) {
             Write-Host "RESET: deleted credential target '$($cred.Clean)'"
         }
     }
+    return $credTargets.Count
 }
 
-if ($foundCount -eq 0) {
-    Write-Host "RESET: nothing to reset (machine is clean)"
-} else {
+function Write-ResetSummary {
+    <#
+    .SYNOPSIS
+        Reports exactly what the reset found, removed and moved.
+
+    .DESCRIPTION
+        On a clean machine nothing was found, so the reset is idempotent: this prints
+        the exact "nothing to reset" line the operator and the repository checks expect,
+        and the caller exits 0. Otherwise every counter is printed so a partial reset is
+        visible rather than implied.
+
+    .OUTPUTS
+        [bool] $true when nothing was found, i.e. the machine was already clean.
+    #>
+    if ($foundCount -eq 0) {
+        Write-Host "RESET: nothing to reset (machine is clean)"
+        return $true
+    }
     Write-Host ("RESET: found {0} machine-level artifact(s); services removed {1}, processes terminated {2}, directories moved {3}, credentials deleted {4}" -f $foundCount, $stats.services, $stats.processes, $stats.directories, $stats.credentials)
+    return $false
 }
+
+# 2. Installation root (system_service installation root only).
+# 3. Credentials (installer-root only; eliot/store/v1/* belongs to the legacy store and
+#    is NEVER deleted).
+# Each step is a named function so the Scope bullet it implements is individually
+# addressable, and each returns how many artifacts it found.
+$foundCount += Reset-InstallationRoot
+$foundCount += Remove-InstallerRootCredentials
+
+$machineWasClean = Write-ResetSummary
 
 if ($failures.Count -gt 0) {
     foreach ($failure in $failures) {
