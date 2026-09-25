@@ -2686,6 +2686,28 @@ mod tests {
         }
     }
 
+    fn compile_ready_receipt(one: &WorkScopeCandidate) -> OnboardingReadinessReceipt {
+        match compile_with(one, &one.instance, &readiness_fence(), current_task_input()) {
+            Ok(value) => value,
+            Err(error) => panic!("readiness compilation failed: {error}"),
+        }
+    }
+
+    fn publish_ready_terminal(
+        flight: &mut OnboardingSingleFlight,
+        receipt: &OnboardingReadinessReceipt,
+    ) {
+        match flight.publish_terminal(
+            "onboarding:one",
+            receipt.clone(),
+            OnboardingLeaseState::Ready,
+            1,
+        ) {
+            Ok(()) => (),
+            Err(error) => panic!("terminal publish failed: {error}"),
+        }
+    }
+
     #[test]
     fn a1_valid_lease_bootstrap_returns_profile_and_receipt_with_allowed_classes_only() {
         let mut lease = bootstrap_lease();
@@ -2766,7 +2788,7 @@ mod tests {
     }
 
     #[test]
-    fn single_flight_coalesces_compatible_attaches_and_isolates_changed_identity() {
+    fn single_flight_coalesces_compatible_attaches_into_terminal_receipt() {
         let one = candidate("instance:a");
         let mut flight = OnboardingSingleFlight::new();
         let discovery = discovery_lease();
@@ -2784,24 +2806,8 @@ mod tests {
                 lease_ref: "onboarding:one".into()
             }
         );
-        let receipt = match compile_with(
-            &one,
-            &one.instance,
-            &readiness_fence(),
-            current_task_input(),
-        ) {
-            Ok(value) => value,
-            Err(error) => panic!("readiness compilation failed: {error}"),
-        };
-        match flight.publish_terminal(
-            "onboarding:one",
-            receipt.clone(),
-            OnboardingLeaseState::Ready,
-            1,
-        ) {
-            Ok(()) => (),
-            Err(error) => panic!("terminal publish failed: {error}"),
-        }
+        let receipt = compile_ready_receipt(&one);
+        publish_ready_terminal(&mut flight, &receipt);
         match join_one(&mut flight, &discovery, onboarding_lease()) {
             LeaseJoin::JoinedTerminal { lease_ref, surface } => {
                 assert_eq!(lease_ref, "onboarding:one");
@@ -2811,6 +2817,18 @@ mod tests {
             }
             other => panic!("waiter did not attach to the terminal receipt: {other:?}"),
         }
+    }
+
+    #[test]
+    fn single_flight_isolates_changed_identity_and_boundary() {
+        let mut flight = OnboardingSingleFlight::new();
+        let discovery = discovery_lease();
+        assert_eq!(
+            join_one(&mut flight, &discovery, onboarding_lease()),
+            LeaseJoin::Created {
+                lease_ref: "onboarding:one".into()
+            }
+        );
         let mut other_lease = onboarding_lease();
         other_lease.lease_ref = "onboarding:two".into();
         other_lease.workspace_instance_candidate_ref = "instance:b".into();
@@ -2829,6 +2847,16 @@ mod tests {
                 lease_ref: "onboarding:boundary".into()
             }
         );
+    }
+
+    #[test]
+    fn single_flight_invalidation_forces_revised_receipt() {
+        let one = candidate("instance:a");
+        let mut flight = OnboardingSingleFlight::new();
+        let discovery = discovery_lease();
+        join_one(&mut flight, &discovery, onboarding_lease());
+        let receipt = compile_ready_receipt(&one);
+        publish_ready_terminal(&mut flight, &receipt);
         let changed_generation = OnboardingObservedKey {
             lineage_candidate_ref: "lineage:one".into(),
             workspace_instance_candidate_ref: "instance:a".into(),
