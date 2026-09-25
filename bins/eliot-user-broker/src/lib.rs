@@ -130,6 +130,31 @@ pub enum BrokerAdmissionRefusal {
     /// yet proven; it must be reconciled before it can be cancelled.
     #[error("BROKER_OPERATION_OUTCOME_UNRECONCILED")]
     OperationOutcomeUnreconciled,
+    /// The launch's tool is not in the introduced operation set.
+    #[error("CAPABILITY_INTRODUCTION_REQUIRED")]
+    IntroductionOperationNotGranted,
+    /// The launch's resource root is not in the introduced resource set.
+    #[error("CAPABILITY_INTRODUCTION_REQUIRED")]
+    IntroductionResourceNotGranted,
+    /// The launch's effect ceiling exceeds the introduced ceiling.
+    #[error("CAPABILITY_INTRODUCTION_REQUIRED")]
+    IntroductionEffectCeilingExceeded,
+    /// The grant introduces no resource or credential for this launch.
+    #[error("CAPABILITY_INTRODUCTION_REQUIRED")]
+    IntroductionRequired,
+    /// The introduced resource or credential lease is not active.
+    #[error("CAPABILITY_GRANT_REVOKED")]
+    IntroductionExpired,
+    /// The launch's credential is not the one its introduction names.
+    #[error("CAPABILITY_INTRODUCTION_REQUIRED")]
+    IntroductionCredentialUnnamed,
+    /// An operation identity was already spent under a fenced generation.
+    #[error("IDENTITY_CONFLICT")]
+    OperationIdRetired,
+    /// An exact replay of an operation that a fenced generation already
+    /// spent, under a new generation.
+    #[error("UNKNOWN_OUTCOME")]
+    RetiredOperation,
 }
 
 impl BrokerAdmissionRefusal {
@@ -141,6 +166,14 @@ impl BrokerAdmissionRefusal {
             Self::ProcessIdentityChanged => "BROKER_PROCESS_IDENTITY_CHANGED",
             Self::RegistrationIdentityForeign => "BROKER_REGISTRATION_IDENTITY_FOREIGN",
             Self::OperationOutcomeUnreconciled => "BROKER_OPERATION_OUTCOME_UNRECONCILED",
+            Self::IntroductionOperationNotGranted
+            | Self::IntroductionResourceNotGranted
+            | Self::IntroductionEffectCeilingExceeded
+            | Self::IntroductionRequired
+            | Self::IntroductionCredentialUnnamed => "CAPABILITY_INTRODUCTION_REQUIRED",
+            Self::IntroductionExpired => "CAPABILITY_GRANT_REVOKED",
+            Self::OperationIdRetired => "IDENTITY_CONFLICT",
+            Self::RetiredOperation => "UNKNOWN_OUTCOME",
         }
     }
 
@@ -459,6 +492,26 @@ impl LocalProcessPort {
         if grant.expires_at <= now {
             return Err(PortError::Denied);
         }
+        // The introduced user-session resource/credential has its own
+        // deadline, enforced here at the point of use rather than only at
+        // admission: a grant that outlived its own introduction, or a
+        // credential lease that ended inside it, cannot start a child.
+        let introduction = &grant.approved.introduction;
+        if introduction.expires_at <= now
+            || introduction
+                .credential_binding
+                .as_ref()
+                .is_some_and(|binding| binding.expires_at <= now)
+        {
+            return Err(PortError::Denied);
+        }
+        // The credential is introduced as an opaque reference only. It is
+        // deliberately NOT added to the child environment: `ProcessExecutor`
+        // refuses any request carrying environment secret references
+        // ("secret environment references require an admitted secret
+        // projection"), and I6.15 requires that signing secrets never enter
+        // a child environment. The child resolves the handle itself through
+        // its own crypto port, so nothing here materialises or forwards it.
         let intent = ProcessIntent::new(
             grant.approved.operation_id.clone(),
             grant.approved.process_tree_id.clone(),
@@ -847,6 +900,7 @@ impl BrokerComposition {
                     user_broker_epoch: 0,
                     operation_cursors: Vec::new(),
                     operation_identities: Vec::new(),
+                    retired_operations: Vec::new(),
                 })
                 .map_err(|error| CompositionError::InvalidConfiguration(error.to_string()))?;
         }
@@ -1185,7 +1239,7 @@ impl BrokerComposition {
         let _ = self.heartbeat()?;
         self.broker
             .launch(request)
-            .map_err(CompositionError::Recovery)
+            .map_err(|error| Self::classify(error))
     }
 
     /// Cancels a broker-owned operation selected by its admitted operation
@@ -1204,7 +1258,7 @@ impl BrokerComposition {
         self.admit_control_operation(BrokerControlOperation::Cancel, operation_id)?;
         self.broker
             .cancel_operation(operation_id)
-            .map_err(CompositionError::Recovery)
+            .map_err(Self::classify)
     }
 
     /// Reconciles a broker-owned operation selected by its admitted operation
@@ -1217,7 +1271,7 @@ impl BrokerComposition {
         self.admit_control_operation(BrokerControlOperation::Reconcile, operation_id)?;
         self.broker
             .reconcile_operation(operation_id)
-            .map_err(CompositionError::Recovery)
+            .map_err(Self::classify)
     }
 
     /// Records this broker-owned control operation's distinct durable
@@ -1230,12 +1284,46 @@ impl BrokerComposition {
         let observed_at = now_unix_ms()?;
         self.broker
             .admit_control_operation(operation, operation_id, observed_at)
-            .map_err(|error| match error {
-                BrokerError::UnreconciledEffect(_) => {
-                    BrokerAdmissionRefusal::OperationOutcomeUnreconciled.with_platform(error)
-                }
-                other => CompositionError::Recovery(other),
-            })
+            .map_err(Self::classify)
+    }
+
+    /// Projects one core refusal onto the broker's closed admission taxonomy.
+    ///
+    /// A refusal the broker can name keeps its exact cause and its own stable
+    /// code; anything else stays the typed `Recovery` variant rather than a
+    /// string. Nothing here is downgraded to a generic composition error.
+    fn classify(error: BrokerError) -> CompositionError {
+        let refusal = match error {
+            BrokerError::StaleRegistrationIdentity => {
+                Some(BrokerAdmissionRefusal::RegistrationIdentityForeign)
+            }
+            BrokerError::UnreconciledEffect(_) => {
+                Some(BrokerAdmissionRefusal::OperationOutcomeUnreconciled)
+            }
+            BrokerError::RetiredOperation(_) => Some(BrokerAdmissionRefusal::RetiredOperation),
+            BrokerError::OperationIdRetired(_) => Some(BrokerAdmissionRefusal::OperationIdRetired),
+            BrokerError::IntroductionRequired(_) => {
+                Some(BrokerAdmissionRefusal::IntroductionRequired)
+            }
+            BrokerError::IntroductionOperationNotGranted => {
+                Some(BrokerAdmissionRefusal::IntroductionOperationNotGranted)
+            }
+            BrokerError::IntroductionResourceNotGranted => {
+                Some(BrokerAdmissionRefusal::IntroductionResourceNotGranted)
+            }
+            BrokerError::IntroductionEffectCeilingExceeded => {
+                Some(BrokerAdmissionRefusal::IntroductionEffectCeilingExceeded)
+            }
+            BrokerError::IntroductionExpired => Some(BrokerAdmissionRefusal::IntroductionExpired),
+            BrokerError::IntroductionCredentialUnnamed => {
+                Some(BrokerAdmissionRefusal::IntroductionCredentialUnnamed)
+            }
+            _ => None,
+        };
+        match refusal {
+            Some(refusal) => refusal.with_platform(error),
+            None => CompositionError::Recovery(error),
+        }
     }
 
     /// Proves, before any authenticated broker operation, that the protected

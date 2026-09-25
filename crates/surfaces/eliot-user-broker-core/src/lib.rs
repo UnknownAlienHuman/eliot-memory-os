@@ -284,6 +284,22 @@ fn validate_no_disclosed_secret(approved: &ApprovedLaunch) -> Result<(), BrokerE
         || approved
             .dependency_closure
             .iter()
+            .any(|value| carries_marker(value.as_str()))
+        // The introduction is scope and audience: it is published into the
+        // grant digest, the durable operation cursor, and every diagnostic
+        // the broker projects. Secret material in any of its scope fields is
+        // a disclosure of exactly the same class as a secret in argv.
+        || carries_marker(&approved.introduction.resource_ref)
+        || carries_marker(&approved.introduction.facet_manifest_ref)
+        || approved
+            .introduction
+            .introduced_operation_set
+            .iter()
+            .any(|value| carries_marker(value.as_str()))
+        || approved
+            .introduction
+            .introduced_resource_set
+            .iter()
             .any(|value| carries_marker(value.as_str()));
     if disclosed {
         return Err(BrokerError::CredentialMaterialDisclosed(
@@ -443,6 +459,153 @@ pub struct RegistrationFenceReceipt {
     pub status: RegistrationStatus,
 }
 
+/// Principal-bound credential lease introduced for one admitted child
+/// (I6.15 `CredentialUseBinding`, narrowed to the fields this broker
+/// admission boundary must enforce).
+///
+/// Only the opaque provider/key handle crosses this boundary: no secret
+/// material is present, is derivable here, or is forwarded to the child
+/// environment. `expires_at` is the binding's own deadline and may never
+/// outlive the introduction that names it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialBinding {
+    /// Opaque provider/key handle resolved by the child's own crypto port.
+    pub handle: SecretRef,
+    /// Absolute expiry of this binding, in Unix milliseconds.
+    pub expires_at: u64,
+}
+
+/// The exact user-session resource a grant introduces to one admitted child.
+///
+/// This is I6.15's `CapabilityIntroduction` reduced to the fields a broker
+/// admission boundary can actually enforce: the opaque resource reference,
+/// the facet manifest the introduction is limited to, the operation and
+/// resource scope it covers, the effect ceiling it may reach, its own
+/// issue/expiry window and use budget, and the credential lease it names.
+/// The issuer is Kernel/Governor — this type grants nothing. Its whole
+/// purpose is to make "a grant must not introduce a resource it does not
+/// name" a checkable comparison instead of a carried-along string.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceIntroduction {
+    /// Opaque, non-revealing reference presented to the child. I6.15: an
+    /// agent sees "an opaque `ResourceRef`, not a broad reusable path
+    /// grant", so a path-shaped or drive-shaped value is refused here
+    /// rather than forwarded as one.
+    pub resource_ref: String,
+    /// Exact facet manifest identity this introduction is limited to.
+    pub facet_manifest_ref: String,
+    /// Operations this introduction may be used for.
+    pub introduced_operation_set: Vec<String>,
+    /// User-session resource roots this introduction may reach.
+    pub introduced_resource_set: Vec<String>,
+    /// Highest effect this introduction may produce.
+    pub max_effect: EffectCeiling,
+    /// Absolute issue instant of this introduction, in Unix milliseconds.
+    pub issued_at: u64,
+    /// Absolute expiry of this introduction, in Unix milliseconds.
+    pub expires_at: u64,
+    /// Use budget of this introduction. Zero is not a usable budget.
+    pub max_calls: u32,
+    /// The principal-bound credential lease, when one is introduced.
+    pub credential_binding: Option<CredentialBinding>,
+}
+
+impl ResourceIntroduction {
+    fn validate(&self) -> Result<(), BrokerError> {
+        text(&self.resource_ref, "introduction.resource_ref")?;
+        if self.resource_ref.contains(['/', '\\', ':', '*', '?']) {
+            return Err(BrokerError::InvalidField("introduction.resource_ref"));
+        }
+        text(&self.facet_manifest_ref, "introduction.facet_manifest_ref")?;
+        if self.introduced_operation_set.is_empty() {
+            return Err(BrokerError::IntroductionRequired(
+                "introduced_operation_set",
+            ));
+        }
+        unique(&self.introduced_operation_set, "introduced_operation_set")?;
+        if self.introduced_resource_set.is_empty() {
+            return Err(BrokerError::IntroductionRequired("introduced_resource_set"));
+        }
+        unique(&self.introduced_resource_set, "introduced_resource_set")?;
+        if self.max_calls == 0 || self.issued_at == 0 || self.expires_at <= self.issued_at {
+            return Err(BrokerError::InvalidField("introduction_window"));
+        }
+        if let Some(binding) = &self.credential_binding
+            && (binding.expires_at == 0
+                || binding.expires_at > self.expires_at
+                || binding.expires_at <= self.issued_at)
+        {
+            return Err(BrokerError::InvalidField("credential_binding.expires_at"));
+        }
+        Ok(())
+    }
+
+    /// Returns the rank of one effect ceiling, from least to most authority.
+    ///
+    /// `NoExternalEffect` is the narrowest ceiling, so a request for a
+    /// narrower ceiling than the introduction allows is admitted and a
+    /// request for a wider one is not.
+    const fn effect_rank(ceiling: EffectCeiling) -> u8 {
+        match ceiling {
+            EffectCeiling::ReadOnly => 0,
+            EffectCeiling::CandidateOnly => 1,
+            EffectCeiling::NoExternalEffect => 2,
+        }
+    }
+
+    /// Compares one launch request against what this introduction names.
+    ///
+    /// Every comparison is exact: the tool must be an introduced operation,
+    /// the resource root must be an introduced resource, the requested
+    /// effect must fit under the introduced ceiling, the introduction must
+    /// be active at the observation instant, and the credential lease the
+    /// launch carries must be exactly the lease the introduction names.
+    /// A request that reaches past any of those is refused with its own
+    /// typed reason (I6.15: a missing exact resource facet returns
+    /// `CAPABILITY_INTRODUCTION_REQUIRED`, and neither that condition nor a
+    /// revoked supporting grant is translated into a generic tool failure or
+    /// a silently widened introduction).
+    fn admits(&self, approved: &ApprovedLaunch, observed_at: u64) -> Result<(), BrokerError> {
+        self.validate()?;
+        if !self
+            .introduced_operation_set
+            .iter()
+            .any(|operation| *operation == approved.tool)
+        {
+            return Err(BrokerError::IntroductionOperationNotGranted);
+        }
+        if !self
+            .introduced_resource_set
+            .iter()
+            .any(|resource| *resource == approved.root)
+        {
+            return Err(BrokerError::IntroductionResourceNotGranted);
+        }
+        if Self::effect_rank(approved.effect_ceiling) > Self::effect_rank(self.max_effect) {
+            return Err(BrokerError::IntroductionEffectCeilingExceeded);
+        }
+        if observed_at < self.issued_at || observed_at >= self.expires_at {
+            return Err(BrokerError::IntroductionExpired);
+        }
+        match (&self.credential_binding, &approved.credential_handle) {
+            (Some(binding), Some(handle)) if binding.handle == *handle => {}
+            (None, None) => {}
+            // A grant that carries a credential the introduction does not
+            // name, or names a credential the launch does not carry, is a
+            // scope mismatch — never a silent pass.
+            _ => return Err(BrokerError::IntroductionCredentialUnnamed),
+        }
+        if let Some(binding) = &self.credential_binding
+            && observed_at >= binding.expires_at
+        {
+            return Err(BrokerError::IntroductionExpired);
+        }
+        Ok(())
+    }
+}
+
 /// The exact approved launch projection.  Credential material is never present.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -465,7 +628,13 @@ pub struct ApprovedLaunch {
     pub root: String,
     pub effect_ceiling: EffectCeiling,
     pub tool: String,
+    /// The opaque credential handle the launch requests. It is meaningful
+    /// only when the grant's [`ResourceIntroduction`] names exactly this
+    /// handle; a request that carries a credential its introduction does
+    /// not name is refused.
     pub credential_handle: Option<SecretRef>,
+    /// The exact user-session resource this launch introduces.
+    pub introduction: ResourceIntroduction,
     pub dependency_closure: Vec<String>,
     pub idempotency_key: String,
     pub generation: Generation,
@@ -496,6 +665,9 @@ impl LaunchRequest {
         text(&self.approved.idempotency_key, "idempotency_key")?;
         text(&self.approved.process_fence_nonce, "process_fence_nonce")?;
         validate_no_disclosed_secret(&self.approved)?;
+        self.approved
+            .introduction
+            .admits(&self.approved, self.observed_at)?;
         if self.approved.executable.contains('*')
             || self.approved.executable.contains('?')
             || self.approved.root.contains('*')
@@ -860,6 +1032,46 @@ pub struct BrokerSnapshot {
     /// Kernel call can mint.
     #[serde(default)]
     pub operation_identities: Vec<IssuedOperationIdentity>,
+    /// Durable tombstones of operations fenced by a newer broker generation.
+    ///
+    /// A new `UserBrokerEpoch` fences the previous registration, so its live
+    /// cursors stop being this broker's lineage. They are retired here
+    /// rather than discarded: an `operation_id` that was already spent is
+    /// the only thing that stops an exact replay of the same launch request
+    /// from starting a *second* process for the same operation under the
+    /// new generation. `#[serde(default)]` is the versioned additive
+    /// migration — a snapshot written before this ledger existed has no
+    /// tombstones, which is read as "nothing was retired", never as a
+    /// licence to reuse an id.
+    #[serde(default)]
+    pub retired_operations: Vec<RetiredOperationIdentity>,
+}
+
+/// One operation identity fenced by a newer broker generation.
+///
+/// This is a tombstone, not a permit: it grants nothing and admits nothing.
+/// It records that a specific `operation_id` already carried an effect under
+/// a registration that a later generation fenced, so a replay of that exact
+/// request is a typed conflict instead of a second effect.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetiredOperationIdentity {
+    /// The spent operation identity.
+    pub operation_id: OperationId,
+    /// Canonical digest of the exact request it carried.
+    pub request_digest: String,
+    /// Registration digest of the generation that spent it.
+    pub registration_digest: String,
+    /// Broker-local generation that spent it.
+    pub user_broker_epoch: u64,
+    /// The user-session resource/credential that generation introduced. It
+    /// is retained so a later audit can prove which introduction was closed
+    /// by the fence rather than infer it. `#[serde(default)]` is the versioned
+    /// additive migration for a tombstone written before this field existed.
+    #[serde(default)]
+    pub introduction: Option<ResourceIntroduction>,
+    /// State the operation held when its generation was fenced.
+    pub state: OperationState,
 }
 
 /// Which broker-owned Kernel operation currently has an unproven outcome
@@ -908,6 +1120,16 @@ pub struct OperationCursor {
     pub generation: Generation,
     pub process_fence_nonce: String,
     pub process_request_digest: String,
+    /// The exact user-session resource/credential this operation introduced.
+    ///
+    /// `#[serde(default)]` is the versioned additive migration: a cursor
+    /// written before introductions were retained has no binding. `None` is
+    /// read as *this operation introduced nothing the broker still owns*,
+    /// never as permission to introduce anything; the child it started
+    /// belonged to a process that is gone, and its introduction is closed
+    /// with that process.
+    #[serde(default)]
+    pub introduction: Option<ResourceIntroduction>,
     pub state: OperationState,
 }
 
@@ -932,6 +1154,9 @@ impl OperationCursor {
             return Err(BrokerError::InvalidField("operation_cursor"));
         }
         text(&self.process_fence_nonce, "process_fence_nonce")?;
+        if let Some(introduction) = &self.introduction {
+            introduction.validate()?;
+        }
         Ok(())
     }
 }
@@ -1027,6 +1252,7 @@ pub struct UserBroker {
     registration_reconciled: bool,
     broker_epoch: u64,
     operations: BTreeMap<String, OperationRecord>,
+    retired_operations: BTreeMap<String, RetiredOperationIdentity>,
     issued_operations: BTreeMap<String, IssuedOperationIdentity>,
     lost_operation: Option<LostOperation>,
 }
@@ -1047,6 +1273,7 @@ impl UserBroker {
             registration_reconciled: false,
             broker_epoch: 0,
             operations: BTreeMap::new(),
+            retired_operations: BTreeMap::new(),
             issued_operations: BTreeMap::new(),
             lost_operation: None,
         }
@@ -1138,6 +1365,7 @@ impl UserBroker {
             }
         }
         self.issued_operations = issued_operations;
+        self.retired_operations = retired_index(snapshot.retired_operations)?;
         let Some(registration) = self.registration.as_ref() else {
             if snapshot.operation_cursors.is_empty() {
                 self.operations.clear();
@@ -1165,6 +1393,12 @@ impl UserBroker {
             }
             if !operation_ids.insert(cursor.operation_id.clone()) {
                 return Err(BrokerError::Duplicate("operation_cursor.operation_id"));
+            }
+            if self
+                .retired_operations
+                .contains_key(cursor.operation_id.as_str())
+            {
+                return Err(BrokerError::Duplicate("retired_operation.operation_id"));
             }
             let permit = permit_from_cursor(&cursor);
             if operations
@@ -1246,11 +1480,25 @@ impl UserBroker {
             return Err(BrokerError::StaleEpoch);
         }
         self.broker_epoch = sealed.user_broker_epoch;
-        // A new broker generation fences the previous one: every operation
-        // cursor admitted under the old registration is no longer this
-        // broker's live lineage, so it is dropped instead of being inherited
-        // by the new generation (I1.4: processes from an old broker epoch
-        // cannot receive new effect authority).
+        // A new broker generation fences the previous one, so the previous
+        // generation's operations stop being this broker's live lineage
+        // (I1.4: processes from an old broker epoch cannot receive new
+        // effect authority). They are *retired*, not discarded: the spent
+        // `operation_id` is the only durable proof that stops an exact
+        // replay of the same launch request from starting a second process
+        // for the same operation under this new generation.
+        for record in self.operations.values() {
+            let retired = RetiredOperationIdentity {
+                operation_id: record.cursor.operation_id.clone(),
+                request_digest: record.cursor.request_digest.clone(),
+                registration_digest: record.cursor.registration_digest.clone(),
+                user_broker_epoch: record.cursor.user_broker_epoch,
+                introduction: record.cursor.introduction.clone(),
+                state: record.cursor.state,
+            };
+            self.retired_operations
+                .insert(retired.operation_id.as_str().to_owned(), retired);
+        }
         self.operations.clear();
         self.registration = Some(sealed.clone());
         self.registration_reconciled = true;
@@ -1345,6 +1593,21 @@ impl UserBroker {
                 return Ok(receipt.clone());
             }
             return Err(BrokerError::UnknownOutcome);
+        }
+        // An `operation_id` already spent under a fenced generation is never
+        // reused, whatever the caller replays. Without this tombstone an
+        // exact replay of the same request under a new registration would
+        // prepare and start a *second* process for one operation identity,
+        // including for an operation whose outcome was never proven.
+        if let Some(retired) = self
+            .retired_operations
+            .get(request.approved.operation_id.as_str())
+        {
+            return Err(if retired.request_digest == request_digest {
+                BrokerError::RetiredOperation(retired.operation_id.clone())
+            } else {
+                BrokerError::OperationIdRetired(retired.operation_id.clone())
+            });
         }
         let grant = self
             .authority
@@ -1478,16 +1741,25 @@ impl UserBroker {
     /// Cancels a previously admitted operation by its broker-issued public
     /// operation identity.  The private one-shot permit remains broker-owned;
     /// stdin/UI callers cannot manufacture or widen it.
+    ///
+    /// An operation whose outcome is not yet proven is refused here, at the
+    /// single site that performs the effect, so cancellation can never erase
+    /// a possibly committed external effect. The refusal is structural
+    /// rather than conventional: it does not depend on a caller having
+    /// remembered to reconcile first.
     pub fn cancel_operation(
         &mut self,
         operation_id: &OperationId,
     ) -> Result<CancellationReceipt, BrokerError> {
-        let permit = self
+        let record = self
             .operations
             .values()
             .find(|record| record.permit.operation_id == *operation_id)
-            .map(|record| record.permit.clone())
             .ok_or(BrokerError::OperationNotFound)?;
+        if record.cursor.state == OperationState::Unknown {
+            return Err(BrokerError::UnreconciledEffect(operation_id.clone()));
+        }
+        let permit = record.permit.clone();
         self.cancel(&permit)
     }
 
@@ -1570,6 +1842,12 @@ impl UserBroker {
     ) -> Result<(), BrokerError> {
         let current = self.active_registration(observed_at)?.clone();
         self.require_admitted_registration(&current)?;
+        // A target whose generation was fenced is named as retired rather
+        // than reported as merely absent, so a caller replaying an old
+        // cancellation learns it is a fenced identity, not a typo.
+        if self.retired_operations.contains_key(target.as_str()) {
+            return Err(BrokerError::OperationIdRetired(target.clone()));
+        }
         let record = self
             .operations
             .values()
@@ -1737,7 +2015,13 @@ impl UserBroker {
             if let Some(registration) = &mut self.registration {
                 registration.status = RegistrationStatus::Closed;
             }
+            // Lease loss is a revocation: it closes every handle and child
+            // the registration still owns, exactly as a terminal close does.
+            // Reporting only the expiry while owned children keep running
+            // would leave a live lineage with no authority behind it.
+            let released = self.release_owned_operations();
             self.persist()?;
+            released?;
             return Err(BrokerError::LeaseExpired);
         }
         self.registration
@@ -1817,13 +2101,16 @@ impl UserBroker {
         }
     }
 
-    /// Closes every child process this registration still owns and drops its
-    /// durable cursors, so a revoked, fenced, or lease-expired registration
-    /// leaves no live lineage and nothing a restart could re-adopt.
+    /// Closes every child process this registration still owns, drops the
+    /// introduced user-session resources those children held, and removes
+    /// their durable cursors, so a revoked, fenced, or lease-expired
+    /// registration leaves no live lineage and nothing a restart could
+    /// re-adopt.
     ///
     /// A child that cannot be closed is reported as a typed refusal naming the
-    /// exact operation, and its cursor is *retained*: reporting a clean close
-    /// while a child may still run is exactly the "termination was assumed"
+    /// exact operation, and its cursor and introduced binding are *retained*:
+    /// reporting a clean close while a child may still run, still holding an
+    /// introduced credential, is exactly the "termination was assumed"
     /// shortcut the containment matrix forbids.
     fn release_owned_operations(&mut self) -> Result<(), BrokerError> {
         let mut retained = Vec::new();
@@ -1961,6 +2248,7 @@ impl UserBroker {
                 .map(|record| record.cursor.clone())
                 .collect(),
             operation_identities: self.projected_operation_identities(),
+            retired_operations: self.retired_operations.values().cloned().collect(),
         }
     }
 
@@ -2141,6 +2429,10 @@ fn validate_launch_grant(
         || grant.proof_ceiling != ProofCeiling::Observation
         || grant.expires_at <= request.observed_at
         || grant.expires_at > request.lease_expires_at
+        // A grant may never outlive the introduction it carries: an
+        // authorization that stays valid after its own user-session
+        // resource/credential lease has ended is a silent widening.
+        || grant.expires_at > grant.approved.introduction.expires_at
     {
         return Err(BrokerError::GrantBindingMismatch);
     }
@@ -2196,8 +2488,48 @@ fn cursor_from_grant(
         generation: grant.approved.generation,
         process_fence_nonce: grant.approved.process_fence_nonce.clone(),
         process_request_digest: process_request_digest.to_owned(),
+        // The introduced user-session resource/credential is retained with
+        // the operation so revocation and restart reconciliation name the
+        // exact thing that was introduced, instead of only the child id.
+        introduction: Some(grant.approved.introduction.clone()),
         state,
     }
+}
+
+/// Builds the in-memory index of operations already fenced by a newer broker
+/// generation, validating every tombstone before any index is touched.
+///
+/// A tombstone is a refusal marker, not a permit, so a malformed or
+/// duplicated one is a corrupt durable file and is rejected before it can
+/// partially bind an operation id.
+fn retired_index(
+    rows: Vec<RetiredOperationIdentity>,
+) -> Result<BTreeMap<String, RetiredOperationIdentity>, BrokerError> {
+    let mut retired_operations = BTreeMap::new();
+    for retired in rows {
+        text(
+            retired.operation_id.as_str(),
+            "retired_operation.operation_id",
+        )?;
+        text(&retired.request_digest, "retired_operation.request_digest")?;
+        text(
+            &retired.registration_digest,
+            "retired_operation.registration_digest",
+        )?;
+        if retired.user_broker_epoch == 0 {
+            return Err(BrokerError::InvalidField("retired_operation"));
+        }
+        if let Some(introduction) = &retired.introduction {
+            introduction.validate()?;
+        }
+        if retired_operations
+            .insert(retired.operation_id.as_str().to_owned(), retired)
+            .is_some()
+        {
+            return Err(BrokerError::Duplicate("retired_operation.operation_id"));
+        }
+    }
+    Ok(retired_operations)
 }
 
 fn permit_from_cursor(cursor: &OperationCursor) -> OperationPermit {
@@ -2269,8 +2601,24 @@ pub enum BrokerError {
     StaleRegistrationIdentity,
     #[error("credential or secret material is disclosed in {0}")]
     CredentialMaterialDisclosed(&'static str),
+    #[error("the grant introduces no {0} for this launch")]
+    IntroductionRequired(&'static str),
+    #[error("the launch's tool is not in the introduced operation set")]
+    IntroductionOperationNotGranted,
+    #[error("the launch's resource root is not in the introduced resource set")]
+    IntroductionResourceNotGranted,
+    #[error("the launch's effect ceiling exceeds the introduced ceiling")]
+    IntroductionEffectCeilingExceeded,
+    #[error("the introduced resource or credential lease is not active")]
+    IntroductionExpired,
+    #[error("the launch's credential is not the one its introduction names")]
+    IntroductionCredentialUnnamed,
     #[error("operation {} has an unreconciled outcome and must be reconciled before cancellation", .0.as_str())]
     UnreconciledEffect(OperationId),
+    #[error("operation {} was already spent under a fenced broker generation and cannot be replayed", .0.as_str())]
+    RetiredOperation(OperationId),
+    #[error("operation id {} was already spent under a fenced broker generation and cannot be reused", .0.as_str())]
+    OperationIdRetired(OperationId),
     #[error("owned operation {} was not closed", .0.as_str())]
     OwnedOperationNotClosed(OperationId),
     #[error("process contract binding mismatch")]
@@ -3003,6 +3351,20 @@ mod tests {
             credential_handle: Some(
                 SecretRef::new("credential-provider", "handle-1").expect("secret ref"),
             ),
+            introduction: ResourceIntroduction {
+                resource_ref: "resource-ref-1".to_owned(),
+                facet_manifest_ref: "facet-manifest-1".to_owned(),
+                introduced_operation_set: vec!["tool-1".to_owned()],
+                introduced_resource_set: vec!["C:\\Eliot".to_owned()],
+                max_effect: EffectCeiling::NoExternalEffect,
+                issued_at: 10,
+                expires_at: 19,
+                max_calls: 1,
+                credential_binding: Some(CredentialBinding {
+                    handle: SecretRef::new("credential-provider", "handle-1").expect("secret ref"),
+                    expires_at: 19,
+                }),
+            },
             dependency_closure: vec!["dep-1".to_owned()],
             idempotency_key: "idem-1".to_owned(),
             generation: Generation::new(1).expect("generation"),
@@ -3140,6 +3502,7 @@ mod tests {
             user_broker_epoch: first.broker_epoch,
             operation_cursors: Vec::new(),
             operation_identities: Vec::new(),
+            retired_operations: Vec::new(),
         };
         let registration_digest = snapshot
             .registration
@@ -3331,6 +3694,7 @@ mod tests {
                 user_broker_epoch: 0,
                 operation_cursors: Vec::new(),
                 operation_identities: Vec::new(),
+                retired_operations: Vec::new(),
             })
             .expect("seed");
         let mut restarted = UserBroker::new(
@@ -3492,6 +3856,7 @@ mod tests {
                 .map(|record| record.cursor.clone())
                 .collect(),
             operation_identities: broker.projected_operation_identities(),
+            retired_operations: broker.retired_operations.values().cloned().collect(),
         };
         let expected_cursor = snapshot.operation_cursors.first().expect("cursor").clone();
         assert_eq!(expected_cursor.operation_id, receipt.operation_id);
