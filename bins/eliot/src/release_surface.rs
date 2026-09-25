@@ -2725,20 +2725,39 @@ fn compare_observed_installation(
     compare_invalidation(collector, manifest, observed_at_unix_seconds);
 }
 
+/// One read-only observation of the accepted manifest bytes, taken before and
+/// after the comparison.
+///
+/// The before/after pair, the recomputed surface digest and the self-integrity
+/// verdict all describe the same single read of the accepted document, so they
+/// travel together: a report can only ever state byte stability and digest
+/// agreement as one observation, never as independently chosen values. The
+/// `after` read happens after every comparison has run, which is what makes
+/// `bytes_unchanged` evidence that the verifier wrote nothing.
+struct ManifestByteObservation<'a> {
+    before: &'a [u8],
+    after: &'a [u8],
+    recomputed_surface_digest: &'a str,
+    self_digest_verified: bool,
+}
+
+impl ManifestByteObservation<'_> {
+    fn bytes_unchanged(&self) -> bool {
+        self.before == self.after
+    }
+}
+
 /// Phase three: aggregate the collected findings into the terminal read-only
 /// report.
 ///
 /// Aggregation only. It derives per-verdict counts and the drift disposition
-/// from the typed findings and records both manifest observations; it never
+/// from the typed findings and records the manifest byte observation; it never
 /// re-derives a verdict, and it holds no write path to the accepted bytes.
 fn build_drift_report(
     manifest: &ReleaseSurfaceManifest,
     findings: Vec<ReleaseSurfaceFinding>,
     manifest_path: &Path,
-    before: &[u8],
-    after: &[u8],
-    recomputed_surface_digest: &str,
-    self_digest_verified: bool,
+    observation: &ManifestByteObservation<'_>,
     observed_at_unix_seconds: i64,
 ) -> ReleaseSurfaceDriftReport {
     let mut counts = ReleaseSurfaceVerdictCounts::default();
@@ -2760,11 +2779,11 @@ fn build_drift_report(
         contract: DRIFT_REPORT_CONTRACT.to_owned(),
         contract_version: DRIFT_REPORT_CONTRACT_VERSION.to_owned(),
         manifest_path: manifest_path.display().to_string(),
-        manifest_sha256_before: sha256_hex(before),
-        manifest_sha256_after: sha256_hex(after),
-        manifest_bytes_unchanged: before == after,
-        manifest_self_digest_verified: self_digest_verified,
-        surface_digest: recomputed_surface_digest.to_owned(),
+        manifest_sha256_before: sha256_hex(observation.before),
+        manifest_sha256_after: sha256_hex(observation.after),
+        manifest_bytes_unchanged: observation.bytes_unchanged(),
+        manifest_self_digest_verified: observation.self_digest_verified,
+        surface_digest: observation.recomputed_surface_digest.to_owned(),
         release_id: manifest.release_id.clone(),
         generation: manifest
             .product_and_source_identity
@@ -2811,14 +2830,17 @@ pub fn verify_release_surface(
     );
 
     let after = read_bounded(manifest_path, "manifest", MAX_MANIFEST_BYTES)?;
+    let observation = ManifestByteObservation {
+        before: &before,
+        after: &after,
+        recomputed_surface_digest: &recomputed,
+        self_digest_verified,
+    };
     Ok(build_drift_report(
         &manifest,
         collector.into_sorted_findings(),
         manifest_path,
-        &before,
-        &after,
-        &recomputed,
-        self_digest_verified,
+        &observation,
         observed_at_unix_seconds,
     ))
 }
