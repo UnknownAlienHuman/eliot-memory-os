@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use eliot_notify::NotifyLaunchRequestReference;
 use eliot_platform::ClockObservation;
 use eliot_platform::WorkScopePath;
 use eliot_platform_windows::{ProtectedPathLease, WindowsPlatform};
@@ -47,6 +48,7 @@ use thiserror::Error;
 mod kernel_authority_port;
 mod notify_fallback_ensure;
 pub mod notify_launch_callin;
+pub mod notify_request_channel;
 mod operation_identity;
 mod protected_launch_config;
 use kernel_authority_port::KernelAuthorityPort;
@@ -59,6 +61,7 @@ pub use notify_launch_callin::{
     admit_notify_request, request_names_notify_image, resolve_broker_notify_launch,
     stage_normal_notify_launch,
 };
+pub use notify_request_channel::{NotifyRequestChannelError, build_notify_request_channel};
 use operation_identity::{
     BrokerOperation, DurableIssuedIdentity, IssuerHandle, OperationIdentityIssuer,
 };
@@ -1201,7 +1204,7 @@ impl BrokerComposition {
     /// This is the ONLY dispatcher that may start `eliot-notify.exe`, and it is
     /// notify-specific on purpose (I11.6:3, "Normal delivery is launched
     /// through the authorized User Broker"). Before anything is dispatched the
-    /// request must satisfy three independent gates:
+    /// request must satisfy four independent gates:
     ///
     /// 1. the protected launch lease still verifies and the registration is
     ///    heartbeated, so a revoked or expired broker cannot spawn;
@@ -1210,24 +1213,50 @@ impl BrokerComposition {
     ///    broker's authenticated SID/session plus the Kernel-issued
     ///    registration digest;
     /// 3. the request names exactly that executable path and its artifact
-    ///    digest equals the digest of the bytes this broker observed.
+    ///    digest equals the digest of the bytes this broker observed;
+    /// 4. the broker has itself built the notify request channel on the grant:
+    ///    exactly `NOTIFY_REQUEST_ARGUMENT` plus one single-line canonical
+    ///    request reference, proved by the binding owner and within the platform
+    ///    launch-line cap. A request that arrives with caller-selected child
+    ///    arguments is refused rather than overruled.
+    ///
+    /// The channel is installed BEFORE the launch is dispatched, so the argv the
+    /// broker built is the argv the G-01 authority provider approves and the
+    /// durable operation digest covers — it is not a post-hoc rewrite of an
+    /// approved launch.
     ///
     /// Only then is the request dispatched on the existing authority/process
     /// ports, which apply the Kernel grant. A generic `Launch` request naming
     /// the notify image is refused by the binary before reaching here (see
     /// [`request_names_notify_image`]), so no other request shape can produce a
     /// normal notification invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::Launch`] when the launch lease does not
+    /// verify, when the notify request channel cannot be built
+    /// ([`NotifyRequestChannelError`]), or when the notify-specific admission
+    /// rejects the grant it is about to dispatch.
     pub fn launch_notify(
         &mut self,
-        request: LaunchRequest,
+        mut request: LaunchRequest,
+        reference: &NotifyLaunchRequestReference,
     ) -> Result<eliot_user_broker_core::LaunchReceipt, CompositionError> {
         self.verify_launch_lease()?;
+        // The broker is the argv authority for the notification adapter, so the
+        // channel is produced here from the canonical reference this call just
+        // proved — never relayed from the caller's own bytes.
+        request.approved.argv =
+            build_notify_request_channel(&request, reference).map_err(|error| {
+                CompositionError::Launch(format!("notify launch rejected: {}", error.code()))
+            })?;
         notify_launch_callin::admit_notify_request(&self.notify_launch, &request).map_err(
             |error| CompositionError::Launch(format!("notify launch rejected: {}", error.code())),
         )?;
         // The dispatch itself is the existing generic authority/process path,
         // so the Kernel grant, operation identity, and fencing stay exactly
-        // where they are; only the admission above is notify-specific.
+        // where they are; only the argv and the admission above are
+        // notify-specific.
         self.launch(request)
     }
 

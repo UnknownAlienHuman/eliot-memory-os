@@ -99,7 +99,12 @@ pub const NOTIFY_REQUEST_ARGUMENT: &str = "--notify-request";
 /// here is the channel, not the request: this is the same envelope and the same
 /// canonical request every other admitted caller supplies, and it is verified
 /// against the same G-08/A-08/ledger path.
-#[derive(Clone, Debug, Deserialize)]
+///
+/// `Serialize` is the mirror of the child-side `Deserialize`: the authorized
+/// broker that produces the launch argv emits the encoding of a value it has
+/// already proved, so the wire shape has exactly one producer and one consumer
+/// and the broker never forwards caller bytes.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotifyLaunchRequestReference {
     /// The exact canonical notification request the launch names.
@@ -1708,6 +1713,7 @@ pub mod installed_binary;
 pub mod no_session_persist;
 pub mod notify_declaration;
 pub mod notify_launch;
+pub mod notify_request_channel;
 pub mod operation_identity;
 pub mod quiet_hours;
 #[cfg(test)]
@@ -1725,6 +1731,7 @@ pub use notify_declaration::{
     render_notify_fallback_declaration,
 };
 pub use notify_launch::{NotifyLaunchError, VerifiedNotifyLaunch, resolve_notify_launch_inputs};
+pub use notify_request_channel::{NotifyRequestChannelError, notify_request_arguments};
 
 /// Records a no-session/control-loss observation, then builds the fail-closed
 /// fallback error. Adapter loss degrades delivery only; canonical state is

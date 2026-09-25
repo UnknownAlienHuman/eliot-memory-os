@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+use eliot_notify::NotifyLaunchRequestReference;
 use eliot_process::OperationId;
 use eliot_user_broker::{
     BrokerComposition, BrokerConfig, canonical_root, request_names_notify_image,
@@ -31,8 +32,15 @@ enum Request {
     /// Per-notification spawn of the canonical installed `eliot-notify.exe` on
     /// a Kernel-authorized grant. This is the ONLY operation that can start the
     /// notification adapter: the generic `Launch` operation refuses that image.
+    ///
+    /// The caller supplies owner-issued canonical values only — the approved
+    /// launch and the canonical request reference it acts on. It does not
+    /// supply the child's argv: the broker builds the notify request channel
+    /// from the reference it just proved, and refuses a request that carries
+    /// caller-selected child arguments.
     NotifyLaunch {
         request: LaunchRequest,
+        reference: NotifyLaunchRequestReference,
     },
     Cancel {
         operation_id: OperationId,
@@ -279,7 +287,9 @@ fn dispatch(
             }
             dispatch_launch(composition.launch(request))
         }
-        Request::NotifyLaunch { request } => dispatch_launch(composition.launch_notify(request)),
+        Request::NotifyLaunch { request, reference } => {
+            dispatch_launch(composition.launch_notify(request, &reference))
+        }
         Request::Cancel { operation_id } => composition.cancel(&operation_id).map_or_else(
             |error| composition_rejection(&error),
             |receipt| Message::Cancelled {
