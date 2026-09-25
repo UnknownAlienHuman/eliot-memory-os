@@ -1260,7 +1260,25 @@ impl AgentCoordinator {
         if self.result_by_attempt.contains_key(&current.attempt_id) {
             return Err(CoordinatorError::DuplicateResult);
         }
-        if current.state != CoordinatedAttemptState::Running {
+        // Cancellation authority gate (issue #370 A12): `CancelledObserved`
+        // is an observation requiring owned cancellation authority, never
+        // cancellation authority itself. A `Running` attempt with no recorded
+        // cancellation request cannot yield a cancellation observation; after
+        // `request_cancellation` the attempt admits only the cancellation
+        // observation, never a fresh candidate outcome.
+        let cancellation_observed =
+            submission.result.disposition == ResultDisposition::CancelledObserved;
+        if current.state == CoordinatedAttemptState::CancellationRequested && !cancellation_observed
+        {
+            return Err(CoordinatorError::InvalidAttemptState(current.state));
+        }
+        if current.state != CoordinatedAttemptState::Running
+            && current.state != CoordinatedAttemptState::CancellationRequested
+        {
+            return Err(CoordinatorError::InvalidAttemptState(current.state));
+        }
+        if cancellation_observed && current.state != CoordinatedAttemptState::CancellationRequested
+        {
             return Err(CoordinatorError::InvalidAttemptState(current.state));
         }
         let work_unit = self.work_unit_for(&current)?;
@@ -1285,8 +1303,15 @@ impl AgentCoordinator {
         // disposition never overrides the embedded physical execution axis;
         // `result_by_attempt` below preserves the submission linkage the
         // `reconcile_unknown_outcome` leg requires. Only observed execution
-        // releases the writer or settles terminally.
-        let next_state = if retains_ownership_on_unknown_execution(&submission.result) {
+        // releases the writer or settles terminally. An authority-gated
+        // cancellation observation (issue #370 A12) likewise retains
+        // ownership: the state stays `CancellationRequested` until
+        // `reconcile_cancellation` completes with the provider reconciliation
+        // receipt, so the observation links for the descendant projection
+        // without settling anything terminally.
+        let next_state = if current.state == CoordinatedAttemptState::CancellationRequested {
+            CoordinatedAttemptState::CancellationRequested
+        } else if retains_ownership_on_unknown_execution(&submission.result) {
             CoordinatedAttemptState::UnknownOutcome
         } else {
             self.release_writer(&current);
