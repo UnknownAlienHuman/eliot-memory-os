@@ -12,11 +12,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{EpochId, OperationId, ResourceGeneration, StateFence};
+use eliot_contracts::{EpochId, ResourceGeneration, StateFence};
 use eliot_governor::{
-    CompositionError, CompositionReadiness, FinishAttemptDraft, FinishAttemptError,
-    FinishDecisionReceipt, GovernorActivationOutcome, GovernorComposition, GovernorLaunchConfig,
-    KernelGenerationPort, KernelGenerationSnapshotProvider, QueueLimits,
+    CompositionError, CompositionReadiness, FinishAttemptError, GovernorActivationOutcome,
+    GovernorComposition, GovernorLaunchConfig, KernelGenerationPort,
+    KernelGenerationSnapshotProvider, QueueLimits,
 };
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
@@ -771,61 +771,58 @@ impl DaemonComposition {
         self.committed_experience.insert(idempotency_key, receipt);
     }
 
-    /// Submits one candidate finish through the Governor owner, commits the
-    /// derived decision through the canonical `RecordFinishDecision` path,
-    /// and rehydrates the daemon projection before returning the decision
-    /// receipt. The caller supplies only a candidate draft; task completion,
-    /// evidence binding, and persistence remain Governor/Canonical-owned.
-    ///
-    /// A committed receipt is preserved when the post-commit refresh cannot
-    /// publish the new projection. In that case the daemon is marked stale,
-    /// matching [`Self::commit_canonical_and_refresh`], and the receipt still
-    /// reports the durable operation rather than a false failure.
-    ///
-    /// (DELETED, #18 N3) `DaemonComposition::finish_attempt`.
-    ///
-    /// This composed one-shot submitted the evidence leg and the finish decision
-    /// inside a single `&mut self` borrow, exchanging twice against the Kernel
-    /// while the borrow was live. On the daemon side `&mut DaemonComposition` is
-    /// obtainable only through `SharedComposition::lock()`, so every caller would
-    /// have held a `tokio::sync::MutexGuard` across two Kernel round trips -
-    /// the exact defect N3 exists to remove. It could not be repaired in place:
-    /// a `&mut self` method cannot release the borrow around the exchange, and
-    /// the method has no Kernel client of its own to exchange through.
-    ///
-    /// It is removed rather than kept because it had no production caller after
-    /// the TestD owner drain went phase-split, and on this side of the boundary
-    /// a `&mut` finish helper is structurally a re-introduction of the defect.
-    ///
-    /// The replacement seam is the phase pair, which the drain already uses and
-    /// which needs no composition borrow at all while it exchanges:
-    /// `eliot_governor::GovernorComposition::prepare_finish_evidence`,
-    /// `::prepare_finish_decision` and `::accept_prepared_exchange`, exchanged
-    /// through `testd_terminal_completion::exchange_testd_owner_finish_leg`
-    /// with the composition lock released.
-    ///
-    /// (DELETED BODY — the closure-assessment observability record that followed
-    /// the decision is preserved on the phase path in
-    /// `testd_terminal_completion::plan_testd_terminal_owner_finish`.)
-    ///
-    /// The post-decision owner refresh that the deleted body also performed
-    /// (`refresh_from_kernel`, marking `view_stale` on failure) is now performed
-    /// by phase (3) of the drain through the Governor's own synchronous
-    /// `prepare_finish_decision`, which refreshes before the decision is
-    /// derived, so the dependent view is still invalidated on a failed refresh.
-    ///
-    /// (DOC PRESERVED FROM main, #1929.) This Finish owner entry had no
-    /// caller-presented readiness receipt, so the exact `TaskSelectionEvidence`
-    /// leg of issue #1929 runs at the composition-root write intake
-    /// ([`Self::commit_canonical_and_refresh`]) and again, from the proof
-    /// handles the transition actually carries, at the store gate. The finish
-    /// draft's own `task_id` + `expected_task_revision` are re-validated
-    /// against the canonical task owner by the Governor finish owner before
-    /// the commit; nothing on the phase path guesses a task. The same two legs
-    /// still run on the surviving path: `plan_testd_terminal_owner_fact`
-    /// prepares the fact through the Governor finish owner, and
-    /// `accept_prepared_exchange` re-checks the pre-commit fence before the
-    /// receipt is admitted.
+    // (DELETED, #18 N3) `DaemonComposition::finish_attempt`.
+    //
+    // Its own contract, for the record: it submitted one candidate finish
+    // through the Governor owner, committed the derived decision through the
+    // canonical `RecordFinishDecision` path, and rehydrated the daemon
+    // projection before returning the decision receipt. The caller supplied
+    // only a candidate draft; task completion, evidence binding and persistence
+    // remained Governor/Canonical-owned. A committed receipt was preserved when
+    // the post-commit refresh could not publish the new projection: the daemon
+    // was marked stale, matching `commit_canonical_and_refresh`, and the
+    // receipt still reported the durable operation rather than a false failure.
+    //
+    // This composed one-shot submitted the evidence leg and the finish decision
+    // inside a single `&mut self` borrow, exchanging twice against the Kernel
+    // while the borrow was live. On the daemon side `&mut DaemonComposition` is
+    // obtainable only through `SharedComposition::lock()`, so every caller would
+    // have held a `tokio::sync::MutexGuard` across two Kernel round trips -
+    // the exact defect N3 exists to remove. It could not be repaired in place:
+    // a `&mut self` method cannot release the borrow around the exchange, and
+    // the method has no Kernel client of its own to exchange through.
+    //
+    // It is removed rather than kept because it had no production caller after
+    // the TestD owner drain went phase-split, and on this side of that boundary
+    // a `&mut` finish helper is structurally a re-introduction of the defect.
+    //
+    // The replacement seam is the phase pair, which the drain already uses and
+    // which needs no composition borrow at all while it exchanges:
+    // `eliot_governor::GovernorComposition::prepare_finish_evidence`,
+    // `::prepare_finish_decision` and `::accept_prepared_exchange`, exchanged
+    // through `testd_terminal_completion::exchange_testd_owner_finish_leg`
+    // with the composition lock released.
+    //
+    // The closure-assessment observability record that followed the decision is
+    // preserved on the phase path in
+    // `testd_terminal_completion::plan_testd_terminal_owner_finish`. The
+    // post-decision owner refresh the deleted body also performed
+    // (`refresh_from_kernel`, marking `view_stale` on failure) is now performed
+    // by phase (3) of the drain through the Governor's own synchronous
+    // `prepare_finish_decision`, which refreshes before the decision is
+    // derived, so the dependent view is still invalidated on a failed refresh.
+    //
+    // Doc preserved from main (#1929), so the rationale is not lost: this Finish
+    // owner entry had no caller-presented readiness receipt, so the exact
+    // `TaskSelectionEvidence` leg of issue #1929 runs at the composition-root
+    // write intake (`Self::commit_canonical_and_refresh`) and again, from the
+    // proof handles the transition actually carries, at the store gate. The
+    // finish draft's own `task_id` + `expected_task_revision` are re-validated
+    // against the canonical task owner by the Governor finish owner before the
+    // commit; nothing on the phase path guesses a task. Both legs still run on
+    // the surviving path: `plan_testd_terminal_owner_fact` prepares the fact
+    // through the Governor finish owner, and `accept_prepared_exchange`
+    // re-checks the pre-commit fence before the receipt is admitted.
 
     /// Returns the admitted Kernel snapshot.
     #[must_use]
