@@ -12,30 +12,40 @@ use eliot_learning_contracts::{
     TASK_CONTROLLER_CAMPAIGN_OWNER_ID, identity::SourceLineage,
 };
 use eliot_store_api::{
-    CampaignSourceDocument, CampaignSourceDocumentSchema, CampaignSourceHead,
-    CampaignSourcePublication, CampaignSourcePublisher, CampaignSourceRecord,
+    CampaignOwnerProjectionBody, CampaignSourceDocument, CampaignSourceDocumentSchema,
+    CampaignSourceHead, CampaignSourcePublication, CampaignSourcePublisher, CampaignSourceRecord,
+    campaign_source_schema_for_role,
 };
 use eliot_task::{TaskLifecycleEvent, TaskRecord};
 use serde::Serialize;
 
+use crate::campaign_source_publishers::build_task_controller_history_record;
 use crate::task_lifecycle::TaskLifecycleError;
 
-/// Exact heads returned by the two named Task Controller source reads.
+/// Exact heads returned by the named Task Controller source reads.
 #[derive(Clone, Debug, Default)]
 pub struct TaskControllerCampaignSourceHeads {
     /// Current head for the task objective, if one exists.
     pub objective: Option<CampaignSourceHead>,
     /// Current head for the task plan, if one exists.
     pub plan: Option<CampaignSourceHead>,
+    /// Current head for the task acceptance projection, if one exists.
+    pub acceptance: Option<CampaignSourceHead>,
+    /// Current head for the task open-items projection, if one exists.
+    pub open_items: Option<CampaignSourceHead>,
 }
 
 /// Source publications derived from one admitted task transition.
 #[derive(Clone, Debug)]
-pub(crate) struct TaskControllerCampaignSources {
+pub struct TaskControllerCampaignSources {
     /// Objective projection from the exact `TaskRecord.goal` value.
     pub objective: CampaignSourcePublication,
     /// Recipe projection anchored to the admitted task fence.
     pub plan: CampaignSourcePublication,
+    /// Task-state acceptance projection derived from the admitted event.
+    pub acceptance: CampaignSourcePublication,
+    /// Task-state open-items projection derived from the admitted event.
+    pub open_items: CampaignSourcePublication,
     /// Recipe with the exact newly built `TaskObjective` reference installed.
     pub recipe: LearningStateViewRecipe,
 }
@@ -56,6 +66,80 @@ struct TaskObjectiveSnapshotIdentity<'a> {
     goal_digest: &'a str,
 }
 
+fn task_state_projection(
+    role: CampaignSourceRole,
+    event: &TaskLifecycleEvent,
+    record: &TaskRecord,
+    owner_id: &OwnerId,
+    goal_digest: &str,
+    source_snapshot: &ArtifactId,
+    expected_head: Option<CampaignSourceHead>,
+) -> Result<CampaignSourcePublication, TaskLifecycleError> {
+    let projection = serde_json::json!({
+        "task_id": record.task_id.as_str(),
+        "revision": record.revision,
+        "state": record.state,
+        "last_event_id": record.last_event_id.as_str(),
+        "last_sequence": record.last_sequence,
+        "goal_digest": goal_digest,
+        "source_snapshot": source_snapshot.as_str(),
+        "event_state_fence": &event.state_fence,
+    });
+    let projection_digest = sha256_hex(
+        &canonical_json_bytes(&projection)
+            .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
+    );
+    let body = CampaignOwnerProjectionBody {
+        owner_id: owner_id.as_str().to_owned(),
+        record_id: record.task_id.as_str().to_owned(),
+        revision: record.revision.to_string(),
+        state_fence: record.state_fence.clone(),
+        projection_digest,
+        required_references: vec![source_snapshot.clone()],
+        projection,
+    };
+    let record = CampaignSourceRecord::new(
+        role,
+        owner_id.clone(),
+        CampaignOwnerRecordId::Task(record.task_id.clone()),
+        CampaignOwnerRevision::Task(
+            TaskRevision::new(record.revision)
+                .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
+        ),
+        record.state_fence.clone(),
+        Vec::new(),
+        Vec::new(),
+        vec![source_snapshot.clone()],
+        Vec::new(),
+        Vec::new(),
+        CampaignSourceDocument {
+            schema: campaign_source_schema_for_role(role),
+            schema_version: CampaignSourceDocument::SCHEMA_VERSION,
+            body: serde_json::to_value(&body)
+                .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
+        },
+    )
+    .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
+    let publisher = match role {
+        CampaignSourceRole::TaskAcceptance => CampaignSourcePublisher::TaskControllerAcceptance,
+        CampaignSourceRole::TaskOpenItems => CampaignSourcePublisher::TaskControllerOpenItems,
+        _ => {
+            return Err(TaskLifecycleError::Serialization(
+                "task state projection role is not a Task Controller projection".to_owned(),
+            ));
+        }
+    };
+    let read_fence = record.recorded_state_fence.clone();
+    let publication = CampaignSourcePublication::from_observed_head(
+        publisher,
+        record,
+        expected_head,
+        &read_fence,
+    )
+    .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
+    Ok(publication)
+}
+
 /// Build `TaskObjective` and `TaskPlan` publications from an accepted task event.
 ///
 /// The caller supplies the exact owner heads it read for both CAS inputs. The
@@ -71,7 +155,7 @@ struct TaskObjectiveSnapshotIdentity<'a> {
     clippy::too_many_lines,
     reason = "the two owner publications and recipe CAS binding remain one auditable transaction builder"
 )]
-pub(crate) fn build_task_controller_campaign_sources(
+pub fn build_task_controller_campaign_sources(
     event: &TaskLifecycleEvent,
     record: &TaskRecord,
     mut recipe: LearningStateViewRecipe,
@@ -142,12 +226,19 @@ pub(crate) fn build_task_controller_campaign_sources(
     let slot_projection_digest = objective_projection
         .canonical_digest()
         .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
+    let history_plan = build_task_controller_history_record(
+        recipe.campaign_id.as_str(),
+        owner_id.as_str(),
+        source_snapshot.clone(),
+        &record.state_fence,
+    )
+    .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
     let objective_body = TaskObjectiveDocument {
         task_id: record.task_id.clone(),
         revision: task_revision,
         goal: record.goal.clone(),
-        goal_digest,
-        source_snapshot,
+        goal_digest: goal_digest.clone(),
+        source_snapshot: source_snapshot.clone(),
     };
     let objective_document = CampaignSourceDocument {
         schema: CampaignSourceDocumentSchema::TaskObjective,
@@ -166,9 +257,9 @@ pub(crate) fn build_task_controller_campaign_sources(
             digest: slot_projection_digest.clone(),
         }],
         vec![objective_projection],
-        vec![objective_body.source_snapshot],
+        vec![objective_body.source_snapshot.clone()],
         vec![],
-        vec![],
+        vec![history_plan],
         objective_document,
     )
     .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
@@ -185,6 +276,58 @@ pub(crate) fn build_task_controller_campaign_sources(
         }],
         recorded_state_fence: record.state_fence.clone(),
     };
+    let acceptance = task_state_projection(
+        CampaignSourceRole::TaskAcceptance,
+        event,
+        record,
+        &owner_id,
+        &goal_digest,
+        &objective_body.source_snapshot,
+        expected_heads.acceptance,
+    )?;
+    let open_items = task_state_projection(
+        CampaignSourceRole::TaskOpenItems,
+        event,
+        record,
+        &owner_id,
+        &goal_digest,
+        &objective_body.source_snapshot,
+        expected_heads.open_items,
+    )?;
+    for (role, publication) in [
+        (CampaignSourceRole::TaskAcceptance, &acceptance),
+        (CampaignSourceRole::TaskOpenItems, &open_items),
+    ] {
+        let requirement = recipe
+            .source_requirements
+            .iter()
+            .find(|requirement| requirement.role == role)
+            .ok_or_else(|| source_error("campaign recipe lacks a Task Controller state source"))?;
+        if requirement.owner != owner_id
+            || requirement.source_binding != CampaignSourceBinding::ExactReference
+            || !requirement.load_bearing
+        {
+            return Err(source_error(
+                "Task Controller state sources must be exact load-bearing owner rows",
+            ));
+        }
+        let reference = CampaignSourceRevisionRef {
+            role,
+            owner: owner_id.clone(),
+            record_id: publication.record.record_id.clone(),
+            revision: publication.record.revision.clone(),
+            content_digest: publication.record.content_digest.clone(),
+            slot_projection_digests: publication.record.slot_projection_digests.clone(),
+            recorded_state_fence: publication.record.recorded_state_fence.clone(),
+        };
+        let requirement = recipe
+            .source_requirements
+            .iter_mut()
+            .find(|requirement| requirement.role == role)
+            .ok_or_else(|| source_error("campaign recipe lacks a Task Controller state source"))?;
+        requirement.expected_reference = Some(reference);
+    }
+
     let objective_manifest = recipe
         .source_requirements
         .iter_mut()
@@ -198,14 +341,14 @@ pub(crate) fn build_task_controller_campaign_sources(
         .validate()
         .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
 
-    let objective = CampaignSourcePublication {
-        publisher: CampaignSourcePublisher::TaskController,
-        record: objective_record,
-        expected_head: expected_heads.objective,
-    };
-    objective
-        .validate()
-        .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
+    let objective_fence = objective_record.recorded_state_fence.clone();
+    let objective = CampaignSourcePublication::from_observed_head(
+        CampaignSourcePublisher::TaskControllerObjective,
+        objective_record,
+        expected_heads.objective,
+        &objective_fence,
+    )
+    .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
 
     let plan_revision = recipe
         .binding
@@ -246,17 +389,20 @@ pub(crate) fn build_task_controller_campaign_sources(
         plan_document,
     )
     .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
-    let plan = CampaignSourcePublication {
-        publisher: CampaignSourcePublisher::TaskController,
-        record: plan_record,
-        expected_head: expected_heads.plan,
-    };
-    plan.validate()
-        .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
+    let plan_fence = plan_record.recorded_state_fence.clone();
+    let plan = CampaignSourcePublication::from_observed_head(
+        CampaignSourcePublisher::TaskControllerPlan,
+        plan_record,
+        expected_heads.plan,
+        &plan_fence,
+    )
+    .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
 
     Ok(TaskControllerCampaignSources {
         objective,
         plan,
+        acceptance,
+        open_items,
         recipe,
     })
 }
