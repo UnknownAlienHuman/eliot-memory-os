@@ -1363,14 +1363,41 @@ impl DaemonComposition {
         let aliases = eliot_skill::ToolAliasTable::new();
         let fence = self.governor.kernel_snapshot().state_fence().clone();
         self.check_skill_lifecycle_standing(&payload.package, &fence)?;
-        self.shared_skill_adapter().ingest_wire_intake(
+        let (skill_id, hotset_receipt) = self.shared_skill_adapter().ingest_wire_intake(
             payload,
             record,
             source.as_ref(),
             &aliases,
             &admitted_version,
             &fence,
-        )
+        )?;
+        // Issue #1946 (I7.25): emit one harness activation receipt for this
+        // delivery attempt and admit it behind the Governor lifecycle owner.
+        // The receipt binds the exact accepted package, the issued Hotset
+        // delivery, and the live fence; activation, adherence and outcomes
+        // stay unobserved at delivery (unknown/empty, never inferred). Skills
+        // the lifecycle owner does not cover stay provisional (open world,
+        // matching the standing gate above); covered Skills enforce the
+        // Material-use gate here too, failing the ingest closed on
+        // stale/quarantined standing or identity drift.
+        let attempt = skill_lifecycle_adapters::delivery_attempt_receipt(
+            &payload.package,
+            &payload.context,
+            record,
+            &fence,
+            &skill_id,
+            &hotset_receipt,
+        )?;
+        match self
+            .governor
+            .owners()
+            .skill
+            .admit_material_attempt(&attempt)
+        {
+            Ok(_) | Err(eliot_skill::SkillError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        Ok((skill_id, hotset_receipt))
     }
 
     /// Carries the receiver ack back to the display boundary under a fresh

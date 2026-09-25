@@ -94,11 +94,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use super::skill_acceptance_read::AcceptanceRecord;
 use eliot_contracts::StateFence;
 use eliot_skill::{
-    ActivatedSkillDisplay, CanonicalToolSource, CatalogueInstallContext, HotsetDeliveryAck,
-    HotsetDeliveryReceipt, KnownTools, LifecycleAction, MaterializationInputs,
-    MaterializationScope, PortableSkillPackageCandidate, ProcedureState, PromotionGate,
-    ReadinessClaims, SkillCandidate, SkillCatalogue, SkillError, SkillLifecycleApi,
-    SkillLifecycleView, SkillPackage, ToolAliasTable, VersionBoundTools,
+    ActivatedSkillDisplay, AdherenceCheckpoints, CanonicalToolSource, CatalogueInstallContext,
+    ConflictState, HotsetDeliveryAck, HotsetDeliveryReceipt, KnownTools, LifecycleAction,
+    MaterializationInputs, MaterializationScope, PortableSkillPackageCandidate, ProcedureState,
+    PromotionGate, ReadinessClaims, SkillActivationStatus, SkillCandidate, SkillCatalogue,
+    SkillDeliveryStatus, SkillError, SkillHarnessActivationReceipt, SkillLifecycleApi,
+    SkillLifecycleView, SkillPackage, SkillRetrievalStatus, ToolAliasTable, VersionBoundTools,
     activation::detect_dependency_staleness,
 };
 
@@ -812,6 +813,78 @@ pub struct VersionedDeliveryAct<'a> {
     pub admitted_definition_version: &'a str,
     pub hotset_id: String,
     pub approval_ref: String,
+}
+
+/// Builds the delivery-stage harness activation receipt for one ingested Skill
+/// (issue #1946, I7.25).
+///
+/// Pure constructor over exact intake/delivery inputs, called on the production
+/// ingest path after the Hotset receipt issues: skill revision and package
+/// digest come from the accepted package, the attempt ref and packet digest
+/// are the issued Hotset receipt digest, the packet position is the Skill's
+/// exact index in the delivered set, the fence is the caller-observed live
+/// admitted fence, and the route ref names the admitted route set
+/// (profile set when no route was admitted). Retrieval and delivery are the
+/// observed stages — the Skill was retrieved for the attempt surface and its
+/// full body delivered under the receipt. Activation, adherence and outcomes
+/// are unobserved at delivery: activation stays `NotAssessed`, adherence stays
+/// all-absent (unknown, never compliance), and outcome refs stay empty. The
+/// package's declared conflict references ride along as conflict refs; nothing
+/// is inferred from installation, retrieval, repetition or agreement.
+/// Validation failures fail the ingest closed; the caller admits the receipt
+/// behind the Governor lifecycle owner.
+pub(crate) fn delivery_attempt_receipt(
+    package: &SkillPackage,
+    context: &CatalogueInstallContext,
+    record: &AcceptanceRecord,
+    fence: &StateFence,
+    skill_id: &str,
+    hotset: &HotsetDeliveryReceipt,
+) -> Result<SkillHarnessActivationReceipt, SkillError> {
+    let packet_position = hotset
+        .delivered_skill_ids
+        .iter()
+        .position(|delivered| delivered == skill_id)
+        .ok_or(SkillError::IdentityMismatch)? as u64;
+    if !hotset.body_digests.contains_key(skill_id) {
+        return Err(SkillError::IdentityMismatch);
+    }
+    let route_ref = if context.eligible_routes.is_empty() {
+        context.eligible_profiles.join(",")
+    } else {
+        context.eligible_routes.join(",")
+    };
+    let conflict_or_suppression_refs = match &package.state.conflict {
+        ConflictState::Conflicted { references } => references.clone(),
+        ConflictState::None => Vec::new(),
+    };
+    let receipt = SkillHarnessActivationReceipt {
+        receipt_id: format!("harness-attempt-{}-{skill_id}", hotset.hotset_id),
+        skill_id: skill_id.to_owned(),
+        skill_revision: package.registration.revision.clone(),
+        package_digest: package.digests.source_digest.clone(),
+        attempt_ref: hotset.receipt_digest.clone(),
+        route_ref,
+        state_fence: fence.clone(),
+        packet_digest: hotset.receipt_digest.clone(),
+        packet_position,
+        eligible: true,
+        eligibility_reason: format!(
+            "owner-accepted intake: verifier={} package={} revision={}",
+            record.verifier_ref, record.package_digest, record.revision
+        ),
+        retrieval: SkillRetrievalStatus::Retrieved,
+        delivery: SkillDeliveryStatus::Full,
+        activation: SkillActivationStatus::NotAssessed,
+        activation_observed_use_ref: None,
+        activation_latency_ms: None,
+        adherence: AdherenceCheckpoints::default(),
+        conflict_or_suppression_refs,
+        downstream_refs: Vec::new(),
+        verified_outcome_refs: Vec::new(),
+    };
+    receipt.validate()?;
+    Ok(receipt)
 }
 
 /// Records post-commit promotion observations in the catalogue: when the
@@ -3043,6 +3116,7 @@ mod tests {
             dependencies: Vec::new(),
             counters: LifecycleCounters::default(),
             execution_evidence: Vec::new(),
+            attempt_receipts: Vec::new(),
             observed_decision_or_verifier_delta: None,
             false_activation_refs: Vec::new(),
             interactions: SkillInteractionView::default(),

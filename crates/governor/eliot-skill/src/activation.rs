@@ -100,10 +100,11 @@ pub struct AdherenceCheckpoints {
 impl AdherenceCheckpoints {
     /// Combines the three checkpoints without inferring compliance:
     /// any violation dominates, then partial, then unanimous followed;
-    /// unanimous silence stays `NotAssessed`, mixed silence stays `Unknown`.
+    /// silence is unknown, never compliance: unanimous and mixed silence
+    /// both resolve to `Unknown` (I7.25).
     #[must_use]
     pub fn combined(self) -> SkillAdherenceStatus {
-        use SkillAdherenceStatus::{Followed, NotAssessed, Partial, Unknown, Violated};
+        use SkillAdherenceStatus::{Followed, Partial, Unknown, Violated};
         let checkpoints = [self.early, self.mid, self.final_checkpoint];
         if checkpoints.contains(&Violated) {
             Violated
@@ -111,8 +112,6 @@ impl AdherenceCheckpoints {
             Partial
         } else if checkpoints.iter().all(|status| *status == Followed) {
             Followed
-        } else if checkpoints.iter().all(|status| *status == NotAssessed) {
-            NotAssessed
         } else {
             Unknown
         }
@@ -565,9 +564,10 @@ pub struct LifecycleEvidence<'a> {
 /// delivery/expansion evidence; `executed`/`failed`/`uncertain` count the
 /// execution evidence by outcome and `verified` counts observed executions
 /// with verifier refs; `useful` counts attempts whose exact receipt summary is
-/// useful. Installed, delivered, executed and useful stay distinct; aggregate
-/// counts never substitute for the per-attempt receipts the caller keeps.
-/// Status is `Stale` with the detection reason exactly when the pinned
+/// useful. Installed, delivered, executed and useful stay distinct; the
+/// validated identity-bound attempt receipts are retained on the view, so
+/// aggregate counts never substitute for the per-attempt records the view
+/// resolves to. Status is `Stale` with the detection reason exactly when the pinned
 /// dependencies disagree with the live set, else `Current`: quarantine only
 /// arrives through governed review, never through derivation. Interaction refs
 /// fold validated conflicts (conflict id, preserved first-skill ordering,
@@ -618,6 +618,9 @@ pub fn derive_lifecycle_view(
             useful: attempts.useful,
         },
         execution_evidence: evidence.executions.to_vec(),
+        // Retained verbatim: every receipt above passed validation and the
+        // exact skill-revision/digest binding inside `fold_attempt_evidence`.
+        attempt_receipts: evidence.attempts.to_vec(),
         observed_decision_or_verifier_delta: evidence.observed_decision_or_verifier_delta,
         false_activation_refs: attempts.false_activation_refs,
         interactions,
@@ -634,11 +637,11 @@ pub fn derive_lifecycle_view(
 
 /// Per-attempt counts folded from exact harness receipts bound to one skill
 /// revision and package digest.
-struct AttemptFold {
-    delivered: u64,
-    expanded: u64,
-    useful: u64,
-    false_activation_refs: Vec<String>,
+pub(crate) struct AttemptFold {
+    pub(crate) delivered: u64,
+    pub(crate) expanded: u64,
+    pub(crate) useful: u64,
+    pub(crate) false_activation_refs: Vec<String>,
 }
 
 /// Folds delivery/expansion/usefulness counts from receipts bound to the exact
@@ -646,7 +649,7 @@ struct AttemptFold {
 /// orthogonal per receipt; retrieved-but-unobserved attempts contribute their
 /// attempt ref to the false-activation history (a history ref, never a
 /// non-use verdict). Foreign revisions or digests fail closed.
-fn fold_attempt_evidence(
+pub(crate) fn fold_attempt_evidence(
     skill_id: &str,
     skill_revision: &str,
     package_digest: &str,
@@ -695,8 +698,10 @@ struct ExecutionFold {
 }
 
 /// Counts execution evidence by outcome; observed executions with verifier
-/// refs count as verified. Causal credit is never assigned: evidence
-/// validation already forces `NoCausalCredit`.
+/// refs count as verified. Causal credit is never assigned to one Skill:
+/// evidence validation binds the association/distributed/uncertain
+/// attributions to exact step evidence, and sole causation has no
+/// representation.
 fn fold_execution_evidence(
     executions: &[SkillExecutionEvidence],
 ) -> Result<ExecutionFold, SkillError> {
@@ -842,6 +847,7 @@ mod tests {
             dependencies,
             counters: LifecycleCounters::default(),
             execution_evidence: Vec::new(),
+            attempt_receipts: Vec::new(),
             observed_decision_or_verifier_delta: None,
             false_activation_refs: Vec::new(),
             interactions: SkillInteractionView::default(),
@@ -871,8 +877,8 @@ mod tests {
         );
         assert_eq!(
             summary.adhered,
-            SkillAdherenceStatus::NotAssessed,
-            "absent adherence evidence stays unassessed, never compliance"
+            SkillAdherenceStatus::Unknown,
+            "absent adherence evidence stays unknown, never compliance"
         );
         Ok(())
     }
