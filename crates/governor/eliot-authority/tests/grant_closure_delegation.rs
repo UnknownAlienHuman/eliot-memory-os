@@ -34,116 +34,56 @@ fn test_binding() -> Result<AuthorityBinding, Box<dyn Error>> {
     })
 }
 
-/// Builds one chain entry that satisfies the narrowing edge rules of
-/// `GrantGraph::from_grants`: a delegated child is issued by its parent
-/// holder and never widens the parent authority, expiry, or use budget
-/// (I6.15 "each child is an intersection of parent authority, requested
-/// scope and current policy"). The `Delegation` tag is what makes the chain
-/// strictly narrower at every hop — equal operations, resources, expiry and
-/// budget would be rejected as `GrantNotNarrower` before any closure could be
-/// enumerated.
 fn grant(
     id: &str,
     parent: Option<&str>,
     root: &str,
-    delegation: Delegation,
     binding: AuthorityBinding,
 ) -> Result<CapabilityGrant, Box<dyn Error>> {
     Ok(CapabilityGrant {
         grant_id: GrantId::new(id)?,
         parent_grant_id: parent.map(GrantId::new).transpose()?,
         authority_root_ref: root.to_owned(),
-        // A child is issued by the holder of the parent it narrows.
-        issuer: PrincipalRef::new(match parent {
-            Some(parent) => parent_holder(parent),
-            None => "governor".to_owned(),
-        })?,
-        holder: PrincipalRef::new(parent_holder(id))?,
+        issuer: PrincipalRef::new("governor")?,
+        holder: PrincipalRef::new("holder-1")?,
         authority: AuthoritySet::new(
-            ["op.read".to_owned(), "op.write".to_owned()],
+            ["op.read".to_owned()],
             ["res:1".to_owned()],
-            delegation.effect(),
+            EffectClass::Read,
         )?,
         inherited_source_ceiling: None,
         binding,
         issued_at: LogicalTime::new(1),
-        expires_at: LogicalTime::new(delegation.expires_at),
-        max_uses: delegation.max_uses,
+        expires_at: LogicalTime::new(10_000),
+        max_uses: 1,
         status: GrantStatus::Active,
     })
-}
-
-/// The principal that holds the named chain entry, matching the holder this
-/// fixture derives from the grant id.
-fn parent_holder(id: &str) -> String {
-    format!("holder-{id}")
-}
-
-/// One strictly narrowing step of the fixture chain.
-#[derive(Clone, Copy)]
-struct Delegation {
-    effect: EffectClass,
-    expires_at: u64,
-    max_uses: u32,
-}
-
-impl Delegation {
-    fn root() -> Self {
-        Self {
-            effect: EffectClass::ExternalEffect,
-            expires_at: 10_000,
-            max_uses: 4,
-        }
-    }
-
-    fn narrow(expires_at: u64, max_uses: u32) -> Self {
-        Self {
-            effect: EffectClass::Read,
-            expires_at,
-            max_uses,
-        }
-    }
 }
 
 fn chain_graph() -> Result<GrantGraph, Box<dyn Error>> {
     let binding = test_binding()?;
     GrantGraph::from_grants(
         [
-            grant(
-                "grant-origin",
-                None,
-                "root-test",
-                Delegation::root(),
-                binding.clone(),
-            )?,
+            grant("grant-origin", None, "root-test", binding.clone())?,
             grant(
                 "grant-mid",
                 Some("grant-origin"),
                 "root-test",
-                Delegation::narrow(9_000, 3),
                 binding.clone(),
             )?,
             grant(
                 "grant-leaf",
                 Some("grant-mid"),
                 "root-test",
-                Delegation::narrow(8_000, 2),
                 binding.clone(),
             )?,
             grant(
                 "grant-tip",
                 Some("grant-leaf"),
                 "root-test",
-                Delegation::narrow(7_000, 1),
                 binding.clone(),
             )?,
-            grant(
-                "grant-other",
-                None,
-                "root-other",
-                Delegation::root(),
-                binding,
-            )?,
+            grant("grant-other", None, "root-other", binding)?,
         ],
         7,
     )

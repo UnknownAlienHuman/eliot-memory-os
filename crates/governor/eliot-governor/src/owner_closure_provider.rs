@@ -1700,40 +1700,24 @@ mod owner_closure_provider_tests {
         }
     }
 
-    /// Builds one graph entry that satisfies the narrowing edge rules of
-    /// `GrantGraph::from_grants`: a delegated child is issued by the holder of
-    /// the parent it narrows and never widens the parent effect ceiling,
-    /// expiry, or use budget (I6.15). Without that, the graph refuses with
-    /// `GrantNotNarrower` and no provider, revision, or closure exists to
-    /// exercise.
     fn grant_entry(fence: &StateFence, grant_id: &str, parent: Option<&str>) -> CapabilityGrant {
-        let delegated = parent.is_some();
         CapabilityGrant {
             grant_id: GrantId::new(grant_id).expect("id"),
             parent_grant_id: parent.map(|id| GrantId::new(id).expect("parent")),
             authority_root_ref: "root:alpha".to_owned(),
-            issuer: PrincipalRef::new(if delegated {
-                "principal:holder"
-            } else {
-                "principal:issuer"
-            })
-            .expect("issuer"),
+            issuer: PrincipalRef::new("principal:issuer").expect("issuer"),
             holder: PrincipalRef::new("principal:holder").expect("holder"),
             authority: AuthoritySet::new(
                 ["op.read".to_owned()],
                 ["res:1".to_owned()],
-                if delegated {
-                    EffectClass::Read
-                } else {
-                    EffectClass::ExternalEffect
-                },
+                EffectClass::Read,
             )
             .expect("authority"),
             inherited_source_ceiling: None,
             binding: binding(fence),
             issued_at: LogicalTime::new(1),
-            expires_at: LogicalTime::new(if delegated { 9 } else { 10 }),
-            max_uses: if delegated { 1 } else { 2 },
+            expires_at: LogicalTime::new(10),
+            max_uses: 2,
             status: GrantStatus::Active,
         }
     }
