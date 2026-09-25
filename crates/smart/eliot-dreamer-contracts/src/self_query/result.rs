@@ -653,6 +653,12 @@ impl ArchitectureBriefCandidate {
                 field: "candidate.complete_source_status",
             });
         }
+        if self.disposition == ArchitectureBriefDisposition::Complete && !self.omissions.is_empty()
+        {
+            return Err(SelfQueryContractError::Conflict {
+                field: "candidate.complete_omissions",
+            });
+        }
         self.denominator.validate()?;
 
         let mut anchor_ids = BTreeSet::new();

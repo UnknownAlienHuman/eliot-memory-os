@@ -34,6 +34,7 @@ eliot-dreamer-contracts.workspace = true
 eliot-dreamer-memory-revision = { path = "../../crates/smart/eliot-dreamer-memory-revision", version = "0.1.0" }
 eliot-evaluation-contracts.workspace = true
 eliot-epistemic-contracts.workspace = true
+eliot-epistemic-context-provider.workspace = true
 eliot-experience-provider = { path = "../../crates/smart/eliot-experience-provider", version = "0.1.0" }
 eliot-governor.workspace = true
 eliot-improvement = { path = "../../crates/meta/eliot-improvement", version = "0.1.0" }

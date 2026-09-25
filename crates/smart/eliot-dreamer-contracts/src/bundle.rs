@@ -232,6 +232,12 @@ impl DreamInputBundle {
                     return Err(ContractViolation::MissingField("authoritative_denominator"));
                 };
                 check_text(d, "authoritative_denominator", 256)?;
+                if !self.omissions.is_empty() {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "omissions",
+                        reason: "a complete bundle cannot carry omissions".to_string(),
+                    });
+                }
             }
             BundleCompleteness::PartialForScope | BundleCompleteness::Unknown => {
                 if let Some(d) = &self.authoritative_denominator {
@@ -377,6 +383,7 @@ mod tests {
     fn valid_complete_bundle_roundtrips_exact_denominator() {
         let mut bundle = valid_bundle();
         bundle.completeness = BundleCompleteness::CompleteForScope;
+        bundle.omissions.clear();
         bundle.authoritative_denominator = Some("scope-1:2-of-2".to_string());
         assert!(bundle.validate().is_ok());
 
@@ -387,6 +394,7 @@ mod tests {
         let denom = back.authoritative_denominator.as_deref();
         assert_eq!(denom, Some("scope-1:2-of-2"));
         let mut maxed = valid_bundle();
+        maxed.omissions.clear();
         maxed.materials[0].handle = "h".repeat(128);
         maxed.authoritative_denominator = Some("d".repeat(256));
         maxed.completeness = BundleCompleteness::CompleteForScope;
@@ -432,6 +440,7 @@ mod tests {
             complete.validate(),
             Err(ContractViolation::MissingField("authoritative_denominator"))
         ));
+        complete.omissions.clear();
         complete.authoritative_denominator = Some("scope-1:2-of-2".to_string());
         assert!(complete.validate().is_ok());
 
@@ -445,6 +454,20 @@ mod tests {
         assert!(empty.validate().is_ok());
 
         assert!(valid_bundle().validate().is_ok());
+    }
+
+    #[test]
+    fn complete_bundle_rejects_any_accounted_omission() {
+        let mut bundle = valid_bundle();
+        bundle.completeness = BundleCompleteness::CompleteForScope;
+        bundle.authoritative_denominator = Some("scope-1:2-of-2".to_string());
+        assert!(matches!(
+            bundle.validate(),
+            Err(ContractViolation::BindingMismatch {
+                field: "omissions",
+                ..
+            })
+        ));
     }
 
     // WORK_UNIT_CASE: 578/16

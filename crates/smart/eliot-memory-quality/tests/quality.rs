@@ -361,6 +361,25 @@ fn receipt() -> HarnessActivationReceiptCandidate {
     candidate
 }
 
+fn bind_request(
+    batch: MemoryProjectionBatch,
+    applicable: ApplicableMemorySet,
+    projections: CanonicalProjectionSet,
+    receipts: Vec<HarnessActivationReceiptCandidate>,
+    missing_owner: Option<SourceId>,
+) -> QualityRequest {
+    let source_batch_digest = batch.canonical_digest().unwrap_or_else(|_| "0".repeat(64));
+    QualityRequest {
+        batch,
+        projection_read_receipt: aid("memory-read-receipt"),
+        source_batch_digest,
+        missing_owner,
+        applicable,
+        projections,
+        receipts,
+    }
+}
+
 fn request(
     batch: MemoryProjectionBatch,
     excluded: &[(&str, ExclusionReason)],
@@ -368,12 +387,13 @@ fn request(
     triggers: Vec<String>,
 ) -> QualityRequest {
     let applicable = set_for(&batch, excluded, cue_hits, None);
-    QualityRequest {
+    bind_request(
         batch,
         applicable,
-        projections: projections(triggers, vec![]),
-        receipts: vec![receipt()],
-    }
+        projections(triggers, vec![]),
+        vec![receipt()],
+        None,
+    )
 }
 
 #[test]
@@ -434,12 +454,13 @@ fn happy_path_emits_complete_assessment_with_exact_denominator() {
 fn canonical_identity_comes_from_the_batch_record_not_the_verdict() {
     let batch_value = batch(vec![record("mem-1")]);
     let applicable = set_for(&batch_value, &[], &[], Some(MemoryKind::Observation));
-    let candidate = QualityRequest {
-        batch: batch_value,
+    let candidate = bind_request(
+        batch_value,
         applicable,
-        projections: projections(vec![], vec![]),
-        receipts: vec![],
-    };
+        projections(vec![], vec![]),
+        vec![],
+        None,
+    );
     let assessment = assess_quality(&candidate).expect("quality assessment");
     assert_eq!(assessment.items[0].kind, MemoryKind::Episode);
 }
@@ -451,12 +472,13 @@ fn unknown_denominator_fails_closed() {
         reason: "read-side recount pending".to_owned(),
     };
     let applicable = set_for(&batch_value, &[], &[], None);
-    let candidate = QualityRequest {
-        batch: batch_value,
+    let candidate = bind_request(
+        batch_value,
         applicable,
-        projections: projections(vec![], vec![]),
-        receipts: vec![],
-    };
+        projections(vec![], vec![]),
+        vec![],
+        None,
+    );
     assert_eq!(
         assess_quality(&candidate),
         Err(QualityError::MissingDenominator)
@@ -471,12 +493,13 @@ fn truncated_coverage_is_inconclusive_with_frontier() {
     batch_value.coverage.frontier = vec!["resume-1".to_owned()];
     batch_value.coverage.revalidation_required = true;
     let applicable = set_for(&batch_value, &[], &[], None);
-    let candidate = QualityRequest {
-        batch: batch_value,
+    let candidate = bind_request(
+        batch_value,
         applicable,
-        projections: projections(vec![], vec![]),
-        receipts: vec![],
-    };
+        projections(vec![], vec![]),
+        vec![],
+        None,
+    );
     let assessment = assess_quality(&candidate).expect("quality assessment");
     assessment.validate().expect("assessment validates");
     assert_eq!(assessment.status, CoverageStatus::Inconclusive);
@@ -497,15 +520,28 @@ fn batch_omissions_are_carried_with_identities() {
     }];
     batch_value.coverage.revalidation_required = true;
     let applicable = set_for(&batch_value, &[], &[], None);
-    let candidate = QualityRequest {
-        batch: batch_value,
+    let candidate = bind_request(
+        batch_value,
         applicable,
-        projections: projections(vec![], vec![]),
-        receipts: vec![],
-    };
+        projections(vec![], vec![]),
+        vec![],
+        Some(SourceId::new("memory-read-owner").expect("fixture owner")),
+    );
     let assessment = assess_quality(&candidate).expect("quality assessment");
     assessment.validate().expect("assessment validates");
     assert_eq!(assessment.status, CoverageStatus::Inconclusive);
+    assert_eq!(
+        assessment.projection_read_receipt,
+        aid("memory-read-receipt")
+    );
+    assert_eq!(
+        assessment.source_batch_digest,
+        candidate.source_batch_digest
+    );
+    assert_eq!(
+        assessment.missing_owner.as_ref().map(SourceId::as_str),
+        Some("memory-read-owner")
+    );
     assert_eq!(assessment.batch_omissions.len(), 1);
     assert_eq!(assessment.batch_omissions[0].handle, aid("mem-omitted"));
     assert_eq!(assessment.counter_metrics.omissions_carried, 1);
@@ -518,12 +554,7 @@ fn undeclared_volume_is_rejected_by_the_batch_owner() {
     let mut lossy = batch_value;
     lossy.coverage.denominator = DenominatorState::Known { total: 3 };
     let applicable = set_for(&lossy, &[], &[], None);
-    let candidate = QualityRequest {
-        batch: lossy,
-        applicable,
-        projections: projections(vec![], vec![]),
-        receipts: vec![],
-    };
+    let candidate = bind_request(lossy, applicable, projections(vec![], vec![]), vec![], None);
     assert!(matches!(
         assess_quality(&candidate),
         Err(QualityError::Projection(
@@ -533,15 +564,54 @@ fn undeclared_volume_is_rejected_by_the_batch_owner() {
 }
 
 #[test]
+fn searched_memory_recovery_identity_must_match_and_name_real_gaps() {
+    let batch_value = batch(vec![record("mem-1")]);
+    let applicable = set_for(&batch_value, &[], &[], None);
+    let mut candidate = bind_request(
+        batch_value,
+        applicable,
+        projections(vec![], vec![]),
+        vec![],
+        None,
+    );
+    candidate.source_batch_digest = "f".repeat(64);
+    assert!(matches!(
+        assess_quality(&candidate),
+        Err(QualityError::BindingMismatch {
+            left: "request.source_batch_digest",
+            ..
+        })
+    ));
+
+    let batch_value = batch(vec![record("mem-1")]);
+    let applicable = set_for(&batch_value, &[], &[], None);
+    let candidate = bind_request(
+        batch_value,
+        applicable,
+        projections(vec![], vec![]),
+        vec![],
+        Some(SourceId::new("memory-read-owner").expect("fixture owner")),
+    );
+    assert!(matches!(
+        assess_quality(&candidate),
+        Err(QualityError::InvalidField {
+            field: "request.missing_owner",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn projection_omissions_block_completeness() {
     let batch_value = batch(vec![record("mem-1")]);
     let applicable = set_for(&batch_value, &[], &[], None);
-    let candidate = QualityRequest {
-        batch: batch_value,
+    let candidate = bind_request(
+        batch_value,
         applicable,
-        projections: projections(vec![], vec![omission_record()]),
-        receipts: vec![],
-    };
+        projections(vec![], vec![omission_record()]),
+        vec![],
+        None,
+    );
     let assessment = assess_quality(&candidate).expect("quality assessment");
     assessment.validate().expect("assessment validates");
     assert_eq!(assessment.status, CoverageStatus::Inconclusive);
@@ -555,12 +625,13 @@ fn verdict_missing_a_batch_record_is_rejected() {
     let applicable = set_for(&batch_value, &[], &[], None);
     let mut partial = applicable;
     partial.applicable.pop();
-    let candidate = QualityRequest {
-        batch: batch_value,
-        applicable: partial,
-        projections: projections(vec![], vec![]),
-        receipts: vec![],
-    };
+    let candidate = bind_request(
+        batch_value,
+        partial,
+        projections(vec![], vec![]),
+        vec![],
+        None,
+    );
     assert!(matches!(
         assess_quality(&candidate),
         Err(QualityError::HandleMismatch { .. })
@@ -581,12 +652,7 @@ fn projection_binding_drift_is_rejected() {
     ] {
         projection.task_id = TaskId::new("other-task").expect("fixture drift");
     }
-    let candidate = QualityRequest {
-        batch: batch_value,
-        applicable,
-        projections: drifted,
-        receipts: vec![],
-    };
+    let candidate = bind_request(batch_value, applicable, drifted, vec![], None);
     assert!(matches!(
         assess_quality(&candidate),
         Err(QualityError::BindingMismatch { .. })
@@ -599,12 +665,13 @@ fn invalid_receipt_propagates_the_owner_error() {
     let applicable = set_for(&batch_value, &[], &[], None);
     let mut broken = receipt();
     broken.stages.clear();
-    let candidate = QualityRequest {
-        batch: batch_value,
+    let candidate = bind_request(
+        batch_value,
         applicable,
-        projections: projections(vec![], vec![]),
-        receipts: vec![broken],
-    };
+        projections(vec![], vec![]),
+        vec![broken],
+        None,
+    );
     assert!(matches!(
         assess_quality(&candidate),
         Err(QualityError::Learning(_))

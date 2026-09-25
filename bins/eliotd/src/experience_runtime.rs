@@ -39,7 +39,8 @@ use eliot_dreamer_contracts::self_query::AcceptedSourceProjection;
 use eliot_dreamer_memory_revision::{
     NegativeMemoryExtinctionCandidate, RevisionError, RevisionIntake,
 };
-use eliot_epistemic_contracts::{CurrentEpistemicPosition, Currentness, ProviderContribution};
+use eliot_epistemic_context_provider::EpistemicContextContribution;
+use eliot_epistemic_contracts::{CurrentEpistemicPosition, Currentness};
 use eliot_experience_provider::{
     BankShapeInputs, ExperienceView, FeedbackShapeInputs, JournalShapeOutput, ProduceJournalInputs,
     ProviderError, RetentionContext, SelfQualityInputs, SelfQualityRecheckInputs, WithheldMember,
@@ -362,8 +363,8 @@ pub struct UnderstandingEventInputs<'a> {
     pub view: &'a ActiveUnderstandingView,
     /// Accepted-source projection for citation checks (edge-supplied).
     pub sources: &'a AcceptedSourceProjection,
-    /// Optional admitted epistemic contribution, echoed by digest/claim.
-    pub contribution: Option<&'a ProviderContribution>,
+    /// Optional typed epistemic contribution, echoed by digest/claim.
+    pub contribution: Option<&'a EpistemicContextContribution>,
     /// Denominator anchor.
     pub scope: AssessmentScope,
     /// Subject route or coupled system.
@@ -394,8 +395,8 @@ pub struct CommonGroundEventInputs<'a> {
     pub view: &'a ActiveUnderstandingView,
     /// Accepted-source projection for citation checks (edge-supplied).
     pub sources: &'a AcceptedSourceProjection,
-    /// Optional admitted epistemic contribution, echoed by digest/claim.
-    pub contribution: Option<&'a ProviderContribution>,
+    /// Optional typed epistemic contribution, echoed by digest/claim.
+    pub contribution: Option<&'a EpistemicContextContribution>,
     /// Denominator anchor.
     pub scope: AssessmentScope,
     /// Terminology compatibility cites.
@@ -657,6 +658,7 @@ pub async fn run_experience_quality_event(
                     view: inputs.view,
                     sources: inputs.sources,
                     contribution: inputs.contribution,
+                    live_epistemic_position: inputs.contribution.map(|_| &position),
                     experience: &experience,
                 },
                 scope: inputs.scope.clone(),
@@ -680,6 +682,7 @@ pub async fn run_experience_quality_event(
                     view: inputs.view,
                     sources: inputs.sources,
                     contribution: inputs.contribution,
+                    live_epistemic_position: inputs.contribution.map(|_| &position),
                     experience: &experience,
                 },
                 scope: inputs.scope.clone(),

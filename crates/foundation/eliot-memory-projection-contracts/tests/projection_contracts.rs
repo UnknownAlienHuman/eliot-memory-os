@@ -469,7 +469,7 @@ fn set_revalidation_binds_kind_roles_and_exact_batch_handles() {
     changed_record.records[0].kind = MemoryKind::Observation;
     assert!(matches!(
         set.validate_against_batch(&changed_record),
-        Err(eliot_memory_projection_contracts::MemoryProjectionError::BindingMismatch { .. })
+        Err(eliot_memory_projection_contracts::MemoryProjectionError::ScopeMismatch { .. })
     ));
 
     let mut missing_disposition = set;

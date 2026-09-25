@@ -24,6 +24,7 @@ eliot-contracts.workspace = true
 eliot-context-contracts.workspace = true
 eliot-dreamer-contracts.workspace = true
 eliot-epistemic-contracts.workspace = true
+eliot-epistemic-context-provider.workspace = true
 eliot-observation-contracts.workspace = true
 schemars.workspace = true
 serde.workspace = true

@@ -252,9 +252,8 @@ impl ApplicableMemorySet {
             || self.truncated != batch.coverage.truncated
             || self.revalidation_required != batch.coverage.revalidation_required
         {
-            return Err(MemoryProjectionError::BindingMismatch {
-                left: "set.coverage",
-                right: "batch.coverage",
+            return Err(MemoryProjectionError::CoverageMismatch {
+                reason: "set coverage echoes do not match the bound batch",
             });
         }
 
@@ -270,9 +269,8 @@ impl ApplicableMemorySet {
                 });
             };
             if record.kind != entry.kind || record.roles != entry.roles {
-                return Err(MemoryProjectionError::BindingMismatch {
-                    left: "set.applicable",
-                    right: "batch.record",
+                return Err(MemoryProjectionError::ScopeMismatch {
+                    reason: "applicable entry identity differs from the bound batch record",
                 });
             }
             dispositions.insert(entry.handle.as_str());
@@ -288,9 +286,8 @@ impl ApplicableMemorySet {
                 });
             };
             if record.kind != entry.kind {
-                return Err(MemoryProjectionError::BindingMismatch {
-                    left: "set.excluded",
-                    right: "batch.record",
+                return Err(MemoryProjectionError::ScopeMismatch {
+                    reason: "excluded entry identity differs from the bound batch record",
                 });
             }
             dispositions.insert(entry.handle.as_str());

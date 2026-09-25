@@ -167,6 +167,20 @@ fn text(value: &str, field: &'static str) -> Result<(), QualityError> {
     Ok(())
 }
 
+fn sha256_digest(value: &str, field: &'static str) -> Result<(), QualityError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(QualityError::InvalidField {
+            field,
+            reason: "must be 64 lowercase SHA-256 hex characters",
+        });
+    }
+    Ok(())
+}
+
 /// Memory quality request over one bounded projection and its owner verdict.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -189,6 +203,7 @@ pub struct QualityRequest {
 
 impl QualityRequest {
     /// Validate owner shapes, binding echoes, and the handle union.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), QualityError> {
         check_consumed_freeze()?;
         self.batch.validate()?;
@@ -659,6 +674,7 @@ impl MemoryEcologyAssessment {
         if self.contract_version != QUALITY_CONTRACT_VERSION {
             return Err(QualityError::VersionMismatch);
         }
+        sha256_digest(&self.source_batch_digest, "assessment.source_batch_digest")?;
         self.binding.validate()?;
         let DenominatorState::Known { total } = &self.denominator else {
             return Err(QualityError::MissingDenominator);
@@ -861,9 +877,20 @@ impl MemoryEcologyAssessment {
     /// Validate coverage/status invariants: Complete binds lossless, fully
     /// accounted evidence; anything else is Inconclusive.
     fn validate_status(&self) -> Result<(), QualityError> {
+        if self.missing_owner.is_some()
+            && self.batch_omissions.is_empty()
+            && self.frontier.is_empty()
+            && self.projection_omissions.is_empty()
+        {
+            return Err(QualityError::InvalidField {
+                field: "assessment.missing_owner",
+                reason: "named missing owner requires explicit recovery evidence",
+            });
+        }
         let lossy = self.truncated
             || !self.batch_omissions.is_empty()
             || !self.projection_omissions.is_empty()
+            || self.missing_owner.is_some()
             || self.counter_metrics.unaccounted_volume != 0;
         if self.status == CoverageStatus::Complete
             && (lossy
@@ -1100,6 +1127,7 @@ pub fn assess_quality(request: &QualityRequest) -> Result<MemoryEcologyAssessmen
     let lossy = request.batch.coverage.truncated
         || !request.batch.coverage.omissions.is_empty()
         || !request.projections.omissions.is_empty()
+        || request.missing_owner.is_some()
         || unaccounted_volume != 0;
     let receipts = request
         .receipts
@@ -1119,6 +1147,9 @@ pub fn assess_quality(request: &QualityRequest) -> Result<MemoryEcologyAssessmen
         } else {
             CoverageStatus::Complete
         },
+        projection_read_receipt: request.projection_read_receipt.clone(),
+        source_batch_digest: request.source_batch_digest.clone(),
+        missing_owner: request.missing_owner.clone(),
         binding: request.batch.binding.clone(),
         projections_binding: request.projections.binding.clone(),
         denominator: request.batch.coverage.denominator.clone(),

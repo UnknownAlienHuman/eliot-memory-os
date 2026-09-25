@@ -50,9 +50,8 @@ pub use eliot_context_contracts::ContextError;
 pub use inputs::{
     AttentionInput, CandidateBounds, CandidatePolicy, CandidateRequest, CueActivationResult,
     CueInput, EpistemicInput, EvidenceInput, MAX_MEMORY_CUE_HITS, MEMORY_PROVIDER,
-    MemberMeasurement, MemoryExclusion, MemoryInput, OpaqueMember, OpaqueProjection,
-    ProjectionSchema, ProjectionState, check_denominator_is_seven_or_eight, eight_slots,
-    memory_availability,
+    MemberMeasurement, MemoryInput, OpaqueMember, OpaqueProjection, ProjectionSchema,
+    ProjectionState, check_denominator_is_seven_or_eight, eight_slots, memory_availability,
 };
 pub use mapper::{
     ContextCandidateSetResult, FrontierRecord, MAX_FRONTIER_TEXT_BYTES, MemberDisposition,

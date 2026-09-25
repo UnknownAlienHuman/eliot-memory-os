@@ -192,5 +192,17 @@ open_challenges = [
 ]
 unregistered_blockers = ["CC-WAVE0-PROOF-IDENTITY"]
 freeze_challenge_closure = "NOT_ACCEPTED_FOR_ISSUE_196"
+denominator_reconciliation = "The r6 ProjectionCoverage note is a lower-bound historical wording. For issue #196, the active repair rule is exact disjoint projected + omitted + frontier accounting; a non-truncated positive remainder fails, while truncation carries the exact remainder and revalidation state. The r6 file is byte-preserved and is not treated as owner acceptance of this reconciliation."
+dependency_currentness_reconciliation = "I5.20 requires exact dependency identity and currentness, not a count alone. The repair carries the read receipt, canonical complete-batch digest, named recovery owner, and live epistemic revalidation; runtime store readback remains owner work."
+implementation_evidence = [
+  "crates/foundation/eliot-memory-projection-contracts/src/contracts/batch.rs",
+  "crates/foundation/eliot-memory-projection-contracts/src/contracts/set.rs",
+  "crates/smart/eliot-memory-applicability/src/lib.rs",
+  "crates/smart/eliot-memory-quality/src/lib.rs",
+  "crates/smart/eliot-context-candidates/src/inputs.rs",
+  "crates/smart/eliot-epistemic-context-provider/src/context_projection.rs",
+  "crates/smart/eliot-understanding-assessment/src/lib.rs",
+  "bins/eliotd/src/experience_runtime.rs",
+]
 proof_ceiling = "STATIC_SOURCE_REPAIR_ONLY"
 note = "The r6 freeze is byte-preserved. Its challenge_closure rows are not accepted as current owner acceptance or provider/consumer conformance for issue #196; the active registry remains open."

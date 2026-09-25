@@ -154,6 +154,69 @@ impl ClosureDenominator {
             .map(|bytes| sha256_hex(&bytes))
             .map_err(|_| RevisionError::NotDigestible)
     }
+
+    /// Validate exact closure membership and the omission-aware completeness
+    /// posture. A nonempty exclusion set is an explicit incomplete read and
+    /// can never be relabeled as a complete closure.
+    pub fn validate(&self) -> Result<(), RevisionError> {
+        self.fence
+            .validate()
+            .map_err(|_| RevisionError::FenceMismatch {
+                field: "denominator.fence",
+            })?;
+        if self.enumerated.len() > MAX_CLOSURE_MEMBERS {
+            return Err(RevisionError::Bounds {
+                field: "denominator.enumerated",
+            });
+        }
+        let mut previous: Option<&ArtifactId> = None;
+        for member in &self.enumerated {
+            check_candidate_id(member)?;
+            if previous.is_some_and(|prior| prior >= member) {
+                return Err(RevisionError::DigestMismatch {
+                    field: "denominator.enumerated",
+                });
+            }
+            previous = Some(member);
+        }
+        if self.exclusions.len() > MAX_CLOSURE_MEMBERS {
+            return Err(RevisionError::Bounds {
+                field: "denominator.exclusions",
+            });
+        }
+        let members: BTreeSet<&str> = self
+            .enumerated
+            .iter()
+            .map(ArtifactId::as_str)
+            .collect();
+        let mut named_exclusions = BTreeSet::new();
+        for exclusion in &self.exclusions {
+            exclusion
+                .validate()
+                .map_err(|_| RevisionError::DigestMismatch {
+                    field: "denominator.exclusions",
+                })?;
+            if let Some(handle) = exclusion.handle.as_ref()
+                && (!named_exclusions.insert(handle.as_str())
+                    || members.contains(handle.as_str()))
+            {
+                return Err(RevisionError::DigestMismatch {
+                    field: "denominator.exclusions",
+                });
+            }
+        }
+        if self.complete != (!self.enumerated.is_empty() && self.exclusions.is_empty()) {
+            return Err(RevisionError::DigestMismatch {
+                field: "denominator.complete",
+            });
+        }
+        if self.recheck_digest != self.compute_digest()? {
+            return Err(RevisionError::DigestMismatch {
+                field: "denominator.recheck_digest",
+            });
+        }
+        Ok(())
+    }
 }
 
 /// One advisory negative-memory extinction candidate.
@@ -219,11 +282,7 @@ impl NegativeMemoryExtinctionCandidate {
                 field: "candidate.missing",
             });
         }
-        if self.denominator.recheck_digest != self.denominator.compute_digest()? {
-            return Err(RevisionError::DigestMismatch {
-                field: "candidate.denominator.recheck_digest",
-            });
-        }
+        self.denominator.validate()?;
         match self.state {
             CandidateState::Complete => {
                 if !self.missing.is_empty() || !self.denominator.complete {
@@ -467,7 +526,7 @@ fn finish(
         recheck_digest: String::new(),
         complete: false,
     };
-    denominator.complete = !denominator.enumerated.is_empty();
+    denominator.complete = !denominator.enumerated.is_empty() && denominator.exclusions.is_empty();
     denominator.recheck_digest = denominator.compute_digest()?;
     check_candidate_id(intake.candidate_id)?;
     let mut candidate = NegativeMemoryExtinctionCandidate {
@@ -495,4 +554,73 @@ fn finish(
     candidate.digest = candidate.compute_digest()?;
     candidate.validate()?;
     Ok(candidate)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+
+    use super::*;
+
+    fn fence() -> StateFence {
+        StateFence::new(
+            EpochId::new(
+                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                    .expect("fixture lineage"),
+                NonZeroU64::new(1).expect("fixture sequence"),
+            )
+            .expect("fixture epoch"),
+            ResourceGeneration::genesis(),
+        )
+    }
+
+    fn handle(value: &str) -> ArtifactId {
+        ArtifactId::new(value).expect("fixture handle")
+    }
+
+    fn omission(value: Option<&str>) -> FailureOmission {
+        FailureOmission {
+            handle: value.map(handle),
+            class: eliot_observation_contracts::FailureOmissionClass::JournalBlind,
+            note: "fixture omission".to_owned(),
+        }
+    }
+
+    #[test]
+    fn closure_complete_requires_an_exact_nonempty_partition() {
+        let mut denominator = ClosureDenominator {
+            fence: fence(),
+            enumerated: vec![handle("member-1")],
+            exclusions: Vec::new(),
+            recheck_digest: String::new(),
+            complete: true,
+        };
+        denominator.recheck_digest = denominator
+            .compute_digest()
+            .expect("complete digest");
+        denominator.validate().expect("complete closure");
+
+        denominator.exclusions.push(omission(Some("member-2")));
+        denominator.recheck_digest = denominator
+            .compute_digest()
+            .expect("incomplete digest");
+        assert!(denominator.validate().is_err());
+    }
+
+    #[test]
+    fn closure_rejects_duplicate_and_overlapping_named_exclusions() {
+        let mut denominator = ClosureDenominator {
+            fence: fence(),
+            enumerated: vec![handle("member-1")],
+            exclusions: vec![omission(Some("member-1")), omission(Some("member-1"))],
+            recheck_digest: String::new(),
+            complete: false,
+        };
+        denominator.recheck_digest = denominator
+            .compute_digest()
+            .expect("fixture digest");
+        assert!(denominator.validate().is_err());
+    }
 }

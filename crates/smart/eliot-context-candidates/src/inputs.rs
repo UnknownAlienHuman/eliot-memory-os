@@ -10,12 +10,11 @@
 //!
 //! Issue #43 designs the eighth provider slot (applicable memory) at this
 //! input boundary without changing the mapped denominator yet: [`MemoryInput`]
-//! carries the evaluated `ApplicableMemorySet` shape structurally (binding,
-//! slot state, applicable/excluded handles, advisory cue hits,
-//! denominator/truncation flags) because the typed
-//! `eliot-memory-projection-contracts` dependency can only land with
-//! workspace admission (registry flip deferred). The mapper still enforces
-//! the seven-slot denominator; [`eight_slots`] and
+//! carries the exact owner [`MemoryProjectionBatch`] and
+//! [`ApplicableMemorySet`] recovered through a typed dependency, plus the
+//! read receipt, canonical source-batch digest, and named recovery owner.
+//! Structural handle lists are not an alternative contract. The mapper still
+//! enforces the seven-slot denominator; [`eight_slots`] and
 //! [`check_denominator_is_seven_or_eight`] name the migration target the
 //! mapper adopts after #41 merges. No eighth provider, unknown field, or
 //! unknown variant is absorbed silently anywhere.
@@ -27,10 +26,11 @@ use eliot_context_contracts::{
     AtomAvailability, AuthorityClass, ContextBinding, ContextError, ContextRecipe, MeasurementRef,
     PrivacyClass, ProofBinding, ProviderId, ProviderRole, SemanticRole, SourceSnapshot,
 };
-use eliot_contracts::{ArtifactId, ContractVersion, RequestId, StateFence, TaskId};
+use eliot_contracts::{ArtifactId, ContractVersion, RequestId, SourceId, StateFence, TaskId};
 use eliot_cue_contracts::{ActivationResult, Completeness};
 use eliot_epistemic_contracts::{ConflictSet, CurrentEpistemicPosition, SourceAssurance};
 use eliot_evidence::{Assertability, EpistemicStatus, EvidenceEnvelope};
+use eliot_memory_projection_contracts::{ApplicableMemorySet, MemoryProjectionBatch};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -545,100 +545,91 @@ pub const MEMORY_PROVIDER: &str = "eliot.memory-applicability.v1";
 /// lands with workspace admission.
 pub const MAX_MEMORY_CUE_HITS: usize = 512;
 
-/// One excluded applicable-memory handle with its substantive reason.
+/// Eighth-slot input: one exact owner memory batch and its applicability set.
 ///
-/// The reason travels as a bounded reason class (never a cue-hit flag):
-/// the typed `ExclusionReason` enum lives in
-/// `eliot-memory-projection-contracts` and is imported directly once that
-/// crate is workspace-admitted. A cue hit on an excluded handle is recorded
-/// on `cue_hit` and never promotes the handle into `applicable`.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct MemoryExclusion {
-    /// Exact canonical handle of the excluded record.
-    pub handle: ArtifactId,
-    /// Stable bounded exclusion reason class.
-    pub reason: String,
-    /// Whether advisory cue-hit evidence named this record.
-    pub cue_hit: bool,
-}
-
-impl MemoryExclusion {
-    /// Validate the exclusion shape.
-    pub fn validate(&self) -> Result<(), ContextError> {
-        check_text(&self.reason, "memory.exclusion.reason")
-    }
-}
-
-/// Eighth-slot input: the evaluated applicable-memory set in structural form.
-///
-/// The binding reuses the exact shared task/scope/fence identity every other
-/// slot binds; `state` reuses the slot-state vocabulary so the memory slot
-/// degrades exactly like the opaque Governor projections (missing/partial
-/// stays visible, never filler). `applicable` names records the evaluator
-/// admitted; `excluded` names records it refused with exact reason classes.
-/// `cue_hits` is advisory evidence only.
+/// The typed batch/set pair is the only source of member identity, roles,
+/// exclusions, denominator, omission/frontier recovery state, and cue-hit
+/// flags. The receipt and canonical batch digest bind this envelope to the
+/// read that produced it; a structural handle list cannot stand in for the
+/// owner contracts.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryInput {
-    /// Shared task/scope/fence/decision identity; must equal the request task.
+    /// Shared task/scope/fence identity; must match the typed batch binding.
     pub binding: ContextBinding,
     /// Completeness state of the memory slot projection.
     pub state: ProjectionState,
-    /// Applicable record handles admitted by the evaluator.
-    pub applicable: Vec<ArtifactId>,
-    /// Excluded record handles with exact reason classes.
-    pub excluded: Vec<MemoryExclusion>,
-    /// Advisory cue-hit handles; flags only, never proof.
-    pub cue_hits: Vec<ArtifactId>,
-    /// Whether the evaluated set carried a known denominator. An unknown
-    /// denominator with applicable members is contradictory input (the
-    /// evaluator fails closed on unknown denominators) and is rejected.
-    pub denominator_known: bool,
-    /// Whether the evaluated set was truncated; travels explicitly.
-    pub truncated: bool,
+    /// Exact owner batch, including omission and frontier recovery identities.
+    pub batch: MemoryProjectionBatch,
+    /// Exact evaluator verdict bound to `batch`.
+    pub applicable: ApplicableMemorySet,
+    /// Exact read receipt that produced the searched-memory state.
+    pub projection_read_receipt: ArtifactId,
+    /// Canonical digest of the complete batch, including recovery state.
+    pub source_batch_digest: String,
+    /// Owner that prevented a complete search, when applicable.
+    pub missing_owner: Option<SourceId>,
 }
 
 impl MemoryInput {
-    /// Validate the memory slot shape: binding, slot-state/member coherence,
-    /// handle uniqueness across applicable/excluded/cue lists, and the
-    /// unknown-denominator closure rule.
+    /// Validate the typed memory slot and its read/recovery identity.
     pub fn validate(&self) -> Result<(), ContextError> {
         self.binding.validate()?;
         self.state.validate()?;
-        if self.applicable.len() > MAX_PROJECTION_MEMBERS {
+        self.batch
+            .validate()
+            .map_err(|_| ContextError::InvalidField("memory.batch"))?;
+        self.applicable
+            .validate_against_batch(&self.batch)
+            .map_err(|_| ContextError::InvalidField("memory.applicable"))?;
+        if self.batch.binding.task_id != self.binding.task_id
+            || self.batch.binding.scope_id != self.binding.scope_id
+            || self.batch.binding.state_fence != self.binding.state_fence
+        {
+            return Err(ContextError::InvalidFence);
+        }
+        if self.source_batch_digest
+            != self
+                .batch
+                .canonical_digest()
+                .map_err(|_| ContextError::InvalidField("memory.source_batch_digest"))?
+        {
+            return Err(ContextError::InvalidField("memory.source_batch_digest"));
+        }
+        check_text(
+            self.projection_read_receipt.as_str(),
+            "memory.projection_read_receipt",
+        )?;
+        if self.applicable.cue_hits_considered > MAX_MEMORY_CUE_HITS {
             return Err(ContextError::Bounds {
-                field: "memory.applicable",
+                field: "memory.cue_hits_considered",
             });
         }
-        if !self.state.allows_members() && !self.applicable.is_empty() {
+        if !self.state.allows_members() && !self.applicable.applicable.is_empty() {
             return Err(ContextError::InvalidField("memory.applicable"));
         }
-        if !self.denominator_known && !self.applicable.is_empty() {
-            return Err(ContextError::InvalidField("memory.applicable"));
+        if (self.batch.coverage.truncated
+            || !self.batch.coverage.omissions.is_empty()
+            || self.batch.coverage.revalidation_required)
+            && matches!(
+                self.state,
+                ProjectionState::Complete | ProjectionState::KnownEmpty
+            )
+        {
+            return Err(ContextError::InvalidField("memory.state"));
         }
-        let mut seen = std::collections::BTreeSet::new();
-        for handle in &self.applicable {
-            if !seen.insert(handle.clone()) {
-                return Err(ContextError::Duplicate("memory.applicable"));
-            }
+        if self.missing_owner.is_some()
+            && self.batch.coverage.omissions.is_empty()
+            && self.batch.coverage.frontier.is_empty()
+        {
+            return Err(ContextError::InvalidField("memory.missing_owner"));
         }
-        for exclusion in &self.excluded {
-            exclusion.validate()?;
-            if !seen.insert(exclusion.handle.clone()) {
-                return Err(ContextError::Duplicate("memory.handles"));
-            }
-        }
-        if self.cue_hits.len() > MAX_MEMORY_CUE_HITS {
-            return Err(ContextError::Bounds {
-                field: "memory.cue_hits",
-            });
-        }
-        let mut seen_hits = std::collections::BTreeSet::new();
-        for handle in &self.cue_hits {
-            if !seen_hits.insert(handle.clone()) {
-                return Err(ContextError::Duplicate("memory.cue_hits"));
-            }
+        if matches!(
+            self.state,
+            ProjectionState::Blocked { .. } | ProjectionState::Unavailable { .. }
+        ) && self.missing_owner.is_none()
+        {
+            return Err(ContextError::InvalidField("memory.missing_owner"));
         }
         Ok(())
     }

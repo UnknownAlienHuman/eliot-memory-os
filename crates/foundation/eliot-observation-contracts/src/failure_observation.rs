@@ -281,7 +281,7 @@ impl FailureObservation {
         Ok(())
     }
 
-    /// Owner coverage is `Complete` with no blind intervals.
+    /// Owner coverage is `Complete` with no blind intervals and no omissions.
     ///
     /// Downstream `Complete` verdicts require this; anything else is an
     /// explicit partial read.
@@ -289,6 +289,7 @@ impl FailureObservation {
     pub fn coverage_complete(&self) -> bool {
         self.coverage.disposition == CoverageDisposition::Complete
             && self.coverage.blind_intervals.is_empty()
+            && self.omissions.is_empty()
     }
 }
 
@@ -407,10 +408,11 @@ impl MemoryRevisionEvidence {
         Ok(())
     }
 
-    /// Owner coverage is `Complete` with no blind intervals.
+    /// Owner coverage is `Complete` with no blind intervals or omissions.
     #[must_use]
     pub fn coverage_complete(&self) -> bool {
         self.coverage.disposition == CoverageDisposition::Complete
             && self.coverage.blind_intervals.is_empty()
+            && self.omissions.is_empty()
     }
 }

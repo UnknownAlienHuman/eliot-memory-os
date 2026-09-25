@@ -40,11 +40,15 @@ fn claim() -> ClaimId {
 }
 
 fn receipt() -> AdmittedReceipt {
+    receipt_with_revision("rev-1")
+}
+
+fn receipt_with_revision(revision: &str) -> AdmittedReceipt {
     AdmittedReceipt::new(AdmittedReceiptParams {
         receipt_id: ReceiptId::new("rc-1").expect("fixture receipt"),
         payload_digest: hex64(),
         owner: SourceId::new("source-epi").expect("fixture source"),
-        revision: "rev-1".to_owned(),
+        revision: revision.to_owned(),
         scope: "scope-epi".to_owned(),
         fence: fence(),
         evidence_digest: hex64(),
@@ -58,6 +62,13 @@ fn receipt() -> AdmittedReceipt {
 }
 
 fn position(currentness: Currentness) -> CurrentEpistemicPosition {
+    position_from_receipt(receipt(), currentness)
+}
+
+fn position_from_receipt(
+    receipt: AdmittedReceipt,
+    currentness: Currentness,
+) -> CurrentEpistemicPosition {
     // A superseded position must name its supersession links.
     let supersession = match currentness {
         Currentness::Current => BTreeSet::new(),
@@ -65,7 +76,7 @@ fn position(currentness: Currentness) -> CurrentEpistemicPosition {
             BTreeSet::from([ArtifactId::new("pos-2").expect("fixture supersession")])
         }
     };
-    CurrentEpistemicPosition::new(receipt(), currentness, supersession, claim())
+    CurrentEpistemicPosition::new(receipt, currentness, supersession, claim())
         .expect("fixture position")
 }
 
@@ -92,6 +103,41 @@ fn from_position_frames_the_owner_envelope() {
         eliot_epistemic_context_provider::PROVIDER_LABEL
     );
     made.validate().expect("contribution validates");
+    assert_eq!(
+        eliot_epistemic_context_provider::FREEZE_ID,
+        "cognitive-rev12-contract-schema-freeze-2026-09-22-r6"
+    );
+}
+
+#[test]
+fn live_revalidation_rejects_revision_drift() {
+    let made = contribution();
+    let live = position_from_receipt(receipt_with_revision("rev-2"), Currentness::Current);
+    let error = made
+        .revalidate_against_live(&live)
+        .expect_err("a changed live owner revision must not bind");
+    assert!(matches!(
+        error,
+        ContributionError::InvalidField {
+            field: "revalidation.revision_coverage_receipt",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn live_revalidation_rejects_non_current_owner_state() {
+    let made = contribution();
+    let error = made
+        .revalidate_against_live(&position(Currentness::Superseded))
+        .expect_err("a superseded live position must not bind");
+    assert!(matches!(
+        error,
+        ContributionError::InvalidField {
+            field: "revalidation.currentness",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -108,8 +154,8 @@ fn from_contribution_attaches_the_provider() {
 #[test]
 fn superseded_position_contributes_nothing() {
     let admitted = position(Currentness::Superseded);
-    let error = EpistemicContextContribution::from_position(&admitted)
-        .expect_err("superseded must fail");
+    let error =
+        EpistemicContextContribution::from_position(&admitted).expect_err("superseded must fail");
     assert!(matches!(error, ContributionError::Upstream(_)));
 }
 

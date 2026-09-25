@@ -12,8 +12,11 @@
 //! * the unit-#3 [`AcceptedSourceProjection`] (frozen owner contract,
 //!   `eliot-dreamer-contracts`), cited by exact handle/revision/digest
 //!   triple with no similarity fallback;
-//! * the owner [`ProviderContribution`] (`eliot-epistemic-contracts`),
-//!   validated and fence-gated, echoed by digest and claim;
+//! * the typed [`EpistemicContextContribution`] adapter from
+//!   `eliot-epistemic-context-provider`, together with the live
+//!   `CurrentEpistemicPosition` read through its admission owner; the
+//!   adapter is revalidated against that live position before any assessment
+//!   cite can bind;
 //! * owner experience envelopes ([`JournalProjection`], [`BankProjection`],
 //!   [`FeedbackProjection`], `eliot-observation-contracts`) for
 //!   outcome/verifier-side evidence, validated as wholes with carried
@@ -78,7 +81,10 @@ use eliot_context_contracts::{ActiveUnderstandingView, ContextError, SemanticRol
 use eliot_dreamer_contracts::self_query::{
     AcceptedSourceProjection, AcceptedSourceRef, SelfQueryContractError,
 };
-use eliot_epistemic_contracts::{ContractError as EpistemicError, ProviderContribution};
+use eliot_epistemic_context_provider::{ContributionError, EpistemicContextContribution};
+use eliot_epistemic_contracts::{
+    ContractError as EpistemicError, CurrentEpistemicPosition,
+};
 use eliot_observation_contracts::{
     BankProjection, ExperienceRecordRef, FeedbackProjection, JournalProjection, ObservationError,
     ObservationKind,
@@ -224,6 +230,9 @@ pub enum AssessmentError {
     /// An epistemic contribution shape is invalid.
     #[error("understanding assessment: {0}")]
     UpstreamEpistemic(#[from] EpistemicError),
+    /// The typed epistemic provider adapter or its live revalidation failed.
+    #[error("understanding assessment provider: {0}")]
+    UpstreamProvider(#[from] ContributionError),
     /// An experience envelope shape is invalid.
     #[error("understanding assessment: {0}")]
     UpstreamObservation(#[from] ObservationError),
@@ -444,14 +453,17 @@ impl EvidenceCite {
         })
     }
 
-    /// Cite one validated owner epistemic contribution by digest and claim.
-    pub fn contribution(contribution: &ProviderContribution) -> Result<Self, AssessmentError> {
+    /// Cite one validated typed epistemic contribution by digest and claim.
+    pub fn contribution(
+        contribution: &EpistemicContextContribution,
+    ) -> Result<Self, AssessmentError> {
         contribution.validate()?;
+        let owner_contribution = &contribution.contribution;
         Ok(Self {
-            handle: ArtifactId::new(contribution.claim.as_str())?,
+            handle: ArtifactId::new(owner_contribution.claim.as_str())?,
             family: CitedFamily::EpistemicContribution,
-            revision: contribution.source_revision.clone(),
-            digest: contribution.position_digest.clone(),
+            revision: owner_contribution.source_revision.clone(),
+            digest: owner_contribution.position_digest.clone(),
         })
     }
 
@@ -616,8 +628,10 @@ pub struct OwnerContext<'a> {
     pub view: &'a ActiveUnderstandingView,
     /// Accepted-source projection for citation checks.
     pub sources: &'a AcceptedSourceProjection,
-    /// Optional admitted epistemic contribution, echoed by digest/claim.
-    pub contribution: Option<&'a ProviderContribution>,
+    /// Optional typed epistemic contribution, echoed by digest/claim.
+    pub contribution: Option<&'a EpistemicContextContribution>,
+    /// Live admitted position used to revalidate the typed contribution.
+    pub live_epistemic_position: Option<&'a CurrentEpistemicPosition>,
     /// Optional experience envelopes for outcome-side evidence.
     pub experience: &'a [ExperienceEvidence<'a>],
 }
@@ -637,11 +651,12 @@ enum CiteBinding {
 /// Match a contribution cite by position digest plus claim plus revision.
 fn match_contribution(
     cite: &EvidenceCite,
-    contribution: &ProviderContribution,
+    contribution: &EpistemicContextContribution,
 ) -> bool {
-    cite.digest == contribution.position_digest
-        && cite.revision == contribution.source_revision
-        && cite.handle.as_str() == contribution.claim.as_str()
+    let owner_contribution = &contribution.contribution;
+    cite.digest == owner_contribution.position_digest
+        && cite.revision == owner_contribution.source_revision
+        && cite.handle.as_str() == owner_contribution.claim.as_str()
 }
 
 /// Match a cite pin against a journal envelope: digest plus source revision.
@@ -890,13 +905,27 @@ fn gate_owner(owner: &OwnerContext<'_>, scope: &AssessmentScope) -> Result<(), A
         &scope.state_fence,
         "assessment.sources_fence",
     )?;
-    if let Some(contribution) = owner.contribution {
-        contribution.validate()?;
-        gate_compatible(
-            &contribution.fence,
-            &scope.state_fence,
-            "assessment.contribution_fence",
-        )?;
+    match (owner.contribution, owner.live_epistemic_position) {
+        (Some(contribution), Some(live)) => {
+            contribution.validate()?;
+            contribution.revalidate_against_live(live)?;
+            gate_compatible(
+                &live.admission.fence,
+                &scope.state_fence,
+                "assessment.contribution_fence",
+            )?;
+        }
+        (None, None) => {}
+        (Some(_), None) => {
+            return Err(AssessmentError::MissingInput {
+                field: "owner.live_epistemic_position",
+            });
+        }
+        (None, Some(_)) => {
+            return Err(AssessmentError::MissingInput {
+                field: "owner.contribution",
+            });
+        }
     }
     for (index, evidence) in owner.experience.iter().enumerate() {
         evidence.validate()?;
