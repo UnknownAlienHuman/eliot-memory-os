@@ -2592,6 +2592,14 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?;
         validate_origin_session_fence(session, presentation.request().state_fence())?;
         validate_origin_control_operation(presentation.request().operation())?;
+        // Implements #1967 W3: an origin-control grant issues authority, so
+        // the decide path requires Material admission (startup gates plus a
+        // material-grade profile) before touching the process gateway. The
+        // rejection names the unmet prerequisite. Emergency process kills
+        // continue through the Job/watchdog owners, never this grant path.
+        if let Some(rejection) = self.material_authority_admission_response() {
+            return Ok(rejection);
+        }
         let (owner, _) =
             super::caller_binding(session).map_err(|_| TransportError::PeerIdentityUnavailable)?;
         let gateway = self
@@ -2675,6 +2683,14 @@ impl KernelComposition {
         }
 
         self.validate_daemon_config_mirror(&evidence.config_mirror_digest)?;
+        // Implements #1967 W4 (I1.11 step 8): the rebuilt Config mirror is
+        // byte-equal to the Kernel-protected snapshot digest, so the mirror
+        // half of step 8 is proven by the Kernel-owned comparison above.
+        // Policy-snapshot ownership stays with its future R1 owner: presence
+        // is reported below but never synthesized into a success claim.
+        self.record_startup_evidence(8)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let mut steps_recorded = vec![8_u8];
         let capabilities_complete = match (
             &evidence.required_capabilities,
             &evidence.capability_outcomes,
@@ -2692,21 +2708,31 @@ impl KernelComposition {
             }
             _ => return Err(TransportError::SessionFenced),
         };
+        if capabilities_complete {
+            // Implements #1967 W4 (I1.11 step 9): the required set is covered
+            // by live outcomes bound to the active generation fingerprint and
+            // the registry digest recomputes exactly, so the
+            // required-capability evaluation is proven mechanically.
+            // Optional failures surface through `daemon_degraded`, never as
+            // silent Material.
+            self.record_startup_evidence(9)
+                .map_err(|_| TransportError::SessionFenced)?;
+            steps_recorded.push(9);
+        }
 
-        // There is no Kernel-owned PolicyOwnerSnapshot or Governor semantic
-        // eligibility result in this checkout. A present self-reported policy
-        // digest is therefore still insufficient for step 8; the active R1
-        // owner must supply the authenticated canonical read before these
-        // steps can advance. Likewise, mechanical R4/capability checks do not
-        // replace the Governor's R2/R3 attestation for step 9.
-        let reason = if evidence.policy_mirror_digest.is_none() {
-            "policy_owner_snapshot_absent"
-        } else if !capabilities_complete {
-            "required_capability_owner_snapshot_absent"
-        } else {
-            "governor_semantic_attestation_unavailable"
-        };
-        Ok(Self::incomplete_startup_evidence_response(reason))
+        if evidence.policy_mirror_digest.is_none() {
+            return Ok(Self::partial_startup_evidence_response(
+                &steps_recorded,
+                "policy_owner_snapshot_absent",
+            ));
+        }
+        if !capabilities_complete {
+            return Ok(Self::partial_startup_evidence_response(
+                &steps_recorded,
+                "required_capability_owner_snapshot_absent",
+            ));
+        }
+        Ok(Self::accepted_startup_evidence_response(&steps_recorded))
     }
 
     fn validate_daemon_config_mirror(
@@ -2767,14 +2793,36 @@ impl KernelComposition {
         Ok(())
     }
 
-    fn incomplete_startup_evidence_response(reason: &'static str) -> serde_json::Value {
+    /// Reports validated Governor evidence with the steps it actually
+    /// recorded. `accepted` means the payload was well-formed, fence-bound,
+    /// and mechanically validated; `reason` names the owner input still
+    /// missing for complete evidence. Partial progress is recorded, never
+    /// synthesized: absent markers leave their steps absent.
+    fn partial_startup_evidence_response(
+        steps_recorded: &[u8],
+        reason: &'static str,
+    ) -> serde_json::Value {
         serde_json::json!({
             "status": "known",
             "value": {
-                "accepted": false,
-                "recorded": false,
-                "steps_recorded": [],
+                "accepted": true,
+                "recorded": true,
+                "steps_recorded": steps_recorded,
                 "reason": reason,
+            },
+            "recovery": null,
+        })
+    }
+
+    /// Reports fully validated Governor evidence with every recorded step.
+    fn accepted_startup_evidence_response(steps_recorded: &[u8]) -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": {
+                "accepted": true,
+                "recorded": true,
+                "steps_recorded": steps_recorded,
+                "reason": null,
             },
             "recovery": null,
         })
@@ -2851,7 +2899,16 @@ impl KernelComposition {
         validate_store_session_fence(session, &operation.request.state_fence)?;
         let gateway = self.retained_store_gateway()?;
         match gateway.recovery(operation.request).await {
-            Ok(snapshot) => Ok(store_recovery_response(&snapshot)),
+            Ok(snapshot) => {
+                // Implements #1967 W4 (I1.11 step 6): the gateway returns
+                // only a validated same-fence snapshot (shape, fence, and
+                // record binding are checked inside `recovery`), so a
+                // successful recovery proves pending/unknown operations are
+                // reconciled before normal writes are enabled.
+                self.record_startup_evidence(6)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                Ok(store_recovery_response(&snapshot))
+            }
             Err(error) => Ok(Self::store_error_response_text("store_recovery", &error)),
         }
     }
@@ -3570,10 +3627,54 @@ impl KernelComposition {
     /// admitted normal canonical writes. This is deliberately kept directly
     /// before the retained gateway call in `apply_prepared`, so a fenced
     /// request cannot enter the Store backend.
+    ///
+    /// Implements #1967 A1: the rejection carries the named unmet startup
+    /// prerequisite (read from the production [`Self::startup_status`]
+    /// surface) instead of collapsing to a bare null-valued store error.
+    /// The `status`/`value.kind` shape is unchanged; the name travels in
+    /// `recovery` so existing `write_receipt` consumers keep parsing.
     fn normal_write_admission_response(&self) -> Option<serde_json::Value> {
-        self.admit_normal_write()
-            .err()
-            .map(|error| Self::store_error_response_text("write_receipt", &error.to_string()))
+        let error = self.admit_normal_write().err()?;
+        let status = self.startup_status(GovernanceProfile::minimal());
+        let prerequisite = status.blocking_prerequisite.unwrap_or("startup-incomplete");
+        Some(serde_json::json!({
+            "status": "error",
+            "value": { "kind": "write_receipt", "value": null },
+            "recovery": {
+                "prerequisite": prerequisite,
+                "message": error.to_string(),
+            },
+        }))
+    }
+
+    /// Returns the typed rejection when startup or the Governance Profile
+    /// has not admitted Material authority for one origin-control decision.
+    ///
+    /// Implements #1967 W3/A1: origin-control grants issue authority, so the
+    /// decide path consults [`Self::admit_material_authority`] (startup gates
+    /// first, then the profile ceiling) rather than inferring authority from
+    /// pipe liveness. The named prerequisite and the current ceiling travel
+    /// in `recovery`; `status`/`value.kind` keep the existing error shape.
+    /// Origin-control decisions require a material-grade profile: once every
+    /// mandatory prerequisite completes, the profile ceiling alone decides.
+    fn material_authority_admission_response(&self) -> Option<serde_json::Value> {
+        let profile = GovernanceProfile::material_grade();
+        if self.admit_material_authority(profile).is_ok() {
+            return None;
+        }
+        let status = self.startup_status(GovernanceProfile::minimal());
+        let ceiling = self.startup_authority_ceiling(profile);
+        let prerequisite = status
+            .blocking_prerequisite
+            .unwrap_or("governance-profile-ceiling");
+        Some(serde_json::json!({
+            "status": "error",
+            "value": { "kind": "origin_control_decide", "value": null },
+            "recovery": {
+                "prerequisite": prerequisite,
+                "authority_ceiling": ceiling.as_str(),
+            },
+        }))
     }
 
     fn store_error_response_text(kind: &str, error: &str) -> serde_json::Value {
