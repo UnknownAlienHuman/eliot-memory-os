@@ -53,6 +53,7 @@ mod bootstrap_draft;
 mod controlboard_status;
 mod first_run_flow;
 mod plugin_preview;
+mod scope_observe;
 mod source_bundle_materializer;
 mod update_installer;
 
@@ -130,6 +131,11 @@ enum Command {
     Backup {
         #[command(subcommand)]
         command: backup_entry::BackupCommand,
+    },
+    /// Observe one explicit workspace root for `WorkScope` attach decisions.
+    Scope {
+        #[command(subcommand)]
+        command: scope_observe::ScopeCommand,
     },
     Version,
     /// Start or reuse the authenticated User Broker and launch Operator.
@@ -619,6 +625,7 @@ fn run() -> Result<i32> {
         Command::Doctor { command } => run_doctor(command),
         Command::ControlBoard { command } => run_controlboard(command),
         Command::Backup { command } => backup_entry::run_backup(command),
+        Command::Scope { command } => Ok(run_scope(command)),
         Command::Dispatch => run_dispatch(),
         Command::Ui => run_ui(),
     }
@@ -856,6 +863,24 @@ fn run_controlboard_status_windows() -> Result<i32> {
         serde_json::to_string_pretty(&controlboard_status::render_status_json(&board)?)?
     );
     Ok(0)
+}
+
+fn run_scope(command: scope_observe::ScopeCommand) -> i32 {
+    match command {
+        scope_observe::ScopeCommand::Observe {
+            repo_root,
+            generation,
+        } => match scope_observe::execute(&repo_root, generation) {
+            Ok(value) => {
+                println!("{value}");
+                0
+            }
+            Err(error) => {
+                println!("{}", error.envelope());
+                error.exit_code()
+            }
+        },
+    }
 }
 
 fn run_bootstrap(command: BootstrapCommand) -> i32 {

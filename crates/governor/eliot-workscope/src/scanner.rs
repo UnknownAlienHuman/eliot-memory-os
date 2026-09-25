@@ -780,6 +780,7 @@ impl ScannerResolverInputs {
             lineage: self.lineage.clone(),
             manifest_boundary: self.manifest_boundary.clone(),
             governing_source_refs: self.governing_source_refs.clone(),
+            supporting_evidence: Vec::new(),
         })
     }
 }

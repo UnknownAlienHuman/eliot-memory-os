@@ -31,13 +31,16 @@
 //! seams rather than re-implementing them.
 
 use super::{
-    GenerationEvidence, GuardTrigger, IdentityEvidence, PrivacyProfile, ProposalSource,
-    RepositoryLineageIdentity, ResolutionAuthentication, ResourceExecutionIdentity,
-    ScopeFingerprint, ScopeKind, ScopeLifecycle, WorkScopeBindingOwner, WorkScopeDescriptor,
-    WorkScopeError, WorkScopeProposal, WorkScopeResolutionReceipt, WorkspaceInstanceIdentity,
-    binding_matches_descriptor, counter, text, unique,
+    EvidenceStanding, GenerationEvidence, GuardTrigger, IdentityEvidence, PrivacyProfile,
+    ProposalSource, RepositoryLineageIdentity, ResolutionAuthentication, ResourceExecutionIdentity,
+    ScopeFingerprint, ScopeKind, ScopeLifecycle, SupportingEvidenceClass, WorkScopeBindingOwner,
+    WorkScopeDescriptor, WorkScopeError, WorkScopeProposal, WorkScopeResolutionReceipt,
+    WorkspaceInstanceIdentity, binding_matches_descriptor, counter, text, unique,
 };
-use eliot_contracts::{StateFence, fences_match_exact};
+use eliot_bootstrap::capture::WorkspaceInstanceFacts;
+use eliot_contracts::{
+    ResourceGeneration, StateFence, canonical_json_bytes, fences_match_exact, sha256_hex,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -428,4 +431,125 @@ pub fn admit_at_trigger(
         scope_ref: bound.scope_ref.clone(),
         decision,
     })
+}
+
+/// Derives validated scope observations from mechanical workspace facts.
+///
+/// This is the identity-derivation policy for bootstrap observations: stable
+/// locators (canonical root, worktree git dir, VCS common dir, root commit)
+/// become identity, while branch, commit, dirty count, and task revision stay
+/// generation/fence evidence and display/manifest/marker/remote values become
+/// supporting evidence only. Identity digests are deterministic over the
+/// observed locators, so the same worktree always derives the same instance
+/// and lineage references and two worktrees never collide. The resource
+/// generation is supplied by the caller from the current fence — it is never
+/// read from clocks, proximity, or recency, which have no input here.
+///
+/// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+///
+/// # Errors
+///
+/// Returns an error when the facts are mechanically invalid or the derived
+/// observations fail validation.
+pub fn derive_observed_resources(
+    facts: &WorkspaceInstanceFacts,
+    resource_generation: ResourceGeneration,
+    display_name: Option<String>,
+) -> Result<ObservedScopeResources, WorkScopeError> {
+    facts
+        .validate()
+        .map_err(|_| WorkScopeError::InvalidSourceEvidence)?;
+    let display_name = display_name
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            std::path::Path::new(&facts.canonical_root)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| facts.canonical_root.clone());
+    let instance_digest = sha256_hex(
+        &canonical_json_bytes(&serde_json::json!({
+            "toplevel": facts.canonical_root,
+            "git_dir": facts.git_dir,
+            "common_dir": facts.common_dir,
+        }))
+        .map_err(|_| WorkScopeError::InvalidSourceEvidence)?,
+    );
+    let lineage = match (&facts.common_dir, &facts.root_commit) {
+        (Some(common_dir), Some(root_commit)) => {
+            let lineage_digest = sha256_hex(
+                &canonical_json_bytes(&serde_json::json!({
+                    "common_dir": common_dir,
+                    "root_commit": root_commit,
+                }))
+                .map_err(|_| WorkScopeError::InvalidSourceEvidence)?,
+            );
+            Some(RepositoryLineageIdentity {
+                lineage_ref: format!("lineage-{lineage_digest}"),
+                object_store_ref: common_dir.clone(),
+                initial_history_ref: root_commit.clone(),
+                normalized_remote_ref: facts.remote_url.clone(),
+                manifest_identity_ref: None,
+            })
+        }
+        _ => None,
+    };
+    let instance = WorkspaceInstanceIdentity {
+        instance_ref: format!("ws-{instance_digest}"),
+        root_identity: facts.canonical_root.clone(),
+        vcs_identity_ref: facts.git_dir.clone(),
+        generation: resource_generation.value(),
+    };
+    let dirty_summary_ref = (facts.dirty_files > 0).then(|| format!("dirty:{}", facts.dirty_files));
+    let generation = GenerationEvidence {
+        branch_ref: facts.head_branch.clone(),
+        commit_ref: facts.head_commit.clone(),
+        dirty_summary_ref,
+        task_revision: None,
+        resource_generation,
+    };
+    let mut supporting_evidence = vec![IdentityEvidence {
+        class: SupportingEvidenceClass::DisplayName,
+        detail_ref: display_name.clone(),
+        standing: EvidenceStanding::Supporting,
+    }];
+    for manifest in &facts.manifest_names {
+        supporting_evidence.push(IdentityEvidence {
+            class: SupportingEvidenceClass::ManifestNameMatch,
+            detail_ref: manifest.clone(),
+            standing: EvidenceStanding::Supporting,
+        });
+    }
+    if let Some(remote) = &facts.remote_url {
+        supporting_evidence.push(IdentityEvidence {
+            class: SupportingEvidenceClass::RemoteUrl,
+            detail_ref: remote.clone(),
+            standing: EvidenceStanding::Supporting,
+        });
+    }
+    if facts.eliot_marker_present {
+        supporting_evidence.push(IdentityEvidence {
+            class: SupportingEvidenceClass::CopiedMarker,
+            detail_ref: ".eliot".to_owned(),
+            standing: EvidenceStanding::Supporting,
+        });
+    }
+    let observed = ObservedScopeResources {
+        kind: if facts.has_git {
+            ScopeKind::GitRepo
+        } else {
+            ScopeKind::Directory
+        },
+        display_name,
+        lineage,
+        instances: vec![instance],
+        canonical_resource_refs: Vec::new(),
+        external_resource_refs: Vec::new(),
+        root_identities: vec![facts.canonical_root.clone()],
+        generation,
+        supporting_evidence,
+    };
+    observed.validate()?;
+    Ok(observed)
 }
