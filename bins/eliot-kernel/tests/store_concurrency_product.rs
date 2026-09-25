@@ -1353,10 +1353,7 @@ async fn precommit_crash_hook_stays_unknown_without_provider_effect() {
         .reconcile(ApiOperationId::new("op-994-fault-pre").expect("operation"))
         .await
         .expect("reconcile");
-    assert!(
-        absent.is_none(),
-        "crashed write left no provider effect"
-    );
+    assert!(absent.is_none(), "crashed write left no provider effect");
     // Unknown is never retried blindly: the same reserved inputs are refused
     // while the faulted attempt's ORS reservation stands.
     let (ctx_dup, transition_dup, rev_dup, ord_dup, seed_dup) =
