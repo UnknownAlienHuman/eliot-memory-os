@@ -141,8 +141,9 @@ pub(crate) use service_registration_projection::{
 };
 
 pub use backup_control::{
-    AcceptedWatchdogBackupMethod, BackupControlHandle, accepted_watchdog_backup_methods,
-    register_backup_control, start_backup_control, stop_backup_control,
+    AcceptedWatchdogBackupMethod, BackupControlError, BackupControlHandle, WatchdogBackupOutcome,
+    WatchdogBackupRequest, accepted_watchdog_backup_methods, register_backup_control,
+    start_backup_control, stop_backup_control,
 };
 pub use heartbeat_transport::{
     FENCE_SEQUENCE, HeartbeatTransport, HeartbeatTransportDescriptor, HeartbeatTransportError,
@@ -306,7 +307,19 @@ pub struct GapRecoveryDisposition {
 /// Minimal independent sensor surface used by the SCM sibling process.
 pub struct IndependentKernelSensor {
     watchdog: Mutex<Option<Watchdog>>,
-    spool: WatchdogSpool,
+    /// The single owner handle for this installation's `watchdog.redb`.
+    ///
+    /// Shared so the owner-bound backup port binds to this exact handle instead
+    /// of a second database opened on the same file. Every append below still
+    /// goes through it.
+    spool: Arc<WatchdogSpool>,
+    /// Owner-bound backup port over [`Self::spool`], carrying this owner's own
+    /// installation identity and generation.
+    ///
+    /// Built once at construction so every later backup request binds against
+    /// owner-held values rather than caller input, and so the composition
+    /// reaches the spool only through the owner that also appends heartbeats.
+    backup_port: Arc<WatchdogBackupPort>,
     /// Retained installer-approved binding and its no-follow leases for
     /// production sensors; `None` for test-constructed sensors, which carry no
     /// protected leases. Export identities always come from the stored fields
@@ -339,7 +352,7 @@ impl IndependentKernelSensor {
         binding: WatchdogRuntimeBinding,
         watchdog_epoch: u64,
     ) -> Result<Self, SpoolError> {
-        let spool = WatchdogSpool::open_runtime_binding(&binding)?;
+        let spool = Arc::new(WatchdogSpool::open_runtime_binding(&binding)?);
         let installation_id = binding
             .selected_manifest
             .runtime_launch
@@ -352,6 +365,7 @@ impl IndependentKernelSensor {
             .runtime_launch
             .authority_generation
             .value();
+        let backup_port = owner_backup_port(&spool, &installation_id, watchdog_generation)?;
         let epoch_lineage = binding
             .selected_manifest
             .runtime_launch
@@ -367,6 +381,7 @@ impl IndependentKernelSensor {
         Ok(Self {
             watchdog: Mutex::new(Some(watchdog)),
             spool,
+            backup_port,
             _runtime_binding: Some(binding),
             installation_id,
             watchdog_generation,
@@ -385,7 +400,7 @@ impl IndependentKernelSensor {
     pub fn open_runtime_binding_without_epoch(
         binding: WatchdogRuntimeBinding,
     ) -> Result<Self, SpoolError> {
-        let spool = WatchdogSpool::open_runtime_binding(&binding)?;
+        let spool = Arc::new(WatchdogSpool::open_runtime_binding(&binding)?);
         let installation_id = binding
             .selected_manifest
             .runtime_launch
@@ -398,6 +413,7 @@ impl IndependentKernelSensor {
             .runtime_launch
             .authority_generation
             .value();
+        let backup_port = owner_backup_port(&spool, &installation_id, watchdog_generation)?;
         let epoch_lineage = binding
             .selected_manifest
             .runtime_launch
@@ -408,6 +424,7 @@ impl IndependentKernelSensor {
         Ok(Self {
             watchdog: Mutex::new(None),
             spool,
+            backup_port,
             _runtime_binding: Some(binding),
             installation_id,
             watchdog_generation,
@@ -614,10 +631,10 @@ impl IndependentKernelSensor {
         }
         let database = Database::create(watchdog_spool_path(state_dir))
             .map_err(|error| SpoolError::Database(error.to_string()))?;
-        let spool = WatchdogSpool {
+        let spool = Arc::new(WatchdogSpool {
             database,
             _path_lease: None,
-        };
+        });
         spool.initialize_or_recover()?;
         let watchdog = Watchdog::new(
             eliot_watchdog_core::WatchdogConfig::default(),
@@ -630,9 +647,11 @@ impl IndependentKernelSensor {
         let epoch_lineage =
             eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
                 .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+        let backup_port = owner_backup_port(&spool, installation_id, watchdog_generation)?;
         Ok(Self {
             watchdog: Mutex::new(Some(watchdog)),
             spool,
+            backup_port,
             _runtime_binding: None,
             installation_id: installation_id.to_owned(),
             watchdog_generation,
@@ -1001,6 +1020,10 @@ impl KernelWatchdogPort for IndependentKernelSensor {
     fn installation_identity(&self) -> Option<&str> {
         Some(self.installation_id.as_str())
     }
+
+    fn spool_backup_port(&self) -> Option<Arc<WatchdogBackupPort>> {
+        Some(Arc::clone(&self.backup_port))
+    }
 }
 
 /// Closed observation-source label for an admission-reload rejection.
@@ -1094,6 +1117,40 @@ pub trait KernelWatchdogPort: Send + Sync + 'static {
     fn installation_identity(&self) -> Option<&str> {
         None
     }
+
+    /// The owner-bound backup port over this port's own spool, when it has one.
+    ///
+    /// This is the single route from the composition to the Watchdog spool. An
+    /// implementation that owns no durable spool returns `None`, which fails
+    /// closed at registration instead of substituting a second handle or a
+    /// synthetic one. It grants no authority: the port only performs bounded
+    /// owner reads and bounded quarantined appends, and binds every request
+    /// against the owner's own retained installation identity and generation.
+    fn spool_backup_port(&self) -> Option<Arc<WatchdogBackupPort>> {
+        None
+    }
+}
+
+/// Binds one owner-held backup port to the exact spool handle that owner owns.
+///
+/// The default page window is the spool's own finite export ceiling set, so the
+/// port is bounded from construction and no unbounded window is ever admitted.
+///
+/// # Errors
+///
+/// Returns [`SpoolError`] when the port cannot bind the owner identity, the
+/// generation, or the default bounded window.
+fn owner_backup_port(
+    spool: &Arc<WatchdogSpool>,
+    installation_id: &str,
+    watchdog_generation: u64,
+) -> Result<Arc<WatchdogBackupPort>, SpoolError> {
+    Ok(Arc::new(WatchdogBackupPort::new(
+        Arc::clone(spool),
+        installation_id.to_owned(),
+        watchdog_generation,
+        WatchdogSpoolBackupLimits::default(),
+    )?))
 }
 
 async fn report_gap_nonfatal(kernel: &dyn KernelWatchdogPort, reason: GapRecoveryReason) {

@@ -37,6 +37,14 @@ pub use authority_state::{WatchdogAuthorityState, WatchdogReadiness};
 pub struct WatchdogComposition {
     runtime: Runtime,
     admission: Arc<dyn WatchdogAdmissionSource>,
+    /// The injected Kernel port, retained so the admitted backup control port
+    /// can reach the owner-held spool through the same owner the supervision
+    /// task supervises through.
+    ///
+    /// The supervision task holds its own clone for the whole process lifetime,
+    /// so retaining one here adds no second owner, no second spool handle, and
+    /// no effect: the admitted backup port is the only reader this exposes.
+    kernel: Arc<dyn KernelWatchdogPort>,
     authority_state: WatchdogAuthorityStateCell,
     config: WatchdogConfig,
     task: eliot_runtime::SupervisedHandle,
@@ -152,12 +160,13 @@ impl WatchdogComposition {
         let authority_state = WatchdogAuthorityStateCell::new();
         let task_authority_state = authority_state.clone();
         let task_heartbeat = heartbeat.clone();
+        let task_kernel = Arc::clone(&kernel);
         let interval = config.tick_interval;
         let task = match runtime.supervisor(SupervisionStrategy::OneForOne).spawn(
             SERVICE_NAME,
             ChildClass::Worker,
             move |token| {
-                let kernel = kernel.clone();
+                let kernel = task_kernel.clone();
                 let admission = task_admission.clone();
                 let host = task_host.clone();
                 let authority_state = task_authority_state.clone();
@@ -261,6 +270,7 @@ impl WatchdogComposition {
         Ok(Self {
             runtime,
             admission,
+            kernel,
             authority_state,
             config,
             task,
@@ -356,19 +366,33 @@ impl WatchdogComposition {
         }
     }
 
-    /// Registers wiring-only Watchdog backup control against this composition.
+    /// Registers the admitted backup control port against this composition.
     ///
-    /// Delegates to [`crate::backup_control::register_backup_control`]. Backup
-    /// control holds no supervision task: it cannot stall supervision or
-    /// exhaust the Control Reserve.
+    /// Delegates to [`crate::backup_control::register_backup_control`], which
+    /// binds the port to the owner-held spool reachable through
+    /// [`Self::owner_backup_port`]. Backup control holds no supervision task:
+    /// it cannot stall supervision or exhaust the Control Reserve.
     ///
     /// # Errors
     ///
-    /// Returns an error when the composition identity is unexpected.
+    /// Returns an error when the composition identity is unexpected or when
+    /// the injected kernel port owns no spool, so no owner-bound backup port
+    /// exists to admit.
     pub fn register_backup_control(
         &self,
     ) -> Result<crate::backup_control::BackupControlHandle, CompositionError> {
         crate::backup_control::register_backup_control(self)
+    }
+
+    /// Returns the owner-bound backup port exposed by this composition's
+    /// kernel port, or `None` when the injected port owns no spool.
+    ///
+    /// This is the only route from the composition to the Watchdog spool: the
+    /// composition holds no `WatchdogSpool` of its own, so the single owner
+    /// handle lives inside the sensor that also appends every heartbeat and
+    /// gap record. No second database handle is opened anywhere on this path.
+    pub(crate) fn owner_backup_port(&self) -> Option<Arc<WatchdogBackupPort>> {
+        self.kernel.spool_backup_port()
     }
 
     /// Requests bounded shutdown from an SCM control path.
@@ -423,12 +447,22 @@ async fn wait_for_shutdown(shutdown_requested: Arc<AtomicBool>) -> bool {
     }
 }
 
-/// Narrow admitted backup control port over the owner-held spool.
+/// Owner-bound admitted backup control port over the Watchdog spool.
+///
+/// The port is bound to the exact owner that holds the spool: the construction
+/// seam is the same
+/// [`IndependentKernelSensor`](crate::IndependentKernelSensor) that appends
+/// through `KernelWatchdogPort::supervise`, so the composition's kernel port
+/// hands out this one object and no second database handle is ever opened. The
+/// port also carries that owner's retained installation identity and watchdog
+/// generation, and binds every request and every fence against those
+/// owner-held values, failing closed on any mismatch.
 ///
 /// The caller must be the admitted backup role (`BackupRole::SpoolOwner` per
 /// #954). Role authentication happens above this port: this crate carries no
 /// `eliot-protocol` dependency, so this type takes no role argument and mints
-/// no authority.
+/// no authority. The port therefore validates no peer identity and no
+/// generation fence of its own; those need the role-bound control contract.
 ///
 /// Every method runs OUTSIDE the heartbeat tick with finite limits, so backup
 /// work can never block Control Reserve through unbounded work. Captures are
@@ -439,42 +473,98 @@ async fn wait_for_shutdown(shutdown_requested: Arc<AtomicBool>) -> bool {
 /// work, and changes nothing on the start/readiness/heartbeat paths.
 pub struct WatchdogBackupPort {
     spool: Arc<WatchdogSpool>,
+    source_installation: String,
+    watchdog_generation: u64,
     limits: WatchdogSpoolBackupLimits,
 }
 
 impl WatchdogBackupPort {
-    /// Binds the admitted port to the composition's spool owner handle with
-    /// finite page limits.
+    /// Binds the admitted port to the composition's spool owner handle, that
+    /// owner's retained identities, and finite page limits.
     ///
     /// The spool handle is the same owner the supervision path appends
     /// through; no second database handle is opened and no global state is
-    /// introduced. `limits` bounds every later [`Self::read_page`] call.
+    /// introduced. `source_installation` and `watchdog_generation` are the
+    /// owner's own retained binding values, not caller input: every later
+    /// capture and page read is bound against them. `limits` bounds every
+    /// later [`Self::read_page`] call.
     ///
     /// # Errors
     ///
     /// Returns [`SpoolError`] when `limits` is unbounded, unprogressable, or
-    /// above its hard ceilings.
-    ///
-    /// The final backup composition (#945 follow-up) is the designated
-    /// production caller that binds the owner spool handle; until that wiring
-    /// lands this constructor is crate-reachable staging, not dead logic.
-    #[allow(
-        dead_code,
-        reason = "constructed by the #945 final backup composition wiring"
-    )]
+    /// above its hard ceilings, when the owner installation identity is
+    /// unusable, or when the owner generation is zero.
     pub(crate) fn new(
         spool: Arc<WatchdogSpool>,
+        source_installation: String,
+        watchdog_generation: u64,
         limits: WatchdogSpoolBackupLimits,
     ) -> Result<Self, SpoolError> {
         limits.validate()?;
-        Ok(Self { spool, limits })
+        if source_installation.trim().is_empty()
+            || source_installation.chars().any(char::is_control)
+        {
+            return Err(SpoolError::Corrupt(
+                "watchdog backup port refuses an unusable owner installation identity".to_owned(),
+            ));
+        }
+        if watchdog_generation == 0 {
+            return Err(SpoolError::Corrupt(
+                "watchdog backup port refuses an uninitialized owner generation".to_owned(),
+            ));
+        }
+        Ok(Self {
+            spool,
+            source_installation,
+            watchdog_generation,
+            limits,
+        })
+    }
+
+    /// Returns the owner-held installation identity this port is bound to.
+    #[must_use]
+    pub fn source_installation(&self) -> &str {
+        &self.source_installation
+    }
+
+    /// Returns the owner-held watchdog generation this port is bound to.
+    #[must_use]
+    pub const fn watchdog_generation(&self) -> u64 {
+        self.watchdog_generation
+    }
+
+    /// Binds one capture request against the owner's retained identity.
+    ///
+    /// The requested source installation and watchdog generation are compared
+    /// with the values the owner itself holds, so a request naming another
+    /// installation or another generation fails closed instead of producing a
+    /// fence that claims the wrong provenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when either binding differs from the owner's.
+    fn check_owner_bindings(&self, params: &CaptureFenceParams) -> Result<(), SpoolError> {
+        if params.source_installation != self.source_installation {
+            return Err(SpoolError::Corrupt(
+                "watchdog backup port refuses a capture for a foreign source installation"
+                    .to_owned(),
+            ));
+        }
+        if params.watchdog_generation != self.watchdog_generation {
+            return Err(SpoolError::Corrupt(
+                "watchdog backup port refuses a capture for a foreign watchdog generation"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Captures one bounded coherent fence through the spool owner.
     ///
     /// Thin delegation to `WatchdogSpool::snapshot_backup`: one bounded read
-    /// transaction over header, high-water, and retained entries. The
-    /// requester bound in `params` must be the admitted backup role.
+    /// transaction over header, high-water, and retained entries, after the
+    /// request is bound against the owner-held installation identity and
+    /// generation.
     ///
     /// # Errors
     ///
@@ -485,40 +575,75 @@ impl WatchdogBackupPort {
         params: CaptureFenceParams,
         limits: WatchdogSpoolBackupLimits,
     ) -> Result<WatchdogSpoolFence, SpoolError> {
+        self.check_owner_bindings(&params)?;
         self.spool.snapshot_backup(params, limits)
     }
 
-    /// Reads one finite page of a captured fence.
+    /// Reads one finite, unexpired page of a captured fence.
     ///
     /// Thin delegation to `backup::read_page`, bounded by the limits fixed at
-    /// [`Self::new`]. Continuation binds the one fence digest; drift fails
-    /// closed instead of returning partial coverage.
+    /// [`Self::new`]. The fence is bound against the owner-held installation
+    /// identity and generation, and the clock-dependent page-freshness and
+    /// whole-snapshot lifetime windows are consulted here against the owner's
+    /// own clock: an expired fence is incomplete, never a current empty page.
+    /// Continuation binds the one fence digest, so drift fails closed instead
+    /// of returning partial coverage.
     ///
     /// # Errors
     ///
-    /// Returns [`SpoolError`] when the page runs past the retained window or
-    /// the cumulative bound.
+    /// Returns [`SpoolError`] when the fence is not this owner's, the page is
+    /// older than the admitted freshness or lifetime window, the page runs
+    /// past the retained window, or the cumulative bound is exceeded.
     pub fn read_page(
         &self,
         fence: &WatchdogSpoolFence,
         page_index: u64,
     ) -> Result<WatchdogSpoolSnapshotPage, SpoolError> {
+        if fence.source_installation != self.source_installation {
+            return Err(SpoolError::Corrupt(
+                "watchdog backup port refuses a page read for a foreign source installation"
+                    .to_owned(),
+            ));
+        }
+        if fence.watchdog_generation != self.watchdog_generation {
+            return Err(SpoolError::Corrupt(
+                "watchdog backup port refuses a page read for a foreign watchdog generation"
+                    .to_owned(),
+            ));
+        }
+        let now_ms = crate::current_unix_ms()?;
+        if now_ms < fence.captured_at_ms {
+            return Err(SpoolError::Corrupt(
+                "watchdog backup port refuses a page read from a future-dated capture".to_owned(),
+            ));
+        }
+        let age_ms = now_ms - fence.captured_at_ms;
+        if age_ms > self.limits.page_ttl_ms || age_ms > self.limits.snapshot_lifetime_ms {
+            return Err(SpoolError::Corrupt(
+                "watchdog backup port refuses a page read from an expired capture".to_owned(),
+            ));
+        }
         crate::watchdog_spool::backup::read_page(fence, page_index, &self.limits)
     }
 
-    /// Imports bounded restore steps into the isolated destination only.
+    /// Imports bounded restore steps and reports whether recovery is accepted.
     ///
-    /// Thin delegation to `WatchdogSpool::import_backup_isolated`. `dest`
-    /// must differ from both `source` and the active installation; old signed
-    /// observations stay historical evidence under their exact source
-    /// identity and grant no active supervision, heartbeat, lease, or epoch
-    /// authority. A repeated byte-identical import appends nothing; unknown
-    /// reconciliation stays visible and blocks acceptance.
+    /// Thin delegation to `WatchdogSpool::import_backup_isolated`, with the
+    /// request's `active` installation bound against the owner-held identity
+    /// so an import can never be presented as isolated from the wrong live
+    /// installation. `dest` must differ from both `source` and that active
+    /// identity; old signed observations stay historical evidence under their
+    /// exact source identity and grant no active supervision, heartbeat,
+    /// lease, or epoch authority. A repeated byte-identical import appends
+    /// nothing; the observed disposition is then passed through
+    /// `acceptance_allowed`, so an unresolved reconciliation blocks recovery
+    /// acceptance instead of returning zero by default.
     ///
     /// # Errors
     ///
-    /// Returns [`SpoolError`] when the destination is not isolated, the step
-    /// chain breaks, content conflicts, or reconciliation is unknown.
+    /// Returns [`SpoolError`] when the active identity is not the owner's, the
+    /// destination is not isolated, the step chain breaks, content conflicts,
+    /// or reconciliation is unknown.
     pub fn import_isolated(
         &self,
         source: &str,
@@ -526,7 +651,16 @@ impl WatchdogBackupPort {
         active: &str,
         steps: &[SpoolRestoreStep],
     ) -> Result<SpoolRestoreDisposition, SpoolError> {
-        self.spool
-            .import_backup_isolated(source, dest, active, steps)
+        if active != self.source_installation {
+            return Err(SpoolError::Corrupt(
+                "watchdog backup port refuses an import that does not name this owner as the active installation"
+                    .to_owned(),
+            ));
+        }
+        let disposition = self
+            .spool
+            .import_backup_isolated(source, dest, active, steps)?;
+        crate::watchdog_spool::backup::acceptance_allowed(disposition)?;
+        Ok(disposition)
     }
 }

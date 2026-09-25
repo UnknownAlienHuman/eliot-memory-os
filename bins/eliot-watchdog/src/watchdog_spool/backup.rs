@@ -250,11 +250,16 @@ pub enum SpoolMarkerDetail {
         /// Retained corrupt digest, or `"missing"` when unreadable.
         corrupt_digest: String,
     },
-    /// Spool-local intent with its evidence digests and owner lineage.
+    /// Spool-local intent with its evidence digests, owner lineage, and the
+    /// exact observed Governor-unavailability reason.
     ///
     /// Evidence refs are 64-hex digests and the lineage repeats only the
     /// owner identities the export cursor already binds; no authority,
-    /// lease, or epoch material is carried.
+    /// lease, or epoch material is carried. `governor_unavailable_reason` is
+    /// the retained proof ceiling of the intent: the exact observed
+    /// admission/lease failure that opened the episode. Dropping it would
+    /// present an unreconciled intent as a bare escalation with no stated
+    /// cause, so it travels verbatim with the marker.
     Intent {
         /// Bounded evidence digest refs carried by the retained record.
         evidence_refs: Vec<String>,
@@ -264,6 +269,9 @@ pub enum SpoolMarkerDetail {
         lineage_generation: u64,
         /// Owner epoch carried by the retained record.
         lineage_epoch: u64,
+        /// Exact observed Governor-unavailability reason that opened the
+        /// episode, preserved verbatim from the retained record.
+        governor_unavailable_reason: GapRecoveryReason,
     },
 }
 
@@ -384,6 +392,16 @@ pub struct WatchdogSpoolFence {
     pub snapshot_operation_id: String,
     /// Fence shape schema version ([`SPOOL_FENCE_SCHEMA_VERSION`]).
     pub schema_version: u16,
+    /// Observation timestamp of the newest retained member the capture
+    /// covers.
+    ///
+    /// This is the fence's capture anchor, taken from the owner's own retained
+    /// record rather than from a caller-supplied or wall-clock instant, so it
+    /// is never later than the newest evidence the fence actually carries.
+    /// A page or whole-snapshot lifetime window is measured from here: a
+    /// fence whose newest evidence is older than the admitted window is
+    /// expired, not current.
+    pub captured_at_ms: u64,
     /// Compatible canonical capture reference, when fence-matched.
     pub canonical_ref: Option<String>,
     /// Compatible ORS capture reference, when fence-matched.
@@ -654,6 +672,7 @@ fn marker_detail(payload: &WatchdogSpoolPayload) -> Result<Option<SpoolMarkerDet
             lineage_installation_id,
             lineage_generation,
             lineage_epoch,
+            governor_unavailable_reason,
             ..
         }
         | WatchdogSpoolPayload::IncidentIntent {
@@ -661,12 +680,14 @@ fn marker_detail(payload: &WatchdogSpoolPayload) -> Result<Option<SpoolMarkerDet
             lineage_installation_id,
             lineage_generation,
             lineage_epoch,
+            governor_unavailable_reason,
             ..
         } => Ok(Some(SpoolMarkerDetail::Intent {
             evidence_refs: evidence_refs.clone(),
             lineage_installation_id: lineage_installation_id.clone(),
             lineage_generation: *lineage_generation,
             lineage_epoch: *lineage_epoch,
+            governor_unavailable_reason: *governor_unavailable_reason,
         })),
     }
 }
@@ -849,6 +870,17 @@ pub fn capture_fence(
             "watchdog spool backup retained count exceeds the bounded counter".to_owned(),
         )
     })?;
+    // The capture anchor is the newest retained observation, so the lifetime
+    // window can only ever understate freshness, never overstate it.
+    let captured_at_ms = entries
+        .last()
+        .map(|entry| entry.observed_at_ms)
+        .ok_or_else(|| {
+            SpoolError::Corrupt(
+                "watchdog spool backup capture covers no retained entries; a bare record vector is not a fence"
+                    .to_owned(),
+            )
+        })?;
     Ok(WatchdogSpoolFence {
         header: header.clone(),
         high_water,
@@ -864,6 +896,7 @@ pub fn capture_fence(
         requester_principal: params.requester_principal.clone(),
         snapshot_operation_id: params.snapshot_operation_id.clone(),
         schema_version: SPOOL_FENCE_SCHEMA_VERSION,
+        captured_at_ms,
         canonical_ref: params.canonical_ref.clone(),
         ors_ref: params.ors_ref.clone(),
         content_digest: sha256_hex(&content_bytes),
@@ -876,15 +909,22 @@ pub fn capture_fence(
 /// members starting at `page_index * per_page`, further truncated so the
 /// cumulative bytes stay within `max_bytes` after always covering at least
 /// one member. The cumulative members and bytes through the end of the page
-/// must stay within `max_items` and `max_bytes`; continuation binds the one
-/// fence digest, so a page past the retained window or past the cumulative
-/// bound fails instead of drifting.
+/// must stay within `max_items`, `max_bytes`, and `max_work_units`; the work
+/// ceiling is consulted here, not only shape-validated, so one page can never
+/// examine more retained members than the admitted bounded window allows.
+/// Continuation binds the one fence digest, so a page past the retained window
+/// or past the cumulative bound fails instead of drifting.
+///
+/// The clock-dependent `page_ttl_ms` and `snapshot_lifetime_ms` bounds are not
+/// decidable from fence data alone; they are enforced by the owner-bound
+/// [`crate::WatchdogBackupPort::read_page`], which holds the owner clock and
+/// the fence's [`WatchdogSpoolFence::captured_at_ms`] anchor.
 ///
 /// # Errors
 ///
 /// Returns [`SpoolError::Corrupt`] when the limits are unusable, the page
-/// index runs past the retained window or the cumulative bound, or a bounded
-/// counter overflows.
+/// index runs past the retained window or past a cumulative bound, or a
+/// bounded counter overflows.
 pub fn read_page(
     fence: &WatchdogSpoolFence,
     page_index: u64,
@@ -951,6 +991,15 @@ pub fn read_page(
     if cumulative_bytes > limits.max_bytes {
         return Err(corrupt(
             "watchdog spool backup page exceeds the cumulative byte bound",
+        ));
+    }
+    // The work ceiling is consulted, not only shape-validated: the members this
+    // page examined must fit the admitted bounded work window.
+    let examined = u64::try_from(end_idx)
+        .map_err(|_| corrupt("watchdog spool backup page width exceeds the bounded counter"))?;
+    if examined > limits.max_work_units {
+        return Err(corrupt(
+            "watchdog spool backup page exceeds the bounded work ceiling",
         ));
     }
     let mut digest_material = Vec::new();

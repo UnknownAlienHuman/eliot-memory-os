@@ -1,46 +1,78 @@
-//! Wiring-only Watchdog backup control registration.
+//! Admitted Watchdog backup control port and its bounded request dispatch.
 //!
-//! Responsibility: expose the closed Watchdog-supported backup method subset
-//! and bounded registration/start-stop handles. No pipe is opened, no ACL or
-//! transport is implemented, no archive bytes are interpreted, no authority is
-//! minted, and no domain algorithm runs here. All effects belong to the owning
-//! [`crate::KernelWatchdogPort`] implementation; this module only validates
-//! request shapes and fails unsupported methods before effects.
+//! Responsibility: bind the closed Watchdog-supported backup method subset to
+//! the owner-bound [`WatchdogBackupPort`] that the composition reaches through
+//! its own kernel port, and dispatch the accepted methods that map to real
+//! owner capability. No pipe is opened, no ACL or transport is implemented, no
+//! archive bytes are interpreted, no authority is minted, and no domain
+//! algorithm runs here. All spool effects belong to the owning spool port;
+//! this module only resolves the closed method table and forwards.
 //!
 //! Supported subset (closed): `READ_SNAPSHOT_PAGE`, `VERIFY_ARCHIVE`,
 //! `RESTORE_STATUS`, `RECONCILE_RESTORE`. Rehearsal completion never maps to
 //! cutover; `ADMIT_CUTOVER` and `PREPARE_ISOLATED_RESTORE` are never accepted
-//! by the Watchdog. Canonical signal pipe (observed only, never opened here):
-//! `\\.\pipe\eliot\watchdog\signals`.
+//! by the Watchdog. The canonical Watchdog signal pipe is observed only and is
+//! never opened here: `\\.\pipe\eliot\watchdog\signals`.
+//!
+//! What this module deliberately does **not** do, because the Watchdog holds no
+//! value that could satisfy the check honestly:
+//!
+//! - it validates no peer SID, service, nonce, or session. No peer presents
+//!   one here: the transport owner is above this port, and the #954
+//!   `BackupAuthenticatedPrincipal` is not wired into this crate.
+//! - it validates no generation fence. The composition publishes an admitted
+//!   epoch pair, not a backup generation fence, so a "live generation equals
+//!   fence generation" claim here would compare the owner against itself.
+//! - it validates no response identity. No response exists at registration or
+//!   dispatch, so an equal-digest echo here would be fabricated evidence.
+//!
+//! Those three checks are properties of the role-bound backup control contract
+//! and belong to whoever admits the authenticated peer and its responses.
 //!
 //! Supervision priority: backup control holds no supervision task and must
-//! never stall the supervision tick loop or exhaust the Control Reserve.
+//! never stall the supervision tick loop or exhaust the Control Reserve. Every
+//! dispatched request is a finite, bounded owner read or a bounded owner write
+//! and runs outside the heartbeat tick.
 
-use crate::{CompositionError, PROTOCOL_VERSION, SERVICE_NAME, WatchdogComposition};
+use std::sync::Mutex;
 
-/// Canonical Watchdog signal pipe observed by backup control (never opened here).
-pub const WATCHDOG_BACKUP_SIGNAL_PIPE: &str = r"\\.\pipe\eliot\watchdog\signals";
+use thiserror::Error;
 
-/// Bounded text field limit mirrored from the backup protocol shape boundary.
-pub const MAX_BACKUP_TEXT_BYTES: usize = 8 * 1024;
-/// Bounded page or artifact body limit mirrored from the backup protocol shape.
-pub const MAX_BACKUP_CONTENT_BYTES: usize = 64 * 1024;
-/// Bounded canonical payload limit mirrored from the backup protocol shape.
-pub const MAX_BACKUP_PAYLOAD_BYTES: usize = 256 * 1024;
-/// Bounded snapshot page member limit mirrored from the backup protocol shape.
-pub const MAX_BACKUP_PAGE_MEMBERS: u32 = 1024;
-
-// Shape-bound ordering pins the mirrored protocol ceilings: text fields fit
-// page bodies, page bodies fit canonical payloads, and pages are nonempty.
-const _: () = assert!(MAX_BACKUP_TEXT_BYTES <= MAX_BACKUP_CONTENT_BYTES);
-const _: () = assert!(MAX_BACKUP_CONTENT_BYTES <= MAX_BACKUP_PAYLOAD_BYTES);
-const _: () = assert!(MAX_BACKUP_PAGE_MEMBERS > 0);
+use crate::{
+    CompositionError, PROTOCOL_VERSION, SERVICE_NAME, SpoolError, SpoolRestoreDisposition,
+    SpoolRestoreStep, WatchdogBackupPort, WatchdogComposition, WatchdogSpoolFence,
+    WatchdogSpoolSnapshotPage,
+};
 
 /// Upper bound for concurrently registered backup control handles per process.
 ///
-/// Wiring-only: registration fails closed past this bound instead of growing
-/// an unbounded listener or task set.
+/// Registration is a bounded process-local slot, not a listener and not a
+/// task: the Watchdog opens no backup listener and spawns no backup task, so
+/// the receipt names only the registration slot it occupies. Registration
+/// fails closed past this bound instead of growing an unbounded set.
 pub const MAX_BACKUP_CONTROL_HANDLES: u64 = 8;
+
+/// Number of bounded registration slots, derived from the declared ceiling.
+///
+/// Declared as its own literal rather than a truncating cast of the `u64`
+/// ceiling, and pinned equal to it by the compile-time assertion below, so the
+/// array length and the public bound can never disagree.
+const REGISTRATION_SLOT_COUNT: usize = 8;
+
+const _: () = assert!(REGISTRATION_SLOT_COUNT as u64 == MAX_BACKUP_CONTROL_HANDLES);
+
+/// Bounded process-local registration table.
+///
+/// One `true` entry is one occupied slot. The table holds no authority, no
+/// handle to a live resource, and no caller-supplied value: it exists only so
+/// a registration receipt names a real bounded allocation instead of a
+/// constant, and so `stop_backup_control` and composition shutdown release
+/// exactly what was taken.
+static REGISTRATION_SLOTS: Mutex<[bool; REGISTRATION_SLOT_COUNT]> =
+    Mutex::new([false; REGISTRATION_SLOT_COUNT]);
+
+/// Whether the composition has already closed backup control.
+static REGISTRATION_CLOSED: Mutex<bool> = Mutex::new(false);
 
 /// Closed backup operation vocabulary mirrored from the protocol wire
 /// (`crates/foundation/eliot-protocol/src/backup.rs`, `BackupOperationKind`).
@@ -116,237 +148,7 @@ pub fn accepted_watchdog_backup_methods() -> &'static [AcceptedWatchdogBackupMet
     &ACCEPTED_WATCHDOG_BACKUP_METHODS
 }
 
-/// Bounded registration receipt for Watchdog backup control.
-///
-/// Carries numeric listener/task ids only; there is intentionally no
-/// kill-by-name (no string handle, no PID, no service-name targeting).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BackupControlHandle {
-    listener_id: u64,
-    task_id: u64,
-    active: bool,
-}
-
-impl BackupControlHandle {
-    /// Returns the bounded listener id.
-    #[must_use]
-    pub const fn listener_id(self) -> u64 {
-        self.listener_id
-    }
-
-    /// Returns the bounded task id.
-    #[must_use]
-    pub const fn task_id(self) -> u64 {
-        self.task_id
-    }
-
-    /// Returns whether the handle is started.
-    #[must_use]
-    pub const fn is_active(self) -> bool {
-        self.active
-    }
-}
-
-/// Registers Watchdog backup control against a live composition.
-///
-/// Wiring-only: validates the composition readiness identity
-/// (`SERVICE_NAME` / `PROTOCOL_VERSION`) and returns an inactive bounded
-/// handle. No listener is opened, no task is spawned, and no authority is
-/// minted; the owning [`crate::KernelWatchdogPort`] keeps all effects.
-///
-/// # Errors
-///
-/// Returns [`CompositionError`] when the composition identity is unexpected.
-pub fn register_backup_control(
-    composition: &WatchdogComposition,
-) -> Result<BackupControlHandle, CompositionError> {
-    let readiness = composition.readiness();
-    if readiness.service != SERVICE_NAME || readiness.protocol != PROTOCOL_VERSION {
-        return Err(CompositionError::InvalidConfiguration(
-            "watchdog backup control refuses an unrecognized composition identity".to_owned(),
-        ));
-    }
-    // Closed-table wiring self-check: every validation helper and the full
-    // accepted-method table are pinned into the production registration path
-    // with self-consistent inputs, so the shape gates cannot rot unwired.
-    // All inputs below are accepted by construction; only an unrecognized
-    // composition identity fails registration, and supervision priority is
-    // unchanged (no task is spawned, no tick is stalled).
-    debug_assert!(!WATCHDOG_BACKUP_SIGNAL_PIPE.is_empty());
-    reject_payload_role_override(false)?;
-    validate_generation_fence(1, 1, true)?;
-    validate_peer_binding(&BackupPeerBinding {
-        peer_sid: "watchdog-backup-wiring",
-        service: SERVICE_NAME,
-        nonce: "watchdog-backup-wiring",
-        session_id: "watchdog-backup-wiring",
-    })?;
-    for method in accepted_watchdog_backup_methods() {
-        resolve_accepted_method(method.wire_id)?;
-    }
-    // Synthetic self-consistent identity: equal lowercase SHA-256 digests.
-    validate_response_identity(
-        "0000000000000000000000000000000000000000000000000000000000000000",
-        "0000000000000000000000000000000000000000000000000000000000000000",
-    )?;
-    Ok(BackupControlHandle {
-        listener_id: 1,
-        task_id: 1,
-        active: false,
-    })
-}
-
-/// Starts a registered backup control handle.
-///
-/// Wiring-only: marks the handle active. Fails closed when already active so
-/// a second listener/task can never be admitted past the bound.
-///
-/// # Errors
-///
-/// Returns [`CompositionError`] when the handle is already active.
-pub fn start_backup_control(handle: &mut BackupControlHandle) -> Result<(), CompositionError> {
-    if handle.active {
-        return Err(CompositionError::InvalidConfiguration(
-            "watchdog backup control is already started".to_owned(),
-        ));
-    }
-    if handle.listener_id == 0
-        || handle.listener_id > MAX_BACKUP_CONTROL_HANDLES
-        || handle.task_id == 0
-        || handle.task_id > MAX_BACKUP_CONTROL_HANDLES
-    {
-        return Err(CompositionError::InvalidConfiguration(
-            "watchdog backup control handle exceeds its bounded ids".to_owned(),
-        ));
-    }
-    // Timeout/ack wiring: a transport acknowledgement never establishes
-    // domain success, and a pre-send timeout classifies as safe-to-retry.
-    // Both markers are pinned here so the vocabulary cannot rot unwired;
-    // neither changes the start disposition.
-    let ack = BackupTransportAck { delivered: false };
-    debug_assert!(!ack.delivered);
-    debug_assert!(domain_success_from_ack(ack).is_none());
-    debug_assert!(matches!(
-        classify_send_timeout(false),
-        BackupSendTimeout::BeforeSend(_)
-    ));
-    handle.active = true;
-    Ok(())
-}
-
-/// Stops backup control with bounded cleanup.
-///
-/// Consuming the handle guarantees no abandoned listener or task: there is no
-/// background work to join because registration never spawned any, and the
-/// receipt cannot be reused after this call.
-pub fn stop_backup_control(handle: BackupControlHandle) -> BackupControlHandle {
-    // Replay/domain wiring: exact replays compare by value and domain success
-    // requires a separate owner attestation. Pinned here so the types cannot
-    // rot unwired; the shutdown receipt is unchanged.
-    let replay_key = BackupReplayKey {
-        request_digest: String::new(),
-        delivery_nonce: String::new(),
-    };
-    debug_assert!(is_exact_replay(&replay_key, &replay_key));
-    debug_assert!(!BackupDomainSuccess { attested: false }.attested);
-    BackupControlHandle {
-        listener_id: handle.listener_id,
-        task_id: handle.task_id,
-        active: false,
-    }
-}
-
-/// Notes composition shutdown for backup control ordering.
-///
-/// No-op marker called from the composition shutdown path so shutdown stays
-/// bounded: backup control holds no task to join and never blocks supervision
-/// teardown.
-pub fn on_composition_shutdown() {}
-
-// ---------------------------------------------------------------------------
-// Validation helpers: pure shape checks, authority stays with the owner.
-// ---------------------------------------------------------------------------
-
-/// Authenticated peer binding presented separately from any payload.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BackupPeerBinding<'a> {
-    /// Peer SID asserted by the transport owner.
-    pub peer_sid: &'a str,
-    /// Peer service name asserted by the transport owner.
-    pub service: &'a str,
-    /// Registration nonce asserted by the transport owner.
-    pub nonce: &'a str,
-    /// Session identity asserted by the transport owner.
-    pub session_id: &'a str,
-}
-
-/// Rejects a wrong peer SID, service, nonce, or session.
-///
-/// Shape-only: non-blank, bounded, no control characters. Exact trust
-/// comparison belongs to the owning port; a mismatch there must also fail
-/// closed.
-///
-/// # Errors
-///
-/// Returns [`CompositionError`] when any binding field is unusable.
-pub fn validate_peer_binding(peer: &BackupPeerBinding<'_>) -> Result<(), CompositionError> {
-    for (value, field) in [
-        (peer.peer_sid, "backup_peer.peer_sid"),
-        (peer.service, "backup_peer.service"),
-        (peer.nonce, "backup_peer.nonce"),
-        (peer.session_id, "backup_peer.session_id"),
-    ] {
-        reject_blank_or_unbounded(value, field)?;
-    }
-    Ok(())
-}
-
-/// Rejects a stale generation, fence mismatch, or missing capability.
-///
-/// Exact-equality only: the fence generation must equal the live generation
-/// (both nonzero) and `capability_granted` — supplied by the owning port —
-/// must be true. Fence semantics stay with the owner.
-///
-/// # Errors
-///
-/// Returns [`CompositionError`] on stale, mismatched, or unpermitted input.
-pub fn validate_generation_fence(
-    generation: u64,
-    fence_generation: u64,
-    capability_granted: bool,
-) -> Result<(), CompositionError> {
-    if generation == 0 || fence_generation == 0 || generation != fence_generation {
-        return Err(CompositionError::InvalidConfiguration(
-            "watchdog backup control rejects a stale generation or fence".to_owned(),
-        ));
-    }
-    if !capability_granted {
-        return Err(CompositionError::InvalidConfiguration(
-            "watchdog backup control rejects a missing backup capability".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-/// Rejects a payload value that claims a role.
-///
-/// A value in a payload never grants a role; the authenticated role travels
-/// as a separate argument owned by the transport. Any payload role claim
-/// fails closed.
-///
-/// # Errors
-///
-/// Returns [`CompositionError`] when the payload claims a role.
-pub fn reject_payload_role_override(payload_claims_role: bool) -> Result<(), CompositionError> {
-    if payload_claims_role {
-        return Err(CompositionError::InvalidConfiguration(
-            "watchdog backup control rejects a payload role override".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-/// Resolves a wire id to its accepted method before any effect.
+/// Resolves a wire id to its accepted method before any owner effect runs.
 ///
 /// Unsupported methods — including `ADMIT_CUTOVER`,
 /// `PREPARE_ISOLATED_RESTORE`, rehearsal-to-cutover mappings, and unknown
@@ -368,121 +170,368 @@ pub fn resolve_accepted_method(
         })
 }
 
-/// Validates that a response echoes its bound request identity.
+/// One admitted Watchdog backup request.
 ///
-/// Both digests must be lowercase SHA-256 and exactly equal; otherwise the
-/// response fails closed without an effect.
+/// Every variant carries only the real inputs the owner needs to act. There is
+/// deliberately no peer identity, role, generation fence, or response digest
+/// field: those belong to the role-bound control contract above this port, and
+/// this crate mints none of them.
+#[derive(Debug)]
+pub enum WatchdogBackupRequest<'a> {
+    /// Read one bounded page of a fence this owner produced.
+    ReadSnapshotPage {
+        /// Fence previously captured through this owner's backup port.
+        fence: &'a WatchdogSpoolFence,
+        /// Zero-based page index within that fence.
+        page_index: u64,
+    },
+    /// Import a bounded restore step chain toward an isolated destination.
+    ReconcileRestore {
+        /// Exact source installation the retained steps came from.
+        source_installation: &'a str,
+        /// Admitted isolated destination installation.
+        dest_installation: &'a str,
+        /// Currently active installation the import must not reuse.
+        active_installation: &'a str,
+        /// Bounded, operation-bound restore step chain.
+        steps: &'a [SpoolRestoreStep],
+    },
+    /// Verify an archive artifact.
+    ///
+    /// Present so the closed table's `VERIFY_ARCHIVE` entry has an explicit
+    /// refusal instead of a silent drop. This owner holds no archive verifier
+    /// and never interprets archive bytes, so dispatch always refuses.
+    VerifyArchive,
+    /// Report restore status.
+    ///
+    /// Present so the closed table's `RESTORE_STATUS` entry has an explicit
+    /// refusal instead of a silent drop. This owner holds no restore-status
+    /// projection, so dispatch always refuses.
+    RestoreStatus,
+}
+
+/// The owner's bounded result for one dispatched request.
+#[derive(Debug)]
+pub enum WatchdogBackupOutcome {
+    /// One finite page bound to a single captured fence.
+    SnapshotPage(WatchdogSpoolSnapshotPage),
+    /// Disposition of the bounded isolated-restore step chain.
+    Restore(SpoolRestoreDisposition),
+}
+
+/// Bounded failure of one admitted backup request.
+#[derive(Debug, Error)]
+pub enum BackupControlError {
+    /// The request is outside the closed admitted subset, or the handle
+    /// cannot currently dispatch.
+    #[error("watchdog backup control rejects the request: {0}")]
+    Rejected(String),
+    /// The owner refused the request; the owner's own bounded reason travels
+    /// verbatim and is never restated as success.
+    #[error("watchdog spool owner refused the backup request: {0}")]
+    OwnerRefused(#[source] SpoolError),
+}
+
+/// Bounded registration receipt for Watchdog backup control.
+///
+/// Carries the bounded registration slot and the owner-bound backup port, so
+/// the accepted methods dispatch to the real owner instead of a receipt alone.
+/// There is intentionally no kill-by-name (no string handle, no PID, no
+/// service-name targeting) and no listener or task identity: this process opens
+/// neither.
+///
+/// The slot is released by [`stop_backup_control`] and by
+/// [`on_composition_shutdown`]. A handle dropped without either holds its slot
+/// until the composition shuts down, which is bounded and fails closed at
+/// [`MAX_BACKUP_CONTROL_HANDLES`] rather than growing an unbounded set.
+pub struct BackupControlHandle {
+    slot: u64,
+    active: bool,
+    port: std::sync::Arc<WatchdogBackupPort>,
+}
+
+impl std::fmt::Debug for BackupControlHandle {
+    /// Renders only the bounded registration facts, never the owner's spool
+    /// internals or any identity material.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BackupControlHandle")
+            .field("registration_slot", &self.slot)
+            .field("active", &self.active)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BackupControlHandle {
+    /// Returns the bounded registration slot this handle occupies.
+    #[must_use]
+    pub fn registration_slot(&self) -> u64 {
+        self.slot
+    }
+
+    /// Returns whether the handle is started.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Returns the owner-held installation identity this handle is bound to.
+    #[must_use]
+    pub fn owner_installation(&self) -> &str {
+        self.port.source_installation()
+    }
+
+    /// Dispatches one admitted backup request to the owner-bound port.
+    ///
+    /// The wire identity is resolved against the closed accepted-method table
+    /// first, then must agree with its own operation, then must match the
+    /// request variant: a method and a request that name different operations
+    /// fail instead of silently running the wrong owner call. `VERIFY_ARCHIVE`
+    /// and `RESTORE_STATUS` are always refused — a transport acknowledgement
+    /// never establishes domain success, and no owner attestation for either
+    /// exists — so the correct outcome until a real archive verifier and a real
+    /// restore-status projection exist is refusal, never a fabricated success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackupControlError::Rejected`] when the handle is not started,
+    /// the wire identity is unsupported, the method and request disagree, or
+    /// the operation is refused. Returns [`BackupControlError::OwnerRefused`]
+    /// when the owner rejects the bounded request.
+    pub fn dispatch(
+        &self,
+        method: &AcceptedWatchdogBackupMethod,
+        request: &WatchdogBackupRequest<'_>,
+    ) -> Result<WatchdogBackupOutcome, BackupControlError> {
+        if !self.active {
+            return Err(BackupControlError::Rejected(
+                "watchdog backup control cannot dispatch before it is started".to_owned(),
+            ));
+        }
+        if !slot_is_registered(self.slot) {
+            return Err(BackupControlError::Rejected(
+                "watchdog backup control cannot dispatch after its registration was released"
+                    .to_owned(),
+            ));
+        }
+        let accepted = resolve_accepted_method(method.wire_id)
+            .map_err(|error| BackupControlError::Rejected(error.to_string()))?;
+        if accepted.op != method.op {
+            return Err(BackupControlError::Rejected(
+                "watchdog backup control rejects a method whose operation disagrees with the closed table"
+                    .to_owned(),
+            ));
+        }
+        match (accepted.op, request) {
+            (
+                BackupOperationKind::ReadSnapshotPage,
+                WatchdogBackupRequest::ReadSnapshotPage { fence, page_index },
+            ) => self
+                .port
+                .read_page(fence, *page_index)
+                .map(WatchdogBackupOutcome::SnapshotPage)
+                .map_err(BackupControlError::OwnerRefused),
+            (
+                BackupOperationKind::ReconcileRestore,
+                WatchdogBackupRequest::ReconcileRestore {
+                    source_installation,
+                    dest_installation,
+                    active_installation,
+                    steps,
+                },
+            ) => self
+                .port
+                .import_isolated(
+                    source_installation,
+                    dest_installation,
+                    active_installation,
+                    steps,
+                )
+                .map(WatchdogBackupOutcome::Restore)
+                .map_err(BackupControlError::OwnerRefused),
+            (BackupOperationKind::VerifyArchive | BackupOperationKind::RestoreStatus, _) => {
+                Err(BackupControlError::Rejected(format!(
+                    "watchdog backup control refuses {}; this owner holds no domain attestation for it and a transport acknowledgement never establishes success",
+                    accepted.op.as_str()
+                )))
+            }
+            _ => Err(BackupControlError::Rejected(format!(
+                "watchdog backup control rejects a {} request dispatched as {}",
+                request_operation_name(request),
+                accepted.op.as_str()
+            ))),
+        }
+    }
+}
+
+/// Returns the closed operation name a request variant belongs to.
+const fn request_operation_name(request: &WatchdogBackupRequest<'_>) -> &'static str {
+    match request {
+        WatchdogBackupRequest::ReadSnapshotPage { .. } => "READ_SNAPSHOT_PAGE",
+        WatchdogBackupRequest::ReconcileRestore { .. } => "RECONCILE_RESTORE",
+        WatchdogBackupRequest::VerifyArchive => "VERIFY_ARCHIVE",
+        WatchdogBackupRequest::RestoreStatus => "RESTORE_STATUS",
+    }
+}
+
+/// Registers Watchdog backup control against a live composition.
+///
+/// Validates the composition readiness identity (`SERVICE_NAME` /
+/// `PROTOCOL_VERSION`), takes the owner-bound backup port from the
+/// composition's own kernel port — the same owner that appends every heartbeat
+/// and gap record, so no second database handle is opened — and reserves one
+/// bounded registration slot. A composition whose kernel port owns no spool
+/// admits no backup control: there is exactly one construction path and no
+/// substitute.
+///
+/// No listener is opened, no task is spawned, and no authority is minted; the
+/// owning [`crate::KernelWatchdogPort`] implementation keeps all effects.
 ///
 /// # Errors
 ///
-/// Returns [`CompositionError`] on shape or identity mismatch.
-pub fn validate_response_identity(
-    request_digest: &str,
-    response_digest: &str,
-) -> Result<(), CompositionError> {
-    reject_non_digest(request_digest, "backup_response.request_digest")?;
-    reject_non_digest(response_digest, "backup_response.response_digest")?;
-    if request_digest != response_digest {
+/// Returns [`CompositionError`] when the composition identity is unexpected,
+/// when the composition exposes no owner-bound spool port, or when the bounded
+/// registration table is exhausted or already closed.
+pub fn register_backup_control(
+    composition: &WatchdogComposition,
+) -> Result<BackupControlHandle, CompositionError> {
+    let readiness = composition.readiness();
+    if readiness.service != SERVICE_NAME || readiness.protocol != PROTOCOL_VERSION {
         return Err(CompositionError::InvalidConfiguration(
-            "watchdog backup control rejects a response identity mismatch".to_owned(),
+            "watchdog backup control refuses an unrecognized composition identity".to_owned(),
         ));
     }
-    Ok(())
+    let port = composition.owner_backup_port().ok_or_else(|| {
+        CompositionError::InvalidConfiguration(
+            "watchdog backup control refuses registration without an owner-held spool port"
+                .to_owned(),
+        )
+    })?;
+    let slot = reserve_registration_slot()?;
+    Ok(BackupControlHandle {
+        slot,
+        active: false,
+        port,
+    })
 }
 
-/// Transport acknowledgement receipt: proves delivery only, never success.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BackupTransportAck {
-    /// True when the transport acknowledged delivery.
-    pub delivered: bool,
-}
-
-/// Domain success receipt: requires a separate owner attestation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BackupDomainSuccess {
-    /// True only when the owning port attested semantic success.
-    pub attested: bool,
-}
-
-/// Maps a transport acknowledgement toward domain success.
+/// Starts a registered backup control handle.
 ///
-/// Always returns `None`: a transport acknowledgement, at any phase, never
-/// establishes capture, restore, rehearsal, or reconciliation success.
-/// Semantic success advances only through owner attestations validated
-/// against the bound request identity.
-#[must_use]
-pub fn domain_success_from_ack(_ack: BackupTransportAck) -> Option<BackupDomainSuccess> {
-    None
-}
-
-/// Marker for a timeout that fired before any byte was sent (safe to retry).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TimeoutBeforeSend;
-
-/// Marker for a timeout that fired after send (retry needs owner dedupe).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TimeoutAfterSend;
-
-/// Bounded send-timeout classification.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BackupSendTimeout {
-    BeforeSend(TimeoutBeforeSend),
-    AfterSend(TimeoutAfterSend),
-}
-
-/// Classifies a send timeout by whether any byte was sent.
-#[must_use]
-pub const fn classify_send_timeout(sent_any_byte: bool) -> BackupSendTimeout {
-    if sent_any_byte {
-        BackupSendTimeout::AfterSend(TimeoutAfterSend)
-    } else {
-        BackupSendTimeout::BeforeSend(TimeoutBeforeSend)
-    }
-}
-
-/// Bounded replay dedupe key. Equality only; the domain retry-or-drop
-/// decision belongs to the owning port.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BackupReplayKey {
-    /// Canonical request digest binding the mutation.
-    pub request_digest: String,
-    /// Transport nonce binding this delivery attempt.
-    pub delivery_nonce: String,
-}
-
-/// Returns whether an incoming delivery is an exact replay of a seen key.
+/// Marks the handle active so the accepted methods can be dispatched. Fails
+/// closed when already active, when the composition has closed backup control,
+/// or when the handle no longer holds a live bounded slot, so a second
+/// registration can never be admitted past the bound.
 ///
-/// Pure field equality for wiring dedupe; whether an exact replay is dropped,
-/// acknowledged idempotently, or escalated is decided by the owning port, not
-/// here.
-#[must_use]
-pub fn is_exact_replay(seen: &BackupReplayKey, incoming: &BackupReplayKey) -> bool {
-    seen == incoming
-}
-
-fn reject_blank_or_unbounded(value: &str, field: &'static str) -> Result<(), CompositionError> {
-    if value.trim().is_empty() || value.chars().any(char::is_control) {
-        return Err(CompositionError::InvalidConfiguration(format!(
-            "watchdog backup control rejects an invalid {field}"
-        )));
+/// # Errors
+///
+/// Returns [`CompositionError`] when the handle is already active or its slot
+/// is no longer registered.
+pub fn start_backup_control(handle: &mut BackupControlHandle) -> Result<(), CompositionError> {
+    if handle.active {
+        return Err(CompositionError::InvalidConfiguration(
+            "watchdog backup control is already started".to_owned(),
+        ));
     }
-    if value.len() > MAX_BACKUP_TEXT_BYTES {
-        return Err(CompositionError::InvalidConfiguration(format!(
-            "watchdog backup control rejects an overlong {field}"
-        )));
+    if !slot_is_registered(handle.slot) {
+        return Err(CompositionError::InvalidConfiguration(
+            "watchdog backup control handle does not hold a live bounded registration slot"
+                .to_owned(),
+        ));
     }
+    handle.active = true;
     Ok(())
 }
 
-fn reject_non_digest(value: &str, field: &'static str) -> Result<(), CompositionError> {
-    let is_digest = value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
-    if !is_digest {
-        return Err(CompositionError::InvalidConfiguration(format!(
-            "watchdog backup control rejects an invalid {field}"
-        )));
+/// Stops backup control with bounded cleanup.
+///
+/// Consumes the handle, releases its bounded registration slot, and returns
+/// the same receipt marked stopped. The returned receipt is already released
+/// and can no longer dispatch, so a later stop is a no-op rather than a double
+/// release. There is no background work to join because registration never
+/// spawned any.
+pub fn stop_backup_control(handle: BackupControlHandle) -> BackupControlHandle {
+    release_registration_slot(handle.slot);
+    BackupControlHandle {
+        slot: handle.slot,
+        active: false,
+        port: handle.port,
     }
-    Ok(())
+}
+
+/// Closes backup control during composition shutdown.
+///
+/// Every bounded registration slot is released, so no abandoned registration
+/// outlives the composition, and any later registration fails closed. Shutdown
+/// stays bounded: there is no task to join and this never blocks supervision
+/// teardown.
+pub fn on_composition_shutdown() {
+    if let Ok(mut closed) = REGISTRATION_CLOSED.lock() {
+        *closed = true;
+    }
+    if let Ok(mut slots) = REGISTRATION_SLOTS.lock() {
+        slots.fill(false);
+    }
+}
+
+/// Reserves the lowest free bounded registration slot, or fails closed.
+fn reserve_registration_slot() -> Result<u64, CompositionError> {
+    if *lock_closed()? {
+        return Err(CompositionError::InvalidConfiguration(
+            "watchdog backup control is closed for this composition lifecycle".to_owned(),
+        ));
+    }
+    let mut slots = lock_slots()?;
+    for (index, occupied) in slots.iter_mut().enumerate() {
+        if !*occupied {
+            *occupied = true;
+            return u64::try_from(index + 1).map_err(|_| {
+                CompositionError::InvalidConfiguration(
+                    "watchdog backup control slot index exceeds the bounded counter".to_owned(),
+                )
+            });
+        }
+    }
+    Err(CompositionError::InvalidConfiguration(
+        "watchdog backup control exceeds its bounded registration table".to_owned(),
+    ))
+}
+
+/// Returns whether one bounded slot is currently reserved.
+fn slot_is_registered(slot: u64) -> bool {
+    if slot == 0 || slot > MAX_BACKUP_CONTROL_HANDLES {
+        return false;
+    }
+    let Ok(index) = usize::try_from(slot - 1) else {
+        return false;
+    };
+    lock_slots().is_ok_and(|slots| slots.get(index).copied().unwrap_or(false))
+}
+
+/// Releases one bounded registration slot; releasing a free slot is a no-op.
+fn release_registration_slot(slot: u64) {
+    let Ok(index) = usize::try_from(slot.saturating_sub(1)) else {
+        return;
+    };
+    if let Ok(mut slots) = lock_slots()
+        && let Some(occupied) = slots.get_mut(index)
+    {
+        *occupied = false;
+    }
+}
+
+fn lock_slots()
+-> Result<std::sync::MutexGuard<'static, [bool; REGISTRATION_SLOT_COUNT]>, CompositionError> {
+    REGISTRATION_SLOTS.lock().map_err(|_| {
+        CompositionError::InvalidConfiguration(
+            "watchdog backup control cannot read its bounded registration table".to_owned(),
+        )
+    })
+}
+
+fn lock_closed() -> Result<std::sync::MutexGuard<'static, bool>, CompositionError> {
+    REGISTRATION_CLOSED.lock().map_err(|_| {
+        CompositionError::InvalidConfiguration(
+            "watchdog backup control cannot read its lifecycle state".to_owned(),
+        )
+    })
 }
