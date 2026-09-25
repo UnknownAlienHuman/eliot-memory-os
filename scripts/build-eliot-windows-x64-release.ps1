@@ -221,6 +221,15 @@ function Get-RuntimeArtifactPlan([object]$Metadata) {
 # owner. The client-declaration file itself stays installation-owned
 # (absolute <...>/agent-bridge/client-declaration-v2.json); the bundle
 # never invents it.
+# Retention disposition (explicit, #1719 step 1'): eliot-governor.exe,
+# the governor-gated-legacy include, and the Codex plugin bundled binary
+# stay in this slice: Codex, OpenCode, Claude Desktop, and the default
+# (legacy) Claude Code path still execute that entry point, and
+# Test-ReleaseBundle requires it plus the plugin hash match. Neither Work
+# option 1 (retire the artifact) nor option 2 (re-home the Codex entry
+# point) lands here: option 1 would break the retained hosts, and option
+# 2 needs the behavior owner (eliot-mcp track per canon; the legacy
+# deletion itself is owned by #18). Full retire/re-home is BLOCKED-BY #18.
 function Get-FrontDoorBridgePlan([object]$Metadata, [string]$Selection) {
     if ([string]::IsNullOrWhiteSpace($Selection)) {
         throw 'Claude Code front-door selection must be legacy or agent-bridge, never empty'
@@ -1545,8 +1554,8 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
         owner = 'cargo-package:eliot-app'
         install_destination = './'
         generation = $SourceCommit
-        proof_ceiling = 'unsigned-build-evidence (retirement scope is Part B after #1189)'
-        gate = '#1189-legacy-retirement (GATED: retained explicitly, never by repository presence)'
+        proof_ceiling = 'unsigned-build-evidence (retained explicitly by #1719 step 1-prime: Codex/OpenCode/Desktop plus the legacy-Claude default still execute this entry; full retire/re-home BLOCKED-BY #18)'
+        gate = '#1189-legacy-retirement (GATED: retained explicitly by #1719, never by repository presence; full retire/re-home BLOCKED-BY #18)'
         entrypoint_disposition = 'retained-legacy-entrypoint (#1858: eliot-governor mcp stdio --host claude refuses with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge selects the new stack; daemon run and the remaining legacy hosts codex/opencode/claude-desktop stay on this binary until their cutover)'
         cutover_behavior = 'refuse-with-code on the retired claude host edge (no daemon auto-launch, no store start, no ControlWal/WriterActor); retained path for the remaining legacy hosts'
     }

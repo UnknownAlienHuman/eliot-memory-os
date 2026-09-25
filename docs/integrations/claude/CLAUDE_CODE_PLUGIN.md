@@ -70,6 +70,10 @@ their `eliot-governor` entries unchanged.
   new path at launch; unset (or any other value) means legacy. The flag is
   consumed by entrypoint delegation owned by the #1858/#77 track, not by
   this plugin tree.
+- Full retirement of the legacy Governor entry (Work option 1) or re-home
+  of the Codex entry point (Work option 2) does not land in this slice:
+  both remain BLOCKED-BY #18 (legacy-deletion owner), and the Codex
+  re-home additionally awaits the eliot-mcp behavior track per canon.
 - New path argv: `eliot-agent-bridge --profile SPINE_FUNCTIONAL --transport
   stdio --client-declaration <installation-absolute
   path>/agent-bridge/client-declaration-v2.json`. The declaration file is
