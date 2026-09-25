@@ -48,7 +48,8 @@ use eliot_context_candidates::ProjectionState;
 use eliot_contracts::RequestMetadata;
 use eliot_read::{
     BranchEnvironmentScope, FreshnessPolicy, NamedParameters, QueryIntent, QueryMode, QueryRequest,
-    ReadApi, ReadError, RequiredAssurance, StateRequest, TimeScope,
+    ReadApi, ReadError, ReadIdentity, ReadOrderingBinding, ReadOutcome, RequiredAssurance,
+    StateRequest, TimeScope,
 };
 use eliot_store_api::{
     EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, ReadConsistency, RevisionHead, RevisionKey,
@@ -186,6 +187,13 @@ pub struct RoleAcquisition {
     pub payload: Option<Value>,
     /// Revision heads observed with this role's read.
     pub revision_heads: Vec<RevisionHead>,
+    /// Exact read identity this role is bound to (`#1144` retained-read
+    /// binding): principal, scope, fence, consistency, declared and observed
+    /// heads, order heads, source, projection schema, coverage and the exact
+    /// invalidation conditions. `None` exactly when the role is not `Complete`
+    /// or `KnownEmpty`, so a retained role can always be revalidated from its
+    /// own record instead of re-deriving freshness from the payload.
+    pub identity: Option<ReadIdentity>,
 }
 
 /// The reconstructed seven-role input closure.
@@ -301,21 +309,45 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             return Err(ContextInputsError::MissingDependencies);
         }
         let heads_before = self.scope_heads(ctx, request).await?;
+        // The declared order-head dependency of every role read is the exact
+        // ordering-head set this reconstruction observed in its own closure
+        // before acquisition (`#1144`). It is observed, never synthesized, and
+        // a head bound to any other fence is refused by the read owner instead
+        // of being carried as a live dependency.
+        let ordering =
+            ReadOrderingBinding::of(heads_before.ordering_heads.clone()).map_err(|error| {
+                ContextInputsError::ClosureUnavailable(format!("closure order heads: {error}"))
+            })?;
         let task_frame = self
-            .acquire_state(ctx, request, NamedReadOperation::GetTaskState)
+            .acquire_state(ctx, request, &ordering, NamedReadOperation::GetTaskState)
             .await?;
         let attention = self
-            .acquire_state(ctx, request, NamedReadOperation::GetAttentionAndProblems)
+            .acquire_state(
+                ctx,
+                request,
+                &ordering,
+                NamedReadOperation::GetAttentionAndProblems,
+            )
             .await?;
-        let (epistemic, epistemic_readback) = self.acquire_epistemic(ctx, request).await?;
-        let cue = self.acquire_projection_inputs(ctx, request).await?;
+        let (epistemic, epistemic_readback) =
+            self.acquire_epistemic(ctx, request, &ordering).await?;
+        let cue = self
+            .acquire_projection_inputs(ctx, request, &ordering)
+            .await?;
         // Negative memory reads the same closed projection; only the
         // candidate-stage interpretation differs (kept separate so the two
         // slots stay statically identifiable per inputs.rs:1-13).
-        let negative_memory = self.acquire_projection_inputs(ctx, request).await?;
-        let evidence = self.acquire_evidence(ctx, request).await?;
+        let negative_memory = self
+            .acquire_projection_inputs(ctx, request, &ordering)
+            .await?;
+        let evidence = self.acquire_evidence(ctx, request, &ordering).await?;
         let affordances = self
-            .acquire_state(ctx, request, NamedReadOperation::GetCapabilityEvidenceState)
+            .acquire_state(
+                ctx,
+                request,
+                &ordering,
+                NamedReadOperation::GetCapabilityEvidenceState,
+            )
             .await?;
         let heads_after = self.scope_heads(ctx, request).await?;
         if heads_after != heads_before {
@@ -344,13 +376,17 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
     ) -> Result<ScopeRevisionView, ContextInputsError> {
         let response = self
             .reads
-            .state(
+            .bound_state(
                 ctx,
                 StateRequest {
                     operation: NamedReadOperation::GetScopeRevisionView,
                     scope_id: Some(request.scope_id.clone()),
                     consistency: ReadConsistency::ExactFence,
                     dependency_revisions: request.dependency_revisions.clone(),
+                    // The scope view read is itself the closure: it declares no
+                    // order-head dependency because the closure it returns is
+                    // what the order heads are.
+                    ordering: ReadOrderingBinding::without_order_dependency(),
                     parameters: NamedParameters::new(),
                     provenance_handles: Vec::new(),
                 },
@@ -360,7 +396,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                 ContextInputsError::ClosureUnavailable(format!("scope heads: {error}"))
             })?;
         let heads: ScopeRevisionView =
-            serde_json::from_value(response.payload).map_err(|error| {
+            serde_json::from_value(response.view.payload).map_err(|error| {
                 ContextInputsError::ClosureUnavailable(format!(
                     "scope heads payload is not a revision view: {error}"
                 ))
@@ -380,17 +416,19 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         &self,
         ctx: &RequestMetadata,
         request: &ContextReconstructionRequest,
+        ordering: &ReadOrderingBinding,
         operation: NamedReadOperation,
     ) -> Result<RoleAcquisition, ContextInputsError> {
         match self
             .reads
-            .state(
+            .bound_state(
                 ctx,
                 StateRequest {
                     operation,
                     scope_id: Some(request.scope_id.clone()),
                     consistency: ReadConsistency::ExactFence,
                     dependency_revisions: request.dependency_revisions.clone(),
+                    ordering: ordering.clone(),
                     parameters: NamedParameters::new(),
                     provenance_handles: Vec::new(),
                 },
@@ -398,16 +436,18 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             .await
         {
             Ok(response) => Ok(RoleAcquisition {
-                operation: response.operation,
-                state: classify_opaque_payload(&response.payload),
-                payload: Some(response.payload),
-                revision_heads: response.revision_heads,
+                operation: response.view.operation,
+                state: classify_opaque_payload(&response.view.payload),
+                payload: Some(response.view.payload),
+                revision_heads: response.view.revision_heads,
+                identity: Some(response.identity),
             }),
             Err(error) => Ok(RoleAcquisition {
                 operation,
                 state: classify_read_error(error)?,
                 payload: None,
                 revision_heads: Vec::new(),
+                identity: None,
             }),
         }
     }
@@ -416,11 +456,12 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         &self,
         ctx: &RequestMetadata,
         request: &ContextReconstructionRequest,
+        ordering: &ReadOrderingBinding,
     ) -> Result<RoleAcquisition, ContextInputsError> {
         let operation = NamedReadOperation::GetUnderstandingProjectionInputs;
         match self
             .reads
-            .query(
+            .bound_query(
                 ctx,
                 QueryRequest {
                     intent: reconstruction_intent(),
@@ -428,6 +469,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                     scope_id: Some(request.scope_id.clone()),
                     consistency: ReadConsistency::ExactFence,
                     dependency_revisions: request.dependency_revisions.clone(),
+                    ordering: ordering.clone(),
                     parameters: NamedParameters::new(),
                     provenance_handles: Vec::new(),
                 },
@@ -435,16 +477,18 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             .await
         {
             Ok(response) => Ok(RoleAcquisition {
-                operation: response.operation,
-                state: classify_opaque_payload(&response.payload),
-                payload: Some(response.payload),
-                revision_heads: response.revision_heads,
+                operation: response.view.operation,
+                state: classify_opaque_payload(&response.view.payload),
+                payload: Some(response.view.payload),
+                revision_heads: response.view.revision_heads,
+                identity: Some(response.identity),
             }),
             Err(error) => Ok(RoleAcquisition {
                 operation,
                 state: classify_read_error(error)?,
                 payload: None,
                 revision_heads: Vec::new(),
+                identity: None,
             }),
         }
     }
@@ -453,11 +497,12 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         &self,
         ctx: &RequestMetadata,
         request: &ContextReconstructionRequest,
+        ordering: &ReadOrderingBinding,
     ) -> Result<(RoleAcquisition, Option<EpistemicPositionReadback>), ContextInputsError> {
         let operation = NamedReadOperation::GetCurrentEpistemicPosition;
         let response = match self
             .reads
-            .query(
+            .bound_query(
                 ctx,
                 QueryRequest {
                     intent: reconstruction_intent(),
@@ -465,6 +510,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                     scope_id: Some(request.scope_id.clone()),
                     consistency: ReadConsistency::ExactFence,
                     dependency_revisions: request.dependency_revisions.clone(),
+                    ordering: ordering.clone(),
                     parameters: NamedParameters::from_map(BTreeMap::from([(
                         "position".to_owned(),
                         Value::String(request.epistemic_position.clone()),
@@ -488,19 +534,21 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                         state: classify_read_error(error)?,
                         payload: None,
                         revision_heads: Vec::new(),
+                        identity: None,
                     },
                     None,
                 ));
             }
         };
-        let (state, readback) = decode_epistemic_payload(&response.payload);
-        let payload = Some(response.payload);
+        let (state, readback) = decode_epistemic_payload(&response.view.payload);
+        let payload = Some(response.view.payload);
         Ok((
             RoleAcquisition {
-                operation: response.operation,
+                operation: response.view.operation,
                 state,
                 payload,
-                revision_heads: response.revision_heads,
+                revision_heads: response.view.revision_heads,
+                identity: Some(response.identity),
             },
             readback,
         ))
@@ -510,11 +558,12 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         &self,
         ctx: &RequestMetadata,
         request: &ContextReconstructionRequest,
+        ordering: &ReadOrderingBinding,
     ) -> Result<RoleAcquisition, ContextInputsError> {
         let operation = NamedReadOperation::GetEvidencePack;
         let response = match self
             .reads
-            .query(
+            .bound_query(
                 ctx,
                 QueryRequest {
                     intent: reconstruction_intent(),
@@ -522,6 +571,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                     scope_id: Some(request.scope_id.clone()),
                     consistency: ReadConsistency::ExactFence,
                     dependency_revisions: request.dependency_revisions.clone(),
+                    ordering: ordering.clone(),
                     parameters: NamedParameters::from_map(BTreeMap::from([
                         (
                             "subject".to_owned(),
@@ -550,19 +600,21 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                     state: classify_read_error(error)?,
                     payload: None,
                     revision_heads: Vec::new(),
+                    identity: None,
                 });
             }
         };
         let state = classify_evidence_payload(
-            &response.payload,
+            &response.view.payload,
             &request.scope_id,
             &request.evidence_subject,
         );
         Ok(RoleAcquisition {
-            operation: response.operation,
+            operation: response.view.operation,
             state,
-            payload: Some(response.payload),
-            revision_heads: response.revision_heads,
+            payload: Some(response.view.payload),
+            revision_heads: response.view.revision_heads,
+            identity: Some(response.identity),
         })
     }
 }
@@ -617,6 +669,7 @@ fn classify_read_error(error: ReadError) -> Result<ProjectionState, ContextInput
         ReadError::Store(detail) => Ok(ProjectionState::Unavailable {
             reason: bounded_reason("store read failed", detail),
         }),
+        ReadError::Outcome(outcome) => Ok(classify_read_outcome(outcome)),
         ReadError::OperationNotAllowed { operation, context } => Ok(ProjectionState::Unavailable {
             reason: bounded_reason(
                 "operation not supported for input reconstruction",
@@ -663,6 +716,50 @@ fn classify_read_error(error: ReadError) -> Result<ProjectionState, ContextInput
         ReadError::InvalidDependencyRevision => Err(ContextInputsError::RequestRejected(
             "invalid dependency revision".to_owned(),
         )),
+        ReadError::OrderingIdentityMismatch { declared } => Ok(ProjectionState::Blocked {
+            reason: bounded_reason(
+                "declared order heads do not carry the read's exact fence",
+                format!("{declared} heads"),
+            ),
+        }),
+    }
+}
+
+/// Maps the read owner's closed non-current observation onto one role
+/// disposition (`#1144`, A5).
+///
+/// The mapping is total over [`ReadOutcome`], so no state is silently dropped
+/// and no two distinct read outcomes collapse into one disposition. Crucially,
+/// none of them becomes `KnownEmpty`: a source that is not running, an answer
+/// that does not observe the bound identity, and a source-declared truncated
+/// coverage are three different facts, and a read that produced none of them
+/// did not produce an empty projection.
+fn classify_read_outcome(outcome: ReadOutcome) -> ProjectionState {
+    match outcome {
+        ReadOutcome::Current | ReadOutcome::NotApplicable => ProjectionState::Unknown {
+            reason: bounded_reason(
+                "current read reported no observation",
+                format!("{outcome:?}"),
+            ),
+        },
+        ReadOutcome::NotRunning => ProjectionState::Unavailable {
+            reason: "named source has no activated store handler".to_owned(),
+        },
+        ReadOutcome::Unavailable => ProjectionState::Unavailable {
+            reason: "admitted source could not be reached".to_owned(),
+        },
+        ReadOutcome::Unknown => ProjectionState::Unknown {
+            reason: "answer does not observe the bound read identity".to_owned(),
+        },
+        ReadOutcome::Stale => ProjectionState::Stale {
+            reason: "answer belongs to another revision, order or fence identity".to_owned(),
+        },
+        ReadOutcome::Conflicted => ProjectionState::Stale {
+            reason: "bound closure moved during acquisition".to_owned(),
+        },
+        ReadOutcome::Partial => ProjectionState::Partial {
+            reason: "source-declared coverage proves a bounded subset".to_owned(),
+        },
     }
 }
 
@@ -871,6 +968,7 @@ mod reconstruction_tests {
                 state: ProjectionState::KnownEmpty,
                 payload: Some(Value::Null),
                 revision_heads: Vec::new(),
+                identity: None,
             },
             epistemic_readback: None,
             cue: unavailable_role(NamedReadOperation::GetUnderstandingProjectionInputs),
@@ -880,6 +978,7 @@ mod reconstruction_tests {
                 state: ProjectionState::Complete,
                 payload: Some(serde_json::json!({"records": []})),
                 revision_heads: Vec::new(),
+                identity: None,
             },
             affordances: unavailable_role(NamedReadOperation::GetCapabilityEvidenceState),
         };
@@ -913,6 +1012,7 @@ mod reconstruction_tests {
             },
             payload: None,
             revision_heads: Vec::new(),
+            identity: None,
         }
     }
 

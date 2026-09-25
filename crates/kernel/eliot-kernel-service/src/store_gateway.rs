@@ -1966,8 +1966,8 @@ mod live_surreal_evidence_pack_e2e {
     use eliot_platform_windows::{RetainedProcessPathLease, WindowsPlatform};
     use eliot_read::{
         BranchEnvironmentScope, FreshnessPolicy, NamedParameters, QueryIntent, QueryMode,
-        QueryRequest, ReadApi, ReadError, ReadService, RequiredAssurance, StateRequest,
-        StoreReadFailure, TimeScope,
+        QueryRequest, ReadApi, ReadError, ReadOrderingBinding, ReadService, RequiredAssurance,
+        StateRequest, StoreReadFailure, TimeScope,
     };
     use eliot_store_api::{
         EVIDENCE_PACK_MAX_RECORDS, EffectClass, EventProjectionRelationIntents,
@@ -2108,6 +2108,7 @@ mod live_surreal_evidence_pack_e2e {
             scope_id: Some(scope.clone()),
             consistency: ReadConsistency::Eventual,
             dependency_revisions: BTreeMap::new(),
+            ordering: ReadOrderingBinding::without_order_dependency(),
             parameters: evidence_parameters(subject, max_records),
             provenance_handles: Vec::new(),
         }
@@ -2306,6 +2307,7 @@ mod live_surreal_evidence_pack_e2e {
             scope_id: Some(scope.clone()),
             consistency: ReadConsistency::Eventual,
             dependency_revisions: BTreeMap::new(),
+            ordering: ReadOrderingBinding::without_order_dependency(),
             parameters: smuggled,
             provenance_handles: Vec::new(),
         };
@@ -2339,6 +2341,7 @@ mod live_surreal_evidence_pack_e2e {
             scope_id: Some(scope.clone()),
             consistency: ReadConsistency::Eventual,
             dependency_revisions: BTreeMap::new(),
+            ordering: ReadOrderingBinding::without_order_dependency(),
             parameters: smuggled_uri,
             provenance_handles: Vec::new(),
         };
@@ -2370,6 +2373,7 @@ mod live_surreal_evidence_pack_e2e {
                     scope_id: Some(scope.clone()),
                     consistency: ReadConsistency::Eventual,
                     dependency_revisions: BTreeMap::new(),
+                    ordering: ReadOrderingBinding::without_order_dependency(),
                     parameters: evidence_parameters(&subject, "10"),
                     provenance_handles: Vec::new(),
                 },
@@ -2541,6 +2545,7 @@ mod live_surreal_evidence_pack_e2e {
                     scope_id: None,
                     consistency: ReadConsistency::Eventual,
                     dependency_revisions: BTreeMap::new(),
+                    ordering: ReadOrderingBinding::without_order_dependency(),
                     parameters: NamedParameters::new(),
                     provenance_handles: Vec::new(),
                 },

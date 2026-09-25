@@ -45,7 +45,7 @@ use eliot_contracts::{
 };
 use eliot_read::{
     BranchEnvironmentScope, FreshnessPolicy, NamedParameters, QueryIntent, QueryMode, QueryRequest,
-    ReadApi, ReadError, ReadService, RequiredAssurance, TimeScope,
+    ReadApi, ReadError, ReadOrderingBinding, ReadService, RequiredAssurance, TimeScope,
 };
 use eliot_store_api::{
     CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadRequest,
@@ -131,6 +131,7 @@ fn reconstruction_query(
         scope_id: scope.map(ScopeId::new).transpose()?,
         consistency: ReadConsistency::ExactFence,
         dependency_revisions: dependencies,
+        ordering: ReadOrderingBinding::without_order_dependency(),
         parameters,
         provenance_handles: Vec::new(),
     })

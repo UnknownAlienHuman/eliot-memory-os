@@ -1,6 +1,6 @@
 //! G-06 Governor read/query contracts and named-read facade.
 //!
-//! DISPOSITION (#1144, WIRE): this crate is the declared Governor read facade.
+//! DISPOSITION (#1144, WIRE): this crate is the declared Governor read owner.
 //! It is a stateless projection over the store-neutral named read port
 //! ([`CanonicalReadClient`]): it owns no cache, no freshness state, and no
 //! second consistency algorithm. Every read binds the caller request identity,
@@ -18,6 +18,98 @@
 //! payloads remain opaque; callers receive their exact payload together
 //! with revision and provenance disposition so a later layer can apply the
 //! appropriate semantic contract.
+//!
+//! # Owner inventory (W1)
+//!
+//! Owned mutable state: **none**. [`ReadService`] holds exactly one field, the
+//! caller-owned store client; every read re-dispatches to that client under the
+//! caller fence, so no cache, freshness state, or second consistency algorithm
+//! exists in this package (ARCH-MOD-03 explicit statelessness).
+//!
+//! ```text
+//! public API:        ReadApi, LocalReadPort, ReadService,
+//!                    contract_identity, CONTRACT_NAME, CONTRACT_VERSION,
+//!                    context_reconstruction_operations,
+//!                    ReadOutcome, ReadPrincipal, ReadSchemaIdentity,
+//!                    ReadSourceIdentity, ReadCoverage, ReadOrderingBinding,
+//!                    ReadIdentity, ReadInvalidationSet, BoundRead,
+//!                    QueryMode, TimeScope, BranchEnvironmentScope,
+//!                    FreshnessPolicy, RequiredAssurance, QueryIntent,
+//!                    NamedParameters, EliotResourceUri, ProvenanceHandle,
+//!                    ProvenanceDisposition, ReadProvenance,
+//!                    StateRequest, QueryRequest, ResourceRequest,
+//!                    CurrentStateView, QueryResult, ResourceContent,
+//!                    ReadError, StoreReadFailure;
+//! store dependency:   CanonicalReadClient (read-only), the Store operation
+//!                    catalogue (generated_operation_manifests,
+//!                    activated_read_operations, declared_read_parameters,
+//!                    project_parameter_schema, parameter_schema_digest) and
+//!                    the Store-owned experience page coverage statement
+//!                    (ExperienceRangePage). No SurrealDB SDK, no credentials,
+//!                    no write capability, no raw query text;
+//! serialization:      every public type is `deny_unknown_fields` JSON with
+//!                    closed enum dimensions; intents reject unknown future
+//!                    prose instead of widening the read;
+//! tests:             crates/governor/eliot-read/tests/read_owner_proof.rs,
+//!                    crates/governor/eliot-read/tests/context_reconstruction.rs,
+//!                    in-crate `evidence_pack_read_tests`.
+//! ```
+//!
+//! # Comparison with the current read owner, Store read model and runtime
+//! # status consumers (W2)
+//!
+//! ```text
+//! semantic read owner:      this crate (G-06). The Governor read *policy*
+//!                            (intent, coverage, provenance, freshness refusal)
+//!                            lives here; it is the only place that decides
+//!                            whether a payload may be called current.
+//! physical data access:      CanonicalReadClient only. `bins/eliotd` supplies
+//!                            KernelContextReadClient (Kernel transport) and
+//!                            the store adapters supply the memory/Surreal
+//!                            handlers. Neither owns a read decision.
+//! Store read model:          `eliot_store_api::NamedReadRequest` /
+//!                            `NamedReadResponse` / `ReadConsistency` /
+//!                            `RevisionHead` / `OrderingHead` /
+//!                            `ScopeRevisionView` and the generated operation
+//!                            catalogue. This crate consumes those identities
+//!                            read-only and never re-declares them.
+//! runtime-status consumers:  `crates/governor/eliot-governor/src/
+//!                            context_inputs.rs` retains seven role reads with
+//!                            `ProjectionState` dispositions; `bins/eliotd`
+//!                            retains one bounded evidence read per admitted
+//!                            `eliot.query` pair. Both consume the resolved
+//!                            [`ReadIdentity`] instead of re-deriving freshness.
+//! ```
+//!
+//! # Retained-read binding (W5, A3)
+//!
+//! [`ReadIdentity`] is the exact closure every retained read is bound to:
+//! principal (derived only from the caller's validated [`RequestMetadata`]),
+//! request identity, scope, current [`StateFence`], consistency mode, the
+//! declared dependency revisions, the observed revision heads, the declared
+//! order-head dependency ([`ReadOrderingBinding`]), the resolved source
+//! ([`ReadSourceIdentity`]) and projection schema ([`ReadSchemaIdentity`]),
+//! the coverage identity ([`ReadCoverage`]) and the exact invalidation
+//! conditions ([`ReadInvalidationSet`], I5.20). The order-head dependency is a
+//! required field on every request: omitting it is a compile error, never a
+//! default, and a declared head bound to another fence is refused rather than
+//! carried as a live dependency. No value in the closure is time-derived, and
+//! no completeness percentage, TTL, or eviction rule is invented: the closure
+//! is exactly what the caller declared plus what the Store catalogue and the
+//! observed heads prove.
+//!
+//! # Read outcomes (A5)
+//!
+//! [`ReadOutcome`] is the closed observation vocabulary of this owner. Only
+//! `Current` is reachable by a successful read, so an empty in-memory payload
+//! can never become a successful empty or current result: a payload that
+//! carries no observation of the bound identity is `Unknown`, an operation with
+//! no activated Store handler is `NotRunning`, and a source-declared truncated
+//! coverage statement is `Partial`. `Unavailable`, `Stale` and `Conflicted`
+//! keep their existing typed [`ReadError`] variants so the exact store identity
+//! survives; the three owner-level states travel as
+//! [`ReadError::Outcome`]. No failure collapses into a string, a generic code,
+//! or another state.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -25,12 +117,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{
-    ContractIdentity, ContractVersion, RequestMetadata, StateFence,
-    contract_identity as make_contract_identity,
+    ContractIdentity, ContractVersion, ProductId, RequestId, RequestMetadata, SessionId, SourceId,
+    StateFence, TaskId, contract_identity as make_contract_identity,
 };
 use eliot_store_api::{
-    CanonicalReadClient, NamedReadOperation, NamedReadRequest, NamedReadResponse, ReadConsistency,
-    RevisionHead, RevisionKey, ScopeId, StoreError,
+    CanonicalReadClient, ExperienceRangePage, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, OrderingHead, ReadConsistency, RevisionHead, RevisionKey, ScopeId,
+    StoreError, activated_read_operations, declared_read_parameters, named_read_operation_name,
+    parameter_schema_digest, project_parameter_schema,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -40,7 +134,12 @@ use thiserror::Error;
 /// Stable wire name for the Governor read contract.
 pub const CONTRACT_NAME: &str = "eliot.governor.read";
 /// Current wire revision for the Governor read contract.
-pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(2, 0, 0);
+///
+/// `3.0.0` adds the retained-read identity closure ([`ReadIdentity`]), the
+/// caller-declared order-head dependency ([`ReadOrderingBinding`]), the
+/// owner-resolved coverage identity ([`ReadCoverage`]) and the closed read
+/// outcome vocabulary ([`ReadOutcome`]).
+pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(3, 0, 0);
 
 /// Closed semantic query modes from the public ELIOT query surface.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -366,6 +465,460 @@ impl NamedParameters {
     }
 }
 
+/// Closed read observation vocabulary of the Governor read owner.
+///
+/// The non-current states are the exact I0.5 conformance/evidence
+/// observation vocabulary plus its `PARTIAL` coverage state, and they are
+/// closed: no other value exists, so a consumer never re-derives the
+/// distinction from prose or a message. `Current` is reachable only by a
+/// successful read — every other state travels as [`ReadError::Outcome`] or as
+/// one of the freshness/availability [`ReadError`] variants that already carry
+/// their exact store identity.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReadOutcome {
+    /// `OBSERVED`: the read resolved over the exact bound identity and the
+    /// returned payload observes it.
+    Current,
+    /// `NOT_RUNNING`: the named source has no activated handler in the current
+    /// Store operation catalogue, so no observation of it can be produced at
+    /// all. Distinct from `Unavailable`, which means an admitted source could
+    /// not be reached.
+    NotRunning,
+    /// `UNAVAILABLE`: the source is admitted but could not be reached. Carried
+    /// by [`StoreReadFailure::Unavailable`] so the exact store identity
+    /// survives.
+    Unavailable,
+    /// `UNKNOWN`: the source answered, but the answer carries no observation of
+    /// the bound identity — an empty in-memory payload, or a missing declared
+    /// coverage statement. Never an authoritative empty result.
+    Unknown,
+    /// `STALE`: the answer belongs to a different revision, order or fence
+    /// identity than the one this read bound. Carried by
+    /// [`ReadError::StaleRevision`] and [`ReadError::ResponseMismatch`].
+    Stale,
+    /// `CONFLICTED`: the bound closure moved while the read was assembled.
+    /// Carried by [`ReadError::RevisionChurn`] and the conflicting store
+    /// failures.
+    Conflicted,
+    /// `PARTIAL`: the source's own declared coverage statement proves the read
+    /// covers a bounded subset of the requested source. This is never reported
+    /// as a complete current result.
+    Partial,
+    /// `NOT_APPLICABLE`: no observation of the bound source applies to this
+    /// read. Retained as a distinct closed value so an inapplicable read can
+    /// never be reported as an observed empty or a current result; the
+    /// read coverage dimension carries the same `NOT_APPLICABLE` meaning
+    /// concretely in [`ReadCoverage::NotApplicable`].
+    NotApplicable,
+}
+
+/// Exact caller identity that one retained read is bound to.
+///
+/// Every component is copied from the caller's validated [`RequestMetadata`],
+/// and this type has no constructor that accepts a synthesized product/source
+/// pair, so a binding can never name a principal the caller did not present.
+/// The product/source pair is the mandatory principal; an attached session or
+/// task narrows it and is carried as such. This is an evidence identity, not
+/// authority: it records who asked, never what they may do.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadPrincipal {
+    product: ProductId,
+    source: SourceId,
+    session: Option<SessionId>,
+    task: Option<TaskId>,
+}
+
+impl ReadPrincipal {
+    /// Derives the exact caller principal from request metadata.
+    ///
+    /// The metadata must already be valid: [`ReadService`] validates it before
+    /// resolving any binding, so no identity is derived from a rejected
+    /// request.
+    #[must_use]
+    pub fn from_metadata(metadata: &RequestMetadata) -> Self {
+        Self {
+            product: metadata.product_id.clone(),
+            source: metadata.source_id.clone(),
+            session: metadata.session_id.clone(),
+            task: metadata.task_id.clone(),
+        }
+    }
+
+    /// Returns the exact product identity the read was requested under.
+    #[must_use]
+    pub const fn product_id(&self) -> &ProductId {
+        &self.product
+    }
+
+    /// Returns the exact source identity the read was requested under.
+    #[must_use]
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source
+    }
+
+    /// Returns the attached caller session, when the request carries one.
+    #[must_use]
+    pub const fn session_id(&self) -> Option<&SessionId> {
+        self.session.as_ref()
+    }
+
+    /// Returns the attached task binding, when the request carries one.
+    #[must_use]
+    pub const fn task_id(&self) -> Option<&TaskId> {
+        self.task.as_ref()
+    }
+}
+
+/// Exact canonical source one retained read resolved through.
+///
+/// Both the manifest name and the manifest digest come from the Store operation
+/// catalogue, which is the single authority for which named source is
+/// activated. A read whose operation has no catalogue entry has no activated
+/// source at all and is refused as [`ReadOutcome::NotRunning`] instead of being
+/// given a synthesized identity.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadSourceIdentity {
+    /// Closed named operation that owns the projection.
+    pub operation: NamedReadOperation,
+    /// Exact canonical operation name in the Store catalogue.
+    pub operation_name: String,
+    /// Exact catalogue manifest name of the activated source.
+    pub manifest_name: String,
+    /// Exact catalogue manifest digest of the activated source.
+    pub manifest_digest: String,
+}
+
+/// Exact projection schema identity of the activated Store operation.
+///
+/// The two digests are independent witnesses of the same schema: the manifest
+/// digest covers the whole catalogue entry, and the parameter-schema digest
+/// covers the owner-approved typed selector schema the request was admitted
+/// against. Neither is derived from the payload, so a payload can never
+/// restate — or widen — the schema it was read under.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadSchemaIdentity {
+    /// Exact catalogue manifest name of the activated operation.
+    pub manifest_name: String,
+    /// Exact manifest version of the activated operation.
+    pub manifest_version: ContractVersion,
+    /// Exact manifest schema digest bound by the catalogue entry.
+    pub manifest_schema_digest: String,
+    /// Exact digest of the owner-approved typed read-parameter schema.
+    pub parameter_schema_digest: String,
+}
+
+/// Closed coverage dimension of one named read.
+///
+/// The values are derived from the Store's own declared read-parameter table
+/// plus the caller's declared selectors, and each states exactly what the
+/// binding can claim. No percentage, fraction or completeness estimate is
+/// derived: a read either binds a declared bound exactly, records that the
+/// Store's own bound stays in force, records that it covers one page of a
+/// cursor-paged source, or records that no coverage dimension applies.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadCoverage {
+    /// `NOT_APPLICABLE`: the Store declares no coverage dimension for this
+    /// operation, so no coverage identity applies to this read.
+    NotApplicable,
+    /// The Store declares a result-set bound for this operation and the caller
+    /// declared the exact bound this read is bound to.
+    BoundedByDeclaredSelector {
+        /// Exact declared result-set bound selector.
+        selector: DeclaredResultSelector,
+        /// Exact declared bound the caller bound this read to.
+        declared_bound: u32,
+    },
+    /// The Store declares a result-set bound for this operation and the caller
+    /// declared no value for it: the Store's own bound stays in force and this
+    /// read carries no caller-declared coverage identity. The source's own
+    /// response remains the only place a bound and any truncation under it are
+    /// observable.
+    BoundByStore {
+        /// Exact declared result-set bound selector.
+        selector: DeclaredResultSelector,
+    },
+    /// The Store declares an opaque continuation cursor for this operation:
+    /// this read covers one page, and the whole source is proven only by
+    /// walking cursors to the end. Such a read is never whole-source coverage
+    /// on its own.
+    PagedByDeclaredCursor {
+        /// Exact declared page bound selector, when the operation declares one
+        /// in addition to the cursor.
+        selector: Option<DeclaredPageSelector>,
+    },
+}
+
+/// Closed result-set bound selectors the Store declares for named reads.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclaredResultSelector {
+    /// The store-declared `max_records` result-set bound.
+    MaxRecords,
+}
+
+/// Closed page bound selectors the Store declares for cursor-paged reads.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclaredPageSelector {
+    /// The store-declared `page_limit` page bound.
+    PageLimit,
+}
+
+/// Exact caller-declared order-head dependency set for one read.
+///
+/// The Store named-read response exposes revision heads only, so this set is a
+/// caller declaration rather than an observed closure, and this is stated
+/// rather than hidden. It is nevertheless required on every request — an
+/// omitted dependency is a compile error, never a default — and it is verified
+/// as far as the current Store contract allows: every declared head must be a
+/// valid, unique, non-zero ordering head carrying the request's exact
+/// [`StateFence`]. A head bound to any other fence is refused instead of being
+/// carried as a live dependency.
+#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadOrderingBinding {
+    heads: Vec<OrderingHead>,
+}
+
+impl ReadOrderingBinding {
+    /// Declares that this read depends on no conflict-serialization head.
+    ///
+    /// This is an explicit declaration, not an omission. Such a read still
+    /// proves its coherence through the revision-head closure and the fence,
+    /// and the resolved binding records that no order-head dependency applies.
+    #[must_use]
+    pub const fn without_order_dependency() -> Self {
+        Self { heads: Vec::new() }
+    }
+
+    /// Declares the exact order-head dependency set this read binds to.
+    pub fn of(heads: Vec<OrderingHead>) -> Result<Self, ReadError> {
+        let binding = Self { heads };
+        binding.validate_against_fence_order()?;
+        Ok(binding)
+    }
+
+    /// Returns the declared order heads.
+    #[must_use]
+    pub fn heads(&self) -> &[OrderingHead] {
+        &self.heads
+    }
+
+    /// Verifies every declared head is a valid, unique ordering head.
+    fn validate_against_fence_order(&self) -> Result<(), ReadError> {
+        let mut seen = BTreeSet::new();
+        for head in &self.heads {
+            head.validate().map_err(|error| ReadError::InvalidField {
+                field: "ordering_heads".to_owned(),
+                reason: error.to_string(),
+            })?;
+            if !seen.insert(head.scope.clone()) {
+                return Err(ReadError::DuplicateField("ordering_heads".to_owned()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Verifies every declared head against the request's exact fence.
+    ///
+    /// A declared dependency is live only at the fence it was declared for. A
+    /// head bound to another fence is a mismatched dependency, not a live one,
+    /// and is refused here rather than carried into the resolved binding.
+    pub fn validate_against(&self, fence: &StateFence) -> Result<(), ReadError> {
+        self.validate_against_fence_order()?;
+        if self.heads.iter().any(|head| head.state_fence != *fence) {
+            return Err(ReadError::OrderingIdentityMismatch {
+                declared: self.heads.len(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Exact conditions that void one retained read (I5.20 invalidation conditions).
+///
+/// The set is the read's own dependency closure: its fence, scope, observed
+/// revision heads, declared order heads, resolved source and projection schema.
+/// It contains no time-to-live, no eviction rule and no guessed threshold, so
+/// revalidating a retained read is an exact comparison of these values and
+/// never a judgement call.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadInvalidationSet {
+    state_fence: StateFence,
+    scope_id: Option<ScopeId>,
+    revision_heads: Vec<RevisionHead>,
+    ordering_heads: Vec<OrderingHead>,
+    source: ReadSourceIdentity,
+    schema: ReadSchemaIdentity,
+}
+
+impl ReadInvalidationSet {
+    /// Returns the exact fence the read was served under.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+
+    /// Returns the exact scope the read was bound to, if any.
+    #[must_use]
+    pub fn scope_id(&self) -> Option<&ScopeId> {
+        self.scope_id.as_ref()
+    }
+
+    /// Returns the exact revision heads observed with the read.
+    #[must_use]
+    pub fn revision_heads(&self) -> &[RevisionHead] {
+        &self.revision_heads
+    }
+
+    /// Returns the exact order heads the read declared a dependency on.
+    #[must_use]
+    pub fn ordering_heads(&self) -> &[OrderingHead] {
+        &self.ordering_heads
+    }
+
+    /// Returns the exact source the read resolved through.
+    #[must_use]
+    pub const fn source(&self) -> &ReadSourceIdentity {
+        &self.source
+    }
+
+    /// Returns the exact projection schema the read was admitted against.
+    #[must_use]
+    pub const fn schema(&self) -> &ReadSchemaIdentity {
+        &self.schema
+    }
+}
+
+/// Exact identity closure one retained read is bound to.
+///
+/// The closure is the whole of what a consumer needs to revalidate a retained
+/// read without consulting this owner again: who asked, for what scope, under
+/// which fence, with which consistency mode, over which declared dependencies,
+/// which observed revision heads, which declared order heads, which source and
+/// projection schema, which coverage identity, and which invalidation
+/// conditions. Every component is either copied from a validated caller
+/// declaration or resolved from the Store catalogue and the observed heads;
+/// none is time-derived, defaulted, or estimated.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadIdentity {
+    principal: ReadPrincipal,
+    request_id: RequestId,
+    operation: NamedReadOperation,
+    scope_id: Option<ScopeId>,
+    state_fence: StateFence,
+    consistency: ReadConsistency,
+    declared_dependency_revisions: BTreeMap<RevisionKey, u64>,
+    observed_revision_heads: Vec<RevisionHead>,
+    ordering: ReadOrderingBinding,
+    source: ReadSourceIdentity,
+    schema: ReadSchemaIdentity,
+    coverage: ReadCoverage,
+    invalidation: ReadInvalidationSet,
+}
+
+impl ReadIdentity {
+    /// Returns the exact caller principal this read is bound to.
+    #[must_use]
+    pub const fn principal(&self) -> &ReadPrincipal {
+        &self.principal
+    }
+
+    /// Returns the exact request identity this read was executed under.
+    #[must_use]
+    pub const fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    /// Returns the closed named operation that produced the payload.
+    #[must_use]
+    pub const fn operation(&self) -> NamedReadOperation {
+        self.operation
+    }
+
+    /// Returns the exact scope this read was bound to, if any.
+    #[must_use]
+    pub fn scope_id(&self) -> Option<&ScopeId> {
+        self.scope_id.as_ref()
+    }
+
+    /// Returns the exact fence this read was served under.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+
+    /// Returns the exact consistency mode this read was requested with.
+    #[must_use]
+    pub const fn consistency(&self) -> ReadConsistency {
+        self.consistency
+    }
+
+    /// Returns the exact dependency revisions the caller declared.
+    #[must_use]
+    pub const fn declared_dependency_revisions(&self) -> &BTreeMap<RevisionKey, u64> {
+        &self.declared_dependency_revisions
+    }
+
+    /// Returns the exact revision heads observed with this read.
+    #[must_use]
+    pub fn observed_revision_heads(&self) -> &[RevisionHead] {
+        &self.observed_revision_heads
+    }
+
+    /// Returns the exact order-head dependency this read declared.
+    #[must_use]
+    pub const fn ordering(&self) -> &ReadOrderingBinding {
+        &self.ordering
+    }
+
+    /// Returns the exact canonical source this read resolved through.
+    #[must_use]
+    pub const fn source(&self) -> &ReadSourceIdentity {
+        &self.source
+    }
+
+    /// Returns the exact projection schema this read was admitted against.
+    #[must_use]
+    pub const fn schema(&self) -> &ReadSchemaIdentity {
+        &self.schema
+    }
+
+    /// Returns the exact coverage identity of this read.
+    #[must_use]
+    pub const fn coverage(&self) -> ReadCoverage {
+        self.coverage
+    }
+
+    /// Returns the exact conditions that void this retained read.
+    #[must_use]
+    pub const fn invalidation(&self) -> &ReadInvalidationSet {
+        &self.invalidation
+    }
+}
+
+/// One read result together with the exact identity it is bound to.
+///
+/// The view keeps the owner-produced payload and its echoed operation, fence,
+/// heads and consistency; the identity carries everything the view cannot state
+/// about itself, so a consumer that retains the pair can revalidate the read
+/// exactly and never has to ask this owner what it meant.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundRead<V> {
+    /// The owner-produced view for this read.
+    pub view: V,
+    /// The exact resolved identity closure of this read.
+    pub identity: ReadIdentity,
+}
+
 /// Request for one bounded current-state named read.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -378,6 +931,10 @@ pub struct StateRequest {
     pub consistency: ReadConsistency,
     /// Dependency revisions used for at-least and stable reads.
     pub dependency_revisions: BTreeMap<RevisionKey, u64>,
+    /// Exact order-head dependency this read binds to; required, never
+    /// defaulted. Use [`ReadOrderingBinding::without_order_dependency`] to
+    /// state explicitly that no order head applies.
+    pub ordering: ReadOrderingBinding,
     /// Closed named selectors; never a raw query string.
     pub parameters: NamedParameters,
     /// Exact source/evidence handles for result lineage.
@@ -395,6 +952,7 @@ impl StateRequest {
             });
         }
         validate_dependencies(&self.dependency_revisions)?;
+        self.ordering.validate_against_fence_order()?;
         self.parameters.validate()?;
         if requires_scope(self.operation) && self.scope_id.is_none() {
             return Err(ReadError::ScopeRequired);
@@ -425,6 +983,10 @@ pub struct QueryRequest {
     pub consistency: ReadConsistency,
     /// Dependency revisions used for consistency validation.
     pub dependency_revisions: BTreeMap<RevisionKey, u64>,
+    /// Exact order-head dependency this read binds to; required, never
+    /// defaulted. Use [`ReadOrderingBinding::without_order_dependency`] to
+    /// state explicitly that no order head applies.
+    pub ordering: ReadOrderingBinding,
     /// Closed named selectors; no physical query syntax is accepted.
     pub parameters: NamedParameters,
     /// Exact source/evidence handles for result lineage.
@@ -436,6 +998,7 @@ impl QueryRequest {
     /// Validates intent, operation semantics and bounded selectors.
     pub fn validate(&self) -> Result<(), ReadError> {
         validate_dependencies(&self.dependency_revisions)?;
+        self.ordering.validate_against_fence_order()?;
         self.parameters.validate()?;
         ReadProvenance::from_handles(&self.provenance_handles)?;
         if requires_scope(self.operation) && self.scope_id.is_none() {
@@ -465,6 +1028,10 @@ pub struct ResourceRequest {
     pub consistency: ReadConsistency,
     /// Dependency revisions used for consistency validation.
     pub dependency_revisions: BTreeMap<RevisionKey, u64>,
+    /// Exact order-head dependency this read binds to; required, never
+    /// defaulted. Use [`ReadOrderingBinding::without_order_dependency`] to
+    /// state explicitly that no order head applies.
+    pub ordering: ReadOrderingBinding,
     /// Additional closed selectors for the named operation.
     pub parameters: NamedParameters,
     /// Exact source/evidence handles for result lineage.
@@ -476,6 +1043,7 @@ impl ResourceRequest {
     /// Validates exact resource ownership and bounded read parameters.
     pub fn validate(&self) -> Result<(), ReadError> {
         validate_dependencies(&self.dependency_revisions)?;
+        self.ordering.validate_against_fence_order()?;
         self.parameters.validate()?;
         ReadProvenance::from_handles(&self.provenance_handles)?;
         if requires_scope(self.operation) && self.scope_id.is_none() {
@@ -601,6 +1169,28 @@ pub enum ReadError {
     /// A read response is older than the declared minimum revision.
     #[error("read response is behind the declared minimum revision")]
     StaleRevision,
+    /// A declared order-head dependency is bound to a fence other than the
+    /// read's exact request fence.
+    ///
+    /// Such a head is not a live dependency for this read: it is refused
+    /// instead of being carried into the resolved binding, so a retained read
+    /// can never claim an order dependency it did not hold.
+    #[error("{declared} declared order heads do not carry the read's exact fence")]
+    OrderingIdentityMismatch {
+        /// Number of declared order heads in the refused binding.
+        declared: usize,
+    },
+    /// The read produced no observation, and its non-current state is one the
+    /// Store error set cannot express.
+    ///
+    /// `NotRunning` (no activated Store source), `Unknown` (an answer that does
+    /// not observe the bound identity) and `Partial` (a Store-declared
+    /// truncated coverage statement) are owner-level observations rather than
+    /// store transport failures, so they travel as the closed
+    /// [`ReadOutcome`] value. `Unavailable`, `Stale` and `Conflicted` keep
+    /// their existing typed variants, which carry the exact store identity.
+    #[error("read produced no current observation: {0:?}")]
+    Outcome(ReadOutcome),
     /// Store boundary rejected the named read, with its exact typed identity.
     ///
     /// Every [`StoreError`] discriminant maps to exactly one variant below, so
@@ -772,6 +1362,13 @@ impl From<StoreError> for ReadError {
 }
 
 /// Read API implemented by the Governor service boundary.
+///
+/// `state`, `query` and `resource` return the owner view; `bound_state`,
+/// `bound_query` and `bound_resource` return the same view together with the
+/// exact resolved [`ReadIdentity`]. Both families are the single
+/// implementation in [`ReadService`]: the plain calls delegate to the bound
+/// ones and drop only the identity, so there is one consistency algorithm, one
+/// source resolution and one outcome classification in this package.
 #[allow(async_fn_in_trait)]
 pub trait ReadApi {
     /// Returns one bounded current-state view.
@@ -792,6 +1389,24 @@ pub trait ReadApi {
         ctx: &RequestMetadata,
         request: ResourceRequest,
     ) -> Result<ResourceContent, ReadError>;
+    /// Returns one bounded current-state view bound to its exact identity.
+    async fn bound_state(
+        &self,
+        ctx: &RequestMetadata,
+        request: StateRequest,
+    ) -> Result<BoundRead<CurrentStateView>, ReadError>;
+    /// Executes one explicit-intent named query bound to its exact identity.
+    async fn bound_query(
+        &self,
+        ctx: &RequestMetadata,
+        request: QueryRequest,
+    ) -> Result<BoundRead<QueryResult>, ReadError>;
+    /// Expands one exact immutable resource URI bound to its exact identity.
+    async fn bound_resource(
+        &self,
+        ctx: &RequestMetadata,
+        request: ResourceRequest,
+    ) -> Result<BoundRead<ResourceContent>, ReadError>;
 }
 
 /// Local Governor read port for daemon-side query/packet serving.
@@ -870,6 +1485,11 @@ impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
             scope_id: Some(scope),
             consistency: ReadConsistency::Eventual,
             dependency_revisions: BTreeMap::new(),
+            // This port declares no conflict-serialization head dependency: its
+            // coherence is proven by the scope-bound evidence projection under
+            // the request fence alone. The declaration is explicit so the
+            // resolved identity records it rather than leaving it unstated.
+            ordering: ReadOrderingBinding::without_order_dependency(),
             parameters,
             provenance_handles: Vec::new(),
         };
@@ -917,6 +1537,10 @@ impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
             scope_id: Some(scope),
             consistency: ReadConsistency::Eventual,
             dependency_revisions: BTreeMap::new(),
+            // Explicit no-order-dependency declaration, for the same reason as
+            // `evidence_query`: the resolved identity states it rather than
+            // leaving the order-head dimension unstated.
+            ordering: ReadOrderingBinding::without_order_dependency(),
             parameters: NamedParameters::new(),
             provenance_handles: Vec::new(),
         };
@@ -943,6 +1567,13 @@ impl<C: CanonicalReadClient> ReadService<C> {
         self.store
     }
 
+    /// The single read engine of this package: resolve the identity closure,
+    /// enforce the declared dependencies, dispatch the one closed named read,
+    /// classify the outcome, and refuse anything that is not current.
+    ///
+    /// This is the only place that talks to [`CanonicalReadClient`], so there
+    /// is no second consistency algorithm, no second source resolution, and no
+    /// second outcome vocabulary anywhere in this owner.
     #[allow(clippy::too_many_arguments)]
     async fn execute(
         &self,
@@ -951,13 +1582,17 @@ impl<C: CanonicalReadClient> ReadService<C> {
         scope_id: Option<ScopeId>,
         consistency: ReadConsistency,
         dependencies: &BTreeMap<RevisionKey, u64>,
+        ordering: &ReadOrderingBinding,
         parameters: &NamedParameters,
         handles: &[ProvenanceHandle],
-    ) -> Result<NamedReadResponse, ReadError> {
+    ) -> Result<BoundRead<NamedReadResponse>, ReadError> {
         ctx.validate().map_err(|error| ReadError::InvalidField {
             field: "request_metadata".to_owned(),
             reason: error.to_string(),
         })?;
+        let (source, schema) = resolve_source_and_schema(operation)?;
+        let coverage = resolve_coverage(operation, parameters)?;
+        ordering.validate_against(&ctx.state_fence)?;
         if matches!(
             consistency,
             ReadConsistency::StableScope | ReadConsistency::ExactFence
@@ -974,7 +1609,7 @@ impl<C: CanonicalReadClient> ReadService<C> {
         validate_minimum_revisions(&before, dependencies)?;
         let request = NamedReadRequest {
             operation,
-            scope_id,
+            scope_id: scope_id.clone(),
             consistency,
             state_fence: ctx.state_fence.clone(),
             parameters: parameters.as_map().clone(),
@@ -1009,8 +1644,34 @@ impl<C: CanonicalReadClient> ReadService<C> {
         {
             return Err(ReadError::StaleRevision);
         }
+        classify_payload_coverage(operation, &response.payload)?;
         let _ = ReadProvenance::from_handles(handles)?;
-        Ok(response)
+        let identity = ReadIdentity {
+            principal: ReadPrincipal::from_metadata(ctx),
+            request_id: ctx.request_id.clone(),
+            operation,
+            scope_id: scope_id.clone(),
+            state_fence: ctx.state_fence.clone(),
+            consistency,
+            declared_dependency_revisions: dependencies.clone(),
+            observed_revision_heads: response.revision_heads.clone(),
+            ordering: ordering.clone(),
+            source: source.clone(),
+            schema: schema.clone(),
+            coverage,
+            invalidation: ReadInvalidationSet {
+                state_fence: ctx.state_fence.clone(),
+                scope_id: scope_id.clone(),
+                revision_heads: response.revision_heads.clone(),
+                ordering_heads: ordering.heads().to_vec(),
+                source: source.clone(),
+                schema: schema.clone(),
+            },
+        };
+        Ok(BoundRead {
+            view: response,
+            identity,
+        })
     }
 }
 
@@ -1020,26 +1681,7 @@ impl<C: CanonicalReadClient> ReadApi for ReadService<C> {
         ctx: &RequestMetadata,
         request: StateRequest,
     ) -> Result<CurrentStateView, ReadError> {
-        request.validate()?;
-        let response = self
-            .execute(
-                ctx,
-                request.operation,
-                request.scope_id,
-                request.consistency,
-                &request.dependency_revisions,
-                &request.parameters,
-                &request.provenance_handles,
-            )
-            .await?;
-        Ok(CurrentStateView {
-            operation: response.operation,
-            state_fence: response.state_fence,
-            revision_heads: response.revision_heads,
-            payload: response.payload,
-            provenance: ReadProvenance::from_handles(&request.provenance_handles)?,
-            consistency: request.consistency,
-        })
+        Ok(self.bound_state(ctx, request).await?.view)
     }
 
     async fn query(
@@ -1047,27 +1689,7 @@ impl<C: CanonicalReadClient> ReadApi for ReadService<C> {
         ctx: &RequestMetadata,
         request: QueryRequest,
     ) -> Result<QueryResult, ReadError> {
-        request.validate()?;
-        let response = self
-            .execute(
-                ctx,
-                request.operation,
-                request.scope_id,
-                request.consistency,
-                &request.dependency_revisions,
-                &request.parameters,
-                &request.provenance_handles,
-            )
-            .await?;
-        Ok(QueryResult {
-            intent: request.intent,
-            operation: response.operation,
-            state_fence: response.state_fence,
-            revision_heads: response.revision_heads,
-            payload: response.payload,
-            provenance: ReadProvenance::from_handles(&request.provenance_handles)?,
-            consistency: request.consistency,
-        })
+        Ok(self.bound_query(ctx, request).await?.view)
     }
 
     async fn resource(
@@ -1075,30 +1697,284 @@ impl<C: CanonicalReadClient> ReadApi for ReadService<C> {
         ctx: &RequestMetadata,
         request: ResourceRequest,
     ) -> Result<ResourceContent, ReadError> {
+        Ok(self.bound_resource(ctx, request).await?.view)
+    }
+
+    async fn bound_state(
+        &self,
+        ctx: &RequestMetadata,
+        request: StateRequest,
+    ) -> Result<BoundRead<CurrentStateView>, ReadError> {
         request.validate()?;
-        let mut parameters = request.parameters.clone();
-        parameters.insert_exact("resource_uri", request.uri.as_str())?;
-        let response = self
+        let bound = self
             .execute(
                 ctx,
                 request.operation,
                 request.scope_id,
                 request.consistency,
                 &request.dependency_revisions,
+                &request.ordering,
+                &request.parameters,
+                &request.provenance_handles,
+            )
+            .await?;
+        let view = CurrentStateView {
+            operation: bound.view.operation,
+            state_fence: bound.view.state_fence,
+            revision_heads: bound.view.revision_heads,
+            payload: bound.view.payload,
+            provenance: ReadProvenance::from_handles(&request.provenance_handles)?,
+            consistency: request.consistency,
+        };
+        Ok(BoundRead {
+            view,
+            identity: bound.identity,
+        })
+    }
+
+    async fn bound_query(
+        &self,
+        ctx: &RequestMetadata,
+        request: QueryRequest,
+    ) -> Result<BoundRead<QueryResult>, ReadError> {
+        request.validate()?;
+        let bound = self
+            .execute(
+                ctx,
+                request.operation,
+                request.scope_id,
+                request.consistency,
+                &request.dependency_revisions,
+                &request.ordering,
+                &request.parameters,
+                &request.provenance_handles,
+            )
+            .await?;
+        let view = QueryResult {
+            intent: request.intent,
+            operation: bound.view.operation,
+            state_fence: bound.view.state_fence,
+            revision_heads: bound.view.revision_heads,
+            payload: bound.view.payload,
+            provenance: ReadProvenance::from_handles(&request.provenance_handles)?,
+            consistency: request.consistency,
+        };
+        Ok(BoundRead {
+            view,
+            identity: bound.identity,
+        })
+    }
+
+    async fn bound_resource(
+        &self,
+        ctx: &RequestMetadata,
+        request: ResourceRequest,
+    ) -> Result<BoundRead<ResourceContent>, ReadError> {
+        request.validate()?;
+        let mut parameters = request.parameters.clone();
+        parameters.insert_exact("resource_uri", request.uri.as_str())?;
+        let bound = self
+            .execute(
+                ctx,
+                request.operation,
+                request.scope_id.clone(),
+                request.consistency,
+                &request.dependency_revisions,
+                &request.ordering,
                 &parameters,
                 &request.provenance_handles,
             )
             .await?;
-        Ok(ResourceContent {
+        let view = ResourceContent {
             uri: request.uri,
-            operation: response.operation,
-            state_fence: response.state_fence,
-            revision_heads: response.revision_heads,
-            payload: response.payload,
+            operation: bound.view.operation,
+            state_fence: bound.view.state_fence,
+            revision_heads: bound.view.revision_heads,
+            payload: bound.view.payload,
             provenance: ReadProvenance::from_handles(&request.provenance_handles)?,
             consistency: request.consistency,
+        };
+        Ok(BoundRead {
+            view,
+            identity: bound.identity,
         })
     }
+}
+
+/// Resolves the exact activated Store source and projection schema of one
+/// named read.
+///
+/// The Store operation catalogue is the single authority for which source is
+/// activated, and it is read here without re-declaring anything. An operation
+/// with no activated entry has no running source, so it is refused as
+/// [`ReadOutcome::NotRunning`] instead of being dispatched and answered by an
+/// unknown-operation error that a consumer could mistake for a refusal of the
+/// caller rather than of the source.
+///
+/// Both schema witnesses come from the Store: the catalogue entry's own schema
+/// digest and the digest over the owner-approved typed read-parameter schema the
+/// request is admitted against. Neither is read from the payload, so a payload
+/// can never restate or widen the schema it was read under.
+fn resolve_source_and_schema(
+    operation: NamedReadOperation,
+) -> Result<(ReadSourceIdentity, ReadSchemaIdentity), ReadError> {
+    let operation_name = named_read_operation_name(operation);
+    if !activated_read_operations().contains(&operation) {
+        return Err(ReadError::Outcome(ReadOutcome::NotRunning));
+    }
+    let entries = generated_manifests()?;
+    let entry = entries
+        .iter()
+        .find(|entry| entry.name == operation_name)
+        .ok_or(ReadError::Outcome(ReadOutcome::NotRunning))?;
+    let source = ReadSourceIdentity {
+        operation,
+        operation_name: operation_name.to_owned(),
+        manifest_name: entry.name.clone(),
+        manifest_digest: entry.digest.as_str().to_owned(),
+    };
+    let schema = ReadSchemaIdentity {
+        manifest_name: entry.name.clone(),
+        manifest_version: entry.version,
+        manifest_schema_digest: entry.schema_digest.clone(),
+        parameter_schema_digest: parameter_schema_digest(&project_parameter_schema(operation))?,
+    };
+    Ok((source, schema))
+}
+
+/// Returns the generated Store operation catalogue.
+///
+/// The catalogue is a pure function of the Store's own declaration table, so
+/// resolving it here introduces no second source of truth; a catalogue that
+/// cannot be generated is a store contract failure, not an empty read.
+fn generated_manifests() -> Result<Vec<eliot_store_api::NamedOperationManifest>, ReadError> {
+    eliot_store_api::generated_operation_manifests()
+        .map_err(StoreReadFailure::from)
+        .map_err(ReadError::Store)
+}
+
+/// Resolves the exact coverage identity of one named read from the Store's own
+/// declared read-parameter table plus the caller's declared selectors.
+///
+/// A result-set bound, a cursor continuation, or the absence of any coverage
+/// dimension is read from the declaration table rather than assumed, and the
+/// caller's declared bound is echoed exactly. No percentage or completeness
+/// estimate is derived here: coverage is a statement about which bound was in
+/// force, never about how much of the source a read happened to see.
+fn resolve_coverage(
+    operation: NamedReadOperation,
+    parameters: &NamedParameters,
+) -> Result<ReadCoverage, ReadError> {
+    let declarations = declared_read_parameters(operation);
+    let mut result_bound = None;
+    let mut page_bound = None;
+    let mut cursor = false;
+    for declaration in declarations {
+        match declaration.name {
+            "max_records" => result_bound = Some(DeclaredResultSelector::MaxRecords),
+            "page_limit" => page_bound = Some(DeclaredPageSelector::PageLimit),
+            "cursor" => cursor = true,
+            _ => {}
+        }
+    }
+    if let Some(selector) = result_bound {
+        return Ok(
+            match declared_bound(parameters, declaration_name(selector))? {
+                Some(declared_bound) => ReadCoverage::BoundedByDeclaredSelector {
+                    selector,
+                    declared_bound,
+                },
+                None => ReadCoverage::BoundByStore { selector },
+            },
+        );
+    }
+    if cursor {
+        return Ok(ReadCoverage::PagedByDeclaredCursor {
+            selector: page_bound,
+        });
+    }
+    Ok(ReadCoverage::NotApplicable)
+}
+
+/// Returns the exact Store selector name for one declared coverage selector.
+const fn declaration_name(selector: DeclaredResultSelector) -> &'static str {
+    match selector {
+        DeclaredResultSelector::MaxRecords => "max_records",
+    }
+}
+
+/// Reads one caller-declared positive decimal bound out of the closed selectors.
+fn declared_bound(parameters: &NamedParameters, selector: &str) -> Result<Option<u32>, ReadError> {
+    let Some(raw) = parameters.as_map().get(selector) else {
+        return Ok(None);
+    };
+    let text = raw.as_str().ok_or_else(|| ReadError::InvalidField {
+        field: format!("coverage.{selector}"),
+        reason: "declared bound must be a decimal string".to_owned(),
+    })?;
+    let bound: u32 = text.parse().map_err(|_| ReadError::InvalidField {
+        field: format!("coverage.{selector}"),
+        reason: "declared bound must be a positive decimal".to_owned(),
+    })?;
+    if bound == 0 {
+        return Err(ReadError::InvalidField {
+            field: format!("coverage.{selector}"),
+            reason: "declared bound must be a positive decimal".to_owned(),
+        });
+    }
+    Ok(Some(bound))
+}
+
+/// Refuses a successful response that does not observe its own bound identity.
+///
+/// Two cases are refused, and neither may become a successful empty or current
+/// result:
+///
+/// * a payload that is a bare JSON `null` is an unobserved in-memory value, not
+///   an authoritative statement that the projection is empty — it is `Unknown`;
+/// * for the operations whose Store contract types a page coverage statement
+///   ([`ExperienceRangePage`]), the statement must decode and must describe the
+///   records it carries — an undecodable or undescribed statement is `Unknown`,
+///   and a statement that proves further rows exist past the declared bound is
+///   `Partial`.
+///
+/// Every other operation keeps its payload opaque here: its own consumer owns
+/// the payload contract, and this owner states only that the read is bound to
+/// the exact [`ReadCoverage`] identity it resolved above.
+fn classify_payload_coverage(
+    operation: NamedReadOperation,
+    payload: &Value,
+) -> Result<(), ReadError> {
+    if payload.is_null() {
+        return Err(ReadError::Outcome(ReadOutcome::Unknown));
+    }
+    if !declares_store_coverage_statement(operation) {
+        return Ok(());
+    }
+    let page: ExperienceRangePage = serde_json::from_value(payload.clone())
+        .map_err(|_| ReadError::Outcome(ReadOutcome::Unknown))?;
+    if page.matched_total != page.records.len() {
+        return Err(ReadError::Outcome(ReadOutcome::Unknown));
+    }
+    if page.truncated {
+        return Err(ReadError::Outcome(ReadOutcome::Partial));
+    }
+    Ok(())
+}
+
+/// Returns whether the Store contract types a page coverage statement for this
+/// operation.
+///
+/// The answer is read from the Store's own exported contract: only the two
+/// experience range reads publish a typed [`ExperienceRangePage`] statement, so
+/// only they are gated on it. Any operation that starts publishing such a
+/// statement gains the gate through its Store contract, not through a decision
+/// made here.
+const fn declares_store_coverage_statement(operation: NamedReadOperation) -> bool {
+    matches!(
+        operation,
+        NamedReadOperation::GetExperienceBankRange | NamedReadOperation::GetAgentFeedbackRange
+    )
 }
 
 /// Returns the stable contract identity for protocol/schema handshakes.
@@ -1110,6 +1986,9 @@ pub fn contract_identity() -> Result<ContractIdentity, eliot_contracts::Contract
         raw_query_rule: &'static str,
         stable_read_rule: &'static str,
         provenance_rule: &'static str,
+        identity_rule: &'static str,
+        ordering_rule: &'static str,
+        outcome_rule: &'static str,
     }
 
     make_contract_identity(
@@ -1121,6 +2000,9 @@ pub fn contract_identity() -> Result<ContractIdentity, eliot_contracts::Contract
             raw_query_rule: "closed_named_operations_and_scalar_selectors_only",
             stable_read_rule: "revision_heads_before_and_after_named_read",
             provenance_rule: "exact_handles_or_read_only_unavailable_disposition",
+            identity_rule: "principal_scope_fence_heads_consistency_source_schema_coverage_and_invalidation",
+            ordering_rule: "declared_order_heads_must_carry_the_exact_read_fence",
+            outcome_rule: "only_current_is_successful_not_running_unknown_partial_stay_distinct",
         },
     )
 }
@@ -1425,6 +2307,7 @@ mod evidence_pack_read_tests {
             scope_id: scope.map(ScopeId::new).transpose()?,
             consistency,
             dependency_revisions: dependencies,
+            ordering: ReadOrderingBinding::without_order_dependency(),
             parameters,
             provenance_handles: Vec::new(),
         })
@@ -1640,6 +2523,7 @@ mod evidence_pack_read_tests {
             scope_id: Some(ScopeId::new("scope-evidence")?),
             consistency: ReadConsistency::Eventual,
             dependency_revisions: BTreeMap::new(),
+            ordering: ReadOrderingBinding::without_order_dependency(),
             parameters: evidence_params("evidence-alpha", "10"),
             provenance_handles: Vec::new(),
         };
