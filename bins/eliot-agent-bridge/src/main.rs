@@ -2004,6 +2004,36 @@ mod tests {
         }
     }"#;
 
+    /// W3 (#77) stdin line: one `eliot.query` invoke through the public
+    /// bridge protocol. The tool shape mirrors the proven-valid query fixture
+    /// (verification intent, exact-subject selector, no resource URI).
+    const INVOKE_QUERY: &str = r#"{
+        "op":"invoke",
+        "request":{
+            "protocol_version":"2026-07-28",
+            "correlation_id":"host-query-1",
+            "client_capabilities":{"tasks":false},
+            "tool":{"name":"eliot.query","arguments":{
+                "intent":{
+                    "mode":"verification",
+                    "time_scope":"session-window",
+                    "branch_environment_scope":"branch",
+                    "freshness_policy":"exact-fence",
+                    "required_assurance":"evidence-provenance"
+                },
+                "query":"subject:evidence-alpha",
+                "exact_resource_uri": null
+            }},
+            "deadline_preference_ms":5000,
+            "observed_context":{
+                "host_session_hint":"host-turn-1",
+                "observed_resource_refs":[],
+                "event_cursors":[],
+                "trace_context":{}
+            }
+        }
+    }"#;
+
     const DRY_RUN_INVOKE: &str = r#"{
         "op":"dry_run_invoke",
         "request":{
@@ -3204,6 +3234,129 @@ mod tests {
             assert!(
                 value.get("evidence").is_none(),
                 "detached recording must not project a handle"
+            );
+        }
+
+        /// Owning-operation answer served through the invoke-read leg.
+        fn query_answer() -> McpResponse {
+            McpResponse {
+                request_id: "req-query-1".to_owned(),
+                idempotency_key: "idem-query-1".to_owned(),
+                canonical_request_sha256: DIGEST_A.to_owned(),
+                kind: ResponseKind::Projection,
+                canonical_tool_name: "eliot.query".to_owned(),
+                content: serde_json::json!({"subject":"evidence-alpha"}),
+                artifacts: Vec::new(),
+                proof_ceiling: ProofCeiling::Observation,
+                resource: None,
+                job: None,
+            }
+        }
+
+        /// Scripted stand-in for the Kernel/Governor side of one query
+        /// invocation: the first invoke admits the operation (the owning
+        /// operation has not answered yet); the re-invoke under the same host
+        /// correlation serves the owner's answer. Never a guessed outcome:
+        /// each step returns exactly one staged port outcome.
+        struct QueryTwoStepPort {
+            answer: McpResponse,
+            calls: usize,
+        }
+
+        impl KernelHostRequestPort for QueryTwoStepPort {
+            fn invoke(
+                &mut self,
+                _request: &HostInvocationRequest,
+            ) -> Result<HostInvocationPortOutcome, PortFailure> {
+                self.calls += 1;
+                let operation_handle =
+                    HostOperationHandle::new("kernel-operation-query-1").expect("valid handle");
+                if self.calls == 1 {
+                    Ok(HostInvocationPortOutcome::Accepted { operation_handle })
+                } else {
+                    Ok(HostInvocationPortOutcome::Responded {
+                        operation_handle,
+                        response: Box::new(self.answer.clone()),
+                    })
+                }
+            }
+
+            fn cancel(
+                &mut self,
+                _request: &super::super::HostCancellationRequest,
+            ) -> Result<super::HostCancellationPortOutcome, PortFailure> {
+                Err(PortFailure::PlanGap {
+                    missing_capability: "test.query-port.cancel".to_owned(),
+                    reason: "cancel not exercised".to_owned(),
+                })
+            }
+        }
+
+        #[test]
+        fn query_invoke_keeps_host_correlation_from_admission_to_answer() {
+            // W3 (#77): one op end-to-end through the public stdin protocol.
+            // A query invoke decodes from its stdin line, dispatches through
+            // the gateway, and answers with the exact host correlation on
+            // both the admission step and the re-invoke step after the owning
+            // Governor operation serves the answer.
+            let request = match decode_bounded_request(super::INVOKE_QUERY)
+                .expect("query invoke must decode")
+            {
+                super::Request::Invoke { request } => request,
+                _ => panic!("expected invoke"),
+            };
+            assert_eq!(request.tool.canonical_name(), "eliot.query");
+            assert_eq!(request.correlation_id.as_str(), "host-query-1");
+            let mut runner = attached_runner();
+            let mut port = QueryTwoStepPort {
+                answer: query_answer(),
+                calls: 0,
+            };
+            // Exact production order: gateway dispatch, then delivery recording.
+            let mut admitted = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            record_invocation_delivery(&mut runner, &mut admitted);
+            let mut answered = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            record_invocation_delivery(&mut runner, &mut answered);
+            assert_eq!(port.calls, 2);
+            assert_eq!(runner.resource_registry_len(), 0);
+            for response in [&admitted, &answered] {
+                let super::Response::Invocation {
+                    result, completion, ..
+                } = response
+                else {
+                    panic!("invoke must answer an invocation envelope");
+                };
+                assert_eq!(result.correlation_id().as_str(), "host-query-1");
+                assert_eq!(completion.correlation_id().as_str(), "host-query-1");
+                let value = serde_json::to_value(response).expect("response must serialize");
+                assert_eq!(
+                    value["result"]["correlation_id"],
+                    serde_json::Value::String("host-query-1".to_owned())
+                );
+                assert_eq!(
+                    value["completion"]["correlation_id"],
+                    serde_json::Value::String("host-query-1".to_owned())
+                );
+            }
+            // The admission step carries no answer; the re-invoke step carries
+            // the owning operation's answer verbatim under the same correlation.
+            let admitted_value = serde_json::to_value(&admitted).expect("admission must serialize");
+            assert_eq!(
+                admitted_value["result"]["outcome"]["disposition"],
+                serde_json::Value::String("ACCEPTED".to_owned())
+            );
+            let answered_value = serde_json::to_value(&answered).expect("answer must serialize");
+            assert_eq!(
+                answered_value["result"]["outcome"]["disposition"],
+                serde_json::Value::String("RESPONDED".to_owned())
+            );
+            assert_eq!(
+                answered_value["result"]["outcome"]["response"]["canonical_tool_name"],
+                serde_json::Value::String("eliot.query".to_owned())
+            );
+            assert_eq!(
+                answered_value["result"]["outcome"]["response"]["content"]["subject"],
+                serde_json::Value::String("evidence-alpha".to_owned())
             );
         }
     }
