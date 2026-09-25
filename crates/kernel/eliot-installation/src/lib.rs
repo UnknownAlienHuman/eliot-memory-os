@@ -7082,6 +7082,10 @@ pub fn registry_projection_pending_ref(
     .map_err(|error| platform_error(&error))
 }
 
+/// Durable pending reference persisted when a bounded service start passes
+/// its convergence deadline without acknowledgement.
+pub(crate) const SERVICE_START_TIMEOUT_PENDING_REF: &str = "timeout:service-start-convergence";
+
 /// Coordinates one durable installation transaction without owning platform mechanics.
 pub(crate) struct InstallationCoordinator<P, S> {
     port: P,
@@ -7388,7 +7392,7 @@ where
                 return self.persist_unknown(
                     transaction,
                     index,
-                    PlatformHandle::new("timeout:service-start-convergence")
+                    PlatformHandle::new(SERVICE_START_TIMEOUT_PENDING_REF)
                         .map_err(|error| platform_error(&error))?,
                 );
             }
@@ -9075,6 +9079,88 @@ where
         })
     }
 
+    /// Recovery-only readback reconciliation for a first-install service-start
+    /// timeout, called before the Host registry abort in
+    /// `rollback_with_activation_owner`.
+    ///
+    /// `Activating` with the exact pending suffix needs no reconciliation and
+    /// yields no indexes.  `RollbackRequired` with the retained intent yields
+    /// the unsettled start indexes only after an authoritative port readback
+    /// observes every one of them `Absent`; the reset to `Pending` itself
+    /// happens later inside the single intent-clearing CAS, so a failed
+    /// readback persists nothing and keeps the intent.  Any present service,
+    /// any residual unknown, or any contour outside the timeout shape refuses
+    /// with recovery/forward-repair rather than quarantining or dropping the
+    /// intent.  This never executes an effect: reconciliation is read-only.
+    pub(crate) fn reconcile_timeout_starts_for_owner_rollback(
+        &mut self,
+        transaction: &InstallationTransaction,
+    ) -> Result<Vec<usize>, InstallationError> {
+        transaction.validate()?;
+        if transaction.activation_projection_intent().is_none() {
+            return Err(InstallationError::IllegalTransition {
+                from: transaction.stage(),
+                to: InstallationStage::RolledBack,
+            });
+        }
+        if transaction.stage() == InstallationStage::Activating {
+            return Ok(Vec::new());
+        }
+        let candidates = transaction.recoverable_timeout_start_indexes()?;
+        for index in &candidates {
+            let attempt = match &transaction.effect_progress[*index].state {
+                InstallationEffectProgressState::IntentCommitted { attempt, .. } => *attempt,
+                InstallationEffectProgressState::Unknown { .. } => 1,
+                _ => {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            };
+            let request = effect_request(
+                transaction,
+                *index,
+                attempt,
+                InstallationEffectAction::Rollback,
+                None,
+            )?;
+            let observed = match self.port.reconcile(&request) {
+                PortOutcome::Known(observed) => {
+                    observed.validate()?;
+                    observed.validate_for_effect(&transaction.installer_effects[*index])?;
+                    observed
+                }
+                other => {
+                    return Err(InstallationError::IncompleteObservation(format!(
+                        "service start reconciliation stays unknown for effect {}: {}",
+                        transaction.effect_progress[*index].effect_id.as_str(),
+                        port_pending(other).as_str(),
+                    )));
+                }
+            };
+            match observed {
+                InstallationEffectObservation::Absent {
+                    service_runtime_lineage: None,
+                    ..
+                } => {}
+                InstallationEffectObservation::Absent { .. } => {
+                    return Err(InstallationError::IncompleteObservation(format!(
+                        "service start reconciliation observed a runtime lineage for effect {}",
+                        transaction.effect_progress[*index].effect_id.as_str(),
+                    )));
+                }
+                InstallationEffectObservation::Matching { .. } => {
+                    return Err(InstallationError::IncompleteObservation(format!(
+                        "service start reconciliation observed a present service for effect {}; forward repair is required",
+                        transaction.effect_progress[*index].effect_id.as_str(),
+                    )));
+                }
+                InstallationEffectObservation::Mismatch { .. } => {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
     fn persist_quarantined(
         &mut self,
         mut transaction: InstallationTransaction,
@@ -9285,6 +9371,24 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
     /// must supply the already-open Host owner capability and registry through
     /// this explicit owner-aware seam; no caller-supplied approval fields are
     /// accepted.
+    ///
+    /// Two pre-no-return first-install contours are admitted.  `Activating`
+    /// with the exact pending service-start/credential/Phase-B suffix needs no
+    /// reconciliation.  `RollbackRequired` is admitted only for the
+    /// service-start timeout contour the bounded-start drive persists, and only
+    /// after an authoritative readback proves every unsettled service start
+    /// `Absent`; a present service, a residual unknown, an observed runtime
+    /// lineage, or an applied credential/Phase-B effect keeps the intent and
+    /// refuses for forward repair.  Past the no-return boundary, after a
+    /// committed activation, or on a non-first install, the existing refusal is
+    /// unchanged and is decided before any readback.
+    ///
+    /// The intent is cleared only after the exact owner acknowledgement, inside
+    /// the single transaction-store `compare_and_save`.  A CAS conflict, a
+    /// mismatched pending projection, a missing Host owner, or an unknown
+    /// provider result leaves the intent durable and returns an error.  The
+    /// cleared transaction then re-enters the ordinary exact-effect rollback
+    /// loop, so only `CreatedByTransaction` identities are removed.
     pub fn rollback_with_activation_owner(
         &mut self,
         registry: &RedbInstallationRegistry,
@@ -9300,12 +9404,11 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
         let Some(intent) = transaction.activation_projection_intent().cloned() else {
             return self.inner.rollback(transaction_id);
         };
-        if transaction.stage() != InstallationStage::Activating {
-            return Err(InstallationError::IllegalTransition {
-                from: transaction.stage(),
-                to: InstallationStage::RolledBack,
-            });
-        }
+        // Past the no-return boundary, after a committed activation, or on any
+        // upgrade of a previously working install, this seam keeps the existing
+        // refusal: no readback, no registry mutation, no intent retirement.
+        // These guards therefore precede the recovery-only reconciliation
+        // below so a post-boundary transaction cannot reach it at all.
         if transaction.no_return_boundary.is_some() || transaction.active_verified_receipt.is_some()
         {
             return Err(InstallationError::IncompleteObservation(
@@ -9318,9 +9421,33 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
                 "activation-intent rollback is restricted to a first installation".to_owned(),
             ));
         }
+        // Only the two pre-no-return contours reach the registry.  Recovery-only
+        // reconciliation for the service-start timeout contour: `Activating`
+        // needs none, while a timeout-persisted `RollbackRequired` must prove
+        // every unsettled start `Absent` through an authoritative readback
+        // before the owner abort below.  Any other stage refuses here; any
+        // present service or residual unknown refuses with the intent kept.
+        // The ordinary `rollback` seam is unchanged and still rejects an
+        // intent outright.
+        if transaction.stage() != InstallationStage::Activating
+            && transaction.stage() != InstallationStage::RollbackRequired
+        {
+            return Err(InstallationError::IllegalTransition {
+                from: transaction.stage(),
+                to: InstallationStage::RolledBack,
+            });
+        }
+        let reconciled_absent = self
+            .inner
+            .reconcile_timeout_starts_for_owner_rollback(&transaction)?;
         // This is the pre-no-return contour: service starts, credential, and
-        // Phase-B effects are still pending and carry no runtime receipt.
-        transaction.require_signed_pending_activation_effects()?;
+        // Phase-B effects are still pending and carry no runtime receipt.  The
+        // `Activating` shape is re-checked here before touching the registry;
+        // the timeout shape was already proven by the reconciliation above and
+        // is re-proven inside the intent-clearing CAS below.
+        if transaction.stage() == InstallationStage::Activating {
+            transaction.require_signed_pending_activation_effects()?;
+        }
         let approval = intent.derive_verified_approval(&transaction)?;
         let manifest_digest = candidate_manifest_digest(&transaction.candidate_manifest)?;
         let activation_intent_digest = activation_projection_intent_digest(&intent)?;
@@ -9368,7 +9495,7 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
             }
         };
         let mut cleared = transaction;
-        cleared.prepare_pre_no_return_rollback(abort_evidence)?;
+        cleared.prepare_pre_no_return_rollback(abort_evidence, &reconciled_absent)?;
         <RedbInstallationTransactionStore as transaction_store_private::Sealed>::compare_and_save(
             self.inner.store_mut(),
             expected_transaction,

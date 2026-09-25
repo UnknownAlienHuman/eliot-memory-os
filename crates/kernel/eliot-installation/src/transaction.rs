@@ -14,10 +14,10 @@ use super::{
     InstallationServiceStartProof, InstallationStepOutcome, InstallerEffectPlan,
     InstallerServiceControlGrantReceipt, InstallerServiceRegistrationApproval,
     InstallerServiceRole, ManagedEnvironmentChangeRequest, PlannedChange, PlatformHandle,
-    RuntimeStateRoots, StagingReceipt, StoreCredentialLifecycle, StoreCredentialProgress,
-    candidate_manifest_digest, handle, handles, ownership_secret_absence_evidence,
-    phase_b_scm_digest, sha256_handle, sha256_hex, validate_installer_effects,
-    validate_package_binding, validate_phase_b_effect_bindings,
+    RuntimeStateRoots, SERVICE_START_TIMEOUT_PENDING_REF, StagingReceipt, StoreCredentialLifecycle,
+    StoreCredentialProgress, candidate_manifest_digest, handle, handles,
+    ownership_secret_absence_evidence, phase_b_scm_digest, sha256_handle, sha256_hex,
+    validate_installer_effects, validate_package_binding, validate_phase_b_effect_bindings,
     validate_staging_receipt_for_observation, validate_staging_receipt_for_plan,
 };
 /// Store-volume observation used to evaluate the immutable free-space policy.
@@ -791,6 +791,163 @@ impl InstallationTransaction {
                 "signed pending activation requires the Registering or Activating boundary, observed {stage:?}"
             ))),
         }
+    }
+
+    /// Names the service-start effects a recovery readback must reconcile
+    /// before an owner-acknowledged rollback may retire the activation intent.
+    ///
+    /// This admits exactly the contour the bounded-start drive persists on a
+    /// first-install service-start timeout: stage `RollbackRequired` with the
+    /// intent retained, every pre-bootstrap effect durably `Applied`, the
+    /// ordered `Watchdog` then `Host` starts each `Pending`, unconverged
+    /// `IntentCommitted`, or timeout `Unknown`, and the credential/Phase-B
+    /// suffix still `Pending` with no receipts.  Any observed service process
+    /// lineage, any non-timeout `Unknown`, or any applied credential/Phase-B
+    /// effect refuses: the transaction stays recovery/quarantine-requiring and
+    /// the intent is kept.  The returned indexes are ascending and non-empty;
+    /// a forged `RollbackRequired` shape with nothing to reconcile is refused
+    /// here rather than mistaken for the pre-drive contour.
+    pub(crate) fn recoverable_timeout_start_indexes(
+        &self,
+    ) -> Result<Vec<usize>, InstallationError> {
+        self.validate()?;
+        if self.stage != InstallationStage::RollbackRequired {
+            return Err(InstallationError::IncompleteObservation(format!(
+                "timeout recovery requires the RollbackRequired boundary, observed {:?}",
+                self.stage
+            )));
+        }
+        if self.activation_projection_intent.is_none() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let first_start = self
+            .installer_effects
+            .iter()
+            .position(|effect| matches!(effect, InstallerEffectPlan::StartService { .. }))
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "timeout recovery requires Watchdog then Host service starts".to_owned(),
+                )
+            })?;
+        for progress in &self.effect_progress[..first_start] {
+            if !matches!(
+                progress.state,
+                InstallationEffectProgressState::Applied { .. }
+            ) {
+                return Err(InstallationError::IncompleteObservation(
+                    "timeout recovery requires all effects before Host bootstrap to be applied"
+                        .to_owned(),
+                ));
+            }
+        }
+        let (unsettled, cursor) = self.recoverable_timeout_start_run(first_start)?;
+        let suffix = &self.installer_effects[cursor..];
+        if suffix.len() != 2
+            || !matches!(
+                suffix[0],
+                InstallerEffectPlan::ProvisionStoreCredential { .. }
+            )
+            || !matches!(suffix[1], InstallerEffectPlan::MaterializePhaseB { .. })
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "timeout recovery requires ordered credential then PhaseB after bootstrap"
+                    .to_owned(),
+            ));
+        }
+        for idx in cursor..self.installer_effects.len() {
+            let progress = &self.effect_progress[idx];
+            if !matches!(progress.state, InstallationEffectProgressState::Pending) {
+                return Err(InstallationError::IncompleteObservation(
+                    "timeout recovery requires the credential and PhaseB suffix to remain pending"
+                        .to_owned(),
+                ));
+            }
+            if progress
+                .store_credential
+                .as_ref()
+                .is_some_and(|c| c.receipt.is_some())
+                || progress.phase_b_receipt.is_some()
+                || progress.staging_receipt.is_some()
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "timeout recovery refuses a suffix carrying receipts".to_owned(),
+                ));
+            }
+        }
+        if unsettled.is_empty() {
+            return Err(InstallationError::IncompleteObservation(
+                "timeout recovery requires at least one unsettled service start to reconcile"
+                    .to_owned(),
+            ));
+        }
+        Ok(unsettled)
+    }
+
+    /// Scans the ordered `Watchdog` then `Host` service-start run for timeout
+    /// recovery, returning the unsettled indexes needing readback and the
+    /// cursor where the credential/Phase-B suffix begins.  Every unsettled
+    /// start is a timeout `Unknown` or an unconverged `IntentCommitted` with
+    /// no observed process lineage; anything else refuses.
+    fn recoverable_timeout_start_run(
+        &self,
+        first_start: usize,
+    ) -> Result<(Vec<usize>, usize), InstallationError> {
+        let mut start_roles = Vec::new();
+        let mut unsettled = Vec::new();
+        let mut cursor = first_start;
+        while cursor < self.installer_effects.len() {
+            let InstallerEffectPlan::StartService { role, .. } = &self.installer_effects[cursor]
+            else {
+                break;
+            };
+            let progress = &self.effect_progress[cursor];
+            if progress
+                .service_start_proof
+                .as_ref()
+                .is_some_and(|proof| proof.process_lineage.is_some())
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "timeout recovery refuses an observed service start lineage".to_owned(),
+                ));
+            }
+            match &progress.state {
+                InstallationEffectProgressState::Pending => {
+                    if progress.service_start_proof.is_some()
+                        || progress.service_start_deadline_ms.is_some()
+                    {
+                        return Err(InstallationError::IncompleteObservation(
+                            "timeout recovery refuses a pending start carrying intent".to_owned(),
+                        ));
+                    }
+                }
+                InstallationEffectProgressState::IntentCommitted { .. } => {
+                    unsettled.push(cursor);
+                }
+                InstallationEffectProgressState::Unknown { pending_ref }
+                    if pending_ref.as_str() == SERVICE_START_TIMEOUT_PENDING_REF =>
+                {
+                    unsettled.push(cursor);
+                }
+                InstallationEffectProgressState::Unknown { .. } => {
+                    return Err(InstallationError::IncompleteObservation(
+                        "timeout recovery refuses a non-timeout unknown service start".to_owned(),
+                    ));
+                }
+                InstallationEffectProgressState::Applied { .. } => {
+                    return Err(InstallationError::IncompleteObservation(
+                        "timeout recovery refuses a converged service start".to_owned(),
+                    ));
+                }
+            }
+            start_roles.push(*role);
+            cursor += 1;
+        }
+        if start_roles != [InstallerServiceRole::Watchdog, InstallerServiceRole::Host] {
+            return Err(InstallationError::IncompleteObservation(
+                "timeout recovery requires Watchdog then Host service starts".to_owned(),
+            ));
+        }
+        Ok((unsettled, cursor))
     }
 
     /// Requires the first-install bootstrap prefix to be durable.
@@ -1990,16 +2147,24 @@ impl InstallationTransaction {
     /// `ABORTED` terminal acknowledgement.  The intent is cleared only by
     /// the transaction-store CAS performed by the coordinator after this
     /// in-memory transition succeeds.
+    ///
+    /// Two pre-no-return contours are admitted.  `Activating` with the exact
+    /// pending service-start/credential/Phase-B suffix requires no
+    /// reconciliation (`reconciled_absent` must be empty).  `RollbackRequired`
+    /// is admitted only for the service-start timeout shape persisted by the
+    /// coordinator's bounded-start drive: every non-`Pending` start is a
+    /// timeout `Unknown` or an unconverged `IntentCommitted` with no observed
+    /// process lineage, and `reconciled_absent` must name exactly those
+    /// indexes after the coordinator's readback observed each one `Absent`.
+    /// The reconciled starts return to `Pending` in this same transition so
+    /// the existing exact-effect rollback loop below can run; any other
+    /// `Unknown`, any observed lineage, or any applied credential/Phase-B
+    /// effect keeps the intent and refuses.
     pub(crate) fn prepare_pre_no_return_rollback(
         &mut self,
         abort_evidence: PlatformHandle,
+        reconciled_absent: &[usize],
     ) -> Result<(), InstallationError> {
-        if self.stage != InstallationStage::Activating {
-            return Err(InstallationError::IllegalTransition {
-                from: self.stage,
-                to: InstallationStage::RollbackRequired,
-            });
-        }
         if self.activation_projection_intent.is_none() {
             return Err(InstallationError::IdentityConflict);
         }
@@ -2014,10 +2179,52 @@ impl InstallationTransaction {
                 "activation-intent rollback is restricted to a first installation".to_owned(),
             ));
         }
-        // This contour proves that both SCM starts and the credential/Phase-B
-        // suffix remain pending: no service is running/committed and no
-        // credential or Phase-B receipt is available to roll back here.
-        self.require_signed_pending_activation_effects()?;
+        match self.stage {
+            InstallationStage::Activating => {
+                if !reconciled_absent.is_empty() {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                // This contour proves that both SCM starts and the credential/Phase-B
+                // suffix remain pending: no service is running/committed and no
+                // credential or Phase-B receipt is available to roll back here.
+                self.require_signed_pending_activation_effects()?;
+            }
+            InstallationStage::RollbackRequired => {
+                let expected = self.recoverable_timeout_start_indexes()?;
+                let mut reconciled = reconciled_absent.to_vec();
+                reconciled.sort_unstable();
+                reconciled.dedup();
+                if reconciled.len() != reconciled_absent.len() || reconciled != expected {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                for index in reconciled {
+                    let progress = self
+                        .effect_progress
+                        .get_mut(index)
+                        .ok_or(InstallationError::IdentityConflict)?;
+                    progress.state = InstallationEffectProgressState::Pending;
+                    progress.service_start_deadline_ms = None;
+                    progress.service_start_proof = None;
+                }
+            }
+            stage => {
+                return Err(InstallationError::IllegalTransition {
+                    from: stage,
+                    to: InstallationStage::RollbackRequired,
+                });
+            }
+        }
+        if self.effect_progress.iter().any(|progress| {
+            progress
+                .service_start_proof
+                .as_ref()
+                .is_some_and(|proof| proof.process_lineage.is_some())
+        }) {
+            return Err(InstallationError::IncompleteObservation(
+                "pre-no-return activation rollback refuses an observed service start lineage"
+                    .to_owned(),
+            ));
+        }
         handle(&abort_evidence, "activation_projection.abort_evidence")?;
         self.completed_stage_refs.push(abort_evidence.clone());
         self.pending_external_changes = vec![abort_evidence];
