@@ -959,15 +959,25 @@ pub fn fabric_rejection_of(error: &FabricError) -> (RejectionReason, OwningCompo
 }
 
 /// Maps one daemon error to its reporting owner. Lifecycle/config/transport
-/// boundaries report themselves; only the Governor composition owner maps
-/// to [`OwningComponent::Governor`]. The error text is never parsed for
-/// ownership.
+/// boundaries report themselves; the Governor semantic admission owner maps
+/// to [`OwningComponent::Governor`] for its own composition, finish,
+/// maintenance-trigger (issue #1688), and task-binding (issue #1929)
+/// admission failures. The error text is never parsed for ownership.
 #[must_use]
 pub fn daemon_error_owner(error: &DaemonError) -> OwningComponent {
     match error {
-        DaemonError::Composition(_) | DaemonError::Finish(_) | DaemonError::Maintenance(_) => {
-            OwningComponent::Governor
-        }
+        // Issue #1929 (I5.5/I5.6): a `TaskBinding` rejection is reported to the
+        // Governor, which is the owner that actually admitted the transition.
+        // The daemon ingress validator mints no authority — it only checks the
+        // caller-presented selection against the Governor-issued
+        // `TaskSelectionEvidence` and the retained `WorkScope` binding — so
+        // both stable codes (`TASK_SELECTION_REQUIRED` and
+        // `TASK_SCOPE_INCOMPATIBLE`) name that same owner. The owner comes
+        // from the variant, never from reading the code out of the message.
+        DaemonError::Composition(_)
+        | DaemonError::Finish(_)
+        | DaemonError::Maintenance(_)
+        | DaemonError::TaskBinding(_) => OwningComponent::Governor,
         DaemonError::Kernel(_) => OwningComponent::Kernel,
         DaemonError::LaunchConfig(_) | DaemonError::Protected(_) => OwningComponent::DaemonConfig,
         DaemonError::Lifecycle(_) => OwningComponent::DaemonRuntime,
@@ -1262,6 +1272,13 @@ impl ErrorRecord {
             DaemonError::Lifecycle(_) => ("lifecycle", error.to_string()),
             DaemonError::ProviderAdmission(_) => ("provider-admission", error.to_string()),
             DaemonError::Maintenance(_) => ("maintenance-trigger", error.to_string()),
+            // Issue #1929: `task-binding` names the rejected edge, and the
+            // detail keeps the typed admission code verbatim — the transparent
+            // wrapper renders `TASK_SELECTION_REQUIRED` or
+            // `TASK_SCOPE_INCOMPATIBLE` ahead of the bounded detail, so the
+            // record carries the exact code the admission edge rejected with
+            // and never a reworded or narrowed one.
+            DaemonError::TaskBinding(_) => ("task-binding", error.to_string()),
         };
         Self::of(owner, code, &detail)
     }

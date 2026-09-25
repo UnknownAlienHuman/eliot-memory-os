@@ -277,6 +277,16 @@ pub enum DaemonError {
     /// attempt budget instead of collapsing them into one lifecycle message.
     #[error("Governor maintenance: {0}")]
     Maintenance(#[from] eliot_maintenance::MaintenanceError),
+    /// Task-binding admission at the daemon ingress edge rejected the
+    /// transition (issue #1929, I5.5/I5.6).
+    ///
+    /// The typed code travels unchanged: the wrapped error renders the stable
+    /// wire token (`TASK_SELECTION_REQUIRED` or `TASK_SCOPE_INCOMPATIBLE`)
+    /// ahead of the bounded detail, so no code is collapsed into prose between
+    /// the admission edge and the caller. The rejection happens before the
+    /// Governor commit, so neither the task nor the store is touched.
+    #[error(transparent)]
+    TaskBinding(#[from] crate::task_binding_admission::TaskBindingError),
 }
 
 /// Typed revision-fence match failure for the daemon cache gate (issue #18
@@ -560,6 +570,38 @@ impl DaemonComposition {
         // handoff (prepared envelope submitted) and the commitment (validated
         // owner receipt) stay distinguishable in the sink.
         let _span = tracing::info_span!("eliotd.canonical_commit").entered();
+        // Issue #1929 (I5.5 capture/promotion split, I5.6 step 4): the daemon
+        // ingress is the admission edge, not a bypass around the store gate.
+        // The caller's compiled readiness receipt is the only place the exact
+        // `TaskSelectionEvidence` exists, so it is resolved and applied here —
+        // before any commit. A capture with no unique task selection stays a
+        // cold unbound candidate with no task memory/support/influence/finish
+        // effect; a task-relative write without current exact evidence is
+        // rejected with `TASK_SELECTION_REQUIRED`, and one whose evidence names
+        // another task, `WorkScope`, or a moved fence with
+        // `TASK_SCOPE_INCOMPATIBLE`. Neither rejection changes a task or
+        // reaches the store, and no task is ever silently selected.
+        let admission = crate::task_binding_admission::admit_canonical_write(
+            envelope.operation_id.as_str().to_owned(),
+            &identity.request.metadata,
+            &envelope,
+            readiness.receipt,
+            readiness.fence,
+        )?;
+        // Issue #1929: a capture admitted cold is still durably retained. The
+        // decision is projected here so operators can see which submissions
+        // carry no task binding and are therefore inert for task memory,
+        // support, influence, and finish until a later governed binding
+        // transition.
+        if let crate::task_binding_admission::TaskBindingAdmission::ColdUnbound(candidate) =
+            &admission
+        {
+            tracing::info!(
+                candidate_id = %crate::diagnostics::sanitize_identity(&candidate.candidate_id),
+                reason_ref = %candidate.reason_ref,
+                "cold unbound observation candidate admitted at the daemon edge: no task activation, support/influence promotion, or finish relevance"
+            );
+        }
         // Issue #1787: the scope-sensitive canonical-write trigger runs before
         // any commit. When a WorkScope binding is retained, a write addressing
         // another scope quarantines here instead of committing against the
@@ -737,6 +779,15 @@ impl DaemonComposition {
     /// publish the new projection. In that case the daemon is marked stale,
     /// matching [`Self::commit_canonical_and_refresh`], and the receipt still
     /// reports the durable operation rather than a false failure.
+    ///
+    /// This Finish owner entry has no caller-presented readiness receipt, so
+    /// the exact `TaskSelectionEvidence` leg of issue #1929 runs at the
+    /// composition-root write intake
+    /// ([`Self::commit_canonical_and_refresh`]) and again, from the proof
+    /// handles the transition actually carries, at the store gate. The finish
+    /// draft's own `task_id` + `expected_task_revision` are re-validated
+    /// against the canonical task owner by the Governor finish owner before
+    /// this commit; nothing here guesses a task.
     pub async fn finish_attempt(
         &mut self,
         identity: &eliot_protocol::RequestIdentity,
@@ -1869,6 +1920,73 @@ impl DaemonComposition {
         Ok(self
             .capability_admission()?
             .admit_production_route(skill_id, scope, now))
+    }
+
+    /// Admits one explicit workspace instance as an attach to the retained
+    /// `WorkScope` binding (issue #1929, I04.4 attach trigger).
+    ///
+    /// The daemon owns exactly one step here and owns no other: it observes
+    /// the caller's explicit absolute root mechanically through
+    /// [`task_binding_admission::observe_explicit_workspace`] and then hands
+    /// that live observation to the Governor's real attach/receipt owner,
+    /// [`eliot_governor::GovernorComposition::admit_observed_scope_attach`],
+    /// together with the retained descriptor, the trigger-authenticated
+    /// authorization reference, the privacy boundary, and the onboarding-
+    /// retained source closure. The Governor produces the owner-issued
+    /// relocation/attach receipt, rebinds with it, requires a fresh `MATCHED`
+    /// source-closure check for the observed instance, and only then is the
+    /// admitted owner installed into the live composition by
+    /// [`eliot_governor::GovernorComposition::install_admitted_work_scope_owner`].
+    ///
+    /// The installed binding is immediately effective: every later
+    /// [`Self::commit_canonical_and_refresh`] runs
+    /// `check_canonical_write_work_scope` against it, so a write addressing a
+    /// different instance, root, or generation quarantines instead of
+    /// committing. Shape failures (non-absolute root, blank reference, zero
+    /// counter, invalid descriptor or privacy boundary) and a root that cannot
+    /// be observed fail closed as [`DaemonError::TaskBinding`] carrying
+    /// `TASK_SELECTION_REQUIRED` or `TASK_SCOPE_INCOMPATIBLE`, and the
+    /// retained binding, task state, and project memory stay untouched.
+    ///
+    /// The daemon never infers a workspace from cwd, proximity, or recency, and
+    /// never mints a receipt of its own: `ScopeAttachIngress` is the only
+    /// accepted input and its `receipt_ref` is a reference the Governor binds,
+    /// not an authority the daemon asserts.
+    pub fn admit_scope_attach(
+        &mut self,
+        ingress: &task_binding_admission::ScopeAttachIngress,
+    ) -> Result<
+        (
+            eliot_governor::ScopeRelocationOrAttachReceipt,
+            eliot_governor::WorkScopeBindingSnapshot,
+        ),
+        DaemonError,
+    > {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        ingress.validate()?;
+        let fence = self.governor.kernel_snapshot().state_fence();
+        let observed = task_binding_admission::observe_explicit_workspace(
+            ingress.explicit_root.as_path(),
+            &fence,
+        )?;
+        let (receipt, owner) = self.governor.admit_observed_scope_attach(
+            ingress.receipt_ref.as_str(),
+            &observed,
+            &ingress.descriptor,
+            ingress.authorizing_ref.as_str(),
+            ingress.privacy_class,
+            ingress.governing_source_generation,
+            &ingress.sources,
+            &ingress.privacy,
+            ingress.owner_revision,
+        )?;
+        let snapshot = self
+            .governor
+            .install_admitted_work_scope_owner(owner)
+            .map_err(DaemonError::Composition)?;
+        Ok((receipt, snapshot))
     }
 
     /// Borrows the Governor reconstruction read composition over the retained
