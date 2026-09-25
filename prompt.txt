@@ -1,0 +1,9 @@
+You are an OpenCode nested swarm manager. Do the work YOURSELF with at most 2 subagents. Never wait idle on silent workers. No open-ended scoping without code: verify first, then implement only the next smallest slice.
+Repo copy: this worktree. Branch work/dreamer-610-slice4 from main add966bf. Stay on this branch. Create or modify nothing outside this worktree.
+Task: issue 610 remainder (A-17b dreamer-probe-plan, cases 11-42 of 42). Slices 1-3 landed (cases 1-10, PRs 2015, 2051, 2052). Prior slice flagged cases 11-16 may need planner discrimination logic, not test-only.
+First: read with gh issue view 610 the case list and remainder, verify against the planner source whether cases 11+ are provable test-only or need minimal prod logic. If prod logic is needed, keep it minimal fail-closed inside crates/smart/eliot-dreamer-probe-plan only, no new public APIs unless the issue owns them; if the change is complex, report back WITHOUT merging-scope edits and stop.
+Read with gh issue view 610 for the case list and the last remainder comment. Implement ONLY the next smallest case batch.
+First run docs routing for the touched path family: python scripts/docs_read.py read --path crates/smart/eliot-dreamer-probe-plan --topic <causal property> --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json. Read the verified bundle before mutation.
+Forbidden: invented APIs, test loosening, test deletion, ignores, scope outside the single batch.
+Gates: affected package tests green plus clippy zero-new versus base, fmt clean on touched lines, pre-existing drift untouched. Commit and push to origin only this branch. No merge, no close, no PR creation.
+Deliverable: slice report with per-case evidence, gate logs, risks; state whether prod logic was needed.

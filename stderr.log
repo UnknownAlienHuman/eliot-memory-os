@@ -1,0 +1,568 @@
+[0m
+> build · muse-spark-1.3-contributor
+[0m$ [0mgit status --short --branch; echo "---"; git rev-parse HEAD; echo "---"; git branch --show-current; echo "---"; git log --oneline -10
+## work/dreamer-610-slice4
+?? prompt.txt
+?? stderr.log
+?? stdout.log
+---
+add966bf027761eef592cee81e612795f97b1e30
+---
+work/dreamer-610-slice4
+---
+add966bf [dreamer] #610 slice 3: probe-plan cases 9-10 closed result schema (#2052)
+f04a1bea work/610: probe-planner proof slice 2 (cases 6..8) (#2051)
+5d4cec40 work/584: context-contracts vocabulary proof slice 9 (cases 55..63) (#2050)
+6f3f5f00 work/584: context-contracts vocabulary proof slice 8 (cases 49..54) (#2049)
+c8d7b92c work/584: context-contracts vocabulary proof slice 7 (cases 43..48) (#2048)
+407fddb5 work/584: context-contracts vocabulary proof slice 6 (cases 37..42) (#2047)
+380e2209 work/584: context-contracts vocabulary proof slice 5 (cases 31..36) (#2046)
+dcb638e4 work/584: context-contracts vocabulary proof slice 4 (cases 25..30) (#2045)
+6309d8d6 work/584: context-contracts vocabulary proof slice 3 (cases 19..24) (#2044)
+2bcabfb9 work/584: context-contracts vocabulary proof slice 2 (cases 13..18) (#2043)
+> build · muse-spark-1.3-contributor
+[0m$ [0mgh issue view 610 --comments 2>&1 | head -n 400
+head: The term 'head' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+> build · muse-spark-1.3-contributor
+[0m$ [0mgh issue view 610 --comments
+author:	UnknownAlienHuman
+association:	owner
+edited:	false
+status:	none
+--
+ContractChallenge `610-A03-PROBE-DECLARATIONS-20260910` — OPEN.
+
+Required owner: A-03, allocated as #1073. Needed by: A-17b #610, then the supplied-probe path in A-39 #673 and A-40 #675. Verified base: `2ff6223a1f642afb0af6247006f3bfb77269af70`.
+
+Missing contract: closed canonical probe objectives, possible-result schemas, complete result-to-rival/gap update declarations, and immutable inquiry-affordance descriptions. Three GPT Luna source/graph checks confirmed that `RivalDeclarationSet`/`RivalPrediction` already exist, while `InvestigationRequirement` provides only inquiry identity/scope/fence and text. It does not supply result branches, independent safety/resource requirements or capability descriptions. #852 is the gate descriptor catalogue and does not own these input schemas.
+
+Forbidden workaround: parse opaque prose into typed facts; copy A03 DTOs into this handler; treat unknown costs/safety/capacity as permission; import execution/provider algorithms; replace the requested planner with an always-blocked placeholder.
+
+Resolution evidence required: #1073 source merged with intrinsic shape/bounds/identity validation and independently reviewed canonical joins. A-17b retains semantic discrimination/readiness/dominance/ranking and ProbePlan output. No source prerequisite alone satisfies this issue's 42 acceptance cases or its later tests/runtime obligations. Affected A-17b implementation remains pending while the actual canonical prerequisite is written.
+
+--
+author:	UnknownAlienHuman
+association:	owner
+edited:	false
+status:	none
+--
+/run-probe-plan-docs
+--
+author:	UnknownAlienHuman
+association:	owner
+edited:	false
+status:	none
+--
+## ContractChallenge — missing owner-neutral `RivalModelSet`
+
+Base inspected: `main@60346b33c17f22957df3abfe4703c5e0b547a47a` (the later temporary workflow-only commits do not alter contracts).
+
+- **id:** `CC-610-RIVAL-MODEL-SET-OWNER-2026-09-12`
+- **status:** `OPEN / BLOCKS AFFECTED API IMPLEMENTATION`
+- **required_owner:** A-03 `eliot-dreamer-contracts` owner (#578) or the accepted topology owner #816
+- **needed_by:** #610 public `plan_discriminative_probes(..., RivalModelSet, ...)` input and #836 admission
+- **missing_contract:** owner-neutral exported `RivalModelSet` contract (including exact model/prediction denominator, lineage, coverage, omissions, invalidation and digest semantics)
+- **current contradiction:** `crates/smart/cognitive-edge-map.toml` names `eliot-dreamer-contracts::RivalModelSet`, but repository search finds `RivalModelSet` only in concrete implementation crate `eliot-dreamer-rival-model::result`. #610 explicitly treats A-16b as a runtime producer, not an algorithm dependency, and `module.toml` allows only `eliot-dreamer-contracts`.
+- **forbidden workaround:** add a concrete dependency on `eliot-dreamer-rival-model`, copy/redefine `RivalModelSet` locally, accept a string/JSON/provider map, or silently substitute `RivalDeclarationSet` with different semantics.
+- **resolution evidence:** A-03 exports the exact owner-neutral set type; A-16b returns that type without owning the public schema; edge-map, #610 manifest and fixed fixtures agree; standalone package checks pass.
+
+No planner algorithm or local rival schema is being committed while this challenge is open. The package-local implementation contract remains on PR #1093. I am moving to the next contract-complete placeholder rather than inventing a second owner.
+--
+author:	UnknownAlienHuman
+association:	owner
+edited:	false
+status:	none
+--
+Slice 1 landed via #2015 (f74c20e5, Opus APPROVE x2): cases 1-5/42 + omission-vocabulary fix (mutation-proved). Remainder 6-42 OPEN (6-8 need ownership ruling).
+--
+author:	UnknownAlienHuman
+association:	owner
+edited:	false
+status:	none
+--
+Slice 2 merged (PR 2051): cases 6-8 with ownership ruling (6 OWNED, 7 OWNED, 8 SPLIT - out-of-scope half owned, materiality upstream A-03). Test-only +104/-6, gates green twice. No prod changes. REMAINDER (issue stays open): cases 9-42.
+
+--
+author:	UnknownAlienHuman
+association:	owner
+edited:	false
+status:	none
+--
+Slice 3 merged (PR 2052): cases 9-10 result-schema discipline, test-only +146/-7. Gates green twice. No prod changes. REMAINDER (issue stays open): cases 11-42. Flag: 11-16 may need planner discrimination logic (not test-only) - next slice verifies first.
+
+--
+> build · muse-spark-1.3-contributor
+[0m$ [0mgh issue view 610 --json title,body,comments --jq '{title, body: .body[0:8000], comments: [.comments[] | {createdAt, body: .body[0:3000]}]}' | Out-String -Width 20000
+
+{"body":"## Objective\n\nImplement `eliot-dreamer-probe-plan` as the sole deterministic pure converter of explicit unknowns/rival disagreements into a bounded ordered set of **inert discriminative probe candidates**. Input: exact DreamInputBundle, ValidatedDreamDraft, RivalModelSet, immutable inquiry-affordance descriptors and versioned policy. Output: ProbePlan, explicit ProbePlanDisposition or ProbePlanError.\n\nEvery probe identifies an exact material gap, bounded possible-result schema, result→rival/gap update matrix and independent information/cost/latency/context/resource/privacy/consent/authority/effect/reversibility/feasibility/Human-attention dimensions. Nondiscriminative probes cannot be ready; cheap/high-information/preferred cannot compensate for unsafe/unauthorized/irreversible/unbounded/evidence-inadequate behavior. Unknown feasibility/capacity is not zero or permission.\n\nNo tool/research/model/provider/agent/process execution or scheduling, route/budget/credential reservation, network/Store, acquired-result grading, rival resolution, epistemic promotion, state/authority/effect/Finish.\n\n## Dependencies and identity\n\nPreserve `smart.dreamer.probe_plan`, stateless bounded vector-preserving planning, zero mutable state/effects, current public inputs/outputs and deterministic order. Start after accepted A-03 #578 public rival/objective/affordance/result-matrix contracts and exact permitted lower-level owners. A-16b #606 is a runtime producer; develop independently from canonical fixtures. A-14b/A-05 are earlier runtime stages, not algorithm imports. Orientation/Clarification/Researcher/Governor are consumers/execution owners, not implementation prerequisites.\n\n#816 owns topology; #836 later owns serialized workspace admission after package-local proof. Controller supplies current main; no worker fetch/pull/rebase/self-merge.\n\n## Exclusive mutable scope\n\nOnly `crates/smart/eliot-dreamer-probe-plan/`: exact manifest/router/API snapshot, cohesive source and package tests/fixtures frozen before coding; remove `.github/temporary/work-unit-610.md` if present.\n\n## Must not modify\n\nOther contracts/algorithms/consumers/execution owners, route/budget/credential stores, root Cargo.toml/Cargo.lock/indexes, gate descriptors, workflows/normative docs or shared registry. No root-promotion exception or unsupported metadata; remain independently buildable until #836.\n\n## Normative documentation\n\nFollow root/local AGENTS.md, WORKFLOW.md and ACTIVE. Route all actual mutable families together, including deletion when applicable:\n\n```bash\npython scripts/docs_read.py read --path crates/smart/eliot-dreamer-probe-plan --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json\n```\n\nRead the full required bundle, then directly read these files under `docs/architecture/`: `I09-03-job-classes.md`, `I09-05-dream-packet.md`, `I21-03-inquiry-protocol-selection.md`, `I12-18-prediction-and-calibration.md`, `I12-22-theory-portfolio-and-practical-weighting.md`, `I13-07-critical-attention.md`, `I15-02-principal-and-session-binding.md`, `I15-04-secrets.md`, `I05-27-canonical-operation-identity-and-effect-identity.md`, `I05-16-common-durable-fields.md`, `I07-20-agent-facing-error-contract.md`. Do not relabel I12.33 Understanding Evaluation Job as causal evidence; resolve actual governing causal/discriminator handles. Routing does not provide shard contents.\n\nRead exact public owner types and bounded donor intent in eliot-epistemic/eliot-dreamer-core, not acquisition or execution algorithms. Freeze objective/result/affordance/disposition vocabulary, rival fields, gap denominator, capability evidence, all independent dimensions/bounds and scalar/executable/reservation/expected-as-observed donor paths. Record reuse/rewrite/reject, read IDs/routes/required handles/fragments/bundle/shard/source/contract digests and explicit attestation.\n\n## Public operation and records\n\nExpose canonical `plan_discriminative_probes(bundle, validated_draft, rivals, affordances, policy)`. Inputs immutable and source-bound; no ambient state/clock/I/O. Validate schemas, operation/task/attempt/scope/fence, bundle/draft/rival/affordance/source revisions/digests, duplicate/same-ID conflicts, complete-or-partial denominators, ceilings and finite bounds before planning.\n\nProbeObjective retains gap/conflict/materiality, exact propositions/predictions/assumptions or coverage/verifier requirement, why resolution matters, source/fence/proof/denominator/invalidation. ProbeCandidate retains identity/schema/objective/rivals, exact typed affordance descriptor (not live provider), target/source/snapshot revision, bounded typed parameters/result schema, complete result matrix, information and all independent budget/safety/feasibility vectors, validity/time/cancel/cleanup/rollback/unknown-effect requirements, external admission/execution/evidence/verifier owners, invalidation/digest/candidate-only proof. Plan retains every objective/candidate disposition, equivalence/dominance/trade-offs, blocked/unprobeable gaps, omissions/frontier and explained order. No generic Value/map/Other/status/command/SDK request/secret/live lease/observed result.\n\n## Algorithm\n\nCreate objectives only from explicit live-rival prediction differences, exact evidence/coverage gap, falsifiable load-bearing assumption, canonical discriminator or missing verifier obligation. Vague learn-more/curiosity/already-resolved/out-of-scope/nonmaterial objectives are rejected with disposition; every material unknown stays accounted.\n\nConstruct candidates through exact compatible affordance descriptors and canonical bounded typed parameters. Preserve all ceilings and external owners. Missing/stale/unavailable affordance remains feasibility-unknown/blocked. Affordance availability is not execution permission; name cleanup/rollback and unknown-outcome reconciliation requirements without performing them.\n\nProve discrimination over the entire closed result matrix: at least two possible valid outcomes cause different updates to two live rivals, a live rival versus unknown/no-model, or an exact coverage/verifier gap affecting admissible conclusions. Reject identical updates, confirmation-only/no-falsifier, tautological self-report, unrelated proxies, expected-as-evidence, correlation-as-causality and unbounded result spaces. Preserve exact evidence acceptance contract per branch, source authority/grade/coverage/provenance, controls/rivals/confounders for causal questions; do not grade/acquire resulting evidence.\n\nIndependently validate privacy/disclosure, consent/Human decisions, principal/scope/fence, effect class/reversibility, severity/blast radius, cleanup/cancel/rollback, unknown-effect reconciliation and credential requirements. Failed/unknown mandatory safety blocks readiness. Side-effect candidates remain subject to explicit external admission or blocked policy; information gain cannot waive a constraint.\n\nIndependently bound count/bytes/STU/source width/calls/currency-cost/wall-idle/resource/Human/output/evidence dimensions. Unknown is not zero/unlimited and budgets do not cross-subsidize. No current availability assumption or reservation. Exhaustion retains exact blocked/partial/frontier.\n\nCoalesce exact equivalents only with all provenance. Remove a strictly dominated candidate only with no unique discrimination branch, no worse accepted value in any relevant dimension and a strict disadvantage somewhere; **unknown/incomparable values cannot establish dominance**. Preserve cheaper-but-riskier trade-offs. Apply only explicit versioned lexicographic presentation policy and stable-ID final tie-break, retaining explanation. Ranking grants no execution priority/truth/admission.\n\nEmit one disposition per objective/candidate, complete matrices/vectors/omissions and canonical identity; preserve semantic branch order while canonicalizing sets. No acquired evidence/new grade/resolved rival/active operation/effect/Finish. Typed errors separate contract/ide","comments":[{"body":"ContractChallenge `610-A03-PROBE-DECLARATIONS-20260910` — OPEN.\n\nRequired owner: A-03, allocated as #1073. Needed by: A-17b #610, then the supplied-probe path in A-39 #673 and A-40 #675. Verified base: `2ff6223a1f642afb0af6247006f3bfb77269af70`.\n\nMissing contract: closed canonical probe objectives, possible-result schemas, complete result-to-rival/gap update declarations, and immutable inquiry-affordance descriptions. Three GPT Luna source/graph checks confirmed that `RivalDeclarationSet`/`RivalPrediction` already exist, while `InvestigationRequirement` provides only inquiry identity/scope/fence and text. It does not supply result branches, independent safety/resource requirements or capability descriptions. #852 is the gate descriptor catalogue and does not own these input schemas.\n\nForbidden workaround: parse opaque prose into typed facts; copy A03 DTOs into this handler; treat unknown costs/safety/capacity as permission; import execution/provider algorithms; replace the requested planner with an always-blocked placeholder.\n\nResolution evidence required: #1073 source merged with intrinsic shape/bounds/identity validation and independently reviewed canonical joins. A-17b retains semantic discrimination/readiness/dominance/ranking and ProbePlan output. No source prerequisite alone satisfies this issue's 42 acceptance cases or its later tests/runtime obligations. Affected A-17b implementation remains pending while the actual canonical prerequisite is written.\r\n","createdAt":"2026-09-10T21:43:37Z"},{"body":"/run-probe-plan-docs","createdAt":"2026-09-12T08:46:46Z"},{"body":"## ContractChallenge — missing owner-neutral `RivalModelSet`\n\nBase inspected: `main@60346b33c17f22957df3abfe4703c5e0b547a47a` (the later temporary workflow-only commits do not alter contracts).\n\n- **id:** `CC-610-RIVAL-MODEL-SET-OWNER-2026-09-12`\n- **status:** `OPEN / BLOCKS AFFECTED API IMPLEMENTATION`\n- **required_owner:** A-03 `eliot-dreamer-contracts` owner (#578) or the accepted topology owner #816\n- **needed_by:** #610 public `plan_discriminative_probes(..., RivalModelSet, ...)` input and #836 admission\n- **missing_contract:** owner-neutral exported `RivalModelSet` contract (including exact model/prediction denominator, lineage, coverage, omissions, invalidation and digest semantics)\n- **current contradiction:** `crates/smart/cognitive-edge-map.toml` names `eliot-dreamer-contracts::RivalModelSet`, but repository search finds `RivalModelSet` only in concrete implementation crate `eliot-dreamer-rival-model::result`. #610 explicitly treats A-16b as a runtime producer, not an algorithm dependency, and `module.toml` allows only `eliot-dreamer-contracts`.\n- **forbidden workaround:** add a concrete dependency on `eliot-dreamer-rival-model`, copy/redefine `RivalModelSet` locally, accept a string/JSON/provider map, or silently substitute `RivalDeclarationSet` with different semantics.\n- **resolution evidence:** A-03 exports the exact owner-neutral set type; A-16b returns that type without owning the public schema; edge-map, #610 manifest and fixed fixtures agree; standalone package checks pass.\n\nNo planner algorithm or local rival schema is being committed while this challenge is open. The package-local implementation contract remains on PR #1093. I am moving to the next contract-complete placeholder rather than inventing a second owner.","createdAt":"2026-09-12T08:58:44Z"},{"body":"Slice 1 landed via #2015 (f74c20e5, Opus APPROVE x2): cases 1-5/42 + omission-vocabulary fix (mutation-proved). Remainder 6-42 OPEN (6-8 need ownership ruling).","createdAt":"2026-09-18T14:09:28Z"},{"body":"Slice 2 merged (PR 2051): cases 6-8 with ownership ruling (6 OWNED, 7 OWNED, 8 SPLIT - out-of-scope half owned, materiality upstream A-03). Test-only +104/-6, gates green twice. No prod changes. REMAINDER (issue stays open): cases 9-42.\r\n","createdAt":"2026-09-19T07:22:25Z"},{"body":"Slice 3 merged (PR 2052): cases 9-10 result-schema discipline, test-only +146/-7. Gates green twice. No prod changes. REMAINDER (issue stays open): cases 11-42. Flag: 11-16 may need planner discrimination logic (not test-only) - next slice verifies first.\r\n","createdAt":"2026-09-19T07:30:58Z"}],"title":"[A-17b] Implement eliot-dreamer-probe-plan as a bounded vector-preserving discriminative probe planner"}
+> build · muse-spark-1.3-contributor
+[0m$ [0mgh issue view 610 --json body --jq '.body | length'; gh issue view 610 --json body --jq '.body[8000:16000]'; echo "===BODY2==="; gh issue view 610 --json body --jq '.body[16000:24000]'
+11959
+ntity/objective/matrix/discrimination/evidence/affordance/safety/feasibility/budget/cleanup/dominance/attempted-execution/partial/internal cases, with bounded redaction.
+
+## Required test matrix
+
+**Declared denominator: 42 cases, exactly 1..42.** One substantive executable Rust test per `// WORK_UNIT_CASE: 610/<case>` immediately above attributes, with exact source/discovery/executed-pass binding.
+
+1. valid two-rival probe;
+2. multi-rival result matrix;
+3. exact objective/result/affordance/disposition vocabulary;
+4. bundle/draft/rival/task/scope/fence mismatch;
+5. duplicate/same-ID-changed objective/candidate/affordance/result;
+6. vague more-information objective;
+7. exact evidence/verifier-gap objective;
+8. resolved/nonmaterial/out-of-scope objective;
+9. bounded closed result schema;
+10. open/unbounded result space rejected;
+11. identical updates for all outcomes rejected;
+12. confirmation-only/no falsifier rejected;
+13. tautology/self-report rejected;
+14. unrelated proxy rejected;
+15. chronology/correlation not causal proof;
+16. causal controls/rivals/confounders requirements;
+17. typed affordance and stale/unknown/unavailable states;
+18. no shell/Value/SDK payload;
+19. no live route/credential/lease/permit/process handle;
+20. exact external admission/execution/evidence owners;
+21. safe read-only candidate;
+22. effectful candidate requires external approval/blocked state;
+23. privacy/consent/secret/authority/effect/reversibility violations;
+24. possible-effect uncertainty/reconciliation requirement;
+25. every independent budget boundary/one-over;
+26. unknown cost/capacity not zero;
+27. no budget cross-subsidy;
+28. exact-equivalent merge retains lineage;
+29. dominance proven across all relevant dimensions, not unknown/incomparable;
+30. cheaper-riskier alternative retained;
+31. no scalar/averaged risk;
+32. explicit lexicographic order/stable tie-break;
+33. exact objective/candidate dispositions/frontier;
+34. observed-result/evidence/resolution injection rejected;
+35. replay and changed input/policy conflict;
+36. irrelevant order preserves plan/digest;
+37. bounded panic-free malformed/property inputs;
+38. ready probe has two valid differently updating outcomes;
+39. ready probe has no failed/unknown mandatory safety dimension;
+40. every material unknown has one objective disposition;
+41. changed rival/affordance/policy invalidates identity;
+42. no provider/tool/agent/process/network/Store/execution/reservation/promotion/Finish path.
+
+## Verification and completion
+
+```bash
+cargo fmt --manifest-path crates/smart/eliot-dreamer-probe-plan/Cargo.toml -- --check
+cargo test --manifest-path crates/smart/eliot-dreamer-probe-plan/Cargo.toml --all-targets
+cargo clippy --manifest-path crates/smart/eliot-dreamer-probe-plan/Cargo.toml --all-targets -- -D warnings
+cargo doc --manifest-path crates/smart/eliot-dreamer-probe-plan/Cargo.toml --no-deps
+git diff --check
+```
+
+All 42 actual cases, current #837 package-local assignment/body/matrix/source bindings, independent discrimination/vector/mutation review, reading evidence and allowed diff required. #852 owns descriptors; count-only/empty/skip/zero-selected and invented flags are not proof. Attach field/owner/phase graph, full result matrices, vector/dominance/trade-off/frontier examples, results/seeds and no-execution proof. Remove reservation, mark package-ready using accepted metadata, remain independent until #836. Actual inquiry/evidence/real Edge/rival resolution/Product/release separate.
+
+## ContractChallenge and context
+
+On I2.17 conflict stop affected work, leave open and post issue-qualified id/status/required_owner/needed_by/missing_contract/forbidden_workaround/resolution_evidence/base SHA here/PR. Only authorized manager writes shared registry. Measure issue + full routed/direct reading + exact public types/source/tests/donor spans under I2.16; split oversized work without dropping 42 requirements or loading entire execution/provider trees.
+===BODY2===
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead crates/smart/eliot-dreamer-probe-plan 
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead crates/smart/eliot-dreamer-probe-plan/src 
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead crates/smart/eliot-dreamer-probe-plan/src/lib.rs 
+[0m→ [0mRead crates/smart/eliot-dreamer-probe-plan/src/model.rs 
+[0m→ [0mRead crates/smart/eliot-dreamer-probe-plan/src/plan.rs 
+[0m→ [0mRead crates/smart/eliot-dreamer-probe-plan/src/bounds.rs 
+[0m→ [0mRead crates/smart/eliot-dreamer-probe-plan/tests 
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs 
+[0m→ [0mRead crates/smart/eliot-dreamer-probe-plan/Cargo.toml 
+[0m→ [0mRead crates/smart/eliot-dreamer-probe-plan/tests/probe_plan.rs 
+> build · muse-spark-1.3-contributor
+[0m$ [0mpython scripts/docs_read.py read --path crates/smart/eliot-dreamer-probe-plan --topic "discriminative probe planning" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+
+DOC_READ: PASS receipt=sha256:ea79ca7e06dbc95bb6ebceb4b5d904a848f265540ab58d6e82d93d5878599ec6 route=sha256:1b9bbbd8b5bb5e2de4737b4fa03e7e3672daba4394afef443dd3d8476554c7fa required=23 bundle_sha256=5ca78f97ee5f6485f6ab552d6687ade11da053a68be0cb38339167aeac0be7f3
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead .eliot/docs-read-bundle.md 
+[0m✱ [0mGrep "PossibleResultSchema|ResultBranch|ResultUpdate|GapUpdateMeaning|has_expected_gain" [90min crates/smart/eliot-dreamer-contracts/src · 30 matches[0m
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead crates/smart/eliot-dreamer-contracts/src/probe/result.rs 
+[0m→ [0mRead crates/smart/eliot-dreamer-contracts/src/probe/affordance.rs [90m[limit=120][0m
+> build · muse-spark-1.3-contributor
+[0m$ [0mgit log -1 --format=%B; echo "==="; git show --stat HEAD --oneline
+[dreamer] #610 slice 3: probe-plan cases 9-10 closed result schema (#2052)
+
+Test-only, no prod changes, no new APIs. Cases 9 OWNED (closed two-branch Gap denominator preserved verbatim, planner validates) and 10 OWNED (empty targets/branches, incomplete cover, duplicate id, undeclared target rejected fail-closed at PossibleResultSchema::new). Remainder 11-42 QUEUED.
+
+Co-authored-by: d01-temp <d01-temp@example.invalid>
+===
+add966bf [dreamer] #610 slice 3: probe-plan cases 9-10 closed result schema (#2052)
+ .../tests/work_unit_610.rs                         | 153 ++++++++++++++++++++-
+ 1 file changed, 146 insertions(+), 7 deletions(-)
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead crates/smart/eliot-dreamer-probe-plan/src/plan.rs [90m[offset=192, limit=80][0m
+> build · muse-spark-1.3-contributor
+[0m← [0mEdit crates/smart/eliot-dreamer-probe-plan/src/plan.rs
+Index: crates/smart/eliot-dreamer-probe-plan/src/plan.rs
+===================================================================
+--- crates/smart/eliot-dreamer-probe-plan/src/plan.rs
++++ crates/smart/eliot-dreamer-probe-plan/src/plan.rs
+@@ -207,9 +207,17 @@
+         reversibility: descriptor.reversibility.clone(),
+         feasibility: descriptor.feasibility.clone(),
+         attention: descriptor.attention.clone(),
+     };
+-    let class = classify_dimensions(&dimensions, &descriptor.applicability.scope, scope);
++    let mut class = classify_dimensions(&dimensions, &descriptor.applicability.scope, scope);
++    if matches!(class, DescriptorClass::Plannable)
++        && schema_has_identical_updates(&descriptor.result_schema)
++    {
++        class = DescriptorClass::Gap(
++            OmissionKind::Unprobeable,
++            "result matrix declares identical updates across all outcomes".to_owned(),
++        );
++    }
+     let order = match &class {
+         DescriptorClass::Plannable => 0,
+         DescriptorClass::Gap(OmissionKind::Unprobeable, _) => 1,
+         DescriptorClass::Gap(OmissionKind::OverBudget, _) => 2,
+
+> build · muse-spark-1.3-contributor
+[0m← [0mEdit crates/smart/eliot-dreamer-probe-plan/src/plan.rs
+Index: crates/smart/eliot-dreamer-probe-plan/src/plan.rs
+===================================================================
+--- crates/smart/eliot-dreamer-probe-plan/src/plan.rs
++++ crates/smart/eliot-dreamer-probe-plan/src/plan.rs
+@@ -266,8 +266,37 @@
+     }
+     Ok(())
+ }
+ 
++/// Closed discrimination gate for case 610/11: a multi-branch result matrix
++/// whose every branch declares the same update set cannot discriminate.
++/// Single-branch schemas defer to case 610/38 (two-outcome readiness) so
++/// prior single-branch fixtures stay plannable. Comparison is order-
++/// insensitive over the branch update sets; debug order is deterministic
++/// for these closed enums so the check is infallible and fail-closed.
++fn schema_has_identical_updates(
++    schema: &eliot_dreamer_contracts::PossibleResultSchema,
++) -> bool {
++    if schema.branches.len() < 2 {
++        return false;
++    }
++    let mut first: Vec<String> = schema.branches[0]
++        .updates
++        .iter()
++        .map(|update| format!("{update:?}"))
++        .collect();
++    first.sort();
++    schema.branches[1..].iter().all(|branch| {
++        let mut updates: Vec<String> = branch
++            .updates
++            .iter()
++            .map(|update| format!("{update:?}"))
++            .collect();
++        updates.sort();
++        updates == first
++    })
++}
++
+ /// Closed gating policy over feasibility, information, authority, consent,
+ /// and applicability scope. Every other dimension stays advisory.
+ fn classify_dimensions(
+     dimensions: &ProbeDimensions,
+
+> build · muse-spark-1.3-contributor
+[0m← [0mEdit crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs
+Index: crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs
+===================================================================
+--- crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs
++++ crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs
+@@ -1,13 +1,14 @@
+-//! Work-unit 610 slice 3: bounded discriminative probe planner, cases 1..10
++//! Work-unit 610 slice 4: bounded discriminative probe planner, cases 1..11
+ //! (valid two-rival probe, multi-rival result matrix, exact
+ //! objective/result/affordance/disposition vocabulary, bound-input
+ //! mismatch, duplicate collapse, vague/no-gain objective gating,
+ //! exact evidence/verifier-gap plannability, per-descriptor scope
+-//! exclusion, bounded closed result schema, open/unbounded rejection).
++//! exclusion, bounded closed result schema, open/unbounded rejection,
++//! identical-updates rejection).
+ //!
+ //! Cases 610/1, 610/4 and 610/5 are marked on the existing planner
+-//! behaviour tests in `tests/probe_plan.rs`. Cases 610/11..42 (discrimination,
++//! behaviour tests in `tests/probe_plan.rs`. Cases 610/12..42 (confirmation,
+ //! affordance/execution, safety, budget/dominance, replay and no-execution
+ //! proof) remain QUEUED on issue #610.
+ //!
+ //! Ownership ruling 610/6-10 (planner-side descriptor gating only; no new
+
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs [90m[offset=620][0m
+> build · muse-spark-1.3-contributor
+[0m← [0mEdit crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs
+Index: crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs
+===================================================================
+--- crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs
++++ crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs
+@@ -640,4 +640,97 @@
+         .is_err(),
+         "update to an undeclared target must fail closed"
+     );
+ }
++
++// WORK_UNIT_CASE: 610/11
++#[test]
++fn identical_updates_for_all_outcomes_are_unprobeable() {
++    fn two_branch_schema(
++        id: &str,
++        objective_id: &str,
++        first: GapUpdateMeaning,
++        second: GapUpdateMeaning,
++    ) -> PossibleResultSchema {
++        let target = objective(objective_id);
++        must(PossibleResultSchema::new(
++            artifact(id),
++            vec![ResultTarget::Gap {
++                objective: target.clone(),
++            }],
++            vec![
++                ResultBranch {
++                    result_id: artifact(&format!("{id}-a")),
++                    value: PossibleResultValue::Unknown {
++                        reason: "outcome not yet observed".to_owned(),
++                    },
++                    updates: vec![ResultUpdate::Gap {
++                        objective: target.clone(),
++                        meaning: first,
++                    }],
++                },
++                ResultBranch {
++                    result_id: artifact(&format!("{id}-b")),
++                    value: PossibleResultValue::Unknown {
++                        reason: "outcome not yet observed".to_owned(),
++                    },
++                    updates: vec![ResultUpdate::Gap {
++                        objective: target,
++                        meaning: second,
++                    }],
++                },
++            ],
++        ))
++    }
++
++    let identical_schema = two_branch_schema(
++        "identical-schema",
++        "objective-identical",
++        GapUpdateMeaning::RemainsOpen,
++        GapUpdateMeaning::RemainsOpen,
++    );
++    must(identical_schema.validate());
++    let mut identical_params = descriptor_params("aff-identical", gap_target("claim-identical"));
++    identical_params.result_schema = identical_schema;
++    let identical = must(InquiryAffordanceDescriptor::new(identical_params));
++
++    let identical_plan = plan_for(vec![identical], Some(16));
++    must(identical_plan.validate());
++    assert!(
++        identical_plan.probes.is_empty(),
++        "identical updates cannot plan a probe"
++    );
++    assert_eq!(identical_plan.omissions.len(), 1);
++    assert_eq!(
++        identical_plan.omissions[0].kind,
++        OmissionKind::Unprobeable
++    );
++    assert!(
++        identical_plan.omissions[0].reason.contains("identical"),
++        "identical-updates gap must cite the discrimination gate, got {}",
++        identical_plan.omissions[0].reason
++    );
++
++    let split_schema = two_branch_schema(
++        "split-schema",
++        "objective-split",
++        GapUpdateMeaning::Addressed,
++        GapUpdateMeaning::RemainsOpen,
++    );
++    must(split_schema.validate());
++    let mut split_params = descriptor_params("aff-split", gap_target("claim-split"));
++    split_params.result_schema = split_schema;
++    let split = must(InquiryAffordanceDescriptor::new(split_params));
++
++    let split_plan = plan_for(vec![split], Some(16));
++    must(split_plan.validate());
++    assert_eq!(split_plan.probes.len(), 1);
++    assert!(split_plan.omissions.is_empty());
++    let probe = &split_plan.probes[0];
++    must(probe.result_schema.validate());
++    assert_eq!(probe.result_schema.branches.len(), 2);
++    assert_ne!(
++        probe.result_schema.branches[0].updates,
++        probe.result_schema.branches[1].updates,
++        "discriminative probe must keep two differently updating outcomes"
++    );
++}
+
+> build · muse-spark-1.3-contributor
+[0m✗ [0mEdit crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs failed
+[91m[1mError: [0mCould not find oldString in crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs. It must match exactly, including whitespace and indentation.
+> build · muse-spark-1.3-contributor
+[0m→ [0mRead crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs [90m[limit=30][0m
+> build · muse-spark-1.3-contributor
+[0m← [0mEdit crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs
+Index: crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs
+===================================================================
+--- crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs
++++ crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs
+@@ -23,9 +23,11 @@
+ //! preserved verbatim by the planner (`probe.result_schema` validates and
+ //! keeps the exact two-branch cover); 610/10 OWNED via the A-03
+ //! `PossibleResultSchema::new` fail-closed boundary (empty targets/branches,
+ //! incomplete cover, duplicate identity, undeclared target all rejected
+-//! before any descriptor can plan).
++//! before any descriptor can plan); 610/11 OWNED via the planner
++//! identical-updates gate (multi-branch matrices with the same update set on
++//! every branch are Unprobeable; single-branch defers to 610/38 readiness).
+ //! Docs route=sha256:1b9bbbd8b5bb5e2de4737b4fa03e7e3672daba4394afef443dd3d8476554c7fa read=sha256:ea79ca7e06dbc95bb6ebceb4b5d904a848f265540ab58d6e82d93d5878599ec6 bundle=5ca78f97ee5f6485f6ab552d6687ade11da053a68be0cb38339167aeac0be7f3 (generic-source; verified bundle read in full plus I09-03, I09-05, I21-03, I12-18, I12-22, I13-07, I15-02, I15-04, I05-27, I05-16, I07-20 read directly).
+ 
+ #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+ 
+
+> build · muse-spark-1.3-contributor
+[0m$ [0mcargo fmt --manifest-path crates/smart/eliot-dreamer-probe-plan/Cargo.toml -- --check 2>&1; echo "FMT_EXIT:$LASTEXITCODE"
+Diff in \\?\C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\smart\eliot-dreamer-probe-plan\src\plan.rs:273:
+ /// prior single-branch fixtures stay plannable. Comparison is order-
+ /// insensitive over the branch update sets; debug order is deterministic
+ /// for these closed enums so the check is infallible and fail-closed.
+[31m-fn schema_has_identical_updates(
+[0m[31m-    schema: &eliot_dreamer_contracts::PossibleResultSchema,
+[0m[31m-) -> bool {
+[0m[32m+fn schema_has_identical_updates(schema: &eliot_dreamer_contracts::PossibleResultSchema) -> bool {
+[0m     if schema.branches.len() < 2 {
+         return false;
+     }
+Diff in \\?\C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\smart\eliot-dreamer-probe-plan\tests\work_unit_610.rs:702:
+         "identical updates cannot plan a probe"
+     );
+     assert_eq!(identical_plan.omissions.len(), 1);
+[31m-    assert_eq!(
+[0m[31m-        identical_plan.omissions[0].kind,
+[0m[31m-        OmissionKind::Unprobeable
+[0m[31m-    );
+[0m[32m+    assert_eq!(identical_plan.omissions[0].kind, OmissionKind::Unprobeable);
+[0m     assert!(
+         identical_plan.omissions[0].reason.contains("identical"),
+         "identical-updates gap must cite the discrimination gate, got {}",
+Diff in \\?\C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\smart\eliot-dreamer-probe-plan\tests\work_unit_610.rs:731:
+     must(probe.result_schema.validate());
+     assert_eq!(probe.result_schema.branches.len(), 2);
+     assert_ne!(
+[31m-        probe.result_schema.branches[0].updates,
+[0m[31m-        probe.result_schema.branches[1].updates,
+[0m[32m+        probe.result_schema.branches[0].updates, probe.result_schema.branches[1].updates,
+[0m         "discriminative probe must keep two differently updating outcomes"
+     );
+ }
+FMT_EXIT:1
+> build · muse-spark-1.3-contributor
+[0m$ [0mcargo fmt --manifest-path crates/smart/eliot-dreamer-probe-plan/Cargo.toml; cargo fmt --manifest-path crates/smart/eliot-dreamer-probe-plan/Cargo.toml -- --check; echo "FMT_EXIT:$LASTEXITCODE"
+FMT_EXIT:0
+> build · muse-spark-1.3-contributor
+[0m$ [0mcargo test --manifest-path crates/smart/eliot-dreamer-probe-plan/Cargo.toml --all-targets 2>&1 | Select-Object -Last 40
+Compiling eliot-protocol v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\foundation\eliot-protocol)
+   Compiling eliot-context-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\smart\eliot-context-contracts)
+   Compiling eliot-dreamer-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\smart\eliot-dreamer-contracts)
+   Compiling eliot-dreamer-probe-plan v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\smart\eliot-dreamer-probe-plan)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 26.89s
+     Running unittests src\lib.rs (C:/Users/kleym/AppData/Local/Eliot/build/rust-env-target\debug\deps\eliot_dreamer_probe_plan-c32c86091a314b98.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\probe_plan.rs (C:/Users/kleym/AppData/Local/Eliot/build/rust-env-target\debug\deps\probe_plan-5a3156c950080150.exe)
+
+running 9 tests
+test empty_denominator_plans_empty ... ok
+test unknown_candidate_bound_admits_nothing ... ok
+test cost_risk_authority_vectors_are_preserved ... ok
+test binding_mismatches_fail_the_planner_closed ... ok
+test bounds_and_digest_failures_fail_closed ... ok
+test duplicate_probes_collapse ... ok
+test probe_names_its_discriminator_or_unknown_target ... ok
+test gaps_are_explicit_with_no_fallback_action ... ok
+test ordering_is_deterministic_and_permutation_stable ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests\work_unit_610.rs (C:/Users/kleym/AppData/Local/Eliot/build/rust-env-target\debug\deps\work_unit_610-fe81a3dfec24b954.exe)
+
+running 8 tests
+test open_unbounded_result_space_is_rejected ... ok
+test bounded_closed_result_schema_is_plannable ... ok
+test vague_no_gain_objective_is_unprobeable ... ok
+test out_of_scope_descriptor_is_unprobeable ... ok
+test exact_evidence_verifier_gap_objective_is_plannable ... ok
+test multi_rival_result_matrix ... ok
+test identical_updates_for_all_outcomes_are_unprobeable ... ok
+test objective_result_affordance_disposition_vocabulary ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+> build · muse-spark-1.3-contributor
+[0m$ [0mcargo clippy --manifest-path crates/smart/eliot-dreamer-probe-plan/Cargo.toml --all-targets -- -D warnings 2>&1 | Select-Object -Last 20; echo "CLIPPY_EXIT:$LASTEXITCODE"; git diff --check; echo "DIFFCHECK_EXIT:$LASTEXITCODE"
+Checking eliot-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\foundation\eliot-contracts)
+    Checking eliot-receipts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\foundation\eliot-receipts)
+    Checking eliot-evidence v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\foundation\eliot-evidence)
+    Checking eliot-instrument-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\instrument\eliot-instrument-api)
+    Checking eliot-runtime-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\foundation\eliot-runtime-contracts)
+    Checking eliot-agent-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\agent\eliot-agent-contracts)
+    Checking eliot-security-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\foundation\eliot-security-contracts)
+    Checking eliot-evaluation-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\foundation\eliot-evaluation-contracts)
+    Checking eliot-epistemic-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\smart\eliot-epistemic-contracts)
+    Checking eliot-protocol v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\foundation\eliot-protocol)
+    Checking eliot-context-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\smart\eliot-context-contracts)
+    Checking eliot-dreamer-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\smart\eliot-dreamer-contracts)
+    Checking eliot-dreamer-probe-plan v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\smart\eliot-dreamer-probe-plan)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.38s
+CLIPPY_EXIT:0
+DIFFCHECK_EXIT:0
+> build · muse-spark-1.3-contributor
+[0m$ [0mcargo doc --manifest-path crates/smart/eliot-dreamer-probe-plan/Cargo.toml --no-deps 2>&1 | Select-Object -Last 5; echo "DOC_EXIT:$LASTEXITCODE"; git status --short --branch; echo "==="; git diff --stat
+Checking eliot-context-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\smart\eliot-context-contracts)
+    Checking eliot-dreamer-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\smart\eliot-dreamer-contracts)
+ Documenting eliot-dreamer-probe-plan v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr45-dreamer-610c\crates\smart\eliot-dreamer-probe-plan)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 17.32s
+   Generated C:/Users/kleym/AppData/Local/Eliot/build/rust-env-target\doc\eliot_dreamer_probe_plan\index.html
+DOC_EXIT:0
+## work/dreamer-610-slice4
+ M crates/smart/eliot-dreamer-probe-plan/src/plan.rs
+ M crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs
+?? prompt.txt
+?? stderr.log
+?? stdout.log
+===
+ crates/smart/eliot-dreamer-probe-plan/src/plan.rs  |  37 +++++++-
+ .../tests/work_unit_610.rs                         | 100 ++++++++++++++++++++-
+ 2 files changed, 132 insertions(+), 5 deletions(-)
+> build · muse-spark-1.3-contributor
+[0m$ [0mgit add crates/smart/eliot-dreamer-probe-plan/src/plan.rs crates/smart/eliot-dreamer-probe-plan/tests/work_unit_610.rs; git commit -m "[dreamer] #610 slice 4: probe-plan case 11 identical-updates gate
+
+Prod logic needed: yes, minimal fail-closed inside eliot-dreamer-probe-plan only.
+plan.rs: identical multi-branch update sets gate to Unprobeable; single-branch
+defers to 610/38 readiness so slices 1-3 fixtures stay plannable. No new public APIs.
+Test: WORK_UNIT_CASE 610/11 identical rejected, split Addressed/RemainsOpen planned.
+Remainder 12-42 QUEUED. 12 needs falsifier semantics (defer to 38 batch);
+13-16 need upstream A-03 typed tautology/proxy/causality/controls declarations,
+planner cannot parse prose per forbidden workaround.
+
+Docs route=sha256:1b9bbbd8b5bb5e2de4737b4fa03e7e3672daba4394afef443dd3d8476554c7fa read=sha256:ea79ca7e06dbc95bb6ebceb4b5d904a848f265540ab58d6e82d93d5878599ec6 bundle=5ca78f97ee5f6485f6ab552d6687ade11da053a68be0cb38339167aeac0be7f3"; git log -1 --format=%H; git push origin work/dreamer-610-slice4 2>&1 | Select-Object -Last 5
+[work/dreamer-610-slice4 c8f8f36e] [dreamer] #610 slice 4: probe-plan case 11 identical-updates gate
+ 2 files changed, 132 insertions(+), 5 deletions(-)
+c8f8f36e04379d92835920e3adb24d4f1e3dab0f
+remote: Create a pull request for 'work/dreamer-610-slice4' on GitHub by visiting:        
+remote:      https://github.com/UnknownAlienHuman/eliot-memory-os/pull/new/work/dreamer-610-slice4        
+remote: 
+To https://github.com/UnknownAlienHuman/eliot-memory-os.git
+ * [new branch]        work/dreamer-610-slice4 -> work/dreamer-610-slice4
+> build · muse-spark-1.3-contributor

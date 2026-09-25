@@ -1,0 +1,25 @@
+Verifying cases 11+ and implementing the next smallest batch.
+Remainder is cases 11–42 — now checking whether 11–16 need planner logic or test-only proof.
+Docs routing passed — now verifying discrimination coverage against the planner.
+Verification complete: cases 11+ need planner logic — the current gates ignore the result matrix. Implementing the minimal single-case batch.
+Planner gate drafted — now adding the case 11 proof test.
+Implementation and test in place — running verification gates.
+All gates green — final checks and commit.
+Slice 4 complete on `work/dreamer-610-slice4` (c8f8f36e, pushed, no PR/merge/close).
+
+**Verification first:** read issue 610 (42-case matrix, remainder 11-42) + `plan.rs`/`model.rs`/`result.rs`. Current `classify_dimensions` gates only feasibility/information/authority/consent/scope — never inspects `PossibleResultSchema.updates`. Cases 11+ are therefore **not provable test-only**; minimal prod logic required.
+
+**Prod logic needed: YES, minimal.** `src/plan.rs` only, no new public APIs:
+- `schema_has_identical_updates()` — multi-branch (≥2) matrices with the same update set on every branch → `Unprobeable` ("identical updates across all outcomes"). Order-insensitive via sorted debug keys, infallible, fail-closed.
+- Single-branch schemas explicitly defer to case 38 (two-outcome readiness), preserving slices 1-3 fixtures.
+
+**Batch implemented (smallest: 1 case):**
+- 610/11 OWNED — `identical_updates_for_all_outcomes_are_unprobeable`: identical 2×`RemainsOpen` → 0 probes/1 `Unprobeable` citing "identical"; split `Addressed`/`RemainsOpen` → 1 probe, 2 branches with differing updates. Evidence: 8/8 `work_unit_610` + 9/9 `probe_plan` green.
+- 12 QUEUED — falsifier semantics (require `Weakened`/`Addressed` branch) deferred to 38-batch; would break single-branch fixtures if done now.
+- 13-16 QUEUED — tautology/proxy/correlation/controls need upstream A-03 typed declarations; planner cannot parse prose per forbidden workaround. Complex → no edits beyond 11.
+
+**Gates:** `cargo test --all-targets` green (9+8), `clippy -- -D warnings` clean (zero-new vs green base), `fmt --check` clean after `cargo fmt`, `cargo doc --no-deps` clean, `git diff --check` clean. Diff: 2 files, +132/-5.
+
+**Risks:** debug-string set comparison is a minimal stand-in for canonical update equality; single-branch nondiscrimination still open until case 38; 12-16 may split OWNED/UPSTREAM like case 8.
+
+Docs: route `sha256:1b9bbbd8…`, read `sha256:ea79ca7e…`, bundle `5ca78f97…` read in full.
