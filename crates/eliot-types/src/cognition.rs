@@ -66,6 +66,7 @@ pub enum PacketQualityResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PacketQualityReport {
     pub packet_id: String,
     pub task_id: String,
@@ -89,6 +90,7 @@ pub struct PacketQualityReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CurrentTruthSnapshot {
     pub project_id: ProjectId,
     pub task_id: String,
@@ -101,6 +103,7 @@ pub struct CurrentTruthSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CausalBridgeHop {
     pub from: String,
     pub relation: String,
@@ -109,6 +112,7 @@ pub struct CausalBridgeHop {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EpistemicPacketState {
     pub supported: Vec<String>,
     pub assumed: Vec<String>,
@@ -117,6 +121,7 @@ pub struct EpistemicPacketState {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecisionLocalitySuffix {
     pub exact_load_bearing_atoms: Vec<String>,
     pub open_unknowns: Vec<String>,
@@ -137,12 +142,14 @@ pub enum PredictionConfidence {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WaivedInvariant {
     pub invariant_ref: String,
     pub reason: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MaterialPacketFrame {
     pub acceptance_items: Vec<String>,
     pub environment: Vec<String>,
@@ -160,6 +167,8 @@ pub struct MaterialPacketFrame {
     pub stop_condition: String,
     pub tool_schema_bytes_visible: usize,
     pub instruction_hotset_size: usize,
+    /// Optional prediction/invariant data: a missing field decodes as empty and
+    /// carries no verified invariant, stored prediction, or coverage claim.
     #[serde(default)]
     pub invariant_refs: Vec<String>,
     #[serde(default)]
@@ -182,6 +191,7 @@ pub enum UnderstandingOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnderstandingOutcomeRecord {
     pub task_id: TaskId,
     pub session_id: AgentSessionId,
@@ -203,6 +213,7 @@ pub struct UnderstandingOutcomeRecord {
     pub revision_required: bool,
     pub outcome: UnderstandingOutcome,
     pub evidence_refs: Vec<String>,
+    /// A missing receipt stays absent; absence never authenticates canonical storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_receipt: Option<WriteReceiptRef>,
 }
@@ -232,6 +243,7 @@ pub enum MemoryInfluenceClass {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryInfluenceTrace {
     pub task_id: TaskId,
@@ -250,11 +262,13 @@ pub struct MemoryInfluenceTrace {
     pub downstream_outcome_ref: Option<String>,
     pub influence_class: MemoryInfluenceClass,
     #[schemars(with = "Option<serde_json::Value>")]
+    /// A missing receipt stays absent; absence never authenticates canonical storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_receipt: Option<WriteReceiptRef>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryDecisionReceipt {
     pub task_id: TaskId,
     pub memory_handle: String,
@@ -268,11 +282,13 @@ pub struct MemoryDecisionReceipt {
     pub action_effect: String,
     pub verifier_effect: String,
     pub future_activation: String,
+    /// A missing receipt stays absent; absence never authenticates canonical storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_receipt: Option<WriteReceiptRef>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextCargoReceipt {
     pub receipt_id: String,
     pub task_id: TaskId,
@@ -286,11 +302,13 @@ pub struct ContextCargoReceipt {
     pub reason: String,
     #[serde(with = "time::serde::rfc3339")]
     pub generated_at: OffsetDateTime,
+    /// A missing receipt stays absent; absence never authenticates canonical storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_receipt: Option<WriteReceiptRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryValueExperiment {
     pub task_b_hash: String,
     pub host_model_harness: String,
@@ -304,6 +322,7 @@ pub struct MemoryValueExperiment {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlanningDecisionRecord {
     pub first_action_or_probe: String,
     pub selected_owner_or_module: String,
@@ -318,6 +337,7 @@ pub struct PlanningDecisionRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryValueComparison {
     pub task_b_hash: String,
     pub control: PlanningDecisionRecord,
@@ -338,6 +358,7 @@ pub enum NegativeMemoryDecision {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NegativeMemoryGateInput {
     pub fingerprint: String,
     pub repeated_count: u64,
@@ -348,6 +369,7 @@ pub struct NegativeMemoryGateInput {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NegativeMemoryDecisionReceipt {
     pub receipt_id: String,
     pub fingerprint: String,
@@ -355,6 +377,7 @@ pub struct NegativeMemoryDecisionReceipt {
     pub reasons: Vec<String>,
     pub reopen_conditions: Vec<String>,
     pub evidence_refs: Vec<String>,
+    /// A missing receipt stays absent; absence never authenticates canonical storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_receipt: Option<WriteReceiptRef>,
 }
@@ -383,6 +406,7 @@ pub enum ContourPolicyScope {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContourPreferredRoute {
     pub host_id: String,
     pub model_route_optional: Option<String>,
@@ -391,6 +415,7 @@ pub struct ContourPreferredRoute {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContourRoutePolicy {
     pub policy_id: String,
     pub scope: ContourPolicyScope,
@@ -415,6 +440,7 @@ pub struct ContourRoutePolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContourRouteDecision {
     pub task_id: TaskId,
     pub work_item_id: WorkItemId,
@@ -430,6 +456,7 @@ pub struct ContourRouteDecision {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LiveContourRoute {
     pub route: ContourPreferredRoute,
     pub available: bool,
@@ -457,6 +484,7 @@ pub enum AutonomyRunState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AutonomyRunContract {
     pub autonomy_run_id: String,
     pub project_id: ProjectId,
@@ -490,6 +518,7 @@ pub struct AutonomyRunContract {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AutonomyRunTransitionReceipt {
     pub transition_id: String,
     pub autonomy_run_id: String,
@@ -502,11 +531,13 @@ pub struct AutonomyRunTransitionReceipt {
     pub verifier_refs: Vec<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub transitioned_at: OffsetDateTime,
+    /// A missing receipt stays absent; absence never authenticates canonical storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_receipt: Option<WriteReceiptRef>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActiveDecisionState {
     pub task_id: TaskId,
     pub packet_id: String,
@@ -521,6 +552,7 @@ pub struct ActiveDecisionState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskCognitionView {
     pub task_contract: TaskContract,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -543,6 +575,7 @@ pub struct TaskCognitionView {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryInspectorView {
     pub project_id: ProjectId,
     pub active_current_claim_refs: Vec<String>,
@@ -571,6 +604,7 @@ pub struct MemoryInspectorView {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentRoutingView {
     pub host_session_refs: Vec<String>,
     pub task_role_lease_refs: Vec<String>,
@@ -600,6 +634,7 @@ pub struct AgentRoutingView {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AutonomyRunView {
     pub contract: AutonomyRunContract,
     pub work_item_refs: Vec<String>,
@@ -640,6 +675,7 @@ pub enum AutonomyTripwireKind {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AutonomyRecoveryRecord {
     pub recovery_id: String,
     pub autonomy_run_id: String,
@@ -651,11 +687,13 @@ pub struct AutonomyRecoveryRecord {
     pub preserved_artifact_refs: Vec<String>,
     pub state_revision: u64,
     pub evidence_refs: Vec<String>,
+    /// A missing receipt stays absent; absence never authenticates the recovery write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_receipt: Option<WriteReceiptRef>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalView {
     pub approval_id: String,
     pub exact_action_hash: String,
@@ -670,6 +708,7 @@ pub struct ApprovalView {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TraceTimelineView {
     pub cursor: Option<String>,
     pub next_cursor: Option<String>,
@@ -678,6 +717,7 @@ pub struct TraceTimelineView {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperatorSnapshot {
     pub schema_version: String,
     pub protocol_version: String,
@@ -780,6 +820,7 @@ pub enum OperatorResultMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperatorFieldView {
     pub label: String,
     pub value: String,
@@ -787,6 +828,7 @@ pub struct OperatorFieldView {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperatorRelationshipView {
     pub relation: String,
     pub target_ref: String,
@@ -795,6 +837,7 @@ pub struct OperatorRelationshipView {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperatorActionView {
     pub command: String,
     pub label: String,
@@ -804,6 +847,7 @@ pub struct OperatorActionView {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperatorRecordView {
     pub record_ref: String,
     pub record_kind: String,
@@ -819,6 +863,7 @@ pub struct OperatorRecordView {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperatorProjectionPage {
     pub schema_version: String,
     pub runtime_id: String,
@@ -853,12 +898,47 @@ pub struct MemoryCurationPreviewRequest {
     pub page_size: u16,
 }
 
+fn deserialize_duplicate_rejecting_string_usize_map<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct DuplicateRejectingMap;
+
+    impl<'de> serde::de::Visitor<'de> for DuplicateRejectingMap {
+        type Value = BTreeMap<String, usize>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON object with unique string keys")
+        }
+
+        fn visit_map<A>(self, mut access: A) -> Result<BTreeMap<String, usize>, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut entries = BTreeMap::new();
+            while let Some((key, value)) = access.next_entry::<String, usize>()? {
+                if entries.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom("duplicate map key"));
+                }
+            }
+            Ok(entries)
+        }
+    }
+
+    deserializer.deserialize_map(DuplicateRejectingMap)
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryCurationCorpusProfile {
     pub scanned_records: usize,
     pub scan_limit: usize,
     pub scan_truncated: bool,
+    #[serde(deserialize_with = "deserialize_duplicate_rejecting_string_usize_map")]
     pub receipt_kind_counts: BTreeMap<String, usize>,
+    #[serde(deserialize_with = "deserialize_duplicate_rejecting_string_usize_map")]
     pub lifecycle_counts: BTreeMap<String, usize>,
 }
 
@@ -876,6 +956,7 @@ pub enum MemoryCurationFindingKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryCurationCandidate {
     pub handle: String,
     pub kind: String,
@@ -890,6 +971,7 @@ pub struct MemoryCurationCandidate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryCurationPreviewResponse {
     pub project_id: ProjectId,
     pub task_id: TaskId,
@@ -991,6 +1073,7 @@ pub enum OperatorCommand {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperatorCommandReceipt {
     /// The exact retained UI idempotency identity that the owner evaluated.
     pub operation_id: String,
@@ -1012,6 +1095,7 @@ pub struct OperatorCommandReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperatorControlRequest {
     pub request_id: String,
     pub project_id: ProjectId,
@@ -1024,6 +1108,7 @@ pub struct OperatorControlRequest {
     pub requested_by: String,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// A missing receipt stays absent; absence never authenticates canonical storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_receipt: Option<WriteReceiptRef>,
 }

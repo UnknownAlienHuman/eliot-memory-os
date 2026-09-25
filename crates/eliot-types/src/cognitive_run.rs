@@ -19,6 +19,7 @@ pub enum CognitiveInvocationRole {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveRunCallPlan {
     pub call_number: u8,
     pub call_id: String,
@@ -49,6 +50,7 @@ pub struct CognitiveRunCallPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveRunContract {
     pub schema_version: String,
     pub harness_version: String,
@@ -79,6 +81,7 @@ pub struct CognitiveRunContract {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalCaseDisposition {
     pub case_id: String,
     pub task_id: TaskId,
@@ -99,6 +102,7 @@ pub struct CanonicalCaseDisposition {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveExecutionSeal {
     /// Exact binary launched by the native runner (which may be the ELIOT host wrapper).
     pub executable_sha256: String,
@@ -112,6 +116,7 @@ pub struct CognitiveExecutionSeal {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveSharedGateBinding {
     pub gate_revision: u64,
     pub gate_receipt: WriteReceiptRef,
@@ -128,6 +133,7 @@ pub struct CognitiveSharedGateBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveCandidateCapability {
     pub capability_id: String,
     pub contract_sha256: String,
@@ -151,6 +157,7 @@ pub struct CognitiveCandidateCapability {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveHostObservation {
     pub observation_version: String,
     pub governor_session_id: Option<SessionId>,
@@ -161,12 +168,17 @@ pub struct CognitiveHostObservation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveToolObservation {
     pub schema_version: String,
     pub run_id: String,
-    #[serde(default)]
+    /// No legacy wire form omits this field: the owner producer always seals the
+    /// exact call subject and the owner binding check rejects any other value, so
+    /// a missing field is refused rather than decoded to an empty identity.
     pub call_subject_ref: String,
-    #[serde(default)]
+    /// No legacy wire form omits this field: the owner producer always seals a
+    /// fresh `UUIDv7` and the owner binding check rejects any other value, so a
+    /// missing field is refused rather than decoded to an empty identity.
     pub observation_id: String,
     pub call_id: String,
     pub call_number: u8,
@@ -199,6 +211,7 @@ pub enum CognitiveRunCallStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveRunAttempt {
     pub schema_version: String,
     pub run_id: String,
@@ -220,6 +233,7 @@ pub struct CognitiveRunAttempt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveRunTerminal {
     pub schema_version: String,
     pub run_id: String,
@@ -246,6 +260,7 @@ pub struct CognitiveRunTerminal {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveRawVerifierEvidence {
     pub schema_version: String,
     pub run_id: String,

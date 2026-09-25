@@ -201,6 +201,44 @@ pub struct CognitiveFieldCausalHop {
     pub status: String,
 }
 
+fn deserialize_duplicate_rejecting_map<'de, D, K, V>(
+    deserializer: D,
+) -> Result<BTreeMap<K, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    K: serde::Deserialize<'de> + Ord,
+    V: serde::Deserialize<'de>,
+{
+    struct DuplicateRejectingMap<K, V>(std::marker::PhantomData<(K, V)>);
+
+    impl<'de, K, V> serde::de::Visitor<'de> for DuplicateRejectingMap<K, V>
+    where
+        K: serde::Deserialize<'de> + Ord,
+        V: serde::Deserialize<'de>,
+    {
+        type Value = BTreeMap<K, V>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON object with unique keys")
+        }
+
+        fn visit_map<A>(self, mut access: A) -> Result<BTreeMap<K, V>, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut entries = BTreeMap::new();
+            while let Some((key, value)) = access.next_entry::<K, V>()? {
+                if entries.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom("duplicate map key"));
+                }
+            }
+            Ok(entries)
+        }
+    }
+
+    deserializer.deserialize_map(DuplicateRejectingMap(std::marker::PhantomData))
+}
+
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CognitiveUnderstandingAnswer {
@@ -235,6 +273,7 @@ pub struct CognitiveUnderstandingAnswer {
     pub memory_handles_expanded: Vec<String>,
     pub memory_handles_used: Vec<String>,
     pub influence_receipt_refs: Vec<String>,
+    #[serde(deserialize_with = "deserialize_duplicate_rejecting_map")]
     pub confidence_by_section: BTreeMap<String, u8>,
 }
 
@@ -517,6 +556,7 @@ pub struct CognitiveFieldValidationReport {
     pub valid: bool,
     pub errors: Vec<String>,
     pub case_count: usize,
+    #[serde(deserialize_with = "deserialize_duplicate_rejecting_map")]
     pub family_counts: BTreeMap<CognitiveFieldFamily, usize>,
     pub model_backed_case_count: usize,
 }
