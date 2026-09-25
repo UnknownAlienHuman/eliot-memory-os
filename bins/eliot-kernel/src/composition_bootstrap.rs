@@ -15,22 +15,21 @@
 //! Public construction semantics remain on `KernelComposition`; this ordinary
 //! module only houses their implementation.
 use super::{
-    AgentActivationPendingState, ArtifactId, AuthorityDescriptorContour,
-    AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState,
-    AuthorityPreparationError, AuthoritySnapshotBinding, BlobStoreController, BoundCanonicalOwner,
-    ContractId, DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId,
-    DispatchSnapshotCodec, GenerationRoute, GenerationRouter, GovernorClosureRestore, HealthVector,
-    IpcImplementation, KernelBackupCapture, KernelBackupRestore, KernelBuildError,
-    KernelComposition, KernelConfig, KernelDispatchKey, KernelError, KernelPathAdmission,
-    KernelService, KernelStoreRebindProductionBoundary, KernelSupervisionLeaseAuthority,
-    ModuleGeneration, ModuleGenerationState, OperationalRecoveryStore, OrsError,
-    OrsGenerationCoordinator, PROTOCOL_VERSION, PreparedAuthorityMaterial,
-    ProcessAuthorityHandoffDescriptor, ProcessDispatchAuthorityController,
-    ProcessExecutionAuthorityConfig, ProcessExecutionGateway, RedbRecoveryStore, RouteScope,
-    Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy, StartupCoordinator, StateFence,
-    USER_AUTOMATION_KERNEL_CAPABILITY, UserOwnedPathLease, UserOwnedRootLease,
-    WindowsDispatchSnapshotCodec, WindowsPlatform, bind_canonical_owner, is_lower_sha256,
-    owner_bundle_digest, sha256_hex, sha256_json, unix_ms,
+    AgentActivationPendingState, ArtifactId, AuthorityDescriptorContour, AuthorityHandoffBegin,
+    AuthorityHandoffRecord, AuthorityHandoffState, AuthorityPreparationError,
+    AuthoritySnapshotBinding, BlobStoreController, BoundCanonicalOwner, ContractId,
+    DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId, DispatchSnapshotCodec,
+    GenerationRoute, GenerationRouter, GovernorClosureRestore, HealthVector, IpcImplementation,
+    KernelBackupCapture, KernelBackupRestore, KernelBuildError, KernelComposition, KernelConfig,
+    KernelDispatchKey, KernelError, KernelPathAdmission, KernelService,
+    KernelStoreRebindProductionBoundary, KernelSupervisionLeaseAuthority, ModuleGeneration,
+    ModuleGenerationState, OperationalRecoveryStore, OrsError, OrsGenerationCoordinator,
+    PROTOCOL_VERSION, PreparedAuthorityMaterial, ProcessAuthorityHandoffDescriptor,
+    ProcessDispatchAuthorityController, ProcessExecutionAuthorityConfig, ProcessExecutionGateway,
+    RedbRecoveryStore, RouteScope, Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy,
+    StartupCoordinator, StateFence, USER_AUTOMATION_KERNEL_CAPABILITY, UserOwnedPathLease,
+    UserOwnedRootLease, WindowsDispatchSnapshotCodec, WindowsPlatform, bind_canonical_owner,
+    is_lower_sha256, owner_bundle_digest, sha256_hex, sha256_json, unix_ms,
 };
 #[cfg(test)]
 use super::{CanonicalEvidenceProvider, DispatchValidationPort};
@@ -1092,14 +1091,16 @@ impl KernelComposition {
             EntrypointStage::Composition,
             &format!(
                 "kernel.composition.route_registered:daemon:epoch={:?}:generation={}",
-                canonical_epoch, generation.value()
+                canonical_epoch,
+                generation.value()
             ),
         );
         observe_entrypoint_with_detail(
             EntrypointStage::StoreBootstrap,
             &format!(
                 "kernel.composition.route_registered:store_bridge:epoch={:?}:generation={}",
-                canonical_epoch, generation.value()
+                canonical_epoch,
+                generation.value()
             ),
         );
         let service = KernelService::new(dispatch_key(&work_root), 4, 128)
@@ -1125,11 +1126,24 @@ impl KernelComposition {
         let session_principal_binding = observed_session_principal_binding()?;
         #[cfg(not(windows))]
         let session_principal_binding = "unsupported-non-windows-principal".to_owned();
+        // The published front-door config snapshot carries the COMPLETE typed
+        // epoch tuple, never a bare sequence counter (Implements #64). A
+        // scalar spelling cannot say which lineage authorized the route, so
+        // two unrelated lineages at the same sequence would project one
+        // indistinguishable snapshot. `EpochId` is the same value shape the
+        // sibling projections publish (`health_view::daemon_snapshot` and
+        // `generation_recovery::update_handshake_policy`) and the exact shape
+        // both readers already require: `eliotd`'s
+        // `daemon_kernel_client::KernelSnapshotWire` and the CLI's
+        // `KernelConfigSnapshot` both declare
+        // `authority_epoch: EpochId` under `deny_unknown_fields`, so a bare
+        // number would fail their decode outright. The daemon takes its
+        // binding epoch from the launch handshake, never from this key.
         let mut config_snapshot = serde_json::json!({
             "service": SERVICE_NAME,
             "protocol": PROTOCOL_VERSION,
             "generation": generation.value(),
-            "authority_epoch": authority_epoch.value(),
+            "authority_epoch": canonical_epoch,
             "artifact_digest": kernel_artifact_sha256
                 .as_deref()
                 .unwrap_or("eliot-kernel-standalone"),

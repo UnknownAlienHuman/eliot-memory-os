@@ -397,7 +397,9 @@ impl KernelComposition {
         // route. The identical rule is already applied to the process receipt
         // above; this closes the same self-inconsistency on the route side.
         if route.active_generation().value() != launch.generation.value()
-            || !route.authority_epoch().is_same_authority(&launch.authority_epoch)
+            || !route
+                .authority_epoch()
+                .is_same_authority(&launch.authority_epoch)
         {
             return Err(KernelBuildError::Service(
                 "eliotd supervised generation is not the active daemon route".to_owned(),

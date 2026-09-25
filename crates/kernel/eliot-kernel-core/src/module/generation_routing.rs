@@ -598,14 +598,18 @@ mod tests {
                 model_epoch = next_epoch;
                 model_generation = next_generation;
             }
-            assert!(router
-                .epoch()
-                .is_same_authority(&canonical_epoch(TEST_LINEAGE, model_epoch)?));
+            assert!(
+                router
+                    .epoch()
+                    .is_same_authority(&canonical_epoch(TEST_LINEAGE, model_epoch)?)
+            );
             let route = router.route(&RouteScope::new("daemon")?)?;
             assert_eq!(route.active_generation().value(), model_generation);
-            assert!(route
-                .authority_epoch()
-                .is_same_authority(&canonical_epoch(TEST_LINEAGE, model_epoch)?));
+            assert!(
+                route
+                    .authority_epoch()
+                    .is_same_authority(&canonical_epoch(TEST_LINEAGE, model_epoch)?)
+            );
         }
         Ok(())
     }

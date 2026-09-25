@@ -263,10 +263,7 @@ impl KernelStoreGateway {
             // Cross-lineage same-sequence routes never authorize: the route
             // carries its own lineage.
             let live_epoch = service.authority_epoch();
-            if !self
-                .route
-                .authority_epoch()
-                .is_same_authority(&live_epoch)
+            if !self.route.authority_epoch().is_same_authority(&live_epoch)
                 || self.route.active_generation() != transition.state_fence.resource_generation
             {
                 return Err(
@@ -514,10 +511,7 @@ impl KernelStoreGateway {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
         let live_epoch = service.authority_epoch();
-        if !self
-            .route
-            .authority_epoch()
-            .is_same_authority(&live_epoch)
+        if !self.route.authority_epoch().is_same_authority(&live_epoch)
             || self.route.active_generation() != transition.state_fence.resource_generation
             || !live_epoch.is_same_authority(&context.state_fence.authority_epoch)
         {
@@ -1183,7 +1177,8 @@ mod tests {
         use std::num::NonZeroU64;
 
         use eliot_contracts::{
-            ClockReading, EpochLineageId, ProductId, RequestId, ResourceGeneration, SourceId,
+            ClockReading, EpochId, EpochLineageId, ProductId, RequestId, ResourceGeneration,
+            SourceId,
         };
         use eliot_store_api::{
             EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
@@ -1734,15 +1729,9 @@ mod named_read_gateway_tests {
             state_fence: fence.clone(),
             parameters: evidence_params(&subject, "10"),
         };
-        let response = execute_named_via(
-            &flight,
-            &service,
-            &route,
-            &store,
-            request,
-        )
-        .await
-        .expect("exact evidence pack reads");
+        let response = execute_named_via(&flight, &service, &route, &store, request)
+            .await
+            .expect("exact evidence pack reads");
         assert_eq!(response.operation, NamedReadOperation::GetEvidencePack);
         assert_eq!(response.state_fence, fence);
         assert_eq!(
@@ -1792,14 +1781,7 @@ mod named_read_gateway_tests {
             state_fence: changed_fence,
             parameters: evidence_params(&subject, "10"),
         };
-        let fenced = execute_named_via(
-            &flight,
-            &service,
-            &route,
-            &store,
-            fenced_request,
-        )
-        .await;
+        let fenced = execute_named_via(&flight, &service, &route, &store, fenced_request).await;
         assert!(
             fenced.is_err(),
             "changed fence must fail closed, observed: {fenced:?}"
@@ -1814,14 +1796,7 @@ mod named_read_gateway_tests {
             state_fence: fence,
             parameters: evidence_params(&subject, &(EVIDENCE_PACK_MAX_RECORDS + 1).to_string()),
         };
-        let bounded = execute_named_via(
-            &flight,
-            &service,
-            &route,
-            &store,
-            over_bound,
-        )
-        .await;
+        let bounded = execute_named_via(&flight, &service, &route, &store, over_bound).await;
         match bounded {
             Err(error) => assert!(
                 error.contains("payload exceeds named-operation limit"),
@@ -1870,15 +1845,9 @@ mod named_read_gateway_tests {
             state_fence: fence.clone(),
             parameters: BTreeMap::from([("position".to_owned(), Value::String(position.clone()))]),
         };
-        let response = execute_named_via(
-            &flight,
-            &service,
-            &route,
-            &store,
-            request,
-        )
-        .await
-        .expect("exact position read passes the gateway");
+        let response = execute_named_via(&flight, &service, &route, &store, request)
+            .await
+            .expect("exact position read passes the gateway");
         assert_eq!(
             response.operation,
             NamedReadOperation::GetCurrentEpistemicPosition
@@ -1898,14 +1867,7 @@ mod named_read_gateway_tests {
             state_fence: changed_fence,
             parameters: BTreeMap::from([("position".to_owned(), Value::String(position.clone()))]),
         };
-        let fenced = execute_named_via(
-            &flight,
-            &service,
-            &route,
-            &store,
-            fenced_request,
-        )
-        .await;
+        let fenced = execute_named_via(&flight, &service, &route, &store, fenced_request).await;
         assert!(
             fenced.is_err(),
             "changed fence must fail closed, observed: {fenced:?}"
@@ -1919,15 +1881,9 @@ mod named_read_gateway_tests {
             parameters: BTreeMap::from([("position".to_owned(), Value::String(position.clone()))]),
         };
         assert!(
-            execute_named_via(
-                &flight,
-                &service,
-                &route,
-                &store,
-                eventual
-            )
-            .await
-            .is_err(),
+            execute_named_via(&flight, &service, &route, &store, eventual)
+                .await
+                .is_err(),
             "non-ExactFence position read must fail closed"
         );
 
@@ -1939,15 +1895,9 @@ mod named_read_gateway_tests {
             parameters: BTreeMap::new(),
         };
         assert!(
-            execute_named_via(
-                &flight,
-                &service,
-                &route,
-                &store,
-                missing
-            )
-            .await
-            .is_err(),
+            execute_named_via(&flight, &service, &route, &store, missing)
+                .await
+                .is_err(),
             "missing position selector must fail closed"
         );
 

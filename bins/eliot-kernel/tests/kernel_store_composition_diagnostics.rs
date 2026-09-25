@@ -373,7 +373,10 @@ fn route_and_generation_are_exact() {
     // The composition observation now spells the whole epoch tuple, so the
     // route observation can no longer be satisfied by a bare sequence from
     // another lineage (Implements #64).
-    assert!(text.contains(&format!("epoch={:?}", requirement.state_fence.authority_epoch)));
+    assert!(text.contains(&format!(
+        "epoch={:?}",
+        requirement.state_fence.authority_epoch
+    )));
     assert!(text.contains(&format!("generation={expected_generation}")));
     let routes = kernel.generation_route_snapshot().expect("snapshot");
     let scope = eliot_kernel_core::RouteScope::new("store_bridge").expect("scope");

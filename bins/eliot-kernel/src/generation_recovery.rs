@@ -184,9 +184,8 @@ impl OrsGenerationCoordinator {
             }
             let scope =
                 RouteScope::new(record.route_scope.clone()).map_err(|error| error.to_string())?;
-            let route =
-                GenerationRoute::new(scope, record.new_generation, active_epoch.clone())
-                    .map_err(|error| error.to_string())?;
+            let route = GenerationRoute::new(scope, record.new_generation, active_epoch.clone())
+                .map_err(|error| error.to_string())?;
             recovered
                 .register(route)
                 .map_err(|error| error.to_string())?;
@@ -318,10 +317,16 @@ pub(crate) fn update_handshake_policy(
         // own lineage is what previously let a route from another lineage be
         // rewritten into the current one, so a lineage disagreement is now a
         // terminal policy error instead of a silent rewrite.
-        if policy.module_generation.state_fence.authority_epoch.lineage_id
+        if policy
+            .module_generation
+            .state_fence
+            .authority_epoch
+            .lineage_id
             != route.authority_epoch().lineage_id
         {
-            return Err("Kernel handshake policy epoch lineage disagrees with the route".to_owned());
+            return Err(
+                "Kernel handshake policy epoch lineage disagrees with the route".to_owned(),
+            );
         }
         policy.module_generation.state_fence =
             StateFence::new(route.authority_epoch().clone(), route.active_generation());
