@@ -119,6 +119,24 @@ impl CacheLane {
         self.store.counters()
     }
 
+    /// Wall time of the most recent uncached derivation, if one ran.
+    #[must_use]
+    pub const fn last_derive_duration_ms(&self) -> Option<u64> {
+        self.store.last_derive_duration_ms()
+    }
+
+    /// Wall time of the most recent verified warm cache lookup, if one ran.
+    #[must_use]
+    pub const fn last_warm_duration_ms(&self) -> Option<u64> {
+        self.store.last_warm_duration_ms()
+    }
+
+    /// Retained payload bytes currently held by the store.
+    #[must_use]
+    pub const fn stored_bytes(&self) -> u64 {
+        self.store.stored_bytes()
+    }
+
     /// Rejection records in insertion order.
     #[must_use]
     pub fn rejected(&self) -> Vec<RejectedCacheRecord> {
@@ -220,6 +238,8 @@ impl CacheLane {
                             producer_id: attest.producer_id.clone(),
                             producer_generation: attest.producer_generation,
                             root_identity: attest.root_identity.clone(),
+                            root_acl_digest: attest.root_acl_digest.clone(),
+                            root_disposition: attest.root_disposition,
                             schema_revision: attest.schema_revision.clone(),
                             identity_digest: "unkeyed".to_owned(),
                             content_digest: attest.content_digest.clone(),

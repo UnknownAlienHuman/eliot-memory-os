@@ -558,20 +558,94 @@ impl TestTelemetry {
 }
 
 /// Target/cache/lock observations for instrument economics.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+///
+/// `None` on a measurement means that the value was not observed; it is never
+/// a fabricated zero. The constructor below accepts the store's measurements
+/// as plain values so the cache and observability crates remain independent.
+#[derive(Clone, Debug, Default, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CacheTelemetry {
+    /// Identity of the target the cache observation belongs to.
     pub target_identity: String,
+    /// Identity digest of the cache entry, when one was established.
     pub cache_identity: Option<String>,
+    /// Time spent waiting for the cache lock, when measured.
     pub lock_wait_ms: Option<u64>,
+    /// Whether the consultation reused a verified entry, when known.
     pub cache_hit: Option<bool>,
+    /// Fraction of consultations that were verified hits, when measured.
+    #[serde(default)]
+    pub hit_rate: Option<f64>,
+    /// Duration of the most recent uncached derivation, when measured.
+    #[serde(default)]
+    pub cold_duration_ms: Option<u64>,
+    /// Duration of the most recent verified warm lookup, when measured.
+    #[serde(default)]
+    pub warm_duration_ms: Option<u64>,
+    /// Retained payload bytes, when the store was observed.
+    #[serde(default)]
+    pub cache_size_bytes: Option<u64>,
+    /// Rejections plus capacity evictions observed by the store.
+    #[serde(default)]
+    pub invalidation_count: Option<u64>,
 }
 
+// Validation rejects non-finite hit rates, so admitted telemetry has the
+// equality semantics required by the enclosing Eq-bearing run record.
+impl Eq for CacheTelemetry {}
+
 impl CacheTelemetry {
+    /// Builds telemetry from plain cache measurements.
+    ///
+    /// A known hit reports only the warm duration, a known miss reports only
+    /// the cold duration, and an unknown mode preserves both when observed.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the constructor mirrors the independent cache measurement fields"
+    )]
+    pub fn from_cache_measurements(
+        target_identity: impl Into<String>,
+        cache_identity: Option<String>,
+        lock_wait_ms: Option<u64>,
+        cache_hit: Option<bool>,
+        hit_rate: Option<f64>,
+        cold_duration_ms: Option<u64>,
+        warm_duration_ms: Option<u64>,
+        cache_size_bytes: Option<u64>,
+        invalidation_count: Option<u64>,
+    ) -> Result<Self, ObservabilityError> {
+        let (cold_duration_ms, warm_duration_ms) = match cache_hit {
+            Some(true) => (None, warm_duration_ms),
+            Some(false) => (cold_duration_ms, None),
+            None => (cold_duration_ms, warm_duration_ms),
+        };
+        let telemetry = Self {
+            target_identity: target_identity.into(),
+            cache_identity,
+            lock_wait_ms,
+            cache_hit,
+            hit_rate,
+            cold_duration_ms,
+            warm_duration_ms,
+            cache_size_bytes,
+            invalidation_count,
+        };
+        telemetry.validate()?;
+        Ok(telemetry)
+    }
+
     fn validate(&self) -> Result<(), ObservabilityError> {
         text(&self.target_identity, "cache.target_identity")?;
         if let Some(identity) = &self.cache_identity {
             text(identity, "cache.cache_identity")?;
+        }
+        if let Some(hit_rate) = self.hit_rate
+            && (!hit_rate.is_finite() || !(0.0..=1.0).contains(&hit_rate))
+        {
+            return Err(ObservabilityError::InvalidField {
+                field: "cache.hit_rate",
+                reason: "must be finite and between zero and one",
+            });
         }
         Ok(())
     }

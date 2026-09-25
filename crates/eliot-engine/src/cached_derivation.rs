@@ -126,13 +126,9 @@ impl CachedDerivationService {
     ) -> Result<Option<CachedDerivation>, EngineError> {
         let identity = Self::govern(request)?;
         Ok(match self.lane.lookup_identity(&identity) {
-            eliot_build_test_graph::CacheLookup::Hit(artifact) => Some(Self::finish(
-                request.invocation,
-                &identity,
-                artifact,
-                true,
-                None,
-            )),
+            eliot_build_test_graph::CacheLookup::Hit(artifact) => {
+                Some(self.finish(request.invocation, &identity, artifact, true, None)?)
+            }
             eliot_build_test_graph::CacheLookup::Miss { .. } => None,
         })
     }
@@ -149,9 +145,10 @@ impl CachedDerivationService {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] when governance fails (stale/unknown
-    /// resolution, non-build kind, executable mismatch, invalid identity, or
-    /// blank target). Derivation and publish outcomes are returned inside
+    /// Returns [`EngineError`] when governance or cache telemetry projection
+    /// fails (stale/unknown resolution, non-build kind, executable mismatch,
+    /// invalid identity, blank target, or invalid measured telemetry).
+    /// Derivation and publish outcomes are returned inside
     /// [`CachedDerivation`], never as errors.
     pub fn derive_governed(
         &mut self,
@@ -160,13 +157,9 @@ impl CachedDerivationService {
     ) -> Result<CachedDerivation, EngineError> {
         let identity = Self::govern(request)?;
         match self.lane.lookup_identity(&identity) {
-            eliot_build_test_graph::CacheLookup::Hit(artifact) => Ok(Self::finish(
-                request.invocation,
-                &identity,
-                artifact,
-                true,
-                None,
-            )),
+            eliot_build_test_graph::CacheLookup::Hit(artifact) => {
+                self.finish(request.invocation, &identity, artifact, true, None)
+            }
             eliot_build_test_graph::CacheLookup::Miss { reason } => {
                 let rejected = if reason.is_recorded() {
                     self.lane.rejected().pop()
@@ -175,24 +168,18 @@ impl CachedDerivationService {
                 };
                 let fresh = derive();
                 if let Ok(artifact) = self.lane.publish_identity(&identity, fresh.clone()) {
-                    Ok(Self::finish(
-                        request.invocation,
-                        &identity,
-                        artifact,
-                        false,
-                        rejected,
-                    ))
+                    self.finish(request.invocation, &identity, artifact, false, rejected)
                 } else {
                     let latest = self.lane.rejected().pop();
                     let digest = identity.digest().unwrap_or_else(|_| "unkeyed".to_owned());
                     let artifact = CachedArtifact::fresh(&identity, &digest, fresh.bytes);
-                    Ok(Self::finish(
+                    self.finish(
                         request.invocation,
                         &identity,
                         artifact,
                         false,
                         latest.or(rejected),
-                    ))
+                    )
                 }
             }
         }
@@ -208,8 +195,9 @@ impl CachedDerivationService {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] only when governance fails. Publish failures
-    /// are returned inside [`CachedDerivation`] as `rejected` evidence.
+    /// Returns [`EngineError`] when governance or cache telemetry projection
+    /// fails. Publish failures are returned inside [`CachedDerivation`] as
+    /// `rejected` evidence.
     pub fn publish_governed(
         &mut self,
         request: &GovernedDerivationRequest<'_>,
@@ -217,24 +205,12 @@ impl CachedDerivationService {
     ) -> Result<CachedDerivation, EngineError> {
         let identity = Self::govern(request)?;
         if let Ok(artifact) = self.lane.publish_identity(&identity, fresh.clone()) {
-            Ok(Self::finish(
-                request.invocation,
-                &identity,
-                artifact,
-                false,
-                None,
-            ))
+            self.finish(request.invocation, &identity, artifact, false, None)
         } else {
             let latest = self.lane.rejected().pop();
             let digest = identity.digest().unwrap_or_else(|_| "unkeyed".to_owned());
             let artifact = CachedArtifact::fresh(&identity, &digest, fresh.bytes);
-            Ok(Self::finish(
-                request.invocation,
-                &identity,
-                artifact,
-                false,
-                latest,
-            ))
+            self.finish(request.invocation, &identity, artifact, false, latest)
         }
     }
 
@@ -275,24 +251,32 @@ impl CachedDerivationService {
     }
 
     fn finish(
+        &self,
         invocation: &InstrumentInvocation,
         identity: &DerivedCacheIdentity,
         artifact: CachedArtifact,
         cached: bool,
-        rejected: Option<RejectedCacheRecord>,
-    ) -> CachedDerivation {
-        let telemetry = CacheTelemetry {
-            target_identity: invocation.target.clone(),
-            cache_identity: identity.digest().ok(),
-            lock_wait_ms: None,
-            cache_hit: Some(cached),
-        };
-        CachedDerivation {
+        rejection: Option<RejectedCacheRecord>,
+    ) -> Result<CachedDerivation, EngineError> {
+        let counters = self.lane.counters();
+        let telemetry = CacheTelemetry::from_cache_measurements(
+            invocation.target.clone(),
+            identity.digest().ok(),
+            None,
+            Some(cached),
+            counters.hit_rate(),
+            self.lane.last_derive_duration_ms(),
+            self.lane.last_warm_duration_ms(),
+            Some(self.lane.stored_bytes()),
+            Some(counters.invalidation_count()),
+        )
+        .map_err(|error| rejected(&format!("cache telemetry is invalid: {error}")))?;
+        Ok(CachedDerivation {
             artifact,
             telemetry,
             cached,
-            rejected,
-        }
+            rejected: rejection,
+        })
     }
 }
 
