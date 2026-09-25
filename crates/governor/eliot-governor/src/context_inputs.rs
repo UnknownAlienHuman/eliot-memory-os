@@ -105,12 +105,21 @@ pub enum ContextInputsError {
 /// Closed request for one seven-role reconstruction.
 ///
 /// The fence travels only in the caller [`RequestMetadata`]; dependency
-/// revisions bind the exact-fence reads. Every catalogue-declared selector is
-/// explicit: `epistemic_position`, evidence `subject`/`max_records`, task
-/// `task_id`/`max_records`, optional attention `problem_id`/`max_records`,
-/// understanding `selector`/`max_records`, and capability
-/// `skill_id`/`max_records`. No selector is guessed from a payload or replaced
-/// with an empty value.
+/// revisions bind the exact-fence reads. Selectors are the exact closed
+/// named-read parameters: `epistemic_position` is the required `position`
+/// selector of `GetCurrentEpistemicPosition`, and `evidence_subject` plus
+/// `evidence_max_records` are the required `subject`/`max_records` selectors
+/// of `GetEvidencePack`. The store catalogue (T11.3 store activation) declares
+/// bounded exact selectors for the remaining reconstruction reads
+/// (`task_id`+`max_records` for `GetTaskState`, optional
+/// `problem_id`+`max_records` for `GetAttentionAndProblems`,
+/// `selector`+`max_records` for `GetUnderstandingProjectionInputs`,
+/// `skill_id`+`max_records` for `GetCapabilityEvidenceState`); this
+/// reconstruction currently acquires those roles with no parameters, so
+/// against the real catalogue they resolve to per-role `Unavailable`
+/// (fail-closed) until a follow-up threads the closed selectors. Cue and
+/// negative-memory roles share the one understanding-projection acquisition;
+/// only the candidate-stage interpretation differs.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextReconstructionRequest {
@@ -124,17 +133,6 @@ pub struct ContextReconstructionRequest {
     pub evidence_subject: String,
     /// Explicit evidence bound (`1..=EVIDENCE_PACK_MAX_RECORDS`).
     pub evidence_max_records: u32,
-    /// Exact task identity for `GetTaskState`.
-    pub task_id: String,
-    /// Optional exact problem filter for `GetAttentionAndProblems`.
-    pub problem_id: Option<String>,
-    /// Exact projection selector for `GetUnderstandingProjectionInputs`.
-    pub projection_selector: String,
-    /// Exact skill selector for `GetCapabilityEvidenceState`.
-    pub capability_skill_id: String,
-    /// Explicit bound shared by the four catalogue-declared reconstruction
-    /// reads (`1..=EVIDENCE_PACK_MAX_RECORDS`).
-    pub reconstruction_max_records: u32,
 }
 
 impl ContextReconstructionRequest {
@@ -166,33 +164,6 @@ impl ContextReconstructionRequest {
         if self.evidence_max_records == 0 || self.evidence_max_records > EVIDENCE_PACK_MAX_RECORDS {
             return Err(ContextInputsError::RequestInvalid(format!(
                 "evidence_max_records must be within 1..={EVIDENCE_PACK_MAX_RECORDS}"
-            )));
-        }
-        for (field, value) in [
-            ("task_id", self.task_id.as_str()),
-            ("projection_selector", self.projection_selector.as_str()),
-            ("capability_skill_id", self.capability_skill_id.as_str()),
-        ] {
-            if value.trim().is_empty() || value.chars().any(char::is_control) {
-                return Err(ContextInputsError::RequestInvalid(format!(
-                    "{field} must be non-blank text"
-                )));
-            }
-        }
-        if self
-            .problem_id
-            .as_deref()
-            .is_some_and(|value| value.trim().is_empty() || value.chars().any(char::is_control))
-        {
-            return Err(ContextInputsError::RequestInvalid(
-                "problem_id must be non-blank text when supplied".to_owned(),
-            ));
-        }
-        if self.reconstruction_max_records == 0
-            || self.reconstruction_max_records > EVIDENCE_PACK_MAX_RECORDS
-        {
-            return Err(ContextInputsError::RequestInvalid(format!(
-                "reconstruction_max_records must be within 1..={EVIDENCE_PACK_MAX_RECORDS}"
             )));
         }
         Ok(())
@@ -411,7 +382,6 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         request: &ContextReconstructionRequest,
         operation: NamedReadOperation,
     ) -> Result<RoleAcquisition, ContextInputsError> {
-        let parameters = reconstruction_state_parameters(request, operation)?;
         match self
             .reads
             .state(
@@ -421,7 +391,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                     scope_id: Some(request.scope_id.clone()),
                     consistency: ReadConsistency::ExactFence,
                     dependency_revisions: request.dependency_revisions.clone(),
-                    parameters,
+                    parameters: NamedParameters::new(),
                     provenance_handles: Vec::new(),
                 },
             )
@@ -448,7 +418,6 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         request: &ContextReconstructionRequest,
     ) -> Result<RoleAcquisition, ContextInputsError> {
         let operation = NamedReadOperation::GetUnderstandingProjectionInputs;
-        let parameters = reconstruction_projection_parameters(request)?;
         match self
             .reads
             .query(
@@ -459,7 +428,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                     scope_id: Some(request.scope_id.clone()),
                     consistency: ReadConsistency::ExactFence,
                     dependency_revisions: request.dependency_revisions.clone(),
-                    parameters,
+                    parameters: NamedParameters::new(),
                     provenance_handles: Vec::new(),
                 },
             )
@@ -467,13 +436,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         {
             Ok(response) => Ok(RoleAcquisition {
                 operation: response.operation,
-                state: classify_projection_payload(
-                    &response.payload,
-                    &request.scope_id,
-                    &request.projection_selector,
-                    request.reconstruction_max_records,
-                    &response.state_fence,
-                ),
+                state: classify_opaque_payload(&response.payload),
                 payload: Some(response.payload),
                 revision_heads: response.revision_heads,
             }),
@@ -601,130 +564,6 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             payload: Some(response.payload),
             revision_heads: response.revision_heads,
         })
-    }
-}
-
-fn reconstruction_state_parameters(
-    request: &ContextReconstructionRequest,
-    operation: NamedReadOperation,
-) -> Result<NamedParameters, ContextInputsError> {
-    let mut parameters = BTreeMap::new();
-    let bound = request.reconstruction_max_records.to_string();
-    match operation {
-        NamedReadOperation::GetTaskState => {
-            parameters.insert("task_id".to_owned(), Value::String(request.task_id.clone()));
-            parameters.insert("max_records".to_owned(), Value::String(bound));
-        }
-        NamedReadOperation::GetAttentionAndProblems => {
-            if let Some(problem_id) = &request.problem_id {
-                parameters.insert("problem_id".to_owned(), Value::String(problem_id.clone()));
-            }
-            parameters.insert("max_records".to_owned(), Value::String(bound));
-        }
-        NamedReadOperation::GetCapabilityEvidenceState => {
-            parameters.insert(
-                "skill_id".to_owned(),
-                Value::String(request.capability_skill_id.clone()),
-            );
-            parameters.insert("max_records".to_owned(), Value::String(bound));
-        }
-        _ => {
-            return Err(ContextInputsError::RequestRejected(
-                "state reconstruction operation has no closed selector profile".to_owned(),
-            ));
-        }
-    }
-    NamedParameters::from_map(parameters).map_err(|error| {
-        ContextInputsError::RequestRejected(bounded_reason(
-            "invalid reconstruction selectors",
-            error,
-        ))
-    })
-}
-
-fn reconstruction_projection_parameters(
-    request: &ContextReconstructionRequest,
-) -> Result<NamedParameters, ContextInputsError> {
-    NamedParameters::from_map(BTreeMap::from([
-        (
-            "selector".to_owned(),
-            Value::String(request.projection_selector.clone()),
-        ),
-        (
-            "max_records".to_owned(),
-            Value::String(request.reconstruction_max_records.to_string()),
-        ),
-    ]))
-    .map_err(|error| {
-        ContextInputsError::RequestRejected(bounded_reason(
-            "invalid understanding projection selectors",
-            error,
-        ))
-    })
-}
-
-/// Classifies the versioned understanding-input envelope before cue decoding.
-///
-/// An explicit, complete empty envelope is the only non-array payload that may
-/// become `KnownEmpty`. A truncated page is `Partial`; malformed, unbound, or
-/// unadmitted material is never folded into an empty cue set.
-fn classify_projection_payload(
-    payload: &Value,
-    scope: &ScopeId,
-    selector: &str,
-    requested_max_records: u32,
-    fence: &eliot_contracts::StateFence,
-) -> ProjectionState {
-    let unavailable = |detail: &str| ProjectionState::Unavailable {
-        reason: bounded_reason(
-            "understanding projection payload fails its contract",
-            detail,
-        ),
-    };
-    if payload.get("version").and_then(Value::as_u64) != Some(1) {
-        return unavailable("unsupported understanding projection payload version");
-    }
-    if payload.get("scope_id").and_then(Value::as_str) != Some(scope.as_str()) {
-        return unavailable("understanding projection scope mismatch");
-    }
-    if payload.get("selector").and_then(Value::as_str) != Some(selector) {
-        return unavailable("understanding projection selector mismatch");
-    }
-    let Some(records) = payload.get("records").and_then(Value::as_array) else {
-        return unavailable("understanding projection has no records array");
-    };
-    let Some(provenance) = payload.get("provenance").and_then(Value::as_object) else {
-        return unavailable("understanding projection has no provenance object");
-    };
-    let observed_fence = provenance
-        .get("state_fence")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<eliot_contracts::StateFence>(value).ok());
-    if observed_fence.as_ref() != Some(fence) {
-        return unavailable("understanding projection fence mismatch");
-    }
-    let truncated = provenance.get("truncated").and_then(Value::as_bool);
-    let matched = provenance.get("matched_total").and_then(Value::as_u64);
-    let returned = provenance.get("returned").and_then(Value::as_u64);
-    let max_records = provenance.get("max_records").and_then(Value::as_u64);
-    let count = u64::try_from(records.len()).unwrap_or(u64::MAX);
-    if max_records != Some(u64::from(requested_max_records)) {
-        return unavailable("understanding projection bound was substituted");
-    }
-    match (truncated, matched, returned) {
-        (Some(false), Some(0), Some(0)) if records.is_empty() => ProjectionState::KnownEmpty,
-        (Some(false), Some(matched), Some(returned))
-            if matched == returned && returned == count =>
-        {
-            ProjectionState::Complete
-        }
-        (Some(true), _, _) => ProjectionState::Partial {
-            reason: "understanding projection truncated at the declared bound".to_owned(),
-        },
-        _ => ProjectionState::Unknown {
-            reason: "understanding projection provenance does not authoritatively describe records"
-                .to_owned(),
-        },
     }
 }
 
@@ -1063,11 +902,6 @@ mod reconstruction_tests {
             epistemic_position: "position-a".to_owned(),
             evidence_subject: "subject-a".to_owned(),
             evidence_max_records: 8,
-            task_id: "task-a".to_owned(),
-            problem_id: None,
-            projection_selector: "selector-a".to_owned(),
-            capability_skill_id: "skill-a".to_owned(),
-            reconstruction_max_records: 8,
         })
     }
 

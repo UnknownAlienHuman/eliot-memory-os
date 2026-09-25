@@ -136,11 +136,11 @@ pub fn build_cue_snapshot_closed(
     )?;
     let closed_weights = bind_weights_at_revision(weights, denominator.source_revision)?;
     let closure = CueSnapshotClosure::new(
-        *denominator,
+        denominator.clone(),
         rows,
         relation_edges.to_vec(),
         closed_weights,
-        fanout_for(relation_edges.len()),
+        CueSnapshotFanout::from_graph(&candidate.snapshot.members, relation_edges)?,
     );
     let mut snapshot = candidate.snapshot.with_closure(closure.clone());
     snapshot.rebuild.digest = snapshot.canonical_digest()?;
@@ -182,11 +182,11 @@ pub fn rebuild_cue_snapshot_closed(
     )?;
     let closed_weights = bind_weights_at_revision(weights, denominator.source_revision)?;
     let closure = CueSnapshotClosure::new(
-        *denominator,
+        denominator.clone(),
         rows,
         rebuilt.relation_edges.clone(),
         closed_weights,
-        fanout_for(rebuilt.relation_edges.len()),
+        CueSnapshotFanout::from_graph(&rebuilt.snapshot.members, &rebuilt.relation_edges)?,
     );
     let mut snapshot = rebuilt.snapshot.with_closure(closure.clone());
     snapshot.rebuild.digest = snapshot.canonical_digest()?;
@@ -250,19 +250,6 @@ fn bind_weights_at_revision(
     Ok(weights.to_vec())
 }
 
-fn fanout_for(edge_count: usize) -> CueSnapshotFanout {
-    if edge_count == 0 {
-        CueSnapshotFanout::direct_only()
-    } else {
-        CueSnapshotFanout::bounded(
-            u8::try_from(eliot_cue_contracts::MAX_PATH_LEN).unwrap_or(u8::MAX),
-            u16::try_from(eliot_cue_contracts::MAX_RELATION_EDGES).unwrap_or(u16::MAX),
-            u32::try_from(eliot_cue_contracts::MAX_RELATION_EDGES).unwrap_or(u32::MAX),
-            u16::try_from(eliot_cue_contracts::MAX_PATH_LEN).unwrap_or(u16::MAX),
-        )
-    }
-}
-
 fn join_closed_rows(
     scope_id: &WorkScopeId,
     members: &[SnapshotMember],
@@ -307,7 +294,7 @@ fn join_closed_rows(
             comparison,
             projection.normalized.observed.source.clone(),
             source_revision,
-        );
+        )?;
         row.validate()?;
         rows.push(row);
     }

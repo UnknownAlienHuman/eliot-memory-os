@@ -28,15 +28,41 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 #[test]
 fn v1_replay_preserves_identity_and_reports_ceiling() -> TestResult {
     let first_id = "cue:0123456789abcdef0123456789abcdef";
-    let first = preserve_v1_row_bytes(first_id, b"legacy-row-1")?;
+    let first_bytes = serde_json::to_vec(&serde_json::json!({
+        "row_id": first_id,
+        "scope": "scope",
+        "kind": "concept",
+        "value": "legacy",
+        "mode": "exact",
+        "target": "artifact:one",
+        "revision": 1
+    }))?;
+    let first = preserve_v1_row_bytes(first_id, &first_bytes)?;
     assert!(first.disposition.is_replay());
     assert_eq!(first.legacy_row_id, first_id);
+    let second_id = "cue:fedcba9876543210fedcba9876543210";
+    let second_bytes = serde_json::to_vec(&serde_json::json!({
+        "row_id": second_id,
+        "scope": "scope",
+        "kind": "concept",
+        "value": "legacy-two",
+        "mode": "exact",
+        "target": "artifact:two",
+        "revision": 1
+    }))?;
+    let snapshot_bytes = serde_json::to_vec(&serde_json::json!({
+        "snapshot_id": "cue:snapshot:legacy",
+        "rows": [
+            {"row_id": first_id, "scope": "scope", "kind": "concept", "value": "legacy", "mode": "exact", "target": "artifact:one", "revision": 1},
+            {"row_id": second_id, "scope": "scope", "kind": "concept", "value": "legacy-two", "mode": "exact", "target": "artifact:two", "revision": 1}
+        ]
+    }))?;
     let report = preserve_v1_snapshot_bytes_with_rows(
         "cue:snapshot:legacy",
-        b"legacy-snapshot",
+        &snapshot_bytes,
         &[
-            V1PreservedRow::new(first_id, b"legacy-row-1")?,
-            V1PreservedRow::new("cue:fedcba9876543210fedcba9876543210", b"legacy-row-2")?,
+            V1PreservedRow::new(first_id, first_bytes)?,
+            V1PreservedRow::new(second_id, second_bytes)?,
         ],
     )?;
     assert_eq!(report.rows.len(), 2);
@@ -118,5 +144,33 @@ fn ledger_1143_owner_path_validates_without_facade_fallback() -> TestResult {
     );
     source.validate()?;
     assert_eq!(source.canonical_spelling, "Src/Lib.rs");
+    Ok(())
+}
+
+#[test]
+fn migration_binds_row_identity_and_rejects_empty_snapshot_bytes() -> TestResult {
+    let row_id = "cue:0123456789abcdef0123456789abcdef";
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "row_id": row_id,
+        "scope": "scope",
+        "kind": "concept",
+        "value": "legacy",
+        "mode": "exact",
+        "target": "artifact:one",
+        "revision": 1
+    }))?;
+    assert!(
+        preserve_v1_row_bytes(row_id, &bytes)?
+            .disposition
+            .is_replay()
+    );
+    assert!(preserve_v1_row_bytes(row_id, b"not-v1-json").is_err());
+    let empty_snapshot = serde_json::to_vec(&serde_json::json!({
+        "snapshot_id": "cue:snapshot:empty",
+        "rows": []
+    }))?;
+    assert!(
+        preserve_v1_snapshot_bytes_with_rows("cue:snapshot:empty", &empty_snapshot, &[],).is_err()
+    );
     Ok(())
 }

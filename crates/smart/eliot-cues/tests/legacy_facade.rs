@@ -1052,19 +1052,45 @@ fn one_call_no_fallback() {
 #[test]
 fn deterministic_owner_version_bound_migration_receipt() -> TestResult {
     let legacy_id = "cue:0123456789abcdef0123456789abcdef";
-    let first = preserve_v1_row_bytes(legacy_id, b"raw-row")?;
-    let again = preserve_v1_row_bytes(legacy_id, b"raw-row")?;
+    let first_bytes = serde_json::to_vec(&serde_json::json!({
+        "row_id": legacy_id,
+        "scope": "scope",
+        "kind": "concept",
+        "value": "legacy",
+        "mode": "exact",
+        "target": "artifact:one",
+        "revision": 1
+    }))?;
+    let second_id = "cue:fedcba9876543210fedcba9876543210";
+    let second_bytes = serde_json::to_vec(&serde_json::json!({
+        "row_id": second_id,
+        "scope": "scope",
+        "kind": "concept",
+        "value": "legacy-two",
+        "mode": "exact",
+        "target": "artifact:two",
+        "revision": 1
+    }))?;
+    let first = preserve_v1_row_bytes(legacy_id, &first_bytes)?;
+    let again = preserve_v1_row_bytes(legacy_id, &first_bytes)?;
     assert_eq!(
         serde_json::to_string(&first).expect("encode"),
         serde_json::to_string(&again).expect("encode")
     );
     assert!(first.disposition.is_replay());
+    let snapshot_bytes = serde_json::to_vec(&serde_json::json!({
+        "snapshot_id": "cue:snapshot:legacy",
+        "rows": [
+            {"row_id": legacy_id, "scope": "scope", "kind": "concept", "value": "legacy", "mode": "exact", "target": "artifact:one", "revision": 1},
+            {"row_id": second_id, "scope": "scope", "kind": "concept", "value": "legacy-two", "mode": "exact", "target": "artifact:two", "revision": 1}
+        ]
+    }))?;
     let snapshot = preserve_v1_snapshot_bytes_with_rows(
         "cue:snapshot:legacy",
-        b"raw-snapshot",
+        &snapshot_bytes,
         &[
-            V1PreservedRow::new(legacy_id, b"raw-row")?,
-            V1PreservedRow::new("cue:fedcba9876543210fedcba9876543210", b"raw-row-2")?,
+            V1PreservedRow::new(legacy_id, first_bytes)?,
+            V1PreservedRow::new(second_id, second_bytes)?,
         ],
     )?;
     assert_eq!(snapshot.rows.len(), 2);
@@ -1081,10 +1107,19 @@ fn missing_fresh_observation_emits_typed_v2_rejection() -> TestResult {
         mode: Some("exact".to_owned()),
         ..legacy_row("concept", "needs-reobservation")
     };
+    let legacy_bytes = serde_json::to_vec(&serde_json::json!({
+        "row_id": "legacy:needs-reobservation",
+        "scope": row.scope.clone(),
+        "kind": row.kind.clone(),
+        "value": row.value.clone(),
+        "mode": row.mode.clone(),
+        "target": row.target.clone(),
+        "revision": row.revision
+    }))?;
     let rejected = eliot_cues::legacy_adapter::convert_v1_row(
         "legacy:needs-reobservation",
         &row,
-        b"raw-legacy-row",
+        &legacy_bytes,
         None,
         None,
     )?;

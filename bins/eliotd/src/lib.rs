@@ -15,18 +15,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentResult, EffectCeiling, ProviderExecutionBinding, ResultDisposition,
 };
-use eliot_contracts::{EpochId, OperationId, RequestMetadata, ResourceGeneration, StateFence};
-use eliot_cue_contracts::{NormalizationProfile, SnapshotId};
+use eliot_contracts::{EpochId, OperationId, ResourceGeneration, StateFence};
 use eliot_governor::{
-    CompositionError, CompositionReadiness, ContextReconstructionRequest, CueReadCompositionError,
-    CueReconstruction, FinishAttemptDraft, FinishAttemptError, FinishDecisionReceipt,
-    GovernorActivationOutcome, GovernorComposition, GovernorLaunchConfig, KernelGenerationPort,
-    KernelGenerationSnapshotProvider, QueueLimits,
+    CompositionError, CompositionReadiness, FinishAttemptDraft, FinishAttemptError,
+    FinishDecisionReceipt, GovernorActivationOutcome, GovernorComposition, GovernorLaunchConfig,
+    KernelGenerationPort, KernelGenerationSnapshotProvider, QueueLimits,
 };
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
 use eliot_protocol::{AgentActivationResolutionResult, AgentActivationResolutionTicket};
-use eliot_read::ReadService;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -246,9 +243,6 @@ pub enum DaemonError {
     /// Exact Kernel/provider or Governor recovery admission failed.
     #[error("Governor composition: {0}")]
     Composition(#[from] CompositionError),
-    /// Governor-owned cue reconstruction failed its read-backed closure.
-    #[error("Governor cue reconstruction: {0}")]
-    CueRead(#[from] CueReadCompositionError),
     /// Governor-owned FinishAttempt evaluation or canonical persistence
     /// rejected the candidate.
     #[error("Governor FinishAttempt: {0}")]
@@ -1425,50 +1419,6 @@ impl DaemonComposition {
             ));
         }
         Ok(KernelContextReadClient::new(Arc::clone(kernel)))
-    }
-
-    /// Returns the exact retained fence for a production cue-read attach.
-    #[must_use]
-    pub fn cue_reconstruction_fence(&self) -> StateFence {
-        self.governor.kernel_snapshot().state_fence().clone()
-    }
-
-    /// Builds the current startup cue-read request from the Governor's exact
-    /// WorkScope, canonical plan, and retained scope revision head. The
-    /// daemon supplies no guessed task, selector, or revision.
-    pub fn production_cue_reconstruction_request(
-        &self,
-    ) -> Result<(eliot_store_api::ScopeId, ContextReconstructionRequest), DaemonError> {
-        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
-            return Err(DaemonError::Composition(
-                eliot_governor::CompositionError::NotReady,
-            ));
-        }
-        let scope = self.governor.current_work_scope_id()?;
-        let request = self
-            .governor
-            .production_cue_reconstruction_request(scope.clone())?;
-        Ok((scope, request))
-    }
-
-    /// Executes the production cue read through the Governor `ReadService`
-    /// over the authenticated `KernelContextReadClient`. A malformed,
-    /// partial, unavailable, or unadmitted envelope is returned as a typed
-    /// failure; it is never converted into an empty cue set.
-    pub async fn reconstruct_cue_snapshot_from_reads(
-        &mut self,
-        kernel: &Arc<DaemonKernelClient>,
-        ctx: &RequestMetadata,
-        request: &ContextReconstructionRequest,
-        snapshot_id: &SnapshotId,
-        profile: &NormalizationProfile,
-    ) -> Result<CueReconstruction, DaemonError> {
-        let client = self.context_read_client(kernel)?;
-        let reads = ReadService::new(client);
-        self.governor
-            .reconstruct_cue_snapshot_from_reads(&reads, ctx, request, snapshot_id, profile)
-            .await
-            .map_err(DaemonError::CueRead)
     }
 
     /// Borrows the Governor epistemic composition over the retained owners

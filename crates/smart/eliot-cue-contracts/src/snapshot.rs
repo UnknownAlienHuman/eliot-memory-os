@@ -6,7 +6,7 @@
 
 use eliot_contracts::StateFence;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use crate::{
     CanonicalCueIdentity, ClosedSnapshotRow, CueContractError, CueProjectionDenominator,
@@ -135,8 +135,8 @@ pub struct CueSnapshot {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub source_revision: u64,
     /// Retained closed row/edge/denominator/fanout state. `None` is reserved
-    /// for the explicitly open compatibility builder; current production
-    /// candidates always carry this record.
+    /// for the explicitly open compatibility builder and is not a published
+    /// snapshot representation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closure: Option<CueSnapshotClosure>,
 }
@@ -216,6 +216,14 @@ impl CueSnapshot {
                 .edge_weights
                 .sort_by(|left, right| left.edge.cmp(&right.edge));
             value
+                .denominator
+                .row_omissions
+                .sort_by(|left, right| left.identity.cmp(&right.identity));
+            value
+                .denominator
+                .edge_omissions
+                .sort_by(|left, right| left.identity.cmp(&right.identity));
+            value
         });
         let preimage = SnapshotPreimage {
             schema_revision: &self.schema_revision,
@@ -271,7 +279,18 @@ impl CueSnapshot {
             &self.rebuild.source_denominator,
             self.source_revision,
         )?;
+        validate_uniform_scope(
+            &closure.rows,
+            &self.rebuild.source_denominator,
+            &closure.relation_edges,
+        )?;
         validate_closed_endpoints(&self.members, &closure.relation_edges)?;
+        crate::version::CueSnapshotFanout::validate_for_graph(
+            &closure.fanout,
+            &self.members,
+            &closure.relation_edges,
+        )?;
+        validate_omission_identities(&closure.denominator, &closure.rows, &closure.relation_edges)?;
         crate::version::validate_closed_weights_at_revision(
             &closure.relation_edges,
             &closure.edge_weights,
@@ -294,35 +313,25 @@ impl CueSnapshot {
                 });
             }
         }
-        if usize::try_from(closure.fanout.max_edges)
-            .is_ok_and(|limit| closure.relation_edges.len() > limit)
-        {
-            return Err(CueContractError::BoundExceeded {
-                field: "snapshot.fanout.max_edges",
-                limit: closure.fanout.max_edges as usize,
-            });
-        }
-        let mut outgoing = BTreeMap::<TargetHandle, usize>::new();
-        for edge in &closure.relation_edges {
-            let count = outgoing.entry(edge.from.clone()).or_default();
-            *count = count.saturating_add(1);
-            if *count > usize::from(closure.fanout.max_fanout) {
-                return Err(CueContractError::BoundExceeded {
-                    field: "snapshot.fanout.max_fanout",
-                    limit: usize::from(closure.fanout.max_fanout),
-                });
-            }
-        }
         Ok(())
+    }
+
+    /// Validates only a self-validating published snapshot. An open
+    /// compatibility record is rejected rather than presented as closed.
+    pub fn validate_published(&self) -> Result<(), CueContractError> {
+        if !self.is_closed() {
+            return Err(CueContractError::SnapshotNotRebuildable);
+        }
+        self.validate_self_closed()
     }
 
     /// Checks closed-snapshot invariants beyond rebuildability.
     ///
     /// For a closed record this compatibility seam verifies that the supplied
     /// values are exactly the retained closure and then delegates to
-    /// [`Self::validate_self_closed`]. For an old open fixture it preserves the
-    /// former external validation behavior; current production callers use the
-    /// self-contained method above.
+    /// [`Self::validate_self_closed`]. For an open compatibility fixture it
+    /// preserves the explicit external validation behavior; publication paths
+    /// use the self-contained method above.
     pub fn validate_closed(
         &self,
         rows: &[ClosedSnapshotRow],
@@ -343,9 +352,17 @@ impl CueSnapshot {
         self.validate_rebuild()?;
         denominator.validate()?;
         denominator.validate_against(self.members.len(), edges.len())?;
-        crate::version::validate_closed_rows(&self.members, rows)?;
+        crate::version::validate_closed_rows_at_revision(
+            &self.members,
+            rows,
+            &self.rebuild.source_denominator,
+            denominator.source_revision,
+        )?;
+        validate_uniform_scope(rows, &self.rebuild.source_denominator, edges)?;
         validate_closed_endpoints(&self.members, edges)?;
+        crate::version::CueSnapshotFanout::from_graph(&self.members, edges)?;
         crate::version::validate_closed_weights(edges, weights)?;
+        validate_omission_identities(denominator, rows, edges)?;
         Ok(())
     }
 
@@ -552,6 +569,19 @@ impl CueSnapshot {
             "snapshot.closure.weights",
         )?;
         bounds::bytes(measured_bytes, 64, "snapshot.closure.fanout")?;
+        for omission in closure
+            .denominator
+            .row_omissions
+            .iter()
+            .chain(closure.denominator.edge_omissions.iter())
+        {
+            bounds::bytes(
+                measured_bytes,
+                omission.identity.len(),
+                "snapshot.closure.omission_identity",
+            )?;
+            bounds::bytes(measured_bytes, 16, "snapshot.closure.omission_reason")?;
+        }
         for row in &closure.rows {
             bounds::bytes(
                 measured_bytes,
@@ -563,6 +593,28 @@ impl CueSnapshot {
                 row.key.normalized_value.len(),
                 "snapshot.closure.row.key",
             )?;
+            bounds::bytes(
+                measured_bytes,
+                row.source.target.as_str().len(),
+                "snapshot.closure.row.source_target",
+            )?;
+            bounds::bytes(
+                measured_bytes,
+                row.source.digest.as_str().len(),
+                "snapshot.closure.row.source_digest",
+            )?;
+            bounds::bytes(
+                measured_bytes,
+                row.source.provenance.source_id.as_str().len()
+                    + row.source.provenance.capture_route.len()
+                    + row.source.provenance.scope.len(),
+                "snapshot.closure.row.source_provenance",
+            )?;
+            bounds::bytes(
+                measured_bytes,
+                row.source_member_digest.as_str().len(),
+                "snapshot.closure.row.source_member_digest",
+            )?;
         }
         for edge in &closure.relation_edges {
             bounds::bytes(
@@ -573,6 +625,54 @@ impl CueSnapshot {
         }
         Ok(())
     }
+}
+
+fn validate_uniform_scope(
+    rows: &[ClosedSnapshotRow],
+    sources: &[SourceHandle],
+    edges: &[crate::RelationEdge],
+) -> Result<(), CueContractError> {
+    let mut scopes = BTreeSet::new();
+    for row in rows {
+        scopes.insert(row.key.scope.as_str());
+        scopes.insert(row.source.provenance.scope.as_str());
+    }
+    for source in sources {
+        scopes.insert(source.provenance.scope.as_str());
+    }
+    for edge in edges {
+        scopes.insert(edge.evidence.provenance.scope.as_str());
+    }
+    if scopes.len() > 1 {
+        return Err(CueContractError::SnapshotNotRebuildable);
+    }
+    Ok(())
+}
+
+fn validate_omission_identities(
+    denominator: &CueProjectionDenominator,
+    rows: &[ClosedSnapshotRow],
+    edges: &[crate::RelationEdge],
+) -> Result<(), CueContractError> {
+    let retained_rows = rows
+        .iter()
+        .map(ClosedSnapshotRow::row_id)
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let retained_edges = edges
+        .iter()
+        .map(|edge| edge.relation_edge_id.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    let mut retained = retained_rows;
+    retained.extend(retained_edges);
+    if denominator
+        .row_omissions
+        .iter()
+        .chain(denominator.edge_omissions.iter())
+        .any(|omission| retained.contains(&omission.identity))
+    {
+        return Err(CueContractError::SnapshotNotRebuildable);
+    }
+    Ok(())
 }
 
 fn validate_closed_endpoints(

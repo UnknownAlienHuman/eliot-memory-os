@@ -20,10 +20,207 @@ use eliot_cue_contracts::{
 use eliot_cue_index::rebuild_cue_snapshot;
 use eliot_cue_normalizer::{NormalizationPolicy, normalize_cue};
 use eliot_observation::ObservationAdmissionReceipt;
+use serde::Deserialize;
+use serde_json::Value;
 
 use crate::{
     FacadeError, LEGACY_KIND_SPELLINGS, LegacyEliotCuesV1Row, V1MigrationRejection, V1RowMigration,
 };
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCueIndexRowBytes {
+    row_id: String,
+    project_id: String,
+    cue_kind: String,
+    cue_value_norm: String,
+    match_mode: String,
+    record_ref: String,
+    record_kind: String,
+    strength: String,
+    negative_memory: bool,
+    lifecycle: String,
+    token_estimate: u64,
+}
+
+fn parse_legacy_index_row(
+    value: &Value,
+    expected_id: &str,
+) -> Result<LegacyEliotCuesV1Row, FacadeError> {
+    let legacy: LegacyCueIndexRowBytes =
+        serde_json::from_value(value.clone()).map_err(|_| FacadeError::LegacyBytesInvalid {
+            field: "row.legacy_index_payload",
+        })?;
+    if legacy.row_id != expected_id {
+        return Err(FacadeError::ResponseIdentityMismatch {
+            what: "migration.row_id",
+        });
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(
+        format!(
+            "{}|{}|{}|{}|{}",
+            legacy.project_id,
+            legacy.cue_kind,
+            legacy.match_mode,
+            legacy.cue_value_norm,
+            legacy.record_ref
+        )
+        .as_bytes(),
+    );
+    let expected_v1_id = format!("cue:{}", &hasher.finalize().to_hex()[..32]);
+    if legacy.row_id != expected_v1_id {
+        return Err(FacadeError::ResponseIdentityMismatch {
+            what: "migration.row_id.digest",
+        });
+    }
+    if legacy.strength != "primary" && legacy.strength != "secondary" {
+        return Err(FacadeError::LegacyBytesInvalid {
+            field: "row.strength",
+        });
+    }
+    let _ = (legacy.negative_memory, legacy.token_estimate);
+    if legacy.record_kind.trim().is_empty()
+        || legacy.record_kind.chars().any(char::is_control)
+        || legacy.lifecycle.trim().is_empty()
+        || legacy.lifecycle.chars().any(char::is_control)
+    {
+        return Err(FacadeError::LegacyBytesInvalid {
+            field: "row.legacy_metadata",
+        });
+    }
+    let row = LegacyEliotCuesV1Row {
+        scope: legacy.project_id,
+        kind: legacy.cue_kind,
+        value: legacy.cue_value_norm,
+        mode: Some(legacy.match_mode),
+        target: legacy.record_ref,
+        revision: 0,
+    };
+    row.validate_for_conversion()
+        .map_err(|_| FacadeError::LegacyBytesInvalid {
+            field: "row.legacy_index_payload",
+        })?;
+    Ok(row)
+}
+
+fn parse_row_value(value: &Value, expected_id: &str) -> Result<LegacyEliotCuesV1Row, FacadeError> {
+    let object = value.as_object().ok_or(FacadeError::LegacyBytesInvalid {
+        field: "row.object",
+    })?;
+    if object.contains_key("cue_value_norm") {
+        return parse_legacy_index_row(value, expected_id);
+    }
+    let (row_id, row_value) = if let Some(row) = object.get("row") {
+        let row_id = object
+            .get("row_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or(FacadeError::LegacyBytesInvalid {
+                field: "row.row_id",
+            })?;
+        if object.len() != 2 {
+            return Err(FacadeError::LegacyBytesInvalid {
+                field: "row.envelope",
+            });
+        }
+        (row_id, row.clone())
+    } else {
+        let mut fields = object.clone();
+        let row_id = fields
+            .remove("row_id")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or(FacadeError::LegacyBytesInvalid {
+                field: "row.row_id",
+            })?;
+        (row_id, Value::Object(fields))
+    };
+    if row_id != expected_id {
+        return Err(FacadeError::ResponseIdentityMismatch {
+            what: "migration.row_id",
+        });
+    }
+    serde_json::from_value(row_value).map_err(|_| FacadeError::LegacyBytesInvalid {
+        field: "row.payload",
+    })
+}
+
+pub(crate) fn parse_bound_v1_row(
+    bytes: &[u8],
+    expected_id: &str,
+) -> Result<LegacyEliotCuesV1Row, FacadeError> {
+    if bytes.is_empty() {
+        return Err(FacadeError::LegacyBytesInvalid { field: "row.bytes" });
+    }
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|_| FacadeError::LegacyBytesInvalid { field: "row.bytes" })?;
+    parse_row_value(&value, expected_id)
+}
+
+pub(crate) fn parse_bound_v1_snapshot(
+    bytes: &[u8],
+    expected_id: &str,
+) -> Result<Vec<(String, LegacyEliotCuesV1Row)>, FacadeError> {
+    if bytes.is_empty() {
+        return Err(FacadeError::LegacyBytesInvalid {
+            field: "snapshot.bytes",
+        });
+    }
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|_| FacadeError::LegacyBytesInvalid {
+            field: "snapshot.bytes",
+        })?;
+    let object = value.as_object().ok_or(FacadeError::LegacyBytesInvalid {
+        field: "snapshot.object",
+    })?;
+    let snapshot_id = object.get("snapshot_id").and_then(Value::as_str).ok_or(
+        FacadeError::LegacyBytesInvalid {
+            field: "snapshot.snapshot_id",
+        },
+    )?;
+    if snapshot_id != expected_id {
+        return Err(FacadeError::ResponseIdentityMismatch {
+            what: "migration.snapshot_id",
+        });
+    }
+    let rows =
+        object
+            .get("rows")
+            .and_then(Value::as_array)
+            .ok_or(FacadeError::LegacyBytesInvalid {
+                field: "snapshot.rows",
+            })?;
+    if rows.is_empty() {
+        return Err(FacadeError::LegacyBytesInvalid {
+            field: "snapshot.rows.empty",
+        });
+    }
+    let mut parsed_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let row_object = row.as_object().ok_or(FacadeError::LegacyBytesInvalid {
+            field: "snapshot.row.object",
+        })?;
+        let row_id = row_object.get("row_id").and_then(Value::as_str).ok_or(
+            FacadeError::LegacyBytesInvalid {
+                field: "snapshot.row.row_id",
+            },
+        )?;
+        let parsed = parse_row_value(row, row_id)?;
+        parsed_rows.push((row_id.to_owned(), parsed));
+    }
+    let mut unique = parsed_rows
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    unique.sort();
+    unique.dedup();
+    if unique.len() != parsed_rows.len() {
+        return Err(FacadeError::ResponseIdentityMismatch {
+            what: "migration.snapshot.duplicate_row_id",
+        });
+    }
+    Ok(parsed_rows)
+}
 
 /// Decodes one frozen legacy v1 kind spelling to the owner vocabulary.
 ///
@@ -369,6 +566,12 @@ pub fn convert_v1_row(
     normalized: Option<&NormalizedCue>,
 ) -> Result<V1RowMigration, FacadeError> {
     row.validate_for_conversion()?;
+    let parsed = crate::legacy_adapter::parse_bound_v1_row(legacy_bytes, legacy_row_id)?;
+    if &parsed != row {
+        return Err(FacadeError::ResponseIdentityMismatch {
+            what: "migration.row_payload",
+        });
+    }
     if legacy_row_id.trim().is_empty() || legacy_row_id.chars().any(char::is_control) {
         return Err(FacadeError::EnvelopeInvalid {
             field: "legacy_row_id",

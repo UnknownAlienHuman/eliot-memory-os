@@ -22,9 +22,10 @@
 //! influence, or lifecycle.
 
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::{
-    CONTRACT_REVISION, CueContractError, RelationEdgeId, SnapshotMember, SourceHandle,
+    CONTRACT_REVISION, CueContractError, Digest, RelationEdgeId, SnapshotMember, SourceHandle,
     TargetHandle, bounds,
     normalization::{CueKind, MatchMode},
 };
@@ -136,15 +137,83 @@ impl CueComparisonKey {
     }
 }
 
+/// The projection dimension named by one exact omission record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
+pub enum CueProjectionOmissionKind {
+    /// A projection row omitted from the retained snapshot.
+    Row,
+    /// A relation edge omitted from the retained snapshot.
+    Edge,
+}
+
+/// A bounded, owner-supplied reason for one omitted projection item.
+///
+/// These reasons describe projection coverage only. They do not grant support,
+/// applicability, accessibility, influence, or lifecycle authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
+pub enum CueProjectionOmissionReason {
+    /// The exact source was unavailable for this frozen build.
+    SourceUnavailable,
+    /// The source revision changed before the item was retained.
+    SourceRevisionChanged,
+    /// The owner excluded the item under a named projection policy.
+    PolicyExcluded,
+    /// The item failed the bounded projection contract.
+    InvalidRecord,
+    /// The owner deliberately stopped at a declared projection bound.
+    OwnerBound,
+}
+
+/// One exact identity and reason retained for an omitted projection item.
+///
+/// Counts are only a denominator. These records are the non-count closure that
+/// makes a partial snapshot auditable without inventing a reason or identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct CueProjectionOmission {
+    /// Exact row or edge identity in the owner's projection namespace.
+    pub identity: String,
+    /// Dimension in which the identity was omitted.
+    pub kind: CueProjectionOmissionKind,
+    /// Closed reason class supplied by the projection owner.
+    pub reason: CueProjectionOmissionReason,
+}
+
+impl CueProjectionOmission {
+    /// Constructs one exact omission record.
+    #[must_use]
+    pub const fn new(
+        identity: String,
+        kind: CueProjectionOmissionKind,
+        reason: CueProjectionOmissionReason,
+    ) -> Self {
+        Self {
+            identity,
+            kind,
+            reason,
+        }
+    }
+
+    /// Validates the retained identity shape.
+    pub fn validate(&self) -> Result<(), CueContractError> {
+        bounds::text(&self.identity, "denominator.omission.identity")
+    }
+}
+
 /// Frozen denominator a snapshot completeness claim is measured against.
 ///
 /// `expected_rows`/`expected_edges` count every admitted row/edge including
-/// omitted ones; `omitted_*` counts the rows/edges the snapshot holds back
-/// with their omission recorded elsewhere. An empty-complete snapshot carries
-/// all-zero counts; an unavailable or partial projection is never described by
-/// this shape alone — partial validation succeeds but classifies differently
-/// (see [`Self::is_empty_complete`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+/// omitted ones. `row_omissions` and `edge_omissions` retain the exact
+/// identity and reason for every count; a non-zero count without its records is
+/// invalid. An empty-complete snapshot carries all-zero counts and no omission
+/// records. An unavailable or partial projection is never described by this
+/// shape alone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct CueProjectionDenominator {
@@ -156,12 +225,19 @@ pub struct CueProjectionDenominator {
     pub omitted_rows: usize,
     /// Edges held back with omission recorded.
     pub omitted_edges: usize,
+    /// Exact row identities and reasons for all omitted rows.
+    #[serde(default)]
+    pub row_omissions: Vec<CueProjectionOmission>,
+    /// Exact edge identities and reasons for all omitted edges.
+    #[serde(default)]
+    pub edge_omissions: Vec<CueProjectionOmission>,
     /// Admitted source revision the denominator was frozen at.
     pub source_revision: u64,
 }
 
 impl CueProjectionDenominator {
-    /// Constructs a denominator. Call [`Self::validate`] before use.
+    /// Constructs a denominator. A non-zero omission count is intentionally
+    /// incomplete until exact [`Self::with_omissions`] records are attached.
     #[must_use]
     pub const fn new(
         expected_rows: usize,
@@ -175,12 +251,27 @@ impl CueProjectionDenominator {
             expected_edges,
             omitted_rows,
             omitted_edges,
+            row_omissions: Vec::new(),
+            edge_omissions: Vec::new(),
             source_revision,
         }
     }
 
-    /// Rejects omitted counts that exceed the totals they are measured against.
-    pub const fn validate(&self) -> Result<(), CueContractError> {
+    /// Attaches exact row and edge omission records.
+    #[must_use]
+    pub fn with_omissions(
+        mut self,
+        row_omissions: Vec<CueProjectionOmission>,
+        edge_omissions: Vec<CueProjectionOmission>,
+    ) -> Self {
+        self.row_omissions = row_omissions;
+        self.edge_omissions = edge_omissions;
+        self
+    }
+
+    /// Rejects count/identity mismatches and omission records with the wrong
+    /// dimension or duplicate identity.
+    pub fn validate(&self) -> Result<(), CueContractError> {
         if self.source_revision == 0 {
             return Err(CueContractError::InvalidText {
                 field: "denominator.source_revision",
@@ -210,42 +301,73 @@ impl CueProjectionDenominator {
                 limit: self.expected_edges,
             });
         }
+        Self::validate_omissions(CueProjectionOmissionKind::Row, &self.row_omissions)?;
+        Self::validate_omissions(CueProjectionOmissionKind::Edge, &self.edge_omissions)?;
+        let mut identities = BTreeSet::new();
+        for omission in self.row_omissions.iter().chain(self.edge_omissions.iter()) {
+            if !identities.insert(&omission.identity) {
+                return Err(CueContractError::DuplicateIdentity {
+                    field: "denominator.omission.identity",
+                });
+            }
+        }
+        if self.omitted_rows != self.row_omissions.len()
+            || self.omitted_edges != self.edge_omissions.len()
+        {
+            return Err(CueContractError::SnapshotNotRebuildable);
+        }
         Ok(())
     }
 
-    /// True only when nothing was omitted.
+    fn validate_omissions(
+        expected_kind: CueProjectionOmissionKind,
+        omissions: &[CueProjectionOmission],
+    ) -> Result<(), CueContractError> {
+        let mut identities = BTreeSet::new();
+        for omission in omissions {
+            omission.validate()?;
+            if omission.kind != expected_kind || !identities.insert(&omission.identity) {
+                return Err(CueContractError::DuplicateIdentity {
+                    field: "denominator.omission.identity",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// True only when nothing was omitted and no orphan omission record exists.
     #[must_use]
-    pub const fn is_complete(&self) -> bool {
-        self.omitted_rows == 0 && self.omitted_edges == 0
+    pub fn is_complete(&self) -> bool {
+        self.source_revision != 0
+            && self.omitted_rows == 0
+            && self.omitted_edges == 0
+            && self.row_omissions.is_empty()
+            && self.edge_omissions.is_empty()
     }
 
     /// True only for "searched everything, found nothing": zero expected rows
-    /// and edges with zero omissions. A partial or unavailable projection never
-    /// satisfies this even when its present counts are zero.
+    /// and edges with zero omissions and no omission records.
     #[must_use]
-    pub const fn is_empty_complete(&self) -> bool {
-        self.expected_rows == 0
-            && self.expected_edges == 0
-            && self.omitted_rows == 0
-            && self.omitted_edges == 0
+    pub fn is_empty_complete(&self) -> bool {
+        self.expected_rows == 0 && self.expected_edges == 0 && self.is_complete()
     }
 
     /// Checks present counts against the frozen totals: present plus omitted
     /// must equal expected on both dimensions.
-    pub const fn validate_against(
+    pub fn validate_against(
         &self,
         present_rows: usize,
         present_edges: usize,
     ) -> Result<(), CueContractError> {
-        if let Err(error) = self.validate() {
-            return Err(error);
-        }
-        let Some(held_rows) = self.expected_rows.checked_sub(self.omitted_rows) else {
-            return Err(CueContractError::SnapshotNotRebuildable);
-        };
-        let Some(held_edges) = self.expected_edges.checked_sub(self.omitted_edges) else {
-            return Err(CueContractError::SnapshotNotRebuildable);
-        };
+        self.validate()?;
+        let held_rows = self
+            .expected_rows
+            .checked_sub(self.omitted_rows)
+            .ok_or(CueContractError::SnapshotNotRebuildable)?;
+        let held_edges = self
+            .expected_edges
+            .checked_sub(self.omitted_edges)
+            .ok_or(CueContractError::SnapshotNotRebuildable)?;
         if present_rows != held_rows || present_edges != held_edges {
             return Err(CueContractError::SnapshotNotRebuildable);
         }
@@ -253,10 +375,14 @@ impl CueProjectionDenominator {
     }
 }
 
-/// One snapshot member joined to the exact comparison key it was admitted under.
+/// One snapshot member joined to the exact comparison key and source that
+/// produced it.
 ///
-/// The join is what makes row identity computable: the member carries kind and
-/// target, the key carries scope, mode, and normalized value.
+/// `source_member_digest` is a domain-separated digest over the complete
+/// member/key/source tuple. It makes this record independently rejectable:
+/// changing the source, member, key, or frozen revision without rebuilding the
+/// join cannot pass validation. The closure validator additionally joins the
+/// exact source to the admitted projection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -266,45 +392,43 @@ pub struct ClosedSnapshotRow {
     /// The exact key the member was admitted under.
     pub key: CueComparisonKey,
     /// The exact observed source identity admitted for this row.
-    ///
-    /// A closed row is not complete without this join. The source handle is
-    /// retained alongside the member so validation can prove that the row,
-    /// projection, and source denominator all refer to the same observation.
     pub source: SourceHandle,
     /// Frozen source revision admitted for this row.
     pub source_revision: u64,
+    /// Digest binding the complete member/key/source tuple.
+    pub source_member_digest: Digest,
 }
 
 impl ClosedSnapshotRow {
-    /// Constructs one closed row. Call [`Self::validate`] before use.
-    #[must_use]
-    pub const fn new(
+    /// Constructs one closed row and binds its complete producer tuple.
+    pub fn new(
         member: SnapshotMember,
         key: CueComparisonKey,
         source: SourceHandle,
         source_revision: u64,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, CueContractError> {
+        let source_member_digest = source_member_digest(&member, &key, &source, source_revision)?;
+        Ok(Self {
             member,
             key,
             source,
             source_revision,
-        }
+            source_member_digest,
+        })
     }
 
     /// Constructs a closed row with the source revision frozen into it.
-    #[must_use]
-    pub const fn new_at_revision(
+    pub fn new_at_revision(
         member: SnapshotMember,
         key: CueComparisonKey,
         source: SourceHandle,
         source_revision: u64,
-    ) -> Self {
+    ) -> Result<Self, CueContractError> {
         Self::new(member, key, source, source_revision)
     }
 
-    /// Validates the member, comparison key, source handle, kind agreement,
-    /// and the source revision marker carried by the source itself.
+    /// Validates the complete producer join, kind agreement, scope, source
+    /// revision marker, and the source/member binding digest.
     pub fn validate(&self) -> Result<(), CueContractError> {
         self.member.validate()?;
         self.key.validate()?;
@@ -327,6 +451,11 @@ impl ClosedSnapshotRow {
         {
             return Err(CueContractError::SnapshotNotRebuildable);
         }
+        let expected =
+            source_member_digest(&self.member, &self.key, &self.source, self.source_revision)?;
+        if self.source_member_digest != expected {
+            return Err(CueContractError::SnapshotNotRebuildable);
+        }
         Ok(())
     }
 
@@ -335,6 +464,34 @@ impl ClosedSnapshotRow {
         self.member
             .row_id(&self.key.scope, self.key.mode, &self.key.normalized_value)
     }
+}
+
+#[derive(Serialize)]
+struct SourceMemberPreimage<'a> {
+    domain: &'a str,
+    member: &'a SnapshotMember,
+    key: &'a CueComparisonKey,
+    source: &'a SourceHandle,
+    source_revision: u64,
+}
+
+fn source_member_digest(
+    member: &SnapshotMember,
+    key: &CueComparisonKey,
+    source: &SourceHandle,
+    source_revision: u64,
+) -> Result<Digest, CueContractError> {
+    let bytes = eliot_contracts::canonical_json_bytes(&SourceMemberPreimage {
+        domain: "eliot.cue.closed-row-source-member.v2",
+        member,
+        key,
+        source,
+        source_revision,
+    })
+    .map_err(|_| CueContractError::Foundation {
+        field: "snapshot.row.source_member_digest",
+    })?;
+    Digest::new(eliot_contracts::sha256_hex(&bytes))
 }
 
 /// One activation-edge weight supplied by the numerical policy owner.
@@ -486,15 +643,212 @@ impl CueSnapshotFanout {
         }
         Ok(())
     }
+
+    /// Measures the exact finite graph closure and returns its observed
+    /// depth, branching, edge count, and longest path. A graph-bearing
+    /// snapshot uses these measured values rather than a global edge ceiling.
+    pub fn from_graph(
+        members: &[SnapshotMember],
+        edges: &[crate::RelationEdge],
+    ) -> Result<Self, CueContractError> {
+        if edges.is_empty() {
+            return Ok(Self::direct_only());
+        }
+        let measured = Self::measure_graph(members, edges)?;
+        let value = Self {
+            max_depth: u8::try_from(measured.depth).map_err(|_| {
+                CueContractError::BoundExceeded {
+                    field: "snapshot.fanout.max_depth",
+                    limit: crate::MAX_PATH_LEN,
+                }
+            })?,
+            max_fanout: u16::try_from(measured.fanout).map_err(|_| {
+                CueContractError::BoundExceeded {
+                    field: "snapshot.fanout.max_fanout",
+                    limit: crate::MAX_RELATION_EDGES,
+                }
+            })?,
+            max_edges: u32::try_from(measured.edge_count).map_err(|_| {
+                CueContractError::BoundExceeded {
+                    field: "snapshot.fanout.max_edges",
+                    limit: crate::MAX_RELATION_EDGES,
+                }
+            })?,
+            max_path_len: u16::try_from(measured.depth).map_err(|_| {
+                CueContractError::BoundExceeded {
+                    field: "snapshot.fanout.max_path_len",
+                    limit: crate::MAX_PATH_LEN,
+                }
+            })?,
+        };
+        value.validate_for_graph(members, edges)?;
+        Ok(value)
+    }
+
+    /// Validates the exact graph closure represented by this fanout record.
+    /// It rejects cycles, unreachable edges/nodes, and a record whose measured
+    /// values differ from the retained values.
+    pub fn validate_for_graph(
+        &self,
+        members: &[SnapshotMember],
+        edges: &[crate::RelationEdge],
+    ) -> Result<(), CueContractError> {
+        self.validate()?;
+        if edges.is_empty() {
+            return if *self == Self::direct_only() {
+                Ok(())
+            } else {
+                Err(CueContractError::Foundation {
+                    field: "snapshot.fanout.direct_only",
+                })
+            };
+        }
+        let measured = Self::measure_graph(members, edges)?;
+        if usize::from(self.max_depth) != measured.depth
+            || usize::from(self.max_fanout) != measured.fanout
+            || usize::try_from(self.max_edges).ok() != Some(measured.edge_count)
+            || usize::from(self.max_path_len) != measured.depth
+        {
+            return Err(CueContractError::Foundation {
+                field: "snapshot.fanout.observed",
+            });
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "graph closure validation keeps endpoint, cycle, reachability, and measurement checks together"
+    )]
+    fn measure_graph(
+        members: &[SnapshotMember],
+        edges: &[crate::RelationEdge],
+    ) -> Result<MeasuredFanout, CueContractError> {
+        for member in members {
+            member.validate()?;
+        }
+        for edge in edges {
+            edge.validate()?;
+        }
+        let nodes: BTreeSet<TargetHandle> =
+            members.iter().map(|member| member.target.clone()).collect();
+        let mut outgoing: BTreeMap<TargetHandle, Vec<TargetHandle>> = BTreeMap::new();
+        let mut indegree: BTreeMap<TargetHandle, usize> =
+            nodes.iter().cloned().map(|node| (node, 0)).collect();
+        let mut edge_ids = BTreeSet::new();
+        for edge in edges {
+            if !edge_ids.insert(edge.relation_edge_id.clone()) {
+                return Err(CueContractError::DuplicateIdentity {
+                    field: "snapshot.graph.edge_id",
+                });
+            }
+            if !nodes.contains(&edge.from) || !nodes.contains(&edge.to) {
+                return Err(CueContractError::Foundation {
+                    field: "snapshot.graph.endpoint",
+                });
+            }
+            outgoing
+                .entry(edge.from.clone())
+                .or_default()
+                .push(edge.to.clone());
+            *indegree
+                .get_mut(&edge.to)
+                .ok_or(CueContractError::Foundation {
+                    field: "snapshot.graph.endpoint",
+                })? += 1;
+        }
+        let roots: Vec<TargetHandle> = indegree
+            .iter()
+            .filter_map(|(node, degree)| (*degree == 0).then_some(node.clone()))
+            .collect();
+        let mut queue: VecDeque<TargetHandle> = roots.iter().cloned().collect();
+        if queue.is_empty() {
+            return Err(CueContractError::Foundation {
+                field: "snapshot.graph.cycle",
+            });
+        }
+        let mut depth: BTreeMap<TargetHandle, usize> =
+            indegree.keys().cloned().map(|node| (node, 0)).collect();
+        let mut processed = 0usize;
+        let mut max_depth = 0usize;
+        while let Some(node) = queue.pop_front() {
+            processed += 1;
+            let node_depth = depth.get(&node).copied().unwrap_or(0);
+            max_depth = max_depth.max(node_depth);
+            if let Some(targets) = outgoing.get(&node) {
+                for target in targets {
+                    let next_depth = node_depth.saturating_add(1);
+                    let entry = depth.entry(target.clone()).or_insert(0);
+                    *entry = (*entry).max(next_depth);
+                    let degree = indegree
+                        .get_mut(target)
+                        .ok_or(CueContractError::Foundation {
+                            field: "snapshot.graph.endpoint",
+                        })?;
+                    *degree = degree.saturating_sub(1);
+                    if *degree == 0 {
+                        queue.push_back(target.clone());
+                    }
+                }
+            }
+        }
+        if processed != nodes.len() {
+            return Err(CueContractError::Foundation {
+                field: "snapshot.graph.cycle",
+            });
+        }
+        let mut reachable_nodes = BTreeSet::new();
+        let mut reach_queue: VecDeque<TargetHandle> = roots.into_iter().collect();
+        while let Some(node) = reach_queue.pop_front() {
+            if !reachable_nodes.insert(node.clone()) {
+                continue;
+            }
+            if let Some(targets) = outgoing.get(&node) {
+                reach_queue.extend(targets.iter().cloned());
+            }
+        }
+        let reachable_edges = reachable_nodes
+            .iter()
+            .filter_map(|node| outgoing.get(node))
+            .map(Vec::len)
+            .sum::<usize>();
+        if reachable_nodes.len() != nodes.len() || reachable_edges != edges.len() {
+            return Err(CueContractError::Foundation {
+                field: "snapshot.graph.reachability",
+            });
+        }
+        let max_fanout = outgoing.values().map(Vec::len).max().unwrap_or(0);
+        if max_depth == 0 || max_fanout == 0 {
+            return Err(CueContractError::Foundation {
+                field: "snapshot.graph.observed",
+            });
+        }
+        if max_depth > crate::MAX_PATH_LEN || max_fanout > crate::MAX_RELATION_EDGES {
+            return Err(CueContractError::BoundExceeded {
+                field: "snapshot.graph.bound",
+                limit: crate::MAX_PATH_LEN,
+            });
+        }
+        Ok(MeasuredFanout {
+            depth: max_depth,
+            fanout: max_fanout,
+            edge_count: edges.len(),
+        })
+    }
+}
+
+struct MeasuredFanout {
+    depth: usize,
+    fanout: usize,
+    edge_count: usize,
 }
 
 /// All state needed to validate one published cue snapshot without an external
 /// closure argument.
 ///
-/// The fields are deliberately a closed set. A candidate may still be built by
-/// the legacy open constructor for package fixtures, but a candidate that
-/// carries this closure is self-validating and is the only shape accepted by
-/// the current Governor production path.
+/// The fields are deliberately a closed set. An open compatibility candidate
+/// may exist for package fixtures, but only a candidate carrying this closure
+/// can be presented as a published/closed snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -554,6 +908,11 @@ impl CueSnapshotClosure {
         for weight in &self.edge_weights {
             weight.validate()?;
         }
+        if self.denominator.omitted_rows != self.denominator.row_omissions.len()
+            || self.denominator.omitted_edges != self.denominator.edge_omissions.len()
+        {
+            return Err(CueContractError::SnapshotNotRebuildable);
+        }
         if self.relation_edges.len() != self.edge_weights.len() {
             return Err(CueContractError::SnapshotNotRebuildable);
         }
@@ -606,11 +965,14 @@ impl ConversionDisposition {
                 bounds::text(legacy_row_id, "conversion.legacy_row_id")?;
                 if let Self::V2Converted { row_id, .. } = self {
                     bounds::text(row_id, "conversion.row_id")?;
-                    if !row_id.starts_with(ROW_ID_PREFIX) {
+                    let Some(digest) = row_id.strip_prefix(ROW_ID_PREFIX) else {
                         return Err(CueContractError::Foundation {
                             field: "conversion.row_id.namespace",
                         });
-                    }
+                    };
+                    Digest::new(digest.to_owned()).map_err(|_| CueContractError::Foundation {
+                        field: "conversion.row_id.digest",
+                    })?;
                 }
                 Ok(())
             }
@@ -619,7 +981,19 @@ impl ConversionDisposition {
                 reason,
             } => {
                 bounds::text(legacy_row_id, "conversion.legacy_row_id")?;
-                bounds::text(reason, "conversion.reason")
+                bounds::text(reason, "conversion.reason")?;
+                if !matches!(
+                    reason.as_str(),
+                    "missing_fresh_observation"
+                        | "fresh_observation_mismatch"
+                        | "missing_normalized_key"
+                        | "unsupported_legacy_identity"
+                ) {
+                    return Err(CueContractError::Foundation {
+                        field: "conversion.reason",
+                    });
+                }
+                Ok(())
             }
         }
     }

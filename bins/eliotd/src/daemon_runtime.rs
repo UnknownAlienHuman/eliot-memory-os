@@ -18,8 +18,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{ClockReading, ProductId, RequestId, SourceId, sha256_hex};
-use eliot_cue_contracts::{Digest, NormalizationProfile, SnapshotId};
 use eliot_governor::KernelTransitionPort;
 use eliot_protocol::{
     AgentActivationResolutionDisposition, AgentActivationResolutionResult,
@@ -355,21 +353,6 @@ pub(super) fn run() -> Result<(), String> {
             .emit();
         }
     }
-    // The cue edge is attached before readiness so the production binary has
-    // one real, read-backed caller in its startup path. It is non-gating: the
-    // typed failure remains visible and never turns into an empty projection.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())?;
-    if let Err(reason) = attach_cue_reconstruction(&runtime, &mut composition, &kernel) {
-        let _ = eliotd::diagnostics::ErrorRecord::of(
-            eliotd::diagnostics::OwningComponent::DaemonRuntime,
-            "cue-reconstruction",
-            &reason,
-        )
-        .emit();
-    }
     kernel.report_ready().map_err(|error| error.to_string())?;
     // The local-read poller below drives Skill pairs through the composition
     // inside its flight future: share it here so the future owns its handle.
@@ -399,6 +382,10 @@ pub(super) fn run() -> Result<(), String> {
     let status = composition.status();
     write_json(&ready_message(&status))?;
 
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
     // The run loop is the only writer of the composition (TestD owner
     // finish drain); readers lock briefly per step. Wrap here: every
     // pre-loop exclusive use above is complete.
@@ -468,62 +455,6 @@ pub(super) fn run() -> Result<(), String> {
         }
     }
     final_result
-}
-
-/// Exercises the real Governor cue-read edge during daemon startup.
-///
-/// The one-shot attach is deliberately non-gating: an unavailable or
-/// unadmitted projection is reported as typed degradation and never becomes
-/// an authoritative empty cue set. The composition still owns the cache, and
-/// the call crosses `ReadService` and the authenticated Kernel context
-/// client exactly once.
-fn attach_cue_reconstruction(
-    runtime: &tokio::runtime::Runtime,
-    composition: &mut DaemonComposition,
-    kernel: &Arc<DaemonKernelClient>,
-) -> Result<(), String> {
-    let (_scope, request) = composition
-        .production_cue_reconstruction_request()
-        .map_err(|error| error.to_string())?;
-    let fence = composition.cue_reconstruction_fence();
-    let context = eliot_contracts::RequestMetadata {
-        request_id: RequestId::new("eliotd:cue:context-reconstruction")
-            .map_err(|error| error.to_string())?,
-        session_id: None,
-        task_id: None,
-        product_id: ProductId::new(SERVICE_NAME).map_err(|error| error.to_string())?,
-        source_id: SourceId::new(SERVICE_NAME).map_err(|error| error.to_string())?,
-        state_fence: fence.clone(),
-        clock: ClockReading {
-            valid_time_ms: None,
-            known_time_ms: None,
-            transaction_sequence: None,
-            monotonic_ns: None,
-        },
-    };
-    context.validate().map_err(|error| error.to_string())?;
-    let profile_digest =
-        Digest::new(sha256_hex(SERVICE_NAME.as_bytes())).map_err(|error| error.to_string())?;
-    let profile = NormalizationProfile::new("eliotd-cue-v2".to_owned(), 1, profile_digest);
-    let snapshot_id = SnapshotId::new(format!("eliotd-cue-{}", fence.resource_generation.value()))
-        .map_err(|error| error.to_string())?;
-    let candidate = runtime
-        .block_on(composition.reconstruct_cue_snapshot_from_reads(
-            kernel,
-            &context,
-            &request,
-            &snapshot_id,
-            &profile,
-        ))
-        .map_err(|error| error.to_string())?;
-    tracing::info!(
-        target: "eliotd::diagnostics",
-        event = "eliotd.cue_reconstruction_attached",
-        cache_hit = candidate.cache_hit,
-        cache_key = %candidate.cache_key,
-        rows = candidate.candidate.snapshot.members.len(),
-    );
-    Ok(())
 }
 
 /// Attaches the T12-06 Governor Dreamer intake registration (gated, no lifecycle change).

@@ -216,6 +216,8 @@ impl V1RowMigration {
                 field: "legacy_bytes",
             });
         }
+        let parsed = legacy_adapter::parse_bound_v1_row(&self.legacy_bytes, &self.legacy_row_id)?;
+        parsed.validate_for_conversion()?;
         self.disposition.validate().map_err(FacadeError::Contract)?;
         if self.disposition.legacy_row_id() != self.legacy_row_id {
             return Err(FacadeError::ResponseIdentityMismatch {
@@ -248,14 +250,34 @@ impl V1SnapshotMigration {
         if self.ceiling != eliot_cue_contracts::ProofCeiling::CandidateArtifact {
             return Err(FacadeError::EnvelopeInvalid { field: "ceiling" });
         }
+        let parsed_ids = legacy_adapter::parse_bound_v1_snapshot(
+            &self.legacy_snapshot_bytes,
+            &self.legacy_snapshot_id,
+        )?;
+        let parsed = parsed_ids
+            .into_iter()
+            .map(|(id, row)| (id, row))
+            .collect::<std::collections::BTreeMap<_, _>>();
         let mut seen = std::collections::BTreeSet::new();
         for row in &self.rows {
             row.validate()?;
-            if !seen.insert(row.legacy_row_id.as_str()) {
+            let parsed_row =
+                legacy_adapter::parse_bound_v1_row(&row.legacy_bytes, &row.legacy_row_id)?;
+            if parsed.get(&row.legacy_row_id) != Some(&parsed_row) {
+                return Err(FacadeError::ResponseIdentityMismatch {
+                    what: "migration.snapshot.row_payload",
+                });
+            }
+            if !seen.insert(row.legacy_row_id.clone()) {
                 return Err(FacadeError::ResponseIdentityMismatch {
                     what: "migration.duplicate_legacy_row_id",
                 });
             }
+        }
+        if parsed.len() != seen.len() || parsed.keys().any(|row_id| !seen.contains(row_id)) {
+            return Err(FacadeError::ResponseIdentityMismatch {
+                what: "migration.snapshot.row_set",
+            });
         }
         Ok(())
     }
@@ -296,6 +318,7 @@ impl V1PreservedRow {
                 field: "legacy_bytes",
             });
         }
+        legacy_adapter::parse_bound_v1_row(&value.legacy_bytes, &value.legacy_row_id)?;
         Ok(value)
     }
 }
@@ -491,6 +514,12 @@ pub fn reject_v1_row_conversion(
     reason: V1MigrationRejection,
 ) -> Result<V1RowMigration, FacadeError> {
     row.validate_for_conversion()?;
+    let parsed = legacy_adapter::parse_bound_v1_row(legacy_bytes, legacy_row_id)?;
+    if &parsed != row {
+        return Err(FacadeError::ResponseIdentityMismatch {
+            what: "migration.row_payload",
+        });
+    }
     validate_legacy_identity(legacy_row_id)?;
     if legacy_bytes.is_empty() {
         return Err(FacadeError::EnvelopeInvalid {
@@ -539,6 +568,12 @@ pub enum FacadeError {
     /// A legacy envelope field failed shape validation.
     #[error("legacy envelope field is blank or carries control characters: {field}")]
     EnvelopeInvalid {
+        /// Stable field path, never caller payload.
+        field: &'static str,
+    },
+    /// Preserved v1 bytes were not a parseable, identity-bound envelope.
+    #[error("legacy bytes are not a complete identity-bound v1 envelope: {field}")]
+    LegacyBytesInvalid {
         /// Stable field path, never caller payload.
         field: &'static str,
     },

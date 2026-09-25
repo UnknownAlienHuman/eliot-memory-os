@@ -402,6 +402,24 @@ fn denominator(
     omitted_rows: usize,
     omitted_edges: usize,
 ) -> CueProjectionDenominator {
+    let row_omissions = (0..omitted_rows)
+        .map(|index| {
+            CueProjectionOmission::new(
+                format!("omitted-row-{index}"),
+                CueProjectionOmissionKind::Row,
+                CueProjectionOmissionReason::OwnerBound,
+            )
+        })
+        .collect();
+    let edge_omissions = (0..omitted_edges)
+        .map(|index| {
+            CueProjectionOmission::new(
+                format!("omitted-edge-{index}"),
+                CueProjectionOmissionKind::Edge,
+                CueProjectionOmissionReason::OwnerBound,
+            )
+        })
+        .collect();
     CueProjectionDenominator::new(
         expected_rows,
         expected_edges,
@@ -409,6 +427,7 @@ fn denominator(
         omitted_edges,
         1,
     )
+    .with_omissions(row_omissions, edge_omissions)
 }
 
 #[test]

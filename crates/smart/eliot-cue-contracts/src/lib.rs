@@ -78,6 +78,7 @@ pub use relation::RelationEdge;
 pub use snapshot::{CueSnapshot, RebuildIdentity, SnapshotMember};
 pub use version::{
     ClosedSnapshotRow, ConversionDisposition, CueComparisonKey, CueProjectionDenominator,
+    CueProjectionOmission, CueProjectionOmissionKind, CueProjectionOmissionReason,
     CueSnapshotClosure, CueSnapshotFanout, CueSourceValue, MAX_EDGE_WEIGHT_MILLI,
     SnapshotEdgeWeight, cue_row_id,
 };
