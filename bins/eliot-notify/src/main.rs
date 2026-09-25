@@ -279,31 +279,27 @@ fn main() {
             parent,
             notification_id,
             principal,
-        }) => {
-            match NotificationComposition::from_kernel_with_quiet_hours(root, &parent) {
-                Ok(mut composition) => {
-                    dispatch_acknowledge(&mut composition, &parent, notification_id, principal)
-                }
-                Err(error) => composition_error(error.to_string()),
+        }) => match NotificationComposition::from_kernel_with_quiet_hours(root, &parent) {
+            Ok(mut composition) => {
+                dispatch_acknowledge(&mut composition, &parent, notification_id, principal)
             }
-        }
+            Err(error) => composition_error(error.to_string()),
+        },
         Ok(Request::Resolve {
             parent,
             notification_id,
             disposition,
             authorization,
-        }) => {
-            match NotificationComposition::from_kernel_with_quiet_hours(root, &parent) {
-                Ok(mut composition) => dispatch_resolve(
-                    &mut composition,
-                    &parent,
-                    notification_id,
-                    disposition,
-                    authorization,
-                ),
-                Err(error) => composition_error(error.to_string()),
-            }
-        }
+        }) => match NotificationComposition::from_kernel_with_quiet_hours(root, &parent) {
+            Ok(mut composition) => dispatch_resolve(
+                &mut composition,
+                &parent,
+                notification_id,
+                disposition,
+                authorization,
+            ),
+            Err(error) => composition_error(error.to_string()),
+        },
         Err(error) => Response::Error {
             code: "REQUEST_INVALID",
             detail: error.to_string(),

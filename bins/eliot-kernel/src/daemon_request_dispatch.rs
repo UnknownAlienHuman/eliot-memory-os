@@ -721,6 +721,95 @@ struct NotificationStateReadOperation {
     cursor: Option<String>,
 }
 
+/// One bounded canonical notification page query (issue #1780).
+///
+/// The typed parameter of the single notification read seam
+/// ([`KernelComposition::read_notification_page`]): the store contract's
+/// closed `GetNotificationState` selector set together with the fence the
+/// page must be served and proved under. The fence is a named field rather
+/// than a sibling argument because that is the whole hazard this value
+/// removes — a selector set and the fence it is served under are one fact
+/// about one read, and a caller can no longer hand `read_notification_page` a
+/// query built for one fence and check the echoed fence against another.
+///
+/// Exactly the closed selector set, nothing else: no quiet-hours field, no
+/// delivery-visibility field, and no role filter, so no read resolved through
+/// this value can be narrowed by a suppression policy (I11.7, I11.10).
+#[cfg(windows)]
+struct NotificationPageQuery {
+    /// The exact fence the page is served and proved under.
+    state_fence: StateFence,
+    /// Optional canonical scope selector.
+    scope: Option<String>,
+    /// Optional deduplication-index selector.
+    dedup_key: Option<String>,
+    /// Optional canonical notification-identity selector.
+    notification_id: Option<String>,
+    /// Whether resolved records join the page.
+    include_resolved: bool,
+    /// Bounded page size; the store contract rejects an out-of-range value.
+    page_limit: u16,
+    /// Opaque page cursor.
+    cursor: Option<String>,
+}
+
+#[cfg(windows)]
+impl NotificationPageQuery {
+    /// Folds the peer-presented selectors of the
+    /// [`NOTIFICATION_STATE_READ_OPERATION`] route into the page query, so
+    /// the route cannot re-spell, drop, or default one of them.
+    fn from_read_operation(operation: &NotificationStateReadOperation) -> Self {
+        Self {
+            state_fence: operation.state_fence.clone(),
+            scope: operation.scope.clone(),
+            dedup_key: operation.dedup_key.clone(),
+            notification_id: operation.notification_id.clone(),
+            include_resolved: operation.include_resolved,
+            page_limit: operation.page_limit,
+            cursor: operation.cursor.clone(),
+        }
+    }
+
+    /// The addressed-record page: exactly the record one lifecycle leg names,
+    /// resolved at the fence that leg was admitted under.
+    ///
+    /// The single named constructor for the two read-backs that must agree —
+    /// the committed transition's post-commit read-back and the Notify launch
+    /// grant's durable-record join. Both ask "does this exact record persist
+    /// at this exact fence", so both build the same value here instead of
+    /// repeating the selector spelling at two call sites.
+    fn addressed_record(
+        state_fence: &StateFence,
+        dedup_key: Option<String>,
+        notification_id: Option<String>,
+    ) -> Self {
+        Self {
+            state_fence: state_fence.clone(),
+            scope: None,
+            dedup_key,
+            notification_id,
+            include_resolved: true,
+            page_limit: 1,
+            cursor: None,
+        }
+    }
+
+    /// The store contract's own closed `GetNotificationState` request for
+    /// these selectors. The contract builder stays the only encoder of the
+    /// parameter set and the only range check on the page limit.
+    fn read_request(&self) -> Result<NamedReadRequest, StoreError> {
+        eliot_store_api::notification_read_request(
+            self.scope.clone(),
+            self.dedup_key.clone(),
+            self.notification_id.clone(),
+            self.include_resolved,
+            self.page_limit,
+            self.cursor.clone(),
+            self.state_fence.clone(),
+        )
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OriginChallengeIssueOperation {
@@ -3213,10 +3302,6 @@ impl KernelComposition {
     /// Any other class, scope, or leg fails closed before the gateway is
     /// entered; an uncommitted or misfenced outcome never reports success.
     #[cfg(windows)]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the canonical notification route keeps decode, closed-plan checks, hash recheck, admission gate, gateway dispatch, and same-fence read-back in one audited order"
-    )]
     async fn notification_state_operation(
         &self,
         session: &Session,
@@ -3225,84 +3310,16 @@ impl KernelComposition {
     ) -> Result<serde_json::Value, TransportError> {
         let operation: NotificationStateApplyOperation =
             serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
-        if operation.context.request_id != request_id {
-            return Err(TransportError::SessionFenced);
-        }
-        operation
-            .context
-            .validate()
-            .map_err(|_| TransportError::SessionFenced)?;
-        if let Err(error) = operation.transition.validate() {
-            return Ok(Self::store_error_response_text(
-                NOTIFICATION_STATE_RESPONSE_KIND,
-                &error.to_string(),
-            ));
-        }
-        if let Err(error) = validate_notification_state_transition(&operation.transition) {
-            return Ok(Self::store_error_response_text(
-                NOTIFICATION_STATE_RESPONSE_KIND,
-                &error,
-            ));
-        }
-        validate_store_session_fence(session, &operation.context.state_fence)?;
-        if operation.transition.state_fence != operation.context.state_fence {
-            return Err(TransportError::SessionFenced);
-        }
-        for head in &operation.expected_revision_heads {
-            if let Err(error) = head.validate() {
-                return Ok(Self::store_error_response_text(
-                    NOTIFICATION_STATE_RESPONSE_KIND,
-                    &error.to_string(),
-                ));
-            }
-            if head.state_fence != operation.context.state_fence {
-                return Err(TransportError::SessionFenced);
-            }
-        }
-        for head in &operation.expected_ordering_heads {
-            if let Err(error) = head.validate() {
-                return Ok(Self::store_error_response_text(
-                    NOTIFICATION_STATE_RESPONSE_KIND,
-                    &error.to_string(),
-                ));
-            }
-            if head.state_fence != operation.context.state_fence {
-                return Err(TransportError::SessionFenced);
-            }
-        }
-        if let Err(error) = verify_ordering_scope_binding(
-            &operation.transition,
-            &operation.expected_ordering_heads,
-        ) {
-            return Ok(Self::store_error_response_text(
-                NOTIFICATION_STATE_RESPONSE_KIND,
-                &error.to_string(),
-            ));
-        }
-        // Recompute the canonical request hash from the exact values about to
-        // be executed, exactly as `apply_prepared` does: a plan edited after
-        // admission fails here instead of entering the store bridge.
+        if let Some(refusal) =
+            Self::validate_notification_state_apply(session, &request_id, &operation)?
         {
-            let view = CanonicalRequestView::from_apply(
-                &operation.context,
-                &operation.transition,
-                &operation.expected_revision_heads,
-                &operation.expected_ordering_heads,
-            );
-            if let Err(error) = verify_canonical_request_hash(
-                &view,
-                &operation.transition.identity.canonical_request_hash,
-            ) {
-                return Ok(Self::store_error_response_text(
-                    NOTIFICATION_STATE_RESPONSE_KIND,
-                    &error.to_string(),
-                ));
-            }
+            return Ok(refusal);
         }
         if let Some(rejection) = self.normal_write_admission_response() {
             return Ok(rejection);
         }
-        let (dedup_key, notification_id) = notification_state_read_selectors(&operation.transition)?;
+        let (dedup_key, notification_id) =
+            notification_state_read_selectors(&operation.transition)?;
         let state_fence = operation.transition.state_fence.clone();
         let gateway = self.retained_store_gateway()?;
         let receipt = match gateway
@@ -3335,12 +3352,16 @@ impl KernelComposition {
         // whose record is not readable at the admitted fence is not a
         // successful canonical write and never reports one.
         let page = self
-            .read_notification_page(&state_fence, None, dedup_key, notification_id, true, 1, None)
+            .read_notification_page(&NotificationPageQuery::addressed_record(
+                &state_fence,
+                dedup_key,
+                notification_id,
+            ))
             .await?;
         if page
             .get(eliot_store_api::NOTIFY_PAGE_RECORDS)
             .and_then(serde_json::Value::as_array)
-            .is_none_or(|records| records.is_empty())
+            .is_none_or(Vec::is_empty)
         {
             return Err(TransportError::SessionFenced);
         }
@@ -3352,6 +3373,99 @@ impl KernelComposition {
             },
             "recovery": null,
         }))
+    }
+
+    /// Every closed-plan check the canonical notification write must pass
+    /// before the store gateway is entered (issue #1780).
+    ///
+    /// `Ok(None)` means the transition is proved and may be dispatched;
+    /// `Ok(Some(text))` is a fail-closed refusal the route returns verbatim;
+    /// `Err` is the session-fence refusal, which never becomes a store error
+    /// response because it is not an owner rejection.
+    ///
+    /// The order is fixed and is the audited one: request-identity binding,
+    /// request-metadata validation, the transition's own validation, the
+    /// closed notification-state plan check, the store session fence, the
+    /// transition/context fence agreement, every expected head's own
+    /// validation and fence agreement, the ordering-scope binding, and finally
+    /// the canonical request hash recomputed from the exact values about to be
+    /// executed — a plan edited after admission fails here instead of entering
+    /// the store bridge.
+    #[cfg(windows)]
+    fn validate_notification_state_apply(
+        session: &Session,
+        request_id: &RequestId,
+        operation: &NotificationStateApplyOperation,
+    ) -> Result<Option<serde_json::Value>, TransportError> {
+        if operation.context.request_id != *request_id {
+            return Err(TransportError::SessionFenced);
+        }
+        operation
+            .context
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if let Err(error) = operation.transition.validate() {
+            return Ok(Some(Self::store_error_response_text(
+                NOTIFICATION_STATE_RESPONSE_KIND,
+                &error.to_string(),
+            )));
+        }
+        if let Err(error) = validate_notification_state_transition(&operation.transition) {
+            return Ok(Some(Self::store_error_response_text(
+                NOTIFICATION_STATE_RESPONSE_KIND,
+                &error,
+            )));
+        }
+        validate_store_session_fence(session, &operation.context.state_fence)?;
+        if operation.transition.state_fence != operation.context.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        for head in &operation.expected_revision_heads {
+            if let Err(error) = head.validate() {
+                return Ok(Some(Self::store_error_response_text(
+                    NOTIFICATION_STATE_RESPONSE_KIND,
+                    &error.to_string(),
+                )));
+            }
+            if head.state_fence != operation.context.state_fence {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        for head in &operation.expected_ordering_heads {
+            if let Err(error) = head.validate() {
+                return Ok(Some(Self::store_error_response_text(
+                    NOTIFICATION_STATE_RESPONSE_KIND,
+                    &error.to_string(),
+                )));
+            }
+            if head.state_fence != operation.context.state_fence {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        if let Err(error) =
+            verify_ordering_scope_binding(&operation.transition, &operation.expected_ordering_heads)
+        {
+            return Ok(Some(Self::store_error_response_text(
+                NOTIFICATION_STATE_RESPONSE_KIND,
+                &error.to_string(),
+            )));
+        }
+        let view = CanonicalRequestView::from_apply(
+            &operation.context,
+            &operation.transition,
+            &operation.expected_revision_heads,
+            &operation.expected_ordering_heads,
+        );
+        if let Err(error) = verify_canonical_request_hash(
+            &view,
+            &operation.transition.identity.canonical_request_hash,
+        ) {
+            return Ok(Some(Self::store_error_response_text(
+                NOTIFICATION_STATE_RESPONSE_KIND,
+                &error.to_string(),
+            )));
+        }
+        Ok(None)
     }
 
     /// No durable canonical store exists off Windows: the retained store
@@ -3385,15 +3499,7 @@ impl KernelComposition {
             serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
         validate_store_session_fence(session, &operation.state_fence)?;
         let page = self
-            .read_notification_page(
-                &operation.state_fence,
-                operation.scope,
-                operation.dedup_key,
-                operation.notification_id,
-                operation.include_resolved,
-                operation.page_limit,
-                operation.cursor,
-            )
+            .read_notification_page(&NotificationPageQuery::from_read_operation(&operation))
             .await?;
         Ok(serde_json::json!({
             "status": "known",
@@ -3417,35 +3523,24 @@ impl KernelComposition {
     /// The one read seam both notification routes share: the transition's
     /// post-commit read-back, the owner inbox read, and the Notify launch
     /// grant's durable-record join all resolve the record through this single
-    /// call, so none of them can observe a different projection shape.
+    /// call, so none of them can observe a different projection shape. The
+    /// selectors and the fence arrive as one [`NotificationPageQuery`], so the
+    /// echoed fence is proved against the same fence the query was built for.
     #[cfg(windows)]
     async fn read_notification_page(
         &self,
-        state_fence: &StateFence,
-        scope: Option<String>,
-        dedup_key: Option<String>,
-        notification_id: Option<String>,
-        include_resolved: bool,
-        page_limit: u16,
-        cursor: Option<String>,
+        query: &NotificationPageQuery,
     ) -> Result<serde_json::Value, TransportError> {
-        let query = eliot_store_api::notification_read_request(
-            scope,
-            dedup_key,
-            notification_id,
-            include_resolved,
-            page_limit,
-            cursor,
-            state_fence.clone(),
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
+        let request = query
+            .read_request()
+            .map_err(|_| TransportError::SessionFenced)?;
         let gateway = self.retained_store_gateway()?;
         let response = gateway
-            .execute_named(query)
+            .execute_named(request)
             .await
             .map_err(|_| TransportError::SessionFenced)?;
         if response.operation != eliot_store_api::NamedReadOperation::GetNotificationState
-            || response.state_fence != *state_fence
+            || response.state_fence != query.state_fence
         {
             return Err(TransportError::SessionFenced);
         }
@@ -3927,15 +4022,11 @@ impl KernelComposition {
     ) -> Result<(), TransportError> {
         let fence = session.module_generation.state_fence.clone();
         let page = self
-            .read_notification_page(
+            .read_notification_page(&NotificationPageQuery::addressed_record(
                 &fence,
                 None,
-                None,
                 Some(notification_id.to_owned()),
-                true,
-                1,
-                None,
-            )
+            ))
             .await?;
         let records = page
             .get(eliot_store_api::NOTIFY_PAGE_RECORDS)
@@ -4258,9 +4349,7 @@ fn validate_origin_inspection(
 /// decodable leg. A plan that smuggles another class, another scope, or a
 /// second named operation is refused before the gateway is entered.
 #[cfg(windows)]
-fn validate_notification_state_transition(
-    transition: &PreparedTransition,
-) -> Result<(), String> {
+fn validate_notification_state_transition(transition: &PreparedTransition) -> Result<(), String> {
     if transition.transition_class != eliot_store_api::TransitionClass::NotificationState {
         return Err(
             "ApplyNotificationState admits only the NotificationState transition class".to_owned(),
@@ -4305,11 +4394,15 @@ fn notification_state_read_selectors(
         eliot_store_api::DecodedNotificationMutation::Upsert { dedup_key, .. } => {
             (Some(dedup_key), None)
         }
-        eliot_store_api::DecodedNotificationMutation::Delivery { notification_id, .. }
-        | eliot_store_api::DecodedNotificationMutation::Acknowledge { notification_id, .. }
-        | eliot_store_api::DecodedNotificationMutation::Resolve { notification_id, .. } => {
-            (None, Some(notification_id))
+        eliot_store_api::DecodedNotificationMutation::Delivery {
+            notification_id, ..
         }
+        | eliot_store_api::DecodedNotificationMutation::Acknowledge {
+            notification_id, ..
+        }
+        | eliot_store_api::DecodedNotificationMutation::Resolve {
+            notification_id, ..
+        } => (None, Some(notification_id)),
     })
 }
 

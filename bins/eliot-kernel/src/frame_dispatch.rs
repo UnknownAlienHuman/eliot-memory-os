@@ -993,6 +993,20 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "revoke_grant"
             | "activate_introduction"
             | "revoke_introduction"
+            // Issue #1780 W2: the Notify launch grant, the delivery gate that
+            // proves the owner created or updated the canonical record before
+            // a toast is launched. The marker is the one string the admitted
+            // dispatch at `daemon_request_dispatch.rs` already serves, and it
+            // was absent here, so the frame fell through every predicate,
+            // failed the `ProcessExecutionRequest` decode, and fenced the
+            // session: `notify_launch_grant_operation` and its
+            // `require_durable_notification_record` join were unreachable, and
+            // "no delivery without a persisted canonical record" was never
+            // enforced. The handler stays fail-closed on its own evidence
+            // (absolute install path, canonical image name, real-byte
+            // re-hash, same-fence record read-back, then the binder's own
+            // ready/epoch/fence checks); this entry only lets the frame reach it.
+            | "bind_notify_launch_grant"
             // Issue #1780: the canonical persistent notification route. Both
             // markers are the store contract's own closed operation names
             // (`ApplyNotificationState` / `GetNotificationState`), which are
