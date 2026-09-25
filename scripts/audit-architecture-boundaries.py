@@ -10,6 +10,14 @@ The scanner consumes Cargo manifests, production Rust source, and the explicit
 
 A clean result is static source evidence only. It is never runtime or Product
 Proof.
+
+Dependency evidence is typed: every Cargo declaration is retained as an edge
+carrying consumer, section, alias, package, kind (normal/dev/build), target
+condition, feature and resolution state. Runtime-root rules evaluate selected
+source projections (runtime/test/build); source/vendor rules evaluate all
+declarations. No resolver runs here, so every dependency witness records its
+resolver inputs as unbound and its completeness as source-only-incomplete.
+Static selection is never executed-binary proof.
 """
 
 from __future__ import annotations
@@ -462,11 +470,94 @@ def _discover_process_launch_sites(
     return sites, attribution_ok
 
 
+# --- Typed dependency evidence (#2614) ---
+#
+# Every Cargo declaration is retained as a DependencyEdge. Two declarations of
+# the same package under different kinds/conditions stay distinct edges; they
+# are never collapsed into a set of names. Target conditions are preserved
+# verbatim and never evaluated here: cfg/feature resolution belongs to Cargo's
+# resolver (see verify-dependency-policy.py), not to regex in this scanner.
+
+DEPENDENCY_SECTIONS = ("dependencies", "dev-dependencies", "build-dependencies")
+
+DEPENDENCY_KIND_BY_SECTION = {
+    "dependencies": "normal",
+    "dev-dependencies": "dev",
+    "build-dependencies": "build",
+}
+
+_KIND_ORDER = {"normal": 0, "dev": 1, "build": 2}
+
+# Declaration-resolution states. Only "direct" and "workspace-inherited" count
+# as resolved; every other state is explicit incomplete evidence, never a
+# silent drop and never an arbitrary identity guess.
+RESOLUTION_DIRECT = "direct"
+RESOLUTION_WORKSPACE_INHERITED = "workspace-inherited"
+RESOLUTION_UNRESOLVED_WORKSPACE = "unresolved-workspace"
+RESOLUTION_UNSUPPORTED_DECLARATION = "unsupported-declaration"
+RESOLUTION_DEGRADED_METADATA = "degraded-metadata"
+
+_RESOLVED_EDGE = (RESOLUTION_DIRECT, RESOLUTION_WORKSPACE_INHERITED)
+
+# Selected source projections. Each names its profile explicitly; resolver
+# inputs (root target, triples, features, toolchain, metadata) stay unbound
+# because this static scanner runs no resolver.
+PROFILE_SOURCE_RUNTIME = "source-runtime"
+PROFILE_SOURCE_TEST = "source-test"
+PROFILE_SOURCE_BUILD = "source-build"
+PROFILE_SOURCE_WIDE = "source-wide"
+
+# Bounded traversal so one hostile or cyclic graph cannot hang the audit.
+_TYPED_PATH_MAX_HOPS = 64
+_TYPED_PATH_MAX_NODES = 4096
+
+_RUNTIME_ROOT_KNOWN_KEYS = frozenset(
+    {"package", "issue", "forbidden_exact", "forbidden_prefix"}
+)
+
+
+@dataclass(frozen=True)
+class DependencyEdge:
+    """One Cargo dependency declaration with its kind and target intact."""
+
+    consumer: str
+    manifest: str
+    section: str
+    alias: str
+    package: str
+    crate_name: str
+    kind: str
+    target: str
+    version: str | None
+    path: str | None
+    source: str
+    optional: bool
+    default_features: bool
+    inherited_features: tuple[str, ...]
+    member_features: tuple[str, ...]
+    features: tuple[str, ...]
+    resolution: str
+
+
+@dataclass(frozen=True)
+class TypedPath:
+    """One ordered edge path plus the context that qualifies it."""
+
+    edges: tuple[DependencyEdge, ...]
+    conditional_hops: tuple[int, ...]
+    host_hops: tuple[int, ...]
+    truncated: bool
+
+
 @dataclass(frozen=True)
 class Manifest:
     name: str
     path: str
+    # Source-wide declared-name projection (compatibility only; never a
+    # runtime claim -- runtime/test/build evidence uses dependency_edges).
     dependencies: tuple[str, ...]
+    dependency_edges: tuple[DependencyEdge, ...] = ()
+    proc_macro: bool = False
 
 
 @dataclass(frozen=True)
@@ -478,6 +569,7 @@ class Finding:
     detail: str
     issue: int | None = None
     removal_condition: str | None = None
+    witness: dict[str, Any] | None = None
 
 
 def _relative(root: Path, path: Path) -> str:
@@ -523,10 +615,547 @@ def _manifest_dependencies(data: dict[str, Any]) -> tuple[str, ...]:
     return tuple(sorted(set(dependencies)))
 
 
-def load_manifests(root: Path) -> tuple[dict[str, Manifest], list[Finding]]:
+def _edge_crate_name(alias: str) -> str:
+    return alias.replace("-", "_")
+
+
+def _edge_order(edge: DependencyEdge) -> tuple[Any, ...]:
+    return (
+        edge.package.casefold(),
+        _KIND_ORDER.get(edge.kind, 9),
+        0 if (edge.target == "all" and not edge.optional) else 1,
+        edge.alias.casefold(),
+        edge.section,
+        edge.target.casefold(),
+    )
+
+
+def _resolve_edge_spec(
+    alias: str, spec: Any, workspace_dependencies: dict[str, Any]
+) -> tuple[Any, list[Any], list[Any], str, bool]:
+    """Resolve workspace inheritance with Cargo's additive feature semantics.
+
+    Mirrors the source-side inheritance in verify-dependency-policy.py: member
+    features add to (never replace) inherited features, and uninterpretable
+    inputs keep an explicit degraded resolution instead of a silent fix.
+    """
+    if isinstance(spec, dict) and "workspace" in spec:
+        if spec.get("workspace") is not True:
+            return spec, [], [], RESOLUTION_UNSUPPORTED_DECLARATION, True
+        inherited = workspace_dependencies.get(alias)
+        if isinstance(inherited, str):
+            effective: Any = {"version": inherited}
+        elif isinstance(inherited, dict):
+            effective = dict(inherited)
+        else:
+            member_only = spec.get("features", [])
+            member_raw = member_only if isinstance(member_only, list) else []
+            return spec, [], member_raw, RESOLUTION_UNRESOLVED_WORKSPACE, True
+        overrides = {key: value for key, value in spec.items() if key != "workspace"}
+        inherited_features = effective.get("features", [])
+        member_features = overrides.pop("features", [])
+        degraded = False
+        if isinstance(inherited_features, list) and isinstance(member_features, list):
+            effective["features"] = [*inherited_features, *member_features]
+        else:
+            degraded = True
+            effective["features"] = (
+                member_features
+                if isinstance(inherited_features, list)
+                else inherited_features
+            )
+        effective.update(overrides)
+        resolution = (
+            RESOLUTION_DEGRADED_METADATA if degraded else RESOLUTION_WORKSPACE_INHERITED
+        )
+        inherited_raw = inherited_features if isinstance(inherited_features, list) else []
+        member_raw = member_features if isinstance(member_features, list) else []
+        return effective, inherited_raw, member_raw, resolution, degraded
+    if isinstance(spec, str):
+        return spec, [], [], RESOLUTION_DIRECT, False
+    if isinstance(spec, dict):
+        return spec, [], [], RESOLUTION_DIRECT, False
+    return spec, [], [], RESOLUTION_UNSUPPORTED_DECLARATION, True
+
+
+def _normalized_features(raw: Any) -> tuple[tuple[str, ...], bool]:
+    if raw is None:
+        return (), False
+    if isinstance(raw, list):
+        clean = tuple(sorted({item for item in raw if isinstance(item, str)}))
+        return clean, any(not isinstance(item, str) for item in raw)
+    return (), True
+
+
+def _build_edge(
+    *,
+    consumer: str,
+    manifest: str,
+    section: str,
+    alias: str,
+    target: str,
+    spec: Any,
+    workspace_dependencies: dict[str, Any],
+) -> DependencyEdge:
+    effective, inherited_raw, member_raw, resolution, degraded = _resolve_edge_spec(
+        alias, spec, workspace_dependencies
+    )
+    declared = effective if isinstance(effective, dict) else {}
+    if isinstance(spec, dict):
+        if resolution == RESOLUTION_DIRECT:
+            member_raw = spec.get("features", [])
+        elif not member_raw:
+            fallback = spec.get("features", [])
+            member_raw = fallback if isinstance(fallback, list) else []
+    inherited_features, bad_inherited = _normalized_features(inherited_raw)
+    member_features, bad_member = _normalized_features(member_raw)
+    degraded = degraded or bad_inherited or bad_member
+    features = tuple(sorted(set(inherited_features) | set(member_features)))
+
+    optional = declared.get("optional", False)
+    if not isinstance(optional, bool):
+        degraded = True
+        optional = False
+    default_features = declared.get("default-features", True)
+    if not isinstance(default_features, bool):
+        degraded = True
+        default_features = True
+
+    if isinstance(effective, str):
+        version: str | None = effective
+        edge_path: str | None = None
+        source = "registry"
+    else:
+        version = declared.get("version")
+        if version is not None and not isinstance(version, str):
+            degraded = True
+            version = None
+        raw_path = declared.get("path")
+        if raw_path is None:
+            edge_path = None
+        elif isinstance(raw_path, str):
+            edge_path = raw_path
+        else:
+            degraded = True
+            edge_path = None
+        source = (
+            "path"
+            if "path" in declared
+            else "git"
+            if "git" in declared
+            else "registry"
+            if "version" in declared or "registry" in declared
+            else "unspecified"
+        )
+
+    if degraded and resolution in _RESOLVED_EDGE:
+        resolution = RESOLUTION_DEGRADED_METADATA
+    package = _dependency_name(
+        alias, effective if isinstance(effective, dict) else alias
+    )
+    return DependencyEdge(
+        consumer=consumer,
+        manifest=manifest,
+        section=section,
+        alias=alias,
+        package=package,
+        crate_name=_edge_crate_name(alias),
+        kind=DEPENDENCY_KIND_BY_SECTION[section],
+        target=target,
+        version=version,
+        path=edge_path,
+        source=source,
+        optional=optional,
+        default_features=default_features,
+        inherited_features=inherited_features,
+        member_features=member_features,
+        features=features,
+        resolution=resolution,
+    )
+
+
+def _manifest_dependency_edges(
+    data: dict[str, Any],
+    *,
+    consumer: str,
+    manifest: str,
+    workspace_dependencies: dict[str, Any],
+) -> tuple[tuple[DependencyEdge, ...], tuple[str, ...]]:
+    """Parse every dependency table into typed edges.
+
+    Target-table keys are preserved verbatim as conditions; they are never
+    evaluated here. Malformed tables are reported as structural problems
+    (explicit incomplete evidence), never silently skipped.
+    """
+    edges: list[DependencyEdge] = []
+    problems: list[str] = []
+
+    def add_table(table: Any, section: str, target: str) -> None:
+        if table is None:
+            return
+        if not isinstance(table, dict):
+            problems.append(f"{section} table for target {target!r} must be a table")
+            return
+        for alias, spec in table.items():
+            if not isinstance(alias, str):
+                problems.append(
+                    f"{section} entry for target {target!r} has a non-string alias"
+                )
+                continue
+            edges.append(
+                _build_edge(
+                    consumer=consumer,
+                    manifest=manifest,
+                    section=section,
+                    alias=alias,
+                    target=target,
+                    spec=spec,
+                    workspace_dependencies=workspace_dependencies,
+                )
+            )
+
+    for section in DEPENDENCY_SECTIONS:
+        add_table(data.get(section), section, "all")
+    target_groups = data.get("target")
+    if isinstance(target_groups, dict):
+        for expression, group in target_groups.items():
+            label = expression if isinstance(expression, str) else str(expression)
+            if not isinstance(group, dict):
+                problems.append(f"target dependency group {label!r} must be a table")
+                continue
+            for section in DEPENDENCY_SECTIONS:
+                add_table(group.get(section), section, label)
+    elif target_groups is not None:
+        problems.append("target dependency groups must be a table")
+
+    edges.sort(key=_edge_order)
+    return tuple(edges), tuple(problems)
+
+
+def _workspace_tables(
+    parsed: list[tuple[str, dict[str, Any]]],
+) -> dict[str, dict[str, Any]]:
+    tables: dict[str, dict[str, Any]] = {}
+    for relative, data in parsed:
+        workspace = data.get("workspace")
+        if isinstance(workspace, dict):
+            tables[relative.rpartition("/")[0]] = workspace
+    return tables
+
+
+def _inheritable_workspace_dependencies(
+    *,
+    relative: str,
+    path: Path,
+    root: Path,
+    data: dict[str, Any],
+    tables: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Owning [workspace.dependencies] table for one manifest.
+
+    Resolution order mirrors Cargo: an explicit [package].workspace pointer
+    first, else the nearest ancestor-or-self [workspace] table. Unused root
+    definitions never become consumer edges; a manifest with no owning table
+    resolves nothing, and its workspace=true declarations stay explicitly
+    unresolved. Member-glob evaluation itself stays resolver-side.
+    """
+    package = data.get("package")
+    pointer = package.get("workspace") if isinstance(package, dict) else None
+    if isinstance(pointer, str) and pointer.strip():
+        try:
+            resolved = (path.parent / pointer.strip()).resolve()
+            pointer_dir = resolved.relative_to(root.resolve()).as_posix()
+        except (OSError, ValueError):
+            return {}
+        table = tables.get(pointer_dir)
+        if not isinstance(table, dict):
+            return {}
+        dependencies = table.get("dependencies")
+        return dependencies if isinstance(dependencies, dict) else {}
+    directory: str | None = relative.rpartition("/")[0]
+    while directory is not None:
+        table = tables.get(directory)
+        if table is not None:
+            dependencies = table.get("dependencies")
+            return dependencies if isinstance(dependencies, dict) else {}
+        directory = directory.rpartition("/")[0] if directory else None
+    return {}
+
+
+def _profile_allows(profile: str, edge: DependencyEdge, *, root_hop: bool) -> bool:
+    """Traversal filter for one selected source projection.
+
+    Runtime paths traverse applicable normal target dependencies only -- never
+    a dev/build edge relabeled as normal. Tests add the selected test target's
+    own dev edges plus transitive normal dependencies, not every transitive
+    library's dev suite. Build/tooling paths start from build edges.
+    """
+    if profile == PROFILE_SOURCE_RUNTIME:
+        return edge.kind == "normal"
+    if profile == PROFILE_SOURCE_TEST:
+        return edge.kind == "normal" or (root_hop and edge.kind == "dev")
+    if profile == PROFILE_SOURCE_BUILD:
+        return (root_hop and edge.kind == "build") or (
+            not root_hop and edge.kind == "normal"
+        )
+    raise ValueError(f"unknown dependency profile {profile!r}")
+
+
+def _edge_is_conditional(edge: DependencyEdge) -> bool:
+    return edge.target != "all" or edge.optional
+
+
+def _profile_descriptor(profile: str) -> dict[str, str]:
+    return {
+        "name": profile,
+        "root_target": "unbound",
+        "host_triple": "unbound",
+        "target_triple": "unbound",
+        "feature_selection": "unbound",
+        "resolver": "unbound",
+        "toolchain": "unbound",
+        "metadata": "none",
+        "completeness": "source_only_incomplete",
+    }
+
+
+def _finish_typed_path(
+    manifests: dict[str, Manifest],
+    edges: tuple[DependencyEdge, ...],
+    stats: dict[str, int],
+) -> TypedPath:
+    conditional = tuple(
+        index for index, edge in enumerate(edges) if _edge_is_conditional(edge)
+    )
+    host_hops: list[int] = []
+    for index, edge in enumerate(edges):
+        target = manifests.get(edge.package)
+        # A proc-macro declared as a normal dependency still executes as a
+        # host build component: kind alone never describes the unit.
+        if target is not None and target.proc_macro:
+            host_hops.append(index)
+    return TypedPath(
+        edges=edges,
+        conditional_hops=conditional,
+        host_hops=tuple(host_hops),
+        truncated=bool(stats["truncated"]),
+    )
+
+
+def _single_edge_path(
+    manifests: dict[str, Manifest], edge: DependencyEdge
+) -> TypedPath:
+    return _finish_typed_path(manifests, (edge,), {"truncated": 0})
+
+
+def _typed_dependency_path(
+    manifests: dict[str, Manifest],
+    ambiguous: frozenset[str],
+    start: str,
+    predicate: Any,
+    profile: str,
+) -> tuple[TypedPath | None, dict[str, int]]:
+    """Shortest multi-hop typed path to a forbidden package in one projection.
+
+    Deterministic breadth-first search over pre-sorted edges: stable witness
+    selection with visited-set cycle handling and explicit bounds. Direct
+    matches stay with the per-edge direct checks, never masking transitive search;
+    external/ambiguous frontiers stop traversal and count as unresolved evidence.
+    """
+    stats = {"visited": 1, "unresolved": 0, "external": 0, "truncated": 0}
+    queue: deque[tuple[DependencyEdge, ...]] = deque([()])
+    visited = {start}
+    counted: set[str] = set()
+    while queue:
+        path = queue.popleft()
+        node = start if not path else path[-1].package
+        if len(path) >= _TYPED_PATH_MAX_HOPS:
+            stats["truncated"] += 1
+            continue
+        manifest = manifests.get(node)
+        if manifest is None:
+            continue
+        for edge in manifest.dependency_edges:
+            if not _profile_allows(profile, edge, root_hop=(node == start)):
+                continue
+            target = edge.package
+            if target in visited:
+                continue
+            next_path = (*path, edge)
+            if predicate(target) and len(next_path) > 1:
+                return _finish_typed_path(manifests, next_path, stats), stats
+            if target in counted:
+                continue
+            counted.add(target)
+            if target in ambiguous or target not in manifests:
+                if target in manifests:
+                    stats["unresolved"] += 1
+                else:
+                    stats["external"] += 1
+                visited.add(target)
+                continue
+            if stats["visited"] >= _TYPED_PATH_MAX_NODES:
+                stats["truncated"] += 1
+                visited.add(target)
+                continue
+            visited.add(target)
+            stats["visited"] += 1
+            queue.append(next_path)
+    return None, stats
+
+
+def _edge_evidence(edge: DependencyEdge) -> dict[str, Any]:
+    return {
+        "consumer": edge.consumer,
+        "manifest": edge.manifest,
+        "section": edge.section,
+        "alias": edge.alias,
+        "package": edge.package,
+        "crate_name": edge.crate_name,
+        "kind": edge.kind,
+        "target": edge.target,
+        "version": edge.version,
+        "path": edge.path,
+        "source": edge.source,
+        "optional": edge.optional,
+        "default_features": edge.default_features,
+        "inherited_features": list(edge.inherited_features),
+        "member_features": list(edge.member_features),
+        "features": list(edge.features),
+        "resolution": edge.resolution,
+    }
+
+
+def _format_leg(edge: DependencyEdge, *, host: bool) -> str:
+    flags = (
+        f"{edge.kind}|{edge.section}|alias={edge.alias}"
+        f"|target={edge.target}|{edge.resolution}"
+    )
+    if edge.optional:
+        flags += "|optional"
+    if not edge.default_features:
+        flags += "|no-default-features"
+    if host:
+        flags += "|executes-on=host"
+    return f"{edge.consumer} --[{flags}]--> {edge.package}"
+
+
+def _target_identity(
+    manifests: dict[str, Manifest], ambiguous: frozenset[str], package: str
+) -> dict[str, Any]:
+    manifest = manifests.get(package)
+    if manifest is None:
+        return {
+            "package": package,
+            "in_tree": False,
+            "manifest": None,
+            "proc_macro": False,
+            "ambiguous": False,
+        }
+    return {
+        "package": package,
+        "in_tree": True,
+        "manifest": manifest.path,
+        "proc_macro": manifest.proc_macro,
+        "ambiguous": package in ambiguous,
+    }
+
+
+def _dependency_counts(root_manifest: Manifest, profile: str) -> dict[str, Any]:
+    declared = len(root_manifest.dependency_edges)
+    if profile == PROFILE_SOURCE_WIDE:
+        selected = declared
+    else:
+        selected = sum(
+            1
+            for edge in root_manifest.dependency_edges
+            if _profile_allows(profile, edge, root_hop=True)
+        )
+    unresolved = sum(
+        1
+        for edge in root_manifest.dependency_edges
+        if edge.resolution not in _RESOLVED_EDGE
+    )
+    return {
+        "declared_edges": declared,
+        "selected_edges": selected,
+        "unresolved_edges": unresolved,
+        "denominator": (
+            f"{declared} declared edges of {root_manifest.name}; "
+            f"{selected} selected in {profile}; {unresolved} unresolved"
+        ),
+    }
+
+
+def _path_resolution(
+    manifests: dict[str, Manifest],
+    ambiguous: frozenset[str],
+    edges: tuple[DependencyEdge, ...],
+) -> str:
+    if not edges:
+        return "no-path"
+    if any(edge.package in ambiguous for edge in edges):
+        return "ambiguous-package"
+    if any(edge.package not in manifests for edge in edges):
+        return "external-unresolved"
+    return "resolved-in-tree"
+
+
+def _dependency_witness(
+    *,
+    rule: str,
+    rule_scope: str,
+    profile: str,
+    path: TypedPath | None,
+    manifests: dict[str, Manifest],
+    ambiguous: frozenset[str],
+    counts: dict[str, Any],
+    violations: int,
+) -> dict[str, Any]:
+    edges = path.edges if path is not None else ()
+    host_hops = path.host_hops if path is not None else ()
+    return {
+        "rule": rule,
+        "rule_scope": rule_scope,
+        "profile": _profile_descriptor(profile),
+        "declarations": [_edge_evidence(edge) for edge in edges],
+        "path": [
+            _format_leg(edge, host=(index in host_hops))
+            for index, edge in enumerate(edges)
+        ],
+        "conditional_hops": list(path.conditional_hops) if path is not None else [],
+        "target_identity": (
+            _target_identity(manifests, ambiguous, edges[-1].package) if edges else None
+        ),
+        "resolution": _path_resolution(manifests, ambiguous, edges),
+        "completeness": "source_only_incomplete",
+        "counts": {**counts, "violations": violations},
+        "truncated": path.truncated if path is not None else False,
+    }
+
+
+def _witness_suffix(witness: dict[str, Any]) -> str:
+    legs = " | ".join(witness["path"]) if witness["path"] else "no-path"
+    counts = witness["counts"]
+    return (
+        f"[rule={witness['rule']} scope={witness['rule_scope']} "
+        f"profile={witness['profile']['name']}(resolver=unbound) "
+        f"path={legs} completeness={witness['completeness']} "
+        f"counts=declared:{counts['declared_edges']} "
+        f"selected:{counts['selected_edges']} "
+        f"violations:{counts['violations']} "
+        f"unresolved:{counts['unresolved_edges']}]"
+    )
+
+
+def load_manifests(
+    root: Path,
+) -> tuple[dict[str, Manifest], list[Finding], frozenset[str]]:
     manifests: dict[str, Manifest] = {}
     findings: list[Finding] = []
+    ambiguous: set[str] = set()
 
+    collected: list[tuple[str, Path, dict[str, Any]]] = []
     for path in _walk(root, "Cargo.toml"):
         relative = _relative(root, path)
         try:
@@ -542,7 +1171,14 @@ def load_manifests(root: Path) -> tuple[dict[str, Manifest], list[Finding]]:
                 )
             )
             continue
+        collected.append((relative, path, data))
+    # Deterministic order: a duplicate name keeps its lowest-sorted manifest
+    # and the name is additionally recorded as ambiguous, so traversal never
+    # silently picks an arbitrary winner for path claims.
+    collected.sort(key=lambda item: item[0])
+    tables = _workspace_tables([(relative, data) for relative, _, data in collected])
 
+    for relative, path, data in collected:
         package = data.get("package")
         if not isinstance(package, dict):
             continue
@@ -559,11 +1195,46 @@ def load_manifests(root: Path) -> tuple[dict[str, Manifest], list[Finding]]:
             )
             continue
 
+        consumer = name.strip()
+        workspace_dependencies = _inheritable_workspace_dependencies(
+            relative=relative, path=path, root=root, data=data, tables=tables
+        )
+        edges, problems = _manifest_dependency_edges(
+            data,
+            consumer=consumer,
+            manifest=relative,
+            workspace_dependencies=workspace_dependencies,
+        )
+        lib = data.get("lib")
         manifest = Manifest(
-            name=name.strip(),
+            name=consumer,
             path=relative,
             dependencies=_manifest_dependencies(data),
+            dependency_edges=edges,
+            proc_macro=isinstance(lib, dict) and lib.get("proc-macro") is True,
         )
+        for problem in problems:
+            witness = _dependency_witness(
+                rule="manifest-parse",
+                rule_scope="resolution-incomplete",
+                profile=PROFILE_SOURCE_WIDE,
+                path=None,
+                manifests={},
+                ambiguous=frozenset(),
+                counts=_dependency_counts(manifest, PROFILE_SOURCE_WIDE),
+                violations=1,
+            )
+            findings.append(
+                Finding(
+                    "AUDIT_SIGNAL",
+                    "dependency_resolution_incomplete",
+                    relative,
+                    consumer,
+                    f"Cargo dependency table is not interpretable ({problem}); "
+                    f"evidence is incomplete, not absent. {_witness_suffix(witness)}",
+                    witness=witness,
+                )
+            )
         previous = manifests.get(manifest.name)
         if previous is not None:
             findings.append(
@@ -575,10 +1246,11 @@ def load_manifests(root: Path) -> tuple[dict[str, Manifest], list[Finding]]:
                     f"Package name also declared by {previous.path}.",
                 )
             )
+            ambiguous.add(manifest.name)
             continue
         manifests[manifest.name] = manifest
 
-    return manifests, findings
+    return manifests, findings, frozenset(ambiguous)
 
 
 def load_policy(path: Path) -> dict[str, Any]:
@@ -779,6 +1451,13 @@ def validate_policy(root: Path, policy: dict[str, Any]) -> list[Finding]:
 
 
 def build_graph(manifests: dict[str, Manifest]) -> dict[str, set[str]]:
+    """Source-wide in-tree name adjacency (compatibility projection).
+
+    SOURCE-WIDE ONLY. This untyped name graph must not back runtime claims:
+    runtime/test/build evidence uses the typed DependencyEdge projections via
+    _typed_dependency_path. Retained so existing name-graph readers keep
+    working while they migrate to typed edges.
+    """
     names = set(manifests)
     return {
         package: {dependency for dependency in manifest.dependencies if dependency in names}
@@ -793,6 +1472,7 @@ def _forbidden(name: str, exact: set[str], prefixes: tuple[str, ...]) -> bool:
 def _dependency_path(
     graph: dict[str, set[str]], start: str, predicate: Any
 ) -> list[str] | None:
+    """Source-wide name path (compatibility helper; not a runtime claim)."""
     queue: deque[list[str]] = deque([[start]])
     visited = {start}
     while queue:
@@ -809,31 +1489,64 @@ def _dependency_path(
 
 
 def audit_dependencies(
-    manifests: dict[str, Manifest], policy: dict[str, Any]
+    manifests: dict[str, Manifest],
+    policy: dict[str, Any],
+    ambiguous: frozenset[str] = frozenset(),
 ) -> list[Finding]:
     findings: list[Finding] = []
-    graph = build_graph(manifests)
+    ambiguous = frozenset(ambiguous)
 
     store_table = policy.get("store_vendor", {})
     allowed_store_packages = set(store_table.get("allowed_packages", []))
-    for manifest in manifests.values():
-        if "surrealdb" in manifest.dependencies and manifest.name not in allowed_store_packages:
+    for manifest in sorted(manifests.values(), key=lambda item: item.name):
+        leaks = [
+            edge for edge in manifest.dependency_edges if edge.package == "surrealdb"
+        ]
+        if leaks and manifest.name not in allowed_store_packages:
+            counts = _dependency_counts(manifest, PROFILE_SOURCE_WIDE)
+            witness = _dependency_witness(
+                rule="store_vendor",
+                rule_scope="source-wide",
+                profile=PROFILE_SOURCE_WIDE,
+                path=_finish_typed_path(manifests, tuple(leaks), {"truncated": 0}),
+                manifests=manifests,
+                ambiguous=ambiguous,
+                counts=counts,
+                violations=len(leaks),
+            )
             findings.append(
                 Finding(
                     "HARD_VIOLATION",
                     "surrealdb_dependency_leak",
                     manifest.path,
                     manifest.name,
-                    "SurrealDB dependency is outside the admitted store contour.",
+                    "SurrealDB dependency is outside the admitted store contour. "
+                    f"{_witness_suffix(witness)}",
                     19,
+                    witness=witness,
                 )
             )
 
-    for item in policy.get("runtime_root", []):
+    for index, item in enumerate(policy.get("runtime_root", [])):
         if not isinstance(item, dict):
             continue
         package = str(item.get("package", "")).strip()
         issue = item.get("issue") if isinstance(item.get("issue"), int) else None
+        unknown_keys = sorted(set(item) - _RUNTIME_ROOT_KNOWN_KEYS)
+        if unknown_keys:
+            findings.append(
+                Finding(
+                    "AUDIT_SIGNAL",
+                    "runtime_root_scope_unresolved",
+                    "config/architecture-boundaries.toml",
+                    package or None,
+                    f"Runtime-root entry #{index} for {package!r} carries "
+                    f"unresolved rule scope keys {unknown_keys}; edges under this "
+                    "entry are evaluated against the declared exact/prefix sets "
+                    "only, and the unknown scope is not allowed.",
+                    issue,
+                )
+            )
         manifest = manifests.get(package)
         if manifest is None:
             findings.append(
@@ -851,30 +1564,211 @@ def audit_dependencies(
         exact = set(str(value) for value in item.get("forbidden_exact", []))
         prefixes = tuple(str(value) for value in item.get("forbidden_prefix", []))
         predicate = lambda name: _forbidden(name, exact, prefixes)
+        if issue is None:
+            rule = f"runtime_root:package={package}"
+        else:
+            rule = f"runtime_root:package={package}#{issue}"
 
-        for dependency in manifest.dependencies:
-            if predicate(dependency):
-                findings.append(
-                    Finding(
-                        "HARD_VIOLATION",
-                        "runtime_root_forbidden_direct_dependency",
-                        manifest.path,
-                        package,
-                        f"Direct dependency {dependency!r} violates the runtime-root boundary.",
-                        issue,
-                    )
+        # Direct declarations: each edge is judged in its own kind/target
+        # scope, so a dev path to a package can never mask a real normal
+        # path to the same package (and vice versa).
+        for edge in manifest.dependency_edges:
+            if not predicate(edge.package):
+                continue
+            if edge.kind == "normal" and not _edge_is_conditional(edge):
+                profile = PROFILE_SOURCE_RUNTIME
+                scope = "selected-source-runtime"
+                severity = "HARD_VIOLATION"
+                code = "runtime_root_forbidden_direct_dependency"
+                detail = (
+                    f"Direct dependency {edge.package!r} violates the "
+                    "runtime-root boundary."
                 )
+            elif edge.kind == "normal":
+                profile = PROFILE_SOURCE_RUNTIME
+                scope = "conditional-unresolved"
+                severity = "AUDIT_SIGNAL"
+                code = "runtime_root_forbidden_conditional_dependency"
+                detail = (
+                    f"Conditional normal dependency {edge.package!r} "
+                    f"(target={edge.target} optional={edge.optional}) may violate "
+                    "the runtime-root boundary; applicability is unresolved "
+                    "without resolver evidence."
+                )
+            elif edge.kind == "dev":
+                profile = PROFILE_SOURCE_TEST
+                scope = "selected-source-test"
+                severity = "AUDIT_SIGNAL"
+                code = "runtime_root_forbidden_test_dependency"
+                detail = (
+                    f"Test-scoped dev dependency {edge.package!r} is recorded in "
+                    "the test projection, not as a runtime-root selected edge."
+                )
+            else:
+                profile = PROFILE_SOURCE_BUILD
+                scope = "selected-source-build"
+                severity = "AUDIT_SIGNAL"
+                code = "runtime_root_forbidden_build_dependency"
+                detail = (
+                    f"Build-scoped dependency {edge.package!r} is recorded in "
+                    "the build/tooling projection, not as target-runtime code."
+                )
+            witness = _dependency_witness(
+                rule=rule,
+                rule_scope=scope,
+                profile=profile,
+                path=_single_edge_path(manifests, edge),
+                manifests=manifests,
+                ambiguous=ambiguous,
+                counts=_dependency_counts(manifest, profile),
+                violations=1,
+            )
+            findings.append(
+                Finding(
+                    severity,
+                    code,
+                    manifest.path,
+                    package,
+                    f"{detail} {_witness_suffix(witness)}",
+                    issue,
+                    witness=witness,
+                )
+            )
 
-        path = _dependency_path(graph, package, predicate)
-        if path is not None and len(path) > 2:
+        runtime_path, _ = _typed_dependency_path(
+            manifests, ambiguous, package, predicate, PROFILE_SOURCE_RUNTIME
+        )
+        if runtime_path is not None and len(runtime_path.edges) > 1:
+            chain = " -> ".join(
+                [package, *(edge.package for edge in runtime_path.edges)]
+            )
+            witness = _dependency_witness(
+                rule=rule,
+                rule_scope="selected-source-runtime",
+                profile=PROFILE_SOURCE_RUNTIME,
+                path=runtime_path,
+                manifests=manifests,
+                ambiguous=ambiguous,
+                counts=_dependency_counts(manifest, PROFILE_SOURCE_RUNTIME),
+                violations=1,
+            )
             findings.append(
                 Finding(
                     "AUDIT_SIGNAL",
                     "runtime_root_forbidden_transitive_dependency",
                     manifest.path,
                     package,
-                    "Transitive closure reaches a forbidden owner: " + " -> ".join(path),
+                    "Transitive closure reaches a forbidden owner: "
+                    f"{chain}. {_witness_suffix(witness)}",
                     issue,
+                    witness=witness,
+                )
+            )
+
+        test_path, _ = _typed_dependency_path(
+            manifests, ambiguous, package, predicate, PROFILE_SOURCE_TEST
+        )
+        if (
+            test_path is not None
+            and len(test_path.edges) > 1
+            and test_path.edges[0].kind == "dev"
+        ):
+            chain = " -> ".join(
+                [package, *(edge.package for edge in test_path.edges)]
+            )
+            witness = _dependency_witness(
+                rule=rule,
+                rule_scope="selected-source-test",
+                profile=PROFILE_SOURCE_TEST,
+                path=test_path,
+                manifests=manifests,
+                ambiguous=ambiguous,
+                counts=_dependency_counts(manifest, PROFILE_SOURCE_TEST),
+                violations=1,
+            )
+            findings.append(
+                Finding(
+                    "AUDIT_SIGNAL",
+                    "runtime_root_forbidden_test_dependency",
+                    manifest.path,
+                    package,
+                    "Test projection reaches a forbidden owner through dev edges: "
+                    f"{chain}. {_witness_suffix(witness)}",
+                    issue,
+                    witness=witness,
+                )
+            )
+
+        build_path, _ = _typed_dependency_path(
+            manifests, ambiguous, package, predicate, PROFILE_SOURCE_BUILD
+        )
+        if (
+            build_path is not None
+            and len(build_path.edges) > 1
+            and build_path.edges[0].kind == "build"
+        ):
+            chain = " -> ".join(
+                [package, *(edge.package for edge in build_path.edges)]
+            )
+            witness = _dependency_witness(
+                rule=rule,
+                rule_scope="selected-source-build",
+                profile=PROFILE_SOURCE_BUILD,
+                path=build_path,
+                manifests=manifests,
+                ambiguous=ambiguous,
+                counts=_dependency_counts(manifest, PROFILE_SOURCE_BUILD),
+                violations=1,
+            )
+            findings.append(
+                Finding(
+                    "AUDIT_SIGNAL",
+                    "runtime_root_forbidden_build_dependency",
+                    manifest.path,
+                    package,
+                    "Build/tooling projection reaches a forbidden owner: "
+                    f"{chain}. {_witness_suffix(witness)}",
+                    issue,
+                    witness=witness,
+                )
+            )
+
+    for manifest in sorted(manifests.values(), key=lambda item: item.name):
+        for edge in manifest.dependency_edges:
+            if edge.resolution in _RESOLVED_EDGE:
+                continue
+            reason = {
+                RESOLUTION_UNRESOLVED_WORKSPACE: (
+                    "workspace=true but no owning [workspace.dependencies] "
+                    f"definition for {edge.alias!r}"
+                ),
+                RESOLUTION_UNSUPPORTED_DECLARATION: (
+                    "unsupported declaration shape or invalid workspace marker"
+                ),
+                RESOLUTION_DEGRADED_METADATA: (
+                    "malformed version/feature/flag metadata preserved as declared"
+                ),
+            }.get(edge.resolution, f"resolution {edge.resolution!r}")
+            witness = _dependency_witness(
+                rule="manifest-parse",
+                rule_scope="resolution-incomplete",
+                profile=PROFILE_SOURCE_WIDE,
+                path=_single_edge_path(manifests, edge),
+                manifests=manifests,
+                ambiguous=ambiguous,
+                counts=_dependency_counts(manifest, PROFILE_SOURCE_WIDE),
+                violations=1,
+            )
+            findings.append(
+                Finding(
+                    "AUDIT_SIGNAL",
+                    "dependency_resolution_incomplete",
+                    manifest.path,
+                    manifest.name,
+                    f"Dependency declaration {edge.alias!r} in {edge.section} "
+                    f"cannot be resolved ({reason}); evidence is incomplete, "
+                    f"not absent. {_witness_suffix(witness)}",
+                    witness=witness,
                 )
             )
 
@@ -1297,10 +2191,10 @@ def audit_source(
 
 def audit(root: Path, policy_path: Path) -> list[Finding]:
     policy = load_policy(policy_path)
-    manifests, findings = load_manifests(root)
+    manifests, findings, ambiguous = load_manifests(root)
     findings.extend(validate_policy(root, policy))
     findings.extend(_audit_process_lint_config(root))
-    findings.extend(audit_dependencies(manifests, policy))
+    findings.extend(audit_dependencies(manifests, policy, ambiguous))
     findings.extend(audit_source(root, manifests, policy))
     return sorted(
         findings,
