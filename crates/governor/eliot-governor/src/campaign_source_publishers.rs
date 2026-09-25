@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_contracts::{ArtifactId, SourceId, StateFence};
 use eliot_learning_contracts::{
     CampaignOwnerRecordId, CampaignOwnerRevision, CampaignSlotProjectionDigest,
-    CampaignSourceBinding, CampaignSourceRevisionRef, CampaignSourceRole, LearningStateViewRecipe,
-    OwnerDisagreement, OwnerId, SlotProjection,
+    CampaignSourceBinding, CampaignSourceRequirement, CampaignSourceRevisionRef,
+    CampaignSourceRole, LearningStateViewRecipe, OwnerDisagreement, OwnerId, SlotProjection,
 };
 use eliot_reactive_context_plan::{
     CampaignBudgets, CampaignIntent, CampaignOutputMode, PlanParts, RetrievalRouteKind,
@@ -338,6 +338,19 @@ impl CampaignSourcePublicationBundle {
             .map(|requirement| (requirement.role, requirement))
             .collect::<BTreeMap<_, _>>();
         let expected_roles = CampaignSourceRole::all();
+        self.admit_publication_count(&requirements, &expected_roles)?;
+        let (by_role, history_count) = self.admit_each_publication(recipe, &requirements)?;
+        admit_role_bindings(recipe, &requirements, &expected_roles, &by_role)?;
+        admit_bound_task_plan(recipe, &by_role)?;
+        admit_campaign_history(history_count)
+    }
+
+    /// Requires exactly one owner publication per non-absent declared role.
+    fn admit_publication_count(
+        &self,
+        requirements: &BTreeMap<CampaignSourceRole, &CampaignSourceRequirement>,
+        expected_roles: &[CampaignSourceRole],
+    ) -> Result<(), CampaignSourcePublisherError> {
         let required_publications = expected_roles
             .iter()
             .filter(|role| {
@@ -352,180 +365,230 @@ impl CampaignSourcePublicationBundle {
                 self.publications.len()
             )));
         }
-
-        let mut by_role = BTreeMap::new();
-        let mut history_count = 0usize;
-        for publication in &self.publications {
-            publication
-                .validate()
-                .map_err(|error| CampaignSourcePublisherError::Invalid(error.to_string()))?;
-            if publication.read_receipt.read_state_fence != recipe.binding.state_fence {
-                return Err(CampaignSourcePublisherError::Invalid(format!(
-                    "source {:?} is not bound to the authenticated current read fence",
-                    publication.record.role
-                )));
-            }
-            for plan in &publication.record.history_plans {
-                plan.validate_for_source_at_fence(
-                    recipe.campaign_id.as_str(),
-                    &publication.record.owner_id,
-                    &recipe.binding.state_fence,
-                )
-                .map_err(|error| CampaignSourcePublisherError::Invalid(error.to_string()))?;
-            }
-            let role = publication.record.role;
-            let requirement = requirements.get(&role).ok_or_else(|| {
-                CampaignSourcePublisherError::Invalid(format!(
-                    "publication contains undeclared source role {role:?}"
-                ))
-            })?;
-            if publication.publisher.role() != role {
-                return Err(CampaignSourcePublisherError::Invalid(format!(
-                    "publisher and source role disagree for {role:?}"
-                )));
-            }
-            if requirement.source_binding == CampaignSourceBinding::ExplicitlyAbsent {
-                return Err(CampaignSourcePublisherError::Invalid(format!(
-                    "explicitly absent role {role:?} must not have a publication"
-                )));
-            }
-            if by_role.insert(role, publication).is_some() {
-                return Err(CampaignSourcePublisherError::Incomplete(format!(
-                    "duplicate source role {role:?}"
-                )));
-            }
-            // The row's recorded fence is historical owner lineage.  It is
-            // intentionally not compared with the packet's current read
-            // fence; only the authenticated read receipt/current resolution
-            // can establish currentness.  Task-anchor rows are the one
-            // exception: they are minted by this same task transition and
-            // must carry its exact fence.
-            if matches!(
-                role,
-                CampaignSourceRole::TaskObjective
-                    | CampaignSourceRole::TaskAcceptance
-                    | CampaignSourceRole::TaskPlan
-                    | CampaignSourceRole::TaskOpenItems
-            ) && publication.record.recorded_state_fence != recipe.binding.state_fence
-            {
-                return Err(CampaignSourcePublisherError::Invalid(format!(
-                    "Task Controller source {role:?} is not bound to the recipe State Fence"
-                )));
-            }
-            let owner_matches = if role == CampaignSourceRole::ContextDelivery {
-                publication
-                    .record
-                    .owner_id
-                    .as_str()
-                    .starts_with("owner:eliot-context/")
-                    && publication
-                        .record
-                        .document
-                        .body
-                        .get("owner_id")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(publication.record.owner_id.as_str())
-            } else {
-                publication.record.owner_id.as_str() == campaign_source_owner_id(role)
-            };
-            if !owner_matches || requirement.owner != publication.record.owner_id {
-                return Err(CampaignSourcePublisherError::Invalid(format!(
-                    "source {role:?} has the wrong owner identity"
-                )));
-            }
-            history_count = history_count.saturating_add(publication.record.history_plans.len());
-        }
-
-        for role in expected_roles {
-            let requirement = requirements.get(&role).ok_or_else(|| {
-                CampaignSourcePublisherError::Incomplete(format!(
-                    "recipe omits source role {role:?}"
-                ))
-            })?;
-            match requirement.source_binding {
-                CampaignSourceBinding::ExplicitlyAbsent => {
-                    if requirement.load_bearing {
-                        return Err(CampaignSourcePublisherError::Invalid(format!(
-                            "explicitly absent role {role:?} cannot be load-bearing"
-                        )));
-                    }
-                    if by_role.contains_key(&role) {
-                        return Err(CampaignSourcePublisherError::Invalid(format!(
-                            "explicitly absent role {role:?} has a publication"
-                        )));
-                    }
-                }
-                CampaignSourceBinding::AuthenticatedTaskAnchor => {
-                    let publication = by_role.get(&role).ok_or_else(|| {
-                        CampaignSourcePublisherError::Incomplete(format!(
-                            "publication bundle omits authenticated role {role:?}"
-                        ))
-                    })?;
-                    if role != CampaignSourceRole::TaskPlan
-                        || publication.record.role != CampaignSourceRole::TaskPlan
-                        || publication.record.record_id
-                            != CampaignOwnerRecordId::Task(recipe.binding.task_id.clone())
-                        || publication.record.revision
-                            != CampaignOwnerRevision::Task(
-                                recipe.binding.state_fence.task_revision.ok_or_else(|| {
-                                    CampaignSourcePublisherError::Invalid(
-                                        "TaskPlan recipe has no task revision".to_owned(),
-                                    )
-                                })?,
-                            )
-                    {
-                        return Err(CampaignSourcePublisherError::Invalid(
-                            "authenticated task anchor is not the exact TaskPlan row".to_owned(),
-                        ));
-                    }
-                }
-                CampaignSourceBinding::ExactReference => {
-                    let publication = by_role.get(&role).ok_or_else(|| {
-                        CampaignSourcePublisherError::Incomplete(format!(
-                            "publication bundle omits exact role {role:?}"
-                        ))
-                    })?;
-                    let expected = requirement.expected_reference.as_ref().ok_or_else(|| {
-                        CampaignSourcePublisherError::Invalid(format!(
-                            "exact role {role:?} lacks an expected reference"
-                        ))
-                    })?;
-                    if source_revision_ref(&publication.record) != *expected {
-                        return Err(CampaignSourcePublisherError::Invalid(format!(
-                            "source {role:?} does not bind the recipe reference"
-                        )));
-                    }
-                }
-            }
-        }
-
-        let task_plan = by_role
-            .get(&CampaignSourceRole::TaskPlan)
-            .and_then(|publication| {
-                serde_json::from_value::<LearningStateViewRecipe>(
-                    publication.record.document.body.clone(),
-                )
-                .ok()
-            })
-            .ok_or_else(|| {
-                CampaignSourcePublisherError::Invalid(
-                    "TaskPlan publication is not the typed recipe".to_owned(),
-                )
-            })?;
-        if &task_plan != recipe {
-            return Err(CampaignSourcePublisherError::Invalid(
-                "TaskPlan publication does not equal the bound recipe".to_owned(),
-            ));
-        }
-        if history_count == 0 {
-            return Err(CampaignSourcePublisherError::Incomplete(
-                "campaign history requires at least one owner-produced RetrievalPlan record"
-                    .to_owned(),
-            ));
-        }
         Ok(())
     }
 
+    /// Admit every presented row once and return the role index plus the number
+    /// of owner-produced history plans the bundle carries.
+    fn admit_each_publication<'row>(
+        &'row self,
+        recipe: &LearningStateViewRecipe,
+        requirements: &BTreeMap<CampaignSourceRole, &CampaignSourceRequirement>,
+    ) -> Result<
+        (
+            BTreeMap<CampaignSourceRole, &'row CampaignSourcePublication>,
+            usize,
+        ),
+        CampaignSourcePublisherError,
+    > {
+        let mut by_role = BTreeMap::new();
+        let mut history_count = 0usize;
+        for publication in &self.publications {
+            admit_one_publication(recipe, requirements, publication, &mut by_role)?;
+            history_count = history_count.saturating_add(publication.record.history_plans.len());
+        }
+        Ok((by_role, history_count))
+    }
+}
+
+/// Admit one presented owner row against the authenticated read fence, the
+/// recipe's declared requirement, and the closed role/owner registry.
+///
+/// The row's recorded fence is historical owner lineage. It is intentionally
+/// not compared with the packet's current read fence; only the authenticated
+/// read receipt/current resolution can establish currentness. Task-anchor rows
+/// are the one exception: they are minted by this same task transition and must
+/// carry its exact fence.
+fn admit_one_publication<'row>(
+    recipe: &LearningStateViewRecipe,
+    requirements: &BTreeMap<CampaignSourceRole, &CampaignSourceRequirement>,
+    publication: &'row CampaignSourcePublication,
+    by_role: &mut BTreeMap<CampaignSourceRole, &'row CampaignSourcePublication>,
+) -> Result<(), CampaignSourcePublisherError> {
+    publication
+        .validate()
+        .map_err(|error| CampaignSourcePublisherError::Invalid(error.to_string()))?;
+    if publication.read_receipt.read_state_fence != recipe.binding.state_fence {
+        return Err(CampaignSourcePublisherError::Invalid(format!(
+            "source {:?} is not bound to the authenticated current read fence",
+            publication.record.role
+        )));
+    }
+    for plan in &publication.record.history_plans {
+        plan.validate_for_source_at_fence(
+            recipe.campaign_id.as_str(),
+            &publication.record.owner_id,
+            &recipe.binding.state_fence,
+        )
+        .map_err(|error| CampaignSourcePublisherError::Invalid(error.to_string()))?;
+    }
+    let role = publication.record.role;
+    let requirement = requirements.get(&role).ok_or_else(|| {
+        CampaignSourcePublisherError::Invalid(format!(
+            "publication contains undeclared source role {role:?}"
+        ))
+    })?;
+    if publication.publisher.role() != role {
+        return Err(CampaignSourcePublisherError::Invalid(format!(
+            "publisher and source role disagree for {role:?}"
+        )));
+    }
+    if requirement.source_binding == CampaignSourceBinding::ExplicitlyAbsent {
+        return Err(CampaignSourcePublisherError::Invalid(format!(
+            "explicitly absent role {role:?} must not have a publication"
+        )));
+    }
+    if by_role.insert(role, publication).is_some() {
+        return Err(CampaignSourcePublisherError::Incomplete(format!(
+            "duplicate source role {role:?}"
+        )));
+    }
+    if matches!(
+        role,
+        CampaignSourceRole::TaskObjective
+            | CampaignSourceRole::TaskAcceptance
+            | CampaignSourceRole::TaskPlan
+            | CampaignSourceRole::TaskOpenItems
+    ) && publication.record.recorded_state_fence != recipe.binding.state_fence
+    {
+        return Err(CampaignSourcePublisherError::Invalid(format!(
+            "Task Controller source {role:?} is not bound to the recipe State Fence"
+        )));
+    }
+    let owner_matches = if role == CampaignSourceRole::ContextDelivery {
+        publication
+            .record
+            .owner_id
+            .as_str()
+            .starts_with("owner:eliot-context/")
+            && publication
+                .record
+                .document
+                .body
+                .get("owner_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(publication.record.owner_id.as_str())
+    } else {
+        publication.record.owner_id.as_str() == campaign_source_owner_id(role)
+    };
+    if !owner_matches || requirement.owner != publication.record.owner_id {
+        return Err(CampaignSourcePublisherError::Invalid(format!(
+            "source {role:?} has the wrong owner identity"
+        )));
+    }
+    Ok(())
+}
+
+/// Admit the closed denominator: every declared role is accounted for by
+/// either its owner-issued row or an explicit recipe absence.
+fn admit_role_bindings(
+    recipe: &LearningStateViewRecipe,
+    requirements: &BTreeMap<CampaignSourceRole, &CampaignSourceRequirement>,
+    expected_roles: &[CampaignSourceRole],
+    by_role: &BTreeMap<CampaignSourceRole, &CampaignSourcePublication>,
+) -> Result<(), CampaignSourcePublisherError> {
+    for &role in expected_roles {
+        let requirement = requirements.get(&role).ok_or_else(|| {
+            CampaignSourcePublisherError::Incomplete(format!("recipe omits source role {role:?}"))
+        })?;
+        match requirement.source_binding {
+            CampaignSourceBinding::ExplicitlyAbsent => {
+                if requirement.load_bearing {
+                    return Err(CampaignSourcePublisherError::Invalid(format!(
+                        "explicitly absent role {role:?} cannot be load-bearing"
+                    )));
+                }
+                if by_role.contains_key(&role) {
+                    return Err(CampaignSourcePublisherError::Invalid(format!(
+                        "explicitly absent role {role:?} has a publication"
+                    )));
+                }
+            }
+            CampaignSourceBinding::AuthenticatedTaskAnchor => {
+                let publication = by_role.get(&role).ok_or_else(|| {
+                    CampaignSourcePublisherError::Incomplete(format!(
+                        "publication bundle omits authenticated role {role:?}"
+                    ))
+                })?;
+                if role != CampaignSourceRole::TaskPlan
+                    || publication.record.role != CampaignSourceRole::TaskPlan
+                    || publication.record.record_id
+                        != CampaignOwnerRecordId::Task(recipe.binding.task_id.clone())
+                    || publication.record.revision
+                        != CampaignOwnerRevision::Task(
+                            recipe.binding.state_fence.task_revision.ok_or_else(|| {
+                                CampaignSourcePublisherError::Invalid(
+                                    "TaskPlan recipe has no task revision".to_owned(),
+                                )
+                            })?,
+                        )
+                {
+                    return Err(CampaignSourcePublisherError::Invalid(
+                        "authenticated task anchor is not the exact TaskPlan row".to_owned(),
+                    ));
+                }
+            }
+            CampaignSourceBinding::ExactReference => {
+                let publication = by_role.get(&role).ok_or_else(|| {
+                    CampaignSourcePublisherError::Incomplete(format!(
+                        "publication bundle omits exact role {role:?}"
+                    ))
+                })?;
+                let expected = requirement.expected_reference.as_ref().ok_or_else(|| {
+                    CampaignSourcePublisherError::Invalid(format!(
+                        "exact role {role:?} lacks an expected reference"
+                    ))
+                })?;
+                if source_revision_ref(&publication.record) != *expected {
+                    return Err(CampaignSourcePublisherError::Invalid(format!(
+                        "source {role:?} does not bind the recipe reference"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Requires the `TaskPlan` row to carry exactly the recipe this bundle is bound
+/// to, so the 26-role matrix cannot describe a different compilation.
+fn admit_bound_task_plan(
+    recipe: &LearningStateViewRecipe,
+    by_role: &BTreeMap<CampaignSourceRole, &CampaignSourcePublication>,
+) -> Result<(), CampaignSourcePublisherError> {
+    let task_plan = by_role
+        .get(&CampaignSourceRole::TaskPlan)
+        .and_then(|publication| {
+            serde_json::from_value::<LearningStateViewRecipe>(
+                publication.record.document.body.clone(),
+            )
+            .ok()
+        })
+        .ok_or_else(|| {
+            CampaignSourcePublisherError::Invalid(
+                "TaskPlan publication is not the typed recipe".to_owned(),
+            )
+        })?;
+    if &task_plan != recipe {
+        return Err(CampaignSourcePublisherError::Invalid(
+            "TaskPlan publication does not equal the bound recipe".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Requires at least one owner-produced bounded history plan: a campaign view
+/// compiled from owner rows alone may not be history-free.
+fn admit_campaign_history(history_count: usize) -> Result<(), CampaignSourcePublisherError> {
+    if history_count == 0 {
+        return Err(CampaignSourcePublisherError::Incomplete(
+            "campaign history requires at least one owner-produced RetrievalPlan record".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+impl CampaignSourcePublicationBundle {
     /// Validate the complete production denominator, not merely the rows
     /// required by a recipe that may contain explicit absences. This is the
     /// gate used by the owner-transition path: every closed role must be

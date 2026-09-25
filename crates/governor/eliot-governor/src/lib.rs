@@ -155,7 +155,7 @@ pub use swarm_plan_attachment_service::{
     ATTACHMENT_ORDERING_SCOPE, ATTACHMENT_REVISION_KEY, CanonicalAttachmentStoreError,
     CanonicalSwarmPlanAttachmentStore, SwarmPlanAttachmentService,
 };
-pub use task_lifecycle::{GovernorTaskLifecycle, TaskLifecycleError};
+pub use task_lifecycle::{GovernorTaskLifecycle, GuardedTaskCommand, TaskLifecycleError};
 pub use wasm_resolution::{
     CONFORMANCE_COMPONENT, CONFORMANCE_INPUT, CONFORMANCE_SEED, ContourAdmission,
     GovernorWasmAdmission, PromotionExpectations,
