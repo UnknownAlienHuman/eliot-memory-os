@@ -1,13 +1,14 @@
 //! Typed versioned research-provider wire protocol.
 //!
 //! The request envelope is encoded before the Kernel-issued process request
-//! is minted and is carried as an exact process argument. The executor's
-//! argv is therefore the delivery channel: the child receives the bytes that
-//! were hashed and admitted, rather than a locally reconstructed equivalent.
-//! Provider-local job identifiers remain correlation evidence only.
+//! is minted. The complete typed request is written to an operation-specific
+//! protected request channel; argv carries only the channel token. The
+//! provider-local job identifier remains correlation evidence only.
 
 use eliot_contracts::ContractVersion;
-use eliot_research_exchange_api::{DisclosureClass, ResearchEvidenceBundle, ResearchQueryRequest};
+use eliot_research_exchange_api::{
+    CompletionDisposition, DisclosureClass, ResearchEvidenceBundle, ResearchQueryRequest,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::admission::ProviderAdmission;
@@ -80,7 +81,9 @@ impl ResearchRequestChannel {
         request: &ResearchQueryRequest,
         operation_id: &str,
     ) -> Result<Self, ProtocolRefusal> {
-        request.validate().map_err(|_| ProtocolRefusal::MalformedWire)?;
+        request
+            .validate()
+            .map_err(|_| ProtocolRefusal::MalformedWire)?;
         let request_bytes = eliot_contracts::canonical_json_bytes(request)
             .map_err(|_| ProtocolRefusal::MalformedWire)?;
         if request_bytes.len() > MAX_CHANNEL_BYTES {
@@ -154,11 +157,10 @@ impl ResearchResultDocument {
         if bytes.len() > MAX_CHANNEL_BYTES {
             return Err(ProtocolRefusal::WireTooLarge);
         }
-        let document: Self = serde_json::from_slice(bytes)
-            .map_err(|_| ProtocolRefusal::MalformedWire)?;
+        let document: Self =
+            serde_json::from_slice(bytes).map_err(|_| ProtocolRefusal::MalformedWire)?;
         let frame = ResultFrame::decode(
-            &serde_json::to_vec(&document.frame)
-                .map_err(|_| ProtocolRefusal::MalformedWire)?,
+            &serde_json::to_vec(&document.frame).map_err(|_| ProtocolRefusal::MalformedWire)?,
             expected_operation,
             expected_request_sha256,
             expected_route,
@@ -166,10 +168,35 @@ impl ResearchResultDocument {
         if frame != document.frame {
             return Err(ProtocolRefusal::MalformedWire);
         }
+        match (frame.disposition, &document.candidate) {
+            (ProviderResultDisposition::CompletedCandidateAvailable, None)
+            | (ProviderResultDisposition::ProviderCancelled, Some(_))
+            | (ProviderResultDisposition::ProviderFailed, Some(_)) => {
+                return Err(ProtocolRefusal::MalformedWire);
+            }
+            _ => {}
+        }
         if let Some(candidate) = &document.candidate {
             candidate
                 .validate_against(request)
                 .map_err(|_| ProtocolRefusal::MalformedWire)?;
+            let candidate_bytes = eliot_contracts::canonical_json_bytes(candidate)
+                .map_err(|_| ProtocolRefusal::MalformedWire)?;
+            if crate::sha256_hex(&candidate_bytes) != frame.candidate_sha256 {
+                return Err(ProtocolRefusal::MalformedWire);
+            }
+            if frame.coverage_denominator != CoverageDenominator::CompleteScope
+                && candidate.coverage_gaps.is_empty()
+                && candidate.coverage_unknowns.is_empty()
+                && candidate.failed_acquisition.is_empty()
+            {
+                return Err(ProtocolRefusal::MalformedWire);
+            }
+            if frame.coverage_denominator == CoverageDenominator::CompleteScope
+                && candidate.disposition == CompletionDisposition::IncompleteCoverage
+            {
+                return Err(ProtocolRefusal::MalformedWire);
+            }
             let candidate_sources = candidate
                 .sources
                 .iter()

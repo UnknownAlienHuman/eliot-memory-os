@@ -285,9 +285,11 @@ pub struct ProviderAttemptReceipt {
     /// could not be completed; it is never replaced by a clean refusal.
     pub process_error: Option<String>,
     /// Cancellation failure retained instead of being discarded after a timeout.
+    #[serde(default)]
     pub cancellation_error: Option<String>,
     /// Reconciliation failure retained instead of being discarded after an
     /// unknown or timed-out outcome.
+    #[serde(default)]
     pub reconciliation_error: Option<String>,
     /// Terminal provider/process classification carried by this receipt.
     pub outcome: ProviderOutcome,
@@ -320,13 +322,15 @@ pub struct ProviderAttemptReceipt {
     /// Absolute operation deadline and cancellation identity.
     pub deadline_unix_ms: i64,
     pub cancellation_id: String,
-    /// SHA-256 of the exact request bytes delivered to the child.
+    /// SHA-256 of the exact typed request bytes delivered through the
+    /// protected request channel.
     pub wire_sha256: String,
     /// Raw stream/exit/lineage evidence.
     pub raw_evidence: RawProviderEvidence,
     /// Optional durable typed stream/process evidence returned by reconcile.
     pub reconciliation: Option<ProcessEvidence>,
     /// Path of the bounded provider result channel, when one was delivered.
+    #[serde(default)]
     pub result_channel_path: Option<String>,
     /// Cancellation receipt, retained rather than discarded.
     pub cancellation: Option<CancellationReceipt>,

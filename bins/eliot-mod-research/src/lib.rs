@@ -1097,9 +1097,24 @@ mod tests {
             &self,
             _admission: &super::admission::ProviderAdmission,
             _envelope: &super::protocol::SubmitEnvelope,
-            _wire_bytes: &[u8],
+            _request: &eliot_research_exchange_api::ResearchQueryRequest,
+            _channel: &super::protocol::ResearchRequestChannel,
         ) -> Result<eliot_process::ProcessRequest, super::execution::RequestPortError> {
             Err(self.0)
+        }
+
+        fn admitted_working_directory(
+            &self,
+            _admission: &super::admission::ProviderAdmission,
+        ) -> Result<std::path::PathBuf, super::execution::RequestPortError> {
+            Err(super::execution::RequestPortError::WireDeliveryRefused)
+        }
+
+        fn admitted_fence_nonce(
+            &self,
+            _admission: &super::admission::ProviderAdmission,
+        ) -> Result<String, super::execution::RequestPortError> {
+            Err(super::execution::RequestPortError::WireDeliveryRefused)
         }
     }
 

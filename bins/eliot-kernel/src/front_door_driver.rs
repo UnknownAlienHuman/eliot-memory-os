@@ -353,13 +353,7 @@ async fn serve_connection(
                 payload,
             } => {
                 let reply = kernel
-                    .execute_research_request(
-                        &session,
-                        request_id,
-                        &identity,
-                        &operation,
-                        payload,
-                    )
+                    .execute_research_request(&session, request_id, &identity, &operation, payload)
                     .await?;
                 if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
                     session.fence();

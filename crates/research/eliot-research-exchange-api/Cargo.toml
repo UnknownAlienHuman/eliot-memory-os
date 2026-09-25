@@ -8,6 +8,7 @@ description = "ELIOT-owned governed research exchange wire contracts"
 
 [dependencies]
 eliot-contracts.workspace = true
+ed25519-dalek.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

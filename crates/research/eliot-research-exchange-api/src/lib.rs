@@ -9,6 +9,8 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+
 use eliot_contracts::{ClockReading, ContractVersion, EpochId, StateFence};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -344,9 +346,25 @@ fn claim_text(value: &str, field: &'static str) -> Result<(), ResearchContractEr
 }
 
 fn claim_digest<T: Serialize>(value: &T) -> Result<String, ResearchContractError> {
-    let bytes = eliot_contracts::canonical_json_bytes(value)
-        .map_err(|_| ResearchContractError::InvalidText { field: "canonical_dispatch_json" })?;
+    let bytes = eliot_contracts::canonical_json_bytes(value).map_err(|_| {
+        ResearchContractError::InvalidText {
+            field: "canonical_dispatch_json",
+        }
+    })?;
     Ok(eliot_contracts::sha256_hex(&bytes))
+}
+
+fn validate_absolute_path(value: &str, field: &'static str) -> Result<(), ResearchContractError> {
+    claim_text(value, field)?;
+    let path = std::path::Path::new(value);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(ResearchContractError::InvalidText { field });
+    }
+    Ok(())
 }
 
 fn claim_nonce(value: &str, field: &'static str) -> Result<(), ResearchContractError> {
@@ -391,14 +409,19 @@ fn set_nested_json_field(
     };
     let mut current = object;
     for key in parents {
-        current = current.get_mut(*key).ok_or(ResearchContractError::InvalidText {
-            field: "provider_contract",
-        })?;
+        current = current
+            .get_mut(*key)
+            .ok_or(ResearchContractError::InvalidText {
+                field: "provider_contract",
+            })?;
     }
     set_json_field(current, last, value)
 }
 
-fn json_text(value: Option<&serde_json::Value>, field: &'static str) -> Result<String, ResearchContractError> {
+fn json_text(
+    value: Option<&serde_json::Value>,
+    field: &'static str,
+) -> Result<String, ResearchContractError> {
     let value = value
         .and_then(serde_json::Value::as_str)
         .ok_or(ResearchContractError::InvalidText { field })?;
@@ -406,7 +429,10 @@ fn json_text(value: Option<&serde_json::Value>, field: &'static str) -> Result<S
     Ok(value.to_owned())
 }
 
-fn json_digest(value: Option<&serde_json::Value>, field: &'static str) -> Result<String, ResearchContractError> {
+fn json_digest(
+    value: Option<&serde_json::Value>,
+    field: &'static str,
+) -> Result<String, ResearchContractError> {
     let value = json_text(value, field)?;
     digest(&value, field)?;
     Ok(value)
@@ -521,17 +547,24 @@ impl ResearchProviderRegistration {
             (&self.required_schema, "required_schema"),
             (&self.data_class, "data_class"),
             (&self.credential_binding_id, "credential_binding_id"),
-            (&self.credential_owner_principal, "credential_owner_principal"),
+            (
+                &self.credential_owner_principal,
+                "credential_owner_principal",
+            ),
             (&self.owner_principal_digest, "owner_principal_digest"),
         ] {
             claim_text(value, field)?;
         }
+        digest(&self.owner_principal_digest, "owner_principal_digest")?;
         if !std::path::Path::new(&self.provider_executable).is_absolute() {
             return Err(ResearchContractError::InvalidText {
                 field: "provider_executable",
             });
         }
-        digest(&self.provider_executable_sha256, "provider_executable_sha256")?;
+        digest(
+            &self.provider_executable_sha256,
+            "provider_executable_sha256",
+        )?;
         digest(&self.provider_contract_sha256, "provider_contract_sha256")?;
         digest(&self.provider_registry_sha256, "provider_registry_sha256")?;
         digest(&self.registration_sha256, "registration_sha256")?;
@@ -544,12 +577,13 @@ impl ResearchProviderRegistration {
         self.state_fence
             .validate()
             .map_err(|_| ResearchContractError::InvalidFence)?;
-        if !self.authority_epoch.is_same_authority(&self.state_fence.authority_epoch) {
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+        {
             return Err(ResearchContractError::InvalidFence);
         }
-        if self.claim_digest_without_registration()?
-            != self.registration_sha256
-        {
+        if self.claim_digest_without_registration()? != self.registration_sha256 {
             return Err(ResearchContractError::InvalidDigest {
                 field: "registration_sha256",
             });
@@ -573,10 +607,14 @@ impl ResearchProviderRegistration {
     fn validate_contract_shape(&self) -> Result<(), ResearchContractError> {
         let contract = &self.provider_contract;
         if json_text(contract.get("module_id"), "contract.module_id")? != self.module_id
-            || json_text(contract.get("module_generation_id"), "contract.module_generation_id")?
-                != self.module_generation_id
-            || json_text(contract.get("bridge_generation"), "contract.bridge_generation")?
-                != self.bridge_generation
+            || json_text(
+                contract.get("module_generation_id"),
+                "contract.module_generation_id",
+            )? != self.module_generation_id
+            || json_text(
+                contract.get("bridge_generation"),
+                "contract.bridge_generation",
+            )? != self.bridge_generation
             || json_text(contract.get("required_schema"), "contract.required_schema")?
                 != self.required_schema
             || json_text(contract.get("data_class"), "contract.data_class")? != self.data_class
@@ -584,19 +622,27 @@ impl ResearchProviderRegistration {
                 contract.pointer("/bridge/executable_sha256"),
                 "contract.bridge.executable_sha256",
             )? != self.provider_executable_sha256
-            || json_text(contract.pointer("/bridge/executable"), "contract.bridge.executable")?
-                != self.provider_executable
+            || json_text(
+                contract.pointer("/bridge/executable"),
+                "contract.bridge.executable",
+            )? != self.provider_executable
         {
             return Err(ResearchContractError::InvalidDisposition);
         }
-        if contract.pointer("/route/route_id").and_then(serde_json::Value::as_str)
+        if contract
+            .pointer("/route/route_id")
+            .and_then(serde_json::Value::as_str)
             != Some(self.route_id.as_str())
-            || contract.pointer("/route/provider_id").and_then(serde_json::Value::as_str)
+            || contract
+                .pointer("/route/provider_id")
+                .and_then(serde_json::Value::as_str)
                 != Some(self.provider_id.as_str())
-            || contract.pointer("/route/credential_binding/binding_id")
+            || contract
+                .pointer("/route/credential_binding/binding_id")
                 .and_then(serde_json::Value::as_str)
                 != Some(self.credential_binding_id.as_str())
-            || contract.pointer("/route/credential_binding/owner_principal")
+            || contract
+                .pointer("/route/credential_binding/owner_principal")
                 .and_then(serde_json::Value::as_str)
                 != Some(self.credential_owner_principal.as_str())
         {
@@ -610,11 +656,17 @@ impl ResearchProviderRegistration {
         let Some(record) = records.iter().find(|record| {
             record.get("module_id").and_then(serde_json::Value::as_str)
                 == Some(self.module_id.as_str())
-                && record.get("generation_id").and_then(serde_json::Value::as_str)
+                && record
+                    .get("generation_id")
+                    .and_then(serde_json::Value::as_str)
                     == Some(self.module_generation_id.as_str())
-                && record.get("artifact_sha256").and_then(serde_json::Value::as_str)
+                && record
+                    .get("artifact_sha256")
+                    .and_then(serde_json::Value::as_str)
                     == Some(self.provider_executable_sha256.as_str())
-                && record.get("evidence_sha256").and_then(serde_json::Value::as_str)
+                && record
+                    .get("evidence_sha256")
+                    .and_then(serde_json::Value::as_str)
                     == contract
                         .get("registry_evidence_sha256")
                         .and_then(serde_json::Value::as_str)
@@ -729,6 +781,48 @@ impl ResearchProviderRegistration {
         )?;
         Ok(contract)
     }
+
+    fn bound_registry(
+        &self,
+        contract: &serde_json::Value,
+    ) -> Result<serde_json::Value, ResearchContractError> {
+        let mut registry = self.provider_registry.clone();
+        let route = contract
+            .get("route")
+            .cloned()
+            .ok_or(ResearchContractError::InvalidDisposition)?;
+        let fence = contract
+            .get("fence")
+            .cloned()
+            .ok_or(ResearchContractError::InvalidDisposition)?;
+        let records = registry
+            .get_mut("records")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or(ResearchContractError::InvalidDisposition)?;
+        let mut matched = false;
+        for record in records.iter_mut() {
+            if record.get("module_id").and_then(serde_json::Value::as_str)
+                == Some(self.module_id.as_str())
+                && record
+                    .get("generation_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(self.module_generation_id.as_str())
+            {
+                let object = record
+                    .as_object_mut()
+                    .ok_or(ResearchContractError::InvalidDisposition)?;
+                object.insert("route".to_owned(), route.clone());
+                object.insert("state_fence".to_owned(), fence.clone());
+                matched = true;
+            }
+        }
+        if !matched {
+            return Err(ResearchContractError::InvalidDigest {
+                field: "provider_registry",
+            });
+        }
+        Ok(registry)
+    }
 }
 
 /// Authenticated claim issued by Kernel for one authenticated research request.
@@ -778,40 +872,15 @@ impl ResearchDispatchClaim {
         request.validate()?;
         let operation_id = operation_id.into();
         claim_text(&operation_id, "operation_id")?;
+        let owner_principal_digest = owner_principal_digest.into();
+        if owner_principal_digest != registration.owner_principal_digest {
+            return Err(ResearchContractError::InvalidDisposition);
+        }
         let short = &claim_digest(&operation_id)?[..16];
         let cancellation_id = format!("research-cancel-{short}");
-        let provider_contract = registration.contract_for_request(
-            &request,
-            &operation_id,
-            &cancellation_id,
-        )?;
-        let mut provider_registry = registration.provider_registry.clone();
-        let bound_route = provider_contract
-            .get("route")
-            .cloned()
-            .ok_or(ResearchContractError::InvalidDisposition)?;
-        let bound_fence = provider_contract
-            .get("fence")
-            .cloned()
-            .ok_or(ResearchContractError::InvalidDisposition)?;
-        if let Some(records) = provider_registry
-            .get_mut("records")
-            .and_then(serde_json::Value::as_array_mut)
-        {
-            for record in records.iter_mut() {
-                if record.get("module_id").and_then(serde_json::Value::as_str)
-                    == Some(registration.module_id.as_str())
-                    && record.get("generation_id").and_then(serde_json::Value::as_str)
-                        == Some(registration.module_generation_id.as_str())
-                {
-                    let Some(object) = record.as_object_mut() else {
-                        return Err(ResearchContractError::InvalidDisposition);
-                    };
-                    object.insert("route".to_owned(), bound_route.clone());
-                    object.insert("state_fence".to_owned(), bound_fence.clone());
-                }
-            }
-        }
+        let provider_contract =
+            registration.contract_for_request(&request, &operation_id, &cancellation_id)?;
+        let provider_registry = registration.bound_registry(&provider_contract)?;
         let provider_registry_sha256 = claim_digest(&provider_registry)?;
         let expires_at_unix_ms = now_unix_ms
             .checked_add(60_000)
@@ -824,7 +893,7 @@ impl ResearchDispatchClaim {
             request_sha256: claim_digest(&request)?,
             request,
             issuer_principal_digest: issuer_principal_digest.into(),
-            owner_principal_digest: owner_principal_digest.into(),
+            owner_principal_digest,
             session_id: session_id.into(),
             session_nonce: session_nonce.into(),
             authority_epoch: registration.authority_epoch.clone(),
@@ -851,6 +920,39 @@ impl ResearchDispatchClaim {
         Ok(value)
     }
 
+    pub fn validate_against_registration(
+        &self,
+        registration: &ResearchProviderRegistration,
+    ) -> Result<(), ResearchContractError> {
+        registration.validate()?;
+        if registration.registration_sha256 != self.registration_sha256
+            || registration.owner_principal_digest != self.owner_principal_digest
+            || registration.provider_executable != self.provider_executable
+            || registration.provider_executable_sha256 != self.provider_executable_sha256
+            || registration.authority_epoch != self.authority_epoch
+            || registration.state_fence != self.state_fence
+            || registration.process_generation != self.process_generation
+        {
+            return Err(ResearchContractError::InvalidDisposition);
+        }
+        let expected_contract = registration.contract_for_request(
+            &self.request,
+            &self.operation_id,
+            &self.cancellation_id,
+        )?;
+        if expected_contract != self.provider_contract {
+            return Err(ResearchContractError::InvalidDisposition);
+        }
+        let expected_registry = registration.bound_registry(&expected_contract)?;
+        if self.provider_registry != expected_registry
+            || self.provider_registry_sha256 != claim_digest(&expected_registry)?
+            || self.provider_contract_sha256 != claim_digest(&expected_contract)?
+        {
+            return Err(ResearchContractError::InvalidDisposition);
+        }
+        self.validate()
+    }
+
     pub fn validate(&self) -> Result<(), ResearchContractError> {
         if self.claim_version != RESEARCH_DISPATCH_WIRE_VERSION {
             return Err(ResearchContractError::InvalidDisposition);
@@ -868,8 +970,9 @@ impl ResearchDispatchClaim {
         ] {
             claim_text(value, field)?;
         }
+        digest(&self.issuer_principal_digest, "issuer_principal_digest")?;
+        digest(&self.owner_principal_digest, "owner_principal_digest")?;
         claim_nonce(&self.session_nonce, "session_nonce")?;
-        claim_nonce(&self.claim_nonce, "claim_nonce")?;
         if self.claim_sha256 != claim_digest(self)? {
             return Err(ResearchContractError::InvalidDigest {
                 field: "claim_sha256",
@@ -919,18 +1022,265 @@ pub struct ResearchDispatchGrant {
     pub expires_at_unix_ms: u64,
 }
 
+/// Opaque authority material issued by Kernel for one protected dispatch.
+///
+/// The private signing key is never serialized. The child receives only a
+/// signed, operation-bound capability projection; a caller can replay that
+/// projection but cannot mint a new authority from public material.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchKernelAuthority {
+    authority_id: String,
+    authority_key_hex: String,
+    authority_key_sha256: String,
+    claim_sha256: String,
+    grant_sha256: String,
+    child_working_directory_sha256: String,
+    provider_artifact_sha256: String,
+    verification_key_hex: String,
+    signature_hex: String,
+    issued_at_unix_ms: u64,
+}
+
+#[derive(Serialize)]
+struct ResearchAuthorityPayload<'a> {
+    domain: &'a str,
+    authority_id: &'a str,
+    authority_key_sha256: &'a str,
+    claim_sha256: &'a str,
+    grant_sha256: &'a str,
+    child_working_directory_sha256: &'a str,
+    provider_artifact_sha256: &'a str,
+    issued_at_unix_ms: u64,
+}
+
+/// Non-serializable owner-side signer. The secret is supplied by the Host/Kernel
+/// authority handoff and is never carried in provider-visible material.
+#[derive(Debug)]
+pub struct ResearchAuthoritySigner {
+    signing_key: SigningKey,
+}
+
+impl ResearchAuthoritySigner {
+    pub fn from_host_secret(secret_key: [u8; 32]) -> Self {
+        Self {
+            signing_key: SigningKey::from_bytes(&secret_key),
+        }
+    }
+
+    pub fn public_key_hex(&self) -> String {
+        self.signing_key
+            .verifying_key()
+            .to_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn issue(
+        &self,
+        authority_id: impl Into<String>,
+        authority_key: [u8; 32],
+        claim_sha256: &str,
+        grant_sha256: &str,
+        child_working_directory: &str,
+        provider_artifact_sha256: &str,
+        issued_at_unix_ms: u64,
+    ) -> Result<ResearchKernelAuthority, ResearchContractError> {
+        let authority_id = authority_id.into();
+        let authority_key_hex = authority_key
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let payload = ResearchAuthorityPayload {
+            domain: "eliot.research.kernel-authority/v1",
+            authority_id: &authority_id,
+            authority_key_sha256: &eliot_contracts::sha256_hex(&authority_key),
+            claim_sha256,
+            grant_sha256,
+            child_working_directory_sha256: &eliot_contracts::sha256_hex(
+                child_working_directory.as_bytes(),
+            ),
+            provider_artifact_sha256,
+            issued_at_unix_ms,
+        };
+        let bytes = eliot_contracts::canonical_json_bytes(&payload).map_err(|_| {
+            ResearchContractError::InvalidText {
+                field: "research_authority_payload",
+            }
+        })?;
+        let signature = self.signing_key.sign(&bytes);
+        Ok(ResearchKernelAuthority {
+            authority_id,
+            authority_key_sha256: payload.authority_key_sha256.to_owned(),
+            authority_key_hex,
+            claim_sha256: claim_sha256.to_owned(),
+            grant_sha256: grant_sha256.to_owned(),
+            child_working_directory_sha256: payload.child_working_directory_sha256.to_owned(),
+            provider_artifact_sha256: provider_artifact_sha256.to_owned(),
+            verification_key_hex: self.public_key_hex(),
+            signature_hex: signature
+                .to_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            issued_at_unix_ms,
+        })
+    }
+}
+
+impl ResearchKernelAuthority {
+    pub fn validate(&self) -> Result<(), ResearchContractError> {
+        claim_text(&self.authority_id, "research_authority_id")?;
+        claim_nonce(&self.authority_id, "research_authority_id")?;
+        for (value, field) in [
+            (&self.authority_key_sha256, "research_authority_key_sha256"),
+            (&self.claim_sha256, "research_authority_claim_sha256"),
+            (&self.grant_sha256, "research_authority_grant_sha256"),
+            (
+                &self.child_working_directory_sha256,
+                "research_authority_working_directory_sha256",
+            ),
+            (
+                &self.provider_artifact_sha256,
+                "research_authority_artifact_sha256",
+            ),
+            (&self.verification_key_hex, "research_authority_verification_key"),
+            (&self.signature_hex, "research_authority_signature"),
+        ] {
+            digest(value, field)?;
+        }
+        if self.issued_at_unix_ms == 0
+            || self.authority_key_hex.len() != 64
+            || self.verification_key_hex.len() != 64
+            || self.signature_hex.len() != 128
+            || ![&self.authority_key_hex, &self.verification_key_hex, &self.signature_hex]
+                .iter()
+                .all(|value| {
+                    value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+        {
+            return Err(ResearchContractError::InvalidDisposition);
+        }
+        let key = decode_authority_hex::<32>(&self.authority_key_hex, "research_authority_key")?;
+        if eliot_contracts::sha256_hex(&key) != self.authority_key_sha256 {
+            return Err(ResearchContractError::InvalidDigest {
+                field: "research_authority_key_sha256",
+            });
+        }
+        let verification_key = decode_authority_hex::<32>(
+            &self.verification_key_hex,
+            "research_authority_verification_key",
+        )?;
+        let signature_bytes = decode_authority_hex::<64>(
+            &self.signature_hex,
+            "research_authority_signature",
+        )?;
+        let payload = ResearchAuthorityPayload {
+            domain: "eliot.research.kernel-authority/v1",
+            authority_id: &self.authority_id,
+            authority_key_sha256: &self.authority_key_sha256,
+            claim_sha256: &self.claim_sha256,
+            grant_sha256: &self.grant_sha256,
+            child_working_directory_sha256: &self.child_working_directory_sha256,
+            provider_artifact_sha256: &self.provider_artifact_sha256,
+            issued_at_unix_ms: self.issued_at_unix_ms,
+        };
+        let bytes = eliot_contracts::canonical_json_bytes(&payload).map_err(|_| {
+            ResearchContractError::InvalidText {
+                field: "research_authority_payload",
+            }
+        })?;
+        let verifying_key = VerifyingKey::from_bytes(&verification_key).map_err(|_| {
+            ResearchContractError::InvalidDigest {
+                field: "research_authority_verification_key",
+            }
+        })?;
+        let signature = Signature::from_bytes(&signature_bytes);
+        verifying_key
+            .verify(&bytes, &signature)
+            .map_err(|_| ResearchContractError::InvalidDisposition)
+    }
+
+    pub fn authority_id(&self) -> &str {
+        &self.authority_id
+    }
+
+    pub fn key_bytes(&self) -> Result<[u8; 32], ResearchContractError> {
+        self.validate()?;
+        decode_authority_hex::<32>(&self.authority_key_hex, "research_authority_key")
+    }
+
+    pub fn claim_sha256(&self) -> &str {
+        &self.claim_sha256
+    }
+
+    pub fn grant_sha256(&self) -> &str {
+        &self.grant_sha256
+    }
+
+    pub fn child_working_directory_sha256(&self) -> &str {
+        &self.child_working_directory_sha256
+    }
+
+    pub fn provider_artifact_sha256(&self) -> &str {
+        &self.provider_artifact_sha256
+    }
+
+    pub fn issued_at_unix_ms(&self) -> u64 {
+        self.issued_at_unix_ms
+    }
+}
+
+fn decode_authority_hex<const N: usize>(
+    value: &str,
+    field: &'static str,
+) -> Result<[u8; N], ResearchContractError> {
+    if value.len() != N * 2 {
+        return Err(ResearchContractError::InvalidDigest { field });
+    }
+    let mut bytes = [0_u8; N];
+    for (index, slot) in bytes.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| ResearchContractError::InvalidDigest { field })?;
+    }
+    Ok(bytes)
+}
+
 /// Exact protected material consumed by `eliot-mod-research`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResearchDispatchMaterial {
     pub material_version: u16,
+    pub registration: ResearchProviderRegistration,
     pub claim: ResearchDispatchClaim,
     pub grant: ResearchDispatchGrant,
+    pub authority: ResearchKernelAuthority,
+    /// Exact owner-bound working directory delivered by Kernel.
+    pub child_working_directory: String,
 }
 
 impl ResearchDispatchMaterial {
-    pub fn from_claim(claim: ResearchDispatchClaim) -> Result<Self, ResearchContractError> {
-        claim.validate()?;
+    pub fn from_kernel_parts(
+        claim: ResearchDispatchClaim,
+        registration: ResearchProviderRegistration,
+        child_working_directory: impl Into<String>,
+        authority_id: impl Into<String>,
+        authority_key: [u8; 32],
+        signer: &ResearchAuthoritySigner,
+        issued_at_unix_ms: u64,
+    ) -> Result<Self, ResearchContractError> {
+        registration.validate()?;
+        if registration.registration_sha256 != claim.registration_sha256 {
+            return Err(ResearchContractError::InvalidDigest {
+                field: "registration_sha256",
+            });
+        }
+        claim.validate_against_registration(&registration)?;
+        let child_working_directory = child_working_directory.into();
+        validate_absolute_path(&child_working_directory, "child_working_directory")?;
         let short = &claim.claim_sha256[..16];
         let fence_nonce = format!("research-dispatch-fence-{short}");
         let idempotency_key = format!("research-dispatch-lease-{short}");
@@ -963,10 +1313,23 @@ impl ResearchDispatchMaterial {
             idempotency_key,
             expires_at_unix_ms,
         };
+        let authority = signer.issue(
+            authority_id,
+            authority_key,
+            &claim.claim_sha256,
+            &grant.grant_sha256,
+            &child_working_directory,
+            &claim.provider_executable_sha256,
+            issued_at_unix_ms,
+        )?;
+        authority.validate()?;
         let value = Self {
             material_version: RESEARCH_DISPATCH_WIRE_VERSION,
+            registration,
             claim,
             grant,
+            authority,
+            child_working_directory,
         };
         value.validate(0)?;
         Ok(value)
@@ -976,12 +1339,37 @@ impl ResearchDispatchMaterial {
         if self.material_version != RESEARCH_DISPATCH_WIRE_VERSION {
             return Err(ResearchContractError::InvalidDisposition);
         }
-        self.claim.validate()?;
+        validate_absolute_path(&self.child_working_directory, "child_working_directory")?;
+        self.registration.validate()?;
+        self.authority.validate()?;
+        if self.authority.claim_sha256 != self.claim.claim_sha256
+            || self.authority.grant_sha256 != self.grant.grant_sha256
+            || self.authority.child_working_directory_sha256
+                != eliot_contracts::sha256_hex(self.child_working_directory.as_bytes())
+            || self.authority.provider_artifact_sha256 != self.claim.provider_executable_sha256
+        {
+            return Err(ResearchContractError::InvalidDisposition);
+        }
+        if self.registration.registration_sha256 != self.claim.registration_sha256 {
+            return Err(ResearchContractError::InvalidDigest {
+                field: "registration_sha256",
+            });
+        }
+        self.claim
+            .validate_against_registration(&self.registration)?;
+        let short = &self.claim.claim_sha256[..16];
+        let expected_fence_nonce = format!("research-dispatch-fence-{short}");
+        let expected_idempotency_key = format!("research-dispatch-lease-{short}");
+        let expected_expiry = self
+            .claim
+            .expires_at_unix_ms
+            .min(u64::try_from(self.claim.deadline_unix_ms).unwrap_or(u64::MAX));
         if self.grant.claim_sha256 != self.claim.claim_sha256
             || self.grant.authority_epoch != self.claim.authority_epoch
             || self.grant.fence_generation != self.claim.process_generation
-            || self.grant.expires_at_unix_ms == 0
-            || self.grant.expires_at_unix_ms > self.claim.expires_at_unix_ms
+            || self.grant.fence_nonce != expected_fence_nonce
+            || self.grant.idempotency_key != expected_idempotency_key
+            || self.grant.expires_at_unix_ms != expected_expiry
         {
             return Err(ResearchContractError::InvalidDisposition);
         }
@@ -1008,6 +1396,52 @@ impl ResearchDispatchMaterial {
             return Err(ResearchContractError::InvalidDisposition);
         }
         Ok(())
+    }
+}
+
+/// Authenticated protected envelope for one operation-specific material file.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchProtectedMaterial {
+    pub wire_id: String,
+    pub wire_version: u16,
+    pub delivery_nonce: String,
+    pub material: ResearchDispatchMaterial,
+    pub material_sha256: String,
+}
+
+impl ResearchProtectedMaterial {
+    pub fn new(
+        material: ResearchDispatchMaterial,
+        delivery_nonce: impl Into<String>,
+    ) -> Result<Self, ResearchContractError> {
+        let delivery_nonce = delivery_nonce.into();
+        claim_nonce(&delivery_nonce, "delivery_nonce")?;
+        let material_sha256 = claim_digest(&material)?;
+        let value = Self {
+            wire_id: RESEARCH_DISPATCH_WIRE_ID.to_owned(),
+            wire_version: RESEARCH_DISPATCH_WIRE_VERSION,
+            delivery_nonce,
+            material,
+            material_sha256,
+        };
+        value.validate(0)?;
+        Ok(value)
+    }
+
+    pub fn validate(&self, now_unix_ms: u64) -> Result<(), ResearchContractError> {
+        if self.wire_id != RESEARCH_DISPATCH_WIRE_ID
+            || self.wire_version != RESEARCH_DISPATCH_WIRE_VERSION
+        {
+            return Err(ResearchContractError::InvalidDisposition);
+        }
+        claim_nonce(&self.delivery_nonce, "delivery_nonce")?;
+        if self.material_sha256 != claim_digest(&self.material)? {
+            return Err(ResearchContractError::InvalidDigest {
+                field: "protected_material_sha256",
+            });
+        }
+        self.material.validate(now_unix_ms)
     }
 }
 
@@ -1136,6 +1570,7 @@ impl ResearchEvidenceBundle {
     ) -> Result<(), ResearchContractError> {
         if self.exchange_id != request.exchange_id
             || self.state_fence != request.state_fence
+            || self.disclosure != request.disclosure
             || !self.synthesis_is_candidate
         {
             return Err(ResearchContractError::InvalidDisposition);
@@ -1156,6 +1591,9 @@ impl ResearchEvidenceBundle {
         let mut seen_gaps = BTreeSet::new();
         for gap in &self.coverage_gaps {
             gap.validate()?;
+            if !request.allowed_references.allows(&gap.source_handle) {
+                return Err(ResearchContractError::CitationNotAllowed);
+            }
             if !seen_gaps.insert(&gap.source_handle) {
                 return Err(ResearchContractError::DuplicateIdentity {
                     field: "bundle.coverage_gaps",
@@ -1185,6 +1623,15 @@ impl ResearchEvidenceBundle {
         }
         for source in &self.sources {
             text(&source.source_handle, "source.source_handle")?;
+            if !request.allowed_references.allows(&source.source_handle)
+                || !request.source_classes.contains(&source.class)
+                || source.disclosure != request.disclosure
+            {
+                return Err(ResearchContractError::CitationNotAllowed);
+            }
+            text(&source.title, "source.title")?;
+            text(&source.locator, "source.locator")?;
+            text(&source.coverage, "source.coverage")?;
             digest(&source.snapshot_digest, "source.snapshot_digest")?;
             source
                 .captured_at

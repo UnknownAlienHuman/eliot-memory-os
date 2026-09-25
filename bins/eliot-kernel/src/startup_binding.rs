@@ -2,7 +2,8 @@
 //!
 //! Binary-private parsing, validation, and bounded lease reads for the
 //! `eliot-kernel` entry: host-injected `KernelStartupBinding`, the exact
-//! 24-value launch contour, neutral store-bootstrap and `eliotd` descriptor
+//! 24-value launch contour (plus an optional Host-owned research-provider
+//! descriptor pair), neutral store-bootstrap and `eliotd` descriptor
 //! preparation, and the authority-contour projection. Zero composition
 //! contact: this module never constructs, reads, or drives
 //! `KernelComposition`; `main` calls the `pub(crate)` parsers and passes the

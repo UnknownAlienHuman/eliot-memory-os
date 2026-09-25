@@ -34,8 +34,8 @@ use eliot_kernel_core::{
     StateMigrationClass, VersionRange, admit_handshake, expected_seal_tag,
 };
 use eliot_research_exchange_api::{
-    ResearchDispatchRequest, ResearchReconcileRequest, RESEARCH_DISPATCH_WIRE_ID,
-    RESEARCH_RECONCILE_OPERATION,
+    RESEARCH_DISPATCH_WIRE_ID, RESEARCH_RECONCILE_OPERATION, ResearchDispatchRequest,
+    ResearchReconcileRequest,
 };
 use eliot_runtime_contracts::{GenerationCutoverState, HealthDimension};
 #[cfg(windows)]
@@ -679,8 +679,8 @@ impl KernelComposition {
                 return self.dispatch_wasm_port_grant_frame(session, frame);
             }
             if is_research_operation(native_operation) {
-                let control = frame.kind == FrameKind::Cancel
-                    && frame.message_type == MessageType::Cancel;
+                let control =
+                    frame.kind == FrameKind::Cancel && frame.message_type == MessageType::Cancel;
                 if session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER
                     || (!control
                         && !matches!(
@@ -1076,7 +1076,9 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         let response = if operation == RESEARCH_DISPATCH_WIRE_ID {
-            if self.service_state().map_err(|_| TransportError::SessionFenced)?
+            if self
+                .service_state()
+                .map_err(|_| TransportError::SessionFenced)?
                 != KernelServiceState::Ready
             {
                 return Err(TransportError::SessionFenced);
@@ -1098,7 +1100,8 @@ impl KernelComposition {
             research_launch_response(&outcome)
         } else {
             if !matches!(
-                self.service_state().map_err(|_| TransportError::SessionFenced)?,
+                self.service_state()
+                    .map_err(|_| TransportError::SessionFenced)?,
                 KernelServiceState::Ready | KernelServiceState::Degraded
             ) {
                 return Err(TransportError::SessionFenced);
@@ -1138,7 +1141,9 @@ fn research_dispatch_request_from_payload(
         .ok_or(TransportError::SessionFenced)?;
     let request: ResearchDispatchRequest =
         serde_json::from_value(value).map_err(|_| TransportError::SessionFenced)?;
-    request.validate().map_err(|_| TransportError::SessionFenced)?;
+    request
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
     Ok(request)
 }
 
@@ -1152,7 +1157,9 @@ fn research_reconcile_request_from_payload(
         .ok_or(TransportError::SessionFenced)?;
     let request: ResearchReconcileRequest =
         serde_json::from_value(value).map_err(|_| TransportError::SessionFenced)?;
-    request.validate().map_err(|_| TransportError::SessionFenced)?;
+    request
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
     Ok(request)
 }
 

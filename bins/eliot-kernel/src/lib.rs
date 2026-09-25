@@ -214,20 +214,20 @@ pub use dispatch_launch::{
     ReadyDoctorLaunch, ReadyNativeWorkerLaunch, ReadyResearchLaunch, ReadyTestdLaunch,
     ReconcileLaunchedOutcome, ResearchDispatchBinding, ResearchLaunchOutcome,
     ResearchReconcileOutcome, SpawnedChild, TestdLaunchMaterial, TestdLaunchOutcome,
-    TestdLaunchSkip, UncertainSpawn,
-    compose_dispatch_contour, compose_doctor_front_door, compose_production_doctor_front_door,
-    compose_production_native_worker_front_door, compose_production_research_front_door,
-    compose_production_testd_front_door, dispatch_contour, doctor_repair_advertised,
-    launch_admitted_doctor_attempt, launch_admitted_native_worker_attempt,
-    launch_admitted_research_attempt, launch_admitted_testd_attempt,
-    native_worker_dispatch_derivation, native_worker_dispatch_derivation_from_epoch_json,
-    native_worker_material_bytes, native_worker_production_composed, prepare_doctor_launch,
-    prepare_native_worker_launch, prepare_research_launch, prepare_testd_launch,
-    reconcile_launched_doctor_attempt, reconcile_launched_native_worker_attempt,
-    reconcile_launched_research_attempt, reconcile_launched_testd_attempt,
-    release_launched_attempt, research_provider_composed, start_ready_doctor_launch,
-    start_ready_native_worker_launch, start_ready_research_launch, start_ready_testd_launch,
-    testd_admission_advertised, testd_production_composed, trigger_admitted_doctor_launch,
+    TestdLaunchSkip, UncertainSpawn, compose_dispatch_contour, compose_doctor_front_door,
+    compose_production_doctor_front_door, compose_production_native_worker_front_door,
+    compose_production_research_front_door, compose_production_testd_front_door, dispatch_contour,
+    doctor_repair_advertised, launch_admitted_doctor_attempt,
+    launch_admitted_native_worker_attempt, launch_admitted_research_attempt,
+    launch_admitted_testd_attempt, native_worker_dispatch_derivation,
+    native_worker_dispatch_derivation_from_epoch_json, native_worker_material_bytes,
+    native_worker_production_composed, prepare_doctor_launch, prepare_native_worker_launch,
+    prepare_research_launch, prepare_testd_launch, reconcile_launched_doctor_attempt,
+    reconcile_launched_native_worker_attempt, reconcile_launched_research_attempt,
+    reconcile_launched_testd_attempt, release_launched_attempt, research_provider_composed,
+    start_ready_doctor_launch, start_ready_native_worker_launch, start_ready_research_launch,
+    start_ready_testd_launch, testd_admission_advertised, testd_production_composed,
+    trigger_admitted_doctor_launch,
 };
 /// Kernel-owned durable Doctor recovery ledger (DISPATCH-WIRE part D).
 ///
@@ -242,10 +242,6 @@ pub use doctor_recovery_ledger::{KernelDoctorRecoveryLedger, doctor_recovery_led
 /// (`KernelStoreGateway::dreamer_job`); no process is spawned here and no
 /// worker binding is invented (worker handoff is T12-09).
 pub use dreamer_job_dispatch::DREAMER_JOB_WIRE_ID;
-pub use eliot_research_exchange_api::{
-    ResearchDispatchRequest, ResearchProviderRegistration, ResearchReconcileRequest,
-    RESEARCH_DISPATCH_WIRE_ID, RESEARCH_RECONCILE_OPERATION,
-};
 use eliot_contracts::{
     ArtifactId, AuthorityEpoch, ContractId, RequestId, ResourceGeneration, StateFence,
     canonical_json_bytes,
@@ -366,6 +362,10 @@ use eliot_protocol::{
     AgentBridgeAuthenticatedBinding, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
     AgentBridgePeerChallenge, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
     RequestIdentity,
+};
+pub use eliot_research_exchange_api::{
+    RESEARCH_DISPATCH_WIRE_ID, RESEARCH_RECONCILE_OPERATION, ResearchDispatchRequest,
+    ResearchProviderRegistration, ResearchReconcileRequest,
 };
 use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
 #[cfg(test)]

@@ -9,7 +9,7 @@
 
 use std::fs;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,21 +20,16 @@ use eliot_process::{
     ProcessLifecycle, ProcessRequest, ProcessStartReceipt,
 };
 use eliot_process_executor::{CapturedStream, WindowsProcessExecutor};
-use eliot_research_exchange_api::{
-    CompletionDisposition, CoverageGap, CoverageGapKind, ResearchEvidenceBundle,
-    ResearchQueryRequest,
-};
+use eliot_research_exchange_api::{ResearchEvidenceBundle, ResearchQueryRequest};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::BridgeError;
 use crate::admission::ProviderAdmission;
-use crate::evidence::{
-    ProviderAttemptReceipt, ProviderCleanupReceipt, RawProviderEvidence, sha256_hex,
-};
+use crate::evidence::{ProviderAttemptReceipt, ProviderCleanupReceipt, RawProviderEvidence};
 use crate::protocol::{
-    CoverageDenominator, ResearchRequestChannel, ResearchResultDocument, ResultFrame, SubmitAck,
-    SubmitEnvelope, PROVIDER_CHANNEL_ARGUMENT, scan_result_frame,
+    PROVIDER_CHANNEL_ARGUMENT, ResearchRequestChannel, ResearchResultDocument, ResultFrame,
+    SubmitAck, SubmitEnvelope, scan_result_frame,
 };
 
 /// Compile-time proof that the production binding uses the shared P-03/P-04
@@ -81,6 +76,21 @@ pub trait ResearchRequestPort: Send + Sync {
         request: &ResearchQueryRequest,
         channel: &ResearchRequestChannel,
     ) -> Result<ProcessRequest, RequestPortError>;
+
+    /// Returns the exact owner-bound working directory that the port used when
+    /// constructing the process intent. The shared runner rechecks this value
+    /// against the minted request; a port cannot substitute a caller-selected
+    /// directory after admission.
+    fn admitted_working_directory(
+        &self,
+        _admission: &ProviderAdmission,
+    ) -> Result<PathBuf, RequestPortError>;
+
+    /// Returns the Kernel grant's exact fence nonce used by the port.
+    fn admitted_fence_nonce(
+        &self,
+        _admission: &ProviderAdmission,
+    ) -> Result<String, RequestPortError>;
 }
 
 /// Terminal provider outcome in provider-local terms.
@@ -261,7 +271,7 @@ impl ProviderBridge {
                         None,
                         reconciliation,
                         reconciliation_error,
-                        Some(&error),
+                        Some(error.to_string()),
                     );
                 }
                 return Err(map_start_error(error));
@@ -287,8 +297,7 @@ impl ProviderBridge {
         match self.await_terminal(&bound) {
             Ok(view) => self.finish_terminal(bound, &view, None),
             Err(WaitFailure::TimedOut) => {
-                let (cancellation, cancellation_error) =
-                    self.cancel_with_error(&bound.operation);
+                let (cancellation, cancellation_error) = self.cancel_with_error(&bound.operation);
                 let (reconciliation, reconciliation_error) =
                     self.reconcile_with_error(&bound.operation);
                 self.finish_unobserved_with_reconciliation(
@@ -334,10 +343,12 @@ impl ProviderBridge {
             .map_err(|refusal| BridgeError::NotAdmitted {
                 reason: refusal.reason(),
             })?;
-        let request_channel = ResearchRequestChannel::new(request, admission.operation_id().as_str())
-            .map_err(|refusal| BridgeError::ProtocolViolation {
-                reason: refusal.reason(),
-            })?;
+        let request_channel =
+            ResearchRequestChannel::new(request, admission.operation_id().as_str()).map_err(
+                |refusal| BridgeError::ProtocolViolation {
+                    reason: refusal.reason(),
+                },
+            )?;
         let envelope = SubmitEnvelope::from_admission(
             request,
             admission,
@@ -363,10 +374,44 @@ impl ProviderBridge {
                     reason: "request port could not persist the pre-start provider intent",
                 },
             })?;
+        let expected_working_directory =
+            self.port
+                .admitted_working_directory(admission)
+                .map_err(|error| match error {
+                    RequestPortError::WireDeliveryRefused => BridgeError::ProtocolViolation {
+                        reason: "request port did not retain an admitted working directory",
+                    },
+                    RequestPortError::EvidenceUnavailable => BridgeError::EvidenceIncomplete {
+                        reason: "request port could not retain the admitted working directory",
+                    },
+                    RequestPortError::NoAuthority | RequestPortError::Refused => {
+                        BridgeError::NotAdmitted {
+                            reason: "request port refused the admitted working-directory binding",
+                        }
+                    }
+                })?;
+        let expected_fence_nonce =
+            self.port
+                .admitted_fence_nonce(admission)
+                .map_err(|error| match error {
+                    RequestPortError::WireDeliveryRefused => BridgeError::ProtocolViolation {
+                        reason: "request port did not retain the admitted fence nonce",
+                    },
+                    RequestPortError::EvidenceUnavailable => BridgeError::EvidenceIncomplete {
+                        reason: "request port could not retain the admitted fence nonce",
+                    },
+                    RequestPortError::NoAuthority | RequestPortError::Refused => {
+                        BridgeError::NotAdmitted {
+                            reason: "request port refused the admitted fence binding",
+                        }
+                    }
+                })?;
         check_minted_request(
             admission,
             &envelope,
             &request_channel,
+            &expected_working_directory,
+            &expected_fence_nonce,
             &process_request,
         )?;
         let operation = process_request.operation_id().clone();
@@ -429,8 +474,7 @@ impl ProviderBridge {
         view: &ProcessExecutionView,
         cancellation: Option<CancellationReceipt>,
     ) -> Result<ProviderExecution, BridgeError> {
-        let (reconciliation, reconciliation_error) =
-            self.reconcile_with_error(&bound.operation);
+        let (reconciliation, reconciliation_error) = self.reconcile_with_error(&bound.operation);
         let captured = self
             .executor
             .captured_output(&bound.operation)
@@ -443,7 +487,7 @@ impl ProviderBridge {
                 None,
                 reconciliation,
                 reconciliation_error,
-                None,
+                Some("provider stream capture unavailable".to_owned()),
             );
         };
         let Some(exit) = view.exit() else {
@@ -503,18 +547,16 @@ impl ProviderBridge {
             }
             if failure.is_none() {
                 let result_path = channel_result_path(&bound)?;
-                let document = fs::read(&result_path)
+                let document = fs::read(&result_path).ok().and_then(|bytes| {
+                    ResearchResultDocument::decode(
+                        &bytes,
+                        &bound.request,
+                        &bound.envelope.operation_id,
+                        &bound.envelope.request_sha256,
+                        &bound.envelope.route_id,
+                    )
                     .ok()
-                    .and_then(|bytes| {
-                        ResearchResultDocument::decode(
-                            &bytes,
-                            &bound.request,
-                            &bound.envelope.operation_id,
-                            &bound.envelope.request_sha256,
-                            &bound.envelope.route_id,
-                        )
-                        .ok()
-                    });
+                });
                 if let Some(document) = document {
                     if let Ok(Some(stdout_frame)) = scan_result_frame(
                         &stdout.bytes,
@@ -575,17 +617,14 @@ impl ProviderBridge {
             tree_terminated,
             provider_job_ref.clone(),
             result_frame.as_ref(),
-            channel_result_path(&bound).ok().map(|path| path.to_string_lossy().into_owned()),
+            channel_result_path(&bound)
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned()),
         );
-        let candidate = candidate.or_else(|| {
-            build_candidate_bundle(
-                &bound.admission,
-                &bound,
-                result_frame.as_ref(),
-                outcome,
-                &evidence,
-            )
-        });
+        // A typed result document is the only source of candidate material.
+        // Never fabricate an empty candidate when that document is missing or
+        // malformed; the failure/receipt path carries the honest gap instead.
+        let candidate = candidate;
         Ok(ProviderExecution {
             job_id: bound.operation.as_str().to_owned(),
             outcome,
@@ -608,7 +647,7 @@ impl ProviderBridge {
         cancellation_error: Option<String>,
         reconciliation: Option<ProcessEvidence>,
         reconciliation_error: Option<String>,
-        start_error: Option<&ProcessExecutionError>,
+        process_error: Option<String>,
     ) -> Result<ProviderExecution, BridgeError> {
         let streams = self
             .executor
@@ -646,6 +685,7 @@ impl ProviderBridge {
                 },
             );
         let evidence = attach_evidence_handles(evidence, reconciliation.as_ref());
+        let process_failed = process_error.is_some();
         let receipt = build_receipt(
             &bound,
             &evidence,
@@ -655,14 +695,18 @@ impl ProviderBridge {
             cancellation_error,
             reconciliation,
             reconciliation_error,
-            start_error.map(ToString::to_string),
+            process_error,
             tree_terminated,
             None,
             None,
-            channel_result_path(&bound).ok().map(|path| path.to_string_lossy().into_owned()),
+            channel_result_path(&bound)
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned()),
         );
-        let candidate = build_candidate_bundle(&bound.admission, &bound, None, outcome, &evidence);
-        let failure = Some(if start_error.is_some() {
+        // An unobserved attempt has no candidate bytes. Its typed failure and
+        // raw evidence are retained without manufacturing an empty result.
+        let candidate = None;
+        let failure = Some(if process_failed {
             ProviderFailureKind::Process
         } else {
             match outcome {
@@ -874,102 +918,12 @@ fn build_receipt(
     }
 }
 
-#[allow(clippy::unnecessary_wraps)]
-fn build_candidate_bundle(
-    admission: &ProviderAdmission,
-    bound: &BoundOperation,
-    result_frame: Option<&ResultFrame>,
-    outcome: ProviderOutcome,
-    evidence: &RawProviderEvidence,
-) -> Option<ResearchEvidenceBundle> {
-    let envelope = &bound.envelope;
-    let (gap_kind, disposition, detail, failed) = match (result_frame, outcome) {
-        (Some(frame), ProviderOutcome::Completed)
-            if frame.coverage_denominator != CoverageDenominator::CompleteScope =>
-        {
-            (
-                CoverageGapKind::Unknown,
-                CompletionDisposition::IncompleteCoverage,
-                "provider returned candidate material without a complete frozen-scope denominator",
-                Vec::new(),
-            )
-        }
-        (Some(_frame), ProviderOutcome::Completed) => (
-            CoverageGapKind::Unknown,
-            CompletionDisposition::Inconclusive,
-            "candidate-only provider result awaits Governor admission",
-            Vec::new(),
-        ),
-        (_, ProviderOutcome::Cancelled) => (
-            CoverageGapKind::Cancelled,
-            CompletionDisposition::Cancelled,
-            "provider acquisition was cancelled before a complete candidate result was proven",
-            vec!["provider cancellation".to_owned()],
-        ),
-        (_, ProviderOutcome::TimedOut) => (
-            CoverageGapKind::Timeout,
-            CompletionDisposition::IncompleteCoverage,
-            "provider acquisition exceeded the admitted deadline",
-            vec!["provider timeout".to_owned()],
-        ),
-        (_, ProviderOutcome::Crashed) => (
-            CoverageGapKind::Unknown,
-            CompletionDisposition::IncompleteCoverage,
-            "provider process crashed or reported acquisition failure",
-            vec!["provider crash/failure".to_owned()],
-        ),
-        (_, ProviderOutcome::Unknown | ProviderOutcome::Completed) => (
-            CoverageGapKind::Unknown,
-            CompletionDisposition::IncompleteCoverage,
-            "provider result is unknown or lacks correlated source/coverage evidence",
-            vec!["provider unknown/incomplete result".to_owned()],
-        ),
-    };
-    let source_handle = result_frame
-        .and_then(|frame| frame.source_handles.first().cloned())
-        .unwrap_or_else(|| format!("provider:{}", envelope.route_id));
-    let coverage_gaps = vec![CoverageGap {
-        source_handle,
-        kind: gap_kind,
-        detail: detail.to_owned(),
-    }];
-    let coverage_unknowns = if result_frame.is_some() {
-        vec!["provider source/provenance/coverage metadata is candidate-only until Governor admission".to_owned()]
-    } else {
-        vec!["no provider result frame was correlated".to_owned()]
-    };
-    let artifact_handles = result_frame
-        .map(|frame| vec![format!("provider-candidate:{}", frame.candidate_sha256)])
-        .unwrap_or_default();
-    let digest_input = format!(
-        "{}:{}:{}:{}",
-        envelope.operation_id, envelope.request_sha256, envelope.route_id, evidence.stdout.sha256
-    );
-    Some(ResearchEvidenceBundle {
-        exchange_id: envelope.exchange_id.clone(),
-        job_id: envelope.operation_id.clone(),
-        system_generation: admission.module_generation_id().to_owned(),
-        immutable_bundle_digest: sha256_hex(digest_input.as_bytes()),
-        origin_authentication: admission.bridge().executable_sha256().to_owned(),
-        state_fence: admission.fence().clone(),
-        sources: Vec::new(),
-        claims: Vec::new(),
-        bounded_excerpts: Vec::new(),
-        artifact_handles,
-        coverage_unknowns,
-        failed_acquisition: failed,
-        coverage_gaps,
-        disposition,
-        synthesis_is_candidate: true,
-        disclosure: envelope.disclosure,
-        invalidation: Some("candidate-only; normal Governor admission required".to_owned()),
-    })
-}
-
 fn check_minted_request(
     admission: &ProviderAdmission,
     expected_envelope: &SubmitEnvelope,
     channel: &ResearchRequestChannel,
+    expected_working_directory: &Path,
+    expected_fence_nonce: &str,
     request: &ProcessRequest,
 ) -> Result<(), BridgeError> {
     request.validate().map_err(|_| BridgeError::NotAdmitted {
@@ -982,13 +936,12 @@ fn check_minted_request(
             reason: "minted process request names an unapproved artifact",
         });
     }
-    let expected_working_directory =
-        Path::new(request.executable())
-            .parent()
-            .ok_or(BridgeError::NotAdmitted {
-                reason: "approved provider artifact has no installation directory",
-            })?;
-    if request.working_directory() != expected_working_directory.to_string_lossy().as_ref() {
+    if !expected_working_directory.is_absolute()
+        || expected_working_directory
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || request.working_directory() != expected_working_directory.to_string_lossy().as_ref()
+    {
         return Err(BridgeError::NotAdmitted {
             reason: "minted process request permits a caller-selected working directory",
         });
@@ -1008,7 +961,7 @@ fn check_minted_request(
         .authority_epoch()
         .is_same_authority(admission.epoch())
         || request.fence().generation().get() != admission.process_generation().get()
-        || request.fence().nonce() != expected_envelope.cancellation_id
+        || request.fence().nonce() != expected_fence_nonce
     {
         return Err(BridgeError::NotAdmitted {
             reason: "minted process request disagrees on the full process fence or cancellation identity",
@@ -1023,18 +976,16 @@ fn check_minted_request(
         });
     }
     let argv = request.argv();
-    if argv.len() != 2
-        || argv[0] != PROVIDER_CHANNEL_ARGUMENT
-        || argv[1] != channel.token()
-    {
+    if argv.len() != 2 || argv[0] != PROVIDER_CHANNEL_ARGUMENT || argv[1] != channel.token() {
         return Err(BridgeError::ProtocolViolation {
             reason: "minted process request did not carry the protected request-channel token",
         });
     }
     let request_path = expected_working_directory.join(channel.request_file_name());
-    let delivered_request = fs::read(&request_path).map_err(|_| BridgeError::ProtocolViolation {
-        reason: "protected request channel is missing before provider start",
-    })?;
+    let delivered_request =
+        fs::read(&request_path).map_err(|_| BridgeError::ProtocolViolation {
+            reason: "protected request channel is missing before provider start",
+        })?;
     if delivered_request != channel.request_bytes() {
         return Err(BridgeError::ProtocolViolation {
             reason: "protected request channel does not contain the exact typed request",

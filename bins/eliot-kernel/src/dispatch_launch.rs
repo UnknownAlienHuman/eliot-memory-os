@@ -97,6 +97,8 @@
 //! outstanding identity.
 
 use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -117,8 +119,9 @@ use eliot_ors::{
 use eliot_process::{OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
 use eliot_research_exchange_api::{
-    ResearchDispatchClaim, ResearchDispatchMaterial, ResearchProviderRegistration,
-    ResearchQueryRequest, RESEARCH_DISPATCH_WIRE_ID,
+    RESEARCH_DISPATCH_WIRE_ID, ResearchAuthoritySigner, ResearchDispatchClaim,
+    ResearchDispatchMaterial, ResearchProtectedMaterial, ResearchProviderRegistration,
+    ResearchQueryRequest,
 };
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
@@ -129,6 +132,7 @@ use eliot_testd_core::{
     testd_profile_binding, verification_receipt_sha256,
 };
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Protected Dreamer dispatch-launch material and launch lineage (T12-09).
 ///
@@ -690,6 +694,10 @@ pub struct ResearchDispatchBinding {
     pub child_executable_sha256: String,
     /// Absolute child working directory.
     pub child_working_directory: PathBuf,
+    /// Kernel-owned signing capability; never serialized into the Host
+    /// descriptor or provider-visible request bytes.
+    #[serde(skip)]
+    pub(crate) authority_signer: Option<Arc<ResearchAuthoritySigner>>,
 }
 
 impl ResearchDispatchBinding {
@@ -714,11 +722,17 @@ impl ResearchDispatchBinding {
                 "research child executable and working directory must be absolute".to_owned(),
             ));
         }
+        let mut authority_secret = [0_u8; 32];
+        authority_secret[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+        authority_secret[16..].copy_from_slice(Uuid::new_v4().as_bytes());
         Ok(Self {
             registration,
             child_executable,
             child_executable_sha256,
             child_working_directory,
+            authority_signer: Some(Arc::new(ResearchAuthoritySigner::from_host_secret(
+                authority_secret,
+            ))),
         })
     }
 }
@@ -2209,6 +2223,39 @@ fn write_material_file(path: &Path, bytes: &[u8]) -> Result<(), DispatchLaunchEr
 /// Reaps the dispatch file best-effort. Removal failure never fails the
 /// shot: the child consumes the file once on a validated read, and the
 /// next launch overwrites it.
+/// Writes one research material with create-new/no-replace semantics. An
+/// existing file is accepted only after exact authenticated byte readback;
+/// conflicting content is never overwritten.
+fn write_material_file_no_replace(path: &Path, bytes: &[u8]) -> Result<(), DispatchLaunchError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| DispatchLaunchError::Io(error.to_string()))?;
+    }
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            file.write_all(bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| DispatchLaunchError::Io(error.to_string()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = fs::read(path)
+                .map_err(|error| DispatchLaunchError::Io(error.to_string()))?;
+            if existing == bytes {
+                Ok(())
+            } else {
+                Err(DispatchLaunchError::ChangedTerms(
+                    "research material path already contains different bytes".to_owned(),
+                ))
+            }
+        }
+        Err(error) => Err(DispatchLaunchError::Io(error.to_string())),
+    }
+}
+
 fn reap_material_file(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
@@ -3836,10 +3883,9 @@ pub fn prepare_research_launch(
         .get()
         .ok_or(DispatchLaunchError::Uncomposed("research front door"))?;
     let binding = {
-        let composed = contour
-            .research
-            .lock()
-            .map_err(|_| DispatchLaunchError::Gate("research front-door lock poisoned".to_owned()))?;
+        let composed = contour.research.lock().map_err(|_| {
+            DispatchLaunchError::Gate("research front-door lock poisoned".to_owned())
+        })?;
         composed
             .clone()
             .ok_or(DispatchLaunchError::Uncomposed("research provider binding"))?
@@ -3847,10 +3893,9 @@ pub fn prepare_research_launch(
     request
         .validate()
         .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
-    session
-        .peer
-        .validate()
-        .map_err(|_| DispatchLaunchError::Gate("research session peer is unavailable".to_owned()))?;
+    session.peer.validate().map_err(|_| {
+        DispatchLaunchError::Gate("research session peer is unavailable".to_owned())
+    })?;
     if now_unix_nanos == 0 {
         return Err(DispatchLaunchError::InvalidMaterial(
             "research admission time must be non-zero".to_owned(),
@@ -3890,31 +3935,67 @@ pub fn prepare_research_launch(
         &canonical_json_bytes(request)
             .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?,
     );
+    let caller = kernel
+        .admitted_process_caller_session(session)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let owner = caller.owner().clone();
+    if binding.registration.owner_principal_digest != owner.principal_digest() {
+        return Err(DispatchLaunchError::Gate(
+            "research registration owner is not the authenticated Kernel caller".to_owned(),
+        ));
+    }
+    let operation_binding = canonical_json_bytes(&serde_json::json!({
+        "request_sha256": request_digest,
+        "owner_principal_digest": owner.principal_digest(),
+        "authority_epoch": authority_epoch,
+        "process_generation": generation,
+    }))
+    .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    let operation_digest = sha256_hex(&operation_binding);
     let operation_id = OperationId::new(format!(
-        "{}-{}",
+        "{}-{}-{}",
         DispatchedWorkerKind::Research.operation_prefix(),
-        short_identity(&request_digest)?
+        short_identity(&request_digest)?,
+        short_identity(&operation_digest)?
     ))
     .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
-    let (owner, _session_binding) = super::caller_binding(session)
-        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let claim = ResearchDispatchClaim::from_registration(
         &binding.registration,
         request.clone(),
         operation_id.as_str(),
         owner.principal_digest(),
-        binding.registration.owner_principal_digest.clone(),
-        session.connection_id.clone(),
+        owner.principal_digest(),
+        caller.session_id().as_str().to_owned(),
         session.launch_nonce.clone(),
         now_unix_nanos / 1_000_000,
     )
     .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
-    let material = ResearchDispatchMaterial::from_claim(claim)
+    let authority_signer = binding
+        .authority_signer
+        .as_deref()
+        .ok_or_else(|| DispatchLaunchError::Gate("research authority signer is not composed".to_owned()))?;
+    let mut authority_key = [0_u8; 32];
+    authority_key[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    authority_key[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    let material = ResearchDispatchMaterial::from_kernel_parts(
+        claim,
+        binding.registration.clone(),
+        binding
+            .child_working_directory
+            .to_string_lossy()
+            .into_owned(),
+        format!("research-authority-{}", Uuid::new_v4().simple()),
+        authority_key,
+        authority_signer,
+        now_unix_nanos / 1_000_000,
+    )
+    .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    let delivery_nonce = format!("research-delivery-{}", Uuid::new_v4().simple());
+    let protected_material = ResearchProtectedMaterial::new(material.clone(), delivery_nonce)
         .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
-    let material_dir = binding
-        .child_executable
-        .parent()
-        .ok_or_else(|| DispatchLaunchError::Path("research child has no installation parent".to_owned()))?;
+    let material_dir = binding.child_executable.parent().ok_or_else(|| {
+        DispatchLaunchError::Path("research child has no installation parent".to_owned())
+    })?;
     let material_path = material_dir.join(RESEARCH_MATERIAL_FILE_NAME);
     let identity = operation_id_string(&operation_id);
     {
@@ -3954,9 +4035,9 @@ pub fn prepare_research_launch(
             },
         );
     }
-    let bytes = serde_json::to_vec(&material)
+    let bytes = serde_json::to_vec(&protected_material)
         .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
-    if let Err(error) = write_material_file(&material_path, &bytes) {
+    if let Err(error) = write_material_file_no_replace(&material_path, &bytes) {
         release_launch(contour, &operation_id_string(&operation_id));
         return Err(error);
     }
@@ -4017,8 +4098,14 @@ pub async fn launch_admitted_research_attempt(
         .ok_or(DispatchLaunchError::Uncomposed("research front door"))?;
     let ready = match prepare_research_launch(kernel, session, request, now_unix_nanos)? {
         PreparedResearchLaunch::Ready(ready) => ready,
-        PreparedResearchLaunch::ReplayOriginal { claim, operation_id } => {
-            return Ok(ResearchLaunchOutcome::ReplayOriginal { claim, operation_id });
+        PreparedResearchLaunch::ReplayOriginal {
+            claim,
+            operation_id,
+        } => {
+            return Ok(ResearchLaunchOutcome::ReplayOriginal {
+                claim,
+                operation_id,
+            });
         }
     };
     let identity = operation_id_string(&ready.operation_id);
@@ -4112,9 +4199,11 @@ pub fn reconcile_launched_research_attempt(
             operation_id: operation_id.to_owned(),
         });
     };
-    let bytes = std::fs::read(material_path).map_err(|error| DispatchLaunchError::Io(error.to_string()))?;
-    let material: ResearchDispatchMaterial = serde_json::from_slice(&bytes)
-        .map_err(|_| DispatchLaunchError::InvalidMaterial("research material is not typed".to_owned()))?;
+    let bytes =
+        std::fs::read(material_path).map_err(|error| DispatchLaunchError::Io(error.to_string()))?;
+    let material: ResearchDispatchMaterial = serde_json::from_slice(&bytes).map_err(|_| {
+        DispatchLaunchError::InvalidMaterial("research material is not typed".to_owned())
+    })?;
     if material.claim.operation_id != operation_id
         || material.claim.authority_epoch != live_epoch
         || material.validate(super::unix_ms()).is_err()
