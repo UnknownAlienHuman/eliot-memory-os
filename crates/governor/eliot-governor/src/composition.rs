@@ -4720,6 +4720,61 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
     }
 
+    /// Checks the task, session, and `WorkScope` owners backing a native
+    /// worker executable binding: `task_revision` must equal the task owner
+    /// revision at the retained fence, `session_id` must name a session at
+    /// that fence on the retained authority with `route_ref` equal to its
+    /// admitted `model_route`, and the bound `WorkScope` must equal
+    /// `work_scope_id` with a freshly `MATCHED` guard receipt (Issue #1787:
+    /// a stale or drifted guard receipt cannot back a native executable
+    /// binding; rebind or revalidate first). Any drift fails closed as
+    /// `Recovery` without selecting another candidate or transferring task
+    /// state or project memory.
+    fn check_native_binding_identity(
+        &self,
+        fence: &StateFence,
+        task_id: &str,
+        task_revision: u64,
+        session_id: &str,
+        route_ref: &str,
+        work_scope_id: &str,
+    ) -> Result<(), CompositionError> {
+        let task_key = TaskId::new(task_id.to_owned())
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let task = self.owners.task.task(&task_key).ok_or_else(|| {
+            CompositionError::Recovery("native binding task has no owner record".to_owned())
+        })?;
+        if task.revision != task_revision || task.state_fence != *fence {
+            return Err(CompositionError::Recovery(
+                "native binding task revision is stale or foreign".to_owned(),
+            ));
+        }
+        let session_key = SessionId::new(session_id.to_owned())
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let session = self.owners.session.session(&session_key).ok_or_else(|| {
+            CompositionError::Recovery("native binding session has no owner record".to_owned())
+        })?;
+        if session.state_fence != *fence
+            || session.authority_epoch != fence.authority_epoch
+            || session.model_route != route_ref
+        {
+            return Err(CompositionError::Recovery(
+                "native binding session/route is stale or foreign".to_owned(),
+            ));
+        }
+        let scope = require_fresh_matched_binding(
+            self.owners.work_scope.as_ref(),
+            fence,
+            "native binding work scope is not freshly matched",
+        )?;
+        if scope.binding.scope.scope_ref != work_scope_id {
+            return Err(CompositionError::Recovery(
+                "native binding work scope does not match the bound WorkScope".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Publishes one versioned Governor-owned executable binding projection
     /// (T9-01 M1, `T9.md` 3.2) for a registered native-worker attempt.
     ///
@@ -4813,46 +4868,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     .to_owned(),
             ));
         }
-        let task_key = TaskId::new(task_id.to_owned())
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        let task = self.owners.task.task(&task_key).ok_or_else(|| {
-            CompositionError::Recovery("native binding task has no owner record".to_owned())
-        })?;
-        if task.revision != task_revision || task.state_fence != fence {
-            return Err(CompositionError::Recovery(
-                "native binding task revision is stale or foreign".to_owned(),
-            ));
-        }
-        let session_key = SessionId::new(session_id.to_owned())
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        let session = self.owners.session.session(&session_key).ok_or_else(|| {
-            CompositionError::Recovery("native binding session has no owner record".to_owned())
-        })?;
-        if session.state_fence != fence
-            || session.authority_epoch != authority_epoch
-            || session.model_route != route_ref
-        {
-            return Err(CompositionError::Recovery(
-                "native binding session/route is stale or foreign".to_owned(),
-            ));
-        }
-        let scope_owner = self.owners.work_scope.as_ref().ok_or_else(|| {
-            CompositionError::Recovery(
-                "native binding WorkScope is unbound; semantic activation is unavailable"
-                    .to_owned(),
-            )
-        })?;
-        let scope = scope_owner
-            .read_current(&fence)
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        if scope.binding.scope.scope_ref != work_scope_id {
-            return Err(CompositionError::Recovery(
-                "native binding work scope does not match the bound WorkScope".to_owned(),
-            ));
-        }
-        // Issue #1787: a stale or drifted guard receipt cannot back a native
-        // executable binding; rebind or revalidate first.
-        ensure_snapshot_fresh(&scope, "native binding work scope is not freshly matched")?;
+        self.check_native_binding_identity(
+            &fence,
+            task_id,
+            task_revision,
+            session_id,
+            route_ref,
+            work_scope_id,
+        )?;
         let mut binding = NativeWorkerExecutableBinding {
             claim_id: claim_id.to_owned(),
             registration_id: registration_id.to_owned(),
