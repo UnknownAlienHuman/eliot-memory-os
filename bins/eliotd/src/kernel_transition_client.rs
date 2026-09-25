@@ -42,6 +42,36 @@ fn check_identity_binding(
     transition
         .validate()
         .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+    // Issue #1929 (I5.5 capture/promotion split): the daemon is the admission
+    // edge, not a bypass around the store gate. Before any transport is
+    // touched, a `CaptureObservation` that names no task on either the
+    // admitted context or the transition has no unique task selection, so it
+    // is admitted here as a cold unbound candidate and can never leave the
+    // daemon with task activation, support/influence promotion, or finish
+    // relevance. A capture that names a task is task-relative and its binding
+    // belongs to the ingress that owns the exact selection evidence; it is
+    // reported, never downgraded to a cold capture and never admitted here.
+    // There is no latest-task/open-task/resolver-guess fallback.
+    //
+    // `KernelPortError` has no task-binding variant, so the typed rejection
+    // travels as its `Contract` detail, which is exactly
+    // `TASK_SELECTION_REQUIRED: …` / `TASK_SCOPE_INCOMPATIBLE: …` — the
+    // stable code is preserved verbatim, not reduced to prose. The store gate
+    // independently re-derives the same two codes as a typed
+    // `StoreError::InvalidField { field: "task_binding", reason: <code> }`,
+    // so neither layer depends on the other's encoding.
+    let admission = super::task_binding_admission::admit_named_mutation_capture(
+        &identity.request.metadata,
+        transition,
+    )
+    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+    if let super::task_binding_admission::TaskBindingAdmission::ColdUnbound(candidate) = &admission
+    {
+        tracing::info!(
+            candidate_id = %super::diagnostics::sanitize_identity(&candidate.candidate_id),
+            "cold unbound observation candidate: durable capture-first bytes, no task activation, support/influence promotion, or finish relevance"
+        );
+    }
     if transition.state_fence != identity.request.metadata.state_fence {
         return Err(KernelPortError::Contract(
             "daemon transition fence does not match the admitted identity".to_owned(),

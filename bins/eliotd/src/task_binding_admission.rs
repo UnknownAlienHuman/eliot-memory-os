@@ -22,21 +22,58 @@
 //! recent or open task and never guesses from resolver output: ambiguous input
 //! stays cold. A contaminated selection (canonical crossover marker) never
 //! promotes: captures stay cold and task-bound promotion rejects.
+//!
+//! # Daemon ingress entries (issue #1929)
+//!
+//! Without an entry below this module was unreachable from the daemon: the
+//! `eliotd` ingress admitted a capture or a task-relative write and only the
+//! downstream store gate could object, so the daemon itself was a bypass
+//! around I5.5. The three production entries added here close that chain
+//! before any canonical write leaves the composition root:
+//!
+//! - [`admit_canonical_write`] — the composition-root named-mutation intake.
+//!   The caller already presented its compiled
+//!   [`OnboardingReadinessReceipt`](eliot_workscope::OnboardingReadinessReceipt),
+//!   so this is the one place where the exact `TaskSelectionEvidence` exists:
+//!   [`resolve_task_selection`] reads the owner-issued `CurrentTaskContract`
+//!   and routes a capture through [`admit_capture`] and every task-relative
+//!   transition through [`admit_task_bound`]. I5.6 step 4 verbatim —
+//!   "resolve `TaskSelectionEvidence` and `TaskContract` compatibility when the
+//!   command is task-relative".
+//! - [`admit_named_mutation_capture`] — the transport edge
+//!   (`DaemonKernelClient::apply_prepared`). No typed selection exists there, so
+//!   this entry only decides the capture leg: a `CaptureObservation` naming no
+//!   task is a cold unbound candidate and is never treated here as task-bound.
+//!   It deliberately does not restate the store bridge's presence/agreement
+//!   rule for task-bearing writes; that rule belongs to
+//!   `eliot-store-surreal::task_binding_gate`, which re-derives it from the
+//!   opaque proof handles before provider I/O. This entry consumes typed
+//!   selection evidence the store cannot see; the store gate re-checks
+//!   presence and agreement it can see. Neither replaces the other.
+//! - [`observe_explicit_workspace`] — the daemon half of the `WorkScope`
+//!   attach trigger. The daemon observes the explicit root mechanically; the
+//!   Governor stays the receipt/admission owner
+//!   (`GovernorComposition::admit_observed_scope_attach`), so this module
+//!   mints no receipt of its own.
+//!
+//! No entry creates a second write path, re-derives a downstream layer's
+//! decision, or accepts a task the caller did not name.
 
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
 
 use eliot_bootstrap::capture::observe_workspace_instance;
-use eliot_contracts::StateFence;
+use eliot_contracts::{RequestMetadata, StateFence, TaskId};
 use eliot_governor::{
-    GenerationEvidence, GoverningSourceSet, PrivacyProfile, ScopeBinding,
-    ScopeRelocationOrAttachReceipt, TaskScopeOutcome, WorkScopeBindingOwner, WorkScopeDescriptor,
-    WorkspaceInstanceIdentity, check_task_observation, derive_observed_resources,
-    produce_attach_receipt,
+    CanonicalWriteEnvelope, GenerationEvidence, GoverningSourceSet, PrivacyProfile, ScopeBinding,
+    TaskScopeOutcome, WorkScopeDescriptor, WorkspaceInstanceIdentity, check_task_observation,
+    derive_observed_resources,
 };
 use eliot_observation::TaskSelectionEvidence;
 use eliot_security_contracts::PrivacyClass;
+use eliot_store_api::{NamedMutationOperation, PreparedTransition};
+use eliot_workscope::{ObservedScopeResources, OnboardingReadinessReceipt, TaskBindingState};
 
 /// Stable rejection code when task-bound promotion lacks current evidence.
 pub const TASK_SELECTION_REQUIRED: &str = "TASK_SELECTION_REQUIRED";
@@ -136,6 +173,42 @@ pub enum CaptureAdmission {
     ColdUnbound(ObservationCandidate),
     /// Exact selection admitted for a later governed binding transition.
     TaskBound(TaskSelectionEvidence),
+}
+
+/// Disposition of one daemon ingress attempt (issue #1929).
+///
+/// The variant, not the transport, decides what the write means: a cold
+/// candidate carries no task activation, support/influence promotion, or
+/// finish relevance, while `TaskBound` is only ever returned after the exact
+/// selection evidence passed [`admit_task_bound`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaskBindingAdmission {
+    /// Cold unbound capture: durable bytes with no task effect.
+    ColdUnbound(ObservationCandidate),
+    /// Exact task-bound transition admitted toward the governed owner commit.
+    TaskBound,
+    /// Task-relative transition whose selection decision belongs to the
+    /// caller that owns the exact selection evidence, never to a capture
+    /// edge. Reported, never admitted and never silently downgraded.
+    TaskRelative,
+    /// Not a capture-first or task-relative write; no binding is required.
+    NotTaskRelative,
+}
+
+/// Task-selection disposition a caller-presented readiness receipt carries.
+///
+/// This is the I5.6 step-4 resolution result: exactly one current
+/// `TaskContract` revision plus its acceptance digest becomes selection
+/// evidence; a missing, exploratory, stale, or multi-candidate binding does
+/// not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaskSelectionDisposition {
+    /// No current exact selection: absent, exploratory (non-material), or stale.
+    Absent,
+    /// More than one candidate task handle survived selection; none is chosen.
+    Ambiguous(usize),
+    /// Exactly one current `TaskContract` revision with an acceptance digest.
+    Current(TaskSelectionEvidence),
 }
 
 /// Admits one `eliot.observe` capture without ever guessing a task.
@@ -315,6 +388,233 @@ pub fn admit_task_bound_with_observed_scope(
     )
 }
 
+/// Resolves the exact task-selection disposition of one caller-presented
+/// readiness receipt (I5.6 step 4, issue #1929).
+///
+/// This is the only producer of [`TaskSelectionEvidence`] in the daemon, and
+/// it invents nothing: a `CurrentTaskContract` binding is the owner-issued
+/// `task_ref` + `task_revision` + `acceptance_digest` triple from the receipt's
+/// own `task_binding`, joined with the receipt's exact `WorkScope` identity and
+/// reference handles. Every other binding state resolves to no selection:
+///
+/// - [`TaskBindingState::None_`] — the caller selected no task;
+/// - `Exploratory` — a task is named but the binding is explicitly
+///   non-material, so it is not a current `TaskContract`;
+/// - `Stale` — the named revision is no longer current;
+/// - `Ambiguous` — several candidate handles survived selection and the receipt
+///   is forbidden to prefer one, so the candidate count is preserved and the
+///   disposition stays non-material.
+///
+/// There is deliberately no latest-task, open-task, or resolver-guess leg here:
+/// ambiguity is reported, never resolved.
+#[must_use]
+pub fn resolve_task_selection(receipt: &OnboardingReadinessReceipt) -> TaskSelectionDisposition {
+    match &receipt.task_binding {
+        TaskBindingState::CurrentTaskContract {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+        } => TaskSelectionDisposition::Current(TaskSelectionEvidence {
+            task_ref: task_ref.clone(),
+            task_revision: *task_revision,
+            acceptance_digest: acceptance_digest.clone(),
+            work_scope_ref: receipt.scope.scope_ref.clone(),
+            selection_source_ref: receipt.governance_profile_ref.clone(),
+            evidence_ref: receipt.receipt_ref.clone(),
+            contamination_flags: Vec::new(),
+        }),
+        TaskBindingState::Ambiguous { candidate_handles } => {
+            TaskSelectionDisposition::Ambiguous(candidate_handles.len())
+        }
+        TaskBindingState::None_
+        | TaskBindingState::Exploratory { .. }
+        | TaskBindingState::Stale { .. } => TaskSelectionDisposition::Absent,
+    }
+}
+
+/// Computes the `TaskContract` compatibility disposition for one write from
+/// the caller's receipt: the selection is compatible only when the receipt was
+/// compiled at the exact write fence and resolved the exact `WorkScope` the
+/// write addresses.
+///
+/// Anything else is `Incompatible` and therefore rejects the task-relative
+/// transition with `TASK_SCOPE_INCOMPATIBLE` instead of admitting it. This
+/// reads only caller-presented terms; it resolves no authority of its own.
+fn compatibility_for(
+    receipt: &OnboardingReadinessReceipt,
+    envelope: &CanonicalWriteEnvelope,
+    write_fence: &StateFence,
+) -> CompatibilityDisposition {
+    if eliot_contracts::fences_match_exact(&receipt.state_fence, write_fence)
+        && receipt.scope.scope_ref == envelope.scope_id.as_str()
+    {
+        CompatibilityDisposition::Compatible
+    } else {
+        CompatibilityDisposition::Incompatible
+    }
+}
+
+/// Admits one daemon named-mutation write at the composition-root ingress
+/// (issue #1929, I5.5 capture/promotion split, I5.6 step 4).
+///
+/// This is the production entry for `DaemonComposition::commit_canonical_and_refresh`,
+/// reached before any Governor commit and therefore before the store. The
+/// caller already presented its compiled [`OnboardingReadinessReceipt`], so the
+/// exact selection is resolved here through [`resolve_task_selection`] and the
+/// write is split by what it actually is:
+///
+/// - a capture naming no task — the capture-first case — goes through
+///   [`admit_capture`] and is returned as
+///   [`TaskBindingAdmission::ColdUnbound`] unless the caller resolved one exact
+///   compatible selection, in which case it is admitted task-bound through
+///   [`admit_task_bound`]. It never affects task memory, support, influence, or
+///   finish while cold;
+/// - any task-relative write — one that names a task, or a task-control,
+///   finish, or other task-bearing transition — requires the exact selection
+///   and is admitted only through [`admit_task_bound`]. Absent, exploratory, or
+///   stale evidence rejects with `TASK_SELECTION_REQUIRED`; a selection naming
+///   a different task, `WorkScope`, or a moved fence rejects with
+///   `TASK_SCOPE_INCOMPATIBLE`, mutating nothing;
+/// - anything else is [`TaskBindingAdmission::NotTaskRelative`].
+///
+/// This entry never selects a task the caller did not name and never consults
+/// recency, proximity, or the newest/open task. Its typed evidence is exactly
+/// what the store bridge cannot see: the store gate re-derives presence and
+/// agreement from the opaque proof handles, this gate verifies the
+/// `TaskSelectionEvidence` values against the caller's own receipt.
+pub fn admit_canonical_write(
+    candidate_id: String,
+    context: &RequestMetadata,
+    envelope: &CanonicalWriteEnvelope,
+    receipt: &OnboardingReadinessReceipt,
+    write_fence: &StateFence,
+) -> Result<TaskBindingAdmission, TaskBindingError> {
+    let disposition = resolve_task_selection(receipt);
+    let compatibility = compatibility_for(receipt, envelope, write_fence);
+    let (selection, candidate_count) = match &disposition {
+        TaskSelectionDisposition::Absent => (None, 0_usize),
+        TaskSelectionDisposition::Ambiguous(count) => (None, *count),
+        TaskSelectionDisposition::Current(evidence) => (Some(evidence), 1_usize),
+    };
+    let carries = |operation: NamedMutationOperation| {
+        envelope
+            .semantic_commands
+            .iter()
+            .any(|command| command.operation == operation)
+    };
+    let captures = carries(NamedMutationOperation::CaptureObservation);
+    let task_relative = envelope.task_id.is_some()
+        || carries(NamedMutationOperation::UpdateTaskState)
+        || carries(NamedMutationOperation::RecordFinishDecision)
+        || carries(NamedMutationOperation::RecordFinishEvidence);
+
+    if captures && !task_relative {
+        return match admit_capture(
+            candidate_id,
+            context.state_fence.clone(),
+            selection,
+            candidate_count,
+            compatibility,
+        )? {
+            CaptureAdmission::ColdUnbound(candidate) => {
+                Ok(TaskBindingAdmission::ColdUnbound(candidate))
+            }
+            CaptureAdmission::TaskBound(evidence) => {
+                admit_task_bound(
+                    Some(&evidence),
+                    evidence.task_ref.as_str(),
+                    envelope.scope_id.as_str(),
+                    write_fence,
+                    compatibility,
+                )?;
+                Ok(TaskBindingAdmission::TaskBound)
+            }
+        };
+    }
+
+    if task_relative {
+        let Some(expected_task_ref) = envelope.task_id.as_deref() else {
+            return Err(TaskBindingError::selection_required(
+                "task-relative write names no task binding",
+            ));
+        };
+        if let Some(context_task) = context.task_id.as_ref().map(TaskId::as_str) {
+            if context_task != expected_task_ref {
+                return Err(TaskBindingError::scope_incompatible(
+                    "task-relative write names a different task than the admitted context",
+                ));
+            }
+        }
+        admit_task_bound(
+            selection,
+            expected_task_ref,
+            envelope.scope_id.as_str(),
+            write_fence,
+            compatibility,
+        )?;
+        return Ok(TaskBindingAdmission::TaskBound);
+    }
+
+    Ok(TaskBindingAdmission::NotTaskRelative)
+}
+
+/// Admits the capture leg of one prepared transition at the daemon transport
+/// edge (issue #1929, I5.5).
+///
+/// This is the production entry for `DaemonKernelClient::apply_prepared`'s
+/// pre-transport admission: the last point inside the daemon where a
+/// `CaptureObservation` can still be classified before it reaches Kernel and
+/// the store. Its only decision is the capture leg:
+///
+/// - a `CaptureObservation` naming no task on either the admitted context or
+///   the transition has no unique task selection, so it is admitted through
+///   [`admit_capture`] as [`TaskBindingAdmission::ColdUnbound`] with no task
+///   activation, support/influence promotion, or finish relevance;
+/// - a `CaptureObservation` that names a task is task-relative, and this edge
+///   reports [`TaskBindingAdmission::TaskRelative`] rather than guessing: the
+///   binding decision belongs to the ingress that owns the exact selection
+///   ([`admit_canonical_write`]) and is re-derived at the store gate from the
+///   proof handles the transition actually carries. A typed selection is never
+///   manufactured here, and an absent one is never treated as compatible;
+/// - a transition with no capture at all is
+///   [`TaskBindingAdmission::NotTaskRelative`].
+///
+/// It never selects the most recent or open task and never falls back to
+/// resolver output.
+pub fn admit_named_mutation_capture(
+    context: &RequestMetadata,
+    transition: &PreparedTransition,
+) -> Result<TaskBindingAdmission, TaskBindingError> {
+    let captures = transition
+        .named_operations
+        .iter()
+        .any(|named| named.operation == NamedMutationOperation::CaptureObservation);
+    if !captures {
+        return Ok(TaskBindingAdmission::NotTaskRelative);
+    }
+    let names_a_task = transition.task_id.is_some() || context.task_id.is_some();
+    if names_a_task {
+        return Ok(TaskBindingAdmission::TaskRelative);
+    }
+    match admit_capture(
+        transition.identity.operation_id.as_str().to_owned(),
+        context.state_fence.clone(),
+        None,
+        0,
+        CompatibilityDisposition::Compatible,
+    )? {
+        CaptureAdmission::ColdUnbound(candidate) => {
+            Ok(TaskBindingAdmission::ColdUnbound(candidate))
+        }
+        CaptureAdmission::TaskBound(evidence) => {
+            Err(TaskBindingError::selection_required(format!(
+                "task-free capture must not carry a task selection: {}",
+                evidence.evidence_ref
+            )))
+        }
+    }
+}
+
 /// Observes one explicit workspace root and admits one task-relative
 /// transition against the live observation.
 ///
@@ -398,9 +698,10 @@ pub fn observe_and_admit_task(
 /// the scope, the lineage, or the authorization — the live owner read at the
 /// fence, the `MATCHED` guard, and the source closure inside
 /// `GovernorComposition::admit_observed_scope_attach` do. Call sequence:
-/// `validate`, then `observe_workspace_instance` on `explicit_root`,
-/// `derive_observed_resources` at the admission fence generation, then
+/// `validate`, then [`observe_explicit_workspace`] on `explicit_root`, then
 /// `GovernorComposition::admit_observed_scope_attach` with every field below.
+/// That call order is the production one in
+/// `DaemonComposition::admit_scope_attach`.
 ///
 /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
 #[derive(Clone, Debug)]
@@ -482,55 +783,35 @@ impl ScopeAttachIngress {
     }
 }
 
-/// Observes one explicit workspace root and produces an authorized attach
-/// receipt for the newly observed instance.
+/// Observes one explicit workspace root and derives the observed scope
+/// resources the `WorkScope` attach trigger admits against.
 ///
-/// This is the daemon trigger ingress for scope attach: the explicit root is
-/// observed mechanically (filesystem/VCS/project facts, never invented), the
-/// observation is derived at the admission fence generation through the same
-/// `derive_observed_resources` the CLI scope-observe ingress runs, and the
-/// owner-issued attach receipt is produced from that live observation, the
-/// retained descriptor and owner, and the explicit authorization reference. A
-/// root that cannot be observed, or an observation that is not exactly one
-/// new same-lineage instance of the bound scope, fails closed with
-/// `TASK_SCOPE_INCOMPATIBLE` carrying the exact producer detail; the retained
-/// binding, task state, and project memory are untouched.
+/// This is the daemon half of the attach ingress and the only mechanical step
+/// it owns: the explicit absolute root is observed from filesystem/VCS/project
+/// facts (never invented, never inferred from cwd, proximity, or recency) and
+/// the observation is derived at the admission fence generation through the
+/// same `derive_observed_resources` the CLI scope-observe ingress runs. A root
+/// that cannot be observed, or one whose derived resources are invalid, fails
+/// closed with `TASK_SCOPE_INCOMPATIBLE` carrying the exact detail; the
+/// retained binding, task state, and project memory are untouched.
 ///
-/// The returned receipt binds nothing by itself: admission runs in the owning
-/// caller through the Governor relocation entry (`admit_scope_relocation`),
-/// which rebinds with the receipt and requires a fresh `MATCHED`
-/// source-closure check for the observed instance. The root is always
-/// explicit — the daemon never infers a workspace from cwd, proximity, or
-/// recency.
-///
-/// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
-pub fn observe_and_produce_attach_receipt(
+/// Receipt production and admission stay with the Governor owner
+/// (`GovernorComposition::admit_observed_scope_attach`): this function mints no
+/// receipt and installs no binding, so the daemon cannot become a second
+/// `WorkScope` writer. The caller's admitted owner read, the fresh `MATCHED`
+/// source-closure check, and the explicit authorization reference are the
+/// Governor's terms, not this crate's.
+pub fn observe_explicit_workspace(
     workspace_root: &Path,
-    receipt_ref: &str,
-    descriptor: &WorkScopeDescriptor,
-    owner: &WorkScopeBindingOwner,
-    authorizing_ref: &str,
     fence: &StateFence,
-) -> Result<ScopeRelocationOrAttachReceipt, TaskBindingError> {
+) -> Result<ObservedScopeResources, TaskBindingError> {
     let facts = observe_workspace_instance(workspace_root).map_err(|error| {
         TaskBindingError::scope_incompatible(format!("workspace observation failed: {error}"))
     })?;
-    let observed =
-        derive_observed_resources(&facts, fence.resource_generation, None).map_err(|error| {
-            TaskBindingError::scope_incompatible(format!(
-                "observed workspace resources invalid: {error}"
-            ))
-        })?;
-    produce_attach_receipt(
-        receipt_ref,
-        descriptor,
-        owner,
-        &observed,
-        authorizing_ref,
-        fence,
-    )
-    .map_err(|error| {
-        TaskBindingError::scope_incompatible(format!("attach receipt production failed: {error}"))
+    derive_observed_resources(&facts, fence.resource_generation, None).map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "observed workspace resources invalid: {error}"
+        ))
     })
 }
 
