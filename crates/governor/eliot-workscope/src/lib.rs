@@ -1950,6 +1950,145 @@ impl OnboardingSingleFlight {
     }
 }
 
+/// Failure of one trigger-driven cold-start compilation.
+///
+/// `Lease` preserves the single-flight join refusal (expired or denied
+/// discovery lease) without translating it into a compilation error;
+/// `Compile` preserves the compiler, surface, or publish failure verbatim.
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum CompileDriverError {
+    /// The trigger's lease could not join: discovery lease expired/denied.
+    #[error("cold-start trigger lease refused: {0:?}")]
+    Lease(OnboardingDegraded),
+    /// Compilation, surface projection, or terminal publish failed.
+    #[error("cold-start compilation failed: {0}")]
+    Compile(#[from] WorkScopeError),
+}
+
+impl OnboardingSingleFlight {
+    /// Drives one live attach trigger end to end: join, compile, publish.
+    ///
+    /// This is the Governor/WorkScopeResolver-owned live-trigger entry point
+    /// (I4.4.1): the caller — first UI project open, agent attach/launch,
+    /// unknown-workspace event, explicit onboarding request, stale
+    /// generation, or resume without a current task — supplies the trigger,
+    /// the privacy-bounded discovery lease, the proposed onboarding lease,
+    /// and every exact identity the freeze requires (scope, instance,
+    /// lineage, candidate, governing sources, fence, governance/route
+    /// profiles, serializer/tokenizer/projection references, privacy
+    /// boundary, task input). The driver joins the single-flight lease for
+    /// the trigger, compiles exactly one [`OnboardingReadinessReceipt`]
+    /// through [`ColdStartController::compile`], and publishes it as the
+    /// lease terminal so compatible concurrent attaches receive the same
+    /// receipt and no worker independently creates a second `WorkScope` or
+    /// "latest task" while the lease is active.
+    ///
+    /// Single-flight semantics: an already-terminal lease returns its
+    /// `JoinedTerminal` surface without recompiling; a lease owned by an
+    /// in-flight trigger returns `Joined` without a second compilation; only
+    /// the trigger that creates the lease compiles and publishes. The
+    /// terminal state follows the compiled receipt: `ReadyMaterial` and
+    /// `ReadyReadOnly` publish `Ready`, a `NeedsTask` receipt over an
+    /// ambiguous task binding publishes `Ambiguous`, and any other compiled
+    /// but incomplete receipt publishes `Failed` — the exact missing
+    /// question stays in the terminal surface, and the next trigger starts a
+    /// new lease revision rather than mutating this one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompileDriverError::Lease`] when the trigger's scanner pass
+    /// is not admitted by the discovery lease, or
+    /// [`CompileDriverError::Compile`] when compilation, surface projection,
+    /// or terminal publish fails closed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_and_publish(
+        &mut self,
+        trigger: ColdStartTrigger,
+        discovery_lease: &DiscoveryReadLease,
+        proposed: OnboardingLease,
+        receipt_ref: impl Into<String>,
+        principal_ref: impl Into<String>,
+        session_ref: impl Into<String>,
+        scope: &ScopeIdentity,
+        instance: &WorkspaceInstanceIdentity,
+        lineage: Option<&RepositoryLineageIdentity>,
+        candidate: &WorkScopeCandidate,
+        sources: &GoverningSourceSet,
+        state_fence: &StateFence,
+        governance_profile_ref: impl Into<String>,
+        limiting_integration_evidence: Vec<String>,
+        route_profile_ref: impl Into<String>,
+        serializer_id: impl Into<String>,
+        serializer_version: impl Into<String>,
+        serializer_options_digest: impl Into<String>,
+        tokenizer_id: impl Into<String>,
+        tokenizer_version: impl Into<String>,
+        tokenizer_hash: impl Into<String>,
+        projection_source_ref: impl Into<String>,
+        projection_generation: u64,
+        privacy: &PrivacyProfile,
+        task: TaskBindingInput,
+        now: u64,
+    ) -> Result<LeaseJoin, CompileDriverError> {
+        let created_ref = proposed.lease_ref.clone();
+        match self
+            .join(trigger, discovery_lease, proposed, now)
+            .map_err(CompileDriverError::Lease)?
+        {
+            already @ (LeaseJoin::JoinedTerminal { .. } | LeaseJoin::Joined { .. }) => Ok(already),
+            LeaseJoin::Created { .. } => {
+                let lease = self
+                    .entries
+                    .iter()
+                    .find(|entry| entry.lease.lease_ref == created_ref)
+                    .map(|entry| entry.lease.clone())
+                    .ok_or(WorkScopeError::BindingReceiptMismatch)?;
+                let receipt = ColdStartController.compile(
+                    receipt_ref,
+                    &lease,
+                    principal_ref,
+                    session_ref,
+                    scope,
+                    instance,
+                    lineage,
+                    candidate,
+                    sources,
+                    state_fence,
+                    governance_profile_ref,
+                    limiting_integration_evidence,
+                    route_profile_ref,
+                    serializer_id,
+                    serializer_version,
+                    serializer_options_digest,
+                    tokenizer_id,
+                    tokenizer_version,
+                    tokenizer_hash,
+                    projection_source_ref,
+                    projection_generation,
+                    privacy,
+                    task,
+                    now,
+                )?;
+                let surface = receipt.surface(&lease)?;
+                let terminal = match (&receipt.readiness, &receipt.task_binding) {
+                    (ReadinessLifecycle::ReadyMaterial | ReadinessLifecycle::ReadyReadOnly, _) => {
+                        OnboardingLeaseState::Ready
+                    }
+                    (ReadinessLifecycle::NeedsTask, TaskBindingState::Ambiguous { .. }) => {
+                        OnboardingLeaseState::Ambiguous
+                    }
+                    _ => OnboardingLeaseState::Failed,
+                };
+                self.publish_terminal(&created_ref, receipt, terminal, now)?;
+                Ok(LeaseJoin::JoinedTerminal {
+                    lease_ref: created_ref,
+                    surface,
+                })
+            }
+        }
+    }
+}
+
 /// ELIOT_ARCH_OWNER: ARCH-SCOPE-01
 /// Stateless mid-task scope binding guard.
 #[allow(clippy::doc_markdown)]

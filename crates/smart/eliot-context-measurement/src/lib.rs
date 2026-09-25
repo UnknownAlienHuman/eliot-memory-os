@@ -1,18 +1,20 @@
 //! Exact UTF-8 measurement for one canonical rendered context payload.
 //!
-//! This crate owns the sole #704 measurement operation consumed by
-//! `eliot-context-assembly::assemble_active_view` as its
-//! `measure: FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>`
-//! callback. It measures the exact payload bytes as UTF-8, derives the
-//! envelope digest with SHA-256, and keeps the three route-cost signals
-//! distinct:
+//! This crate owns the sole #704 measurement operation. It measures the
+//! exact payload bytes as UTF-8, derives the envelope digest with SHA-256,
+//! and keeps the three route-cost signals distinct:
 //!
 //! * exact `rendered_utf8_bytes` proves route fit;
 //! * `stu_estimate` remains a conservative estimate and never proves fit;
 //! * `tokenizer` remains an observation from an actually-run route tokenizer
 //!   and is never fabricated locally.
 //!
-//! There is no byte/3 fallback and no tokenizer synthesis. A non-UTF-8
+//! No route owner invokes this crate yet: no workspace member depends on it
+//! (its manifest records `prototype = true` with `workspace_admission`
+//! pending), so [`measure_exact_utf8`] is shaped as the assembly
+//! `measure: FnOnce(&[u8])` callback for a future admitted consumer —
+//! `|bytes| measure_exact_utf8(bytes, &params)` — but that closure is not
+//! formed anywhere in the workspace today. There is no byte/3 fallback and
 //! payload, an oversized payload, or an invalid binding is refused with a
 //! typed [`ContextError`]. The operation is leaf-local and pure: no I/O,
 //! no retrieval, no ranking, no admission, no persistence.
