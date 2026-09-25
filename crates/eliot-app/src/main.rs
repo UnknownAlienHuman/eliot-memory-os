@@ -597,7 +597,6 @@ enum DbCommand {
     Start,
     Stop,
     Status,
-    Smoke,
     Migrate,
 }
 
@@ -2195,7 +2194,6 @@ async fn dispatch_command(
             DbCommand::Start => commands::run_db_start(config).await,
             DbCommand::Stop => commands::run_db_stop(config).await,
             DbCommand::Status => commands::run_db_status(config).await,
-            DbCommand::Smoke => commands::run_db_smoke(config).await,
             DbCommand::Migrate => commands::run_db_migrate(config).await,
         },
         Command::Writer { command } => match command {
