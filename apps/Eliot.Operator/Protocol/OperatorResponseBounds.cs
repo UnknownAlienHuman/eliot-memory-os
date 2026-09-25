@@ -78,18 +78,86 @@ public static class OperatorResponseGuard
     }
 }
 
+/// The closed `ReadConsistency` vocabulary of I5.20. It is a classification
+/// of values the owner already issued on the page, not a support level the
+/// client picks: the vocabulary is fixed, and every input is an owner-issued
+/// field of `OperatorProjectionPage`. A read consistency word is never a
+/// Material State Fence — see `OperatorProjectionBinding.MaterialStateFence`.
+public enum OperatorReadConsistency
+{
+    /// I5.20:17 — cheap preview. No task revision is bound to the page, so
+    /// there is no owner revision to be read-your-write against.
+    Eventual = 0,
+
+    /// I5.20:18 — read-your-write after receipt. The owner issued the
+    /// matching count as a lower bound it declined to sharpen.
+    AtLeastRevision = 1,
+
+    /// I5.20:20 — all listed dependency revisions must match. The owner issued
+    /// an exact count and a task revision, so every revision key in
+    /// `ProjectionDependencySet` is owner-issued and comparable.
+    ExactFence = 2
+}
+
+/// The exact I5.20 vocabulary word for one classified read consistency.
+/// Nothing else is ever written in its place.
+public static class OperatorReadConsistencyTokens
+{
+    public static string Token(this OperatorReadConsistency consistency) => consistency switch
+    {
+        OperatorReadConsistency.Eventual => "eventual",
+        OperatorReadConsistency.AtLeastRevision => "at_least_revision",
+        OperatorReadConsistency.ExactFence => "exact_fence",
+        // A value outside the closed vocabulary is refused, never reported
+        // under a word the owner did not issue.
+        _ => throw new OperatorProtocolException("projection", "read_consistency_unclassified")
+    };
+}
+
+/// The exact owner-issued dependency tuple one retained page was built from.
+/// I5.20:46 requires every reused response to carry its dependency set and
+/// invalidation conditions, and I5.20:26-32 compares that set as one unit
+/// (read it, read it again, publish only if every dependency revision still
+/// matches). These are the owner-issued revision keys the page itself carries;
+/// no key is added and none is invented.
+public readonly record struct OperatorProjectionDependencySet(
+    string RuntimeId,
+    string AuthGeneration,
+    string SchemaVersion,
+    string Projection,
+    string? ProjectId,
+    string? TaskId,
+    ulong? TaskRevision)
+{
+    public static OperatorProjectionDependencySet From(OperatorProjectionPage page)
+    {
+        ArgumentNullException.ThrowIfNull(page);
+        return new OperatorProjectionDependencySet(
+            page.RuntimeId,
+            page.AuthGeneration,
+            page.SchemaVersion,
+            page.Projection,
+            page.ProjectId,
+            page.TaskId,
+            page.TaskRevision);
+    }
+}
+
 /// The exact identity one retained projection is bound to.
 ///
 /// Rows, selection, cursor, task context and the retained result payload are
 /// rebuildable views of this binding, never authority. Any change to runtime,
-/// auth generation, owner task revision, projection or project/task scope
-/// invalidates every dependent piece of UI state before the new page is used.
+/// auth generation, owner task revision, projection, project/task scope,
+/// owner read consistency or the owner-issued dependency set invalidates
+/// every dependent piece of UI state before the new page is used.
 ///
-/// `GeneratedAtUtc` is the owner's timestamp. The page contract in
-/// `crates/eliot-types` carries no State Fence or consistency discriminator,
-/// so this binding records them as owner-unissued rather than inventing one:
-/// the client refuses to *act* on a binding it cannot place against the exact
-/// owner revision, and the owner remains the single source of both values.
+/// `GeneratedAtUtc` is the owner's timestamp and the page contract in
+/// `crates/eliot-types` carries no expiry field, so the expiry axis is the
+/// owner's own handoff lifetime applied to that timestamp: a page outside that
+/// bound is refused whole, in both directions, and a retained binding never
+/// outlives its own expiry. The same page contract carries no Material State
+/// Fence, and I5.20:34 forbids treating a rebuildable aggregate as one, so
+/// that axis stays owner-unissued rather than being invented here.
 public sealed record OperatorProjectionBinding(
     string SchemaVersion,
     string RuntimeId,
@@ -98,19 +166,31 @@ public sealed record OperatorProjectionBinding(
     string? ProjectId,
     string? TaskId,
     ulong? TaskRevision,
+    OperatorReadConsistency ReadConsistency,
+    OperatorProjectionDependencySet ProjectionDependencySet,
     DateTimeOffset GeneratedAtUtc)
 {
-    /// The owner-supplied State Fence discriminator does not exist in the
-    /// current page contract. It is reported as absent, never defaulted to a
-    /// value the client made up.
-    public const string StateFence = "owner_unissued";
-    public const string Consistency = "owner_unissued";
+    /// No Material State Fence exists on this page contract, and a rebuildable
+    /// aggregate is never sufficient for one by itself. It is reported as
+    /// absent and is never defaulted to a value the client made up.
+    public const string MaterialStateFence = "owner_unissued";
 
     /// Bounded clock-skew tolerance for the owner timestamp, taken from the
     /// owner's own handoff lifetime. A page dated further into the future is
-    /// refused instead of becoming permanently "fresh".
+    /// refused instead of becoming permanently "fresh", and a page already
+    /// older than this bound is no longer reusable.
     public static TimeSpan ClockSkewTolerance { get; } =
         TimeSpan.FromSeconds(OperatorProtocol.HandoffLifetimeSeconds);
+
+    /// Expiry of one page on the owner's own bound. The single place that bound
+    /// is turned into a time, so the refusal in `From` and the axis carried by
+    /// every binding can never drift apart.
+    public static DateTimeOffset ExpiryOf(DateTimeOffset generatedAtUtc) =>
+        generatedAtUtc + ClockSkewTolerance;
+
+    /// When this retained page stops being reusable. It never becomes stale
+    /// silently: `From` refuses the page outright once this moment has passed.
+    public DateTimeOffset ExpiresAtUtc => ExpiryOf(GeneratedAtUtc);
 
     public static OperatorProjectionBinding From(OperatorProjectionPage page, DateTimeOffset nowUtc)
     {
@@ -118,6 +198,10 @@ public sealed record OperatorProjectionBinding(
         if (page.GeneratedAt - nowUtc > ClockSkewTolerance)
         {
             throw new OperatorProtocolException("projection", "generated_at_ahead_of_client");
+        }
+        if (nowUtc > ExpiryOf(page.GeneratedAt))
+        {
+            throw new OperatorProtocolException("projection", "page_past_expiry");
         }
         return new OperatorProjectionBinding(
             page.SchemaVersion,
@@ -127,11 +211,32 @@ public sealed record OperatorProjectionBinding(
             page.ProjectId,
             page.TaskId,
             page.TaskRevision,
+            ClassifyReadConsistency(page),
+            OperatorProjectionDependencySet.From(page),
             page.GeneratedAt);
     }
 
+    /// Classifies the owner-issued page fields into the closed I5.20
+    /// `ReadConsistency` vocabulary, strongest match first: an exact owner
+    /// count bound to an owner task revision is `exact_fence`; a count the
+    /// owner issued as a lower bound is `at_least_revision`; a page with no
+    /// bound task revision is an `eventual` preview. Every branch reads only
+    /// owner-issued fields, so the class cannot be used to claim a support
+    /// level the owner did not send.
+    public static OperatorReadConsistency ClassifyReadConsistency(OperatorProjectionPage page)
+    {
+        ArgumentNullException.ThrowIfNull(page);
+        if (page.TotalIsExact && page.TaskRevision is not null) return OperatorReadConsistency.ExactFence;
+        if (!page.TotalIsExact) return OperatorReadConsistency.AtLeastRevision;
+        return OperatorReadConsistency.Eventual;
+    }
+
     /// True when the two bindings describe different owner state. A change on
-    /// any identity axis requires invalidation before use.
+    /// any identity, read-consistency or dependency-set axis requires
+    /// invalidation before use. The expiry axis is deliberately not compared
+    /// here: a fresh page always carries a fresh owner timestamp, so comparing
+    /// it would rotate every read rather than describe a change in owner
+    /// state. Expiry is enforced by refusing the page in `From`.
     public bool DiffersFrom(OperatorProjectionBinding? other) =>
         other is null
         || !string.Equals(SchemaVersion, other.SchemaVersion, StringComparison.Ordinal)
@@ -140,14 +245,18 @@ public sealed record OperatorProjectionBinding(
         || !string.Equals(Projection, other.Projection, StringComparison.Ordinal)
         || !string.Equals(ProjectId, other.ProjectId, StringComparison.Ordinal)
         || !string.Equals(TaskId, other.TaskId, StringComparison.Ordinal)
-        || TaskRevision != other.TaskRevision;
+        || TaskRevision != other.TaskRevision
+        || ReadConsistency != other.ReadConsistency
+        || ProjectionDependencySet != other.ProjectionDependencySet;
 
     /// Bounded redacted projection for the status banner. It names the binding
     /// axes and revision, never a record body.
     public string Describe() =>
         $"runtime={RuntimeId} auth_generation={AuthGeneration} projection={Projection} " +
         $"task_revision={(TaskRevision?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "none")} " +
-        $"state_fence={StateFence} consistency={Consistency}";
+        $"read_consistency={ReadConsistency.Token()} " +
+        $"material_state_fence={MaterialStateFence} " +
+        $"expires_at={ExpiresAtUtc.UtcDateTime:o}";
 }
 
 /// Refuses a decoded projection page whose retained containers exceed their
