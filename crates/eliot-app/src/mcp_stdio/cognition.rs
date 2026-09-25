@@ -1722,39 +1722,6 @@ pub(super) fn cognitive_memory_request_allowed(
             && string_array_field(arguments, "handles") == capability.expected_exposure_handles)
 }
 
-pub(super) fn restrict_cognitive_recall(
-    structured: &mut Value,
-    expected_handles: &[String],
-) -> Result<()> {
-    let returned = {
-        let handles = structured
-            .get_mut("handles")
-            .and_then(Value::as_array_mut)
-            .context("cognitive recall response has no handles array")?;
-        let mut by_handle = handles
-            .drain(..)
-            .filter_map(|item| {
-                let handle = item
-                    .get("handle")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)?;
-                Some((handle, item))
-            })
-            .collect::<HashMap<_, _>>();
-        *handles = expected_handles
-            .iter()
-            .filter_map(|handle| by_handle.remove(handle))
-            .collect();
-        handles.len()
-    };
-    if let Some(truncation) = structured.get_mut("truncation") {
-        truncation["returned"] = json!(returned);
-        truncation["limit"] = json!(expected_handles.len().max(1));
-        truncation["truncated"] = json!(false);
-    }
-    Ok(())
-}
-
 pub(super) async fn ensure_cognitive_tool_observation_capacity(
     state: &McpState,
     capability: &CognitiveCandidateCapability,

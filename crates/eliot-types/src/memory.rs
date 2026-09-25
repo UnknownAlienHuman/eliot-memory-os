@@ -961,20 +961,24 @@ impl RecallDisposition {
 /// conflict state. Callers cannot inject a disposition through this struct.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecallDispositionInputs {
-    /// The corpus holds no records at all.
-    pub corpus_empty: bool,
+    /// The corpus holds no records at all when the response owner has
+    /// authoritative cardinality evidence. `None` preserves an unavailable
+    /// observation and cannot be coerced to `false`.
+    pub corpus_empty: Option<bool>,
     /// Retrieval candidates considered before scope/lifecycle policy.
     pub candidates_considered: usize,
     /// Admitted handles returned to the agent.
     pub visible_count: usize,
-    /// Matches suppressed by scope policy.
+    /// Matches suppressed by scope policy. `SCOPE_SUPPRESSED` is emitted only
+    /// when this equals every candidate considered and coverage is complete.
     pub scope_suppressed_count: usize,
     /// Current projection freshness.
     pub projection_state: CognitiveProjectionReadState,
     /// Retrieval covered the corpus without truncation or scan gaps.
     pub coverage_complete: bool,
-    /// Conflicting evidence blocks admission.
-    pub conflicted: bool,
+    /// Conflicting evidence blocks admission when observed by the response
+    /// owner. `None` preserves an unavailable observation.
+    pub conflicted: Option<bool>,
     /// Best admitted total score, when any handle was admitted.
     pub top_score: Option<i32>,
 }
@@ -982,14 +986,16 @@ pub struct RecallDispositionInputs {
 /// Derives the canonical [`RecallDisposition`] server-side.
 ///
 /// Deterministic priority: empty corpus, then projection freshness, then
-/// conflict, then admission strength, then scope suppression, then coverage,
-/// then server-observed uselessness, and finally no match. `NO_USEFUL_MEMORY`
-/// is returned only here, never by an agent.
+/// conflict, then admission strength, then coverage, then all-candidate scope
+/// suppression, then server-observed uselessness, and finally no match. If a
+/// required owner observation is unavailable, derivation returns
+/// `INCOMPLETE_COVERAGE` rather than coercing unknown state to a boolean.
+/// `NO_USEFUL_MEMORY` is returned only here, never by an agent.
 #[must_use]
 pub const fn derive_recall_disposition(
     inputs: &RecallDispositionInputs,
 ) -> (RecallDisposition, &'static str) {
-    if inputs.corpus_empty {
+    if let Some(true) = inputs.corpus_empty {
         return (RecallDisposition::EmptyCorpus, "corpus contains no records");
     }
     if !inputs.projection_state.is_published() {
@@ -1001,10 +1007,16 @@ pub const fn derive_recall_disposition(
         };
         return (RecallDisposition::StaleProjection, reason);
     }
-    if inputs.conflicted {
+    if let Some(true) = inputs.conflicted {
         return (
             RecallDisposition::Conflicted,
             "conflicting evidence blocks admission",
+        );
+    }
+    if let (None, _) | (_, None) = (inputs.corpus_empty, inputs.conflicted) {
+        return (
+            RecallDisposition::IncompleteCoverage,
+            "required server observation unavailable",
         );
     }
     if inputs.visible_count > 0 {
@@ -1019,16 +1031,18 @@ pub const fn derive_recall_disposition(
             ),
         };
     }
-    if inputs.scope_suppressed_count > 0 {
-        return (
-            RecallDisposition::ScopeSuppressed,
-            "all matches suppressed by scope",
-        );
-    }
     if !inputs.coverage_complete {
         return (
             RecallDisposition::IncompleteCoverage,
             "coverage incomplete with no admissible handle",
+        );
+    }
+    if inputs.scope_suppressed_count > 0
+        && inputs.scope_suppressed_count == inputs.candidates_considered
+    {
+        return (
+            RecallDisposition::ScopeSuppressed,
+            "all matches suppressed by scope",
         );
     }
     if inputs.candidates_considered > 0 {
@@ -1122,10 +1136,10 @@ impl RecallReceipt {
 /// Server-issued recall verdict: derived disposition, binding receipt, and
 /// the rank-trace handle resolving to exactly the delivered ranking.
 ///
-/// The handle is content-addressed over the disposition, revision binding,
-/// counts, and admitted feature scores, so swapping the disposition or any
-/// bound fact invalidates the handle. Packet responses reuse this verdict
-/// shape with packet-side inputs; only the response owner may issue it.
+/// The handle is content-addressed over the disposition, receipt binding, and
+/// complete delivered rank trace, so swapping any bound fact invalidates the
+/// handle. Packet responses reuse this verdict shape with packet-side inputs;
+/// only the response owner may issue it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerRecallVerdict {
@@ -1134,10 +1148,17 @@ pub struct ServerRecallVerdict {
     pub rank_trace_handle: String,
 }
 
+fn hash_rank_trace_field(hasher: &mut blake3::Hasher, value: &str) {
+    let length = u64::try_from(value.len()).unwrap_or(u64::MAX);
+    hasher.update(&length.to_le_bytes());
+    hasher.update(value.as_bytes());
+}
+
 impl ServerRecallVerdict {
-    /// Issues the verdict for one L0 recall response from server-observed
-    /// facts only. The disposition is derived, never taken as an argument,
-    /// so bridge/model output cannot inject it.
+    /// Issues the verdict for callers that already hold authoritative boolean
+    /// observations. New production paths should use
+    /// [`Self::issue_for_l0_response_with_observations`] so unavailable
+    /// owner facts remain unknown.
     pub fn issue_for_l0_response(
         response: &RecallL0Response,
         scope: &str,
@@ -1145,6 +1166,28 @@ impl ServerRecallVerdict {
         corpus_empty: bool,
         coverage_complete: bool,
         conflicted: bool,
+    ) -> Result<Self, String> {
+        Self::issue_for_l0_response_with_observations(
+            response,
+            scope,
+            state_fence,
+            Some(corpus_empty),
+            coverage_complete,
+            Some(conflicted),
+        )
+    }
+
+    /// Issues the verdict from explicit owner observations. `None` means the
+    /// response owner has not supplied that fact; it is never coerced to
+    /// `false`. The disposition is derived, never accepted from bridge/model
+    /// output.
+    pub fn issue_for_l0_response_with_observations(
+        response: &RecallL0Response,
+        scope: &str,
+        state_fence: &str,
+        corpus_empty: Option<bool>,
+        coverage_complete: bool,
+        conflicted: Option<bool>,
     ) -> Result<Self, String> {
         let visible_count = u32::try_from(response.handles.len())
             .map_err(|_| "visible handle count overflows u32".to_owned())?;
@@ -1184,7 +1227,8 @@ impl ServerRecallVerdict {
             response.projection_revision,
             visible_count,
             suppressed_count,
-            &response.rank_trace.feature_scores,
+            &response.rank_trace,
+            &receipt,
         );
         Ok(Self {
             disposition,
@@ -1196,9 +1240,10 @@ impl ServerRecallVerdict {
     /// Derives the deterministic delivery handle for one ranking.
     ///
     /// The handle is content-addressed (`rank-trace:<blake3>`) over the
-    /// disposition, revision binding, counts, and sorted per-score identity,
-    /// totals, and reasons, so it resolves to exactly the delivered ranking
-    /// plus its bound verdict facts regardless of order.
+    /// disposition, receipt scope/fence/reason, revision binding, counts, and
+    /// the complete ordered `L0RankTrace`. Every feature component, query
+    /// field, suppression, duplicate-collapse record, and reason is covered;
+    /// changing any delivered fact changes the handle.
     #[must_use]
     pub fn rank_trace_handle_for(
         disposition: RecallDisposition,
@@ -1206,33 +1251,110 @@ impl ServerRecallVerdict {
         projection_revision: Option<MemoryRevision>,
         visible_count: u32,
         suppressed_count: u32,
-        scores: &[L0FeatureScore],
+        rank_trace: &L0RankTrace,
+        receipt: &RecallReceipt,
     ) -> String {
-        let mut material: Vec<String> = scores
-            .iter()
-            .map(|score| {
-                let mut reasons = score.reasons.clone();
-                reasons.sort();
-                format!("{}|{}|{}", score.handle, score.total, reasons.join(","))
-            })
-            .collect();
-        material.sort();
-        let projection = projection_revision.map_or_else(
-            || "none".to_owned(),
-            |revision| revision.value().to_string(),
-        );
-        let header = format!(
-            "{}|{}|{}|{visible_count}|{suppressed_count}",
-            disposition.as_wire_str(),
-            source_revision.value(),
-            projection,
-        );
         let mut hasher = blake3::Hasher::new();
-        hasher.update(header.as_bytes());
-        hasher.update(&[0]);
-        for entry in &material {
-            hasher.update(entry.as_bytes());
-            hasher.update(&[0]);
+        hash_rank_trace_field(&mut hasher, "rank-trace-v2");
+        hash_rank_trace_field(&mut hasher, disposition.as_wire_str());
+        hash_rank_trace_field(&mut hasher, &source_revision.value().to_string());
+        hash_rank_trace_field(
+            &mut hasher,
+            &projection_revision.map_or_else(
+                || "none".to_owned(),
+                |revision| revision.value().to_string(),
+            ),
+        );
+        hash_rank_trace_field(&mut hasher, &visible_count.to_string());
+        hash_rank_trace_field(&mut hasher, &suppressed_count.to_string());
+        hash_rank_trace_field(
+            &mut hasher,
+            match receipt.freshness {
+                CognitiveProjectionReadState::Published => "published",
+                CognitiveProjectionReadState::Stale => "stale",
+                CognitiveProjectionReadState::Blocked => "blocked",
+                CognitiveProjectionReadState::Unavailable => "unavailable",
+            },
+        );
+        hash_rank_trace_field(&mut hasher, &receipt.scope);
+        hash_rank_trace_field(&mut hasher, &receipt.state_fence);
+        hash_rank_trace_field(&mut hasher, &receipt.reason);
+
+        hash_rank_trace_field(&mut hasher, &rank_trace.query);
+        hash_rank_trace_field(&mut hasher, &rank_trace.normalized_query);
+        hash_rank_trace_field(&mut hasher, &rank_trace.candidates_considered.to_string());
+        hash_rank_trace_field(&mut hasher, &rank_trace.candidates_returned.to_string());
+        hash_rank_trace_field(&mut hasher, &rank_trace.query_mode);
+        hash_rank_trace_field(
+            &mut hasher,
+            if rank_trace.no_useful_memory {
+                "true"
+            } else {
+                "false"
+            },
+        );
+
+        hash_rank_trace_field(&mut hasher, &rank_trace.feature_scores.len().to_string());
+        for score in &rank_trace.feature_scores {
+            hash_rank_trace_field(&mut hasher, &score.handle);
+            for value in [
+                score.exact_identifier,
+                score.subject_identity,
+                score.lexical_overlap,
+                score.task_relation,
+                score.scope_fit,
+                score.lifecycle_fit,
+                score.evidence_authority,
+                score.prior_decision_delta,
+                score.exact_cue,
+                score.concept_relation,
+                score.freshness_fit,
+                score.negative_memory_value,
+                score.known_decision_delta,
+                score.prior_beneficial_use,
+                score.verification_value,
+                score.context_cost,
+                score.stale_penalty,
+                score.contradiction_penalty,
+                score.harm_penalty,
+                score.repetition_penalty,
+                score.distraction_penalty,
+                score.total,
+            ] {
+                hash_rank_trace_field(&mut hasher, &value.to_string());
+            }
+            hash_rank_trace_field(&mut hasher, &score.reasons.len().to_string());
+            for score_reason in &score.reasons {
+                hash_rank_trace_field(&mut hasher, score_reason);
+            }
+        }
+
+        for (label, traces) in [
+            ("lifecycle", &rank_trace.lifecycle_suppressions),
+            ("scope", &rank_trace.scope_suppressions),
+        ] {
+            hash_rank_trace_field(&mut hasher, label);
+            hash_rank_trace_field(&mut hasher, &traces.len().to_string());
+            for trace in traces {
+                hash_rank_trace_field(&mut hasher, &trace.handle);
+                hash_rank_trace_field(&mut hasher, &trace.reason);
+            }
+        }
+
+        hash_rank_trace_field(
+            &mut hasher,
+            &rank_trace.collapsed_duplicates.len().to_string(),
+        );
+        for duplicate in &rank_trace.collapsed_duplicates {
+            hash_rank_trace_field(&mut hasher, &duplicate.authoritative_handle);
+            hash_rank_trace_field(
+                &mut hasher,
+                &duplicate.collapsed_record_refs.len().to_string(),
+            );
+            for record_ref in &duplicate.collapsed_record_refs {
+                hash_rank_trace_field(&mut hasher, record_ref);
+            }
+            hash_rank_trace_field(&mut hasher, &duplicate.reason);
         }
         format!("rank-trace:{}", hasher.finalize().to_hex())
     }
@@ -1240,11 +1362,12 @@ impl ServerRecallVerdict {
     /// Fail-closed check binding the verdict to the carried L0 response.
     ///
     /// Rejects a delivery whose handle does not resolve to the carried
-    /// disposition, revision binding, counts, and ranking; whose counts
-    /// disagree with the visible handles and suppression traces; or whose
-    /// receipt binding disagrees with the response revisions and freshness.
-    /// A forged or agent-invented disposition fails this check because the
-    /// handle covers the derived disposition.
+    /// disposition, receipt binding, revision binding, counts, and complete
+    /// ranking/suppression trace; whose counts disagree with the visible
+    /// handles and suppression traces; or whose receipt binding disagrees with
+    /// the response revisions and freshness. A forged or agent-invented
+    /// disposition fails this check because the handle covers the derived
+    /// disposition.
     pub fn validate_for_l0_response(&self, response: &RecallL0Response) -> Result<(), String> {
         let visible_count = u32::try_from(response.handles.len())
             .map_err(|_| "visible handle count overflows u32".to_owned())?;
@@ -1270,7 +1393,8 @@ impl ServerRecallVerdict {
             response.projection_revision,
             visible_count,
             suppressed_count,
-            &response.rank_trace.feature_scores,
+            &response.rank_trace,
+            &self.receipt,
         );
         if self.rank_trace_handle != expected {
             return Err(
