@@ -17,6 +17,7 @@ use crate::activation_outcome::{
 use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
+use crate::finish_attempt::{PreparedFinishDecision, PreparedKernelExchange};
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
 use crate::owner_closure_feed::{
@@ -4088,6 +4089,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// the same canonical owner CAS used by `FinishEvidence`. The caller gives
     /// only the job identity; `TestD` currentness and the full receipt/run are
     /// re-read inside the Governor service before the write.
+    ///
+    /// This is the composed form of the three phases below, for the caller that
+    /// holds only `&self`. The `TestD` owner drain drives
+    /// [`Self::prepare_testd_verifier_execution_fact_from_evidence`],
+    /// [`PreparedKernelExchange::exchange`] and
+    /// [`Self::accept_prepared_exchange`] itself, so that no composition lock is
+    /// held across the Kernel exchange.
     pub async fn publish_testd_verifier_execution_fact(
         &self,
         identity: &RequestIdentity,
@@ -4112,47 +4120,117 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .await
     }
 
-    /// Publishes the verifier-execution owner from complete identity-joined
-    /// terminal evidence supplied by the Kernel owner route. The daemon-side
-    /// entry: no `TestdStore` handle crosses the daemon boundary.
-    pub async fn publish_testd_verifier_execution_fact_from_evidence(
+    /// Prepares the exact exchange that publishes the verifier-execution owner
+    /// from complete identity-joined terminal evidence supplied by the Kernel
+    /// owner route. The daemon-side entry: no `TestdStore` handle crosses the
+    /// daemon boundary.
+    ///
+    /// This half performs no transport and mutates nothing, so the caller holds
+    /// its composition borrow for this call alone and releases it before
+    /// [`PreparedKernelExchange::exchange`].
+    pub fn prepare_testd_verifier_execution_fact_from_evidence(
         &self,
         evidence: &TestdTerminalCompletionEvidence,
-    ) -> Result<Option<WriteReceipt>, FinishAttemptError> {
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));
         }
         self.finish_attempt_service()
-            .publish_testd_verifier_execution_fact_from_evidence(evidence)
-            .await
+            .prepare_testd_verifier_execution_fact_from_evidence(evidence)
+    }
+
+    /// Prepares the exact exchange that publishes the Governor-derived
+    /// canonical finish-evidence owner image for one candidate. `None` means
+    /// the derived image is already current, so nothing is owed.
+    ///
+    /// This method transports nothing, so the caller may hold its composition
+    /// borrow for this call alone. The refresh that publishes the evidence leg's
+    /// committed image belongs to [`Self::prepare_finish_decision`].
+    pub fn prepare_finish_evidence(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        draft: &FinishAttemptDraft,
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.finish_attempt_service()
+            .prepare_finish_evidence(identity, operation_id, draft)
+    }
+
+    /// Prepares the exact exchange that persists the finish decision.
+    ///
+    /// The refresh runs here, synchronously and under the caller's `&mut self`,
+    /// because the decision must be evaluated against the canonical image the
+    /// evidence leg actually published — never against a pre-publish snapshot.
+    /// No transport is touched, so the caller may hold its composition borrow
+    /// for this call alone.
+    pub fn prepare_finish_decision(
+        &mut self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        draft: FinishAttemptDraft,
+    ) -> Result<PreparedFinishDecision, FinishAttemptError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.refresh_from_kernel()
+            .map_err(FinishAttemptError::Composition)?;
+        self.finish_attempt_service()
+            .prepare_finish_decision(identity, operation_id, draft)
+    }
+
+    /// Re-checks a completed exchange against the live canonical owner.
+    ///
+    /// The prepared leg captured its owner fence before the caller began the
+    /// exchange, and the exchange ran with no composition borrow, so this is
+    /// where a fence that moved in the meantime refuses the leg with the same
+    /// typed mismatch the prepare half uses. Nothing is re-derived and no
+    /// receipt is repaired.
+    pub fn accept_prepared_exchange(
+        &self,
+        prepared: &PreparedKernelExchange,
+    ) -> Result<(), FinishAttemptError> {
+        self.finish_attempt_service()
+            .accept_prepared_exchange(prepared)
     }
 
     /// Runs the production `FinishAttempt` path and returns only after the
     /// canonical receipt has committed. Publication is performed by the
     /// daemon composition through `refresh_from_kernel`, using the same
     /// committed-receipt boundary as the other daemon callers.
+    ///
+    /// This is the composed form of [`Self::prepare_finish_evidence`],
+    /// [`Self::prepare_finish_decision`] and [`Self::accept_prepared_exchange`]
+    /// for a caller that holds `&mut self` and accepts that borrow across the
+    /// exchanges. A caller that must not hold a lock across Kernel IO — the
+    /// `TestD` owner drain — runs the same phases itself over the same
+    /// Governor-derived exchanges, identities, fence and receipt checks, in
+    /// this same order.
+    ///
+    /// The order is load-bearing: the evidence leg is exchanged and admitted
+    /// before the decision is prepared, so the decision is derived against the
+    /// canonical image the evidence leg actually published and never against a
+    /// pre-publish snapshot.
     pub async fn finish_attempt(
         &mut self,
         identity: &RequestIdentity,
         operation_id: OperationId,
         draft: FinishAttemptDraft,
     ) -> Result<FinishDecisionReceipt, FinishAttemptError> {
-        if self.readiness != CompositionReadiness::Ready {
-            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        let evidence = self.prepare_finish_evidence(identity, &operation_id, &draft)?;
+        if let Some(prepared) = evidence.as_ref() {
+            let _receipt = prepared.exchange(self.kernel.as_ref()).await?;
+            self.accept_prepared_exchange(prepared)?;
         }
-        {
-            let service = self.finish_attempt_service();
-            service
-                .publish_finish_evidence(identity, &operation_id, &draft)
-                .await?;
+        // Refreshes the owner, so the decision sees the evidence leg's image.
+        let decision = self.prepare_finish_decision(identity, &operation_id, draft)?;
+        if let Some(prepared) = decision.exchange() {
+            let _receipt = prepared.exchange(self.kernel.as_ref()).await?;
+            self.accept_prepared_exchange(prepared)?;
         }
-        self.refresh_from_kernel()
-            .map_err(FinishAttemptError::Composition)?;
-        let receipt = {
-            let service = self.finish_attempt_service();
-            service.submit(identity, operation_id, draft).await?
-        };
-        Ok(receipt)
+        Ok(decision.into_decision())
     }
 
     /// Borrows the single observation/verified-repair reconciliation owner as

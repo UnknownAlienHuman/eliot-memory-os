@@ -11,7 +11,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_canonical::{CanonicalWriteEnvelope, FinishAttemptDraft, FinishEvidence};
-use eliot_contracts::{OperationId, StateFence, TaskId, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{
+    OperationId, StateFence, TaskId, canonical_json_bytes, fences_match_exact, sha256_hex,
+};
 use eliot_coordination::CoordinationOwner;
 use eliot_finish::{
     FinishAdmission, FinishAttempt, FinishClosureIntent, FinishContext, FinishDecisionReceipt,
@@ -21,8 +23,9 @@ use eliot_observation::{ObservationAdmissionResult, ObservationJournal, Observat
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
     EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
-    OperationManifestDigest, ScopeId, SecurityContext, StoreFailure, TransitionClass, WriteReceipt,
-    WriteReceiptStatus, generated_operation_manifests, operation_manifest_set_digest,
+    OperationManifestDigest, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
+    ScopeId, SecurityContext, StoreFailure, TransitionClass, WriteReceipt, WriteReceiptStatus,
+    generated_operation_manifests, operation_manifest_set_digest,
 };
 use eliot_task::{TaskCommand, TaskLifecycleOwner, TaskRecord, TaskState};
 use eliot_testd_core::{
@@ -105,6 +108,218 @@ impl<'a, P: ?Sized> GovernorFinishAttempt<'a, P> {
 struct ProducedFinishEvidence {
     canonical: CanonicalFinishEvidence,
     snapshot: CanonicalAdmissionSnapshot,
+}
+
+/// The exact neutral-Kernel exchange one prepared Governor owner leg still
+/// owes, together with the identity it binds and the owner fence observed
+/// before the caller began the exchange.
+///
+/// Preparing is pure. It rehydrates the current owner state, derives the one
+/// `CanonicalWriteEnvelope`, checks the admitted identity against that
+/// envelope, and returns the single immutable `PreparedTransition` plus the
+/// compare-and-swap heads it was derived from. No transport is touched while
+/// preparing, so a caller may hold a composition lock for the whole
+/// preparation and release it before [`Self::exchange`]; the composition
+/// borrow is only required again by the accept step, which re-checks the
+/// retained [`Self::pre_commit_fence`] before a receipt is admitted.
+///
+/// A leg whose derived owner image is already current owes only a receipt
+/// readback under its exact operation identity — re-deriving a transition
+/// there would mint a second fact for the same owner revision — so
+/// [`Self::transition`] is absent and [`Self::exchange`] reconciles instead of
+/// committing. That distinction is carried by the value itself and is never
+/// inferred by the caller.
+#[derive(Clone, Debug)]
+pub struct PreparedKernelExchange {
+    identity: RequestIdentity,
+    operation_id: OperationId,
+    idempotency_key: String,
+    transition: Option<PreparedTransition>,
+    expected_revision_heads: Vec<RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    pre_commit_fence: StateFence,
+}
+
+impl PreparedKernelExchange {
+    /// The admitted identity this exchange must be submitted under. It is the
+    /// identity the envelope and the derived transition were both checked
+    /// against; nothing here is synthesized locally.
+    #[must_use]
+    pub const fn identity(&self) -> &RequestIdentity {
+        &self.identity
+    }
+
+    /// The exact operation identity this exchange commits or reconciles.
+    #[must_use]
+    pub const fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    /// The owner fence captured while preparing, before this leg committed
+    /// anything. The accept step compares it against the live owner fence so a
+    /// fence that moved during the exchange refuses the receipt.
+    #[must_use]
+    pub const fn pre_commit_fence(&self) -> &StateFence {
+        &self.pre_commit_fence
+    }
+
+    /// Runs the owed exchange over the neutral Kernel port.
+    ///
+    /// This method deliberately borrows no `GovernorComposition`: the caller
+    /// runs it with no composition lock held, which is what keeps a
+    /// `tokio::sync::MutexGuard` over the daemon composition off a Kernel
+    /// round trip. The unresolved-outcome reconciliation is the owner's and is
+    /// unchanged: an unknown commit outcome is settled by reading the receipt
+    /// for this exact operation rather than by re-deriving the transition.
+    pub async fn exchange<P: KernelTransitionPort + ?Sized>(
+        &self,
+        port: &P,
+    ) -> Result<WriteReceipt, FinishAttemptError> {
+        let Some(transition) = self.transition.clone() else {
+            return self.reconcile_receipt(port).await;
+        };
+        let committed = match port
+            .apply_prepared(
+                &self.identity,
+                transition,
+                self.expected_revision_heads.clone(),
+                self.expected_ordering_heads.clone(),
+            )
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(KernelPortError::Unknown(_)) => return self.reconcile_receipt(port).await,
+            Err(error) => return Err(error.into()),
+        };
+        check_finish_receipt(
+            &committed,
+            &self.operation_id,
+            &self.pre_commit_fence,
+            &self.idempotency_key,
+        )?;
+        Ok(committed)
+    }
+
+    /// Reads back the committed receipt for this exact operation.
+    ///
+    /// Used for the already-current owner image, where the transition must not
+    /// be re-derived, and for an unknown commit outcome, where the outcome
+    /// must be established rather than assumed.
+    async fn reconcile_receipt<P: KernelTransitionPort + ?Sized>(
+        &self,
+        port: &P,
+    ) -> Result<WriteReceipt, FinishAttemptError> {
+        let committed = port
+            .receipt(self.operation_id.clone())
+            .await?
+            .ok_or_else(|| {
+                FinishAttemptError::Kernel(KernelPortError::Unknown(format!(
+                    "{} receipt is unresolved after an unknown commit outcome",
+                    self.operation_id.as_str()
+                )))
+            })?;
+        check_finish_receipt(
+            &committed,
+            &self.operation_id,
+            &self.pre_commit_fence,
+            &self.idempotency_key,
+        )?;
+        Ok(committed)
+    }
+}
+
+/// One prepared finish-decision leg: the decision the Governor derived from
+/// canonical evidence, and the exchange that leg still owes.
+///
+/// A `None` exchange means the finish service already admitted this attempt
+/// under the admitted idempotency identity, so the retained decision replays
+/// and no canonical mutation is owed; the decision is the same value either
+/// way and is never recomputed.
+#[derive(Clone, Debug)]
+pub struct PreparedFinishDecision {
+    decision: FinishDecisionReceipt,
+    exchange: Option<PreparedKernelExchange>,
+}
+
+impl PreparedFinishDecision {
+    /// The exchange this decision still owes, or `None` when the retained
+    /// decision replays without a canonical mutation.
+    #[must_use]
+    pub const fn exchange(&self) -> Option<&PreparedKernelExchange> {
+        self.exchange.as_ref()
+    }
+
+    /// Consumes the plan and returns the Governor-derived decision.
+    #[must_use]
+    pub fn into_decision(self) -> FinishDecisionReceipt {
+        self.decision
+    }
+}
+
+/// Derives the single immutable transition one Governor-owned leg will submit.
+///
+/// This is the whole of the pre-transport half of the canonical owner commit:
+/// the admitted identity is validated, the envelope's request and idempotency
+/// binding must agree with it exactly, and the transition derived from the
+/// envelope must agree with both. Nothing is rehashed or repaired locally.
+fn prepare_exchange(
+    canonical: &CanonicalAdmissionOwner,
+    identity: &RequestIdentity,
+    envelope: CanonicalWriteEnvelope,
+) -> Result<PreparedKernelExchange, FinishAttemptError> {
+    identity.validate().map_err(|error| {
+        FinishAttemptError::Composition(CompositionError::Provider(error.to_string()))
+    })?;
+    if envelope.request != identity.request.metadata {
+        return Err(FinishAttemptError::Composition(CompositionError::Provider(
+            "admitted request binding does not match the Canonical envelope request".to_owned(),
+        )));
+    }
+    if envelope.idempotency_key != identity.idempotency_key {
+        return Err(FinishAttemptError::Composition(CompositionError::Provider(
+            "admitted idempotency key does not match the Canonical envelope".to_owned(),
+        )));
+    }
+    let transition = canonical.prepare(&envelope)?;
+    if transition.identity.idempotency_key != identity.idempotency_key
+        || transition.state_fence != identity.request.metadata.state_fence
+    {
+        return Err(FinishAttemptError::Composition(CompositionError::Provider(
+            "immutable transition does not agree with the admitted request identity".to_owned(),
+        )));
+    }
+    // The envelope is consumed here: the operation and the compare-and-swap
+    // heads the transition was derived from move into the exchange, so the
+    // Kernel leg cannot be handed a different head set than the one the
+    // admission actually produced.
+    Ok(PreparedKernelExchange {
+        operation_id: envelope.operation_id,
+        idempotency_key: identity.idempotency_key.clone(),
+        pre_commit_fence: canonical.state_fence().clone(),
+        identity: identity.clone(),
+        transition: Some(transition),
+        expected_revision_heads: envelope.expected_revision_heads,
+        expected_ordering_heads: envelope.expected_ordering_heads,
+    })
+}
+
+/// Prepares the receipt readback owed by a leg whose derived owner image is
+/// already current. The operation and idempotency binding are the ones the
+/// original commit used, so the readback resolves the same logical transition.
+fn prepare_receipt_readback(
+    canonical: &CanonicalAdmissionOwner,
+    operation_id: OperationId,
+    identity: &RequestIdentity,
+) -> PreparedKernelExchange {
+    PreparedKernelExchange {
+        identity: identity.clone(),
+        operation_id,
+        idempotency_key: identity.idempotency_key.clone(),
+        transition: None,
+        expected_revision_heads: Vec::new(),
+        expected_ordering_heads: Vec::new(),
+        pre_commit_fence: canonical.state_fence().clone(),
+    }
 }
 
 impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
@@ -329,6 +544,14 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
     /// this boundary: the row, receipt, run, canonical task, current plan,
     /// and fence are all read and joined here. A caller-held `TestJob` or
     /// verdict cannot become canonical proof.
+    ///
+    /// This is the composed form of the same three phases
+    /// [`Self::prepare_testd_verifier_execution_fact`],
+    /// [`PreparedKernelExchange::exchange`] and
+    /// [`Self::accept_prepared_exchange`] provide, for the caller that holds
+    /// only `&self` and therefore has no mutable composition to refresh. The
+    /// `TestD` owner drain does not use it: it runs the phases itself so no
+    /// lock is held across the exchange.
     pub async fn publish_testd_verifier_execution_fact(
         &self,
         identity: &RequestIdentity,
@@ -338,6 +561,36 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         job_id: &str,
         testd: &TestdStore,
     ) -> Result<Option<WriteReceipt>, FinishAttemptError> {
+        let prepared = self.prepare_testd_verifier_execution_fact(
+            identity,
+            operation_id,
+            task_id,
+            task_revision,
+            job_id,
+            testd,
+        )?;
+        let Some(exchange) = prepared.as_ref() else {
+            return Ok(None);
+        };
+        let committed = exchange.exchange(self.kernel).await?;
+        self.accept_prepared_exchange(exchange)?;
+        Ok(Some(committed))
+    }
+
+    /// Rehydrates the verifier-execution owner from the current durable `TestD`
+    /// row and returns the exact exchange it still owes, without touching the
+    /// transport. See
+    /// [`Self::prepare_testd_verifier_execution_fact_from_evidence`] for the
+    /// daemon-side entry over Kernel-enumerated evidence.
+    pub fn prepare_testd_verifier_execution_fact(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        task_id: &TaskId,
+        task_revision: u64,
+        job_id: &str,
+        testd: &TestdStore,
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
         validate_identity(identity)?;
         let fence = identity.request.metadata.state_fence.clone();
         if self.canonical.state_fence() != &fence {
@@ -420,24 +673,28 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             deadline_unix_ms: identity.deadline_unix_ms,
             cancellation_id: identity.cancellation_id.clone(),
         };
-        self.commit_verifier_execution_fact(task_id, &fence, fact, fact_identity, fact_operation)
-            .await
+        self.commit_verifier_execution_fact(task_id, &fence, &fact, &fact_identity, fact_operation)
     }
 
-    /// Rehydrates and publishes the verifier-execution owner from complete
-    /// identity-joined terminal evidence supplied by the Kernel owner route.
+    /// Rehydrates the verifier-execution owner from complete identity-joined
+    /// terminal evidence supplied by the Kernel owner route and returns the
+    /// exact exchange it still owes, without touching the transport.
     ///
-    /// This is the daemon-side entry: the caller gives the exact evidence
+    /// This is the daemon-side prepare: the caller gives the exact evidence
     /// projection the Kernel owner just enumerated (durable job plus the
     /// admitted frame identity). The row, receipt, run, canonical task,
     /// current plan, and fence are all re-validated and joined here; a
     /// caller-held `TestJob` or verdict that disagrees with the admitted
     /// binding cannot become canonical proof. The daemon never opens the
     /// `TestD` database.
-    pub async fn publish_testd_verifier_execution_fact_from_evidence(
+    ///
+    /// Because nothing is transported here, the caller can release its
+    /// composition lock before [`PreparedKernelExchange::exchange`] and take
+    /// it again only for [`Self::accept_prepared_exchange`].
+    pub fn prepare_testd_verifier_execution_fact_from_evidence(
         &self,
         evidence: &TestdTerminalCompletionEvidence,
-    ) -> Result<Option<WriteReceipt>, FinishAttemptError> {
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
         let identity = &evidence.request_identity;
         let job = &evidence.job;
         validate_identity(identity)?;
@@ -522,95 +779,80 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             deadline_unix_ms: identity.deadline_unix_ms,
             cancellation_id: identity.cancellation_id.clone(),
         };
-        self.commit_verifier_execution_fact(&task_id, &fence, fact, fact_identity, fact_operation)
-            .await
+        self.commit_verifier_execution_fact(&task_id, &fence, &fact, &fact_identity, fact_operation)
     }
 
-    /// Commits one derived verifier-execution fact through the canonical
-    /// owner CAS and returns the committed `WriteReceipt`. An identical
-    /// current owner image is a readback no-op that returns the retained
-    /// receipt instead of minting a second fact.
-    async fn commit_verifier_execution_fact(
+    /// Derives the exact exchange that publishes one verifier-execution fact
+    /// through the canonical owner CAS, without touching the transport. An
+    /// identical current owner image is prepared as a receipt readback so the
+    /// retained receipt is returned instead of a second fact being minted.
+    fn commit_verifier_execution_fact(
         &self,
         task_id: &TaskId,
         fence: &StateFence,
-        fact: CanonicalVerifierExecutionFact,
-        fact_identity: RequestIdentity,
+        fact: &CanonicalVerifierExecutionFact,
+        fact_identity: &RequestIdentity,
         fact_operation: OperationId,
-    ) -> Result<Option<WriteReceipt>, FinishAttemptError> {
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
         if self
             .canonical
             .read_verifier_execution_fact(fence)
             .ok()
-            .is_some_and(|existing| existing == fact)
+            .is_some_and(|existing| existing == *fact)
         {
-            let committed = self
-                .kernel
-                .receipt(fact_operation.clone())
-                .await?
-                .ok_or_else(|| {
-                    FinishAttemptError::Kernel(KernelPortError::Unknown(
-                        "verifier fact is current but its committed WriteReceipt is absent"
-                            .to_owned(),
-                    ))
-                })?;
-            check_finish_receipt(
-                &committed,
-                &fact_operation,
-                fence,
-                &fact_identity.idempotency_key,
-            )?;
-            return Ok(Some(committed));
+            return Ok(Some(prepare_receipt_readback(
+                self.canonical,
+                fact_operation,
+                fact_identity,
+            )));
         }
         let snapshot = self
             .canonical
             .prepare_verifier_execution_fact(fact.clone())?;
         let envelope = canonical_owner_snapshot_envelope(
-            &fact_identity,
-            fact_operation.clone(),
+            fact_identity,
+            fact_operation,
             &snapshot,
             task_id.as_str(),
             &fact.verification_run.run_id.to_string(),
         )?;
-        let committed = match self
-            .canonical
-            .commit(self.kernel, &fact_identity, envelope)
-            .await
-        {
-            Ok(receipt) => receipt,
-            Err(CompositionError::Kernel(KernelPortError::Unknown(_))) => self
-                .kernel
-                .receipt(fact_operation.clone())
-                .await?
-                .ok_or_else(|| {
-                    FinishAttemptError::Kernel(KernelPortError::Unknown(
-                        "verifier execution fact receipt is unresolved after an unknown commit outcome"
-                            .to_owned(),
-                    ))
-                })?,
-            Err(error) => return Err(error.into()),
-        };
-        check_finish_receipt(
-            &committed,
-            &fact_operation,
-            fence,
-            &fact_identity.idempotency_key,
-        )?;
-        Ok(Some(committed))
+        prepare_exchange(self.canonical, fact_identity, envelope).map(Some)
     }
 
-    /// Produces and commits the next canonical finish-evidence owner image.
+    /// Re-checks a completed exchange against the live canonical owner before
+    /// its receipt is admitted downstream.
+    ///
+    /// The prepared leg captured [`PreparedKernelExchange::pre_commit_fence`]
+    /// before the caller started the exchange. The exchange itself runs with no
+    /// composition borrow, so this is where the guarantee is recovered: if the
+    /// owner fence moved while the exchange was in flight, the leg is refused
+    /// with the same typed `FenceMismatch` the prepare half uses, instead of a
+    /// stale owner image being published. The receipt was already bound to that
+    /// fence by [`PreparedKernelExchange::exchange`], so nothing is re-derived
+    /// and no receipt is repaired here.
+    pub fn accept_prepared_exchange(
+        &self,
+        prepared: &PreparedKernelExchange,
+    ) -> Result<(), FinishAttemptError> {
+        if !fences_match_exact(prepared.pre_commit_fence(), self.canonical.state_fence()) {
+            return Err(FinishError::FenceMismatch.into());
+        }
+        Ok(())
+    }
+
+    /// Produces the next canonical finish-evidence owner image and returns the
+    /// exact exchange it still owes, without touching the transport.
     ///
     /// The derived child identity is created by Governor for this owner leg;
     /// it carries the admitted request binding and never accepts proof or
     /// evidence from the public draft.  An identical current owner image is
-    /// already materialized and therefore is a readback no-op.
-    pub async fn publish_finish_evidence(
+    /// already materialized, so nothing is owed and `None` is returned.
+    pub fn prepare_finish_evidence(
         &self,
         identity: &RequestIdentity,
         operation_id: &OperationId,
         draft: &FinishAttemptDraft,
-    ) -> Result<Option<WriteReceipt>, FinishAttemptError> {
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
         validate_identity(identity)?;
         draft.validate().map_err(FinishError::from)?;
         let fence = identity.request.metadata.state_fence.clone();
@@ -671,49 +913,28 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             deadline_unix_ms: identity.deadline_unix_ms,
             cancellation_id: identity.cancellation_id.clone(),
         };
-        let envelope = finish_evidence_envelope(
-            &evidence_identity,
-            evidence_operation.clone(),
-            &produced.snapshot,
-        )?;
-        let committed = match self
-            .canonical
-            .commit(self.kernel, &evidence_identity, envelope)
-            .await
-        {
-            Ok(receipt) => receipt,
-            Err(CompositionError::Kernel(KernelPortError::Unknown(_))) => self
-                .kernel
-                .receipt(evidence_operation.clone())
-                .await?
-                .ok_or_else(|| {
-                    FinishAttemptError::Kernel(KernelPortError::Unknown(
-                        "finish-evidence receipt is unresolved after an unknown commit outcome"
-                            .to_owned(),
-                    ))
-                })?,
-            Err(error) => return Err(error.into()),
-        };
-        check_finish_receipt(
-            &committed,
-            &evidence_operation,
-            &fence,
-            &evidence_identity.idempotency_key,
-        )?;
-        Ok(Some(committed))
+        let envelope =
+            finish_evidence_envelope(&evidence_identity, evidence_operation, &produced.snapshot)?;
+        prepare_exchange(self.canonical, &evidence_identity, envelope).map(Some)
     }
 
-    /// Rehydrates and evaluates one candidate against canonical owner state.
+    /// Rehydrates and evaluates one candidate against canonical owner state,
+    /// returning the decision and the exact exchange it still owes.
     ///
     /// The attempt identity is the admitted idempotency identity.  Public
     /// callers provide only the draft; closure intent is a fail-closed owner
     /// mapping, and evidence comes exclusively from the canonical owner.
-    pub async fn submit(
+    ///
+    /// Evaluation is pure — it runs the existing finish service against a
+    /// scratch clone — so the whole derivation completes with no composition
+    /// borrow held across a Kernel exchange. A retained decision replays with
+    /// no exchange owed.
+    pub fn prepare_finish_decision(
         &self,
         identity: &RequestIdentity,
-        operation_id: OperationId,
+        operation_id: &OperationId,
         draft: FinishAttemptDraft,
-    ) -> Result<FinishDecisionReceipt, FinishAttemptError> {
+    ) -> Result<PreparedFinishDecision, FinishAttemptError> {
         validate_identity(identity)?;
         draft.validate().map_err(FinishError::from)?;
         let fence = identity.request.metadata.state_fence.clone();
@@ -790,7 +1011,12 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         let mut scratch = self.finish.clone();
         let admission = scratch.evaluate(attempt.clone(), &context)?;
         let receipt = match admission {
-            FinishAdmission::Replayed { receipt } => return Ok(receipt),
+            FinishAdmission::Replayed { receipt } => {
+                return Ok(PreparedFinishDecision {
+                    decision: receipt,
+                    exchange: None,
+                });
+            }
             FinishAdmission::Accepted { receipt } => receipt,
         };
         let receipts = scratch.receipts();
@@ -802,21 +1028,11 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             &receipts,
             self.finish_owner_revision,
         )?;
-        let committed = match self.canonical.commit(self.kernel, identity, envelope).await {
-            Ok(receipt) => receipt,
-            Err(CompositionError::Kernel(KernelPortError::Unknown(_))) => self
-                .kernel
-                .receipt(operation_id.clone())
-                .await?
-                .ok_or_else(|| {
-                    FinishAttemptError::Kernel(KernelPortError::Unknown(
-                        "finish receipt is unresolved after an unknown commit outcome".to_owned(),
-                    ))
-                })?,
-            Err(error) => return Err(error.into()),
-        };
-        check_finish_receipt(&committed, &operation_id, &fence, &identity.idempotency_key)?;
-        Ok(receipt)
+        let exchange = prepare_exchange(self.canonical, identity, envelope)?;
+        Ok(PreparedFinishDecision {
+            decision: receipt,
+            exchange: Some(exchange),
+        })
     }
 }
 
