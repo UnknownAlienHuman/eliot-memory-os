@@ -6,17 +6,18 @@ use eliot_types::{
     EvalComparisonVerdict, EvalComponentCoverage, EvalCoverageMatrix, EvalCoverageStatus,
     EvalCriterion, EvalDatasetManifest, EvalDatasetManifestId, EvalFamily, EvalFamilyCoverage,
     EvalFamilyDelta, EvalFamilyThreshold, EvalFamilyTrend, EvalFixtureChecksum,
-    EvalFixtureStabilityReport, EvalGateDecision, EvalGateDecisionKind, EvalMeasurementKind,
-    EvalMeasurementResult, EvalMeasurementSpec, EvalRegressionGateProfile, EvalRegressionSeverity,
-    EvalRiskCoverage, EvalRun, EvalRunId, EvalRunProfile, EvalRunStatus, EvalSuite, EvalSuiteId,
-    EvalTrendDirection, EvalTrendReport, EvalVerdict, EvalVerdictId, EvalVerdictStatus,
-    ExperimentalMetaPolicyCandidate, ExperimentalMetaPolicyPayload, ExperimentalMetaPolicyState,
-    HarnessExperimentRecord, HarnessExperimentRecordId, LifecycleStatus, MetaCandidateChangeClass,
-    MetaExperimentDecision, MetaIsolationFence, MetaIsolationRejectionRecord,
-    MetaPolicyAuthorization, MetaPolicyExecutionAction, MetaPolicyExecutionReceipt, ProjectId,
-    ReplayCaseStatus, ReplayRun, ReplayRunStatus, ReplaySetRole, ReplayThresholdPolicyV1,
-    SealedReplaySetRecord, SemanticCommand, TaintClass, TaskId, ToolObservationRecordCommand,
-    Visibility, WriteId, WriteReceiptRef,
+    EvalFixtureStabilityReport, EvalGateDecision, EvalGateDecisionKind,
+    EvalIntegrityFingerprintSet, EvalMeasurementKind, EvalMeasurementResult, EvalMeasurementSpec,
+    EvalRegressionGateProfile, EvalRegressionSeverity, EvalRiskCoverage, EvalRun, EvalRunId,
+    EvalRunProfile, EvalRunStatus, EvalSuite, EvalSuiteId, EvalTrendDirection, EvalTrendReport,
+    EvalVerdict, EvalVerdictId, EvalVerdictStatus, ExperimentalMetaPolicyCandidate,
+    ExperimentalMetaPolicyPayload, ExperimentalMetaPolicyState, HarnessExperimentRecord,
+    HarnessExperimentRecordId, LifecycleStatus, MetaCandidateChangeClass, MetaExperimentDecision,
+    MetaIsolationFence, MetaIsolationRejectionRecord, MetaPolicyAuthorization,
+    MetaPolicyExecutionAction, MetaPolicyExecutionReceipt, ProjectId, ReplayCaseStatus, ReplayRun,
+    ReplayRunStatus, ReplaySetRole, ReplayThresholdPolicyV1, SealedReplaySetRecord,
+    SemanticCommand, TaintClass, TaskId, ToolObservationRecordCommand, Visibility, WriteId,
+    WriteReceiptRef,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -901,6 +902,69 @@ pub struct EvalMeasurementService;
 const NOT_YET_IMPLEMENTED_OBSERVATION_PREFIX: &str = "not yet implemented:";
 const STRUCTURAL_ONLY_PROOF_CEILING: &str = "STRUCTURAL_ONLY";
 
+/// Current evaluator identity fingerprints (issue #1922 stale-marking basis).
+///
+/// Single source for the identity strings the receipt builder records:
+/// the builder and [`current_eval_fingerprints`] both read these
+/// constants, so any future identity change automatically stale-marks
+/// previously recorded fingerprint sets through
+/// [`EvalIntegrityFingerprintSet::is_stale_against`] instead of silently
+/// comparing across identities. `EVALUATOR_PATH` is compiler-provided
+/// (`module_path!`), so a module move re-identifies automatically;
+/// descriptive strings below it name review-verified behavior, not
+/// observed runtime effects.
+const HARNESS_FINGERPRINT: &str = "eliot-engine-eval-case-schema";
+const EVALUATOR_PATH: &str = concat!(module_path!(), "::EvalMeasurementService");
+const ENVIRONMENT_FINGERPRINT: &str = "not-captured:structural-evaluator-process";
+const ACTUAL_ROUTE: &str = concat!(module_path!(), "::evaluate_case");
+const REQUESTED_ROUTE: &str = "runtime artifact/effect observation";
+const ACCEPTANCE_RELATION: &str = "required criterion matches a measurement result";
+const ORACLE_OWNER: &str = concat!(module_path!(), "::EvalMeasurementService");
+
+/// Capture the current evaluator identity as a comparable set.
+/// Pure snapshot of the constants above; performs no observation and
+/// grants no validity.
+pub fn current_eval_fingerprints() -> EvalIntegrityFingerprintSet {
+    EvalIntegrityFingerprintSet {
+        harness_fingerprint: HARNESS_FINGERPRINT.to_owned(),
+        evaluator_fingerprint: EVALUATOR_PATH.to_owned(),
+        environment_fingerprint: ENVIRONMENT_FINGERPRINT.to_owned(),
+        actual_route: ACTUAL_ROUTE.to_owned(),
+        requested_route: REQUESTED_ROUTE.to_owned(),
+        acceptance_relation: ACCEPTANCE_RELATION.to_owned(),
+        oracle_owner: ORACLE_OWNER.to_owned(),
+    }
+}
+
+/// Visibility and leakage fields built by one receipt helper.
+type ReceiptVisibilityFields = (
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+);
+
+/// Lineage, exclusion, and limit fields built by one receipt helper.
+type ReceiptLineageLimitFields = (
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+);
+
+/// Sensitivity evidence fields built by one receipt helper.
+type ReceiptSensitivityFields = (
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+);
+
 impl EvalMeasurementService {
     pub fn evaluate_case(case: &EvalCase) -> EvalCaseResult {
         let measurements = case
@@ -956,6 +1020,7 @@ impl EvalMeasurementService {
             produced_refs: vec![format!("eval:{}:report", family_slug(case.family))],
             errors,
             duration_ms: 0,
+            integrity_fingerprints: Some(current_eval_fingerprints()),
         }
     }
 
@@ -967,8 +1032,114 @@ impl EvalMeasurementService {
         case: &EvalCase,
         measurements: &[EvalMeasurementResult],
     ) -> EvaluationIntegrityReceipt {
-        let unobserved_measurement_kinds = case
-            .measurement_specs
+        let unobserved_measurement_kinds = Self::unobserved_measurement_kinds(case, measurements);
+        let raw_result_refs = measurements
+            .iter()
+            .map(|measurement| measurement.measurement_id.clone())
+            .collect::<Vec<_>>();
+        let receipt_id = Self::integrity_receipt_id(case, measurements);
+        let budget_fingerprint = Self::receipt_budget_fingerprint(case);
+        let (
+            visible_inputs,
+            worker_visible_inputs,
+            evaluator_visible_inputs,
+            human_visible_inputs,
+            reference_leakage_checks,
+            contamination_checks,
+        ) = Self::receipt_visibility_fields();
+        let (
+            source_independence,
+            shared_lineage_limits,
+            excluded_trials,
+            limits,
+            known_shortcuts,
+            invalidation_conditions,
+        ) = Self::receipt_lineage_limit_fields();
+        let (production_role, measurement_role, optimization_feedback_role) =
+            Self::receipt_role_fields();
+        let (
+            mutation_survivors,
+            historical_escapes,
+            ood_set,
+            false_pass_evidence,
+            false_fail_evidence,
+        ) = Self::receipt_sensitivity_fields();
+        let (oracle_dependencies, collusion_shared_lineage_limits) =
+            Self::receipt_oracle_lineage_fields();
+        let (
+            second_route_or_human_disposition,
+            budget_equivalence_ledger,
+            complexity_economics_delta,
+            assertability,
+            ground_truth_origin,
+        ) = Self::receipt_disposition_fields();
+        EvaluationIntegrityReceipt {
+            receipt_id,
+            property: case.description.clone(),
+            product_identity: format!(
+                "eliot-memory-os/eliot-engine-eval:product:{}",
+                case.project_id
+            ),
+            oracle_owner: ORACLE_OWNER.to_owned(),
+            acceptance_relation: ACCEPTANCE_RELATION.to_owned(),
+            task_subset: vec![case.eval_case_id.to_string()],
+            sampling_procedure: "single declared case; no runtime sampling or replicate unit"
+                .to_owned(),
+            model_fingerprint: "not-applicable:no-model-invocation".to_owned(),
+            harness_fingerprint: HARNESS_FINGERPRINT.to_owned(),
+            tools_fingerprint: "not-applicable:no-runtime-tools".to_owned(),
+            evaluator_fingerprint: EVALUATOR_PATH.to_owned(),
+            environment_fingerprint: ENVIRONMENT_FINGERPRINT.to_owned(),
+            budget_fingerprint,
+            visible_inputs,
+            worker_visible_inputs,
+            evaluator_visible_inputs,
+            human_visible_inputs,
+            reference_leakage_checks,
+            contamination_checks,
+            evidence_family: format!("structural-fixture:{}", case.fixture_ref),
+            source_independence,
+            shared_lineage_limits,
+            raw_result_refs,
+            aggregation_method: "required criteria: any failed measurement".to_owned(),
+            excluded_trials,
+            limits,
+            counter_metrics: Vec::new(),
+            known_shortcuts,
+            invalidation_conditions,
+            production_role,
+            measurement_role,
+            optimization_feedback_role,
+            mutation_survivors,
+            historical_escapes,
+            ood_set,
+            false_pass_evidence,
+            false_fail_evidence,
+            actual_route: ACTUAL_ROUTE.to_owned(),
+            requested_route: REQUESTED_ROUTE.to_owned(),
+            resource_fingerprint: "not-captured:no runtime execution".to_owned(),
+            oracle_dependencies,
+            effective_independent_evidence_n: 0,
+            collusion_shared_lineage_limits,
+            second_route_or_human_disposition,
+            budget_equivalence_ledger,
+            complexity_economics_delta,
+            assertability,
+            ground_truth_origin,
+            artifact_binding: vec![case.fixture_ref.clone()],
+            observed_artifact_refs: Vec::new(),
+            unobserved_measurement_kinds,
+            status: EvaluationIntegrityStatus::Inconclusive,
+            proof_ceiling: STRUCTURAL_ONLY_PROOF_CEILING.to_owned(),
+        }
+    }
+
+    /// Distinct measurement kinds whose results carry no runtime observation.
+    fn unobserved_measurement_kinds(
+        case: &EvalCase,
+        measurements: &[EvalMeasurementResult],
+    ) -> Vec<EvalMeasurementKind> {
+        case.measurement_specs
             .iter()
             .filter_map(|spec| {
                 let measurement = measurements
@@ -988,122 +1159,136 @@ impl EvalMeasurementService {
                     kinds.push(kind);
                 }
                 kinds
-            });
-        let raw_result_refs = measurements
-            .iter()
-            .map(|measurement| measurement.measurement_id.clone())
-            .collect::<Vec<_>>();
+            })
+    }
+
+    /// Deterministic receipt identifier derived from the case binding.
+    fn integrity_receipt_id(case: &EvalCase, measurements: &[EvalMeasurementResult]) -> String {
         let receipt_binding = format!(
             "case={};fixture={};measurements={measurements:?}",
             case.eval_case_id, case.fixture_ref
         );
-        EvaluationIntegrityReceipt {
-            receipt_id: format!(
-                "evaluation-integrity:{}",
-                checksum_text(&receipt_binding)
-            ),
-            property: case.description.clone(),
-            product_identity: "eliot-memory-os/eliot-engine-eval".to_owned(),
-            oracle_owner: "eliot-engine::EvalMeasurementService".to_owned(),
-            acceptance_relation: "required criterion matches a measurement result".to_owned(),
-            task_subset: vec![case.eval_case_id.to_string()],
-            sampling_procedure: "single declared case; no runtime sampling or replicate unit"
-                .to_owned(),
-            model_fingerprint: "not-applicable:no-model-invocation".to_owned(),
-            harness_fingerprint: "eliot-engine-eval-case-schema".to_owned(),
-            tools_fingerprint: "not-applicable:no-runtime-tools".to_owned(),
-            evaluator_fingerprint: "eliot-engine::EvalMeasurementService".to_owned(),
-            environment_fingerprint: "not-captured:structural-evaluator-process".to_owned(),
-            budget_fingerprint: format!(
-                "declared:max_runtime_ms={};max_input_tokens={};max_output_tokens={};max_tool_calls={}",
-                case.budget.max_runtime_ms,
-                case.budget.max_input_tokens,
-                case.budget.max_output_tokens,
-                case.budget.max_tool_calls
-            ),
-            visible_inputs: vec![
+        format!("evaluation-integrity:{}", checksum_text(&receipt_binding))
+    }
+
+    /// Declared budget limits recorded on the receipt.
+    fn receipt_budget_fingerprint(case: &EvalCase) -> String {
+        format!(
+            "declared:max_runtime_ms={};max_input_tokens={};max_output_tokens={};max_tool_calls={}",
+            case.budget.max_runtime_ms,
+            case.budget.max_input_tokens,
+            case.budget.max_output_tokens,
+            case.budget.max_tool_calls
+        )
+    }
+
+    /// Visibility and leakage inputs recorded on the receipt.
+    fn receipt_visibility_fields() -> ReceiptVisibilityFields {
+        (
+            vec![
                 "EvalCase.measurement_specs".to_owned(),
                 "EvalCase.criteria".to_owned(),
                 "EvalCase.expected_evidence_refs".to_owned(),
                 "EvalCase.forbidden_effects".to_owned(),
             ],
-            worker_visible_inputs: vec!["not-applicable:no worker invocation".to_owned()],
-            evaluator_visible_inputs: vec![
-                "EvalCase declarations and fixture metadata".to_owned(),
-            ],
-            human_visible_inputs: vec![
+            vec!["not-applicable:no worker invocation".to_owned()],
+            vec!["EvalCase declarations and fixture metadata".to_owned()],
+            vec![
                 "receipt status and proof ceiling; no durable receipt reference is emitted"
                     .to_owned(),
             ],
-            reference_leakage_checks: vec![
-                "not run: no blind worker/evaluator separation on this path".to_owned(),
-            ],
-            contamination_checks: vec![
-                "not run: fixture and expectation declarations share one source".to_owned(),
-            ],
-            evidence_family: format!("structural-fixture:{}", case.fixture_ref),
-            source_independence: vec![
+            vec!["not run: no blind worker/evaluator separation on this path".to_owned()],
+            vec!["not run: fixture and expectation declarations share one source".to_owned()],
+        )
+    }
+
+    /// Lineage, exclusion, and limit inputs recorded on the receipt.
+    fn receipt_lineage_limit_fields() -> ReceiptLineageLimitFields {
+        (
+            vec![
                 "not established: fixture, expectation and evaluator share the declaration path"
                     .to_owned(),
             ],
-            shared_lineage_limits: vec![
-                "case declarations are not independent runtime evidence".to_owned(),
-            ],
-            raw_result_refs,
-            aggregation_method: "required criteria: any failed measurement".to_owned(),
-            excluded_trials: vec!["no runtime trials were supplied".to_owned()],
-            limits: vec![
+            vec!["case declarations are not independent runtime evidence".to_owned()],
+            vec!["no runtime trials were supplied".to_owned()],
+            vec![
                 "criterion-only structural result".to_owned(),
                 "ecological, temporal and transfer validity are not measured".to_owned(),
             ],
-            counter_metrics: Vec::new(),
-            known_shortcuts: vec![
-                "case-declared expectations can match without observing behavior".to_owned(),
-            ],
-            invalidation_conditions: vec![
+            vec!["case-declared expectations can match without observing behavior".to_owned()],
+            vec![
                 "route, harness/tool schema, evaluator/oracle, task subset, environment, policy or Product Identity changes"
                     .to_owned(),
             ],
-            production_role: "none: structural evaluator only".to_owned(),
-            measurement_role: "structural harness self-check; cannot establish product behavior"
-                .to_owned(),
-            optimization_feedback_role: "none; cannot promote or tune a mechanism".to_owned(),
-            mutation_survivors: vec!["not measured".to_owned()],
-            historical_escapes: vec!["not available".to_owned()],
-            ood_set: vec!["not available".to_owned()],
-            false_pass_evidence: vec![
-                "not measured: no known-valid/known-invalid runtime set".to_owned(),
-            ],
-            false_fail_evidence: vec![
-                "not measured: no known-valid/known-invalid runtime set".to_owned(),
-            ],
-            actual_route: "eliot-engine::EvalMeasurementService::evaluate_case".to_owned(),
-            requested_route: "runtime artifact/effect observation".to_owned(),
-            resource_fingerprint: "not-captured:no runtime execution".to_owned(),
-            oracle_dependencies: vec![
+        )
+    }
+
+    /// Production, measurement, and feedback roles recorded on the receipt.
+    fn receipt_role_fields() -> (String, String, String) {
+        (
+            "none: structural evaluator only".to_owned(),
+            "structural harness self-check; cannot establish product behavior".to_owned(),
+            "none; cannot promote or tune a mechanism".to_owned(),
+        )
+    }
+
+    /// Sensitivity evidence recorded on the receipt.
+    fn receipt_sensitivity_fields() -> ReceiptSensitivityFields {
+        (
+            vec!["not measured".to_owned()],
+            vec!["not available".to_owned()],
+            vec!["not available".to_owned()],
+            vec!["not measured: no known-valid/known-invalid runtime set".to_owned()],
+            vec!["not measured: no known-valid/known-invalid runtime set".to_owned()],
+        )
+    }
+
+    /// Oracle dependency and collusion limits recorded on the receipt.
+    fn receipt_oracle_lineage_fields() -> (Vec<String>, Vec<String>) {
+        (
+            vec![
                 "case-declared expectations".to_owned(),
                 "eliot-engine::EvalMeasurementService".to_owned(),
             ],
-            effective_independent_evidence_n: 0,
-            collusion_shared_lineage_limits: vec![
-                "no independent oracle or second route was supplied".to_owned(),
-            ],
-            second_route_or_human_disposition:
-                "not run; required before measured validity".to_owned(),
-            budget_equivalence_ledger: "UNKNOWN: no execution arms were run".to_owned(),
-            complexity_economics_delta: "UNKNOWN: no product route was executed".to_owned(),
-            assertability: "INCONCLUSIVE: runtime behavior is not assertable from EvalCase alone"
-                .to_owned(),
-            ground_truth_origin: "seeded_script:case-declared fixture metadata".to_owned(),
-            artifact_binding: vec![case.fixture_ref.clone()],
-            observed_artifact_refs: Vec::new(),
-            unobserved_measurement_kinds,
-            status: EvaluationIntegrityStatus::Inconclusive,
-            proof_ceiling: STRUCTURAL_ONLY_PROOF_CEILING.to_owned(),
-        }
+            vec!["no independent oracle or second route was supplied".to_owned()],
+        )
+    }
+
+    /// Disposition and economics inputs recorded on the receipt.
+    fn receipt_disposition_fields() -> (String, String, String, String, String) {
+        (
+            "not run; required before measured validity".to_owned(),
+            "UNKNOWN: no execution arms were run".to_owned(),
+            "UNKNOWN: no product route was executed".to_owned(),
+            "INCONCLUSIVE: runtime behavior is not assertable from EvalCase alone".to_owned(),
+            "seeded_script:case-declared fixture metadata".to_owned(),
+        )
     }
 
     pub fn measure(_case: &EvalCase, spec: &EvalMeasurementSpec) -> EvalMeasurementResult {
+        // Structural self-check with a real observation (issue #1922):
+        // MustBlockAction carries the action under test in
+        // `expected_ref` (see the `block()` fixture constructor) and the
+        // runner owns the production block gate, so the measurement
+        // observes the gate's actual decision instead of matching a
+        // declaration. Every other kind lacks a reachable runtime input
+        // (no artifact, registry, or suite/manifest in scope) and stays
+        // reported as not-yet-observed; the integrity gate below keeps the
+        // case NYI regardless until measured validity exists.
+        if spec.kind == EvalMeasurementKind::MustBlockAction
+            && let Some(action) = spec.expected_ref.as_deref()
+        {
+            let blocked = EvalRunnerService::mutation_attempt_blocked(action);
+            return EvalMeasurementResult {
+                measurement_id: spec.measurement_id.clone(),
+                passed: blocked,
+                observed: format!(
+                    "structural self-check: runner gate {} action {action:?}",
+                    if blocked { "blocked" } else { "permitted" },
+                ),
+                evidence_refs: Vec::new(),
+            };
+        }
         let (passed, observed, evidence_refs) = match spec.kind {
             EvalMeasurementKind::MustIncludeEvidence
             | EvalMeasurementKind::MustExcludeEvidence
@@ -1320,6 +1505,22 @@ impl EvalBaselineService {
         git_commit: &str,
         approved_by: &str,
     ) -> EvalBaseline {
+        // Retain the run's evaluator identity only on unanimous observation
+        // (issue #1922): `Some` exactly when every case result carries one
+        // identical retained set. Empty, mixed, or partially unretained runs
+        // yield `None` (unknown provenance), which comparison treats as
+        // non-evidence. No inference across differing identities.
+        let mut retained = run
+            .case_results
+            .iter()
+            .filter_map(|result| result.integrity_fingerprints.as_ref());
+        let first = retained.next();
+        let integrity_fingerprints = match first {
+            Some(set) if !run.case_results.is_empty() && retained.all(|other| other == set) => {
+                Some(set.clone())
+            }
+            _ => None,
+        };
         EvalBaseline {
             baseline_id: format!("eval-baseline-{}", WriteId::new_v7()),
             suite_id: suite.eval_suite_id.to_string(),
@@ -1330,6 +1531,7 @@ impl EvalBaselineService {
             overall_status: verdict.status,
             approved_at: OffsetDateTime::now_utc(),
             approved_by: approved_by.to_owned(),
+            integrity_fingerprints,
         }
     }
 }
@@ -1380,7 +1582,30 @@ impl EvalComparisonService {
             })
             .map(|result| result.eval_case_id.to_string())
             .collect::<Vec<_>>();
-        let verdict = comparison_verdict(&family_deltas, candidate_run.status);
+        let verdict = {
+            // Automatic stale invalidation (issue #1922): a candidate run
+            // whose retained fingerprint sets predate current evaluator
+            // identity — or predate retention entirely (unknown
+            // provenance is non-evidence per contract) — cannot support a
+            // fresh comparison verdict, so the comparison is Inconclusive
+            // and gates block it unless they allow inconclusive. Fresh
+            // runs always carry current fingerprints and flow unchanged;
+            // the baseline side's unanimously retained set is not yet
+            // compared here, so baseline-side staleness remains a
+            // documented future interface.
+            let current = current_eval_fingerprints();
+            let stale_inputs = candidate_run.case_results.iter().any(|result| {
+                match &result.integrity_fingerprints {
+                    None => true,
+                    Some(recorded) => recorded.is_stale_against(&current),
+                }
+            });
+            if stale_inputs {
+                EvalComparisonVerdict::Inconclusive
+            } else {
+                comparison_verdict(&family_deltas, candidate_run.status)
+            }
+        };
         EvalCandidateComparison {
             comparison_id: format!("eval-comparison-{}", WriteId::new_v7()),
             suite_id: suite.eval_suite_id.to_string(),
