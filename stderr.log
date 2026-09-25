@@ -1,0 +1,581 @@
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit status --short --branch; git rev-parse HEAD; pwd; ls
+## HEAD (no branch)
+?? prompt.txt
+?? stderr.log
+?? stdout.log
+f0abfe139e944f781344df037268ba2845ae77dc
+
+Path
+----
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+
+PSPath              : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\.
+                      github
+PSParentPath        : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+PSChildName         : .github
+PSDrive             : C
+PSProvider          : Microsoft.PowerShell.Core\FileSystem
+PSIsContainer       : True
+Name                : .github
+Parent              : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+Root                : C:\
+Exists              : True
+FullName            : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\.github
+Extension           : .github
+CreationTime        : 9/18/2026 8:53:54 PM
+CreationTimeUtc     : 9/19/2026 12:53:54 AM
+LastAccessTime      : 9/18/2026 8:54:04 PM
+LastAccessTimeUtc   : 9/19/2026 12:54:04 AM
+LastWriteTime       : 9/18/2026 8:53:54 PM
+LastWriteTimeUtc    : 9/19/2026 12:53:54 AM
+LinkTarget          : 
+UnixFileMode        : -1
+Attributes          : Directory
+Mode                : d----
+ModeWithoutHardLink : d----
+BaseName            : .github
+ResolvedTarget      : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\.github
+Target              : 
+LinkType            : 
+
+
+PSPath              : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\a
+                      pps
+PSParentPath        : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+PSChildName         : apps
+PSDrive             : C
+PSProvider          : Microsoft.PowerShell.Core\FileSystem
+PSIsContainer       : True
+Name                : apps
+Parent              : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+Root                : C:\
+Exists              : True
+FullName            : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\apps
+Extension           : 
+CreationTime        : 9/18/2026 8:53:54 PM
+CreationTimeUtc     : 9/19/2026 12:53:54 AM
+LastAccessTime      : 9/18/2026 8:53:54 PM
+LastAccessTimeUtc   : 9/19/2026 12:53:54 AM
+LastWriteTime       : 9/18/2026 8:53:54 PM
+LastWriteTimeUtc    : 9/19/2026 12:53:54 AM
+LinkTarget          : 
+UnixFileMode        : -1
+Attributes          : Directory
+Mode                : d----
+ModeWithoutHardLink : d----
+BaseName            : apps
+ResolvedTarget      : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\apps
+Target              : 
+LinkType            : 
+
+
+PSPath              : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\b
+                      ins
+PSParentPath        : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+PSChildName         : bins
+PSDrive             : C
+PSProvider          : Microsoft.PowerShell.Core\FileSystem
+PSIsContainer       : True
+Name                : bins
+Parent              : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+Root                : C:\
+Exists              : True
+FullName            : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\bins
+Extension           : 
+CreationTime        : 9/18/2026 8:53:54 PM
+CreationTimeUtc     : 9/19/2026 12:53:54 AM
+LastAccessTime      : 9/18/2026 8:54:04 PM
+LastAccessTimeUtc   : 9/19/2026 12:54:04 AM
+LastWriteTime       : 9/18/2026 8:53:54 PM
+LastWriteTimeUtc    : 9/19/2026 12:53:54 AM
+LinkTarget          : 
+UnixFileMode        : -1
+Attributes          : Directory
+Mode                : d----
+ModeWithoutHardLink : d----
+BaseName            : bins
+ResolvedTarget      : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\bins
+Target              : 
+LinkType            : 
+
+
+PSPath              : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\c
+                      onfig
+PSParentPath        : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+PSChildName         : config
+PSDrive             : C
+PSProvider          : Microsoft.PowerShell.Core\FileSystem
+PSIsContainer       : True
+Name                : config
+Parent              : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+Root                : C:\
+Exists              : True
+FullName            : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\config
+Extension           : 
+CreationTime        : 9/18/2026 8:53:54 PM
+CreationTimeUtc     : 9/19/2026 12:53:54 AM
+LastAccessTime      : 9/18/2026 8:54:04 PM
+LastAccessTimeUtc   : 9/19/2026 12:54:04 AM
+LastWriteTime       : 9/18/2026 8:53:54 PM
+LastWriteTimeUtc    : 9/19/2026 12:53:54 AM
+LinkTarget          : 
+UnixFileMode        : -1
+Attributes          : Directory
+Mode                : d----
+ModeWithoutHardLink : d----
+BaseName            : config
+ResolvedTarget      : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\config
+Target              : 
+LinkType            : 
+
+
+PSPath              : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\c
+                      rates
+PSParentPath        : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+PSChildName         : crates
+PSDrive             : C
+PSProvider          : Microsoft.PowerShell.Core\FileSystem
+PSIsContainer       : True
+Name                : crates
+Parent              : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+Root                : C:\
+Exists              : True
+FullName            : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates
+Extension           : 
+CreationTime        : 9/18/2026 8:53:54 PM
+CreationTimeUtc     : 9/19/2026 12:53:54 AM
+LastAccessTime      : 9/18/2026 8:54:04 PM
+LastAccessTimeUtc   : 9/19/2026 12:54:04 AM
+LastWriteTime       : 9/18/2026 8:53:55 PM
+LastWriteTimeUtc    : 9/19/2026 12:53:55 AM
+LinkTarget          : 
+UnixFileMode        : -1
+Attributes          : Directory
+Mode                : d----
+ModeWithoutHardLink : d----
+BaseName            : crates
+ResolvedTarget      : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates
+Target              : 
+LinkType            : 
+
+
+PSPath              : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\d
+                      ocs
+PSParentPath        : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+PSChildName         : docs
+PSDrive             : C
+PSProvider          : Microsoft.PowerShell.Core\FileSystem
+PSIsContainer       : True
+Name                : docs
+Parent              : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+Root                : C:\
+Exists              : True
+FullName            : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\docs
+Extension           : 
+CreationTime        : 9/18/2026 8:53:55 PM
+CreationTimeUtc     : 9/19/2026 12:53:55 AM
+LastAccessTime      : 9/18/2026 8:54:04 PM
+LastAccessTimeUtc   : 9/19/2026 12:54:04 AM
+LastWriteTime       : 9/18/2026 8:53:55 PM
+LastWriteTimeUtc    : 9/19/2026 12:53:55 AM
+LinkTarget          : 
+UnixFileMode        : -1
+Attributes          : Directory
+Mode                : d----
+ModeWithoutHardLink : d----
+BaseName            : docs
+ResolvedTarget      : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\docs
+Target              : 
+LinkType            : 
+
+
+PSPath              : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\i
+                      ntegrations
+PSParentPath        : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+PSChildName         : integrations
+PSDrive             : C
+PSProvider          : Microsoft.PowerShell.Core\FileSystem
+PSIsContainer       : True
+Name                : integrations
+Parent              : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+Root                : C:\
+Exists              : True
+FullName            : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\integrations
+Extension           : 
+CreationTime        : 9/18/2026 8:53:55 PM
+CreationTimeUtc     : 9/19/2026 12:53:55 AM
+LastAccessTime      : 9/18/2026 8:54:04 PM
+LastAccessTimeUtc   : 9/19/2026 12:54:04 AM
+LastWriteTime       : 9/18/2026 8:53:55 PM
+LastWriteTimeUtc    : 9/19/2026 12:53:55 AM
+LinkTarget          : 
+UnixFileMode        : -1
+Attributes          : Directory
+Mode                : d----
+ModeWithoutHardLink : d----
+BaseName            : integrations
+ResolvedTarget      : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\integrations
+Target              : 
+LinkType            : 
+
+
+PSPath              : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\m
+                      igrations
+PSParentPath        : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+PSChildName         : migrations
+PSDrive             : C
+PSProvider          : Microsoft.PowerShell.Core\FileSystem
+PSIsContainer       : True
+Name                : migrations
+Parent              : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+Root                : C:\
+Exists              : True
+FullName            : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\migrations
+Extension           : 
+CreationTime        : 9/18/2026 8:53:55 PM
+CreationTimeUtc     : 9/19/2026 12:53:55 AM
+LastAccessTime      : 9/18/2026 8:54:04 PM
+LastAccessTimeUtc   : 9/19/2026 12:54:04 AM
+LastWriteTime       : 9/18/2026 8:53:55 PM
+LastWriteTimeUtc    : 9/19/2026 12:53:55 AM
+LinkTarget          : 
+UnixFileMode        : -1
+Attributes          : Directory
+Mode                : d----
+ModeWithoutHardLink : d----
+BaseName            : migrations
+ResolvedTarget      : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\migrations
+Target              : 
+LinkType            : 
+
+
+PSPath              : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\p
+                      lugin
+PSParentPath        : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+PSChildName         : plugin
+PSDrive             : C
+PSProvider          : Microsoft.PowerShell.Core\FileSystem
+PSIsContainer       : True
+Name                : plugin
+Parent              : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+Root                : C:\
+Exists              : True
+FullName            : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\plugin
+Extension           : 
+CreationTime        : 9/18/2026 8:53:55 PM
+CreationTimeUtc     : 9/19/2026 12:53:55 AM
+LastAccessTime      : 9/18/2026 8:54:04 PM
+LastAccessTimeUtc   : 9/19/2026 12:54:04 AM
+LastWriteTime       : 9/18/2026 8:53:55 PM
+LastWriteTimeUtc    : 9/19/2026 12:53:55 AM
+LinkTarget          : 
+UnixFileMode        : -1
+Attributes          : Directory
+Mode                : d----
+ModeWithoutHardLink : d----
+BaseName            : plugin
+ResolvedTarget      : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\plugin
+Target              : 
+LinkType            : 
+
+
+PSPath              : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\s
+                      cripts
+PSParentPath        : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+PSChildName         : scripts
+PSDrive             : C
+PSProvider          : Microsoft.PowerShell.Core\FileSystem
+PSIsContainer       : True
+Name                : scripts
+Parent              : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+Root                : C:\
+Exists              : True
+FullName            : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\scripts
+Extension           : 
+CreationTime        : 9/18/2026 8:53:55 PM
+CreationTimeUtc     : 9/19/2026 12:53:55 AM
+LastAccessTime      : 9/18/2026 8:54:04 PM
+LastAccessTimeUtc   : 9/19/2026 12:54:04 AM
+LastWriteTime       : 9/18/2026 8:53:55 PM
+LastWriteTimeUtc    : 9/19/2026 12:53:55 AM
+LinkTarget          : 
+UnixFileMode        : -1
+Attributes          : Directory
+Mode                : d----
+ModeWithoutHardLink : d----
+BaseName            : scripts
+ResolvedTarget      : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\scripts
+Target              : 
+LinkType            : 
+
+
+PSPath              : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\t
+                      ests
+PSParentPath        : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+PSChildName         : tests
+PSDrive             : C
+PSProvider          : Microsoft.PowerShell.Core\FileSystem
+PSIsContainer       : True
+Name                : tests
+Parent              : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+Root                : C:\
+Exists              : True
+FullName            : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\tests
+Extension           : 
+CreationTime        : 9/18/2026 8:53:55 PM
+CreationTimeUtc     : 9/19/2026 12:53:55 AM
+LastAccessTime      : 9/18/2026 8:54:04 PM
+LastAccessTimeUtc   : 9/19/2026 12:54:04 AM
+LastWriteTime       : 9/18/2026 8:53:55 PM
+LastWriteTimeUtc    : 9/19/2026 12:53:55 AM
+LinkTarget          : 
+UnixFileMode        : -1
+Attributes          : Directory
+Mode                : d----
+ModeWithoutHardLink : d----
+BaseName            : tests
+ResolvedTarget      : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\tests
+Target              : 
+LinkType            : 
+
+
+PSPath              : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\w
+                      orkspace
+PSParentPath        : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+PSChildName         : workspace
+PSDrive             : C
+PSProvider          : Microsoft.PowerShell.Core\FileSystem
+PSIsContainer       : True
+Name                : workspace
+Parent              : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+Root                : C:\
+Exists              : True
+FullName            : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\workspace
+Extension           : 
+CreationTime        : 9/18/2026 8:53:55 PM
+CreationTimeUtc     : 9/19/2026 12:53:55 AM
+LastAccessTime      : 9/18/2026 8:53:55 PM
+LastAccessTimeUtc   : 9/19/2026 12:53:55 AM
+LastWriteTime       : 9/18/2026 8:53:55 PM
+LastWriteTimeUtc    : 9/19/2026 12:53:55 AM
+LinkTarget          : 
+UnixFileMode        : -1
+Attributes          : Directory
+Mode                : d----
+ModeWithoutHardLink : d----
+BaseName            : workspace
+ResolvedTarget      : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\workspace
+Target              : 
+LinkType            : 
+
+
+PSPath              : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\w
+                      orkstreams
+PSParentPath        : Microsoft.PowerShell.Core\FileSystem::C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+PSChildName         : workstreams
+PSDrive             : C
+PSProvider          : Microsoft.PowerShell.Core\FileSystem
+PSIsContainer       : True
+Name                : workstreams
+Parent              : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch
+Root                : C:\
+Exists              : True
+FullName            : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\workstreams
+Extension           : 
+CreationTime        : 9/18/2026 8:53:55 PM
+CreationTimeUtc     : 9/19/2026 12:53:55 AM
+LastAccessTime      : 9/18/2026 8:54:04 PM
+LastAccessTimeUtc   : 9/19/2026 12:54:04 AM
+LastWriteTime       : 9/18/2026 8:53:55 PM
+LastWriteTimeUtc    : 9/19/2026 12:53:55 AM
+LinkTarget          : 
+UnixFileMode        : -1
+Attributes          : Directory
+Mode                : d----
+ModeWithoutHardLink : d----
+BaseName            : workstreams
+ResolvedTarget      : C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\workstreams
+Target              : 
+LinkType            : 
+
+
+LastWriteTime : 9/18/2026 8:53:54 PM
+Length        : 198
+Name          : .gitattributes
+
+
+LastWriteTime : 9/18/2026 8:53:54 PM
+Length        : 1513
+Name          : .gitignore
+
+
+LastWriteTime : 9/18/2026 8:53:54 PM
+Length        : 320
+Name          : .typos.toml
+
+
+LastWriteTime : 9/18/2026 8:53:54 PM
+Length        : 2620
+Name          : AGENTS.md
+
+
+LastWriteTime : 9/18/2026 8:53:54 PM
+Length        : 104808
+Name          : Cargo.lock
+
+
+LastWriteTime : 9/18/2026 8:53:54 PM
+Length        : 16941
+Name          : Cargo.toml
+
+
+LastWriteTime : 9/18/2026 8:53:55 PM
+Length        : 435
+Name          : deny.toml
+
+
+LastWriteTime : 9/18/2026 8:53:54 PM
+Length        : 5054
+Name          : Justfile
+
+
+LastWriteTime : 9/18/2026 8:53:54 PM
+Length        : 1091
+Name          : LICENSE
+
+
+LastWriteTime : 9/18/2026 8:53:55 PM
+Length        : 479
+Name          : mcpls.toml
+
+
+LastWriteTime : 9/18/2026 8:54:03 PM
+Length        : 819
+Name          : prompt.txt
+
+
+LastWriteTime : 9/18/2026 8:53:54 PM
+Length        : 4206
+Name          : README.md
+
+
+LastWriteTime : 9/18/2026 8:53:55 PM
+Length        : 394
+Name          : rust-toolchain.toml
+
+
+LastWriteTime : 9/18/2026 8:53:54 PM
+Length        : 3384
+Name          : START.md
+
+
+LastWriteTime : 9/18/2026 8:54:03 PM
+Length        : 0
+Name          : stderr.log
+
+
+LastWriteTime : 9/18/2026 8:54:03 PM
+Length        : 0
+Name          : stdout.log
+
+
+LastWriteTime : 9/18/2026 8:53:54 PM
+Length        : 43729
+Name          : T11.md
+
+
+LastWriteTime : 9/18/2026 8:53:54 PM
+Length        : 47185
+Name          : T12.md
+
+
+LastWriteTime : 9/18/2026 8:53:54 PM
+Length        : 48855
+Name          : T14.md
+
+
+LastWriteTime : 9/18/2026 8:53:54 PM
+Length        : 39992
+Name          : T5.md
+
+
+LastWriteTime : 9/18/2026 8:53:54 PM
+Length        : 39110
+Name          : T9.md
+
+
+LastWriteTime : 9/18/2026 8:53:55 PM
+Length        : 454
+Name          : tool-versions.json
+
+
+LastWriteTime : 9/18/2026 8:53:54 PM
+Length        : 7991
+Name          : WORKFLOW.md
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead Justfile 
+[0m$ [0mGet-Command just -ErrorAction SilentlyContinue | Format-List; just --version
+Name            : just.exe
+CommandType     : Application
+Definition      : C:\Users\kleym\AppData\Local\Microsoft\WinGet\Packages\Casey.Just_Microsoft.Winget.Source_8wekyb3d8bb
+                  we\just.exe
+Extension       : .exe
+Path            : C:\Users\kleym\AppData\Local\Microsoft\WinGet\Packages\Casey.Just_Microsoft.Winget.Source_8wekyb3d8bb
+                  we\just.exe
+FileVersionInfo : File:             C:\Users\kleym\AppData\Local\Microsoft\WinGet\Packages\Casey.Just_Microsoft.Winget.
+                  Source_8wekyb3d8bbwe\just.exe
+                  InternalName:     
+                  OriginalFilename: 
+                  FileVersion:      
+                  FileDescription:  
+                  Product:          
+                  ProductVersion:   
+                  Debug:            False
+                  Patched:          False
+                  PreRelease:       False
+                  PrivateBuild:     False
+                  SpecialBuild:     False
+                  Language:         
+                  
+
+just 1.58.0
+> build · muse-spark-1.3-contributor-free
+[0m$ [0m$sw=[System.Diagnostics.Stopwatch]::StartNew(); just quick; $code=$LASTEXITCODE; $sw.Stop(); Write-Output "===JUST_QUICK_RECEIPT EXIT=$code WALL=$($sw.Elapsed.ToString()) SECS=$([math]::Round($sw.Elapsed.TotalSeconds,1))==="
+python scripts/docs_shards.py self-test
+DOC_SHARDS_SELF_TEST: PASS cases=6
+DOC_SHARDS_HARDENING_SELF_TEST: PASS cases=7
+python scripts/docs_shards.py verify --root .
+DOC_SHARDS_VERIFY: PASS pair=sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea architecture_fragments=123 architecture_bytes=149403 architecture_largest=10212 implementation_fragments=504 implementation_bytes=1003351 implementation_largest=25823 markdown_files=829 links=4341
+python scripts/docs_router.py self-test
+DOC_ROUTER_SELF_TEST: PASS cases=5
+DOC_ROUTER_HARDENING_SELF_TEST: PASS cases=3
+python scripts/docs_router.py check --root .
+DOC_ROUTER_CHECK: PASS routes=17 selectors=193 examples=11 tracked_files=3315 payloads_checked=14
+python scripts/docs_read.py self-test
+DOC_READ_SELF_TEST: PASS cases=3
+python scripts/verify-doc-code-conformance.py --self-test
+DOC_CODE_CONFORMANCE_SELF_TEST: PASS cases=18
+DOC_TRACEABILITY_RETIREMENT_SELF_TEST: PASS cases=5
+NORMATIVE_REFERENCE_CONFORMANCE_SELF_TEST: PASS cases=8
+DOC_CODE_CONFORMANCE_PIPELINE_SELF_TEST: PASS cases=19
+python scripts/verify-doc-code-conformance.py --root .
+DOC_CODE_CONFORMANCE: PASS binary_packages=15 decision_anchor_candidates=932 documentation_pipeline_files=2 normative_reference_files=3231 numeric_reference_candidates=2937 owner_bindings=1 reader_generator_scopes=3 reader_surfaces=36 reference_files=2516 repository_path_references=1523 repository_paths_unique=249 scripts=56 traceability_retirement_surfaces=34 workflow_files=4
+python scripts/code_navigation.py self-test
+CODE_NAVIGATION_SELF_TEST: PASS cases=14
+PACKAGE_DOC_INDEX_SELF_TEST: PASS cases=4
+PROTOTYPE_DOC_INDEX_SELF_TEST: PASS cases=5
+python scripts/code_navigation.py check --root .
+CODE_NAVIGATION_FAIL: workspace package docs index is stale or hand-edited; run `python scripts/code_navigation.py sync-index --root .`
+CODE_NAVIGATION_CHECK: PASS workspace_members=174 default_members=6 nonmember_packages=11 rust_files=1571 logical_blocks=15
+error: recipe `code-navigation` failed on line 30 with exit code 1
+===JUST_QUICK_RECEIPT EXIT=1 WALL=00:00:25.2692494 SECS=25.3===
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit status --short --branch; git rev-parse HEAD
+## HEAD (no branch)
+?? prompt.txt
+?? stderr.log
+?? stdout.log
+f0abfe139e944f781344df037268ba2845ae77dc
+> build · muse-spark-1.3-contributor-free

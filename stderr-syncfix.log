@@ -1,0 +1,1012 @@
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit status --short --branch; echo "---HEAD---"; git rev-parse HEAD; echo "---JUST recipes---"; just --list 2>&1 | head -n 100
+## HEAD (no branch)
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-syncfix.log
+?? stdout.log
+---HEAD---
+f0abfe139e944f781344df037268ba2845ae77dc
+---JUST recipes---
+head: The term 'head' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit status --short --branch
+git rev-parse HEAD
+just --list
+## HEAD (no branch)
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-syncfix.log
+?? stdout.log
+f0abfe139e944f781344df037268ba2845ae77dc
+Available recipes:
+    agent-bridge-protocol
+    agent-bridge-protocol-self-test
+    agent-guardrails
+    agent-guardrails-self-test
+    agent-route-bundles
+    agent-route-bundles-self-test
+    architecture-boundaries
+    architecture-boundaries-self-test
+    check
+    claude-package
+    clippy
+    code-navigation
+    code-navigation-self-test
+    code-navigation-sync
+    core-daemon-inventory
+    core-daemon-inventory-self-test
+    default
+    dependency-policy
+    dependency-policy-advisories
+    dependency-policy-self-test
+    doc-code-conformance
+    doc-code-conformance-self-test
+    docs-closure-audit
+    docs-read-self-test
+    docs-router
+    docs-router-self-test
+    docs-shards
+    docs-shards-self-test
+    fmt-check
+    metadata
+    normative
+    opencode-plugin
+    operator-check
+    quick                             # (DOC-GATE-JUST); it runs each bounded gate once.
+    runtime-source-hygiene
+    runtime-source-hygiene-self-test
+    standalone-crates                 # covers them. Runs fmt, clippy and tests for each.
+    sync-skills                       # The copies are generated: edit the canonical body, then run this.
+    test
+    verify                            # Complete locked Review profile, sole definition in scripts/verify.ps1.
+    verify-list
+    verify-review                     # Explicit Review alias; identical single Review invocation as `verify`.
+    work-unit crate                   # Legacy source-shape diagnostic (always NOT_VERIFIED; see module.toml acceptance), e.g. `just work-unit eliot-cue-contracts`.
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mjust code-navigation-sync
+python scripts/code_navigation.py sync-index --root .
+PACKAGE_DOC_INDEX_WRITE: PASS path=docs/code-navigation/PACKAGE_DOCS_INDEX.md workspace_members=174
+PROTOTYPE_DOC_INDEX_WRITE: PASS nonmember_prototypes=11
+PACKAGE_DOC_INDEX_CHECK: PASS workspace_members=174 default_members=6 logical_blocks=15
+PROTOTYPE_DOC_INDEX_CHECK: PASS nonmember_prototypes=11
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mjust quick
+python scripts/docs_shards.py self-test
+DOC_SHARDS_SELF_TEST: PASS cases=6
+DOC_SHARDS_HARDENING_SELF_TEST: PASS cases=7
+python scripts/docs_shards.py verify --root .
+DOC_SHARDS_VERIFY: PASS pair=sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea architecture_fragments=123 architecture_bytes=149403 architecture_largest=10212 implementation_fragments=504 implementation_bytes=1003351 implementation_largest=25823 markdown_files=829 links=4341
+python scripts/docs_router.py self-test
+DOC_ROUTER_SELF_TEST: PASS cases=5
+DOC_ROUTER_HARDENING_SELF_TEST: PASS cases=3
+python scripts/docs_router.py check --root .
+DOC_ROUTER_CHECK: PASS routes=17 selectors=193 examples=11 tracked_files=3315 payloads_checked=14
+python scripts/docs_read.py self-test
+DOC_READ_SELF_TEST: PASS cases=3
+python scripts/verify-doc-code-conformance.py --self-test
+DOC_CODE_CONFORMANCE_SELF_TEST: PASS cases=18
+DOC_TRACEABILITY_RETIREMENT_SELF_TEST: PASS cases=5
+NORMATIVE_REFERENCE_CONFORMANCE_SELF_TEST: PASS cases=8
+DOC_CODE_CONFORMANCE_PIPELINE_SELF_TEST: PASS cases=19
+python scripts/verify-doc-code-conformance.py --root .
+DOC_CODE_CONFORMANCE: PASS binary_packages=15 decision_anchor_candidates=932 documentation_pipeline_files=2 normative_reference_files=3231 numeric_reference_candidates=2937 owner_bindings=1 reader_generator_scopes=3 reader_surfaces=36 reference_files=2516 repository_path_references=1523 repository_paths_unique=249 scripts=56 traceability_retirement_surfaces=34 workflow_files=4
+python scripts/code_navigation.py self-test
+CODE_NAVIGATION_SELF_TEST: PASS cases=14
+PACKAGE_DOC_INDEX_SELF_TEST: PASS cases=4
+PROTOTYPE_DOC_INDEX_SELF_TEST: PASS cases=5
+python scripts/code_navigation.py check --root .
+CODE_NAVIGATION_CHECK: PASS workspace_members=174 default_members=6 nonmember_packages=11 rust_files=1571 logical_blocks=15
+PACKAGE_DOC_INDEX_CHECK: PASS workspace_members=174 default_members=6 logical_blocks=15
+PROTOTYPE_DOC_INDEX_CHECK: PASS nonmember_prototypes=11
+python scripts/docs_closure_audit.py --root .
+DOC_CLOSURE_AUDIT: errors=2 warnings=45 info=27 report=.eliot/docs-closure-audit
+error: recipe `docs-closure-audit` failed on line 36 with exit code 1
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit status --short --branch
+echo "===TRACKED-DIFF-NAME-ONLY==="
+git diff --name-only
+echo "===UNTRACKED-LIST==="
+git ls-files --others --exclude-standard
+## HEAD (no branch)
+ M docs/code-navigation/PACKAGE_DOCS_INDEX.md
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-syncfix.log
+?? stdout.log
+===TRACKED-DIFF-NAME-ONLY===
+docs/code-navigation/PACKAGE_DOCS_INDEX.md
+===UNTRACKED-LIST===
+prompt-syncfix.txt
+prompt.txt
+stderr-syncfix.log
+stderr.log
+stdout-syncfix.log
+stdout.log
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mjust docs-closure-audit; echo "EXIT:$LASTEXITCODE"
+python scripts/docs_closure_audit.py --root .
+DOC_CLOSURE_AUDIT: errors=2 warnings=45 info=27 report=.eliot/docs-closure-audit
+error: recipe `docs-closure-audit` failed on line 36 with exit code 1
+EXIT:1
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit diff --stat
+echo "===DIFF-PACKAGE-INDEX-STAT==="
+git diff --numstat -- docs/code-navigation/PACKAGE_DOCS_INDEX.md
+echo "===AUDIT-REPORT-DIR==="
+Get-ChildItem .eliot/docs-closure-audit | Select-Object Name,Length
+echo "===AUDIT-REPORT-CONTENT==="
+Get-ChildItem .eliot/docs-closure-audit -File | ForEach-Object { echo "--- $($_.FullName) ---"; Get-Content $_.FullName }
+docs/code-navigation/PACKAGE_DOCS_INDEX.md | 22 +++++++++++-----------
+ 1 file changed, 11 insertions(+), 11 deletions(-)
+===DIFF-PACKAGE-INDEX-STAT===
+11	11	docs/code-navigation/PACKAGE_DOCS_INDEX.md
+===AUDIT-REPORT-DIR===
+
+Name       Length
+----       ------
+audit.json  28019
+audit.md    12192
+===AUDIT-REPORT-CONTENT===
+--- C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\.eliot\docs-closure-audit\audit.json ---
+{
+  "commit": "f0abfe139e944f781344df037268ba2845ae77dc",
+  "evidence": {
+    "architecture_original_matches": [
+      {
+        "blob": "81ad1508217393ac6dbaecd2386081697405846a",
+        "commit": "c0a880a2af2c94e76972daf03c7e532b7dfb2e86"
+      }
+    ],
+    "architecture_reconstructed_blob": "81ad1508217393ac6dbaecd2386081697405846a",
+    "pair": {
+      "adopted_at": "2026-08-28",
+      "architecture_compatibility_path": "docs/architecture/ELIOT_ARCHITECTURE.md",
+      "architecture_edition": "2026-08-28",
+      "architecture_entry_path": "docs/architecture/architecture/README.md",
+      "architecture_path": "docs/architecture/architecture/manifest.json",
+      "architecture_revision": "4.5-draft",
+      "architecture_sha256": "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a",
+      "content_layout": "eliot-doc-shards-v1",
+      "decision_ref": "github:UnknownAlienHuman/eliot-memory-os#25",
+      "historical_material_location": "git-history-and-issue-pr-records-only",
+      "implementation_compatibility_path": "docs/architecture/ELIOT_IMPLEMENTATION.md",
+      "implementation_edition": "2026-08-28",
+      "implementation_entry_path": "docs/architecture/implementation/README.md",
+      "implementation_path": "docs/architecture/implementation/manifest.json",
+      "implementation_revision": "0.29-draft",
+      "implementation_sha256": "40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89",
+      "pair_key": "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea",
+      "pair_key_algorithm": "sha256-domain-separated-v1",
+      "pair_key_input": "UTF-8 domain tag eliot-normative-pair-v1 and lowercase document digests separated and terminated by NUL bytes",
+      "repository_authority_branch": "main",
+      "schema_version": "eliot-normative-pair-v2-sharded",
+      "status": "accepted",
+      "supersedes_architecture_sha256": "58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8",
+      "supersedes_implementation_sha256": "c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b"
+    }
+  },
+  "findings": [
+    {
+      "detail": {
+        "reconstructed_sha256": "40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89"
+      },
+      "id": "DOC-ORIGINAL-NOT-FOUND",
+      "message": "no Git-history version of the monolith matches reconstructed bytes",
+      "path": "docs/architecture/ELIOT_IMPLEMENTATION.md",
+      "severity": "error"
+    },
+    {
+      "id": "DOC-ORIGINAL-PAIR-COMMIT",
+      "message": "Architecture and Implementation do not share a Git commit with both adopted byte streams",
+      "severity": "error"
+    },
+    {
+      "detail": {
+        "line": "//!   I07.20 agent-facing error contract (typed codes stay with their owners)."
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 9,
+      "message": "possible unresolved bare normative handle I07.20",
+      "path": "bins/eliot-host/src/host_diagnostics.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! Implementation: I1.5, I8.1, I8.2, I8.3, I8.4, I14.10, I14.15, I2.2, I2.23"
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 4,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "bins/eliot-kernel/src/daemon_live_receipt.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//!   text); I07.20 agent-facing error contract (typed codes stay with their"
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 10,
+      "message": "possible unresolved bare normative handle I07.20",
+      "path": "bins/eliot-kernel/src/kernel_diagnostics.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! Implementation: I6.4, I6.5, I7.1, I7.2, I7.3, I7.4, I7.5, I7.14, I1.4, I1.5, I2.2, I2.23, I8.1, I8.2, I8.3, I8.4, I14.10, I14.15"
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 9,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "bins/eliot-kernel/src/lib.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! - `ELIOT_IMPLEMENTATION.md` :: I2.2 and `I2.16` - crate capability extraction and crate-size/Agent Context Envelope."
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 11,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "bins/eliot-kernel/src/tests.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! - `ELIOT_IMPLEMENTATION.md` :: I2.2 and `I2.16` - crate capability extraction and crate-size/Agent Context Envelope."
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 5,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "bins/eliot-kernel/src/tests/activation.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! - `ELIOT_IMPLEMENTATION.md` :: I2.2, `I2.16`, `I2.20`, `I2.23` - kernel process execution orchestration."
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 5,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "bins/eliot-kernel/src/tests/process_execution.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! - **I2.2 When a capability becomes a separate crate** - pure contract/test seam justifies isolated module; no placeholder proliferation."
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 11,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "bins/eliotd/src/activation_projection.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Replace the pre-sharding project identifier and nonexistent I2.2 with current paths and indexed numeric handles.\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 9,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Replace the pre-sharding project/free-form identifiers and nonexistent I2.2 with current paths and indexed numeric handles.\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 22,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Replace the pre-sharding project identifier and nonexistent I2.2 with current paths and indexed numeric handles.\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 39,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Replace the pre-sharding project identifier and nonexistent I2.2 with current paths and indexed numeric handles.\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 52,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Replace the pre-sharding project identifier and nonexistent I2.2 with current paths and indexed numeric handles.\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 65,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Replace the pre-sharding project identifier and nonexistent I2.2 with current paths and indexed numeric handles.\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 78,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Replace the pre-sharding project identifier and nonexistent I2.2 with current paths and indexed numeric handles.\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 91,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Replace nonexistent I2.2, stale documentation line coordinates, and the old CodeBase Memory source pin while preserving valid A16.1 Decision Anchors.\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 104,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Retire nonexistent I2.2 handle and ensure architecture decision anchors and implementation handles.\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 190,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Retire nonexistent I2.2 handle and ensure architecture decision anchors and implementation handles.\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 303,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Retire nonexistent I2.2 handle and ensure implementation and architecture handles.\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 316,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Retire nonexistent I2.2 handle and ensure architecture decision anchors and implementation handles.\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 328,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Retire nonexistent I2.2 handle and ensure architecture decision anchors and implementation handles.\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 341,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "# topology handles never match; bare nonexistent I2.2 still fails."
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 358,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Retire pre-sharding project ID and nonexistent I2.2 while ensuring canonical watchdog handles (issue 1147 WRITER-A scope; TOML owned by WRITER-1147B).\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 362,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Retire pre-sharding project ID and nonexistent I2.2 while ensuring canonical watchdog/runtime handles (issue 1147 WRITER-A scope; TOML owned by WRITER-1147B).\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 375,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Retire pre-sharding project ID and nonexistent I2.2 while ensuring canonical watchdog handles (issue 1147 WRITER-A scope; TOML owned by WRITER-1147B).\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 388,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Retire pre-sharding project ID and nonexistent I2.2 while ensuring canonical watchdog/kernel handles (issue 1147 WRITER-A scope; TOML owned by WRITER-1147B).\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 401,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Retire pre-sharding project ID and nonexistent I2.2 while ensuring canonical watchdog/kernel handles (issue 1147 WRITER-A scope; TOML owned by WRITER-1147B).\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 414,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "reason = \"Retire pre-sharding project ID and nonexistent I2.2 while ensuring canonical kernel handles (issue 1147 WRITER-A scope; TOML owned by WRITER-1147B).\""
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 427,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "config/doc-traceability-retirement.toml",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! Implementation: I1.8 I2.2 I2.23 P.3 I14.21 I14.26"
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 3,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "crates/governor/eliot-governor/src/genesis_owner_packet.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! Implementation: I3.15 (redb registry store owner), I2.2 (explicit protected `ProgramData` path), I2.23 (CAS/revision transaction), I15.3/I15.8 (typed approval and fence validation)."
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 4,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "crates/kernel/eliot-installation/src/installation_registry.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! Implementation I1.2/I2.2/I2.23: redb owns durable bytes and atomic table"
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 4,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "crates/kernel/eliot-installation/src/redb_state.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! Implementation: I2.16, I2.17, I2.18, I2.23, I3.15, I15.3, I15.8, I18.36, I18.40"
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 3,
+      "message": "possible unresolved bare normative handle I18.36",
+      "path": "crates/kernel/eliot-installation/src/tests/registry_wire_launch.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! Implementation: I19.11, I14.21, I2.2, I2.23"
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 3,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "crates/kernel/eliot-installation/src/tests/rollback_recovery.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! Implementation: I19.11, I14.21, I2.2, I2.23"
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 3,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "crates/kernel/eliot-installation/src/tests/service_start_recovery.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! Implementation: I3.15, I14.21, I2.2, I2.23"
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 3,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "crates/kernel/eliot-installation/src/tests/transaction_recovery.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! Implementation (source-backed): I15.5, I15.9, I15.19, I2.2, I2.23."
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 5,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "crates/kernel/eliot-platform-windows/src/package_staging/authenticode.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! Implementation: I1.6/I2.2/I2.23/I15.2/I15.3/I15.8/I15.16/I15.19"
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 3,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "crates/kernel/eliot-platform-windows/src/platform_security.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! Implementation: I10.8.2, I15.3, I15.5, I15.8, I15.19, I2.2, I2.23"
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 2,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "crates/kernel/eliot-platform-windows/src/process_path_lease.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! Implementation: I1.2, I1.6, I2.2, I2.23."
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 5,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "crates/kernel/eliot-platform-windows/src/runtime_receipt_publication.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! Implementation: I1.8, I5.1, I5.4, I5.9, I2.2, I2.23 - named already-prepared transition only; bridge alone owns SDK/credentials; event/projection/relation/revision/receipt/outbox commit in one DB transaction; unknown outcome resolves exact `WriteReceipt` before replay."
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 5,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "crates/storage/eliot-store-surreal-adapter/src/apply/atomic_write.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! Implementation: I5.1, I5.4, I5.9, I2.2, I2.23."
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 2,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "crates/storage/eliot-store-surreal-adapter/src/apply/genesis.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "//! Implementation: I5.1, I5.3, I5.9, I2.2, I2.23."
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 2,
+      "message": "possible unresolved bare normative handle I2.2",
+      "path": "crates/storage/eliot-store-surreal-adapter/src/apply/read_boundary.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "assert!(!normative_heading_exists(fixture, \"A9.9\"));"
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 2471,
+      "message": "possible unresolved bare normative handle A9.9",
+      "path": "crates/surfaces/eliot-cli/src/lib.rs",
+      "severity": "warning"
+    },
+    {
+      "detail": {
+        "line": "source.write_text(\"//! docs/current.md:A9.9\\n\", encoding=\"utf-8\")"
+      },
+      "id": "DOC-HANDLE-BARE-UNKNOWN",
+      "line": 915,
+      "message": "possible unresolved bare normative handle A9.9",
+      "path": "scripts/doc_code_conformance_core.py",
+      "severity": "warning"
+    },
+    {
+      "id": "DOC-WORKSTREAM-STATE-UNVERIFIED",
+      "message": "GitHub repository/token unavailable; issue-state parity was not checked",
+      "path": "workstreams/ACTIVE.toml",
+      "severity": "warning"
+    },
+    {
+      "id": "DOC-ANCHOR-NEGATIVE-FIXTURE",
+      "line": 504,
+      "message": "intentional unknown Decision Anchor fixture ARCH-FAKE-99",
+      "path": "scripts/doc_code_conformance_lib/normative_references.py",
+      "severity": "info"
+    },
+    {
+      "detail": {
+        "selector": "I2.2"
+      },
+      "id": "DOC-HANDLE-NEGATIVE-FIXTURE",
+      "line": 491,
+      "message": "unknown exact handle I2.2",
+      "path": "scripts/doc_code_conformance_lib/normative_references.py",
+      "severity": "info"
+    },
+    {
+      "detail": {
+        "selector": "I2.2"
+      },
+      "id": "DOC-HANDLE-NEGATIVE-FIXTURE",
+      "line": 492,
+      "message": "unknown exact handle I2.2",
+      "path": "scripts/doc_code_conformance_lib/normative_references.py",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 149,
+      "message": "retired token named by its owning rule: ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md",
+      "path": ".github/workflows/repository-policy.yml",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 150,
+      "message": "retired token named by its owning rule: ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md",
+      "path": ".github/workflows/repository-policy.yml",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 211,
+      "message": "retired token named by its owning rule: docs/normative/",
+      "path": ".github/workflows/repository-policy.yml",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 216,
+      "message": "retired token named by its owning rule: docs/normative/",
+      "path": ".github/workflows/repository-policy.yml",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 87,
+      "message": "retired token named by its owning rule: docs/normative/",
+      "path": "config/doc-code-conformance.toml",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 92,
+      "message": "retired token named by its owning rule: ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md",
+      "path": "config/doc-code-conformance.toml",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 93,
+      "message": "retired token named by its owning rule: ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md",
+      "path": "config/doc-code-conformance.toml",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 110,
+      "message": "retired token named by its owning rule: docs/normative/",
+      "path": "config/doc-code-conformance.toml",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 115,
+      "message": "retired token named by its owning rule: ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md",
+      "path": "config/doc-code-conformance.toml",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 120,
+      "message": "retired token named by its owning rule: ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md",
+      "path": "config/doc-code-conformance.toml",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 130,
+      "message": "retired token named by its owning rule: docs/normative/",
+      "path": "config/doc-code-conformance.toml",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 135,
+      "message": "retired token named by its owning rule: ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md",
+      "path": "config/doc-code-conformance.toml",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 140,
+      "message": "retired token named by its owning rule: ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md",
+      "path": "config/doc-code-conformance.toml",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 145,
+      "message": "retired token named by its owning rule: docs/normative/",
+      "path": "config/doc-code-conformance.toml",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 150,
+      "message": "retired token named by its owning rule: ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md",
+      "path": "config/doc-code-conformance.toml",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 155,
+      "message": "retired token named by its owning rule: ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md",
+      "path": "config/doc-code-conformance.toml",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 225,
+      "message": "retired token named by its owning rule: ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md",
+      "path": "config/doc-code-conformance.toml",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 230,
+      "message": "retired token named by its owning rule: ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md",
+      "path": "config/doc-code-conformance.toml",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 686,
+      "message": "retired token named by its owning rule: docs/normative/",
+      "path": "scripts/doc_code_conformance_core.py",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 693,
+      "message": "retired token named by its owning rule: docs/normative/",
+      "path": "scripts/doc_code_conformance_core.py",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 771,
+      "message": "retired token named by its owning rule: docs/normative/",
+      "path": "scripts/doc_code_conformance_core.py",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 848,
+      "message": "retired token named by its owning rule: docs/normative/",
+      "path": "scripts/doc_code_conformance_core.py",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 1518,
+      "message": "retired token named by its owning rule: ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md",
+      "path": "scripts/docs_shards_core.py",
+      "severity": "info"
+    },
+    {
+      "id": "DOC-RETIRED-REFERENCE-ALLOWED",
+      "line": 1519,
+      "message": "retired token named by its owning rule: ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md",
+      "path": "scripts/docs_shards_core.py",
+      "severity": "info"
+    }
+  ],
+  "metrics": {
+    "architecture_bytes": 149403,
+    "architecture_fragments": 123,
+    "architecture_sha256": "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a",
+    "bare_handle_candidates_scanned": 5865,
+    "decision_anchor_references_scanned": 950,
+    "decision_anchors": 63,
+    "implementation_bytes": 1003351,
+    "implementation_fragments": 504,
+    "implementation_sha256": "40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89",
+    "manifest_fragment_paths": 627,
+    "numeric_handles": 621,
+    "strict_handle_selectors_scanned": 2907,
+    "tracked_fragment_paths": 627
+  },
+  "schema_version": "eliot-doc-closure-audit-v1",
+  "summary": {
+    "errors": 2,
+    "info": 27,
+    "warnings": 45
+  }
+}
+--- C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\.eliot\docs-closure-audit\audit.md ---
+# ELIOT documentation closure audit
+
+- Commit: `f0abfe139e944f781344df037268ba2845ae77dc`
+- Errors: **2**
+- Warnings: **45**
+- Informational findings: **27**
+
+## Reconstruction and identity
+
+- architecture: reconstructed blob `81ad1508217393ac6dbaecd2386081697405846a`; matching historical versions: 1.
+- implementation: reconstructed blob `UNKNOWN`; matching historical versions: 0.
+- Common exact original commits: none.
+
+## Metrics
+
+| Metric | Value |
+|---|---:|
+| `architecture_bytes` | 149403 |
+| `architecture_fragments` | 123 |
+| `architecture_sha256` | c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a |
+| `bare_handle_candidates_scanned` | 5865 |
+| `decision_anchor_references_scanned` | 950 |
+| `decision_anchors` | 63 |
+| `implementation_bytes` | 1003351 |
+| `implementation_fragments` | 504 |
+| `implementation_sha256` | 40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89 |
+| `manifest_fragment_paths` | 627 |
+| `numeric_handles` | 621 |
+| `strict_handle_selectors_scanned` | 2907 |
+| `tracked_fragment_paths` | 627 |
+
+## Findings
+
+- **ERROR DOC-ORIGINAL-NOT-FOUND**: no Git-history version of the monolith matches reconstructed bytes - `docs/architecture/ELIOT_IMPLEMENTATION.md`
+- **ERROR DOC-ORIGINAL-PAIR-COMMIT**: Architecture and Implementation do not share a Git commit with both adopted byte streams
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I07.20 - `bins/eliot-host/src/host_diagnostics.rs:9`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `bins/eliot-kernel/src/daemon_live_receipt.rs:4`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I07.20 - `bins/eliot-kernel/src/kernel_diagnostics.rs:10`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `bins/eliot-kernel/src/lib.rs:9`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `bins/eliot-kernel/src/tests.rs:11`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `bins/eliot-kernel/src/tests/activation.rs:5`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `bins/eliot-kernel/src/tests/process_execution.rs:5`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `bins/eliotd/src/activation_projection.rs:11`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:9`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:22`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:39`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:52`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:65`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:78`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:91`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:104`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:190`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:303`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:316`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:328`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:341`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:358`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:362`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:375`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:388`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:401`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:414`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `config/doc-traceability-retirement.toml:427`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `crates/governor/eliot-governor/src/genesis_owner_packet.rs:3`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `crates/kernel/eliot-installation/src/installation_registry.rs:4`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `crates/kernel/eliot-installation/src/redb_state.rs:4`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I18.36 - `crates/kernel/eliot-installation/src/tests/registry_wire_launch.rs:3`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `crates/kernel/eliot-installation/src/tests/rollback_recovery.rs:3`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `crates/kernel/eliot-installation/src/tests/service_start_recovery.rs:3`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `crates/kernel/eliot-installation/src/tests/transaction_recovery.rs:3`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `crates/kernel/eliot-platform-windows/src/package_staging/authenticode.rs:5`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `crates/kernel/eliot-platform-windows/src/platform_security.rs:3`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `crates/kernel/eliot-platform-windows/src/process_path_lease.rs:2`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `crates/kernel/eliot-platform-windows/src/runtime_receipt_publication.rs:5`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `crates/storage/eliot-store-surreal-adapter/src/apply/atomic_write.rs:5`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `crates/storage/eliot-store-surreal-adapter/src/apply/genesis.rs:2`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle I2.2 - `crates/storage/eliot-store-surreal-adapter/src/apply/read_boundary.rs:2`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle A9.9 - `crates/surfaces/eliot-cli/src/lib.rs:2471`
+- **WARNING DOC-HANDLE-BARE-UNKNOWN**: possible unresolved bare normative handle A9.9 - `scripts/doc_code_conformance_core.py:915`
+- **WARNING DOC-WORKSTREAM-STATE-UNVERIFIED**: GitHub repository/token unavailable; issue-state parity was not checked - `workstreams/ACTIVE.toml`
+- **INFO DOC-ANCHOR-NEGATIVE-FIXTURE**: intentional unknown Decision Anchor fixture ARCH-FAKE-99 - `scripts/doc_code_conformance_lib/normative_references.py:504`
+- **INFO DOC-HANDLE-NEGATIVE-FIXTURE**: unknown exact handle I2.2 - `scripts/doc_code_conformance_lib/normative_references.py:491`
+- **INFO DOC-HANDLE-NEGATIVE-FIXTURE**: unknown exact handle I2.2 - `scripts/doc_code_conformance_lib/normative_references.py:492`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md - `.github/workflows/repository-policy.yml:149`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md - `.github/workflows/repository-policy.yml:150`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: docs/normative/ - `.github/workflows/repository-policy.yml:211`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: docs/normative/ - `.github/workflows/repository-policy.yml:216`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: docs/normative/ - `config/doc-code-conformance.toml:87`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md - `config/doc-code-conformance.toml:92`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md - `config/doc-code-conformance.toml:93`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: docs/normative/ - `config/doc-code-conformance.toml:110`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md - `config/doc-code-conformance.toml:115`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md - `config/doc-code-conformance.toml:120`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: docs/normative/ - `config/doc-code-conformance.toml:130`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md - `config/doc-code-conformance.toml:135`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md - `config/doc-code-conformance.toml:140`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: docs/normative/ - `config/doc-code-conformance.toml:145`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md - `config/doc-code-conformance.toml:150`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md - `config/doc-code-conformance.toml:155`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md - `config/doc-code-conformance.toml:225`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md - `config/doc-code-conformance.toml:230`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: docs/normative/ - `scripts/doc_code_conformance_core.py:686`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: docs/normative/ - `scripts/doc_code_conformance_core.py:693`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: docs/normative/ - `scripts/doc_code_conformance_core.py:771`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: docs/normative/ - `scripts/doc_code_conformance_core.py:848`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md - `scripts/docs_shards_core.py:1518`
+- **INFO DOC-RETIRED-REFERENCE-ALLOWED**: retired token named by its owning rule: ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md - `scripts/docs_shards_core.py:1519`
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit status --short --branch
+git rev-parse HEAD
+git diff -- docs/code-navigation/PACKAGE_DOCS_INDEX.md
+nance-plan`](../../crates/smart/eliot-dreamer-maintenance-plan/Cargo.toml)<br>[`crates/smart/eliot-dreamer-memory-repair`](../../crates/smart/eliot-dreamer-memory-repair/Cargo.toml)<br>[`crates/smart/eliot-dreamer-orchestration-plan`](../../crates/smart/eliot-dreamer-orchestration-plan/Cargo.toml)<br>[`crates/smart/eliot-dreamer-orientation`](../../crates/smart/eliot-dreamer-orientation/Cargo.toml)<br>[`crates/smart/eliot-dreamer-probe-plan`](../../crates/smart/eliot-dreamer-probe-plan/Cargo.toml)<br>[`crates/smart/eliot-dreamer-procedure`](../../crates/smart/eliot-dreamer-procedure/Cargo.toml)<br>[`crates/smart/eliot-dreamer-reconsolidation`](../../crates/smart/eliot-dreamer-reconsolidation/Cargo.toml)<br>[`crates/smart/eliot-dreamer-relation`](../../crates/smart/eliot-dreamer-relation/Cargo.toml)<br>[`crates/smart/eliot-dreamer-research-synthesis`](../../crates/smart/eliot-dreamer-research-synthesis/Cargo.toml)<br>[`crates/smart/eliot-dreamer-rival-model`](../../crates/smart/eliot-dreamer-rival-model/Cargo.toml)<br>[`crates/smart/eliot-dreamer-structure-repair`](../../crates/smart/eliot-dreamer-structure-repair/Cargo.toml)<br>[`crates/smart/eliot-epistemic`](../../crates/smart/eliot-epistemic/Cargo.toml)<br>[`crates/smart/eliot-epistemic-contracts`](../../crates/smart/eliot-epistemic-contracts/Cargo.toml)<br>[`crates/smart/eliot-learning-contracts`](../../crates/smart/eliot-learning-contracts/Cargo.toml)<br>[`crates/smart/eliot-learning-delta`](../../crates/smart/eliot-learning-delta/Cargo.toml)<br>[`crates/smart/eliot-learning-overlay`](../../crates/smart/eliot-learning-overlay/Cargo.toml)<br>[`crates/smart/eliot-learning-state-view`](../../crates/smart/eliot-learning-state-view/Cargo.toml)<br>[`crates/smart/eliot-memory-curation`](../../crates/smart/eliot-memory-curation/Cargo.toml)<br>[`crates/smart/eliot-memory-curation-contracts`](../../crates/smart/eliot-memory-curation-contracts/Cargo.toml)<br>[`crates/smart/eliot-memory-curation-screen`](../../crates/smart/eliot-memory-curation-screen/Cargo.toml)<br>[`crates/smart/eliot-reactive-context-plan`](../../crates/smart/eliot-reactive-context-plan/Cargo.toml) | `bins/eliot-dreamer:src/main.rs`<br>`bins/eliot-dreamer:src/lib.rs`<br>`crates/smart/eliot-context:src/lib.rs`<br>`crates/smart/eliot-context:tests/admission_integrity.rs`<br>`crates/smart/eliot-context-admission:src/lib.rs`<br>`crates/smart/eliot-context-admission:tests/admission.rs`<br>`crates/smart/eliot-context-assembly:src/lib.rs`<br>`crates/smart/eliot-context-assembly:tests/assembly.rs`<br>`crates/smart/eliot-context-candidates:src/lib.rs`<br>`crates/smart/eliot-context-candidates:tests/candidates.rs`<br>`crates/smart/eliot-context-candidates:tests/helpers.rs`<br>`crates/smart/eliot-context-candidates:tests/memory_applicability_fixtures.rs`<br>`crates/smart/eliot-context-candidates:tests/projection_fence_fixtures.rs`<br>`crates/smart/eliot-context-contracts:src/lib.rs`<br>`crates/smart/eliot-context-contracts:tests/admission_input.rs`<br>`crates/smart/eliot-context-contracts:tests/context_contracts.rs`<br>`crates/smart/eliot-context-contracts:tests/reactive_contracts.rs`<br>`crates/smart/eliot-context-contracts:tests/work_unit_584.rs`<br>`crates/smart/eliot-context-measurement:src/lib.rs`<br>`crates/smart/eliot-context-measurement:tests/measurement.rs`<br>`crates/smart/eliot-cue-activation:src/lib.rs`<br>`crates/smart/eliot-cue-activation:tests/activation.rs`<br>`crates/smart/eliot-cue-binding:src/lib.rs`<br>`crates/smart/eliot-cue-binding:tests/binding.rs`<br>`crates/smart/eliot-cue-binding:tests/work_unit_622.rs`<br>`crates/smart/eliot-cue-contracts:src/lib.rs`<br>`crates/smart/eliot-cue-contracts:tests/acceptance_804.rs`<br>`crates/smart/eliot-cue-contracts:tests/contract_shape.rs`<br>`crates/smart/eliot-cue-contracts:tests/index_projection.rs`<br>`crates/smart/eliot-cue-contracts:tests/version.rs`<br>`crates/smart/eliot-cue-index:src/lib.rs`<br>`crates/smart/eliot-cue-index:tests/build.rs`<br>`crates/smart/eliot-cue-normalizer:src/lib.rs`<br>`crates/smart/eliot-cue-normalizer:tests/normalization.rs`<br>`crates/smart/eliot-cues:src/lib.rs`<br>`crates/smart/eliot-cues:tests/integrity.rs`<br>`crates/smart/eliot-dreamer-accessibility:src/lib.rs`<br>`crates/smart/eliot-dreamer-architecture-brief:src/lib.rs`<br>`crates/smart/eliot-dreamer-architecture-brief:tests/architecture_brief.rs`<br>`crates/smart/eliot-dreamer-bundle:src/lib.rs`<br>`crates/smart/eliot-dreamer-bundle:tests/bundle_proof.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:src/lib.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/handoff.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/validation.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/wu595_a.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/wu595_b.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/wu595_c.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/wu595_d.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/wu595_e.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/wu595_f.rs`<br>`crates/smart/eliot-dreamer-claim-grounding:src/lib.rs`<br>`crates/smart/eliot-dreamer-claim-grounding:tests/grounding.rs`<br>`crates/smart/eliot-dreamer-claim-grounding:tests/support.rs`<br>`crates/smart/eliot-dreamer-clarification:src/lib.rs`<br>`crates/smart/eliot-dreamer-classification:src/lib.rs`<br>`crates/smart/eliot-dreamer-classification:tests/classification.rs`<br>`crates/smart/eliot-dreamer-concept:src/lib.rs`<br>`crates/smart/eliot-dreamer-concept:tests/concept.rs`<br>`crates/smart/eliot-dreamer-configuration-plan:src/lib.rs`<br>`crates/smart/eliot-dreamer-conflict-analysis:src/lib.rs`<br>`crates/smart/eliot-dreamer-contracts:src/lib.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/assembly.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/classification_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/concept_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/consumer_and_source_proof.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/curation_invocation.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/failure_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/grounding_handoff.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/inquiry_affordance_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/model_route_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/probe_input_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/rejection_vocab.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/relation_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/rival_declaration_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/rival_projection_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/validated_draft.rs`<br>`crates/smart/eliot-dreamer-core:src/lib.rs`<br>`crates/smart/eliot-dreamer-curation:src/lib.rs`<br>`crates/smart/eliot-dreamer-cycle:src/lib.rs`<br>`crates/smart/eliot-dreamer-cycle:tests/cycle.rs`<br>`crates/smart/eliot-dreamer-development-diagnosis:src/lib.rs`<br>`crates/smart/eliot-dreamer-episode:src/lib.rs`<br>`crates/smart/eliot-dreamer-episode:tests/episode_candidate.rs`<br>`crates/smart/eliot-dreamer-failure:src/lib.rs`<br>`crates/smart/eliot-dreamer-failure:tests/failure.rs`<br>`crates/smart/eliot-dreamer-implementation-brief:src/lib.rs`<br>`crates/smart/eliot-dreamer-implementation-brief:tests/implementation_brief.rs`<br>`crates/smart/eliot-dreamer-maintenance-plan:src/lib.rs`<br>`crates/smart/eliot-dreamer-memory-repair:src/lib.rs`<br>`crates/smart/eliot-dreamer-orchestration-plan:src/lib.rs`<br>`crates/smart/eliot-dreamer-orientation:src/lib.rs`<br>`crates/smart/eliot-dreamer-orientation:tests/orientation.rs`<br>`crates/smart/eliot-dreamer-probe-plan:src/lib.rs`<br>`crates/smart/eliot-dreamer-probe-plan:tests/probe_plan.rs`<br>`crates/smart/eliot-dreamer-probe-plan:tests/work_unit_610.rs`<br>`crates/smart/eliot-dreamer-procedure:src/lib.rs`<br>`crates/smart/eliot-dreamer-reconsolidation:src/lib.rs`<br>`crates/smart/eliot-dreamer-relation:src/lib.rs`<br>`crates/smart/eliot-dreamer-relation:tests/relation.rs`<br>`crates/smart/eliot-dreamer-research-synthesis:src/lib.rs`<br>`crates/smart/eliot-dreamer-research-synthesis:tests/proof.rs`<br>`crates/smart/eliot-dreamer-rival-model:src/lib.rs`<br>`crates/smart/eliot-dreamer-rival-model:tests/rival_proof.rs`<br>`crates/smart/eliot-dreamer-structure-repair:src/lib.rs`<br>`crates/smart/eliot-epistemic:src/lib.rs`<br>`crates/smart/eliot-epistemic-contracts:src/lib.rs`<br>`crates/smart/eliot-epistemic-contracts:tests/consumer_fixtures.rs`<br>`crates/smart/eliot-learning-contracts:src/lib.rs`<br>`crates/smart/eliot-learning-contracts:tests/contracts.rs`<br>`crates/smart/eliot-learning-contracts:tests/self_learning_contracts.rs`<br>`crates/smart/eliot-learning-contracts:tests/work_unit_590.rs`<br>`crates/smart/eliot-learning-delta:src/lib.rs`<br>`crates/smart/eliot-learning-delta:tests/delta.rs`<br>`crates/smart/eliot-learning-overlay:src/lib.rs`<br>`crates/smart/eliot-learning-overlay:tests/overlay.rs`<br>`crates/smart/eliot-learning-state-view:src/lib.rs`<br>`crates/smart/eliot-learning-state-view:tests/state_view.rs`<br>`crates/smart/eliot-memory-curation:src/lib.rs`<br>`crates/smart/eliot-memory-curation-contracts:src/lib.rs`<br>`crates/smart/eliot-memory-curation-contracts:tests/contracts.rs`<br>`crates/smart/eliot-memory-curation-contracts:tests/work_unit_586.rs`<br>`crates/smart/eliot-memory-curation-screen:src/lib.rs`<br>`crates/smart/eliot-memory-curation-screen:tests/screen.rs`<br>`crates/smart/eliot-reactive-context-plan:src/lib.rs`<br>`crates/smart/eliot-reactive-context-plan:tests/reactive_delivery_plan.rs`<br>`crates/smart/eliot-reactive-context-plan:tests/work_unit_612.rs` |
+ | [`I14.25`](../architecture/I14-25-doctor-implementation-contract.md#i1425-doctor-implementation-contract) | [`docs/architecture/I14-25-doctor-implementation-contract.md#i1425-doctor-implementation-contract`](../architecture/I14-25-doctor-implementation-contract.md#i1425-doctor-implementation-contract) | [`bins/eliot-doctor`](../../bins/eliot-doctor/Cargo.toml)<br>[`bins/eliot-watchdog`](../../bins/eliot-watchdog/Cargo.toml)<br>[`crates/meta/eliot-doctor-core`](../../crates/meta/eliot-doctor-core/Cargo.toml)<br>[`crates/meta/eliot-improvement`](../../crates/meta/eliot-improvement/Cargo.toml)<br>[`crates/meta/eliot-learning-activation-assessment`](../../crates/meta/eliot-learning-activation-assessment/Cargo.toml)<br>[`crates/meta/eliot-runtime-status`](../../crates/meta/eliot-runtime-status/Cargo.toml)<br>[`crates/meta/eliot-self-quality`](../../crates/meta/eliot-self-quality/Cargo.toml)<br>[`crates/supervision/eliot-watchdog-core`](../../crates/supervision/eliot-watchdog-core/Cargo.toml) | `bins/eliot-doctor:src/main.rs`<br>`bins/eliot-doctor:src/lib.rs`<br>`bins/eliot-doctor:tests/admitted_second_consumer.rs`<br>`bins/eliot-watchdog:src/main.rs`<br>`bins/eliot-watchdog:src/lib.rs`<br>`bins/eliot-watchdog:tests/export_through_admission_advances_once.rs`<br>`bins/eliot-watchdog:tests/store_unavailable_leaves_cursor_replayable.rs`<br>`bins/eliot-watchdog:tests/watchdog_diagnostics.rs`<br>`bins/eliot-watchdog:tests/watchdog_publication_service_timing_diagnostics.rs`<br>`crates/meta/eliot-doctor-core:src/lib.rs`<br>`crates/meta/eliot-doctor-core:tests/attempt-identity.rs`<br>`crates/meta/eliot-improvement:src/lib.rs`<br>`crates/meta/eliot-improvement:tests/candidate_admission_edge.rs`<br>`crates/meta/eliot-improvement:tests/learning_closure.rs`<br>`crates/meta/eliot-improvement:tests/promotion_input.rs`<br>`crates/meta/eliot-learning-activation-assessment:src/lib.rs`<br>`crates/meta/eliot-learning-activation-assessment:tests/activation.rs`<br>`crates/meta/eliot-learning-activation-assessment:tests/work_unit_620.rs`<br>`crates/meta/eliot-runtime-status:src/lib.rs`<br>`crates/meta/eliot-self-quality:src/lib.rs`<br>`crates/meta/eliot-self-quality:tests/self_quality_820_a.rs`<br>`crates/meta/eliot-self-quality:tests/self_quality_820_b.rs`<br>`crates/meta/eliot-self-quality:tests/self_quality_820_c.rs`<br>`crates/meta/eliot-self-quality:tests/self_quality_820_d.rs`<br>`crates/supervision/eliot-watchdog-core:src/lib.rs` |
+ | [`I15.9`](../architecture/I15-09-source-admission-and-executable-supply-chain.md#i159-source-admission-and-executable-supply-chain) | [`docs/architecture/I15-09-source-admission-and-executable-supply-chain.md#i159-source-admission-and-executable-supply-chain`](../architecture/I15-09-source-admission-and-executable-supply-chain.md#i159-source-admission-and-executable-supply-chain) | [`crates/security/eliot-erasure`](../../crates/security/eliot-erasure/Cargo.toml)<br>[`crates/security/eliot-influence`](../../crates/security/eliot-influence/Cargo.toml)<br>[`crates/security/eliot-source-assurance`](../../crates/security/eliot-source-assurance/Cargo.toml) | `crates/security/eliot-erasure:src/lib.rs`<br>`crates/security/eliot-erasure:tests/purge_protocol.rs`<br>`crates/security/eliot-erasure:tests/tombstone_closure.rs`<br>`crates/security/eliot-influence:src/lib.rs`<br>`crates/security/eliot-source-assurance:src/lib.rs`<br>`crates/security/eliot-source-assurance:tests/mcp_assurance_contract.rs` |
+-| [`I17.11`](../architecture/I17-11-delivery-depth-d3-grounded-smart-understanding.md#i1711-delivery-depth-d3--grounded-smart-understanding) | [`docs/architecture/I17-11-delivery-depth-d3-grounded-smart-understanding.md#i1711-delivery-depth-d3--grounded-smart-understanding`](../architecture/I17-11-delivery-depth-d3-grounded-smart-understanding.md#i1711-delivery-depth-d3--grounded-smart-understanding) | [`bins/eliot-dreamer`](../../bins/eliot-dreamer/Cargo.toml)<br>[`crates/smart/eliot-context`](../../crates/smart/eliot-context/Cargo.toml)<br>[`crates/smart/eliot-context-admission`](../../crates/smart/eliot-context-admission/Cargo.toml)<br>[`crates/smart/eliot-context-assembly`](../../crates/smart/eliot-context-assembly/Cargo.toml)<br>[`crates/smart/eliot-context-candidates`](../../crates/smart/eliot-context-candidates/Cargo.toml)<br>[`crates/smart/eliot-context-contracts`](../../crates/smart/eliot-context-contracts/Cargo.toml)<br>[`crates/smart/eliot-context-measurement`](../../crates/smart/eliot-context-measurement/Cargo.toml)<br>[`crates/smart/eliot-cue-activation`](../../crates/smart/eliot-cue-activation/Cargo.toml)<br>[`crates/smart/eliot-cue-binding`](../../crates/smart/eliot-cue-binding/Cargo.toml)<br>[`crates/smart/eliot-cue-contracts`](../../crates/smart/eliot-cue-contracts/Cargo.toml)<br>[`crates/smart/eliot-cue-index`](../../crates/smart/eliot-cue-index/Cargo.toml)<br>[`crates/smart/eliot-cue-normalizer`](../../crates/smart/eliot-cue-normalizer/Cargo.toml)<br>[`crates/smart/eliot-cues`](../../crates/smart/eliot-cues/Cargo.toml)<br>[`crates/smart/eliot-dreamer-accessibility`](../../crates/smart/eliot-dreamer-accessibility/Cargo.toml)<br>[`crates/smart/eliot-dreamer-architecture-brief`](../../crates/smart/eliot-dreamer-architecture-brief/Cargo.toml)<br>[`crates/smart/eliot-dreamer-bundle`](../../crates/smart/eliot-dreamer-bundle/Cargo.toml)<br>[`crates/smart/eliot-dreamer-candidate-validation`](../../crates/smart/eliot-dreamer-candidate-validation/Cargo.toml)<br>[`crates/smart/eliot-dreamer-claim-grounding`](../../crates/smart/eliot-dreamer-claim-grounding/Cargo.toml)<br>[`crates/smart/eliot-dreamer-clarification`](../../crates/smart/eliot-dreamer-clarification/Cargo.toml)<br>[`crates/smart/eliot-dreamer-classification`](../../crates/smart/eliot-dreamer-classification/Cargo.toml)<br>[`crates/smart/eliot-dreamer-concept`](../../crates/smart/eliot-dreamer-concept/Cargo.toml)<br>[`crates/smart/eliot-dreamer-configuration-plan`](../../crates/smart/eliot-dreamer-configuration-plan/Cargo.toml)<br>[`crates/smart/eliot-dreamer-conflict-analysis`](../../crates/smart/eliot-dreamer-conflict-analysis/Cargo.toml)<br>[`crates/smart/eliot-dreamer-contracts`](../../crates/smart/eliot-dreamer-contracts/Cargo.toml)<br>[`crates/smart/eliot-dreamer-core`](../../crates/smart/eliot-dreamer-core/Cargo.toml)<br>[`crates/smart/eliot-dreamer-curation`](../../crates/smart/eliot-dreamer-curation/Cargo.toml)<br>[`crates/smart/eliot-dreamer-cycle`](../../crates/smart/eliot-dreamer-cycle/Cargo.toml)<br>[`crates/smart/eliot-dreamer-development-diagnosis`](../../crates/smart/eliot-dreamer-development-diagnosis/Cargo.toml)<br>[`crates/smart/eliot-dreamer-episode`](../../crates/smart/eliot-dreamer-episode/Cargo.toml)<br>[`crates/smart/eliot-dreamer-failure`](../../crates/smart/eliot-dreamer-failure/Cargo.toml)<br>[`crates/smart/eliot-dreamer-implementation-brief`](../../crates/smart/eliot-dreamer-implementation-brief/Cargo.toml)<br>[`crates/smart/eliot-dreamer-maintenance-plan`](../../crates/smart/eliot-dreamer-maintenance-plan/Cargo.toml)<br>[`crates/smart/eliot-dreamer-memory-repair`](../../crates/smart/eliot-dreamer-memory-repair/Cargo.toml)<br>[`crates/smart/eliot-dreamer-orchestration-plan`](../../crates/smart/eliot-dreamer-orchestration-plan/Cargo.toml)<br>[`crates/smart/eliot-dreamer-orientation`](../../crates/smart/eliot-dreamer-orientation/Cargo.toml)<br>[`crates/smart/eliot-dreamer-probe-plan`](../../crates/smart/eliot-dreamer-probe-plan/Cargo.toml)<br>[`crates/smart/eliot-dreamer-procedure`](../../crates/smart/eliot-dreamer-procedure/Cargo.toml)<br>[`crates/smart/eliot-dreamer-reconsolidation`](../../crates/smart/eliot-dreamer-reconsolidation/Cargo.toml)<br>[`crates/smart/eliot-dreamer-relation`](../../crates/smart/eliot-dreamer-relation/Cargo.toml)<br>[`crates/smart/eliot-dreamer-research-synthesis`](../../crates/smart/eliot-dreamer-research-synthesis/Cargo.toml)<br>[`crates/smart/eliot-dreamer-rival-model`](../../crates/smart/eliot-dreamer-rival-model/Cargo.toml)<br>[`crates/smart/eliot-dreamer-structure-repair`](../../crates/smart/eliot-dreamer-structure-repair/Cargo.toml)<br>[`crates/smart/eliot-epistemic`](../../crates/smart/eliot-epistemic/Cargo.toml)<br>[`crates/smart/eliot-epistemic-contracts`](../../crates/smart/eliot-epistemic-contracts/Cargo.toml)<br>[`crates/smart/eliot-learning-contracts`](../../crates/smart/eliot-learning-contracts/Cargo.toml)<br>[`crates/smart/eliot-learning-delta`](../../crates/smart/eliot-learning-delta/Cargo.toml)<br>[`crates/smart/eliot-learning-overlay`](../../crates/smart/eliot-learning-overlay/Cargo.toml)<br>[`crates/smart/eliot-learning-state-view`](../../crates/smart/eliot-learning-state-view/Cargo.toml)<br>[`crates/smart/eliot-memory-curation`](../../crates/smart/eliot-memory-curation/Cargo.toml)<br>[`crates/smart/eliot-memory-curation-contracts`](../../crates/smart/eliot-memory-curation-contracts/Cargo.toml)<br>[`crates/smart/eliot-memory-curation-screen`](../../crates/smart/eliot-memory-curation-screen/Cargo.toml)<br>[`crates/smart/eliot-reactive-context-plan`](../../crates/smart/eliot-reactive-context-plan/Cargo.toml) | `bins/eliot-dreamer:src/main.rs`<br>`bins/eliot-dreamer:src/lib.rs`<br>`crates/smart/eliot-context:src/lib.rs`<br>`crates/smart/eliot-context:tests/admission_integrity.rs`<br>`crates/smart/eliot-context-admission:src/lib.rs`<br>`crates/smart/eliot-context-admission:tests/admission.rs`<br>`crates/smart/eliot-context-assembly:src/lib.rs`<br>`crates/smart/eliot-context-assembly:tests/assembly.rs`<br>`crates/smart/eliot-context-candidates:src/lib.rs`<br>`crates/smart/eliot-context-candidates:tests/candidates.rs`<br>`crates/smart/eliot-context-candidates:tests/helpers.rs`<br>`crates/smart/eliot-context-candidates:tests/memory_applicability_fixtures.rs`<br>`crates/smart/eliot-context-candidates:tests/projection_fence_fixtures.rs`<br>`crates/smart/eliot-context-contracts:src/lib.rs`<br>`crates/smart/eliot-context-contracts:tests/admission_input.rs`<br>`crates/smart/eliot-context-contracts:tests/context_contracts.rs`<br>`crates/smart/eliot-context-contracts:tests/reactive_contracts.rs`<br>`crates/smart/eliot-context-measurement:src/lib.rs`<br>`crates/smart/eliot-context-measurement:tests/measurement.rs`<br>`crates/smart/eliot-cue-activation:src/lib.rs`<br>`crates/smart/eliot-cue-activation:tests/activation.rs`<br>`crates/smart/eliot-cue-binding:src/lib.rs`<br>`crates/smart/eliot-cue-binding:tests/binding.rs`<br>`crates/smart/eliot-cue-binding:tests/work_unit_622.rs`<br>`crates/smart/eliot-cue-contracts:src/lib.rs`<br>`crates/smart/eliot-cue-contracts:tests/acceptance_804.rs`<br>`crates/smart/eliot-cue-contracts:tests/contract_shape.rs`<br>`crates/smart/eliot-cue-contracts:tests/index_projection.rs`<br>`crates/smart/eliot-cue-contracts:tests/version.rs`<br>`crates/smart/eliot-cue-index:src/lib.rs`<br>`crates/smart/eliot-cue-index:tests/build.rs`<br>`crates/smart/eliot-cue-normalizer:src/lib.rs`<br>`crates/smart/eliot-cue-normalizer:tests/normalization.rs`<br>`crates/smart/eliot-cues:src/lib.rs`<br>`crates/smart/eliot-cues:tests/integrity.rs`<br>`crates/smart/eliot-dreamer-accessibility:src/lib.rs`<br>`crates/smart/eliot-dreamer-architecture-brief:src/lib.rs`<br>`crates/smart/eliot-dreamer-architecture-brief:tests/architecture_brief.rs`<br>`crates/smart/eliot-dreamer-bundle:src/lib.rs`<br>`crates/smart/eliot-dreamer-bundle:tests/bundle_proof.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:src/lib.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/handoff.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/validation.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/wu595_a.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/wu595_b.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/wu595_c.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/wu595_d.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/wu595_e.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/wu595_f.rs`<br>`crates/smart/eliot-dreamer-claim-grounding:src/lib.rs`<br>`crates/smart/eliot-dreamer-claim-grounding:tests/grounding.rs`<br>`crates/smart/eliot-dreamer-claim-grounding:tests/support.rs`<br>`crates/smart/eliot-dreamer-clarification:src/lib.rs`<br>`crates/smart/eliot-dreamer-classification:src/lib.rs`<br>`crates/smart/eliot-dreamer-classification:tests/classification.rs`<br>`crates/smart/eliot-dreamer-concept:src/lib.rs`<br>`crates/smart/eliot-dreamer-concept:tests/concept.rs`<br>`crates/smart/eliot-dreamer-configuration-plan:src/lib.rs`<br>`crates/smart/eliot-dreamer-conflict-analysis:src/lib.rs`<br>`crates/smart/eliot-dreamer-contracts:src/lib.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/assembly.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/classification_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/concept_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/consumer_and_source_proof.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/curation_invocation.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/failure_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/grounding_handoff.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/inquiry_affordance_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/model_route_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/probe_input_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/rejection_vocab.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/relation_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/rival_declaration_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/rival_projection_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/validated_draft.rs`<br>`crates/smart/eliot-dreamer-core:src/lib.rs`<br>`crates/smart/eliot-dreamer-curation:src/lib.rs`<br>`crates/smart/eliot-dreamer-cycle:src/lib.rs`<br>`crates/smart/eliot-dreamer-cycle:tests/cycle.rs`<br>`crates/smart/eliot-dreamer-development-diagnosis:src/lib.rs`<br>`crates/smart/eliot-dreamer-episode:src/lib.rs`<br>`crates/smart/eliot-dreamer-episode:tests/episode_candidate.rs`<br>`crates/smart/eliot-dreamer-failure:src/lib.rs`<br>`crates/smart/eliot-dreamer-failure:tests/failure.rs`<br>`crates/smart/eliot-dreamer-implementation-brief:src/lib.rs`<br>`crates/smart/eliot-dreamer-implementation-brief:tests/implementation_brief.rs`<br>`crates/smart/eliot-dreamer-maintenance-plan:src/lib.rs`<br>`crates/smart/eliot-dreamer-memory-repair:src/lib.rs`<br>`crates/smart/eliot-dreamer-orchestration-plan:src/lib.rs`<br>`crates/smart/eliot-dreamer-orientation:src/lib.rs`<br>`crates/smart/eliot-dreamer-orientation:tests/orientation.rs`<br>`crates/smart/eliot-dreamer-probe-plan:src/lib.rs`<br>`crates/smart/eliot-dreamer-probe-plan:tests/probe_plan.rs`<br>`crates/smart/eliot-dreamer-procedure:src/lib.rs`<br>`crates/smart/eliot-dreamer-reconsolidation:src/lib.rs`<br>`crates/smart/eliot-dreamer-relation:src/lib.rs`<br>`crates/smart/eliot-dreamer-relation:tests/relation.rs`<br>`crates/smart/eliot-dreamer-research-synthesis:src/lib.rs`<br>`crates/smart/eliot-dreamer-research-synthesis:tests/proof.rs`<br>`crates/smart/eliot-dreamer-rival-model:src/lib.rs`<br>`crates/smart/eliot-dreamer-rival-model:tests/rival_proof.rs`<br>`crates/smart/eliot-dreamer-structure-repair:src/lib.rs`<br>`crates/smart/eliot-epistemic:src/lib.rs`<br>`crates/smart/eliot-epistemic-contracts:src/lib.rs`<br>`crates/smart/eliot-epistemic-contracts:tests/consumer_fixtures.rs`<br>`crates/smart/eliot-learning-contracts:src/lib.rs`<br>`crates/smart/eliot-learning-contracts:tests/contracts.rs`<br>`crates/smart/eliot-learning-contracts:tests/self_learning_contracts.rs`<br>`crates/smart/eliot-learning-contracts:tests/work_unit_590.rs`<br>`crates/smart/eliot-learning-delta:src/lib.rs`<br>`crates/smart/eliot-learning-delta:tests/delta.rs`<br>`crates/smart/eliot-learning-overlay:src/lib.rs`<br>`crates/smart/eliot-learning-overlay:tests/overlay.rs`<br>`crates/smart/eliot-learning-state-view:src/lib.rs`<br>`crates/smart/eliot-learning-state-view:tests/state_view.rs`<br>`crates/smart/eliot-memory-curation:src/lib.rs`<br>`crates/smart/eliot-memory-curation-contracts:src/lib.rs`<br>`crates/smart/eliot-memory-curation-contracts:tests/contracts.rs`<br>`crates/smart/eliot-memory-curation-contracts:tests/work_unit_586.rs`<br>`crates/smart/eliot-memory-curation-screen:src/lib.rs`<br>`crates/smart/eliot-memory-curation-screen:tests/screen.rs`<br>`crates/smart/eliot-reactive-context-plan:src/lib.rs`<br>`crates/smart/eliot-reactive-context-plan:tests/reactive_delivery_plan.rs`<br>`crates/smart/eliot-reactive-context-plan:tests/work_unit_612.rs` |
++| [`I17.11`](../architecture/I17-11-delivery-depth-d3-grounded-smart-understanding.md#i1711-delivery-depth-d3--grounded-smart-understanding) | [`docs/architecture/I17-11-delivery-depth-d3-grounded-smart-understanding.md#i1711-delivery-depth-d3--grounded-smart-understanding`](../architecture/I17-11-delivery-depth-d3-grounded-smart-understanding.md#i1711-delivery-depth-d3--grounded-smart-understanding) | [`bins/eliot-dreamer`](../../bins/eliot-dreamer/Cargo.toml)<br>[`crates/smart/eliot-context`](../../crates/smart/eliot-context/Cargo.toml)<br>[`crates/smart/eliot-context-admission`](../../crates/smart/eliot-context-admission/Cargo.toml)<br>[`crates/smart/eliot-context-assembly`](../../crates/smart/eliot-context-assembly/Cargo.toml)<br>[`crates/smart/eliot-context-candidates`](../../crates/smart/eliot-context-candidates/Cargo.toml)<br>[`crates/smart/eliot-context-contracts`](../../crates/smart/eliot-context-contracts/Cargo.toml)<br>[`crates/smart/eliot-context-measurement`](../../crates/smart/eliot-context-measurement/Cargo.toml)<br>[`crates/smart/eliot-cue-activation`](../../crates/smart/eliot-cue-activation/Cargo.toml)<br>[`crates/smart/eliot-cue-binding`](../../crates/smart/eliot-cue-binding/Cargo.toml)<br>[`crates/smart/eliot-cue-contracts`](../../crates/smart/eliot-cue-contracts/Cargo.toml)<br>[`crates/smart/eliot-cue-index`](../../crates/smart/eliot-cue-index/Cargo.toml)<br>[`crates/smart/eliot-cue-normalizer`](../../crates/smart/eliot-cue-normalizer/Cargo.toml)<br>[`crates/smart/eliot-cues`](../../crates/smart/eliot-cues/Cargo.toml)<br>[`crates/smart/eliot-dreamer-accessibility`](../../crates/smart/eliot-dreamer-accessibility/Cargo.toml)<br>[`crates/smart/eliot-dreamer-architecture-brief`](../../crates/smart/eliot-dreamer-architecture-brief/Cargo.toml)<br>[`crates/smart/eliot-dreamer-bundle`](../../crates/smart/eliot-dreamer-bundle/Cargo.toml)<br>[`crates/smart/eliot-dreamer-candidate-validation`](../../crates/smart/eliot-dreamer-candidate-validation/Cargo.toml)<br>[`crates/smart/eliot-dreamer-claim-grounding`](../../crates/smart/eliot-dreamer-claim-grounding/Cargo.toml)<br>[`crates/smart/eliot-dreamer-clarification`](../../crates/smart/eliot-dreamer-clarification/Cargo.toml)<br>[`crates/smart/eliot-dreamer-classification`](../../crates/smart/eliot-dreamer-classification/Cargo.toml)<br>[`crates/smart/eliot-dreamer-concept`](../../crates/smart/eliot-dreamer-concept/Cargo.toml)<br>[`crates/smart/eliot-dreamer-configuration-plan`](../../crates/smart/eliot-dreamer-configuration-plan/Cargo.toml)<br>[`crates/smart/eliot-dreamer-conflict-analysis`](../../crates/smart/eliot-dreamer-conflict-analysis/Cargo.toml)<br>[`crates/smart/eliot-dreamer-contracts`](../../crates/smart/eliot-dreamer-contracts/Cargo.toml)<br>[`crates/smart/eliot-dreamer-core`](../../crates/smart/eliot-dreamer-core/Cargo.toml)<br>[`crates/smart/eliot-dreamer-curation`](../../crates/smart/eliot-dreamer-curation/Cargo.toml)<br>[`crates/smart/eliot-dreamer-cycle`](../../crates/smart/eliot-dreamer-cycle/Cargo.toml)<br>[`crates/smart/eliot-dreamer-development-diagnosis`](../../crates/smart/eliot-dreamer-development-diagnosis/Cargo.toml)<br>[`crates/smart/eliot-dreamer-episode`](../../crates/smart/eliot-dreamer-episode/Cargo.toml)<br>[`crates/smart/eliot-dreamer-failure`](../../crates/smart/eliot-dreamer-failure/Cargo.toml)<br>[`crates/smart/eliot-dreamer-implementation-brief`](../../crates/smart/eliot-dreamer-implementation-brief/Cargo.toml)<br>[`crates/smart/eliot-dreamer-maintenance-plan`](../../crates/smart/eliot-dreamer-maintenance-plan/Cargo.toml)<br>[`crates/smart/eliot-dreamer-memory-repair`](../../crates/smart/eliot-dreamer-memory-repair/Cargo.toml)<br>[`crates/smart/eliot-dreamer-orchestration-plan`](../../crates/smart/eliot-dreamer-orchestration-plan/Cargo.toml)<br>[`crates/smart/eliot-dreamer-orientation`](../../crates/smart/eliot-dreamer-orientation/Cargo.toml)<br>[`crates/smart/eliot-dreamer-probe-plan`](../../crates/smart/eliot-dreamer-probe-plan/Cargo.toml)<br>[`crates/smart/eliot-dreamer-procedure`](../../crates/smart/eliot-dreamer-procedure/Cargo.toml)<br>[`crates/smart/eliot-dreamer-reconsolidation`](../../crates/smart/eliot-dreamer-reconsolidation/Cargo.toml)<br>[`crates/smart/eliot-dreamer-relation`](../../crates/smart/eliot-dreamer-relation/Cargo.toml)<br>[`crates/smart/eliot-dreamer-research-synthesis`](../../crates/smart/eliot-dreamer-research-synthesis/Cargo.toml)<br>[`crates/smart/eliot-dreamer-rival-model`](../../crates/smart/eliot-dreamer-rival-model/Cargo.toml)<br>[`crates/smart/eliot-dreamer-structure-repair`](../../crates/smart/eliot-dreamer-structure-repair/Cargo.toml)<br>[`crates/smart/eliot-epistemic`](../../crates/smart/eliot-epistemic/Cargo.toml)<br>[`crates/smart/eliot-epistemic-contracts`](../../crates/smart/eliot-epistemic-contracts/Cargo.toml)<br>[`crates/smart/eliot-learning-contracts`](../../crates/smart/eliot-learning-contracts/Cargo.toml)<br>[`crates/smart/eliot-learning-delta`](../../crates/smart/eliot-learning-delta/Cargo.toml)<br>[`crates/smart/eliot-learning-overlay`](../../crates/smart/eliot-learning-overlay/Cargo.toml)<br>[`crates/smart/eliot-learning-state-view`](../../crates/smart/eliot-learning-state-view/Cargo.toml)<br>[`crates/smart/eliot-memory-curation`](../../crates/smart/eliot-memory-curation/Cargo.toml)<br>[`crates/smart/eliot-memory-curation-contracts`](../../crates/smart/eliot-memory-curation-contracts/Cargo.toml)<br>[`crates/smart/eliot-memory-curation-screen`](../../crates/smart/eliot-memory-curation-screen/Cargo.toml)<br>[`crates/smart/eliot-reactive-context-plan`](../../crates/smart/eliot-reactive-context-plan/Cargo.toml) | `bins/eliot-dreamer:src/main.rs`<br>`bins/eliot-dreamer:src/lib.rs`<br>`crates/smart/eliot-context:src/lib.rs`<br>`crates/smart/eliot-context:tests/admission_integrity.rs`<br>`crates/smart/eliot-context-admission:src/lib.rs`<br>`crates/smart/eliot-context-admission:tests/admission.rs`<br>`crates/smart/eliot-context-assembly:src/lib.rs`<br>`crates/smart/eliot-context-assembly:tests/assembly.rs`<br>`crates/smart/eliot-context-candidates:src/lib.rs`<br>`crates/smart/eliot-context-candidates:tests/candidates.rs`<br>`crates/smart/eliot-context-candidates:tests/helpers.rs`<br>`crates/smart/eliot-context-candidates:tests/memory_applicability_fixtures.rs`<br>`crates/smart/eliot-context-candidates:tests/projection_fence_fixtures.rs`<br>`crates/smart/eliot-context-contracts:src/lib.rs`<br>`crates/smart/eliot-context-contracts:tests/admission_input.rs`<br>`crates/smart/eliot-context-contracts:tests/context_contracts.rs`<br>`crates/smart/eliot-context-contracts:tests/reactive_contracts.rs`<br>`crates/smart/eliot-context-contracts:tests/work_unit_584.rs`<br>`crates/smart/eliot-context-measurement:src/lib.rs`<br>`crates/smart/eliot-context-measurement:tests/measurement.rs`<br>`crates/smart/eliot-cue-activation:src/lib.rs`<br>`crates/smart/eliot-cue-activation:tests/activation.rs`<br>`crates/smart/eliot-cue-binding:src/lib.rs`<br>`crates/smart/eliot-cue-binding:tests/binding.rs`<br>`crates/smart/eliot-cue-binding:tests/work_unit_622.rs`<br>`crates/smart/eliot-cue-contracts:src/lib.rs`<br>`crates/smart/eliot-cue-contracts:tests/acceptance_804.rs`<br>`crates/smart/eliot-cue-contracts:tests/contract_shape.rs`<br>`crates/smart/eliot-cue-contracts:tests/index_projection.rs`<br>`crates/smart/eliot-cue-contracts:tests/version.rs`<br>`crates/smart/eliot-cue-index:src/lib.rs`<br>`crates/smart/eliot-cue-index:tests/build.rs`<br>`crates/smart/eliot-cue-normalizer:src/lib.rs`<br>`crates/smart/eliot-cue-normalizer:tests/normalization.rs`<br>`crates/smart/eliot-cues:src/lib.rs`<br>`crates/smart/eliot-cues:tests/integrity.rs`<br>`crates/smart/eliot-dreamer-accessibility:src/lib.rs`<br>`crates/smart/eliot-dreamer-architecture-brief:src/lib.rs`<br>`crates/smart/eliot-dreamer-architecture-brief:tests/architecture_brief.rs`<br>`crates/smart/eliot-dreamer-bundle:src/lib.rs`<br>`crates/smart/eliot-dreamer-bundle:tests/bundle_proof.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:src/lib.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/handoff.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/validation.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/wu595_a.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/wu595_b.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/wu595_c.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/wu595_d.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/wu595_e.rs`<br>`crates/smart/eliot-dreamer-candidate-validation:tests/wu595_f.rs`<br>`crates/smart/eliot-dreamer-claim-grounding:src/lib.rs`<br>`crates/smart/eliot-dreamer-claim-grounding:tests/grounding.rs`<br>`crates/smart/eliot-dreamer-claim-grounding:tests/support.rs`<br>`crates/smart/eliot-dreamer-clarification:src/lib.rs`<br>`crates/smart/eliot-dreamer-classification:src/lib.rs`<br>`crates/smart/eliot-dreamer-classification:tests/classification.rs`<br>`crates/smart/eliot-dreamer-concept:src/lib.rs`<br>`crates/smart/eliot-dreamer-concept:tests/concept.rs`<br>`crates/smart/eliot-dreamer-configuration-plan:src/lib.rs`<br>`crates/smart/eliot-dreamer-conflict-analysis:src/lib.rs`<br>`crates/smart/eliot-dreamer-contracts:src/lib.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/assembly.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/classification_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/concept_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/consumer_and_source_proof.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/curation_invocation.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/failure_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/grounding_handoff.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/inquiry_affordance_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/model_route_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/probe_input_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/rejection_vocab.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/relation_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/rival_declaration_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/rival_projection_contracts.rs`<br>`crates/smart/eliot-dreamer-contracts:tests/validated_draft.rs`<br>`crates/smart/eliot-dreamer-core:src/lib.rs`<br>`crates/smart/eliot-dreamer-curation:src/lib.rs`<br>`crates/smart/eliot-dreamer-cycle:src/lib.rs`<br>`crates/smart/eliot-dreamer-cycle:tests/cycle.rs`<br>`crates/smart/eliot-dreamer-development-diagnosis:src/lib.rs`<br>`crates/smart/eliot-dreamer-episode:src/lib.rs`<br>`crates/smart/eliot-dreamer-episode:tests/episode_candidate.rs`<br>`crates/smart/eliot-dreamer-failure:src/lib.rs`<br>`crates/smart/eliot-dreamer-failure:tests/failure.rs`<br>`crates/smart/eliot-dreamer-implementation-brief:src/lib.rs`<br>`crates/smart/eliot-dreamer-implementation-brief:tests/implementation_brief.rs`<br>`crates/smart/eliot-dreamer-maintenance-plan:src/lib.rs`<br>`crates/smart/eliot-dreamer-memory-repair:src/lib.rs`<br>`crates/smart/eliot-dreamer-orchestration-plan:src/lib.rs`<br>`crates/smart/eliot-dreamer-orientation:src/lib.rs`<br>`crates/smart/eliot-dreamer-orientation:tests/orientation.rs`<br>`crates/smart/eliot-dreamer-probe-plan:src/lib.rs`<br>`crates/smart/eliot-dreamer-probe-plan:tests/probe_plan.rs`<br>`crates/smart/eliot-dreamer-probe-plan:tests/work_unit_610.rs`<br>`crates/smart/eliot-dreamer-procedure:src/lib.rs`<br>`crates/smart/eliot-dreamer-reconsolidation:src/lib.rs`<br>`crates/smart/eliot-dreamer-relation:src/lib.rs`<br>`crates/smart/eliot-dreamer-relation:tests/relation.rs`<br>`crates/smart/eliot-dreamer-research-synthesis:src/lib.rs`<br>`crates/smart/eliot-dreamer-research-synthesis:tests/proof.rs`<br>`crates/smart/eliot-dreamer-rival-model:src/lib.rs`<br>`crates/smart/eliot-dreamer-rival-model:tests/rival_proof.rs`<br>`crates/smart/eliot-dreamer-structure-repair:src/lib.rs`<br>`crates/smart/eliot-epistemic:src/lib.rs`<br>`crates/smart/eliot-epistemic-contracts:src/lib.rs`<br>`crates/smart/eliot-epistemic-contracts:tests/consumer_fixtures.rs`<br>`crates/smart/eliot-learning-contracts:src/lib.rs`<br>`crates/smart/eliot-learning-contracts:tests/contracts.rs`<br>`crates/smart/eliot-learning-contracts:tests/self_learning_contracts.rs`<br>`crates/smart/eliot-learning-contracts:tests/work_unit_590.rs`<br>`crates/smart/eliot-learning-delta:src/lib.rs`<br>`crates/smart/eliot-learning-delta:tests/delta.rs`<br>`crates/smart/eliot-learning-overlay:src/lib.rs`<br>`crates/smart/eliot-learning-overlay:tests/overlay.rs`<br>`crates/smart/eliot-learning-state-view:src/lib.rs`<br>`crates/smart/eliot-learning-state-view:tests/state_view.rs`<br>`crates/smart/eliot-memory-curation:src/lib.rs`<br>`crates/smart/eliot-memory-curation-contracts:src/lib.rs`<br>`crates/smart/eliot-memory-curation-contracts:tests/contracts.rs`<br>`crates/smart/eliot-memory-curation-contracts:tests/work_unit_586.rs`<br>`crates/smart/eliot-memory-curation-screen:src/lib.rs`<br>`crates/smart/eliot-memory-curation-screen:tests/screen.rs`<br>`crates/smart/eliot-reactive-context-plan:src/lib.rs`<br>`crates/smart/eliot-reactive-context-plan:tests/reactive_delivery_plan.rs`<br>`crates/smart/eliot-reactive-context-plan:tests/work_unit_612.rs` |
+ | [`I18.3`](../architecture/I18-03-impact-graph-and-selection.md#i183-impact-graph-and-selection) | [`docs/architecture/I18-03-impact-graph-and-selection.md#i183-impact-graph-and-selection`](../architecture/I18-03-impact-graph-and-selection.md#i183-impact-graph-and-selection) | [`workspace/tools/eliot-campaign-executor`](../../workspace/tools/eliot-campaign-executor/Cargo.toml)<br>[`workspace/tools/eliot-live-canary`](../../workspace/tools/eliot-live-canary/Cargo.toml)<br>[`workspace/tools/eliot-runtime-compiler`](../../workspace/tools/eliot-runtime-compiler/Cargo.toml) | `workspace/tools/eliot-campaign-executor:src/main.rs`<br>`workspace/tools/eliot-campaign-executor:src/lib.rs`<br>`workspace/tools/eliot-campaign-executor:tests/d02_control_and_leases.rs`<br>`workspace/tools/eliot-campaign-executor:tests/d02_coordination.rs`<br>`workspace/tools/eliot-campaign-executor:tests/d02_recovery_and_ledger.rs`<br>`workspace/tools/eliot-campaign-executor:tests/d02_staffing_and_opencode.rs`<br>`workspace/tools/eliot-live-canary:src/main.rs`<br>`workspace/tools/eliot-live-canary:src/lib.rs`<br>`workspace/tools/eliot-runtime-compiler:src/main.rs`<br>`workspace/tools/eliot-runtime-compiler:src/lib.rs` |
+ | [`I18.18`](../architecture/I18-18-code-intelligence-admission-suite.md#i1818-code-intelligence-admission-suite) | [`docs/architecture/I18-18-code-intelligence-admission-suite.md#i1818-code-intelligence-admission-suite`](../architecture/I18-18-code-intelligence-admission-suite.md#i1818-code-intelligence-admission-suite) | [`bins/eliot-testd`](../../bins/eliot-testd/Cargo.toml)<br>[`crates/instrument/eliot-artifact`](../../crates/instrument/eliot-artifact/Cargo.toml)<br>[`crates/instrument/eliot-build-test-graph`](../../crates/instrument/eliot-build-test-graph/Cargo.toml)<br>[`crates/instrument/eliot-code-cortex`](../../crates/instrument/eliot-code-cortex/Cargo.toml)<br>[`crates/instrument/eliot-code-graph`](../../crates/instrument/eliot-code-graph/Cargo.toml)<br>[`crates/instrument/eliot-diagnostic`](../../crates/instrument/eliot-diagnostic/Cargo.toml)<br>[`crates/instrument/eliot-empirical-profile`](../../crates/instrument/eliot-empirical-profile/Cargo.toml)<br>[`crates/instrument/eliot-graph-api`](../../crates/instrument/eliot-graph-api/Cargo.toml)<br>[`crates/instrument/eliot-instrument-api`](../../crates/instrument/eliot-instrument-api/Cargo.toml)<br>[`crates/instrument/eliot-instrument-cargo`](../../crates/instrument/eliot-instrument-cargo/Cargo.toml)<br>[`crates/instrument/eliot-instrument-dotnet`](../../crates/instrument/eliot-instrument-dotnet/Cargo.toml)<br>[`crates/instrument/eliot-instrument-nextest`](../../crates/instrument/eliot-instrument-nextest/Cargo.toml)<br>[`crates/instrument/eliot-instrument-runner`](../../crates/instrument/eliot-instrument-runner/Cargo.toml)<br>[`crates/instrument/eliot-instrument-rustc`](../../crates/instrument/eliot-instrument-rustc/Cargo.toml)<br>[`crates/instrument/eliot-instrument-rustfmt`](../../crates/instrument/eliot-instrument-rustfmt/Cargo.toml)<br>[`crates/instrument/eliot-instrument-scip`](../../crates/instrument/eliot-instrument-scip/Cargo.toml)<br>[`crates/instrument/eliot-observability`](../../crates/instrument/eliot-observability/Cargo.toml)<br>[`crates/instrument/eliot-process-executor`](../../crates/instrument/eliot-process-executor/Cargo.toml)<br>[`crates/instrument/eliot-product-evaluation`](../../crates/instrument/eliot-product-evaluation/Cargo.toml)<br>[`crates/instrument/eliot-r13-harness`](../../crates/instrument/eliot-r13-harness/Cargo.toml)<br>[`crates/instrument/eliot-reports`](../../crates/instrument/eliot-reports/Cargo.toml)<br>[`crates/instrument/eliot-test-selection`](../../crates/instrument/eliot-test-selection/Cargo.toml)<br>[`crates/instrument/eliot-testd-core`](../../crates/instrument/eliot-testd-core/Cargo.toml)<br>[`crates/instrument/eliot-verifier`](../../crates/instrument/eliot-verifier/Cargo.toml) | `bins/eliot-testd:src/main.rs`<br>`bins/eliot-testd:src/lib.rs`<br>`crates/instrument/eliot-artifact:src/lib.rs`<br>`crates/instrument/eliot-build-test-graph:src/lib.rs`<br>`crates/instrument/eliot-code-cortex:src/lib.rs`<br>`crates/instrument/eliot-code-graph:src/lib.rs`<br>`crates/instrument/eliot-diagnostic:src/lib.rs`<br>`crates/instrument/eliot-empirical-profile:src/lib.rs`<br>`crates/instrument/eliot-graph-api:src/lib.rs`<br>`crates/instrument/eliot-instrument-api:src/lib.rs`<br>`crates/instrument/eliot-instrument-cargo:src/lib.rs`<br>`crates/instrument/eliot-instrument-dotnet:src/lib.rs`<br>`crates/instrument/eliot-instrument-nextest:src/lib.rs`<br>`crates/instrument/eliot-instrument-runner:src/lib.rs`<br>`crates/instrument/eliot-instrument-rustc:src/lib.rs`<br>`crates/instrument/eliot-instrument-rustfmt:src/lib.rs`<br>`crates/instrument/eliot-instrument-scip:src/lib.rs`<br>`crates/instrument/eliot-observability:src/lib.rs`<br>`crates/instrument/eliot-process-executor:src/lib.rs`<br>`crates/instrument/eliot-product-evaluation:src/lib.rs`<br>`crates/instrument/eliot-r13-harness:src/bin/eliot-r13-two-token-harness.rs`<br>`crates/instrument/eliot-r13-harness:src/lib.rs`<br>`crates/instrument/eliot-reports:src/lib.rs`<br>`crates/instrument/eliot-test-selection:src/lib.rs`<br>`crates/instrument/eliot-testd-core:src/lib.rs`<br>`crates/instrument/eliot-testd-core:tests/durable_sequence_integrity.rs`<br>`crates/instrument/eliot-verifier:src/lib.rs` |
+ | [`I19.14`](../architecture/I19-14-old-object-compatibility-map.md#i1914-old-object-compatibility-map) | [`docs/architecture/I19-14-old-object-compatibility-map.md#i1914-old-object-compatibility-map`](../architecture/I19-14-old-object-compatibility-map.md#i1914-old-object-compatibility-map) | [`crates/eliot-app`](../../crates/eliot-app/Cargo.toml)<br>[`crates/eliot-engine`](../../crates/eliot-engine/Cargo.toml)<br>[`crates/eliot-store`](../../crates/eliot-store/Cargo.toml)<br>[`crates/eliot-types`](../../crates/eliot-types/Cargo.toml)<br>[`crates/eliot-windows-ipc`](../../crates/eliot-windows-ipc/Cargo.toml) | `crates/eliot-app:src/main.rs`<br>`crates/eliot-app:build.rs`<br>`crates/eliot-app:tests/cognitive_contract_tests.rs`<br>`crates/eliot-app:tests/cognitive_field_cli.rs`<br>`crates/eliot-app:tests/dogfood_runtime.rs`<br>`crates/eliot-app:tests/first_working_loop.rs`<br>`crates/eliot-app:tests/mcp_protocol.rs`<br>`crates/eliot-app:tests/multi_agent_access.rs`<br>`crates/eliot-app:tests/plugin_hooks.rs`<br>`crates/eliot-app:tests/ul_behavior_cli.rs`<br>`crates/eliot-app:tests/ul_c3_retrieval.rs`<br>`crates/eliot-app:tests/ul_contract_errors.rs`<br>`crates/eliot-app:tests/ul_control_treatment.rs`<br>`crates/eliot-app:tests/ul_convenience_forms.rs`<br>`crates/eliot-app:tests/ul_cross_agent_contract.rs`<br>`crates/eliot-app:tests/ul_cue_candidate.rs`<br>`crates/eliot-app:tests/ul_e_surface.rs`<br>`crates/eliot-app:tests/ul_mvp_done.rs`<br>`crates/eliot-app:tests/ul_observability_mcp.rs`<br>`crates/eliot-app:tests/ul_push_first_value.rs`<br>`crates/eliot-app:tests/ul_pyramid_delivery.rs`<br>`crates/eliot-engine:src/lib.rs`<br>`crates/eliot-engine:tests/action_lease.rs`<br>`crates/eliot-engine:tests/adapters.rs`<br>`crates/eliot-engine:tests/antigravity_contract.rs`<br>`crates/eliot-engine:tests/antigravity_runtime.rs`<br>`crates/eliot-engine:tests/autonomy_runs.rs`<br>`crates/eliot-engine:tests/codecortex.rs`<br>`crates/eliot-engine:tests/codecortex_integration.rs`<br>`crates/eliot-engine:tests/cognitive_field_grading.rs`<br>`crates/eliot-engine:tests/collective_blackboard.rs`<br>`crates/eliot-engine:tests/context_packets_and_proofs.rs`<br>`crates/eliot-engine:tests/delegation_calibration.rs`<br>`crates/eliot-engine:tests/delegation_policy.rs`<br>`crates/eliot-engine:tests/delegation_utility.rs`<br>`crates/eliot-engine:tests/eval_baselines.rs`<br>`crates/eliot-engine:tests/eval_suites.rs`<br>`crates/eliot-engine:tests/external_agent.rs`<br>`crates/eliot-engine:tests/external_review.rs`<br>`crates/eliot-engine:tests/host_integration.rs`<br>`crates/eliot-engine:tests/integrity_canary.rs`<br>`crates/eliot-engine:tests/m2_integrity_foundation.rs`<br>`crates/eliot-engine:tests/memory_distillation.rs`<br>`crates/eliot-engine:tests/memory_ecology.rs`<br>`crates/eliot-engine:tests/memory_lifecycle.rs`<br>`crates/eliot-engine:tests/meta_experiments.rs`<br>`crates/eliot-engine:tests/metrics_and_slo.rs`<br>`crates/eliot-engine:tests/operations_runbook.rs`<br>`crates/eliot-engine:tests/patch_runner.rs`<br>`crates/eliot-engine:tests/phase0_completion_truth.rs`<br>`crates/eliot-engine:tests/project_understanding.rs`<br>`crates/eliot-engine:tests/provider_budget_integrity.rs`<br>`crates/eliot-engine:tests/provider_timeout_reconciliation.rs`<br>`crates/eliot-engine:tests/replay_and_sleep.rs`<br>`crates/eliot-engine:tests/runtime_services.rs`<br>`crates/eliot-engine:tests/runtime_supervision.rs`<br>`crates/eliot-engine:tests/safety_and_backup.rs`<br>`crates/eliot-engine:tests/semantic_memory.rs`<br>`crates/eliot-engine:tests/skill_curator.rs`<br>`crates/eliot-engine:tests/skill_lifecycle.rs`<br>`crates/eliot-engine:tests/task_execution_class.rs`<br>`crates/eliot-engine:tests/ul_activation.rs`<br>`crates/eliot-engine:tests/ul_admission_graph.rs`<br>`crates/eliot-engine:tests/ul_behavior_mining.rs`<br>`crates/eliot-engine:tests/ul_cue_firing.rs`<br>`crates/eliot-engine:tests/ul_dependency_maintenance.rs`<br>`crates/eliot-engine:tests/ul_exam.rs`<br>`crates/eliot-engine:tests/ul_measurement.rs`<br>`crates/eliot-engine:tests/ul_module_cards.rs`<br>`crates/eliot-engine:tests/ul_observability_writer.rs`<br>`crates/eliot-engine:tests/ul_onboarding.rs`<br>`crates/eliot-engine:tests/ul_prediction.rs`<br>`crates/eliot-engine:tests/ul_pyramid.rs`<br>`crates/eliot-engine:tests/ul_refinement.rs`<br>`crates/eliot-engine:tests/ul_token_policy.rs`<br>`crates/eliot-engine:tests/ul_touched_injection.rs`<br>`crates/eliot-engine:tests/verification_gates.rs`<br>`crates/eliot-engine:tests/windows_service.rs`<br>`crates/eliot-engine:tests/work_lease.rs`<br>`crates/eliot-engine:tests/worktree_lease.rs`<br>`crates/eliot-engine:tests/write_idempotency_and_recovery.rs`<br>`crates/eliot-store:src/lib.rs`<br>`crates/eliot-store:tests/canonical_store.rs`<br>`crates/eliot-store:tests/cognitive_field_scale.rs`<br>`crates/eliot-store:tests/memory_retrieval.rs`<br>`crates/eliot-store:tests/serde_canonical_record_boundary.rs`<br>`crates/eliot-store:tests/ul_cue_store.rs`<br>`crates/eliot-store:tests/ul_dependency_activation.rs`<br>`crates/eliot-store:tests/ul_observability_store.rs`<br>`crates/eliot-store:tests/ul_token_policy.rs`<br>`crates/eliot-types:src/lib.rs`<br>`crates/eliot-types:tests/appendix_p_no_silent_defaults.rs`<br>`crates/eliot-types:tests/cognitive_field_contract.rs`<br>`crates/eliot-types:tests/external_agent.rs`<br>`crates/eliot-types:tests/operation_status.rs`<br>`crates/eliot-types:tests/provider_route_policy.rs`<br>`crates/eliot-types:tests/ul_contract_schema.rs`<br>`crates/eliot-types:tests/ul_cue_normalize.rs`<br>`crates/eliot-types:tests/ul_encoding_guard.rs`<br>`crates/eliot-windows-ipc:src/bin/eliot-credential-suite-guard.rs`<br>`crates/eliot-windows-ipc:src/bin/eliot-process-guardian.rs`<br>`crates/eliot-windows-ipc:src/lib.rs`<br>`crates/eliot-windows-ipc:tests/unsafe_family_boundaries.rs` |
+
+
+[output truncated; full output saved to: C:\Users\kleym\.local\share\opencode\shell\7a17247a088fa8d5e3dde519c5c183a3e4c711c9\sh_0b72a8941001IGlNVw7deI85uX.out]
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit status --short --branch; git diff --stat; git rev-parse HEAD
+## HEAD (no branch)
+ M docs/code-navigation/PACKAGE_DOCS_INDEX.md
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-syncfix.log
+?? stdout.log
+ docs/code-navigation/PACKAGE_DOCS_INDEX.md | 22 +++++++++++-----------
+ 1 file changed, 11 insertions(+), 11 deletions(-)
+f0abfe139e944f781344df037268ba2845ae77dc
+> build · muse-spark-1.3-contributor-free

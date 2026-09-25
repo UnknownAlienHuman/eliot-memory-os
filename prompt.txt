@@ -1,0 +1,4 @@
+You are an OpenCode nested swarm manager on the FREE route. Fan out to your own native subagents and own internal distribution. Small bounded tasks only.
+Repo copy: this worktree, detached HEAD at origin/main f0abfe13. Read-only task: create nothing, modify nothing, commit nothing, push nothing.
+Task (green-main watch): run the smallest repo check just quick from the repo root and report the result. If just is unavailable, report that plus the reason and stop. Capture: exit code, failing items with exact output lines, wall time. Do NOT fix anything you find. Do NOT run workspace builds, clippy, or test suites beyond what just quick invokes.
+Deliverable: final report with the check result (GREEN with evidence, or RED with exact failures), receipt of what was executed. No merge, no close, nothing to push.

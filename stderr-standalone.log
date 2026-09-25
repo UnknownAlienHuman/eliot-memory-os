@@ -1,0 +1,918 @@
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit status --short --branch; echo "---"; git rev-parse HEAD; echo "---"; git log --oneline -5
+## work/docs-closure-provenance...origin/work/docs-closure-provenance
+?? prompt-closure.txt
+?? prompt-provenance.txt
+?? prompt-standalone.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-prov.log
+?? stderr-standalone.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-prov.log
+?? stdout-standalone.log
+?? stdout-syncfix.log
+?? stdout.log
+---
+b64fdf990726a34d20dadecf36c4c2d3d7b4a83c
+---
+b64fdf99 docs: restore compatibility facades byte-identical after provenance adoption
+d8eec940 docs: adopt current normative byte streams to legacy paths for closure provenance
+09c2c902 docs: refresh package docs index via code-navigation-sync (just quick navigation gate green) (#2026)
+f0abfe13 fix: update stale architecture doc paths in contracts and assignments (#2024)
+716755b1 [store/sconc] Bounded in-transaction allocation with contention retry (slice #989) (#2023)
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead justfile 
+[0m→ [0mRead stdout-standalone.log 
+[0m→ [0mRead stderr-standalone.log 
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead scripts/verify-standalone-crates.py 
+[0m$ [0mgit log --oneline --all -3 -- crates/smart/eliot-dreamer-curation-wasm crates/smart/eliot-dreamer-cycle-wasm; echo "==="; ls crates/smart/ | Select-String dreamer
+8901ad7b #1980: I9.4 canonizes two objects; admission envelope renamed DreamJobAdmission (#1983)
+86b3cd40 work/644: thin typed Dreamer-cycle WASM adapter with 27-case proof matrix (Implements #644) (#1619)
+19ccc725 work/644: component-encoding import gate + full 27-case parity (Implements #644)
+===
+
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-accessibility
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-architecture-brief
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-bundle
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-candidate-validation
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-claim-grounding
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-clarification
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-classification
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-concept
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-configuration-plan
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-conflict-analysis
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-contracts
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-core
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-curation
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-curation-wasm
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-cycle
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-cycle-wasm
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-development-diagnosis
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-episode
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-failure
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-implementation-brief
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-maintenance-plan
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-memory-repair
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-memory-revision
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-orchestration-plan
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-orientation
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-orientation-wasm
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-probe-plan
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-procedure
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-reconsolidation
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-relation
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-research-synthesis
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-research-wasm
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-rival-model
+C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-structure-repair
+crates\smart\cognitive-contract-challenges.toml:13:needed_by = ["eliot-dreamer-accessibility", "future use 
+attribution/usefulness evaluation"]
+crates\smart\cognitive-contract-challenges.toml:22:needed_by = ["Orientation Product Pulse", "all Dreamer handlers"]
+crates\smart\cognitive-contract-challenges.toml:33:needed_by = ["eliot-dreamer-curation"]
+crates\smart\cognitive-contract-challenges.toml:51:needed_by = ["future Dreamer Research synthesis"]
+crates\smart\cognitive-contract-challenges.toml:53:forbidden_workaround = "Dreamer source acquisition, self-selected 
+denominator or aggregate URL list treated as grounded research"
+crates\smart\cognitive-contract-challenges.toml:60:needed_by = ["future Dreamer ArchitectureBrief", "future Dreamer 
+ImplementationBrief", "conformance handler"]
+crates\smart\cognitive-contract-challenges.toml:62:forbidden_workaround = "Dreamer reading arbitrary repository prose 
+and declaring architecture conformance"
+crates\smart\cognitive-contract-challenges.toml:135:needed_by = ["eliot-dreamer-memory-revision"]
+crates\smart\cognitive-contract-challenges.toml:174:needed_by = ["eliot-memory-quality", 
+"eliot-dreamer-memory-revision", "eliot-cognitive-quality", "eliot-understanding-assessment"]
+crates\smart\cognitive-crate-decisions.toml:27:first_consumer = "Dreamer bundle"
+crates\smart\cognitive-crate-decisions.toml:33:functional_cell = "smart.dreamer.contracts"
+crates\smart\cognitive-crate-decisions.toml:34:crate = "eliot-dreamer-contracts"
+crates\smart\cognitive-crate-decisions.toml:36:causal_property = "provider-neutral Dreamer contract representation 
+with separate job classes"
+crates\smart\cognitive-crate-decisions.toml:38:first_consumer = "all Dreamer handlers"
+crates\smart\cognitive-crate-decisions.toml:44:functional_cell = "smart.dreamer.bundle"
+crates\smart\cognitive-crate-decisions.toml:45:crate = "eliot-dreamer-bundle"
+crates\smart\cognitive-crate-decisions.toml:47:causal_property = "bounded disclosure-safe Dreamer input assembly"
+crates\smart\cognitive-crate-decisions.toml:49:first_consumer = "Dreamer runtime adapter"
+crates\smart\cognitive-crate-decisions.toml:50:depends_on = ["eliot-dreamer-contracts"]
+crates\smart\cognitive-crate-decisions.toml:55:functional_cell = "smart.dreamer.candidate_validation"
+crates\smart\cognitive-crate-decisions.toml:56:crate = "eliot-dreamer-candidate-validation"
+crates\smart\cognitive-crate-decisions.toml:58:causal_property = "common Dreamer candidate validation"
+crates\smart\cognitive-crate-decisions.toml:60:first_consumer = "all specialized Dreamer handlers"
+crates\smart\cognitive-crate-decisions.toml:61:depends_on = ["eliot-dreamer-contracts"]
+crates\smart\cognitive-crate-decisions.toml:66:functional_cell = "smart.dreamer.orientation"
+crates\smart\cognitive-crate-decisions.toml:67:crate = "eliot-dreamer-orientation"
+crates\smart\cognitive-crate-decisions.toml:71:first_consumer = "Main Agent/Human Dreamer surface"
+crates\smart\cognitive-crate-decisions.toml:72:depends_on = ["eliot-epistemic", "eliot-dreamer-contracts", 
+"eliot-dreamer-bundle", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-crate-decisions.toml:77:functional_cell = "smart.dreamer.clarification"
+crates\smart\cognitive-crate-decisions.toml:78:crate = "eliot-dreamer-clarification"
+crates\smart\cognitive-crate-decisions.toml:83:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-crate-decisions.toml:88:functional_cell = "smart.dreamer.architecture_brief"
+crates\smart\cognitive-crate-decisions.toml:89:crate = "eliot-dreamer-architecture-brief"
+crates\smart\cognitive-crate-decisions.toml:93:first_consumer = "Dreamer self-query surface"
+crates\smart\cognitive-crate-decisions.toml:94:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-crate-decisions.toml:99:functional_cell = "smart.dreamer.implementation_brief"
+crates\smart\cognitive-crate-decisions.toml:100:crate = "eliot-dreamer-implementation-brief"
+crates\smart\cognitive-crate-decisions.toml:104:first_consumer = "Dreamer self-query surface"
+crates\smart\cognitive-crate-decisions.toml:105:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-crate-decisions.toml:231:functional_cell = "smart.dreamer.classification"
+crates\smart\cognitive-crate-decisions.toml:232:crate = "eliot-dreamer-classification"
+crates\smart\cognitive-crate-decisions.toml:236:first_consumer = "eliot-dreamer-curation"
+crates\smart\cognitive-crate-decisions.toml:237:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-crate-decisions.toml:242:functional_cell = "smart.dreamer.relation"
+crates\smart\cognitive-crate-decisions.toml:243:crate = "eliot-dreamer-relation"
+crates\smart\cognitive-crate-decisions.toml:247:first_consumer = "eliot-dreamer-curation"
+crates\smart\cognitive-crate-decisions.toml:248:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-crate-decisions.toml:253:functional_cell = "smart.dreamer.episode"
+crates\smart\cognitive-crate-decisions.toml:254:crate = "eliot-dreamer-episode"
+crates\smart\cognitive-crate-decisions.toml:258:first_consumer = "eliot-dreamer-curation"
+crates\smart\cognitive-crate-decisions.toml:259:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-crate-decisions.toml:264:functional_cell = "smart.dreamer.concept"
+crates\smart\cognitive-crate-decisions.toml:265:crate = "eliot-dreamer-concept"
+crates\smart\cognitive-crate-decisions.toml:269:first_consumer = "eliot-dreamer-curation"
+crates\smart\cognitive-crate-decisions.toml:270:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-crate-decisions.toml:275:functional_cell = "smart.dreamer.procedure"
+crates\smart\cognitive-crate-decisions.toml:276:crate = "eliot-dreamer-procedure"
+crates\smart\cognitive-crate-decisions.toml:280:first_consumer = "eliot-dreamer-curation"
+crates\smart\cognitive-crate-decisions.toml:281:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-crate-decisions.toml:286:functional_cell = "smart.dreamer.failure"
+crates\smart\cognitive-crate-decisions.toml:287:crate = "eliot-dreamer-failure"
+crates\smart\cognitive-crate-decisions.toml:291:first_consumer = "eliot-dreamer-curation"
+crates\smart\cognitive-crate-decisions.toml:292:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-crate-decisions.toml:297:functional_cell = "smart.dreamer.structure_repair"
+crates\smart\cognitive-crate-decisions.toml:298:crate = "eliot-dreamer-structure-repair"
+crates\smart\cognitive-crate-decisions.toml:302:first_consumer = "eliot-dreamer-curation"
+crates\smart\cognitive-crate-decisions.toml:303:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-crate-decisions.toml:308:functional_cell = "smart.dreamer.reconsolidation"
+crates\smart\cognitive-crate-decisions.toml:309:crate = "eliot-dreamer-reconsolidation"
+crates\smart\cognitive-crate-decisions.toml:313:first_consumer = "eliot-dreamer-curation"
+crates\smart\cognitive-crate-decisions.toml:314:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-crate-decisions.toml:319:functional_cell = "smart.dreamer.accessibility"
+crates\smart\cognitive-crate-decisions.toml:320:crate = "eliot-dreamer-accessibility"
+crates\smart\cognitive-crate-decisions.toml:324:first_consumer = "eliot-dreamer-curation"
+crates\smart\cognitive-crate-decisions.toml:325:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-crate-decisions.toml:330:functional_cell = "smart.dreamer.memory_repair"
+crates\smart\cognitive-crate-decisions.toml:331:crate = "eliot-dreamer-memory-repair"
+crates\smart\cognitive-crate-decisions.toml:335:first_consumer = "eliot-dreamer-curation"
+crates\smart\cognitive-crate-decisions.toml:336:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-crate-decisions.toml:341:functional_cell = "smart.dreamer.curation"
+crates\smart\cognitive-crate-decisions.toml:342:crate = "eliot-dreamer-curation"
+crates\smart\cognitive-crate-decisions.toml:347:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation", "eliot-memory-curation-screen", "eliot-dreamer-classification", 
+"eliot-dreamer-relation", "eliot-dreamer-episode", "eliot-dreamer-concept", "eliot-dreamer-procedure", 
+"eliot-dreamer-failure", "eliot-dreamer-structure-repair", "eliot-dreamer-reconsolidation", 
+"eliot-dreamer-accessibility", "eliot-dreamer-memory-repair"]
+crates\smart\cognitive-crate-decisions.toml:429:functional_cell = "smart.dreamer.conflict_analysis"
+crates\smart\cognitive-crate-decisions.toml:430:crate = "eliot-dreamer-conflict-analysis"
+crates\smart\cognitive-crate-decisions.toml:435:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-crate-decisions.toml:440:functional_cell = "smart.dreamer.development_diagnosis"
+crates\smart\cognitive-crate-decisions.toml:441:crate = "eliot-dreamer-development-diagnosis"
+crates\smart\cognitive-crate-decisions.toml:445:first_consumer = "Dreamer surface"
+crates\smart\cognitive-crate-decisions.toml:446:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation", "eliot-dreamer-conflict-analysis"]
+crates\smart\cognitive-crate-decisions.toml:451:functional_cell = "smart.dreamer.maintenance_plan"
+crates\smart\cognitive-crate-decisions.toml:452:crate = "eliot-dreamer-maintenance-plan"
+crates\smart\cognitive-crate-decisions.toml:456:first_consumer = "Dreamer surface"
+crates\smart\cognitive-crate-decisions.toml:457:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-crate-decisions.toml:462:functional_cell = "smart.dreamer.configuration_plan"
+crates\smart\cognitive-crate-decisions.toml:463:crate = "eliot-dreamer-configuration-plan"
+crates\smart\cognitive-crate-decisions.toml:467:first_consumer = "Dreamer surface"
+crates\smart\cognitive-crate-decisions.toml:468:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-crate-decisions.toml:473:functional_cell = "smart.dreamer.orchestration_plan"
+crates\smart\cognitive-crate-decisions.toml:474:crate = "eliot-dreamer-orchestration-plan"
+crates\smart\cognitive-crate-decisions.toml:478:first_consumer = "Dreamer surface"
+crates\smart\cognitive-crate-decisions.toml:479:depends_on = ["eliot-dreamer-contracts", 
+"eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-donor-map.toml:41:path = "crates/smart/eliot-dreamer-core"
+crates\smart\cognitive-donor-map.toml:46:targets = ["eliot-dreamer-contracts", "eliot-dreamer-bundle", 
+"eliot-dreamer-claim-grounding", "eliot-dreamer-candidate-validation", "eliot-dreamer-rival-model", 
+"eliot-dreamer-probe-plan", "eliot-dreamer-orientation", "eliot-dreamer-clarification", 
+"eliot-dreamer-architecture-brief", "eliot-dreamer-implementation-brief", "eliot-dreamer-classification", 
+"eliot-dreamer-relation", "eliot-dreamer-episode", "eliot-dreamer-concept", "eliot-dreamer-procedure", 
+"eliot-dreamer-failure", "eliot-dreamer-structure-repair", "eliot-dreamer-reconsolidation", 
+"eliot-dreamer-accessibility", "eliot-dreamer-memory-repair", "eliot-dreamer-curation", 
+"eliot-dreamer-conflict-analysis", "eliot-dreamer-development-diagnosis", "eliot-dreamer-maintenance-plan", 
+"eliot-dreamer-configuration-plan", "eliot-dreamer-orchestration-plan"]
+crates\smart\cognitive-donor-map.toml:60:targets = ["eliot-memory-curation-screen", "eliot-dreamer-structure-repair", 
+"eliot-dreamer-accessibility", "eliot-dreamer-curation"]
+crates\smart\cognitive-edge-map.toml:18:consumer = "eliot-context-candidates, Dreamer handlers"
+crates\smart\cognitive-edge-map.toml:36:consumer = "eliot-dreamer-bundle, Governor decision path"
+crates\smart\cognitive-edge-map.toml:40:producer = "eliot-dreamer-bundle"
+crates\smart\cognitive-edge-map.toml:41:contract = "eliot-dreamer-contracts::DreamInputBundle"
+crates\smart\cognitive-edge-map.toml:42:consumer = "model-route adapter, eliot-dreamer-claim-grounding"
+crates\smart\cognitive-edge-map.toml:46:producer = "eliot-dreamer-claim-grounding"
+crates\smart\cognitive-edge-map.toml:47:contract = "eliot-dreamer-contracts::GroundedDreamDraft"
+crates\smart\cognitive-edge-map.toml:48:consumer = "eliot-dreamer-candidate-validation"
+crates\smart\cognitive-edge-map.toml:52:producer = "eliot-dreamer-candidate-validation"
+crates\smart\cognitive-edge-map.toml:53:contract = "eliot-dreamer-contracts::ValidatedDreamDraft"
+crates\smart\cognitive-edge-map.toml:54:consumer = "all Dreamer semantic handlers"
+crates\smart\cognitive-edge-map.toml:58:producer = "eliot-dreamer-rival-model, eliot-dreamer-probe-plan"
+crates\smart\cognitive-edge-map.toml:59:contract = "eliot-dreamer-contracts::RivalModelSet, ProbePlan"
+crates\smart\cognitive-edge-map.toml:60:consumer = "eliot-dreamer-orientation"
+crates\smart\cognitive-edge-map.toml:66:consumer = "eliot-dreamer-curation"
+crates\smart\cognitive-edge-map.toml:71:contract = "eliot-dreamer-contracts::TypedCurationHandlerResult"
+crates\smart\cognitive-edge-map.toml:72:consumer = "eliot-dreamer-curation"
+crates\smart\cognitive-edge-map.toml:91:from = "Dreamer semantic handler"
+crates\smart\cognitive-edge-map.toml:92:to = "eliot-dreamer-candidate-validation or eliot-dreamer-claim-grounding"
+crates\smart\cognitive-edge-map.toml:96:from = "eliot-dreamer-curation"
+crates\smart\cognitive-wave-01.toml:94:crate = "eliot-dreamer-contracts"
+crates\smart\cognitive-wave-01.toml:95:manifest = "crates/smart/eliot-dreamer-contracts/module.toml"
+crates\smart\cognitive-wave-01.toml:102:crate = "eliot-dreamer-bundle"
+crates\smart\cognitive-wave-01.toml:103:manifest = "crates/smart/eliot-dreamer-bundle/module.toml"
+crates\smart\cognitive-wave-01.toml:104:depends_on = ["eliot-dreamer-contracts"]
+crates\smart\cognitive-wave-01.toml:110:crate = "eliot-dreamer-candidate-validation"
+crates\smart\cognitive-wave-01.toml:111:manifest = "crates/smart/eliot-dreamer-candidate-validation/module.toml"
+crates\smart\cognitive-wave-01.toml:112:depends_on = ["eliot-dreamer-contracts"]
+crates\smart\cognitive-wave-01.toml:118:crate = "eliot-dreamer-orientation"
+crates\smart\cognitive-wave-01.toml:119:manifest = "crates/smart/eliot-dreamer-orientation/module.toml"
+crates\smart\cognitive-wave-01.toml:120:depends_on = ["eliot-epistemic", "eliot-dreamer-contracts", 
+"eliot-dreamer-bundle", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-wave-01.toml:126:crate = "eliot-dreamer-clarification"
+crates\smart\cognitive-wave-01.toml:127:manifest = "crates/smart/eliot-dreamer-clarification/module.toml"
+crates\smart\cognitive-wave-01.toml:128:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-wave-01.toml:134:crate = "eliot-dreamer-architecture-brief"
+crates\smart\cognitive-wave-01.toml:135:manifest = "crates/smart/eliot-dreamer-architecture-brief/module.toml"
+crates\smart\cognitive-wave-01.toml:136:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-wave-01.toml:142:crate = "eliot-dreamer-implementation-brief"
+crates\smart\cognitive-wave-01.toml:143:manifest = "crates/smart/eliot-dreamer-implementation-brief/module.toml"
+crates\smart\cognitive-wave-01.toml:144:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-wave-01.toml:238:crate = "eliot-dreamer-classification"
+crates\smart\cognitive-wave-01.toml:239:manifest = "crates/smart/eliot-dreamer-classification/module.toml"
+crates\smart\cognitive-wave-01.toml:240:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-wave-01.toml:246:crate = "eliot-dreamer-relation"
+crates\smart\cognitive-wave-01.toml:247:manifest = "crates/smart/eliot-dreamer-relation/module.toml"
+crates\smart\cognitive-wave-01.toml:248:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-wave-01.toml:254:crate = "eliot-dreamer-episode"
+crates\smart\cognitive-wave-01.toml:255:manifest = "crates/smart/eliot-dreamer-episode/module.toml"
+crates\smart\cognitive-wave-01.toml:256:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-wave-01.toml:262:crate = "eliot-dreamer-concept"
+crates\smart\cognitive-wave-01.toml:263:manifest = "crates/smart/eliot-dreamer-concept/module.toml"
+crates\smart\cognitive-wave-01.toml:264:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-wave-01.toml:270:crate = "eliot-dreamer-procedure"
+crates\smart\cognitive-wave-01.toml:271:manifest = "crates/smart/eliot-dreamer-procedure/module.toml"
+crates\smart\cognitive-wave-01.toml:272:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-wave-01.toml:278:crate = "eliot-dreamer-failure"
+crates\smart\cognitive-wave-01.toml:279:manifest = "crates/smart/eliot-dreamer-failure/module.toml"
+crates\smart\cognitive-wave-01.toml:280:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-wave-01.toml:286:crate = "eliot-dreamer-structure-repair"
+crates\smart\cognitive-wave-01.toml:287:manifest = "crates/smart/eliot-dreamer-structure-repair/module.toml"
+crates\smart\cognitive-wave-01.toml:288:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-wave-01.toml:294:crate = "eliot-dreamer-reconsolidation"
+crates\smart\cognitive-wave-01.toml:295:manifest = "crates/smart/eliot-dreamer-reconsolidation/module.toml"
+crates\smart\cognitive-wave-01.toml:296:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-wave-01.toml:302:crate = "eliot-dreamer-accessibility"
+crates\smart\cognitive-wave-01.toml:303:manifest = "crates/smart/eliot-dreamer-accessibility/module.toml"
+crates\smart\cognitive-wave-01.toml:304:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-wave-01.toml:310:crate = "eliot-dreamer-memory-repair"
+crates\smart\cognitive-wave-01.toml:311:manifest = "crates/smart/eliot-dreamer-memory-repair/module.toml"
+crates\smart\cognitive-wave-01.toml:312:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-wave-01.toml:318:crate = "eliot-dreamer-curation"
+crates\smart\cognitive-wave-01.toml:319:manifest = "crates/smart/eliot-dreamer-curation/module.toml"
+crates\smart\cognitive-wave-01.toml:320:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation", 
+"eliot-memory-curation-screen", "eliot-dreamer-classification", "eliot-dreamer-relation", "eliot-dreamer-episode", 
+"eliot-dreamer-concept", "eliot-dreamer-procedure", "eliot-dreamer-failure", "eliot-dreamer-structure-repair", 
+"eliot-dreamer-reconsolidation", "eliot-dreamer-accessibility", "eliot-dreamer-memory-repair"]
+crates\smart\cognitive-wave-01.toml:328:capability = "Dreamer Research synthesis and Concilium planning"
+crates\smart\cognitive-wave-02.toml:6:purpose = "Add task-local online learning and advisory Dreamer 
+diagnosis/planning without creating new task, scheduler, evaluator, promotion or authority owners."
+crates\smart\cognitive-wave-02.toml:19:id = "ADVISORY_DREAMER_DIAGNOSIS_AND_PLANNING"
+crates\smart\cognitive-wave-02.toml:93:crate = "eliot-dreamer-conflict-analysis"
+crates\smart\cognitive-wave-02.toml:94:manifest = "crates/smart/eliot-dreamer-conflict-analysis/module.toml"
+crates\smart\cognitive-wave-02.toml:95:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-wave-02.toml:101:crate = "eliot-dreamer-development-diagnosis"
+crates\smart\cognitive-wave-02.toml:102:manifest = "crates/smart/eliot-dreamer-development-diagnosis/module.toml"
+crates\smart\cognitive-wave-02.toml:103:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation", 
+"eliot-dreamer-conflict-analysis"]
+crates\smart\cognitive-wave-02.toml:109:crate = "eliot-dreamer-maintenance-plan"
+crates\smart\cognitive-wave-02.toml:110:manifest = "crates/smart/eliot-dreamer-maintenance-plan/module.toml"
+crates\smart\cognitive-wave-02.toml:111:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-wave-02.toml:117:crate = "eliot-dreamer-configuration-plan"
+crates\smart\cognitive-wave-02.toml:118:manifest = "crates/smart/eliot-dreamer-configuration-plan/module.toml"
+crates\smart\cognitive-wave-02.toml:119:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-wave-02.toml:125:crate = "eliot-dreamer-orchestration-plan"
+crates\smart\cognitive-wave-02.toml:126:manifest = "crates/smart/eliot-dreamer-orchestration-plan/module.toml"
+crates\smart\cognitive-wave-02.toml:127:depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+crates\smart\cognitive-wave-02.toml:135:capability = "Dreamer Research synthesis and Concilium plan"
+crates\smart\cognitive-wave-09.toml:18:disjointness_rule = "This catalogue does not modify bins/, 233 
+memory-curation/dreamer-cycle files, 246 cue normalizer/binding/index/activation files, retired eliot-understanding 
+paths, root Cargo.toml/Cargo.lock, workflows, normative prose, or generated indexes."
+crates\smart\cognitive-wave-09.toml:33:gate = "Skill lifecycle, tool-surface, Dreamer economics, EliotSelfQualityView, 
+bottleneck diagnosis, and advisory intervention are frozen as candidate-only assessments; no aggregate score, no 
+self-promotion."
+crates\smart\cognitive-wave-09.toml:48:scenario = "One Skill revision and one Dreamer job family yield lifecycle, 
+tool-surface, economics, self-quality, bottleneck, and intervention candidates with exact denominators and no 
+aggregate score."
+crates\smart\cognitive-wave-09.toml:87:crate = "eliot-dreamer-memory-revision"
+crates\smart\cognitive-wave-09.toml:88:manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
+crates\smart\cognitive-wave-09.toml:89:functional_cell = "smart.dreamer.memory_revision"
+crates\smart\cognitive-wave-09.toml:116:functional_cell = "smart.dreamer.job_economics"
+crates\smart\cognitive-wave-09.toml:204:crate = "eliot-dreamer-memory-revision"
+crates\smart\cognitive-wave-09.toml:205:functional_cell = "smart.dreamer.memory_revision"
+crates\smart\cognitive-wave-09.toml:207:write_scope = ["crates/smart/eliot-dreamer-memory-revision/**"]
+crates\smart\cognitive-wave-09.toml:247:functional_cell = "smart.dreamer.job_economics"
+crates\smart\cognitive-wave-09.toml:248:objective = "Project Dreamer job/family economics from durable job, 
+route-usage, curation, and outcome receipts; promotion requires declared downstream utility exceeding full cost plus 
+measured harms."
+crates\smart\cognitive-wave-09.toml:251:outputs = ["DreamerJobEconomics candidate"]
+crates\smart\cognitive-wave-09.toml:333:owner_crate = "eliot-dreamer-memory-revision"
+crates\smart\cognitive-wave-09.toml:351:family = "skill lifecycle, tool-surface, Dreamer economics, 
+EliotSelfQualityView, bottleneck, advisory intervention"
+crates\smart\cognitive-wave-09.toml:357:fields = ["skill_ref_and_revision", 
+"skill_task_host_route_and_governance_scope", "skill_applies_when_and_does_not_apply_when", 
+"skill_dependency_and_tool_definition_versions", "skill_delivered_expanded_and_executed_counts", 
+"skill_eligibility_activation_and_activation_latency", "skill_adherence_at_early_mid_and_final_checkpoints", 
+"skill_verified_success_failure_and_uncertain_outcomes", "skill_observed_decision_or_verifier_delta", 
+"skill_false_activation_and_distractor_history", "skill_interactions_ordering_and_mutual_exclusion", 
+"skill_stale_or_quarantine_reason", 
+"skill_proposed_action_keep_or_patch_or_split_or_merge_or_suppress_or_archive_or_quarantine_or_restore", 
+"skill_evidence_review_and_rollback", 
+"tool_surface_eligibility_retrieval_delivery_activation_adherence_per_attempt_with_exact_tool_definition_version", 
+"tool_surface_where_not_apply_stop_and_escalation_first_class", "dreamer_job_accepted_rejected_expired_candidates", 
+"dreamer_job_verified_decision_verifier_and_downstream_outcome_delta", 
+"dreamer_job_false_merge_split_procedure_and_negative_transfer", 
+"dreamer_job_source_coverage_missed_material_evidence_and_unresolved_uncertainty", 
+"dreamer_job_model_agent_swarm_calls_raw_route_usage_and_retries", 
+"dreamer_job_cpu_ram_storage_network_queue_wait_wall_latency_and_human_attention", 
+"dreamer_job_context_reconstruction_savings_without_shifted_cost", 
+"dreamer_job_clarification_usefulness_backlog_age_and_expiry", 
+"dreamer_job_model_route_calibration_rollback_and_invalidation", "self_quality_agent_loop_and_no_progress", 
+"self_quality_observation_coverage_and_integration_gaps", "self_quality_context_packet_size_quality_and_feedback", 
+"self_quality_memory_growth_staleness_duplicates_false_activation_and_use", 
+"self_quality_dreamer_watchdog_doctor_job_utility_and_failures", 
+"self_quality_configuration_maintenance_and_update_outcomes", 
+"self_quality_orphan_descendant_and_unknown_effect_state", "self_quality_product_pulse_and_user_outcome_delta", 
+"self_quality_open_problems_improvement_candidates_and_human_actions", "self_quality_counter_metrics_context_bytes_vs_u
+sefulness_delivery_vs_use_growth_vs_resolved_activity_vs_progress_cost_vs_delta_maintenance_vs_recurrence_resolution_la
+tency", "bottleneck_diagnosis_update_quality_high_activation_low_or_activation_high_adherence_low_or_adherence_high_no_
+delta_or_delta_present_outcome_worse_or_immediate_gain_retention_regression", 
+"intervention_id_and_trigger_observation_refs", "intervention_affected_capability_scope_and_owner", 
+"intervention_causal_hypothesis_rivals_and_discriminator", 
+"intervention_selected_action_observe_or_repair_or_configure_or_reroute_or_experiment_or_abstain_or_escalate", 
+"intervention_candidate_change_and_authority_refs", "intervention_proof_ceiling_verifier_and_counter_metrics", 
+"intervention_rollback_and_validity_scope", "intervention_immediate_and_delayed_outcomes", 
+"intervention_terminal_disposition_retained_or_narrowed_or_rolled_back_or_reopened_or_escalated_or_inconclusive", 
+"intervention_system_observation_and_experience_writeback_refs"]
+crates\smart\cognitive-wave-09.toml:359:denominator_rule = "RECHECK: for Skill/tool-surface recompute 
+delivered/expanded/executed and eligibility/activation/adherence from per-attempt HarnessActivationReceipt refs at the 
+named scope; for Dreamer economics re-resolve the declared job/job-family window and full 
+compute/storage/context/Human cost ledger plus held-out/live outcome refs; for SelfQuality compare observations 
+against the ObservationObligationProfile; for intervention re-enumerate the affected capability closure. Each Complete 
+sub-assessment requires its own exact denominator; aggregate counts never substitute for per-attempt receipts."
+crates\smart\cognitive-wave-09.toml:363:invariants = ["no aggregate intelligence/confidence/utility score and no 
+aggregate learning score", "retrieval/repetition/model-agreement do not reinforce a Skill", "Dreamer/Curator proposals 
+remain reversible candidates until governed promotion", "recurring failure without changed hypothesis or discriminator 
+opens Mechanism Review", "one model's delete recommendation is never its own oracle", "proof depth follows effect per 
+I12-21 lifecycle rules"]
+crates\smart\cognitive-wave-09.toml:388:consumers = ["eliot-dreamer-accessibility (inputs)", "Governor disposition 
+path (candidate only)"]
+crates\smart\cognitive-wave-09.toml:400:owner_crate = "eliot-dreamer-memory-revision"
+crates\smart\cognitive-wave-09.toml:401:functional_cells = ["smart.dreamer.memory_revision"]
+crates\smart\cognitive-wave-09.toml:402:manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
+crates\smart\cognitive-wave-09.toml:412:consumers = ["Dreamer/Curator review surface (candidate only)"]
+crates\smart\cognitive-wave-09.toml:415:public_type = "DreamerJobEconomics"
+crates\smart\cognitive-wave-09.toml:417:functional_cells = ["smart.dreamer.job_economics"]
+crates\smart\cognitive-wave-09.toml:420:consumers = ["Dreamer route/curation review surface (projection only)"]
+crates\smart\cognitive-wave-09.toml:464:owner_crate = "eliot-dreamer-memory-revision"
+crates\smart\cognitive-wave-09.toml:465:manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
+crates\smart\cognitive-wave-09.toml:494:crate = "eliot-dreamer-memory-revision"
+crates\smart\cognitive-wave-09.toml:495:manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
+crates\smart\cognitive-wave-09.toml:497:functional_cells = ["smart.dreamer.memory_revision"]
+crates\smart\cognitive-wave-09.toml:504:functional_cells = ["smart.skill.lifecycle", "smart.tool.surface", 
+"smart.dreamer.job_economics", "smart.self.quality_view", "smart.self.intervention_candidate"]
+crates\smart\cognitive-wave-09.toml:534:rule = "Distinct crate eliot-understanding-assessment only; retired 
+eliot-understanding paths are never recreated; 233 memory-curation/dreamer-cycle and 246 cue files are untouched; 
+orders 1-43 are never reused."
+crates\smart\cognitive-wave-09.toml:553:consumer = "eliot-memory-quality, eliot-dreamer-memory-revision"
+crates\smart\cognitive-wave-09.toml:559:consumer = "eliot-dreamer-memory-revision"
+crates\smart\cognitive-wave-09.toml:581:producer = "eliot-dreamer-memory-revision"
+crates\smart\cognitive-wave-09.toml:588:contract = "CognitiveQualityAssessment (SkillLifecycleView, 
+DreamerJobEconomics, EliotSelfQualityView, SelfQualityInterventionReceipt)"
+crates\smart\cognitive-wave-09.toml:589:consumer = "Dreamer/Curator/Human/Governor review surfaces"
+crates\smart\cognitive-wave-09.toml:611:targets = ["eliot-memory-quality", "eliot-dreamer-memory-revision"]
+crates\smart\cognitive-wave-09.toml:616:targets = ["eliot-dreamer-memory-revision"]
+crates\smart\cognitive-wave-09.toml:624:path = "docs/architecture/I09-16-dreamer-quality-and-job-economics.md"
+crates\smart\cognitive-wave-09.toml:625:disposition = "authoritative contract for DreamerJobEconomics tracking 
+dimensions and promotion rule"
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython scripts/verify-standalone-crates.py --root . --list 2>&1 | head -60
+head: The term 'head' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython scripts/verify-standalone-crates.py --root . --list
+crates/foundation/eliot-memory-projection-contracts
+crates/governor/eliot-memory-projection-provider
+crates/research/eliot-dreamer-source-assurance
+crates/smart/eliot-context-compiler-wasm
+crates/smart/eliot-cue-activation-wasm
+crates/smart/eliot-dreamer-curation-wasm
+crates/smart/eliot-dreamer-cycle-wasm
+crates/smart/eliot-dreamer-orientation-wasm
+crates/smart/eliot-dreamer-research-wasm
+crates/smart/eliot-memory-applicability
+crates/smart/eliot-memory-curation-screen-wasm
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mcargo fmt --manifest-path crates/smart/eliot-dreamer-cycle-wasm/Cargo.toml -- --check 2>&1; echo "EXIT:$LASTEXITCODE"
+Diff in \\?\C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-cycle-wasm\tests\proof.rs:17:
+     TaskId, TaskRevision, TransactionSequence, canonical_json_bytes, sha256_hex,
+ };
+ use eliot_dreamer_contracts::{
+[31m-    BudgetLimits, BudgetUsage, DreamJobAdmission, JobClass, Requester, RequesterOrigin, ScreenBinding,
+[0m[31m-    ScreenState,
+[0m[32m+    BudgetLimits, BudgetUsage, DreamJobAdmission, JobClass, Requester, RequesterOrigin,
+[0m[32m+    ScreenBinding, ScreenState,
+[0m };
+ use eliot_dreamer_cycle::{
+     CYCLE_SCHEMA_VERSION, CycleError, CyclePhase, CyclePolicy, DreamerCycleState, ExpectedArtifact,
+Diff in \\?\C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-cycle-wasm\tests\proof.rs:169:
+     }
+ }
+ 
+[31m-fn state(policy: &CyclePolicy, job: &DreamJobAdmission, request: PendingRequest) -> DreamerCycleState {
+[0m[32m+fn state(
+[0m[32m+    policy: &CyclePolicy,
+[0m[32m+    job: &DreamJobAdmission,
+[0m[32m+    request: PendingRequest,
+[0m[32m+) -> DreamerCycleState {
+[0m     let mut state = DreamerCycleState {
+         schema_version: 1,
+         cycle_id: ArtifactId::new("cycle-1").unwrap(),
+EXIT:1
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mcargo test --manifest-path crates/smart/eliot-dreamer-curation-wasm/Cargo.toml --all-targets 2>&1; echo "EXIT:$LASTEXITCODE"
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 14 tests
+test exhaustive_input_output_error_conversion ... ok
+test exact_world_subtype_descriptor_abi_target_and_registry_identity ... ok
+test built_forbidden_imports_and_canonical_application_fields_rejected ... ok
+test wrong_subtype_version_payload_rejected_before_native_call ... ok
+test protected_target_zero_dispatch_with_retained_evidence ... ok
+test one_a31_call_inert_static_registration_only ... ok
+test preservation_lineage_counterevidence_parity ... ok
+test standalone_capsule_through_e_host ... ok
+test deterministic_permutation_parity ... ok
+test all_or_nothing_partial_native_component_parity ... ok
+test stale_identity_duplicates_and_all_bounds ... ok
+test property_component_equals_native_every_member_accounted_once ... ok
+test all_eleven_kinds_ten_families_and_every_disposition ... ok
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src\lib.rs (C:/Users/kleym/AppData/Local/Eliot/build/rust-env-target\debug\deps\eliot_dreamer_curation_wasm-c8dc9c6a22045651.exe)
+     Running tests\proof.rs (C:/Users/kleym/AppData/Local/Eliot/build/rust-env-target\debug\deps\proof-9a6e511d429bcfdd.exe)
+test clean_warm_artifact_hash_size_world_abi_toolchain_and_admission ... FAILED
+
+failures:
+
+---- clean_warm_artifact_hash_size_world_abi_toolchain_and_admission stdout ----
+
+thread 'clean_warm_artifact_hash_size_world_abi_toolchain_and_admission' (68052) panicked at tests\proof.rs:1415:52:
+gate sets CARGO_TARGET_DIR: NotPresent
+stack backtrace:
+   0: std::panicking::panic_handler
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library\std\src\panicking.rs:689
+   1: core::panicking::panic_fmt
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library\core\src\panicking.rs:80
+   2: core::result::unwrap_failed
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library\core\src\result.rs:1867
+   3: enum2$<core::result::Result<alloc::string::String,enum2$<std::env::VarError> > >::expect<alloc::string::String,enum2$<std::env::VarError> >
+             at C:\Users\kleym\.rustup\toolchains\1.97.1-x86_64-pc-windows-msvc\lib\rustlib\src\rust\library\core\src\result.rs:1185
+   4: proof::clean_warm_artifact_hash_size_world_abi_toolchain_and_admission
+             at .\tests\proof.rs:1415
+   5: proof::clean_warm_artifact_hash_size_world_abi_toolchain_and_admission::closure$0
+             at .\tests\proof.rs:1400
+   6: core::ops::function::FnOnce::call_once<proof::clean_warm_artifact_hash_size_world_abi_toolchain_and_admission::closure_env$0,tuple$<> >
+             at C:\Users\kleym\.rustup\toolchains\1.97.1-x86_64-pc-windows-msvc\lib\rustlib\src\rust\library\core\src\ops\function.rs:250
+   7: core::ops::function::FnOnce::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library\core\src\ops\function.rs:250
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    clean_warm_artifact_hash_size_world_abi_toolchain_and_admission
+
+test result: FAILED. 13 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+error: test failed, to rerun pass `--test proof`
+EXIT:101
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs [90m[limit=80, offset=1390][0m
+[0m→ [0mRead crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs [90m[limit=60, offset=1][0m
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit diff --stat origin/main -- crates/smart/eliot-dreamer-curation-wasm crates/smart/eliot-dreamer-cycle-wasm; echo "DIFF_EXIT:$LASTEXITCODE"; git log --oneline -8 -- crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs; echo "==="; git log --oneline -8 -- crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
+DIFF_EXIT:0
+8901ad7b #1980: I9.4 canonizes two objects; admission envelope renamed DreamJobAdmission (#1983)
+86b3cd40 work/644: thin typed Dreamer-cycle WASM adapter with 27-case proof matrix (Implements #644) (#1619)
+===
+d23d12c4 work/636: thin typed curation WASM adapter (Implements #636) (#1612)
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit blame -L 19,22 -- crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs; echo "==="; git blame -L 165,175 -- crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs
+86b3cd408 (Iurii Lisenkov 2026-09-15 20:56:24 -0400 19) use eliot_dreamer_contracts::{
+8901ad7b6 (Iurii Lisenkov 2026-09-17 06:18:11 -0400 20)     BudgetLimits, BudgetUsage, DreamJobAdmission, JobClass, Requester, RequesterOrigin, ScreenBinding,
+86b3cd408 (Iurii Lisenkov 2026-09-15 20:56:24 -0400 21)     ScreenState,
+86b3cd408 (Iurii Lisenkov 2026-09-15 20:56:24 -0400 22) };
+===
+86b3cd408 (Iurii Lisenkov 2026-09-15 20:56:24 -0400 165)             sha256: PAYLOAD.to_owned(),
+86b3cd408 (Iurii Lisenkov 2026-09-15 20:56:24 -0400 166)             role: ReceiptKind::Artifact,
+86b3cd408 (Iurii Lisenkov 2026-09-15 20:56:24 -0400 167)             source_revision: None,
+86b3cd408 (Iurii Lisenkov 2026-09-15 20:56:24 -0400 168)         }],
+86b3cd408 (Iurii Lisenkov 2026-09-15 20:56:24 -0400 169)     }
+86b3cd408 (Iurii Lisenkov 2026-09-15 20:56:24 -0400 170) }
+86b3cd408 (Iurii Lisenkov 2026-09-15 20:56:24 -0400 171) 
+8901ad7b6 (Iurii Lisenkov 2026-09-17 06:18:11 -0400 172) fn state(policy: &CyclePolicy, job: &DreamJobAdmission, request: PendingRequest) -> DreamerCycleState {
+86b3cd408 (Iurii Lisenkov 2026-09-15 20:56:24 -0400 173)     let mut state = DreamerCycleState {
+86b3cd408 (Iurii Lisenkov 2026-09-15 20:56:24 -0400 174)         schema_version: 1,
+86b3cd408 (Iurii Lisenkov 2026-09-15 20:56:24 -0400 175)         cycle_id: ArtifactId::new("cycle-1").unwrap(),
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit show 8901ad7b --stat | head -40; echo "==="; git log --oneline origin/main -3; echo "==="; git merge-base HEAD origin/main | ForEach-Object { git log --oneline -1 $_ }
+head: The term 'head' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+===
+543e8c35 Merge pull request #2027 from UnknownAlienHuman/work/docs-closure-provenance
+b64fdf99 docs: restore compatibility facades byte-identical after provenance adoption
+d8eec940 docs: adopt current normative byte streams to legacy paths for closure provenance
+===
+b64fdf99 docs: restore compatibility facades byte-identical after provenance adoption
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit show 8901ad7b --stat; echo "==="; git branch --contains 8901ad7b --all
+commit 8901ad7b6c369e235964cb8a0cd74cb88b65271f
+Author: Iurii Lisenkov <71514792+UnknownAlienHuman@users.noreply.github.com>
+Date:   Thu Sep 17 06:18:11 2026 -0400
+
+    #1980: I9.4 canonizes two objects; admission envelope renamed DreamJobAdmission (#1983)
+    
+    * work(1980): rename contracts envelope DreamJobInput to DreamJobAdmission
+    
+    One causal change: resolve the I9.4 name collision per owner decision on #1980.
+    The admission envelope (job.rs) takes DreamJobAdmission; bundle::DreamInputBundle,
+    bins/eliot-dreamer flat struct (#1978) and dreamer-core facade (#1143) untouched.
+    No aliases, no From/Into bridges; module.toml envelope lines renamed.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    
+    * work(1980): amend I9.4 to canonize admission envelope and semantic bundle
+    
+    I9.4 now names DreamJobAdmission (closed intake record) alongside DreamJobInput
+    (the role-addressed semantic bundle), with required roles per class, per-role
+    cardinality/lineage, omission rules, denominator source and BundleCompleteness
+    states, each grounded in assembly/recipe.rs and bundle types. Regenerate the
+    serde boundary inventory through scripts/serde_boundary_inventory.py sync
+    (check PASS); envelope row now keys on DreamJobAdmission.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    
+    ---------
+    
+    Co-authored-by: d01-temp <d01-temp@example.invalid>
+    Co-authored-by: Claude Opus 5 <noreply@anthropic.com>
+
+ .../tests/data/shipped_serde_boundaries.toml       | 9820 +++++++++++++-------
+ .../eliot-dreamer-architecture-brief/module.toml   |    2 +-
+ .../tests/architecture_brief.rs                    |    4 +-
+ crates/smart/eliot-dreamer-bundle/module.toml      |    2 +-
+ .../eliot-dreamer-bundle/tests/bundle_proof.rs     |    8 +-
+ .../eliot-dreamer-candidate-validation/module.toml |    2 +-
+ .../src/error.rs                                   |    4 +-
+ .../src/input.rs                                   |    6 +-
+ .../src/receipt.rs                                 |    4 +-
+ .../tests/handoff.rs                               |    6 +-
+ .../tests/validation.rs                            |    6 +-
+ .../eliot-dreamer-claim-grounding/src/grounding.rs |    8 +-
+ .../eliot-dreamer-claim-grounding/tests/support.rs |    6 +-
+ .../smart/eliot-dreamer-clarification/module.toml  |    2 +-
+ .../src/model/part_01.rs                           |    2 +-
+ .../src/model/part_04.rs                           |    6 +-
+ .../src/model/part_05.rs                           |    2 +-
+ .../smart/eliot-dreamer-clarification/src/tests.rs |    8 +-
+ .../tests/classification.rs                        |    2 +-
+ .../smart/eliot-dreamer-concept/tests/concept.rs   |   10 +-
+ .../eliot-dreamer-configuration-plan/module.toml   |    2 +-
+ .../eliot-dreamer-configuration-plan/src/lib.rs    |   12 +-
+ crates/smart/eliot-dreamer-contracts/module.toml   |    2 +-
+ .../src/assembly/material.rs                       |    4 +-
+ .../eliot-dreamer-contracts/src/assembly/recipe.rs |   10 +-
+ .../eliot-dreamer-contracts/src/assembly/result.rs |    2 +-
+ crates/smart/eliot-dreamer-contracts/src/bundle.rs |    2 +-
+ .../src/classification/input.rs                    |    2 +-
+ .../eliot-dreamer-contracts/src/concept/input.rs   |    4 +-
+ crates/smart/eliot-dreamer-contracts/src/draft.rs  |   18 +-
+ .../eliot-dreamer-contracts/src/failure/input.rs   |    4 +-
+ .../eliot-dreamer-contracts/src/grounding/mod.rs   |   14 +-
+ crates/smart/eliot-dreamer-contracts/src/job.rs    |   20 +-
+ crates/smart/eliot-dreamer-contracts/src/lib.rs    |    2 +-
+ .../eliot-dreamer-contracts/src/model_route.rs     |    2 +-
+ .../src/validation/bounds.rs                       |    4 +-
+ .../src/validation/encoding.rs                     |   10 +-
+ .../eliot-dreamer-contracts/src/validation/mod.rs  |    4 +-
+ .../eliot-dreamer-contracts/tests/assembly.rs      |    6 +-
+ .../tests/classification_contracts.rs              |    4 +-
+ .../tests/concept_contracts.rs                     |    8 +-
+ .../tests/consumer_and_source_proof.rs             |   18 +-
+ .../tests/curation_invocation.rs                   |   10 +-
+ .../tests/relation_contracts.rs                    |    6 +-
+ .../tests/support/grounding.rs                     |    6 +-
+ .../smart/eliot-dreamer-cycle-wasm/tests/proof.rs  |   12 +-
+ crates/smart/eliot-dreamer-cycle/module.toml       |    2 +-
+ crates/smart/eliot-dreamer-cycle/src/bounds.rs     |    2 +-
+ crates/smart/eliot-dreamer-cycle/src/contract.rs   |   10 +-
+ crates/smart/eliot-dreamer-cycle/tests/cycle.rs    |    6 +-
+ .../module.toml                                    |    2 +-
+ .../eliot-dreamer-development-diagnosis/src/lib.rs |   12 +-
+ .../smart/eliot-dreamer-episode/src/reconstruct.rs |    2 +-
+ .../eliot-dreamer-episode/tests/support/episode.rs |    4 +-
+ .../eliot-dreamer-failure/tests/support/mod.rs     |    4 +-
+ .../tests/support/mod.rs                           |    4 +-
+ .../eliot-dreamer-maintenance-plan/module.toml     |    2 +-
+ .../eliot-dreamer-maintenance-plan/src/lib.rs      |   12 +-
+ .../eliot-dreamer-orchestration-plan/module.toml   |    2 +-
+ .../eliot-dreamer-orchestration-plan/src/lib.rs    |   14 +-
+ .../eliot-dreamer-orientation-wasm/tests/proof.rs  |    4 +-
+ crates/smart/eliot-dreamer-orientation/module.toml |    2 +-
+ .../smart/eliot-dreamer-orientation/src/input.rs   |   14 +-
+ .../eliot-dreamer-orientation/tests/orientation.rs |    4 +-
+ .../smart/eliot-dreamer-relation/tests/relation.rs |    8 +-
+ .../eliot-dreamer-research-synthesis/src/model.rs  |    2 +-
+ .../eliot-dreamer-rival-model/tests/rival_proof.rs |   10 +-
+ docs/architecture/I09-04-dreamer-input-bundle.md   |  107 +-
+ 68 files changed, 6902 insertions(+), 3425 deletions(-)
+===
++ codex/simplify-root-agents
++ main
+  mgr19-992-final
+  mgr20-989-rend
+  mgr20-989-rework
+  mgr20-989-rv2
+  pr-2001-review
++ work/1137-operator-winui-alloc-refresh
++ work/1719-governor-rehome
++ work/1976-kernel-store-gateway-tests
++ work/1995-native-worker-types
+  work/595-dreamer-pipeline-rejection-proof
++ work/602-grounding-bind
++ work/620-activation-status-fix
++ work/702-pipeline-slice-3
++ work/806-dreamer-controller
++ work/820-self-quality
++ work/836-wave-d0-admission
++ work/966-curation-admission
+  work/966-workspace-mgr05
++ work/967-wave-l1-admission
++ work/968-wave-d1-admission
++ work/activation-202-slice
++ work/activation-203-slice
++ work/burn-r2-i11-i21
+  work/burn-r3-dreamer
+  work/burn-r5-kernel
++ work/cdi-bootstrap-i94
+  work/code-navigation-sync
+* work/docs-closure-provenance
++ work/dreamer-584-remainder
++ work/governor-2017-port
++ work/handle-index-i94-resync
++ work/slice-1678-1679
++ work/slice-1687-1811
++ work/slice-993-exec
++ work/source-assurance-metadata
+  remotes/origin/HEAD -> origin/main
+  remotes/origin/fix/10-audit-hardening
+  remotes/origin/fix/doc-code-conformance-drift-4717178965839013570
+  remotes/origin/main
+  remotes/origin/work/1126-durable-swarm-runtime
+  remotes/origin/work/1137-operator-winui-alloc-refresh
+  remotes/origin/work/1976-kernel-store-gateway-tests
+  remotes/origin/work/602-grounding-bind
+  remotes/origin/work/966-workspace-mgr05
+  remotes/origin/work/burn-r1-i01-i10
+  remotes/origin/work/burn-r3-dreamer
+  remotes/origin/work/burn-r4-harden
+  remotes/origin/work/burn-r6-roots
+  remotes/origin/work/code-navigation-sync
+  remotes/origin/work/docs-closure-provenance
+  remotes/origin/work/duty-991-wire
+  remotes/origin/work/governor-attach-once
+  remotes/origin/work/slice-1678-1679
+  remotes/origin/work/slice-1687-1811
+  remotes/origin/work/slice-1848-latency
+  remotes/origin/work/slice-1949-trace
+  remotes/origin/work/slice-989-sconc
+  remotes/origin/work/slice-990-sconc
+  remotes/origin/work/slice-992-ors
+  remotes/origin/work/slice-993-exec
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit show 8901ad7b -- crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs; echo "==="; git show 86b3cd40 --stat -- crates/smart/eliot-dreamer-cycle-wasm | head -20
+commit 8901ad7b6c369e235964cb8a0cd74cb88b65271f
+Author: Iurii Lisenkov <71514792+UnknownAlienHuman@users.noreply.github.com>
+Date:   Thu Sep 17 06:18:11 2026 -0400
+
+    #1980: I9.4 canonizes two objects; admission envelope renamed DreamJobAdmission (#1983)
+    
+    * work(1980): rename contracts envelope DreamJobInput to DreamJobAdmission
+    
+    One causal change: resolve the I9.4 name collision per owner decision on #1980.
+    The admission envelope (job.rs) takes DreamJobAdmission; bundle::DreamInputBundle,
+    bins/eliot-dreamer flat struct (#1978) and dreamer-core facade (#1143) untouched.
+    No aliases, no From/Into bridges; module.toml envelope lines renamed.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    
+    * work(1980): amend I9.4 to canonize admission envelope and semantic bundle
+    
+    I9.4 now names DreamJobAdmission (closed intake record) alongside DreamJobInput
+    (the role-addressed semantic bundle), with required roles per class, per-role
+    cardinality/lineage, omission rules, denominator source and BundleCompleteness
+    states, each grounded in assembly/recipe.rs and bundle types. Regenerate the
+    serde boundary inventory through scripts/serde_boundary_inventory.py sync
+    (check PASS); envelope row now keys on DreamJobAdmission.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    
+    ---------
+    
+    Co-authored-by: d01-temp <d01-temp@example.invalid>
+    Co-authored-by: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs b/crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs
+index 4d669dd5..2ba88cc5 100644
+--- a/crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs
++++ b/crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs
+@@ -17,7 +17,7 @@ use eliot_contracts::{
+     TaskId, TaskRevision, TransactionSequence, canonical_json_bytes, sha256_hex,
+ };
+ use eliot_dreamer_contracts::{
+-    BudgetLimits, BudgetUsage, DreamJobInput, JobClass, Requester, RequesterOrigin, ScreenBinding,
++    BudgetLimits, BudgetUsage, DreamJobAdmission, JobClass, Requester, RequesterOrigin, ScreenBinding,
+     ScreenState,
+ };
+ use eliot_dreamer_cycle::{
+@@ -67,12 +67,12 @@ fn fence() -> StateFence {
+     }
+ }
+ 
+-fn job(fence: &StateFence) -> DreamJobInput {
++fn job(fence: &StateFence) -> DreamJobAdmission {
+     job_with_deadline(fence, None)
+ }
+ 
+-fn job_with_deadline(fence: &StateFence, deadline_ms: Option<u64>) -> DreamJobInput {
+-    DreamJobInput {
++fn job_with_deadline(fence: &StateFence, deadline_ms: Option<u64>) -> DreamJobAdmission {
++    DreamJobAdmission {
+         schema_version: 1,
+         job_class: JobClass::Curation,
+         requester: Requester {
+@@ -138,7 +138,7 @@ fn policy_for_phase(fence: &StateFence, phase: CyclePhase, operation_kind: &str)
+     policy
+ }
+ 
+-fn pending(policy: &CyclePolicy, job: &DreamJobInput) -> PendingRequest {
++fn pending(policy: &CyclePolicy, job: &DreamJobAdmission) -> PendingRequest {
+     PendingRequest {
+         request_id: RequestId::new("request-1").unwrap(),
+         operation_id: OperationId::new("operation-1").unwrap(),
+@@ -169,7 +169,7 @@ fn pending(policy: &CyclePolicy, job: &DreamJobInput) -> PendingRequest {
+     }
+ }
+ 
+-fn state(policy: &CyclePolicy, job: &DreamJobInput, request: PendingRequest) -> DreamerCycleState {
++fn state(policy: &CyclePolicy, job: &DreamJobAdmission, request: PendingRequest) -> DreamerCycleState {
+     let mut state = DreamerCycleState {
+         schema_version: 1,
+         cycle_id: ArtifactId::new("cycle-1").unwrap(),
+===
+head: The term 'head' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit blame -L 1398,1420 -- crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs; echo "==="; git log --oneline -4 -- crates/smart/eliot-dreamer-curation-wasm/
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1398) // WORK_UNIT_CASE: 636/13
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1399) #[test]
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1400) fn clean_warm_artifact_hash_size_world_abi_toolchain_and_admission() {
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1401)     assert_eq!(env!("CARGO_PKG_NAME"), "eliot-dreamer-curation-wasm");
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1402)     assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0");
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1403)     assert_eq!(descriptor_digest(), descriptor_digest());
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1404)     assert_eq!(GUEST_TARGET, "wasm32-wasip2");
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1405)     // Controller-owned handoff (issue #636): the package must NOT be a root
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1406)     // workspace member on this branch; admission is a separate serialized turn.
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1407)     assert!(!root_cargo_toml().contains("eliot-dreamer-curation-wasm"));
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1408)     // Frozen toolchain identity matches the owning file.
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1409)     let toolchain = String::from_utf8(TOOLCHAIN_BYTES.to_vec()).expect("toolchain UTF-8");
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1410)     assert!(toolchain.contains("channel = \"1.97.1\""));
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1411)     assert!(toolchain.contains("wasm32-wasip2"));
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1412)     // The real release artifact: stable hash, non-empty, exact pure world.
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1413)     // Current rustc emits a Component Model component (not a core module);
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1414)     // the gate parses both, descending into the nested core module.
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1415)     let target = std::env::var("CARGO_TARGET_DIR").expect("gate sets CARGO_TARGET_DIR");
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1416)     let artifact = std::format!("{target}/wasm32-wasip2/release/eliot_dreamer_curation_wasm.wasm");
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1417)     let bytes = std::fs::read(&artifact).unwrap_or_else(|_| panic!("read {artifact}"));
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1418)     assert!(!bytes.is_empty(), "release artifact is non-empty");
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1419)     assert_eq!(bytes[0..4], [0x00, 0x61, 0x73, 0x6D]);
+d23d12c46 (Iurii Lisenkov 2026-09-15 20:18:58 -0400 1420)     assert_eq!(bytes[4..8], COMPONENT_VERSION);
+===
+d23d12c4 work/636: thin typed curation WASM adapter (Implements #636) (#1612)
+> build · muse-spark-1.3-contributor-free
+[0m✱ [0mGrep "CARGO_TARGET_DIR" [90min scripts · 24 matches[0m
+[0m$ [0m$env:CARGO_TARGET_DIR; echo "ENV_CHECK_DONE"; Get-ChildItem Env: | Where-Object { $_.Name -like '*CARGO*' -or $_.Name -like '*TARGET*' } | Format-Table -AutoSize
+ENV_CHECK_DONE
+> build · muse-spark-1.3-contributor-free
+[0m✱ [0mGrep "CARGO_TARGET_DIR" [90min scripts/verify.ps1 · 0 matches[0m
+[0m✱ [0mGrep "CARGO_TARGET_DIR" [90min crates/smart · 2 matches[0m
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs [90m[limit=80, offset=470][0m
+[0m✱ [0mGrep "TARGET|target_dir|artifact|wasm32-wasip2" [90min crates/smart/eliot-dreamer-curation-wasm · 30 matches[0m
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit branch --contains d23d12c4 --all | Select-String "main"; echo "==="; git diff --stat origin/main -- crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs; echo "NODIFF_EXIT:$LASTEXITCODE"; echo "==="; cargo --version; rustc --version
++ main
++ work/dreamer-584-remainder
+  remotes/origin/HEAD -> origin/main
+  remotes/origin/main
+===
+NODIFF_EXIT:0
+===
+cargo 1.97.1 (c980f4866 2026-06-30)
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+> build · muse-spark-1.3-contributor-free
+[0m$ [0m$env:CARGO_TARGET_DIR = 'C:\Users\kleym\AppData\Local\Eliot\build\rust-env-target'; cargo test --manifest-path crates/smart/eliot-dreamer-curation-wasm/Cargo.toml --all-targets --test proof clean_warm_artifact_hash_size_world_abi_toolchain_and_admission 2>&1 | Select-Object -Last 25; echo "EXIT:$LASTEXITCODE"
+Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src\lib.rs (C:\Users\kleym\AppData\Local\Eliot\build\rust-env-target\debug\deps\eliot_dreamer_curation_wasm-c8dc9c6a22045651.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\proof.rs (C:\Users\kleym\AppData\Local\Eliot\build\rust-env-target\debug\deps\proof-9a6e511d429bcfdd.exe)
+
+running 1 test
+test clean_warm_artifact_hash_size_world_abi_toolchain_and_admission ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+EXIT:0
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mGet-Item 'C:\Users\kleym\AppData\Local\Eliot\build\rust-env-target\wasm32-wasip2\release\eliot_dreamer_curation_wasm.wasm' | Format-List Name,Length,LastWriteTime; echo "==="; Get-Item 'C:\Users\kleym\AppData\Local\Eliot\build\rust-env-target\wasm32-wasip2\release\eliot_dreamer_cycle_wasm.wasm' -ErrorAction SilentlyContinue | Format-List Name,Length,LastWriteTime; echo "DONE"
+Name          : eliot_dreamer_curation_wasm.wasm
+Length        : 14357
+LastWriteTime : 9/18/2026 7:19:12 AM
+
+===
+DONE
+> build · muse-spark-1.3-contributor-free
+[0m✱ [0mGrep "candidate_artifact_paths|clean_warm|62[0-9]/1[0-9]" [90min crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs · 3 matches[0m
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs [90m[limit=65, offset=1600][0m
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython scripts/verify-standalone-crates.py --root . 2>&1; echo "GATE_EXIT:$LASTEXITCODE"
+STANDALONE_CRATE_FAIL: crates/smart/eliot-dreamer-curation-wasm step=test
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s
+         Running unittests src\lib.rs (C:/Users/kleym/AppData/Local/Eliot/build/rust-env-target\debug\deps\eliot_dreamer_curation_wasm-c8dc9c6a22045651.exe)
+         Running tests\proof.rs (C:/Users/kleym/AppData/Local/Eliot/build/rust-env-target\debug\deps\proof-9a6e511d429bcfdd.exe)
+    error: test failed, to rerun pass `--test proof`
+STANDALONE_CRATE_FAIL: crates/smart/eliot-dreamer-cycle-wasm step=fmt
+    [0m[32m+fn state(
+    [0m[32m+    policy: &CyclePolicy,
+    [0m[32m+    job: &DreamJobAdmission,
+    [0m[32m+    request: PendingRequest,
+    [0m[32m+) -> DreamerCycleState {
+    [0m     let mut state = DreamerCycleState {
+             schema_version: 1,
+             cycle_id: ArtifactId::new("cycle-1").unwrap(),
+STANDALONE_CRATES: FAIL crates=11 failures=2
+GATE_EXIT:1
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit status --short --branch; echo "---"; git rev-parse HEAD
+## work/docs-closure-provenance...origin/work/docs-closure-provenance
+?? prompt-closure.txt
+?? prompt-provenance.txt
+?? prompt-standalone.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-prov.log
+?? stderr-standalone.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-prov.log
+?? stdout-standalone.log
+?? stdout-syncfix.log
+?? stdout.log
+---
+b64fdf990726a34d20dadecf36c4c2d3d7b4a83c
+> build · muse-spark-1.3-contributor-free

@@ -1,0 +1,28 @@
+Green-main watch — running `just quick` read-only.
+Final report — green-main watch (read-only, no fix, no merge, nothing to push):
+
+Result: RED
+
+- Repo: detached HEAD at `f0abfe13` (`f0abfe139e944f781344df037268ba2845ae77dc`), confirmed via `git rev-parse HEAD`.
+- Executed from repo root: `just quick` (`just 1.58.0`).
+- Exit code: 1. Wall time: ~25.3s (`00:00:25.2692494`).
+- Failure point: `quick` stopped at recipe `code-navigation` (Justfile:30). Later `quick` gates (docs-closure-audit onward, incl. metadata/fmt-check/check) did not run.
+
+Exact failing output lines:
+```
+CODE_NAVIGATION_FAIL: workspace package docs index is stale or hand-edited; run `python scripts/code_navigation.py sync-index --root .`
+CODE_NAVIGATION_CHECK: PASS workspace_members=174 default_members=6 nonmember_packages=11 rust_files=1571 logical_blocks=15
+error: recipe `code-navigation` failed on line 30 with exit code 1
+```
+
+Passing prefix (evidence, in order):
+- `docs-shards-self-test`: PASS cases=6; hardening PASS cases=7
+- `docs-shards verify`: PASS
+- `docs-router-self-test`: PASS cases=5; hardening PASS cases=3
+- `docs-router check`: PASS routes=17
+- `docs-read-self-test`: PASS cases=3
+- `doc-code-conformance-self-test`: PASS (18/5/8/19)
+- `doc-code-conformance`: PASS
+- `code-navigation-self-test`: PASS cases=14 (+4/+5)
+
+Receipt: ran only `just quick`; no files created/modified/committed/pushed (`git status` unchanged except pre-existing untracked `prompt.txt`, `stderr.log`, `stdout.log`). Nothing fixed per work order.

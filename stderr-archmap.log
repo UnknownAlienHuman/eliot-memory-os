@@ -1,0 +1,621 @@
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead . 
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit status --short --branch; echo "---"; git rev-parse HEAD; echo "---"; git log --oneline -3
+## HEAD (no branch)
+?? prompt-archmap.txt
+?? prompt-closure.txt
+?? prompt-nextgate.txt
+?? prompt-provenance.txt
+?? prompt-safix.txt
+?? prompt-standalone.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-archmap.log
+?? stderr-closure.log
+?? stderr-nextgate.log
+?? stderr-prov.log
+?? stderr-safix.log
+?? stderr-standalone.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-archmap.log
+?? stdout-closure.log
+?? stdout-nextgate.log
+?? stdout-prov.log
+?? stdout-safix.log
+?? stdout-standalone.log
+?? stdout-syncfix.log
+?? stdout.log
+---
+4d427ca9b20630e2880a64ca9201918935cb123e
+---
+4d427ca9 fix: standalone wasm proofs hermetic (fmt cycle-wasm, curation skips absent artifact) (#2028)
+543e8c35 Merge pull request #2027 from UnknownAlienHuman/work/docs-closure-provenance
+b64fdf99 docs: restore compatibility facades byte-identical after provenance adoption
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead Justfile 
+[0m→ [0mRead stdout-archmap.log 
+[0m→ [0mRead stderr-archmap.log 
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead stderr-nextgate.log 
+[0m→ [0mRead stdout-nextgate.log 
+[0m→ [0mRead docs/ARCHITECTURE_CONTRACT.md 
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead stderr-nextgate.log [90m[limit=200, offset=288][0m
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython scripts/audit-architecture-boundaries.py 2>&1 | Tee-Object -Variable archOut | Select-Object -First 300; echo "---EXIT:$LASTEXITCODE---"
+ARCHITECTURE_BOUNDARY_AUDIT: hard=32 debt=27 signals=121
+HARD_VIOLATION: runtime_root_forbidden_direct_dependency: bins/eliot-native-worker/Cargo.toml package=eliot-native-worker issue=#22: Direct dependency 'eliot-agent-claude' violates the runtime-root boundary.
+HARD_VIOLATION: runtime_root_forbidden_direct_dependency: bins/eliot-native-worker/Cargo.toml package=eliot-native-worker issue=#22: Direct dependency 'eliot-agent-codex' violates the runtime-root boundary.
+HARD_VIOLATION: runtime_root_forbidden_direct_dependency: bins/eliot-native-worker/Cargo.toml package=eliot-native-worker issue=#22: Direct dependency 'eliot-agent-opencode' violates the runtime-root boundary.
+HARD_VIOLATION: runtime_root_forbidden_direct_dependency: bins/eliotd/Cargo.toml package=eliotd issue=#18: Direct dependency 'eliot-dreamer-bundle' violates the runtime-root boundary.
+HARD_VIOLATION: runtime_root_forbidden_direct_dependency: bins/eliotd/Cargo.toml package=eliotd issue=#18: Direct dependency 'eliot-dreamer-candidate-validation' violates the runtime-root boundary.
+HARD_VIOLATION: runtime_root_forbidden_direct_dependency: bins/eliotd/Cargo.toml package=eliotd issue=#18: Direct dependency 'eliot-dreamer-claim-grounding' violates the runtime-root boundary.
+HARD_VIOLATION: runtime_root_forbidden_direct_dependency: bins/eliotd/Cargo.toml package=eliotd issue=#18: Direct dependency 'eliot-dreamer-probe-plan' violates the runtime-root boundary.
+HARD_VIOLATION: runtime_root_forbidden_direct_dependency: bins/eliotd/Cargo.toml package=eliotd issue=#18: Direct dependency 'eliot-dreamer-rival-model' violates the runtime-root boundary.
+HARD_VIOLATION: untracked_direct_process_launch: bins/eliot-host/src/runtime_restart_state.rs package=eliot-host: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 1013 (construct, test-gated, cfg=['test', 'windows'], item='runtime_restart_abrupt_child_causal_success_and_fault_reopen'): let mut child = std::process::Command::new(&exe); line 1027 (construct, test-gated, cfg=['test', 'windows'], item='runtime_restart_abrupt_child_causal_success_and_fault_reopen'): let mut child2 = std::process::Command::new(&exe).
+HARD_VIOLATION: untracked_direct_process_launch: bins/eliot-host/src/store_recovery_persistence.rs package=eliot-host: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 2144 (construct, test-gated, cfg=['test', 'windows'], item='store_abrupt_child_causal_success_and_fault_reopen'): let mut child = std::process::Command::new(&exe); line 2158 (construct, test-gated, cfg=['test', 'windows'], item='store_abrupt_child_causal_success_and_fault_reopen'): let mut child2 = std::process::Command::new(&exe).
+HARD_VIOLATION: untracked_direct_process_launch: bins/eliot-store-surreal/src/request_dispatch.rs package=eliot-store-surreal: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 1040 (construct, test-gated, cfg=['test'], item='prepare_initial_root_user'): let mut child = std::process::Command::new(exe).
+HARD_VIOLATION: untracked_direct_process_launch: crates/eliot-app/src/host_runtime/supervised_process.rs package=eliot-app: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 993 (construct, production, item='run_worker'): let mut command = Command::new(&spec.executable);; line 2099 (construct, test-gated, cfg=['test'], item='supervised_process_native_fixture'): let mut descendant = std::process::Command::new(std::env::current_exe()?).
+HARD_VIOLATION: untracked_direct_process_launch: crates/eliot-app/src/mcp_stdio.rs package=eliot-app: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 1211 (construct, production, item='validate_bound_worktree_lease'): let head = Command::new("git.exe").
+HARD_VIOLATION: untracked_direct_process_launch: crates/eliot-app/src/named_pipe_ipc.rs package=eliot-app: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 1312 (construct, production, item='current_windows_sid'): let output = Command::new("whoami.exe"); line 1336 (construct, production, item='restrict_directory_to_current_user'): let output = Command::new("icacls.exe").
+HARD_VIOLATION: untracked_direct_process_launch: crates/eliot-engine/src/antigravity.rs package=eliot-engine: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 406 (construct, production, item='probe'): let output = ProcessCommand::new("tasklist.exe"); line 3289 (construct, production, item='where_command_hits'): let Ok(output) = ProcessCommand::new("where.exe"); line 3374 (construct, production, item='run_bounded_command'): let mut command = ProcessCommand::new(path);; line 3407 (construct, production, item='terminate_process_tree'): let _ = ProcessCommand::new("taskkill.exe"); line 3672 (construct, production, item='git_bytes_sync'): let output = ProcessCommand::new("git").
+HARD_VIOLATION: untracked_direct_process_launch: crates/eliot-engine/src/codecortex.rs package=eliot-engine: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 575 (construct, production, item='run_process'): let output = Command::new(program).args(args).current_dir(cwd).output()?;.
+HARD_VIOLATION: untracked_direct_process_launch: crates/eliot-engine/src/cognitive_projection.rs package=eliot-engine: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 1638 (construct, test-gated, cfg=['test'], item='require_exact_surreal_version'): let output = Command::new(&config.exe).arg("version").output()?;.
+HARD_VIOLATION: untracked_direct_process_launch: crates/eliot-engine/src/verification/current.rs package=eliot-engine: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 181 (construct, test-gated, cfg=['test'], item='compile_probe'): let output = std::process::Command::new(rustc); line 338 (construct, test-gated, cfg=['test'], item='current_run_through_registered_nextest_binding_passes'): let nextest_output = std::process::Command::new(cargo); line 362 (construct, test-gated, cfg=['test'], item='current_run_through_registered_nextest_binding_passes'): let probe_output = std::process::Command::new(&exe); line 417 (construct, test-gated, cfg=['test'], item='current_run_rejects_unadmitted_inputs'): let probe_output = std::process::Command::new(&exe).
+HARD_VIOLATION: untracked_direct_process_launch: crates/eliot-store/src/payload_byte_preservation.rs package=eliot-store: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 230 (construct, test-gated, cfg=['all', 'feature', 'test'], item='spawn_scratch'): let mut spawn = Command::new(exe);.
+HARD_VIOLATION: untracked_direct_process_launch: crates/eliot-windows-ipc/src/lib.rs package=eliot-windows-ipc: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 1359 (raw-launch, production, item='spawn_named'): CreateProcessW(; line 2780 (construct, test-gated, cfg=['test'], item='supervised_fixture_command'): let mut command = std::process::Command::new(std::env::current_exe()?);; line 2909 (construct, test-gated, cfg=['test'], item='managed_powershell'): let mut command = std::process::Command::new(; line 2937 (construct, test-gated, cfg=['test'], item='managed_cmd'): let mut command = std::process::Command::new(comspec);; line 3317 (construct, test-gated, cfg=['test'], item='new_output_writer_rejects_precreated_junction_without_touching_target'): let status = std::process::Command::new("cmd").
+HARD_VIOLATION: untracked_direct_process_launch: crates/instrument/eliot-verifier/src/lib.rs package=eliot-verifier: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 942 (construct, test-gated, cfg=['test'], item='compile_probe'): let output = std::process::Command::new(rustc); line 962 (construct, test-gated, cfg=['test'], item='run_probe'): Ok(std::process::Command::new(exe).
+HARD_VIOLATION: untracked_direct_process_launch: crates/kernel/eliot-host-state/src/redb_journal.rs package=eliot-host-state: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 1958 (construct, test-gated, cfg=['test', 'windows'], item='runtime_openers_reject_reparse_parent_without_touching_target'): let output = Command::new("cmd.exe").
+HARD_VIOLATION: untracked_direct_process_launch: crates/kernel/eliot-installation/src/redb_state.rs package=eliot-installation: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 3426 (construct, test-gated, cfg=['test', 'windows'], item='create_planned_rejects_reparse_parent_before_publication'): let link = std::process::Command::new("cmd.exe").
+HARD_VIOLATION: untracked_direct_process_launch: crates/kernel/eliot-ipc/src/lib.rs package=eliot-ipc: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 3646 (construct, test-gated, cfg=['test', 'windows'], item='server_authenticates_distinct_client_pid_sid_session_and_process'): let mut child = std::process::Command::new(std::env::current_exe()?); line 3767 (construct, test-gated, cfg=['test', 'windows'], item='kernel_front_door_live_proof_retains_process_file_and_extra_sid'): let mut child = std::process::Command::new(std::env::current_exe()?).
+HARD_VIOLATION: untracked_direct_process_launch: crates/kernel/eliot-kernel-service/src/store_gateway.rs package=eliot-kernel-service: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 1959 (construct, test-gated, cfg=['test'], item='bootstrap_root_user'): let mut child = tokio::process::Command::new(exe).
+HARD_VIOLATION: untracked_direct_process_launch: crates/meta/eliot-runtime-status/src/lib.rs package=eliot-runtime-status: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 5134 (construct, test-gated, cfg=['test'], item='separate_process_cli_readback_matches_in_process_and_no_writes'): let output = std::process::Command::new("cargo"); line 5637 (construct, test-gated, item='production_subprocess_reports_projection_without_writing'): let output = std::process::Command::new("cargo").
+HARD_VIOLATION: untracked_direct_process_launch: crates/storage/eliot-store-surreal-adapter/src/apply.rs package=eliot-store-surreal-adapter: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 2087 (construct, test-gated, cfg=['test', 'windows'], item='start'): let mut child = Command::new(&exe).
+HARD_VIOLATION: untracked_direct_process_launch: crates/storage/eliot-store-surreal-adapter/src/apply/read_boundary.rs package=eliot-store-surreal-adapter: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 2366 (construct, test-gated, cfg=['all', 'test', 'windows'], item='start'): let mut child = Command::new(&exe).
+HARD_VIOLATION: untracked_direct_process_launch: crates/storage/eliot-store-surreal-adapter/src/client/provider_owner.rs package=eliot-store-surreal-adapter: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 184 (construct, production, item='spawn_provider'): let mut command = Command::new(&config.provider_executable_path);.
+HARD_VIOLATION: untracked_direct_process_launch: crates/storage/eliot-store-surreal-adapter/src/client/session.rs package=eliot-store-surreal-adapter: Direct std/tokio process launch is outside a declared process owner and has no exact debt record.
+HARD_VIOLATION: untracked_direct_process_launch: crates/storage/eliot-store-surreal-adapter/src/client/session_pool.rs package=eliot-store-surreal-adapter: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 507 (construct, test-gated, cfg=['all', 'test', 'windows'], item='provision'): let mut command = Command::new(&exe);.
+HARD_VIOLATION: untracked_direct_process_launch: workspace/tools/eliot-live-canary/src/lib.rs package=eliot-live-canary: Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 4526 (construct, test-gated, cfg=['test', 'windows'], item='evidence_directory_rejects_junction_ancestor'): let output = std::process::Command::new("cmd.exe").
+TRACKED_DEBT: direct_process_launch: bins/eliot-kernel/src/tests.rs package=eliot-kernel issue=#15: Kernel composition tests still create native processes outside the declared process owner.
+  remove_when: Kernel process fixtures execute through the shared ProcessExecutor test seam and retain equivalent no-orphan/fencing coverage.
+TRACKED_DEBT: direct_process_launch: crates/eliot-app/src/action_plan.rs package=eliot-app issue=#18: The legacy Governor facade still owns direct tool/process execution in action-plan compatibility code.
+  remove_when: The current consumer is migrated to its typed Instrument/process owner or the obsolete facade path is deleted.
+TRACKED_DEBT: direct_process_launch: crates/eliot-app/src/calibration_runtime.rs package=eliot-app issue=#18: The legacy Governor facade still launches calibration processes directly.
+  remove_when: Calibration execution is migrated behind the admitted process and Instrument contracts or the compatibility path is retired.
+TRACKED_DEBT: direct_process_launch: crates/eliot-app/src/cognitive_field_runner.rs package=eliot-app issue=#18: The legacy Governor facade still contains a direct cognitive-field runner process path.
+  remove_when: The current consumer is moved to its declared replaceable execution contour or the runner is removed.
+TRACKED_DEBT: direct_process_launch: crates/eliot-app/src/dogfood.rs package=eliot-app issue=#18: Legacy dogfood orchestration still launches native commands inside the Governor migration facade.
+  remove_when: Dogfood execution is expressed through current typed instruments/process contracts or the legacy path is deleted.
+TRACKED_DEBT: direct_process_launch: crates/eliot-app/src/host_runtime/external_agent.rs package=eliot-app issue=#18: Legacy external-agent execution still launches host runtimes directly from the Governor facade.
+  remove_when: Every current route uses its supervised adapter/process owner and the legacy launch implementation is removed.
+TRACKED_DEBT: direct_process_launch: crates/eliot-app/src/host_runtime/path_and_package_support.rs package=eliot-app issue=#18: Legacy host path/package probes still execute native commands directly.
+  remove_when: Discovery/probing uses an admitted bounded Instrument/process adapter or the obsolete probe is removed.
+TRACKED_DEBT: direct_process_launch: crates/eliot-app/src/host_runtime/tests.rs package=eliot-app issue=#18: Legacy host-runtime tests still bypass the shared process fixture owner.
+  remove_when: The tests use the shared ProcessExecutor fake/real fixture seam or are retired with the facade consumer.
+TRACKED_DEBT: direct_process_launch: crates/eliot-app/src/mcp_stdio/finalization.rs package=eliot-app issue=#18: Legacy MCP finalization still starts native commands inside the migration facade.
+  remove_when: Finalization uses the current bridge/process contract and no direct launch remains in the facade.
+TRACKED_DEBT: direct_process_launch: crates/eliot-app/src/mcp_stdio/protocol_tests.rs package=eliot-app issue=#18: Legacy MCP protocol tests still launch process fixtures directly.
+  remove_when: Protocol fixtures use the admitted bridge/process test owner or the compatibility suite is retired.
+TRACKED_DEBT: direct_process_launch: crates/eliot-app/src/mcp_stdio/provider_handlers.rs package=eliot-app issue=#18: Legacy MCP provider handlers still own direct provider process launch mechanics.
+  remove_when: Provider execution is migrated to the declared adapter/process generation and the facade implementation is removed.
+TRACKED_DEBT: direct_process_launch: crates/eliot-app/src/mcp_stdio/runtime_handlers.rs package=eliot-app issue=#18: Legacy MCP runtime handlers still launch native runtimes directly.
+  remove_when: Runtime handlers delegate to the current supervised route/process owner and direct launch code is deleted.
+TRACKED_DEBT: direct_process_launch: crates/eliot-app/src/mcp_stdio/verification.rs package=eliot-app issue=#18: Legacy verification logic still starts verifier processes inside the Governor facade.
+  remove_when: Verification executes through typed Instrument profiles and the legacy direct-launch path is removed.
+TRACKED_DEBT: direct_process_launch: crates/eliot-app/src/mcp_stdio/work_support.rs package=eliot-app issue=#18: Legacy work-support behavior still launches native commands directly.
+  remove_when: Work support is migrated to current task/Instrument/process owners or the compatibility code is retired.
+TRACKED_DEBT: direct_process_launch: crates/eliot-app/src/provider_budget_runtime.rs package=eliot-app issue=#18: Legacy provider-budget runtime code still starts provider commands directly.
+  remove_when: Provider execution and usage collection use the admitted route adapter/process contract.
+TRACKED_DEBT: direct_process_launch: crates/eliot-app/src/provider_runtime_contract.rs package=eliot-app issue=#18: Legacy provider contract probes still contain direct process launch mechanics.
+  remove_when: Capability probes execute through a typed bounded adapter and the legacy launch code is removed.
+TRACKED_DEBT: direct_process_launch: crates/eliot-app/src/runtime_bootstrap.rs package=eliot-app issue=#18: Legacy runtime bootstrap still owns direct native process startup.
+  remove_when: Bootstrap delegates to Host/Kernel/User Broker or the exact supervised adapter owner and the facade launch is deleted.
+TRACKED_DEBT: direct_process_launch: crates/eliot-app/src/ul_cross_agent_runner.rs package=eliot-app issue=#18: Legacy cross-agent runner still launches native processes inside the Governor facade.
+  remove_when: Agent attempts run through the current Agent Coordinator/route process boundary or the runner is retired.
+TRACKED_DEBT: direct_process_launch: crates/eliot-engine/src/patch.rs package=eliot-engine issue=#18: Legacy engine patch execution still owns direct process mechanics outside the admitted Instrument/process owner.
+  remove_when: Patch execution is migrated to a typed current owner or the unused legacy path is deleted.
+TRACKED_DEBT: direct_process_launch: crates/eliot-engine/src/safety.rs package=eliot-engine issue=#18: Legacy engine safety probes still execute native commands directly.
+  remove_when: Safety probes use admitted typed Instruments/process fixtures and the legacy launch code is removed.
+TRACKED_DEBT: direct_process_launch: crates/eliot-engine/src/worktree.rs package=eliot-engine issue=#18: Legacy worktree helpers still launch Git/native commands directly.
+  remove_when: Worktree operations use the governed tool/process adapter and no direct launch remains in the legacy facade.
+TRACKED_DEBT: direct_process_launch: crates/eliot-store/src/canonical_store/fts_live_tests.rs package=eliot-store issue=#19: Legacy live-store tests still start a Surreal process directly outside the Host-managed dependency contour.
+  remove_when: The fixture uses the shared store-generation/process test owner with exclusive root and no-orphan proof.
+TRACKED_DEBT: direct_process_launch: crates/eliot-store/src/surreal_server.rs package=eliot-store issue=#19: The legacy store facade still owns direct Surreal server process lifecycle mechanics.
+  remove_when: Surreal process lifecycle is exclusively Host-managed through the immutable dependency/process contract.
+TRACKED_DEBT: direct_process_launch: crates/eliot-windows-ipc/src/bin/eliot-process-guardian.rs package=eliot-windows-ipc issue=#100: The legacy IPC process guardian implements native launch mechanics outside the single admitted ProcessExecutor owner.
+  remove_when: Guardian consumers migrate to the shared Windows ProcessExecutor/Job Object contract or the binary is retired.
+TRACKED_DEBT: direct_process_launch: crates/instrument/eliot-r13-harness/src/lib.rs package=eliot-r13-harness issue=#15: Kernel's legacy R13 OS harness still launches native helpers directly instead of using the admitted process-generation adapter.
+  remove_when: The R13 harness is moved to the Instrument/conformance boundary or uses the shared ProcessExecutor contract with an independent edge proof.
+TRACKED_DEBT: direct_process_launch: workspace/tools/eliot-campaign-executor/src/lib.rs package=eliot-campaign-executor issue=#100: The development campaign executor uses a private native-process implementation instead of the shared process contract.
+  remove_when: Campaign execution uses the admitted ProcessExecutor client contract or receives a separately justified development-only owner and proof.
+TRACKED_DEBT: direct_process_launch: workspace/tools/eliot-runtime-compiler/src/lib.rs package=eliot-runtime-compiler issue=#100: The development runtime compiler uses a private native-process implementation instead of the shared process contract.
+  remove_when: Runtime compilation uses the admitted ProcessExecutor client contract or receives a separately justified development-only owner and proof.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-agent-bridge/src/kernel_host_request_client.rs package=eliot-agent-bridge: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-agent-bridge/src/lib.rs package=eliot-agent-bridge: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-agent-bridge/src/main.rs package=eliot-agent-bridge: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-doctor/src/admitted_effect.rs package=eliot-doctor: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-doctor/src/dispatch_authority.rs package=eliot-doctor: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-doctor/src/kernel_client.rs package=eliot-doctor: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-doctor/src/main.rs package=eliot-doctor: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-dreamer/src/bundle_stage.rs package=eliot-dreamer: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-dreamer/src/controller.rs package=eliot-dreamer: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-dreamer/src/curation_screen_stage.rs package=eliot-dreamer: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-dreamer/src/dispatch_stage.rs package=eliot-dreamer: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-dreamer/src/grounding_stage.rs package=eliot-dreamer: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-dreamer/src/kernel_port.rs package=eliot-dreamer: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-dreamer/src/lib.rs package=eliot-dreamer: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-dreamer/src/main.rs package=eliot-dreamer: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-dreamer/src/model_stage.rs package=eliot-dreamer: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-dreamer/src/result_stage.rs package=eliot-dreamer: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-dreamer/src/validation_stage.rs package=eliot-dreamer: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-host/src/credential_control.rs package=eliot-host: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-host/src/host_durable_persistence.rs package=eliot-host: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-host/src/journal_append.rs package=eliot-host: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-host/src/journal_tests.rs package=eliot-host: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-host/src/lib.rs package=eliot-host: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-host/src/main.rs package=eliot-host: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-host/src/phase_b_projection.rs package=eliot-host: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-host/src/readiness_gate.rs package=eliot-host: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-host/src/runtime_restart_state.rs package=eliot-host: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-host/src/runtime_restart_state/pending_codec.rs package=eliot-host: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-host/src/scm_launch.rs package=eliot-host: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-host/src/store_recovery_persistence.rs package=eliot-host: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/composition_bootstrap.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/control_plane.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/daemon_request_dispatch.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/dispatch_launch.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/doctor_recovery_ledger.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/dreamer_dispatch_launch.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/dreamer_job_dispatch.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/generation_control.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/generation_recovery.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/host_request_route.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/kernel_config.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/lib.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/native_worker_lifecycle_route.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/native_worker_reconcile_route.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/native_worker_replay_route.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/notify_operation_identity.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/process_execution.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/provider_capability_route.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/runtime_identity.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/shutdown_drain.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/startup_binding.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/tests/native_worker_reconcile_plumbing.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/tests/native_worker_replay_route.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-kernel/src/tests/provider_capability_plumbing.rs package=eliot-kernel: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-mod-research/src/lib.rs package=eliot-mod-research: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-mod-research/src/main.rs package=eliot-mod-research: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-native-worker/src/dispatch_authority.rs package=eliot-native-worker: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-native-worker/src/kernel_admission_client.rs package=eliot-native-worker: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-native-worker/src/lib.rs package=eliot-native-worker: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-native-worker/src/main.rs package=eliot-native-worker: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-notify/src/lib.rs package=eliot-notify: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-notify/src/main.rs package=eliot-notify: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-notify/src/operation_identity.rs package=eliot-notify: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-store-surreal/src/launch_config.rs package=eliot-store-surreal: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-store-surreal/src/lib.rs package=eliot-store-surreal: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-store-surreal/src/main.rs package=eliot-store-surreal: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-store-surreal/src/request_dispatch.rs package=eliot-store-surreal: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-testd/src/kernel_client.rs package=eliot-testd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-testd/src/lib.rs package=eliot-testd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-testd/src/main.rs package=eliot-testd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-testd/src/worker.rs package=eliot-testd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-user-broker/src/lib.rs package=eliot-user-broker: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-user-broker/src/main.rs package=eliot-user-broker: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-user-broker/src/operation_identity.rs package=eliot-user-broker: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-user-broker/src/protected_launch_config.rs package=eliot-user-broker: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-wasm-host/src/admission.rs package=eliot-wasm-host: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-wasm-host/src/artifact_preflight.rs package=eliot-wasm-host: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-wasm-host/src/lib.rs package=eliot-wasm-host: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-wasm-host/src/shadow.rs package=eliot-wasm-host: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-wasm-host/src/wasmtime_provider.rs package=eliot-wasm-host: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-watchdog/src/diagnostics.rs package=eliot-watchdog: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-watchdog/src/host_identity_observation.rs package=eliot-watchdog: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-watchdog/src/lib.rs package=eliot-watchdog: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-watchdog/src/main.rs package=eliot-watchdog: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-watchdog/src/registry_fixture.rs package=eliot-watchdog: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-watchdog/src/watchdog_admission.rs package=eliot-watchdog: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-watchdog/src/watchdog_composition/authority_state.rs package=eliot-watchdog: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot-watchdog/src/watchdog_service_status.rs package=eliot-watchdog: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot/src/legacy_governor_config.rs package=eliot: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot/src/main.rs package=eliot: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliot/src/source_bundle_materializer.rs package=eliot: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliotd/src/activation_projection.rs package=eliotd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliotd/src/controlboard_adapters.rs package=eliotd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliotd/src/daemon_kernel_client.rs package=eliotd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliotd/src/daemon_runtime.rs package=eliotd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliotd/src/dreamer_admission.rs package=eliotd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliotd/src/dreamer_materials.rs package=eliotd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliotd/src/dreamer_model_adapter.rs package=eliotd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliotd/src/kernel_authority_client.rs package=eliotd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliotd/src/kernel_context_read_client.rs package=eliotd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliotd/src/kernel_transition_client.rs package=eliotd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliotd/src/lib.rs package=eliotd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliotd/src/observation_adapters.rs package=eliotd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliotd/src/skill_lifecycle_adapters.rs package=eliotd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliotd/src/skill_surface_adapters.rs package=eliotd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: large_composition_source: bins/eliot-doctor/src/kernel_client.rs package=eliot-doctor: Composition source has 2507 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: large_composition_source: bins/eliot-host/src/journal_tests.rs package=eliot-host: Composition source has 3625 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: large_composition_source: bins/eliot-host/src/lib.rs package=eliot-host: Composition source has 6217 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: large_composition_source: bins/eliot-kernel/src/dispatch_launch.rs package=eliot-kernel: Composition source has 4620 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: large_composition_source: bins/eliot-kernel/src/lib.rs package=eliot-kernel: Composition source has 2718 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: large_composition_source: bins/eliot-kernel/src/tests.rs package=eliot-kernel: Composition source has 5573 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: large_composition_source: bins/eliot/src/main.rs package=eliot: Composition source has 3516 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: large_composition_source: bins/eliot/src/source_bundle_materializer.rs package=eliot: Composition source has 2597 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: process_lint_config_pending: clippy.toml: Root clippy.toml is absent (controller handoff pending); compiler-lint coverage is not claimed and this report's source-oracle gap coverage stands alone.
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-doctor/Cargo.toml package=eliot-doctor issue=#17: Transitive closure reaches a forbidden owner: eliot-doctor -> eliot-kernel-service -> eliot-store-surreal-adapter
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-host/Cargo.toml package=eliot-host issue=#14: Transitive closure reaches a forbidden owner: eliot-host -> eliot-kernel-service -> eliot-store-surreal-adapter
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-kernel/Cargo.toml package=eliot-kernel issue=#15: Transitive closure reaches a forbidden owner: eliot-kernel -> eliot-kernel-service -> eliot-store-surreal-adapter
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-store-surreal/Cargo.toml package=eliot-store-surreal issue=#19: Transitive closure reaches a forbidden owner: eliot-store-surreal -> eliot-protocol -> eliot-agent-contracts
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-user-broker/Cargo.toml package=eliot-user-broker issue=#23: Transitive closure reaches a forbidden owner: eliot-user-broker -> eliot-protocol -> eliot-agent-contracts
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-watchdog/Cargo.toml package=eliot-watchdog issue=#16: Transitive closure reaches a forbidden owner: eliot-watchdog -> eliot-installation -> eliot-protocol -> eliot-agent-contracts
+AUDIT_SIGNAL: tracked_debt_not_observed: bins/eliot-mod-research/src/lib.rs issue=#24: Exact debt record exists but the scanner did not observe the corresponding source pattern; review/remove the debt entry.
+  remove_when: Research provider execution uses an admitted immutable bridge manifest and shared governed ProcessExecutor semantics.
+---EXIT:1---
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython scripts/audit-architecture-boundaries.py 2>&1 | python3 -c "
+import sys, re, collections
+lines=[l.rstrip('\n') for l in sys.stdin]
+hard=[l for l in lines if l.startswith('HARD_VIOLATION:')]
+sig=[l for l in lines if l.startswith('AUDIT_SIGNAL:')]
+print(f'TOTAL_LINES={len(lines)} HARD={len(hard)} SIG={len(sig)}')
+for l in lines[:1]:
+    print(l)
+# group by issue
+pat=re.compile(r'issue=#(\d+)')
+def key(l):
+    m=pat.search(l)
+    return '#'+m.group(1) if m else '(no issue)'
+from collections import Counter, defaultdict
+c=Counter(key(l) for l in hard+sig)
+print(c)
+# per issue files
+import re
+files=defaultdict(set)
+rules=defaultdict(set)
+for l in hard+sig:
+    k=key(l)
+    m=re.search(r'HARD_VIOLATION:\s*(\S+):\s*(\S+)',l)
+    m2=re.search(r'AUDIT_SIGNAL:\s*(\S+):\s*(\S+)',l)
+    m=m or m2
+    if m:
+        rules[k].add(m.group(1))
+        files[k].add(m.group(2))
+for k in sorted(files, key=lambda x:(x=='(no issue)',x)):
+    print(f'{k} count={c[k]} rules={sorted(rules[k])} files={len(files[k])}')
+"
+
+(no output)
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython scripts/audit-architecture-boundaries.py > $env:TEMP/arch-full.log 2>&1; echo "exit=$LASTEXITCODE"; Get-Content $env:TEMP/arch-full.log | Measure-Object -Line; Get-Content $env:TEMP/arch-full.log | Select-Object -First 5
+exit=1
+
+Lines Words Characters Property
+----- ----- ---------- --------
+  209                  
+ARCHITECTURE_BOUNDARY_AUDIT: hard=32 debt=27 signals=121
+HARD_VIOLATION: runtime_root_forbidden_direct_dependency: bins/eliot-native-worker/Cargo.toml package=eliot-native-worker issue=#22: Direct dependency 'eliot-agent-claude' violates the runtime-root boundary.
+HARD_VIOLATION: runtime_root_forbidden_direct_dependency: bins/eliot-native-worker/Cargo.toml package=eliot-native-worker issue=#22: Direct dependency 'eliot-agent-codex' violates the runtime-root boundary.
+HARD_VIOLATION: runtime_root_forbidden_direct_dependency: bins/eliot-native-worker/Cargo.toml package=eliot-native-worker issue=#22: Direct dependency 'eliot-agent-opencode' violates the runtime-root boundary.
+HARD_VIOLATION: runtime_root_forbidden_direct_dependency: bins/eliotd/Cargo.toml package=eliotd issue=#18: Direct dependency 'eliot-dreamer-bundle' violates the runtime-root boundary.
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython -c "import re,collections; lines=open(r'C:\Users\kleym\AppData\Local\Temp\arch-full.log',encoding='utf-8',errors='replace').read().splitlines(); hard=[l for l in lines if l.startswith('HARD_VIOLATION:')]; sig=[l for l in lines if l.startswith('AUDIT_SIGNAL:')]; print(f'HARD={len(hard)} SIG={len(sig)} TOTAL={len(lines)}'); pat=re.compile(r'issue=#(\d+)'); def key(l): m=pat.search(l); return '#'+m.group(1) if m else '(no issue)'; c=collections.Counter(key(l) for l in hard+sig); print(dict(c)); files=collections.defaultdict(set); rules=collections.defaultdict(set); pkgs=collections.defaultdict(set); import re as R; print('--- per issue ---'); allk=sorted(c, key=lambda x:(x=='(no issue)',x)); fp=re.compile(r'(?:HARD_VIOLATION|AUDIT_SIGNAL):\s*(\S+):\s*(\S+).*?package=(\S+)'); print(allk); details={}; import json; print('---'); [print(repr(l)) for l in hard+sig if '(no issue)'==key(l)][:3]"
+File "<string>", line 1
+    import re,collections; lines=open(r'C:\Users\kleym\AppData\Local\Temp\arch-full.log',encoding='utf-8',errors='replace').read().splitlines(); hard=[l for l in lines if l.startswith('HARD_VIOLATION:')]; sig=[l for l in lines if l.startswith('AUDIT_SIGNAL:')]; print(f'HARD={len(hard)} SIG={len(sig)} TOTAL={len(lines)}'); pat=re.compile(r'issue=#(\d+)'); def key(l): m=pat.search(l); return '#'+m.group(1) if m else '(no issue)'; c=collections.Counter(key(l) for l in hard+sig); print(dict(c)); files=collections.defaultdict(set); rules=collections.defaultdict(set); pkgs=collections.defaultdict(set); import re as R; print('--- per issue ---'); allk=sorted(c, key=lambda x:(x=='(no issue)',x)); fp=re.compile(r'(?:HARD_VIOLATION|AUDIT_SIGNAL):\s*(\S+):\s*(\S+).*?package=(\S+)'); print(allk); details={}; import json; print('---'); [print(repr(l)) for l in hard+sig if '(no issue)'==key(l)][:3]
+                                                                                                                                                                                                                                                                                                                                                                     ^^^
+SyntaxError: invalid syntax
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mGet-Content $env:TEMP/arch-full.log | Select-String '^HARD_VIOLATION' | Measure-Object; Get-Content $env:TEMP/arch-full.log | Select-String '^AUDIT_SIGNAL' | Measure-Object; Get-Content $env:TEMP/arch-full.log | Select-String 'issue=#' | Group-Object { ($_ -match 'issue=#(\d+)' | Out-Null); $Matches[1] } | Sort-Object Name | Format-Table Name,Count -AutoSize | Out-String -Width 200
+Count             : 32
+Average           : 
+Sum               : 
+Maximum           : 
+Minimum           : 
+StandardDeviation : 
+Property          : 
+
+Count             : 121
+Average           : 
+Sum               : 
+Maximum           : 
+Minimum           : 
+StandardDeviation : 
+Property          : 
+
+
+Name Count
+---- -----
+100      3
+14       1
+15       3
+16       1
+17       1
+18      25
+19       3
+22       3
+23       1
+24       1
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mecho "== HARD+SIGNAL with issue =="; Get-Content $env:TEMP/arch-full.log | Select-String '^(HARD_VIOLATION|AUDIT_SIGNAL).*issue=#' | Group-Object { ($_ -match 'issue=#(\d+)' | Out-Null); $Matches[1] } | Sort-Object Name | Format-Table Name,Count -AutoSize | Out-String -Width 200; echo "== HARD only =="; Get-Content $env:TEMP/arch-full.log | Select-String '^HARD_VIOLATION' | Group-Object { if ($_ -match 'issue=#(\d+)') { $Matches[1] } else { '(no issue)' } } | Format-Table Name,Count -AutoSize | Out-String -Width 200; echo "== SIGNAL only =="; Get-Content $env:TEMP/arch-full.log | Select-String '^AUDIT_SIGNAL' | Group-Object { if ($_ -match 'issue=#(\d+)') { $Matches[1] } else { '(no issue)' } } | Format-Table Name,Count -AutoSize | Out-String -Width 200
+== HARD+SIGNAL with issue ==
+
+Name Count
+---- -----
+14       1
+15       1
+16       1
+17       1
+18       5
+19       1
+22       3
+23       1
+24       1
+
+
+== HARD only ==
+
+Name       Count
+----       -----
+(no issue)    24
+18             5
+22             3
+
+
+== SIGNAL only ==
+
+Name       Count
+----       -----
+(no issue)   114
+14             1
+15             1
+16             1
+17             1
+19             1
+23             1
+24             1
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mecho "== HARD no-issue files =="; Get-Content $env:TEMP/arch-full.log | Select-String '^HARD_VIOLATION' | Where-Object { $_ -notmatch 'issue=#' } | ForEach-Object { ($_ -match 'HARD_VIOLATION:\s*(\S+):\s*(\S+).*package=(\S+)' | Out-Null); \"$($Matches[1]) | $($Matches[2]) | $($Matches[3])\" } | Out-String -Width 500; echo "== SIGNAL no-issue rule breakdown =="; Get-Content $env:TEMP/arch-full.log | Select-String '^AUDIT_SIGNAL' | Where-Object { $_ -notmatch 'issue=#' } | ForEach-Object { ($_ -match 'AUDIT_SIGNAL:\s*(\S+):' | Out-Null); $Matches[1] } | Group-Object | Format-Table Name,Count -AutoSize | Out-String -Width 200
+== HARD no-issue files ==
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\: The term '\$($Matches[1]) | $($Matches[2]) | $($Matches[3])\' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+
+== SIGNAL no-issue rule breakdown ==
+
+Name                        Count
+----                        -----
+embedded_composition_tests    105
+large_composition_source        8
+process_lint_config_pending     1
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mGet-Content $env:TEMP/arch-full.log | Select-String '^HARD_VIOLATION' | Where-Object { $_ -notmatch 'issue=#' }
+HARD_VIOLATION: untracked_direct_process_launch: bins/eliot-host/src/runtime_restart_state.rs package=eliot-host: 
+Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: 
+line 1013 (construct, test-gated, cfg=['test', 'windows'], 
+item='runtime_restart_abrupt_child_causal_success_and_fault_reopen'): let mut child = 
+std::process::Command::new(&exe); line 1027 (construct, test-gated, cfg=['test', 'windows'], 
+item='runtime_restart_abrupt_child_causal_success_and_fault_reopen'): let mut child2 = 
+std::process::Command::new(&exe).
+HARD_VIOLATION: untracked_direct_process_launch: bins/eliot-host/src/store_recovery_persistence.rs package=eliot-host: 
+Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: 
+line 2144 (construct, test-gated, cfg=['test', 'windows'], item='store_abrupt_child_causal_success_and_fault_reopen'): 
+let mut child = std::process::Command::new(&exe); line 2158 (construct, test-gated, cfg=['test', 'windows'], 
+item='store_abrupt_child_causal_success_and_fault_reopen'): let mut child2 = std::process::Command::new(&exe).
+HARD_VIOLATION: untracked_direct_process_launch: bins/eliot-store-surreal/src/request_dispatch.rs 
+package=eliot-store-surreal: Direct process launch outside a declared process owner missed by the legacy constructor 
+gate has no exact debt record: line 1040 (construct, test-gated, cfg=['test'], item='prepare_initial_root_user'): let 
+mut child = std::process::Command::new(exe).
+HARD_VIOLATION: untracked_direct_process_launch: crates/eliot-app/src/host_runtime/supervised_process.rs 
+package=eliot-app: Direct process launch outside a declared process owner missed by the legacy constructor gate has no 
+exact debt record: line 993 (construct, production, item='run_worker'): let mut command = 
+Command::new(&spec.executable);; line 2099 (construct, test-gated, cfg=['test'], 
+item='supervised_process_native_fixture'): let mut descendant = std::process::Command::new(std::env::current_exe()?).
+HARD_VIOLATION: untracked_direct_process_launch: crates/eliot-app/src/mcp_stdio.rs package=eliot-app: Direct process 
+launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 1211 
+(construct, production, item='validate_bound_worktree_lease'): let head = Command::new("git.exe").
+HARD_VIOLATION: untracked_direct_process_launch: crates/eliot-app/src/named_pipe_ipc.rs package=eliot-app: Direct 
+process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 
+1312 (construct, production, item='current_windows_sid'): let output = Command::new("whoami.exe"); line 1336 
+(construct, production, item='restrict_directory_to_current_user'): let output = Command::new("icacls.exe").
+HARD_VIOLATION: untracked_direct_process_launch: crates/eliot-engine/src/antigravity.rs package=eliot-engine: Direct 
+process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 
+406 (construct, production, item='probe'): let output = ProcessCommand::new("tasklist.exe"); line 3289 (construct, 
+production, item='where_command_hits'): let Ok(output) = ProcessCommand::new("where.exe"); line 3374 (construct, 
+production, item='run_bounded_command'): let mut command = ProcessCommand::new(path);; line 3407 (construct, 
+production, item='terminate_process_tree'): let _ = ProcessCommand::new("taskkill.exe"); line 3672 (construct, 
+production, item='git_bytes_sync'): let output = ProcessCommand::new("git").
+HARD_VIOLATION: untracked_direct_process_launch: crates/eliot-engine/src/codecortex.rs package=eliot-engine: Direct 
+process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 
+575 (construct, production, item='run_process'): let output = 
+Command::new(program).args(args).current_dir(cwd).output()?;.
+HARD_VIOLATION: untracked_direct_process_launch: crates/eliot-engine/src/cognitive_projection.rs package=eliot-engine: 
+Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: 
+line 1638 (construct, test-gated, cfg=['test'], item='require_exact_surreal_version'): let output = 
+Command::new(&config.exe).arg("version").output()?;.
+HARD_VIOLATION: untracked_direct_process_launch: crates/eliot-engine/src/verification/current.rs package=eliot-engine: 
+Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: 
+line 181 (construct, test-gated, cfg=['test'], item='compile_probe'): let output = std::process::Command::new(rustc); 
+line 338 (construct, test-gated, cfg=['test'], item='current_run_through_registered_nextest_binding_passes'): let 
+nextest_output = std::process::Command::new(cargo); line 362 (construct, test-gated, cfg=['test'], 
+item='current_run_through_registered_nextest_binding_passes'): let probe_output = std::process::Command::new(&exe); 
+line 417 (construct, test-gated, cfg=['test'], item='current_run_rejects_unadmitted_inputs'): let probe_output = 
+std::process::Command::new(&exe).
+HARD_VIOLATION: untracked_direct_process_launch: crates/eliot-store/src/payload_byte_preservation.rs 
+package=eliot-store: Direct process launch outside a declared process owner missed by the legacy constructor gate has 
+no exact debt record: line 230 (construct, test-gated, cfg=['all', 'feature', 'test'], item='spawn_scratch'): let mut 
+spawn = Command::new(exe);.
+HARD_VIOLATION: untracked_direct_process_launch: crates/eliot-windows-ipc/src/lib.rs package=eliot-windows-ipc: Direct 
+process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 
+1359 (raw-launch, production, item='spawn_named'): CreateProcessW(; line 2780 (construct, test-gated, cfg=['test'], 
+item='supervised_fixture_command'): let mut command = std::process::Command::new(std::env::current_exe()?);; line 2909 
+(construct, test-gated, cfg=['test'], item='managed_powershell'): let mut command = std::process::Command::new(; line 
+2937 (construct, test-gated, cfg=['test'], item='managed_cmd'): let mut command = 
+std::process::Command::new(comspec);; line 3317 (construct, test-gated, cfg=['test'], 
+item='new_output_writer_rejects_precreated_junction_without_touching_target'): let status = 
+std::process::Command::new("cmd").
+HARD_VIOLATION: untracked_direct_process_launch: crates/instrument/eliot-verifier/src/lib.rs package=eliot-verifier: 
+Direct process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: 
+line 942 (construct, test-gated, cfg=['test'], item='compile_probe'): let output = std::process::Command::new(rustc); 
+line 962 (construct, test-gated, cfg=['test'], item='run_probe'): Ok(std::process::Command::new(exe).
+HARD_VIOLATION: untracked_direct_process_launch: crates/kernel/eliot-host-state/src/redb_journal.rs 
+package=eliot-host-state: Direct process launch outside a declared process owner missed by the legacy constructor gate 
+has no exact debt record: line 1958 (construct, test-gated, cfg=['test', 'windows'], 
+item='runtime_openers_reject_reparse_parent_without_touching_target'): let output = Command::new("cmd.exe").
+HARD_VIOLATION: untracked_direct_process_launch: crates/kernel/eliot-installation/src/redb_state.rs 
+package=eliot-installation: Direct process launch outside a declared process owner missed by the legacy constructor 
+gate has no exact debt record: line 3426 (construct, test-gated, cfg=['test', 'windows'], 
+item='create_planned_rejects_reparse_parent_before_publication'): let link = std::process::Command::new("cmd.exe").
+HARD_VIOLATION: untracked_direct_process_launch: crates/kernel/eliot-ipc/src/lib.rs package=eliot-ipc: Direct process 
+launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 3646 
+(construct, test-gated, cfg=['test', 'windows'], 
+item='server_authenticates_distinct_client_pid_sid_session_and_process'): let mut child = 
+std::process::Command::new(std::env::current_exe()?); line 3767 (construct, test-gated, cfg=['test', 'windows'], 
+item='kernel_front_door_live_proof_retains_process_file_and_extra_sid'): let mut child = 
+std::process::Command::new(std::env::current_exe()?).
+HARD_VIOLATION: untracked_direct_process_launch: crates/kernel/eliot-kernel-service/src/store_gateway.rs 
+package=eliot-kernel-service: Direct process launch outside a declared process owner missed by the legacy constructor 
+gate has no exact debt record: line 1959 (construct, test-gated, cfg=['test'], item='bootstrap_root_user'): let mut 
+child = tokio::process::Command::new(exe).
+HARD_VIOLATION: untracked_direct_process_launch: crates/meta/eliot-runtime-status/src/lib.rs 
+package=eliot-runtime-status: Direct process launch outside a declared process owner missed by the legacy constructor 
+gate has no exact debt record: line 5134 (construct, test-gated, cfg=['test'], 
+item='separate_process_cli_readback_matches_in_process_and_no_writes'): let output = 
+std::process::Command::new("cargo"); line 5637 (construct, test-gated, 
+item='production_subprocess_reports_projection_without_writing'): let output = std::process::Command::new("cargo").
+HARD_VIOLATION: untracked_direct_process_launch: crates/storage/eliot-store-surreal-adapter/src/apply.rs 
+package=eliot-store-surreal-adapter: Direct process launch outside a declared process owner missed by the legacy 
+constructor gate has no exact debt record: line 2087 (construct, test-gated, cfg=['test', 'windows'], item='start'): 
+let mut child = Command::new(&exe).
+HARD_VIOLATION: untracked_direct_process_launch: crates/storage/eliot-store-surreal-adapter/src/apply/read_boundary.rs 
+package=eliot-store-surreal-adapter: Direct process launch outside a declared process owner missed by the legacy 
+constructor gate has no exact debt record: line 2366 (construct, test-gated, cfg=['all', 'test', 'windows'], 
+item='start'): let mut child = Command::new(&exe).
+HARD_VIOLATION: untracked_direct_process_launch: 
+crates/storage/eliot-store-surreal-adapter/src/client/provider_owner.rs package=eliot-store-surreal-adapter: Direct 
+process launch outside a declared process owner missed by the legacy constructor gate has no exact debt record: line 
+184 (construct, production, item='spawn_provider'): let mut command = Command::new(&config.provider_executable_path);.
+HARD_VIOLATION: untracked_direct_process_launch: crates/storage/eliot-store-surreal-adapter/src/client/session.rs 
+package=eliot-store-surreal-adapter: Direct std/tokio process launch is outside a declared process owner and has no 
+exact debt record.
+HARD_VIOLATION: untracked_direct_process_launch: crates/storage/eliot-store-surreal-adapter/src/client/session_pool.rs 
+package=eliot-store-surreal-adapter: Direct process launch outside a declared process owner missed by the legacy 
+constructor gate has no exact debt record: line 507 (construct, test-gated, cfg=['all', 'test', 'windows'], 
+item='provision'): let mut command = Command::new(&exe);.
+HARD_VIOLATION: untracked_direct_process_launch: workspace/tools/eliot-live-canary/src/lib.rs 
+package=eliot-live-canary: Direct process launch outside a declared process owner missed by the legacy constructor 
+gate has no exact debt record: line 4526 (construct, test-gated, cfg=['test', 'windows'], 
+item='evidence_directory_rejects_junction_ancestor'): let output = std::process::Command::new("cmd.exe").
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead workstreams/ACTIVE.toml 
+[0m$ [0mjust architecture-boundaries 2>&1 | Select-Object -Last 20; echo "JUST_EXIT:$LASTEXITCODE"
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliotd/src/skill_lifecycle_adapters.rs package=eliotd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: embedded_composition_tests: bins/eliotd/src/skill_surface_adapters.rs package=eliotd: Composition source contains an in-file cfg(test) cluster; verify that independent proofs live at the owning cell boundary.
+AUDIT_SIGNAL: large_composition_source: bins/eliot-doctor/src/kernel_client.rs package=eliot-doctor: Composition source has 2507 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: large_composition_source: bins/eliot-host/src/journal_tests.rs package=eliot-host: Composition source has 3625 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: large_composition_source: bins/eliot-host/src/lib.rs package=eliot-host: Composition source has 6217 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: large_composition_source: bins/eliot-kernel/src/dispatch_launch.rs package=eliot-kernel: Composition source has 4620 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: large_composition_source: bins/eliot-kernel/src/lib.rs package=eliot-kernel: Composition source has 2718 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: large_composition_source: bins/eliot-kernel/src/tests.rs package=eliot-kernel: Composition source has 5573 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: large_composition_source: bins/eliot/src/main.rs package=eliot: Composition source has 3516 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: large_composition_source: bins/eliot/src/source_bundle_materializer.rs package=eliot: Composition source has 2597 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: process_lint_config_pending: clippy.toml: Root clippy.toml is absent (controller handoff pending); compiler-lint coverage is not claimed and this report's source-oracle gap coverage stands alone.
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-doctor/Cargo.toml package=eliot-doctor issue=#17: Transitive closure reaches a forbidden owner: eliot-doctor -> eliot-kernel-service -> eliot-store-surreal-adapter
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-host/Cargo.toml package=eliot-host issue=#14: Transitive closure reaches a forbidden owner: eliot-host -> eliot-kernel-service -> eliot-store-surreal-adapter
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-kernel/Cargo.toml package=eliot-kernel issue=#15: Transitive closure reaches a forbidden owner: eliot-kernel -> eliot-kernel-service -> eliot-store-surreal-adapter
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-store-surreal/Cargo.toml package=eliot-store-surreal issue=#19: Transitive closure reaches a forbidden owner: eliot-store-surreal -> eliot-protocol -> eliot-agent-contracts
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-user-broker/Cargo.toml package=eliot-user-broker issue=#23: Transitive closure reaches a forbidden owner: eliot-user-broker -> eliot-protocol -> eliot-agent-contracts
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-watchdog/Cargo.toml package=eliot-watchdog issue=#16: Transitive closure reaches a forbidden owner: eliot-watchdog -> eliot-installation -> eliot-protocol -> eliot-agent-contracts
+AUDIT_SIGNAL: tracked_debt_not_observed: bins/eliot-mod-research/src/lib.rs issue=#24: Exact debt record exists but the scanner did not observe the corresponding source pattern; review/remove the debt entry.
+  remove_when: Research provider execution uses an admitted immutable bridge manifest and shared governed ProcessExecutor semantics.
+error: recipe `architecture-boundaries` failed on line 53 with exit code 1
+JUST_EXIT:1
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit rev-parse HEAD; git status --short --branch | Select-Object -First 40; Get-Content $env:TEMP/arch-full.log | Select-Object -Last 12
+4d427ca9b20630e2880a64ca9201918935cb123e
+## HEAD (no branch)
+?? prompt-archmap.txt
+?? prompt-closure.txt
+?? prompt-nextgate.txt
+?? prompt-provenance.txt
+?? prompt-safix.txt
+?? prompt-standalone.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-archmap.log
+?? stderr-closure.log
+?? stderr-nextgate.log
+?? stderr-prov.log
+?? stderr-safix.log
+?? stderr-standalone.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-archmap.log
+?? stdout-closure.log
+?? stdout-nextgate.log
+?? stdout-prov.log
+?? stdout-safix.log
+?? stdout-standalone.log
+?? stdout-syncfix.log
+?? stdout.log
+AUDIT_SIGNAL: large_composition_source: bins/eliot-kernel/src/tests.rs package=eliot-kernel: Composition source has 5573 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: large_composition_source: bins/eliot/src/main.rs package=eliot: Composition source has 3516 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: large_composition_source: bins/eliot/src/source_bundle_materializer.rs package=eliot: Composition source has 2597 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: process_lint_config_pending: clippy.toml: Root clippy.toml is absent (controller handoff pending); compiler-lint coverage is not claimed and this report's source-oracle gap coverage stands alone.
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-doctor/Cargo.toml package=eliot-doctor issue=#17: Transitive closure reaches a forbidden owner: eliot-doctor -> eliot-kernel-service -> eliot-store-surreal-adapter
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-host/Cargo.toml package=eliot-host issue=#14: Transitive closure reaches a forbidden owner: eliot-host -> eliot-kernel-service -> eliot-store-surreal-adapter
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-kernel/Cargo.toml package=eliot-kernel issue=#15: Transitive closure reaches a forbidden owner: eliot-kernel -> eliot-kernel-service -> eliot-store-surreal-adapter
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-store-surreal/Cargo.toml package=eliot-store-surreal issue=#19: Transitive closure reaches a forbidden owner: eliot-store-surreal -> eliot-protocol -> eliot-agent-contracts
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-user-broker/Cargo.toml package=eliot-user-broker issue=#23: Transitive closure reaches a forbidden owner: eliot-user-broker -> eliot-protocol -> eliot-agent-contracts
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-watchdog/Cargo.toml package=eliot-watchdog issue=#16: Transitive closure reaches a forbidden owner: eliot-watchdog -> eliot-installation -> eliot-protocol -> eliot-agent-contracts
+AUDIT_SIGNAL: tracked_debt_not_observed: bins/eliot-mod-research/src/lib.rs issue=#24: Exact debt record exists but the scanner did not observe the corresponding source pattern; review/remove the debt entry.
+  remove_when: Research provider execution uses an admitted immutable bridge manifest and shared governed ProcessExecutor semantics.
+> build · muse-spark-1.3-contributor-free

@@ -1,0 +1,45 @@
+Syncing code-navigation index and re-checking the gate.
+Sync is clean and the navigation gate now passes — pulling the final failure details.
+Final report — sanctioned sync fix (detached HEAD, no branches/commits):
+
+**1. `just code-navigation-sync` — exact output (exit 0):**
+```text
+PACKAGE_DOC_INDEX_WRITE: PASS path=docs/code-navigation/PACKAGE_DOCS_INDEX.md workspace_members=174
+PROTOTYPE_DOC_INDEX_WRITE: PASS nonmember_prototypes=11
+PACKAGE_DOC_INDEX_CHECK: PASS workspace_members=174 default_members=6 logical_blocks=15
+PROTOTYPE_DOC_INDEX_CHECK: PASS nonmember_prototypes=11
+```
+
+**2. `just quick` re-run — RED (fails later than before):**
+Code-navigation recipe now GREEN:
+```text
+python scripts/code_navigation.py check --root .
+CODE_NAVIGATION_CHECK: PASS workspace_members=174 default_members=6 nonmember_packages=11 rust_files=1571 logical_blocks=15
+PACKAGE_DOC_INDEX_CHECK: PASS workspace_members=174 default_members=6 logical_blocks=15
+PROTOTYPE_DOC_INDEX_CHECK: PASS nonmember_prototypes=11
+```
+New failure tail:
+```text
+python scripts/docs_closure_audit.py --root .
+DOC_CLOSURE_AUDIT: errors=2 warnings=45 info=27 report=.eliot/docs-closure-audit
+error: recipe `docs-closure-audit` failed on line 36 with exit code 1
+```
+Audit errors (`audit.md`):
+- `ERROR DOC-ORIGINAL-NOT-FOUND: no Git-history version of the monolith matches reconstructed bytes - docs/architecture/ELIOT_IMPLEMENTATION.md`
+- `ERROR DOC-ORIGINAL-PAIR-COMMIT: Architecture and Implementation do not share a Git commit with both adopted byte streams`
+
+No builds/clippy/test suites run beyond the two recipes (plus `just docs-closure-audit` once to confirm exact lines).
+
+**3. File disposition (`git status --short --branch`, HEAD `f0abfe139e944f781344df037268ba2845ae77dc`, still `## HEAD (no branch)`):**
+- Tracked modified by sync (1 file, `git diff --stat`: `11 insertions(+), 11 deletions(-)`):
+  - `M docs/code-navigation/PACKAGE_DOCS_INDEX.md`
+- Untracked (pre-existing harness artifacts, not sync products):
+  - `?? prompt-syncfix.txt`
+  - `?? prompt.txt`
+  - `?? stderr-syncfix.log`
+  - `?? stderr.log`
+  - `?? stdout-syncfix.log`
+  - `?? stdout.log`
+- `.eliot/docs-closure-audit/audit.{json,md}` regenerated but ignored (not in status).
+
+Nothing committed, pushed, merged, or closed. Nothing to push.

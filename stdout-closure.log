@@ -1,0 +1,48 @@
+Investigating the docs-closure failures — tracing git history to find the divergence.
+Audit shows the implementation reconstruction matches zero historical versions. I'll verify the exact byte divergence against git objects.
+The implementation digest changed without a matching monolith update. I'll pinpoint the exact source commit.
+Initial byte comparison didn't produce output. I'll switch to a working approach.
+Confirmed the monolith diverged from the sharded reconstruction. I'll gather the final evidence for the fix plan.
+# Docs-closure audit root-cause report (investigation only — nothing changed, committed, or pushed)
+
+## Verdict up front
+
+**Both errors are pre-existing on `main`, not introduced by this worktree.** The worktree (`37deb67e`) has an empty tree-diff against `origin/main` (`09c2c902`); its only commit over `f0abfe13` touches `docs/code-navigation/PACKAGE_DOCS_INDEX.md`. The defect was introduced by the I9.4 amendment + resync pair (`8901ad7b` → `a9b51160`), both ancestors of `main`, and no later commit touches the affected paths.
+
+## The two errors
+
+Regenerated locally with `python scripts/docs_closure_audit.py --root .` → `errors=2 warnings=45 info=27`, identical to the committed `.eliot/docs-closure-audit/audit.md` (which records commit `f0abfe13`, the parent of the `main` tip):
+
+- `ERROR DOC-ORIGINAL-NOT-FOUND` — no Git-history version of `docs/architecture/ELIOT_IMPLEMENTATION.md` matches reconstructed bytes (audit: `implementation: reconstructed blob UNKNOWN; matching historical versions: 0`).
+- `ERROR DOC-ORIGINAL-PAIR-COMMIT` — no shared commit holds both adopted byte streams (`Common exact original commits: none`).
+
+Check logic: `scripts/docs_closure_audit.py:452-518` (`history_matches` + `validate_originals`) — reconstructs each book from shard manifests (reversing `navigation_rewrites`, `validate_manifest` at `:302`), then scans `git log --all -- <monolith-path>` comparing SHA-256.
+
+## Root cause (verified against git objects, not just script output)
+
+1. **Sharding (`75a868bc`) replaced both monoliths with compatibility facades.** Since then `docs/architecture/ELIOT_IMPLEMENTATION.md` is a 154,307-byte map (`ELIOT_IMPLEMENTATION.md:1-11`: "This stable path is a compatibility map, not the full normative book"), and `ELIOT_ARCHITECTURE.md` is a 23,333-byte facade. The audit still passed because history retained the full pre-shard versions, and the manifests still reconstructed exactly those bytes:
+   - impl manifest `source_sha256` at `75a868bc` = `7805bf23…f063` (999,718 bytes) = `git show c0a880a2:…ELIOT_IMPLEMENTATION.md` (999,718 bytes, blob `490e9e70…`). Pair file agreed (`implementation_sha256 = 7805bf23…` at `c0a880a2`, `75a868bc`, `8901ad7b`).
+   - arch reconstruction `c6932eaf…` (149,403 bytes, blob `81ad1508…`) matches `c0a880a2` — the audit's single architecture match.
+2. **The I9.4 amendment (`8901ad7b`, "#1980: I9.4 canonizes two objects… (#1983)") edited the shard fragment `docs/architecture/I09-04-dreamer-input-bundle.md` (+75 net lines: `DreamJobAdmission` envelope + `DreamJobInput` semantic bundle) but updated neither the manifest nor the pair** — leaving manifests stale (manifest at `8901ad7b` still `7805bf23…`, 999,718 bytes).
+3. **The resync (`a9b51160` on `main`; duplicate `ed5c60a8` is not an ancestor of `main`) updated the manifest (now `40b0908a…`, 1,003,351 bytes, +3,633), `docs/normative-pair.toml:12,26` (`pair_key 3ea4dc34…`, `implementation_sha256 40b0908a…`), indexes, and `SPLIT_REPORT.md:7,15` — but never recorded the new full byte stream as a version of the monolith path**, which still holds the 154,307-byte facade (sha `63e6de3b…`, unchanged since `75a868bc`).
+4. **Consequence, enumerated from objects:** every historical version of the impl monolith path is one of three byte streams (`c216fb7f…` @`1122e21b`, `7805bf23…` @`c0a880a2`, `63e6de3b…` facade @`75a868bc`→tip) — none equals `40b0908a…`. Hence 0 matches → `DOC-ORIGINAL-NOT-FOUND`; architecture matches only `c0a880a2`, so the intersection is empty → `DOC-ORIGINAL-PAIR-COMMIT`. The 3,532-line manifest diff at the resync with zero other fragment-file changes is consistent: all post-I09-04 fragment offsets/hashes shifted.
+
+## Pre-existing-on-main evidence
+
+- `git merge-base --is-ancestor 8901ad7b HEAD` → 0; `a9b51160 HEAD` → 0; same for `origin/main`. (`ed5c60a8` → 1: superseded duplicate, not on `main`.)
+- `git log a9b51160..origin/main -- <impl-monolith, impl-manifest, normative-pair, I09-04 fragment>` → **empty**: untouched since the resync.
+- `git diff origin/main HEAD --stat` → empty; `37deb67e` stat = only `PACKAGE_DOCS_INDEX.md`.
+- Committed `audit.md` at `f0abfe13` (parent of `09c2c902`) already shows the same 2 errors; fresh audit at `37deb67e` reproduces identical SHAs/counts.
+
+## Minimal fix plan (proposal only — not executed)
+
+**Recommended (data-only, preserves tip design): two-commit adopt-then-restore:**
+
+1. Commit A ("adopt"): write the two exact adopted byte streams to the legacy paths — arch bytes from `git show c0a880a2:docs/architecture/ELIOT_ARCHITECTURE.md` (149,403 B, `c6932eaf…`), impl bytes from deterministic manifest reconstruction (1,003,351 B, `40b0908a…`; generate via `scripts/docs_shards_core.py` / the audit's own reconstruction, verify with `git hash-object`). This creates the common commit the audit requires.
+2. Commit B: restore the two facades byte-identical (so tip trees are unchanged; only history gains the provenance commit). Future audits pass via `git log --all`.
+
+- Files touched: `docs/architecture/ELIOT_ARCHITECTURE.md`, `docs/architecture/ELIOT_IMPLEMENTATION.md` (two commits; no manifest/pair/code changes needed — they already agree).
+- Risks: intermediate commit carries ~1.1 MB of full text; bytes must be machine-generated, never hand-edited, or the SHA match fails closed. Confirm `SPLIT_REPORT.md` / `READING_PROTOCOL.md` don't forbid transient full-text commits; if they do, the alternative is amending `scripts/docs_closure_audit.py` history resolution (code change, needs docs-routing + wider review — not minimal).
+- Rejected alternative: reverting I9.4 (discards approved normative change) or editing the facade (154 KB ≠ 1,003,351 B, can never satisfy the digest).
+
+Worktree left untouched: `git status` shows only the pre-existing untracked prompt/log files; scratch regeneration stayed inside ignored `.eliot/`; temp scripts were outside the repo and removed.

@@ -1,0 +1,629 @@
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit status --short --branch; echo "---"; git rev-parse HEAD; echo "---"; git log --oneline -5
+## work/code-navigation-sync
+?? prompt-closure.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-syncfix.log
+?? stdout.log
+---
+37deb67e9690adaeada83340f1d7d81d5b98dfe3
+---
+37deb67e docs: refresh package docs index via code-navigation-sync (just quick navigation gate green)
+f0abfe13 fix: update stale architecture doc paths in contracts and assignments (#2024)
+716755b1 [store/sconc] Bounded in-transaction allocation with contention retry (slice #989) (#2023)
+1479ae85 [kernel/store] Bind Kernel writes to durable ORS reservation (slice #992) (#2022)
+eaf77281 [store/sconc] Carry reserved-write contract through authenticated path (slice #991) (#2021)
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead .eliot/docs-closure-audit/audit.md 
+[0m$ [0mgit log --oneline --all -- docs/architecture/ELIOT_IMPLEMENTATION.md | head -20; echo "==="; git log --oneline origin/main -5 2>&1 | head -20; echo "==="; git branch -vv | head -20
+head: The term 'head' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+===
+head: The term 'head' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+===
+head: The term 'head' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit log --oneline --all -- docs/architecture/ELIOT_IMPLEMENTATION.md | Select-Object -First 20; echo "===IMPL==="; git log --oneline --all -- docs/architecture/ELIOT_ARCHITECTURE.md | Select-Object -First 20
+75a868bc docs: shard normative books and enforce routed reading
+c0a880a2 docs: adopt 2026-08-28 normative pair and inventory core/daemon work
+1122e21b Refresh architecture documentation and related runtime tooling
+===IMPL===
+75a868bc docs: shard normative books and enforce routed reading
+c0a880a2 docs: adopt 2026-08-28 normative pair and inventory core/daemon work
+1122e21b Refresh architecture documentation and related runtime tooling
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit log --oneline -15; echo "===BRANCHES==="; git branch -vv | Select-Object -First 20; echo "===STATUS f0abfe==="; git show --stat --oneline f0abfe13 | Select-Object -First 60
+37deb67e docs: refresh package docs index via code-navigation-sync (just quick navigation gate green)
+f0abfe13 fix: update stale architecture doc paths in contracts and assignments (#2024)
+716755b1 [store/sconc] Bounded in-transaction allocation with contention retry (slice #989) (#2023)
+1479ae85 [kernel/store] Bind Kernel writes to durable ORS reservation (slice #992) (#2022)
+eaf77281 [store/sconc] Carry reserved-write contract through authenticated path (slice #991) (#2021)
+3e1b3dcd [retrieval] Delivery trace-handle binding with exact counts (slice #1949) (#2019)
+da0ab172 [kernel] Versioned capacity-evidence schemas with explicit unknown (slice #1848) (#2020)
+3cc6e663 [store/sconc] Store-neutral write-reservation projection (slice #990) (#2018)
+99407aa6 [agent/swarm] Connect swarm coordination to durable jobs and provider execution (#1127)
+e358cf08 [governor] Canonical attach-once for swarm plan binding (+durable CAS contract, #1126) (#2016)
+f74c20e5 [contracts] Dreamer slices #584 (1-12/63) + #610 (1-5/42) (#2015)
+5a5036b5 [store/sconc] Bounded session pool + pure scheduler (slices #987/#988) (#2014)
+e5227403 [store/surreal] Preserve record free text across RPC boundary (slice A of #10) (#2013)
+96935947 [store/disposition] Typed wire rejection + crate disposition proofs (slices #1699/#1714/#1715/#1716) (#2012)
+4f89c846 [test/epistemic-contracts] Prove assumption/investigation never serialize as support (#38) (#2011)
+===BRANCHES===
+  astra/T11.2                               772d8bee [origin/astra/T11.2] fix(T11.2): compare predecessor identity without extra provider dependency
+  chore/admit-research-synthesis            b58ef57a [origin/chore/admit-research-synthesis: gone] chore(workspace): admit eliot-dreamer-research-synthesis (Implements #995)
+  chore/drop-legacy-epoch-backup-test       6b7f1327 [origin/chore/drop-legacy-epoch-backup-test: gone] chore(eliot-backup): drop the legacy scalar-epoch import assertions
+  chore/remove-837-temp-evidence            22d9d96e [origin/main: ahead 1, behind 277] chore: remove swarm evidence note committed into .github/temporary by #1443
+  chore/remove-committed-swarm-evidence     7f2a390d [origin/chore/remove-committed-swarm-evidence: gone] chore: remove committed swarm evidence and close doc-code conformance
++ codex/simplify-root-agents                964c06d2 (C:/Development/Rust/worktrees/simplify-root-agents) docs: simplify root agent instructions
+  docs/1147-remove-stale-provenance         8ddd7e6e docs(1147): replace stale provenance with canonical handles in packet quality, codecortex evidence adapter, memory writer and traceability retirement
+  docs/1231-start-authority-mgr03           a10927cd docs(onboarding): allocate START authority alignment
+  docs/342-agent-bridge-host-port           81310cb2 [origin/docs/342-agent-bridge-host-port: gone] Wave A 342 kernel host-request binding (real code, no stubs)
+  fix/10-payload-harness-readiness          b0b7c005 WIP: single shared readiness module via payload_tests, ptr_arg + duplicate_mod fixes
+  fix/10-payload-harness-readiness3         e25cb717 WIP: single shared readiness module via payload_tests, ptr_arg + duplicate_mod fixes
+  fix/1714-test-imports                     f89deb29 [origin/fix/1714-test-imports: gone] kernel/store: import the typed failure types into the store_client test module
++ integ/706-cue-legacy                      e9451f89 (C:/Development/Rust/projects/eliot-swarm/mgr02-item-706b) [origin/integ/706-cue-legacy] work/706: warning-clean oracle, grounded future-value probes, pinned fmt digests
++ main                                      09c2c902 (C:/Development/Rust/projects/eliot-memory-os) [origin/main] docs: refresh package docs index via code-navigation-sync (just quick navigation gate green) (#2026)
+  mgr19-992-final                           3f256b44 [store/sconc] Harden slice #992 FINAL audits F1-F4
+  mgr20-989-rend                            85e38fa3 [origin/work/slice-989-sconc: behind 2] [store/sconc] Production-path transaction-attempt rendezvous proof (slice #989)
+  mgr20-989-rework                          d976710f [origin/work/slice-989-sconc: behind 3] [store/sconc] Structural rework: unguarded production allocation, narrow recompute, exclusive classifier (slice #989)
+  mgr20-989-rv2                             d3218432 [origin/work/slice-989-sconc: behind 1] [store/sconc] Fix unreachable rendezvous gate; prove arrivals with third-party observer (slice #989)
+  pr-1610                                   ea51c3e6 fix: resolve documentation and code conformance discrepancies
+  pr-2001-review                            1e4e1a0a fix: resolve doc-code conformance drift in AGENTS.md and test_wave_admission_s2.py
+===STATUS f0abfe===
+f0abfe13 fix: update stale architecture doc paths in contracts and assignments (#2024)
+ crates/agent/eliot-swarm/durable-runtime.contract.toml                | 2 +-
+ crates/security/eliot-erasure/runtime-closure.contract.toml           | 4 ++--
+ .../core-daemons/assignments/024-research-provider-runtime.toml       | 4 ++--
+ workstreams/dreamer/assignments/595-prehandler-validation.toml        | 2 +-
+ workstreams/product/assignments/011-installed-product-pulse.toml      | 4 ++--
+ 5 files changed, 8 insertions(+), 8 deletions(-)
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit rev-parse HEAD origin/main main 2>&1; echo "==="; git log --oneline origin/main --max-count=5 2>&1 | Select-Object -First 10; echo "===MERGEBASE==="; git merge-base HEAD origin/main 2>&1; echo "===DIFF main HEAD==="; git diff --stat origin/main HEAD 2>&1 | Select-Object -First 30; echo "===DIFF main local==="; git diff --stat main HEAD 2>&1 | Select-Object -First 30
+37deb67e9690adaeada83340f1d7d81d5b98dfe3
+09c2c902d31bae9ceb7f37ab14b6ea2084b47b9a
+09c2c902d31bae9ceb7f37ab14b6ea2084b47b9a
+===
+09c2c902 docs: refresh package docs index via code-navigation-sync (just quick navigation gate green) (#2026)
+f0abfe13 fix: update stale architecture doc paths in contracts and assignments (#2024)
+716755b1 [store/sconc] Bounded in-transaction allocation with contention retry (slice #989) (#2023)
+1479ae85 [kernel/store] Bind Kernel writes to durable ORS reservation (slice #992) (#2022)
+eaf77281 [store/sconc] Carry reserved-write contract through authenticated path (slice #991) (#2021)
+===MERGEBASE===
+f0abfe139e944f781344df037268ba2845ae77dc
+===DIFF main HEAD===
+===DIFF main local===
+> build · muse-spark-1.3-contributor-free
+[0m✱ [0mGlob "**/*closure*" [90m19 matches[0m
+[0m$ [0mgit show --stat --oneline 37deb67e | Select-Object -First 30; echo "==="; git show --stat --oneline 09c2c902 | Select-Object -First 30; echo "===DIFF TREES==="; git diff 37deb67e 09c2c902 --stat | Select-Object -First 20
+37deb67e docs: refresh package docs index via code-navigation-sync (just quick navigation gate green)
+ docs/code-navigation/PACKAGE_DOCS_INDEX.md | 22 +++++++++++-----------
+ 1 file changed, 11 insertions(+), 11 deletions(-)
+===
+09c2c902 docs: refresh package docs index via code-navigation-sync (just quick navigation gate green) (#2026)
+ docs/code-navigation/PACKAGE_DOCS_INDEX.md | 22 +++++++++++-----------
+ 1 file changed, 11 insertions(+), 11 deletions(-)
+===DIFF TREES===
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead scripts/docs_closure_audit.py 
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead docs/normative-pair.toml 
+[0m$ [0mgit log --format="%H %s" --all -- docs/normative-pair.toml | Select-Object -First 20; echo "==="; git log --format="%H %s" --all -- docs/architecture/architecture/manifest.json | Select-Object -First 20; echo "==="; git log --format="%H %s" --all -- docs/architecture/implementation/manifest.json | Select-Object -First 20
+a9b51160dadcb731b117e343e2f47e589fe81fd4 work(cdi): bootstrap resync docs-shard chain for merged I9.4 amendment (#1994) (#1997)
+ed5c60a88a69446b0d5c3e182664dd2f98507276 work(cdi): bootstrap resync docs-shard chain for merged I9.4 amendment (#1994)
+75a868bccd6df737edf5afe5c7a2e2d0478a1c57 docs: shard normative books and enforce routed reading
+9d952ef2ecb39ce6848f6db25a76439d36397816 fix(docs): restore normative-pair receipt integrity (#110)
+ce05a82500093681862727909f00483522e600f8 chore(repo): make main the only authority surface
+c0a880a2af2c94e76972daf03c7e532b7dfb2e86 docs: adopt 2026-08-28 normative pair and inventory core/daemon work
+===
+75a868bccd6df737edf5afe5c7a2e2d0478a1c57 docs: shard normative books and enforce routed reading
+===
+a9b51160dadcb731b117e343e2f47e589fe81fd4 work(cdi): bootstrap resync docs-shard chain for merged I9.4 amendment (#1994) (#1997)
+ed5c60a88a69446b0d5c3e182664dd2f98507276 work(cdi): bootstrap resync docs-shard chain for merged I9.4 amendment (#1994)
+75a868bccd6df737edf5afe5c7a2e2d0478a1c57 docs: shard normative books and enforce routed reading
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython scripts/docs_closure_audit.py --root . 2>&1 | Select-Object -First 10; echo "EXIT:$LASTEXITCODE"
+DOC_CLOSURE_AUDIT: errors=2 warnings=45 info=27 report=.eliot/docs-closure-audit
+EXIT:1
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython -c "import json; d=json.load(open('.eliot/docs-closure-audit/audit.json')); print('commit', d['commit']); print('errors', d['summary']); print('metrics arch/impl:', d['metrics'].get('architecture_sha256'), d['metrics'].get('implementation_sha256')); print('evidence keys', list(d['evidence'].keys())); import pprint; pprint.pprint(d['evidence'].get('architecture_original_matches')); pprint.pprint(d['evidence'].get('implementation_original_matches')); pprint.pprint(d['evidence'].get('common_original_commits')); print('arch blob', d['evidence'].get('architecture_reconstructed_blob')); print('impl blob', d['evidence'].get('implementation_reconstructed_blob'))"
+commit 37deb67e9690adaeada83340f1d7d81d5b98dfe3
+errors {'errors': 2, 'info': 27, 'warnings': 45}
+metrics arch/impl: c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a 40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89
+evidence keys ['architecture_original_matches', 'architecture_reconstructed_blob', 'pair']
+[{'blob': '81ad1508217393ac6dbaecd2386081697405846a',
+  'commit': 'c0a880a2af2c94e76972daf03c7e532b7dfb2e86'}]
+None
+None
+arch blob 81ad1508217393ac6dbaecd2386081697405846a
+impl blob None
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit show --stat --oneline ed5c60a8 | Select-Object -First 40; echo "===A9B51160==="; git show --stat --oneline a9b51160 | Select-Object -First 60
+ed5c60a8 work(cdi): bootstrap resync docs-shard chain for merged I9.4 amendment (#1994)
+ docs/ARCHITECTURE_CONTRACT.md                  |   11 +-
+ docs/architecture/DECISION_ANCHOR_INDEX.md     |    2 +-
+ docs/architecture/HANDLE_INDEX.md              |  638 ++---
+ docs/architecture/READING_PROTOCOL.md          |    2 +-
+ docs/architecture/README.md                    |    2 +-
+ docs/architecture/SPLIT_REPORT.md              |    4 +-
+ docs/architecture/decision-anchor-index.json   |    2 +-
+ docs/architecture/handle-index.json            | 1604 +++++------
+ docs/architecture/implementation/README.md     |    6 +-
+ docs/architecture/implementation/manifest.json | 3532 ++++++++++++------------
+ docs/normative-pair.toml                       |    4 +-
+ 11 files changed, 2904 insertions(+), 2903 deletions(-)
+===A9B51160===
+a9b51160 work(cdi): bootstrap resync docs-shard chain for merged I9.4 amendment (#1994) (#1997)
+ docs/ARCHITECTURE_CONTRACT.md                  |   11 +-
+ docs/architecture/DECISION_ANCHOR_INDEX.md     |    2 +-
+ docs/architecture/HANDLE_INDEX.md              |  638 ++---
+ docs/architecture/READING_PROTOCOL.md          |    2 +-
+ docs/architecture/README.md                    |    2 +-
+ docs/architecture/SPLIT_REPORT.md              |    4 +-
+ docs/architecture/decision-anchor-index.json   |    2 +-
+ docs/architecture/handle-index.json            | 1604 +++++------
+ docs/architecture/implementation/README.md     |    6 +-
+ docs/architecture/implementation/manifest.json | 3532 ++++++++++++------------
+ docs/normative-pair.toml                       |    4 +-
+ 11 files changed, 2904 insertions(+), 2903 deletions(-)
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit show ed5c60a8 -- docs/normative-pair.toml | Out-String | Select-Object -First 60; echo "===PARENT==="; git log --oneline ed5c60a8~1 -1; echo "===A9 parent diff pair==="; git show a9b51160 -- docs/normative-pair.toml | Out-String | Select-Object -First 60
+commit ed5c60a88a69446b0d5c3e182664dd2f98507276
+Author: d01-temp <d01-temp@example.invalid>
+Date:   Thu Sep 17 10:02:12 2026 -0400
+
+    work(cdi): bootstrap resync docs-shard chain for merged I9.4 amendment (#1994)
+
+diff --git a/docs/normative-pair.toml b/docs/normative-pair.toml
+index 2a9510bb..23bcd1d1 100644
+--- a/docs/normative-pair.toml
++++ b/docs/normative-pair.toml
+@@ -9,7 +9,7 @@ content_layout = "eliot-doc-shards-v1"
+ 
+ pair_key_algorithm = "sha256-domain-separated-v1"
+ pair_key_input = "UTF-8 domain tag eliot-normative-pair-v1 and lowercase document digests separated and terminated by NUL bytes"
+-pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
++pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
+ 
+ architecture_path = "docs/architecture/architecture/manifest.json"
+ architecture_entry_path = "docs/architecture/architecture/README.md"
+@@ -23,7 +23,7 @@ implementation_entry_path = "docs/architecture/implementation/README.md"
+ implementation_compatibility_path = "docs/architecture/ELIOT_IMPLEMENTATION.md"
+ implementation_revision = "0.29-draft"
+ implementation_edition = "2026-08-28"
+-implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
++implementation_sha256 = "40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89"
+ 
+ supersedes_architecture_sha256 = "58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8"
+ supersedes_implementation_sha256 = "c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b"
+
+===PARENT===
+964c06d2 docs: simplify root agent instructions
+===A9 parent diff pair===
+commit a9b51160dadcb731b117e343e2f47e589fe81fd4
+Author: Iurii Lisenkov <71514792+UnknownAlienHuman@users.noreply.github.com>
+Date:   Thu Sep 17 12:13:26 2026 -0400
+
+    work(cdi): bootstrap resync docs-shard chain for merged I9.4 amendment (#1994) (#1997)
+    
+    Co-authored-by: d01-temp <d01-temp@example.invalid>
+
+diff --git a/docs/normative-pair.toml b/docs/normative-pair.toml
+index 2a9510bb..23bcd1d1 100644
+--- a/docs/normative-pair.toml
++++ b/docs/normative-pair.toml
+@@ -9,7 +9,7 @@ content_layout = "eliot-doc-shards-v1"
+ 
+ pair_key_algorithm = "sha256-domain-separated-v1"
+ pair_key_input = "UTF-8 domain tag eliot-normative-pair-v1 and lowercase document digests separated and terminated by NUL bytes"
+-pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
++pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
+ 
+ architecture_path = "docs/architecture/architecture/manifest.json"
+ architecture_entry_path = "docs/architecture/architecture/README.md"
+@@ -23,7 +23,7 @@ implementation_entry_path = "docs/architecture/implementation/README.md"
+ implementation_compatibility_path = "docs/architecture/ELIOT_IMPLEMENTATION.md"
+ implementation_revision = "0.29-draft"
+ implementation_edition = "2026-08-28"
+-implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
++implementation_sha256 = "40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89"
+ 
+ supersedes_architecture_sha256 = "58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8"
+ supersedes_implementation_sha256 = "c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b"
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit log --all --oneline --grep="I9.4" | Select-Object -First 20; echo "==="; git log --all --oneline --grep="1994" | Select-Object -First 20; echo "=== manifest history ==="; git log --all --format="%H %s" -- docs/architecture/implementation/manifest.json
+a9b51160 work(cdi): bootstrap resync docs-shard chain for merged I9.4 amendment (#1994) (#1997)
+ed5c60a8 work(cdi): bootstrap resync docs-shard chain for merged I9.4 amendment (#1994)
+8901ad7b #1980: I9.4 canonizes two objects; admission envelope renamed DreamJobAdmission (#1983)
+===
+a9b51160 work(cdi): bootstrap resync docs-shard chain for merged I9.4 amendment (#1994) (#1997)
+ed5c60a8 work(cdi): bootstrap resync docs-shard chain for merged I9.4 amendment (#1994)
+=== manifest history ===
+a9b51160dadcb731b117e343e2f47e589fe81fd4 work(cdi): bootstrap resync docs-shard chain for merged I9.4 amendment (#1994) (#1997)
+ed5c60a88a69446b0d5c3e182664dd2f98507276 work(cdi): bootstrap resync docs-shard chain for merged I9.4 amendment (#1994)
+75a868bccd6df737edf5afe5c7a2e2d0478a1c57 docs: shard normative books and enforce routed reading
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit show --stat --oneline 8901ad7b | Select-Object -First 60
+8901ad7b #1980: I9.4 canonizes two objects; admission envelope renamed DreamJobAdmission (#1983)
+ .../tests/data/shipped_serde_boundaries.toml       | 9820 +++++++++++++-------
+ .../eliot-dreamer-architecture-brief/module.toml   |    2 +-
+ .../tests/architecture_brief.rs                    |    4 +-
+ crates/smart/eliot-dreamer-bundle/module.toml      |    2 +-
+ .../eliot-dreamer-bundle/tests/bundle_proof.rs     |    8 +-
+ .../eliot-dreamer-candidate-validation/module.toml |    2 +-
+ .../src/error.rs                                   |    4 +-
+ .../src/input.rs                                   |    6 +-
+ .../src/receipt.rs                                 |    4 +-
+ .../tests/handoff.rs                               |    6 +-
+ .../tests/validation.rs                            |    6 +-
+ .../eliot-dreamer-claim-grounding/src/grounding.rs |    8 +-
+ .../eliot-dreamer-claim-grounding/tests/support.rs |    6 +-
+ .../smart/eliot-dreamer-clarification/module.toml  |    2 +-
+ .../src/model/part_01.rs                           |    2 +-
+ .../src/model/part_04.rs                           |    6 +-
+ .../src/model/part_05.rs                           |    2 +-
+ .../smart/eliot-dreamer-clarification/src/tests.rs |    8 +-
+ .../tests/classification.rs                        |    2 +-
+ .../smart/eliot-dreamer-concept/tests/concept.rs   |   10 +-
+ .../eliot-dreamer-configuration-plan/module.toml   |    2 +-
+ .../eliot-dreamer-configuration-plan/src/lib.rs    |   12 +-
+ crates/smart/eliot-dreamer-contracts/module.toml   |    2 +-
+ .../src/assembly/material.rs                       |    4 +-
+ .../eliot-dreamer-contracts/src/assembly/recipe.rs |   10 +-
+ .../eliot-dreamer-contracts/src/assembly/result.rs |    2 +-
+ crates/smart/eliot-dreamer-contracts/src/bundle.rs |    2 +-
+ .../src/classification/input.rs                    |    2 +-
+ .../eliot-dreamer-contracts/src/concept/input.rs   |    4 +-
+ crates/smart/eliot-dreamer-contracts/src/draft.rs  |   18 +-
+ .../eliot-dreamer-contracts/src/failure/input.rs   |    4 +-
+ .../eliot-dreamer-contracts/src/grounding/mod.rs   |   14 +-
+ crates/smart/eliot-dreamer-contracts/src/job.rs    |   20 +-
+ crates/smart/eliot-dreamer-contracts/src/lib.rs    |    2 +-
+ .../eliot-dreamer-contracts/src/model_route.rs     |    2 +-
+ .../src/validation/bounds.rs                       |    4 +-
+ .../src/validation/encoding.rs                     |   10 +-
+ .../eliot-dreamer-contracts/src/validation/mod.rs  |    4 +-
+ .../eliot-dreamer-contracts/tests/assembly.rs      |    6 +-
+ .../tests/classification_contracts.rs              |    4 +-
+ .../tests/concept_contracts.rs                     |    8 +-
+ .../tests/consumer_and_source_proof.rs             |   18 +-
+ .../tests/curation_invocation.rs                   |   10 +-
+ .../tests/relation_contracts.rs                    |    6 +-
+ .../tests/support/grounding.rs                     |    6 +-
+ .../smart/eliot-dreamer-cycle-wasm/tests/proof.rs  |   12 +-
+ crates/smart/eliot-dreamer-cycle/module.toml       |    2 +-
+ crates/smart/eliot-dreamer-cycle/src/bounds.rs     |    2 +-
+ crates/smart/eliot-dreamer-cycle/src/contract.rs   |   10 +-
+ crates/smart/eliot-dreamer-cycle/tests/cycle.rs    |    6 +-
+ .../module.toml                                    |    2 +-
+ .../eliot-dreamer-development-diagnosis/src/lib.rs |   12 +-
+ .../smart/eliot-dreamer-episode/src/reconstruct.rs |    2 +-
+ .../eliot-dreamer-episode/tests/support/episode.rs |    4 +-
+ .../eliot-dreamer-failure/tests/support/mod.rs     |    4 +-
+ .../tests/support/mod.rs                           |    4 +-
+ .../eliot-dreamer-maintenance-plan/module.toml     |    2 +-
+ .../eliot-dreamer-maintenance-plan/src/lib.rs      |   12 +-
+ .../eliot-dreamer-orchestration-plan/module.toml   |    2 +-
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit show --stat --oneline 8901ad7b | Select-Object -Last 60; echo "===DOCS PART==="; git show --name-only --oneline 8901ad7b | Select-String "docs/architecture" | Select-Object -First 30
+.../tests/handoff.rs                               |    6 +-
+ .../tests/validation.rs                            |    6 +-
+ .../eliot-dreamer-claim-grounding/src/grounding.rs |    8 +-
+ .../eliot-dreamer-claim-grounding/tests/support.rs |    6 +-
+ .../smart/eliot-dreamer-clarification/module.toml  |    2 +-
+ .../src/model/part_01.rs                           |    2 +-
+ .../src/model/part_04.rs                           |    6 +-
+ .../src/model/part_05.rs                           |    2 +-
+ .../smart/eliot-dreamer-clarification/src/tests.rs |    8 +-
+ .../tests/classification.rs                        |    2 +-
+ .../smart/eliot-dreamer-concept/tests/concept.rs   |   10 +-
+ .../eliot-dreamer-configuration-plan/module.toml   |    2 +-
+ .../eliot-dreamer-configuration-plan/src/lib.rs    |   12 +-
+ crates/smart/eliot-dreamer-contracts/module.toml   |    2 +-
+ .../src/assembly/material.rs                       |    4 +-
+ .../eliot-dreamer-contracts/src/assembly/recipe.rs |   10 +-
+ .../eliot-dreamer-contracts/src/assembly/result.rs |    2 +-
+ crates/smart/eliot-dreamer-contracts/src/bundle.rs |    2 +-
+ .../src/classification/input.rs                    |    2 +-
+ .../eliot-dreamer-contracts/src/concept/input.rs   |    4 +-
+ crates/smart/eliot-dreamer-contracts/src/draft.rs  |   18 +-
+ .../eliot-dreamer-contracts/src/failure/input.rs   |    4 +-
+ .../eliot-dreamer-contracts/src/grounding/mod.rs   |   14 +-
+ crates/smart/eliot-dreamer-contracts/src/job.rs    |   20 +-
+ crates/smart/eliot-dreamer-contracts/src/lib.rs    |    2 +-
+ .../eliot-dreamer-contracts/src/model_route.rs     |    2 +-
+ .../src/validation/bounds.rs                       |    4 +-
+ .../src/validation/encoding.rs                     |   10 +-
+ .../eliot-dreamer-contracts/src/validation/mod.rs  |    4 +-
+ .../eliot-dreamer-contracts/tests/assembly.rs      |    6 +-
+ .../tests/classification_contracts.rs              |    4 +-
+ .../tests/concept_contracts.rs                     |    8 +-
+ .../tests/consumer_and_source_proof.rs             |   18 +-
+ .../tests/curation_invocation.rs                   |   10 +-
+ .../tests/relation_contracts.rs                    |    6 +-
+ .../tests/support/grounding.rs                     |    6 +-
+ .../smart/eliot-dreamer-cycle-wasm/tests/proof.rs  |   12 +-
+ crates/smart/eliot-dreamer-cycle/module.toml       |    2 +-
+ crates/smart/eliot-dreamer-cycle/src/bounds.rs     |    2 +-
+ crates/smart/eliot-dreamer-cycle/src/contract.rs   |   10 +-
+ crates/smart/eliot-dreamer-cycle/tests/cycle.rs    |    6 +-
+ .../module.toml                                    |    2 +-
+ .../eliot-dreamer-development-diagnosis/src/lib.rs |   12 +-
+ .../smart/eliot-dreamer-episode/src/reconstruct.rs |    2 +-
+ .../eliot-dreamer-episode/tests/support/episode.rs |    4 +-
+ .../eliot-dreamer-failure/tests/support/mod.rs     |    4 +-
+ .../tests/support/mod.rs                           |    4 +-
+ .../eliot-dreamer-maintenance-plan/module.toml     |    2 +-
+ .../eliot-dreamer-maintenance-plan/src/lib.rs      |   12 +-
+ .../eliot-dreamer-orchestration-plan/module.toml   |    2 +-
+ .../eliot-dreamer-orchestration-plan/src/lib.rs    |   14 +-
+ .../eliot-dreamer-orientation-wasm/tests/proof.rs  |    4 +-
+ crates/smart/eliot-dreamer-orientation/module.toml |    2 +-
+ .../smart/eliot-dreamer-orientation/src/input.rs   |   14 +-
+ .../eliot-dreamer-orientation/tests/orientation.rs |    4 +-
+ .../smart/eliot-dreamer-relation/tests/relation.rs |    8 +-
+ .../eliot-dreamer-research-synthesis/src/model.rs  |    2 +-
+ .../eliot-dreamer-rival-model/tests/rival_proof.rs |   10 +-
+ docs/architecture/I09-04-dreamer-input-bundle.md   |  107 +-
+ 68 files changed, 6902 insertions(+), 3425 deletions(-)
+===DOCS PART===
+
+docs/architecture/I09-04-dreamer-input-bundle.md
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit merge-base --is-ancestor 8901ad7b HEAD; echo "8901-in-HEAD:$LASTEXITCODE"; git merge-base --is-ancestor ed5c60a8 HEAD; echo "ed5c-in-HEAD:$LASTEXITCODE"; git merge-base --is-ancestor a9b51160 HEAD; echo "a9-in-HEAD:$LASTEXITCODE"; git merge-base --is-ancestor 8901ad7b origin/main; echo "8901-in-main:$LASTEXITCODE"; git merge-base --is-ancestor a9b51160 origin/main; echo "a9-in-main:$LASTEXITCODE"; git branch --all --contains 8901ad7b | Select-Object -First 10; echo "==="; git branch --all --contains a9b51160 | Select-Object -First 10
+8901-in-HEAD:0
+ed5c-in-HEAD:1
+a9-in-HEAD:0
+8901-in-main:0
+a9-in-main:0
++ codex/simplify-root-agents
++ main
+  mgr19-992-final
+  mgr20-989-rend
+  mgr20-989-rework
+  mgr20-989-rv2
+  pr-2001-review
++ work/1137-operator-winui-alloc-refresh
++ work/1719-governor-rehome
++ work/1976-kernel-store-gateway-tests
+===
++ main
+  mgr19-992-final
+  mgr20-989-rend
+  mgr20-989-rework
+  mgr20-989-rv2
+  pr-2001-review
++ work/1137-operator-winui-alloc-refresh
++ work/1719-governor-rehome
++ work/1976-kernel-store-gateway-tests
++ work/1995-native-worker-types
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython3 -c "
+import subprocess, hashlib
+def show(commit, path):
+    r = subprocess.run(['git','show', f'{commit}:{path}'], capture_output=True)
+    if r.returncode != 0:
+        print(commit, path, 'MISSING', r.stderr.decode()[:200])
+        return
+    data = r.stdout
+    print(commit[:8], path, 'bytes', len(data), 'sha256', hashlib.sha256(data).hexdigest(), 'blob', subprocess.run(['git','rev-parse', f'{commit}:{path}'], capture_output=True).stdout.decode().strip()[:12])
+for c in ['1122e21b','c0a880a2','75a868bc','8901ad7b','a9b51160','f0abfe13','09c2c902','37deb67e']:
+    show(c, 'docs/architecture/ELIOT_IMPLEMENTATION.md')
+print('---ARCH---')
+for c in ['1122e21b','c0a880a2','75a868bc','a9b51160']:
+    show(c, 'docs/architecture/ELIOT_ARCHITECTURE.md')
+print('---RECONSTRUCTED---')
+import json
+print('pair impl', open('docs/normative-pair.toml').read().split('implementation_sha256')[1][:80])
+m=json.load(open('docs/architecture/implementation/manifest.json'))
+print('manifest source_sha256', m['source_sha256'], 'bytes', m['source_bytes'])
+m2=json.load(open('docs/architecture/architecture/manifest.json'))
+print('arch manifest source_sha256', m2['source_sha256'])
+"
+
+(no output)
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython -c "import sys; print(sys.version)"
+3.13.15 (tags/v3.13.15:4061bc4, Aug  5 2026, 13:05:39) [MSC v.1944 64 bit (AMD64)]
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython scripts/docs_closure_audit.py --root . 2>&1 | Select-Object -First 5; git show 75a868bc:docs/architecture/ELIOT_IMPLEMENTATION.md > $env:TEMP/old_impl.md; Get-FileHash $env:TEMP/old_impl.md -Algorithm SHA256 | Select-Object -ExpandProperty Hash
+DOC_CLOSURE_AUDIT: errors=2 warnings=45 info=27 report=.eliot/docs-closure-audit
+63E6DE3BEA958B05087907C36F69DD00455904BCA990CC658DD04D28147BD0B4
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython --version; echo "---"; git rev-parse "75a868bc:docs/architecture/ELIOT_IMPLEMENTATION.md"; git rev-parse "c0a880a2:docs/architecture/ELIOT_IMPLEMENTATION.md"
+Python 3.13.15
+---
+51a56d3a2ba1fe041b42674a2300a0ae9bf44bd5
+490e9e702a8df5d1b353f86684a7bede906a1d48
+> build · muse-spark-1.3-contributor-free
+[0m← [0mWrite C:/Users/kleym/AppData/Local/Temp/opencode/verify_closure.py
+Created file successfully: C:/Users/kleym/AppData/Local/Temp/opencode/verify_closure.py
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython C:\Users\kleym\AppData\Local\Temp\opencode\verify_closure.py
+== IMPL monolith history ==
+1122e21b docs/architecture/ELIOT_IMPLEMENTATION.md bytes=999963 sha256=c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b blob=d984545dfde23602a656cd4c5627bb4bd15c1c66
+c0a880a2 docs/architecture/ELIOT_IMPLEMENTATION.md bytes=999718 sha256=7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063 blob=490e9e702a8df5d1b353f86684a7bede906a1d48
+75a868bc docs/architecture/ELIOT_IMPLEMENTATION.md bytes=154307 sha256=63e6de3bea958b05087907c36f69dd00455904bca990cc658dd04d28147bd0b4 blob=51a56d3a2ba1fe041b42674a2300a0ae9bf44bd5
+8901ad7b docs/architecture/ELIOT_IMPLEMENTATION.md bytes=154307 sha256=63e6de3bea958b05087907c36f69dd00455904bca990cc658dd04d28147bd0b4 blob=51a56d3a2ba1fe041b42674a2300a0ae9bf44bd5
+a9b51160 docs/architecture/ELIOT_IMPLEMENTATION.md bytes=154307 sha256=63e6de3bea958b05087907c36f69dd00455904bca990cc658dd04d28147bd0b4 blob=51a56d3a2ba1fe041b42674a2300a0ae9bf44bd5
+f0abfe13 docs/architecture/ELIOT_IMPLEMENTATION.md bytes=154307 sha256=63e6de3bea958b05087907c36f69dd00455904bca990cc658dd04d28147bd0b4 blob=51a56d3a2ba1fe041b42674a2300a0ae9bf44bd5
+09c2c902 docs/architecture/ELIOT_IMPLEMENTATION.md bytes=154307 sha256=63e6de3bea958b05087907c36f69dd00455904bca990cc658dd04d28147bd0b4 blob=51a56d3a2ba1fe041b42674a2300a0ae9bf44bd5
+== ARCH monolith history ==
+1122e21b docs/architecture/ELIOT_ARCHITECTURE.md bytes=172875 sha256=58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8 blob=bf813edfd8cbb00a4f997ad03dcfcaa546902163
+c0a880a2 docs/architecture/ELIOT_ARCHITECTURE.md bytes=149403 sha256=c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a blob=81ad1508217393ac6dbaecd2386081697405846a
+75a868bc docs/architecture/ELIOT_ARCHITECTURE.md bytes=23333 sha256=100d72df90eda0202c138465e49556c62539e7fb5c81fc9567f071d65144eac6 blob=e19800d7db756ca934b10866c573adc3a19cb3b3
+a9b51160 docs/architecture/ELIOT_ARCHITECTURE.md bytes=23333 sha256=100d72df90eda0202c138465e49556c62539e7fb5c81fc9567f071d65144eac6 blob=e19800d7db756ca934b10866c573adc3a19cb3b3
+== RECONSTRUCTED / ADOPTED ==
+Traceback (most recent call last):
+  File "C:\Users\kleym\AppData\Local\Temp\opencode\verify_closure.py", line 23, in <module>
+    m=json.load(open('docs/architecture/implementation/manifest.json'))
+  File "C:\Users\kleym\AppData\Local\Programs\Python\Python313\Lib\json\__init__.py", line 298, in load
+    return loads(fp.read(),
+                 ~~~~~~~^^
+  File "C:\Users\kleym\AppData\Local\Programs\Python\Python313\Lib\encodings\cp1252.py", line 23, in decode
+    return codecs.charmap_decode(input,self.errors,decoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeDecodeError: 'charmap' codec can't decode byte 0x9d in position 206162: character maps to <undefined>
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead docs/architecture/ELIOT_IMPLEMENTATION.md [90m[limit=60][0m
+[0m$ [0mgit show 8901ad7b -- docs/architecture/I09-04-dreamer-input-bundle.md | Select-Object -First 80
+commit 8901ad7b6c369e235964cb8a0cd74cb88b65271f
+Author: Iurii Lisenkov <71514792+UnknownAlienHuman@users.noreply.github.com>
+Date:   Thu Sep 17 06:18:11 2026 -0400
+
+    #1980: I9.4 canonizes two objects; admission envelope renamed DreamJobAdmission (#1983)
+    
+    * work(1980): rename contracts envelope DreamJobInput to DreamJobAdmission
+    
+    One causal change: resolve the I9.4 name collision per owner decision on #1980.
+    The admission envelope (job.rs) takes DreamJobAdmission; bundle::DreamInputBundle,
+    bins/eliot-dreamer flat struct (#1978) and dreamer-core facade (#1143) untouched.
+    No aliases, no From/Into bridges; module.toml envelope lines renamed.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    
+    * work(1980): amend I9.4 to canonize admission envelope and semantic bundle
+    
+    I9.4 now names DreamJobAdmission (closed intake record) alongside DreamJobInput
+    (the role-addressed semantic bundle), with required roles per class, per-role
+    cardinality/lineage, omission rules, denominator source and BundleCompleteness
+    states, each grounded in assembly/recipe.rs and bundle types. Regenerate the
+    serde boundary inventory through scripts/serde_boundary_inventory.py sync
+    (check PASS); envelope row now keys on DreamJobAdmission.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    
+    ---------
+    
+    Co-authored-by: d01-temp <d01-temp@example.invalid>
+    Co-authored-by: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/docs/architecture/I09-04-dreamer-input-bundle.md b/docs/architecture/I09-04-dreamer-input-bundle.md
+index e2d8f0b5..05733dda 100644
+--- a/docs/architecture/I09-04-dreamer-input-bundle.md
++++ b/docs/architecture/I09-04-dreamer-input-bundle.md
+@@ -1,28 +1,103 @@
+ ## I9.4. Dreamer input bundle
+ 
++I9.4 canonizes TWO objects. `DreamJobAdmission` is the admission envelope:
++the closed intake record the Kernel path admits and the assembly recipe
++binds. `DreamJobInput` is the semantic bundle: the role-addressed input the
++model reads. The historic flat field list named roles, not a struct; those
++names are the closed `DreamInputRole` wire spellings.
++
+ ```yaml
+-DreamJobInput:
+-  job_id:
++DreamJobAdmission:
++  schema_version:
+   job_class:
+-  exact_question:
+   requester:
+-  scope_id:
++  operation_id:
++  idempotency_key:
+   task_id:
++  scope_id:
+   state_fence:
+-  evidence_handles:
+-  memory_handles:
+-  architecture_handles:
+-  implementation_handles:
+-  conformance_handles:
+-  conflicts_and_unknowns:
+   privacy_profile:
+-  allowed_tools:
+-  allowed_model_routes:
++  contract_ref:
++  policy_ref:
+   budget:
+-  deadline:
+-  output_schema:
+-  forbidden_effects:
++  deadline_ms:
++  frozen_manifest_digest:
++
++DreamJobInput:
++  roles: exactly the required roles of the job class below,
++    each role carrying its retained items or an accounted omission
++  completeness:
+> build · muse-spark-1.3-contributor-free
+[0m← [0mWrite C:/Users/kleym/AppData/Local/Temp/opencode/verify2.py
+Created file successfully: C:/Users/kleym/AppData/Local/Temp/opencode/verify2.py
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython C:\Users\kleym\AppData\Local\Temp\opencode\verify2.py
+monolith impl sha:
+  c0a880a2 bytes=999718 sha=7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063
+  75a868bc bytes=154307 sha=63e6de3bea958b05087907c36f69dd00455904bca990cc658dd04d28147bd0b4
+  8901ad7b bytes=154307 sha=63e6de3bea958b05087907c36f69dd00455904bca990cc658dd04d28147bd0b4
+  a9b51160 bytes=154307 sha=63e6de3bea958b05087907c36f69dd00455904bca990cc658dd04d28147bd0b4
+manifest impl source:
+  75a868bc source_sha=7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063 bytes=999718 fragments=504
+  8901ad7b source_sha=7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063 bytes=999718 fragments=504
+  a9b51160 source_sha=40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89 bytes=1003351 fragments=504
+pair file:
+ commit c0a880a2:
+  c0a880a2 pair_key_algorithm = "sha256-domain-separated-v1"
+  c0a880a2 pair_key_input = "UTF-8 domain tag eliot-normative-pair-v1 and lowercase document digests separated and terminated by NUL bytes"
+  c0a880a2 pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+  c0a880a2 architecture_sha256 = "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a"
+  c0a880a2 implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+  c0a880a2 supersedes_architecture_sha256 = "58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8"
+  c0a880a2 supersedes_implementation_sha256 = "c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b"
+ commit 75a868bc:
+  75a868bc pair_key_algorithm = "sha256-domain-separated-v1"
+  75a868bc pair_key_input = "UTF-8 domain tag eliot-normative-pair-v1 and lowercase document digests separated and terminated by NUL bytes"
+  75a868bc pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+  75a868bc architecture_sha256 = "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a"
+  75a868bc implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+  75a868bc supersedes_architecture_sha256 = "58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8"
+  75a868bc supersedes_implementation_sha256 = "c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b"
+ commit 8901ad7b:
+  8901ad7b pair_key_algorithm = "sha256-domain-separated-v1"
+  8901ad7b pair_key_input = "UTF-8 domain tag eliot-normative-pair-v1 and lowercase document digests separated and terminated by NUL bytes"
+  8901ad7b pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+  8901ad7b architecture_sha256 = "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a"
+  8901ad7b implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+  8901ad7b supersedes_architecture_sha256 = "58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8"
+  8901ad7b supersedes_implementation_sha256 = "c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b"
+ commit a9b51160:
+  a9b51160 pair_key_algorithm = "sha256-domain-separated-v1"
+  a9b51160 pair_key_input = "UTF-8 domain tag eliot-normative-pair-v1 and lowercase document digests separated and terminated by NUL bytes"
+  a9b51160 pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
+  a9b51160 architecture_sha256 = "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a"
+  a9b51160 implementation_sha256 = "40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89"
+  a9b51160 supersedes_architecture_sha256 = "58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8"
+  a9b51160 supersedes_implementation_sha256 = "c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b"
+current worktree manifest:
+  source_sha 40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89 bytes 1003351
+audit reconstructed impl 40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89 1003351
+audit reconstructed arch c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a 149403
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead docs/architecture/SPLIT_REPORT.md [90m[limit=80][0m
+[0m$ [0mgit log --oneline a9b51160..origin/main -- docs/architecture/ELIOT_IMPLEMENTATION.md docs/architecture/implementation/manifest.json docs/normative-pair.toml docs/architecture/I09-04-dreamer-input-bundle.md; echo "EMPTY-ABOVE-MEANS-UNTOUCHED-SINCE-A9"; echo "==="; git log --oneline --all --format="%H %s" -- docs/architecture/I09-04-dreamer-input-bundle.md | Select-Object -First 10
+EMPTY-ABOVE-MEANS-UNTOUCHED-SINCE-A9
+===
+8901ad7b6c369e235964cb8a0cd74cb88b65271f #1980: I9.4 canonizes two objects; admission envelope renamed DreamJobAdmission (#1983)
+75a868bccd6df737edf5afe5c7a2e2d0478a1c57 docs: shard normative books and enforce routed reading
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit status --short --branch; echo "==="; Remove-Item C:\Users\kleym\AppData\Local\Temp\opencode\verify_closure.py, C:\Users\kleym\AppData\Local\Temp\opencode\verify2.py -ErrorAction SilentlyContinue; echo "temp-cleaned"
+## work/code-navigation-sync
+?? prompt-closure.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-syncfix.log
+?? stdout.log
+===
+temp-cleaned
+> build · muse-spark-1.3-contributor-free

@@ -1,0 +1,6 @@
+You are an OpenCode nested swarm manager on the FREE route. Small bounded tasks only. Your standalone root-cause report is accepted (both failures pre-existing on main with blamed commits). Now implement your own minimal fix plan, nothing more.
+Repo copy: this worktree. Create new branch work/standalone-wasm-fixes from origin/main 543e8c35 and work only there.
+Task, exactly two changes: (1) run cargo fmt for crates/smart/eliot-dreamer-cycle-wasm (expect the two-hunk diff in tests/proof.rs lines 19-22 and 172); verify with git diff that ONLY formatting changed in that file. (2) In crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs line 1415, replace the hard std env var expect on CARGO_TARGET_DIR with the cycle-wasm sibling pattern (option_env plus manifest-relative fallback candidates, skip artifact inspection when absent). No other files, no gate script changes.
+Then verify: run the standalone gate for exactly these two crates until GREEN; report the gate log. Push the branch to origin.
+Forbidden: touching anything else; merge, close.
+Deliverable: pushed branch, gate GREEN log, diff stat, final report. No merge.

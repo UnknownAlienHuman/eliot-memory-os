@@ -1,0 +1,54 @@
+Investigating those two standalone failures — reproducing the gate and tracing the root causes.
+Both failures reproduced — now digging into the exact lines and history.
+Documentation routing noted — this is investigation-only so no code changes, no routing bundle needed. Continuing evidence gathering.
+The curation test passes when the target-dir env var is set — now confirming the artifact and running the full gate for exact failure lines.
+Final report — standalone-crates root cause (investigation only; nothing changed, committed, or pushed).
+
+## 1. Reproduction evidence
+
+Full standalone gate on this worktree (`python scripts/verify-standalone-crates.py --root .`):
+
+```text
+STANDALONE_CRATE_FAIL: crates/smart/eliot-dreamer-curation-wasm step=test
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s
+         Running unittests src\lib.rs (.../eliot_dreamer_curation_wasm-c8dc9c6a22045651.exe)
+         Running tests\proof.rs (.../proof-9a6e511d429bcfdd.exe)
+    error: test failed, to rerun pass `--test proof`
+STANDALONE_CRATE_FAIL: crates/smart/eliot-dreamer-cycle-wasm step=fmt
+    +fn state(
+    +    policy: &CyclePolicy,
+    +    job: &DreamJobAdmission,
+    +    request: PendingRequest,
+    +) -> DreamerCycleState {
+         let mut state = DreamerCycleState {
+             schema_version: 1,
+             cycle_id: ArtifactId::new("cycle-1").unwrap(),
+STANDALONE_CRATES: FAIL crates=11 failures=2
+```
+
+Matches the reported signature exactly: `FAIL crates=11 failures=2`, curation-wasm `step=test`, cycle-wasm `step=fmt`.
+
+Isolated step output:
+
+- **cycle-wasm fmt** (`cargo fmt --manifest-path crates/smart/eliot-dreamer-cycle-wasm/Cargo.toml -- --check`, exit 1): two diffs in `crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs` — line 20 import (`BudgetLimits, BudgetUsage, DreamJobAdmission, ... ScreenBinding,` exceeds width; rustfmt wants `ScreenBinding` moved to the next line) and line 172 `fn state(...)` signature (rustfmt wants multi-line form).
+- **curation-wasm test** (`cargo test --manifest-path crates/smart/eliot-dreamer-curation-wasm/Cargo.toml --all-targets`, exit 101): 13 passed, 1 failed — `clean_warm_artifact_hash_size_world_abi_toolchain_and_admission` panics at `crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs:1415:52` with `gate sets CARGO_TARGET_DIR: NotPresent`.
+
+## 2. Root cause
+
+**Failure A — cycle-wasm fmt.** Commit `8901ad7b` ("#1980: I9.4 … admission envelope renamed DreamJobAdmission (#1983)") renamed `DreamJobInput` → `DreamJobAdmission` (+4 chars per use) in `crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs` without running `cargo fmt`. The two lines that crossed rustfmt's max width are exactly the diff hunks: the line-20 import and the line-172 `fn state` signature. Pure formatting drift; no semantic change.
+
+**Failure B — curation-wasm test.** `crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs:1415` does `std::env::var("CARGO_TARGET_DIR").expect("gate sets CARGO_TARGET_DIR")` — a hard runtime requirement on an env var that **no gate sets**: `scripts/verify-standalone-crates.py` runs `cargo test` with the inherited environment and never exports it; `scripts/verify.ps1` has no `CARGO_TARGET_DIR` match either. This environment has it unset (verified: empty). When set to the real target dir, the test passes (verified: 1 passed with `$env:CARGO_TARGET_DIR='C:\Users\kleym\AppData\Local\Eliot\build\rust-env-target'`; artifact `wasm32-wasip2/release/eliot_dreamer_curation_wasm.wasm`, 14357 bytes, exists). So the test's artifact assertions are fine — only the env lookup is brittle. Sibling precedent: `crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs:506-519,1617-1638` uses compile-time `option_env!("CARGO_TARGET_DIR")` with a manifest-relative fallback and gracefully skips artifact inspection when absent (`eprintln!("no built wasip2 artifact present; gate proven over fixtures")`).
+
+## 3. Pre-existing verdict: yes, both pre-existing on main
+
+- `git diff --stat origin/main` for both crates' `tests/proof.rs`: empty — worktree content equals main.
+- Failure A blamed to `8901ad7b` (lines 20, 172); that commit is contained in `main`/`origin/main`.
+- Failure B blamed to `d23d12c4` (line 1415, original #636 commit, Sept 15); contained in `main`/`origin/main`. Latent since introduction — passes only where the operator exports `CARGO_TARGET_DIR` per the documented "owner disk rule" (cf. `scripts/tests/test_wave_admission_*.py` runners), never under the bare standalone gate.
+- Current HEAD `b64fdf99` (PR 2027 docs provenance merge) touches neither crate. Prior provenance work untouched.
+
+## 4. Minimal fix plan (not implemented per work order)
+
+1. **cycle-wasm fmt** — `crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs` lines 19-22 and 172: run `cargo fmt --manifest-path crates/smart/eliot-dreamer-cycle-wasm/Cargo.toml`. Zero semantic change; expect the exact two-hunk diff captured above.
+2. **curation-wasm test** — `crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs:1415`: replace the hard `std::env::var("CARGO_TARGET_DIR").expect(...)` with the cycle-wasm pattern — `option_env!("CARGO_TARGET_DIR")` plus manifest-relative fallback candidates, skipping artifact inspection when no artifact is present. Crate-local, follows sibling precedent, keeps the standalone gate hermetic. Rejected alternative: exporting `CARGO_TARGET_DIR` inside `verify-standalone-crates.py` — changes the shared gate to satisfy one crate's assumption.
+
+Verification state: `git status --short` shows no modifications (only pre-existing untracked prompt/log files).

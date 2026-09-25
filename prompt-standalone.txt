@@ -1,0 +1,4 @@
+You are an OpenCode nested swarm manager on the FREE route. Small bounded tasks only. Investigation only: change nothing, commit nothing, push nothing.
+Repo copy: this worktree (branch work/docs-closure-provenance, already merged to main; content equals main). Prior provenance work is DONE and merged (PR 2027); do not touch it.
+Task: root-cause the two just quick standalone-crates failures on main: STANDALONE_CRATE_FAIL crates/smart/eliot-dreamer-curation-wasm step=test and crates/smart/eliot-dreamer-cycle-wasm step=fmt (STANDALONE_CRATES: FAIL crates=11 failures=2). Reproduce with the standalone gate, capture exact failing output lines, determine whether pre-existing on main (git history of those crates), and propose the minimal fix plan with exact file paths and line evidence. Verify claims against code and git objects.
+Deliverable: final report with reproduction evidence, root cause, pre-existing verdict, minimal fix plan. Nothing to push.

@@ -1,0 +1,4 @@
+You are an OpenCode nested swarm manager on the FREE route. Small bounded tasks only. Read-only: change nothing, commit nothing, push nothing.
+Repo copy: this worktree. First sync it to origin/main (fetch, checkout a fresh detached HEAD at origin/main tip). The standalone fix (PR 2028) is merged; your provenance and standalone branches are done, do not touch them.
+Task: run just quick from the repo root on the fresh main and report the result: GREEN with tail evidence, or RED with the exact first failing recipe and its exact failing output lines plus wall time. Do NOT fix anything. Do NOT run builds, clippy, or test suites beyond what just quick invokes.
+Deliverable: final report with gate result. Nothing to push.

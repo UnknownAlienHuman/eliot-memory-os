@@ -1,0 +1,47 @@
+Re-running the architecture boundary gate to map every violation to its fix package.
+Prior gate failed with 32 hard violations — re-running the boundary audit now to capture the complete list.
+Full audit confirmed — now grouping the violations by owning issue.
+Final report — `architecture-boundaries` re-run, analysis only. Nothing changed, committed, or pushed.
+
+- HEAD: `4d427ca9b20630e2880a64ca9201918935cb123e` (detached, = `origin/main` tip, #2028). `git status --short` shows only pre-existing untracked `prompt-*.txt` / `stdout*.log` / `stderr*.log`; no tracked modifications.
+- Gate run: `just architecture-boundaries` (= `python scripts/audit-architecture-boundaries.py`). Exit `1`.
+- Summary line: `ARCHITECTURE_BOUNDARY_AUDIT: hard=32 debt=27 signals=121`
+- Verified counts from this run: `HARD_VIOLATION=32`, `AUDIT_SIGNAL=121`. Of those, 15 carry `issue=#N`; 138 carry no issue.
+
+## Work-package table (HARD_VIOLATION + AUDIT_SIGNAL only; TRACKED_DEBT excluded per brief)
+
+| Issue | Violations | Rule / files | One-line fix scope |
+|---|---|---|---|
+| #14 | 1 signal | `runtime_root_forbidden_transitive_dependency`: `bins/eliot-host/Cargo.toml` (pkg `eliot-host`): `eliot-host -> eliot-kernel-service -> eliot-store-surreal-adapter` | Break the host transitive edge into the forbidden store adapter owner. |
+| #15 | 1 signal | `runtime_root_forbidden_transitive_dependency`: `bins/eliot-kernel/Cargo.toml` (pkg `eliot-kernel`): same `-> eliot-kernel-service -> eliot-store-surreal-adapter` chain | Same: remove/reroute kernel transitive reach to the store adapter. |
+| #16 | 1 signal | `runtime_root_forbidden_transitive_dependency`: `bins/eliot-watchdog/Cargo.toml` (pkg `eliot-watchdog`): `-> eliot-installation -> eliot-protocol -> eliot-agent-contracts` | Break watchdog transitive reach into agent-contracts. |
+| #17 | 1 signal | `runtime_root_forbidden_transitive_dependency`: `bins/eliot-doctor/Cargo.toml` (pkg `eliot-doctor`): `-> eliot-kernel-service -> eliot-store-surreal-adapter` | Break doctor transitive edge into the store adapter. |
+| #18 | 5 hard | `runtime_root_forbidden_direct_dependency` x5: `bins/eliotd/Cargo.toml` (pkg `eliotd`): `eliot-dreamer-bundle`, `-candidate-validation`, `-claim-grounding`, `-probe-plan`, `-rival-model` | Remove the 5 direct dreamer deps from the `eliotd` runtime root or move behind the admitted owner. |
+| #19 | 1 signal | `runtime_root_forbidden_transitive_dependency`: `bins/eliot-store-surreal/Cargo.toml` (pkg `eliot-store-surreal`): `-> eliot-protocol -> eliot-agent-contracts` | Break store-surreal transitive reach into agent-contracts. |
+| #22 | 3 hard | `runtime_root_forbidden_direct_dependency` x3: `bins/eliot-native-worker/Cargo.toml` (pkg `eliot-native-worker`): `eliot-agent-claude`, `eliot-agent-codex`, `eliot-agent-opencode` | Remove the 3 direct agent deps from the native-worker runtime root. |
+| #23 | 1 signal | `runtime_root_forbidden_transitive_dependency`: `bins/eliot-user-broker/Cargo.toml` (pkg `eliot-user-broker`): `-> eliot-protocol -> eliot-agent-contracts` | Break user-broker transitive reach into agent-contracts. |
+| #24 | 1 signal | `tracked_debt_not_observed`: `bins/eliot-mod-research/src/lib.rs` | Delete or correct the stale exact debt record (scanner observes no pattern). |
+| (no issue) | 24 hard | `untracked_direct_process_launch` x24, one per file: `bins/eliot-host/src/runtime_restart_state.rs`, `bins/eliot-host/src/store_recovery_persistence.rs`, `bins/eliot-store-surreal/src/request_dispatch.rs`, `crates/eliot-app/src/host_runtime/supervised_process.rs`, `crates/eliot-app/src/mcp_stdio.rs`, `crates/eliot-app/src/named_pipe_ipc.rs`, `crates/eliot-engine/src/antigravity.rs`, `crates/eliot-engine/src/codecortex.rs`, `crates/eliot-engine/src/cognitive_projection.rs`, `crates/eliot-engine/src/verification/current.rs`, `crates/eliot-store/src/payload_byte_preservation.rs`, `crates/eliot-windows-ipc/src/lib.rs`, `crates/instrument/eliot-verifier/src/lib.rs`, `crates/kernel/eliot-host-state/src/redb_journal.rs`, `crates/kernel/eliot-installation/src/redb_state.rs`, `crates/kernel/eliot-ipc/src/lib.rs`, `crates/kernel/eliot-kernel-service/src/store_gateway.rs`, `crates/meta/eliot-runtime-status/src/lib.rs`, `crates/storage/eliot-store-surreal-adapter/src/apply.rs`, `.../apply/read_boundary.rs`, `.../client/provider_owner.rs`, `.../client/session.rs`, `.../client/session_pool.rs`, `workspace/tools/eliot-live-canary/src/lib.rs` | Triage to owning issue (cf. #100 process-convergence follow-up): add exact debt records or migrate each launch behind the declared ProcessExecutor owner. |
+| (no issue) | 114 signals | `embedded_composition_tests` x105 (in-file `cfg(test)` clusters across `bins/eliot-agent-bridge`(3), `eliot-doctor`(4), `eliot-dreamer`(11), `eliot-host`(12), `eliot-kernel`(24), `eliot-mod-research`(2), `eliot-native-worker`(4), `eliot-notify`(3), `eliot-store-surreal`(4), `eliot-testd`(4), `eliot-user-broker`(4), `eliot-wasm-host`(5), `eliot-watchdog`(8), `eliot`(3), `eliotd`(14)); `large_composition_source` x8 (`eliot-doctor/src/kernel_client.rs`, `eliot-host/src/journal_tests.rs`, `eliot-host/src/lib.rs`, `eliot-kernel/src/dispatch_launch.rs`, `eliot-kernel/src/lib.rs`, `eliot-kernel/src/tests.rs`, `eliot/src/main.rs`, `eliot/src/source_bundle_materializer.rs`); `process_lint_config_pending` x1 (`clippy.toml` absent) | Advisory only: move proofs to cell boundary / split at owner seam / restore root `clippy.toml`; no owning issue assigned by the gate. |
+
+Note: 27 `TRACKED_DEBT` lines (issues #15, #18, #19, #100) exist alongside but were excluded from the table per the brief.
+
+## Raw log tail (`just architecture-boundaries`, this run)
+
+```text
+AUDIT_SIGNAL: large_composition_source: bins/eliot-kernel/src/tests.rs package=eliot-kernel: Composition source has 5573 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: large_composition_source: bins/eliot/src/main.rs package=eliot: Composition source has 3516 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: large_composition_source: bins/eliot/src/source_bundle_materializer.rs package=eliot: Composition source has 2597 nonblank/non-comment lines; split only at a causal owner/proof seam.
+AUDIT_SIGNAL: process_lint_config_pending: clippy.toml: Root clippy.toml is absent (controller handoff pending); compiler-lint coverage is not claimed and this report's source-oracle gap coverage stands alone.
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-doctor/Cargo.toml package=eliot-doctor issue=#17: Transitive closure reaches a forbidden owner: eliot-doctor -> eliot-kernel-service -> eliot-store-surreal-adapter
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-host/Cargo.toml package=eliot-host issue=#14: Transitive closure reaches a forbidden owner: eliot-host -> eliot-kernel-service -> eliot-store-surreal-adapter
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-kernel/Cargo.toml package=eliot-kernel issue=#15: Transitive closure reaches a forbidden owner: eliot-kernel -> eliot-kernel-service -> eliot-store-surreal-adapter
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-store-surreal/Cargo.toml package=eliot-store-surreal issue=#19: Transitive closure reaches a forbidden owner: eliot-store-surreal -> eliot-protocol -> eliot-agent-contracts
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-user-broker/Cargo.toml package=eliot-user-broker issue=#23: Transitive closure reaches a forbidden owner: eliot-user-broker -> eliot-protocol -> eliot-agent-contracts
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-watchdog/Cargo.toml package=eliot-watchdog issue=#16: Transitive closure reaches a forbidden owner: eliot-watchdog -> eliot-installation -> eliot-protocol -> eliot-agent-contracts
+AUDIT_SIGNAL: tracked_debt_not_observed: bins/eliot-mod-research/src/lib.rs issue=#24: Exact debt record exists but the scanner did not observe the corresponding source pattern; review/remove the debt entry.
+  remove_when: Research provider execution uses an admitted immutable bridge manifest and shared governed ProcessExecutor semantics.
+error: recipe `architecture-boundaries` failed on line 53 with exit code 1
+```
+
+No other gates run. Nothing fixed. Nothing to push.

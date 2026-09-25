@@ -1,0 +1,39 @@
+Syncing to origin/main and running the quick gate — read-only, no fixes.
+The gate is RED — pulling the exact failure evidence.
+Final report — `just quick` gate on fresh `main`:
+
+- Sync: `git fetch origin`, `git checkout --detach origin/main`
+- HEAD: `4d427ca9b20630e2880a64ca9201918935cb123e` = `origin/main` tip (`#2028 fix: standalone wasm proofs hermetic`)
+- Prior branches untouched. No changes, commits, or pushes. `git status --short` shows only pre-existing untracked `prompt-*.txt` / `stdout*.log` / `stderr*.log`; no tracked modifications.
+
+Gate result: **RED**
+
+- Wall time: **48.5s** (`21:15:44` → `21:16:33 UTC+02`, measured around `just quick`)
+- Exit: `1`
+- First failing recipe: **`architecture-boundaries`** (`justfile:52-53`: `python scripts/audit-architecture-boundaries.py`)
+- Prior recipes passed through `architecture-boundaries-self-test` (`ARCHITECTURE_BOUNDARY_SELF_TEST: PASS`).
+
+Exact failing output lines:
+
+```text
+ARCHITECTURE_BOUNDARY_AUDIT: hard=32 debt=27 signals=121
+...
+error: recipe `architecture-boundaries` failed on line 53 with exit code 1
+```
+
+Representative failure detail (first hard violation; 32 total):
+
+```text
+HARD_VIOLATION: runtime_root_forbidden_direct_dependency: bins/eliot-native-worker/Cargo.toml package=eliot-native-worker issue=#22: Direct dependency 'eliot-agent-claude' violates the runtime-root boundary.
+```
+
+Tail evidence (last lines before just error):
+
+```text
+AUDIT_SIGNAL: runtime_root_forbidden_transitive_dependency: bins/eliot-watchdog/Cargo.toml package=eliot-watchdog issue=#16: Transitive closure reaches a forbidden owner: eliot-watchdog -> eliot-installation -> eliot-protocol -> eliot-agent-contracts
+AUDIT_SIGNAL: tracked_debt_not_observed: bins/eliot-mod-research/src/lib.rs issue=#24: Exact debt record exists but the scanner did not observe the corresponding source pattern; review/remove the debt entry.
+  remove_when: Research provider execution uses an admitted immutable bridge manifest and shared governed ProcessExecutor semantics.
+error: recipe `architecture-boundaries` failed on line 53 with exit code 1
+```
+
+Nothing fixed. Nothing to push.

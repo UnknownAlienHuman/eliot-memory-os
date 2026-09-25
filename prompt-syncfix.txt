@@ -1,0 +1,4 @@
+You are an OpenCode nested swarm manager on the FREE route. Small bounded tasks only. You already ran just quick here (RED at code-navigation recipe: stale package docs index). Now apply the sanctioned fix.
+Repo copy: this worktree, detached HEAD at origin/main f0abfe13. Stay detached; create no branches.
+Task: (1) run just code-navigation-sync from the repo root; (2) re-run just quick; (3) report: exact sync output, new just quick result (GREEN with tail evidence, or RED with exact failing lines), and git status showing which files the sync changed (tracked versus untracked). Do NOT commit, push, merge, or close anything. Do NOT run builds, clippy, or test suites beyond what the two just recipes invoke.
+Deliverable: final report with sync log excerpt, gate result, and file disposition list. Nothing to push.

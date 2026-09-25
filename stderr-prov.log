@@ -1,0 +1,1098 @@
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead . 
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead prompt-provenance.txt 
+[0m→ [0mRead AGENTS.md 
+[0m→ [0mRead Justfile 
+[0m→ [0mRead WORKFLOW.md 
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit status --short --branch; echo "---REV---"; git rev-parse HEAD; echo "---LOG_ONELINE_5---"; git log --oneline -5; echo "---BRANCHES---"; git branch -a | head -n 50; echo "---ORIGIN_MAIN---"; git rev-parse origin/main 2>&1; git log --oneline origin/main -3 2>&1
+## work/code-navigation-sync
+?? prompt-closure.txt
+?? prompt-provenance.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-prov.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-prov.log
+?? stdout-syncfix.log
+?? stdout.log
+---REV---
+37deb67e9690adaeada83340f1d7d81d5b98dfe3
+---LOG_ONELINE_5---
+37deb67e docs: refresh package docs index via code-navigation-sync (just quick navigation gate green)
+f0abfe13 fix: update stale architecture doc paths in contracts and assignments (#2024)
+716755b1 [store/sconc] Bounded in-transaction allocation with contention retry (slice #989) (#2023)
+1479ae85 [kernel/store] Bind Kernel writes to durable ORS reservation (slice #992) (#2022)
+eaf77281 [store/sconc] Carry reserved-write contract through authenticated path (slice #991) (#2021)
+---BRANCHES---
+head: The term 'head' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+---ORIGIN_MAIN---
+09c2c902d31bae9ceb7f37ab14b6ea2084b47b9a
+09c2c902 docs: refresh package docs index via code-navigation-sync (just quick navigation gate green) (#2026)
+f0abfe13 fix: update stale architecture doc paths in contracts and assignments (#2024)
+716755b1 [store/sconc] Bounded in-transaction allocation with contention retry (slice #989) (#2023)
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit branch --all; echo "---STATUS---"; git status --short --branch
+astra/T11.2
+  chore/admit-research-synthesis
+  chore/drop-legacy-epoch-backup-test
+  chore/remove-837-temp-evidence
+  chore/remove-committed-swarm-evidence
++ codex/simplify-root-agents
+  docs/1147-remove-stale-provenance
+  docs/1231-start-authority-mgr03
+  docs/342-agent-bridge-host-port
+  fix/10-payload-harness-readiness
+  fix/10-payload-harness-readiness3
+  fix/1714-test-imports
++ integ/706-cue-legacy
++ main
+  mgr19-992-final
+  mgr20-989-rend
+  mgr20-989-rework
+  mgr20-989-rv2
+  pr-1610
+  pr-2001-review
+  work/1029-classification-contracts
+  work/1029-classification-contracts-r2
+  work/1029-classification-contracts-r3
+  work/1056-assembly-tests
+  work/1056-assembly-tests-r2
+  work/1064-rival-declarations
+  work/1136-dreamer-job-port
++ work/1137-operator-winui-alloc-refresh
+  work/1139-provider-wire-retire
+  work/1143-legacy-ledger
++ work/1144-read-disposition
+  work/1144-read-wire-migration
+  work/1145-runtime-admission
+  work/1189-current-verifier-s2
++ work/1217-agent-host-integrations
+  work/1270-store-exact-surql
+  work/1270-store-exact-visibility
+  work/1714-legacy-decode-removal
++ work/1719-governor-rehome
++ work/1750-watchdog-scm-sibling
++ work/1754-watchdog-intent-spool
+  work/18-query-e2e-local-read-caller
+  work/18-t11-1-daemon-named-read-rebase
+  work/18-t11-1-daemon-query-e2e
+  work/18-t11-3-seven-provider-retake
+  work/19-reconcile-recovery-c01
++ work/1976-kernel-store-gateway-tests
+  work/1976-kernel-test-migration
+  work/1978-jobclass-owner
++ work/1995-native-worker-types
++ work/205-store-failure-contract-mgr03-r2
+  work/205-store-failure-contract-r3
++ work/268-capture-sessions-A
+  work/461-dispatch-wire-rebase
+  work/484-swarm-command-candidates
+  work/487-admitted-attempt-edge
+  work/501-swarm-launch-bind
+  work/593-bundle-proof
+  work/595-dreamer-pipeline-rejection-proof
++ work/602-grounding-bind
+  work/612-reactive-plan
+  work/614-state-view
+  work/620-activation-assessment
+  work/620-activation-assessment-r2
++ work/620-activation-status-fix
+  work/624-cue-snapshot
+  work/628-orientation
+  work/630-clarification
+  work/632-orientation-wasm
+  work/634-research-wasm
+  work/636-curation-wasm
+  work/638-compiler-wasm
+  work/64-atomic-wire-migration
+  work/64-atomic-wire-migration-continue
+  work/64-atomic-wire-migration-continue-2
+  work/640-activation-wasm
+  work/642-screen-wasm
+  work/644-cycle-wasm
+  work/65-control-reserve-core
+  work/65-control-reserve-service
+  work/651-implementation-brief-exec
+  work/653-classification
+  work/655-relation
+  work/657-episode
+  work/659-concept
+  work/663-failure
+  work/669-accessibility
++ work/688-STORE-2-pack-AFIX
++ work/688-STORE-2-surreal-migration-B
+  work/688-STORE-2-surreal-pack-A
+  work/69-model-portfolio-enforcement-mgr11
+  work/692-source-assurance-separation
+  work/692-source-assurance-separation-r2
+  work/696-peer-mailbox
+  work/696-peer-mailbox-r2
+  work/700-evidence-discipline
+  work/700-evidence-discipline-r2
+  work/702-dreamer-kernel-port
++ work/702-pipeline-slice-3
+  work/702-t12-07-model-adapter
+  work/704-measurement
+  work/704-measurement-r2
+  work/706-cue-legacy
+  work/710-serde-closure
+  work/710-serde-closure-checker
+  work/710-serde-closure-tests
+  work/738-watchdog-diagnostics
+  work/738-watchdog-diagnostics-3
+  work/740-daemon-diagnostics
+  work/748-process-executor-tests
+  work/769-drm-control
++ work/806-dreamer-controller
+  work/819-learning-closure
++ work/820-self-quality
+  work/830-context-admission-denominator
+  work/836-dreamer-wave-d0-merge2
++ work/836-wave-d0-admission
+  work/860-abort-boundary
++ work/866-context-measurement-inventory
+  work/870-wasm-toolchain-tests
+  work/872-agent-fabric
+  work/872-agent-fabric-r2
+  work/9-antigravity-terminal
+  work/9-antigravity-terminal-bridge
+  work/9-antigravity-terminal-r2
+  work/9-antigravity-terminal-route
++ work/949-restore-tx-A
++ work/966-curation-admission
+  work/966-workspace-mgr05
++ work/967-wave-l1-admission
++ work/968-wave-d1-admission
+  work/971-self-quality-contract
+  work/971-self-quality-contract-r2
+  work/972-promotion-input
+  work/972-promotion-input-r2
+  work/972-promotion-input-r3
+  work/976-deny-ls-record
+  work/995-research-synthesis
+  work/995-research-synthesis-r2
++ work/activation-202-slice
++ work/activation-203-slice
++ work/burn-r2-i11-i21
+  work/burn-r3-dreamer
+  work/burn-r5-kernel
++ work/cdi-bootstrap-i94
+* work/code-navigation-sync
++ work/dreamer-584-remainder
++ work/governor-2017-port
++ work/handle-index-i94-resync
++ work/slice-1678-1679
++ work/slice-1687-1811
++ work/slice-993-exec
++ work/source-assurance-metadata
+  remotes/origin/HEAD -> origin/main
+  remotes/origin/astra/T11.2
+  remotes/origin/docs/1231-start-authority
+  remotes/origin/fix/10-audit-hardening
+  remotes/origin/fix/10-payload-harness-readiness
+  remotes/origin/fix/10-payload-harness-readiness3
+  remotes/origin/fix/1264-recall-l0-config-surface
+  remotes/origin/fix/doc-code-conformance-drift-4717178965839013570
+  remotes/origin/integ/706-cue-legacy
+  remotes/origin/main
+  remotes/origin/regression/9-antigravity-terminal-reduction
+  remotes/origin/wip/rescued-item-1084a
+  remotes/origin/work/100-kernel-client-s08k
+  remotes/origin/work/100-process-epoch-v4-F
+  remotes/origin/work/1025-f-conform-donor-vocabulary
+  remotes/origin/work/1029-classification-contracts
+  remotes/origin/work/1029-classification-contracts-r2
+  remotes/origin/work/1056-assembly-tests
+  remotes/origin/work/1064-rival-declarations
+  remotes/origin/work/1073-probe-inquiry-declarations
+  remotes/origin/work/1126-durable-swarm-runtime
+  remotes/origin/work/1136-dreamer-job-port
+  remotes/origin/work/1137-operator-winui-alloc-refresh
+  remotes/origin/work/1137-operator-winui-runtime
+  remotes/origin/work/1139-provider-wire-retire
+  remotes/origin/work/1143-legacy-ledger
+  remotes/origin/work/1144-read-disposition
+  remotes/origin/work/1144-read-wire-migration
+  remotes/origin/work/1145-runtime-admission
+  remotes/origin/work/1187-operator-replay-durable
+  remotes/origin/work/1189-current-verifier-s2
+  remotes/origin/work/1189-legacy-core-retirement
+  remotes/origin/work/1189-runtime-status-s3
+  remotes/origin/work/1189-status-wire-s3
+  remotes/origin/work/1189-status-wire-s3-newbase2
+  remotes/origin/work/1189-verifier-donor-cut
+  remotes/origin/work/1213-controlboard-fixture
+  remotes/origin/work/1217-agent-host-integrations
+  remotes/origin/work/1218-host-bundle-identity
+  remotes/origin/work/1218-host-bundle-planning
+  remotes/origin/work/1218-host-integration-owners
+  remotes/origin/work/1218-host-integration-owners-rebase
+  remotes/origin/work/1219-legacy-config-retirement
+  remotes/origin/work/1220-legacy-config-retirement
+  remotes/origin/work/1220-legacy-config-retirement-rebase
+  remotes/origin/work/1220-legacy-config-retirement-rebase2
+  remotes/origin/work/1227-release-current-generation
+  remotes/origin/work/1228-release-generation-binding
+  remotes/origin/work/1228-release-generation-binding-rebase
+  remotes/origin/work/1228-release-generation-binding-rebase2
+  remotes/origin/work/1228-release-generation-binding-rebase3
+  remotes/origin/work/1228-release-generation-binding-rebase4
+  remotes/origin/work/1228-signing-generation-binding
+  remotes/origin/work/1228-staged-payload-binding
+  remotes/origin/work/1236-probe-input-contracts
+  remotes/origin/work/1236-rivalmodel-affordance-contracts
+  remotes/origin/work/1270-store-exact-surql
+  remotes/origin/work/1270-store-exact-visibility
+  remotes/origin/work/1345-host-scm-selfcheck
+  remotes/origin/work/16-watchdog-client-s08w
+  remotes/origin/work/1691-kernel-shutdown-r2
+  remotes/origin/work/1754-watchdog-intent-spool
+  remotes/origin/work/18-governor-read-port-lrr
+  remotes/origin/work/18-query-e2e-local-read-caller
+  remotes/origin/work/18-t11-1-daemon-client
+  remotes/origin/work/18-t11-1-daemon-e2e3
+  remotes/origin/work/18-t11-1-daemon-e2e4
+  remotes/origin/work/18-t11-1-daemon-gateway
+  remotes/origin/work/18-t11-1-daemon-named-read
+  remotes/origin/work/18-t11-1-daemon-named-read-rebase
+  remotes/origin/work/18-t11-1-daemon-query-e2e
+  remotes/origin/work/18-t11-1-daemon-query-e2e-retake
+  remotes/origin/work/18-t11-3-a-governor
+  remotes/origin/work/18-t11-3-b-store
+  remotes/origin/work/18-t11-3-c-daemon
+  remotes/origin/work/18-t11-3-seven-provider
+  remotes/origin/work/18-t11-3-seven-provider-retake
+  remotes/origin/work/19-eliot-read-evidence-test
+  remotes/origin/work/19-reconcile-recovery-c01
+  remotes/origin/work/19-store-admitted-op-c2-newbase
+  remotes/origin/work/19-store-contour-mgr03
+  remotes/origin/work/19-surreal-evidence-pack-surr
+  remotes/origin/work/19-task-lifecycle-activation
+  remotes/origin/work/196-wave0-denominator-evidence
+  remotes/origin/work/1976-kernel-store-gateway-tests
+  remotes/origin/work/205-store-failure-contract-mgr03
+  remotes/origin/work/205-store-failure-contract-mgr03-r2
+  remotes/origin/work/21-wasm-host-generations
+  remotes/origin/work/21-wasm-host-generations-r2
+  remotes/origin/work/216-bootstrap-five-domain-v2-newbase
+  remotes/origin/work/22-dispatch-governor-binding
+  remotes/origin/work/22-native-worker-boundaries
+  remotes/origin/work/22-native-worker-boundaries-r2
+  remotes/origin/work/267-stream-evidence-sink
+  remotes/origin/work/268-capture-sessions
+  remotes/origin/work/268-capture-sessions-A
+  remotes/origin/work/342-agent-bridge-ebp-transport
+  remotes/origin/work/342-agent-bridge-kernel-port
+  remotes/origin/work/448-recovery-durability
+  remotes/origin/work/448-restart-durability
+  remotes/origin/work/45-cc007-contracts-r39a77e96
+  remotes/origin/work/458-watchdog-governor-wave-c
+  remotes/origin/work/461-dispatch-2-drive
+  remotes/origin/work/461-dispatch-2-launch
+  remotes/origin/work/461-dispatch-2-ledger
+  remotes/origin/work/461-dispatch-2-native
+  remotes/origin/work/461-dispatch-wire
+  remotes/origin/work/461-dispatch-wire-a
+  remotes/origin/work/461-dispatch-wire-b
+  remotes/origin/work/461-dispatch-wire-c
+  remotes/origin/work/461-dispatch-wire-rebase
+  remotes/origin/work/484-swarm-command-candidates
+  remotes/origin/work/487-admitted-attempt-edge
+  remotes/origin/work/501-swarm-launch-bind
+  remotes/origin/work/593-bundle-proof
+  remotes/origin/work/593-bundle-proof-merge
+  remotes/origin/work/602-grounding-bind
+  remotes/origin/work/606-rival-model-proof
+  remotes/origin/work/610-dreamer-probe-plan
+  remotes/origin/work/612-reactive-plan
+  remotes/origin/work/614-state-view
+  remotes/origin/work/620-activation-assessment
+  remotes/origin/work/624-cue-snapshot
+  remotes/origin/work/628-orientation
+  remotes/origin/work/63-canonical-request-hash-newbase
+  remotes/origin/work/630-clarification
+  remotes/origin/work/632-orientation-wasm
+  remotes/origin/work/634-research-wasm
+  remotes/origin/work/636-curation-wasm
+  remotes/origin/work/638-compiler-wasm
+  remotes/origin/work/64-E3-A-session4
+  remotes/origin/work/64-E3-B-session4
+  remotes/origin/work/64-E3-C-session4
+  remotes/origin/work/64-E3-D-session4
+  remotes/origin/work/64-E3-E-session4
+  remotes/origin/work/64-E3-F-session4
+  remotes/origin/work/64-E3-G-session4
+  remotes/origin/work/64-E3-H-session4
+  remotes/origin/work/64-E3-W1-ors
+  remotes/origin/work/64-E3-W3-bridge-cli
+  remotes/origin/work/64-E3-W4-mechanical
+  remotes/origin/work/64-atomic-wire-migration
+  remotes/origin/work/64-atomic-wire-migration-continue
+  remotes/origin/work/64-atomic-wire-migration-continue-2
+  remotes/origin/work/640-activation-wasm
+  remotes/origin/work/642-screen-wasm
+  remotes/origin/work/644-cycle-wasm
+  remotes/origin/work/65-control-reserve-core
+  remotes/origin/work/65-control-reserve-service
+  remotes/origin/work/651-implementation-brief-exec
+  remotes/origin/work/653-classification
+  remotes/origin/work/655-relation
+  remotes/origin/work/657-episode
+  remotes/origin/work/659-concept
+  remotes/origin/work/66-agent-activation-integration
+  remotes/origin/work/663-failure
+  remotes/origin/work/665-structure-repair-exec
+  remotes/origin/work/669-accessibility
+  remotes/origin/work/675-development-diagnosis-exec
+  remotes/origin/work/686-transitive-influence-revocation
+  remotes/origin/work/688-STORE-2-mgr03
+  remotes/origin/work/688-STORE-2-pack-AFIX
+  remotes/origin/work/688-STORE-2-surreal-migration-B
+  remotes/origin/work/688-STORE-2-surreal-pack-A
+  remotes/origin/work/688-erasure-fail-closed
+  remotes/origin/work/688-store-fix
+  remotes/origin/work/688-store-surreal-surfaces-A
+  remotes/origin/work/688-store-surreal-surfaces-B
+  remotes/origin/work/69-model-portfolio-enforcement
+  remotes/origin/work/692-source-assurance
+  remotes/origin/work/692-source-assurance-role-separation
+  remotes/origin/work/692-source-assurance-separation
+  remotes/origin/work/696-peer-mailbox
+  remotes/origin/work/696-peer-mailbox-r2
+  remotes/origin/work/698-durable-staged-work
+  remotes/origin/work/700-evidence-discipline
+  remotes/origin/work/702-dreamer-kernel-port
+  remotes/origin/work/702-t12-07-model-adapter
+  remotes/origin/work/704-measurement
+  remotes/origin/work/706-cue-legacy
+  remotes/origin/work/710-serde-closure
+  remotes/origin/work/710-serde-closure-checker
+  remotes/origin/work/710-serde-closure-tests
+  remotes/origin/work/738-watchdog-diagnostics
+  remotes/origin/work/738-watchdog-diagnostics-3
+  remotes/origin/work/740-daemon-diagnostics
+  remotes/origin/work/744-conformance-root-admit
+  remotes/origin/work/748-process-executor-tests
+  remotes/origin/work/756-wit-typed-worlds
+  remotes/origin/work/758-wasm-host-execution
+  remotes/origin/work/760-typed-runtime-a
+  remotes/origin/work/760-typed-runtime-b
+  remotes/origin/work/760-typed-wasm-runtime
+  remotes/origin/work/769-drm-control
+  remotes/origin/work/77-agent-bridge-edge-retake
+  remotes/origin/work/77-agent-bridge-edge-retake2
+  remotes/origin/work/77-shim-host-facade
+  remotes/origin/work/77-shim-mcp-single-path
+  remotes/origin/work/77-shim-testd-cleanup
+  remotes/origin/work/775-dreamer-job-ledger-mgr03
+  remotes/origin/work/78-notification-child-identities
+  remotes/origin/work/78-notification-child-identities2
+  remotes/origin/work/789-wipc-unsafe-audit
+  remotes/origin/work/819-learning-closure
+  remotes/origin/work/82-executor-isolation
+  remotes/origin/work/82-executor-isolation-a
+  remotes/origin/work/82-executor-isolation-b
+  remotes/origin/work/82-executor-isolation-fresh
+  remotes/origin/work/829-admit-c0-contracts
+  remotes/origin/work/83-deadline-fail-closed
+  remotes/origin/work/83-deadline-watcher-a
+  remotes/origin/work/830-context-admission-denominator
+  remotes/origin/work/836-dreamer-wave-d0-admission
+  remotes/origin/work/836-dreamer-wave-d0-merge2
+  remotes/origin/work/838-clippy-baseline-slice1
+  remotes/origin/work/84-resumed-job-containment
+  remotes/origin/work/860-abort-boundary
+  remotes/origin/work/866-context-measurement-inventory
+  remotes/origin/work/870-wasm-toolchain-tests
+  remotes/origin/work/872-agent-fabric
+  remotes/origin/work/889-host-diagnostics-sinks
+  remotes/origin/work/891-host-lifecycle-diagnostics
+  remotes/origin/work/893-A-phaseb-activation
+  remotes/origin/work/893-B-credential-recovery
+  remotes/origin/work/893-host-durable-diagnostics
+  remotes/origin/work/893-host-durable-diagnostics-r2
+  remotes/origin/work/897-kernel-frontdoor-diagnostics
+  remotes/origin/work/899-kernel-store-diagnostics
+  remotes/origin/work/899-kernel-store-diagnostics-r2
+  remotes/origin/work/899-kernel-store-diagnostics-r4
+  remotes/origin/work/9-antigravity-terminal
+  remotes/origin/work/9-antigravity-terminal-bridge
+  remotes/origin/work/9-antigravity-terminal-r2
+  remotes/origin/work/9-antigravity-terminal-route
+  remotes/origin/work/901-kernel-process-diagnostics
+  remotes/origin/work/903-kernel-generation
+  remotes/origin/work/903-kernel-generation-a
+  remotes/origin/work/903-kernel-generation-b
+  remotes/origin/work/929-serde-boundary-inventory
+  remotes/origin/work/929-serde-boundary-inventory-r2
+  remotes/origin/work/929-serde-boundary-inventory-r3
+  remotes/origin/work/946-cas-contract-a
+  remotes/origin/work/946-cas-contract-b
+  remotes/origin/work/947-restore-evidence
+  remotes/origin/work/948-backup-verify
+  remotes/origin/work/948-backup-verify-B
+  remotes/origin/work/966-dreamer-workspace-admission
+  remotes/origin/work/966-workspace-mgr05
+  remotes/origin/work/969-dreamer-analysis-workspace-admission
+  remotes/origin/work/969-dreamer-workspace-admission
+  remotes/origin/work/971-self-quality-contract
+  remotes/origin/work/972-promotion-input
+  remotes/origin/work/972-promotion-input-r2
+  remotes/origin/work/976-deny-ls-record
+  remotes/origin/work/978-AB-launch-artifact
+  remotes/origin/work/978-CD-scm-activation
+  remotes/origin/work/978-host-launch-diagnostics
+  remotes/origin/work/982-host-console-diagnostics
+  remotes/origin/work/995-research-synthesis
+  remotes/origin/work/burn-r1-i01-i10
+  remotes/origin/work/burn-r3-dreamer
+  remotes/origin/work/burn-r4-harden
+  remotes/origin/work/burn-r6-roots
+  remotes/origin/work/code-navigation-sync
+  remotes/origin/work/duty-991-wire
+  remotes/origin/work/governor-attach-once
+  remotes/origin/work/shim-broker-v1-sweep
+  remotes/origin/work/shim-epoch-import-sweep
+  remotes/origin/work/slice-1678-1679
+  remotes/origin/work/slice-1687-1811
+  remotes/origin/work/slice-1848-latency
+  remotes/origin/work/slice-1949-trace
+  remotes/origin/work/slice-989-sconc
+  remotes/origin/work/slice-990-sconc
+  remotes/origin/work/slice-992-ors
+  remotes/origin/work/slice-993-exec
+---STATUS---
+## work/code-navigation-sync
+?? prompt-closure.txt
+?? prompt-provenance.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-prov.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-prov.log
+?? stdout-syncfix.log
+?? stdout.log
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead stdout-closure.log 
+[0m→ [0mRead stderr-closure.log 
+[0m→ [0mRead stdout-prov.log 
+[0m✱ [0mGlob "**/SPLIT_REPORT.md" [90m1 match[0m
+[0m✱ [0mGlob "**/READING_PROTOCOL.md" [90m1 match[0m
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead docs/normative-pair.toml 
+[0m→ [0mRead docs/architecture/SPLIT_REPORT.md 
+[0m→ [0mRead scripts/docs_closure_audit.py 
+[0m→ [0mRead docs/architecture/READING_PROTOCOL.md 
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead docs/ARCHITECTURE_CONTRACT.md 
+[0m→ [0mRead docs/architecture/ELIOT_ARCHITECTURE.md 
+[0m✱ [0mGlob "scripts/docs_*.py" [90m6 matches[0m
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead scripts/docs_shards.py 
+[0m→ [0mRead scripts/docs_shards_core.py 
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead scripts/docs_shards_core.py [90m[limit=300, offset=1350][0m
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython scripts/docs_shards.py --help 2>&1 | Select-Object -First 60; echo "---"; python scripts/docs_read.py --help 2>&1 | Select-Object -First 80
+usage: docs_shards.py [-h] {migrate,verify,assemble,self-test} ...
+
+positional arguments:
+  {migrate,verify,assemble,self-test}
+
+options:
+  -h, --help            show this help message and exit
+---
+usage: docs_read.py [-h] {read,self-test} ...
+
+Verify and render every required item from an ELIOT documentation route.
+
+positional arguments:
+  {read,self-test}
+
+options:
+  -h, --help        show this help message and exit
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython scripts/docs_shards.py assemble --help 2>&1; echo "==="; python scripts/docs_read.py read --help 2>&1
+usage: docs_shards.py assemble [-h] [--root ROOT]
+                               --source {architecture,implementation}
+                               --output OUTPUT
+
+options:
+  -h, --help            show this help message and exit
+  --root ROOT
+  --source {architecture,implementation}
+  --output OUTPUT
+===
+usage: docs_read.py read [-h] [--root ROOT] [--path PATH]
+                         [--changed-from CHANGED_FROM] [--topic TOPIC]
+                         [--output OUTPUT] [--receipt-out RECEIPT_OUT]
+
+options:
+  -h, --help            show this help message and exit
+  --root ROOT
+  --path PATH
+  --changed-from CHANGED_FROM
+  --topic TOPIC
+  --output OUTPUT
+  --receipt-out RECEIPT_OUT
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython scripts/docs_read.py read --path docs/architecture/ELIOT_ARCHITECTURE.md --path docs/architecture/ELIOT_IMPLEMENTATION.md --topic "docs-closure provenance restoration" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json 2>&1; echo "EXIT:$LASTEXITCODE"; Get-Content .eliot/docs-read-receipt.json 2>&1 | Select-Object -First 100
+DOC_READ: PASS receipt=sha256:97f9c012f1c1c4dbef10a6255f216a2dfa1ce64af0c419f17162d17d82ddbb01 route=sha256:52c5386be4eb4f0ccca33a3a2e89a07da8fd810b3bd1a69b0c664ebc05f774e2 required=28 bundle_sha256=1f6fdef1fca1d95648f45751e1aaffbdc3ab785b3fb7c321f5357e30f4576a65
+EXIT:0
+{
+  "attestation_required": true,
+  "bundle_bytes": 107618,
+  "bundle_sha256": "1f6fdef1fca1d95648f45751e1aaffbdc3ab785b3fb7c321f5357e30f4576a65",
+  "matched_routes": [
+    "security-privacy",
+    "documentation-authority"
+  ],
+  "pair_key": "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea",
+  "paths": [
+    "docs/architecture/ELIOT_ARCHITECTURE.md",
+    "docs/architecture/ELIOT_IMPLEMENTATION.md"
+  ],
+  "read_receipt_id": "sha256:97f9c012f1c1c4dbef10a6255f216a2dfa1ce64af0c419f17162d17d82ddbb01",
+  "required": [
+    {
+      "bytes": 2620,
+      "kind": "file",
+      "path": "AGENTS.md",
+      "sha256": "e2508482aa659aae51df2e0dc0e7bbfa2b827dc8a8a854e7a1c4a7d06a334332"
+    },
+    {
+      "bytes": 7991,
+      "kind": "file",
+      "path": "WORKFLOW.md",
+      "sha256": "ba1119920d47f33b99ee51332d8951b009fc04ebe8512fb64966c6afbd9ff070"
+    },
+    {
+      "bytes": 5523,
+      "kind": "file",
+      "path": "docs/ARCHITECTURE_CONTRACT.md",
+      "sha256": "d1e4c393cd7c953d8e41725eae404882236b13493ace74e4513c4cd894a9e846"
+    },
+    {
+      "bytes": 5163,
+      "kind": "file",
+      "path": "docs/DEPENDENCY_POLICY.md",
+      "sha256": "a69844d656e7cdac0b92fb4d1e6fbcd5d3e923c30ee706ec598acd3c3868933a"
+    },
+    {
+      "bytes": 2611,
+      "kind": "file",
+      "path": "docs/architecture/READING_PROTOCOL.md",
+      "sha256": "fc2ac357ecec293f7246a5ebc5c1e46f5407bb3574ffe39b6224e4d5aa6a3e25"
+    },
+    {
+      "bytes": 12338,
+      "kind": "file",
+      "path": "docs/architecture/route-rules.toml",
+      "sha256": "268434030c9c0bfee516c0abaa1a536c822086ea35fed36ef3dac92523cffb97"
+    },
+    {
+      "bytes": 1541,
+      "kind": "file",
+      "path": "docs/normative-pair.toml",
+      "sha256": "4483d37484e3b07b57a67fbb199b87aa14ff10bd1e3f6638b45cce7b98fc7dc9"
+    },
+    {
+      "bytes": 4264,
+      "kind": "file",
+      "path": "scripts/docs_router.py",
+      "sha256": "dfa620878659326985b5319baf9516e01a31f49decaae44c438244753d9e84f4"
+    },
+    {
+      "bytes": 16933,
+      "kind": "file",
+      "path": "scripts/docs_shards.py",
+      "sha256": "a542962499de7b4db5be555cfa41f27fb826ecc8a7cb6595dc96d3560eff8067"
+    },
+    {
+      "bytes": 2625,
+      "kind": "file",
+      "path": "workstreams/ACTIVE.toml",
+      "sha256": "2bf61c09315add08bb0ec8fd2148f2f295b6abbf5e2e1e11b283204cada5b69b"
+    },
+    {
+      "anchors": [
+        "a01-purpose-of-the-architecture"
+      ],
+      "bytes": 1871,
+      "handles": [
+        "A0.1"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-01-purpose-of-the-architecture.md",
+      "sha256": "ee540ede56579ec388e26da2b290759e78ad3bb8a70ba57d56364800a1692750"
+    },
+    {
+      "anchors": [
+        "a02-hierarchy-of-architectural-decisions"
+      ],
+      "bytes": 1867,
+      "handles": [
+        "A0.2"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-02-hierarchy-of-architectural-decisions.md",
+      "sha256": "342c67f670714c83bb4c68693447fd7597bc4a662b87d4fa6bae09df3cbaf6e5"
+    },
+    {
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython -c "import json; d=json.load(open('.eliot/docs-read-receipt.json')); print('route', d.get('route_receipt_id') if 'route_receipt_id' in d else d.get('route')); print('read', d.get('read_receipt_id')); print('matched', d.get('matched_routes')); print('bundle', d.get('bundle_sha256')); print('required_count', len(d.get('required',[])))" 2>&1
+(Get-Content .eliot/docs-read-bundle.md -TotalCount 30) -join "`n"
+route sha256:52c5386be4eb4f0ccca33a3a2e89a07da8fd810b3bd1a69b0c664ebc05f774e2
+read sha256:97f9c012f1c1c4dbef10a6255f216a2dfa1ce64af0c419f17162d17d82ddbb01
+matched ['security-privacy', 'documentation-authority']
+bundle 1f6fdef1fca1d95648f45751e1aaffbdc3ab785b3fb7c321f5357e30f4576a65
+required_count 28
+# ELIOT verified documentation read bundle
+
+Route receipt: `sha256:52c5386be4eb4f0ccca33a3a2e89a07da8fd810b3bd1a69b0c664ebc05f774e2`
+
+Normative pair: `sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea`
+
+> Every item below was verified against the route immediately before rendering.
+
+---
+
+## Required item `AGENTS.md`
+
+SHA-256: `e2508482aa659aae51df2e0dc0e7bbfa2b827dc8a8a854e7a1c4a7d06a334332`; bytes: `2620`.
+
+# Repository agent instructions
+
+## Working scope
+
+- Follow the requested scope. Explicit user instructions take priority over repository defaults.
+- Use current `main` as the source and documentation authority. Check `git status --short --branch` and `git rev-parse HEAD` before editing.
+- Preserve unrelated changes. For parallel work, use isolated worktrees and one writer per file; the root agent handles synchronization and integration.
+- Read the nearest `AGENTS.md`, the owning issue/PR when present, and documentation relevant to the change.
+- Project navigation: [workflow](WORKFLOW.md), [active workstreams](workstreams/ACTIVE.toml), [architecture contract](docs/ARCHITECTURE_CONTRACT.md).
+
+<!-- eliot-doc-routing:start -->
+## Mandatory documentation routing
+
+Before changing code, configuration, tests, workflows, or normative prose, run
+from the repository root:
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit rev-parse origin/main; git show --stat --oneline origin/main | Select-Object -First 10; echo "---CREATE_BRANCH---"; git checkout -b work/docs-closure-provenance origin/main 2>&1; echo "EXIT:$LASTEXITCODE"; git status --short --branch; git rev-parse HEAD
+09c2c902d31bae9ceb7f37ab14b6ea2084b47b9a
+09c2c902 docs: refresh package docs index via code-navigation-sync (just quick navigation gate green) (#2026)
+ docs/code-navigation/PACKAGE_DOCS_INDEX.md | 22 +++++++++++-----------
+ 1 file changed, 11 insertions(+), 11 deletions(-)
+---CREATE_BRANCH---
+branch 'work/docs-closure-provenance' set up to track 'origin/main'.
+Switched to a new branch 'work/docs-closure-provenance'
+EXIT:0
+## work/docs-closure-provenance...origin/main
+?? prompt-closure.txt
+?? prompt-provenance.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-prov.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-prov.log
+?? stdout-syncfix.log
+?? stdout.log
+09c2c902d31bae9ceb7f37ab14b6ea2084b47b9a
+> build · muse-spark-1.3-contributor-free
+[0m$ [0m$tmp = $env:TEMP
+Write-Output "TEMP=$tmp"
+git show c0a880a2:docs/architecture/ELIOT_ARCHITECTURE.md > "$tmp/adopt_arch.md"
+git show c0a880a2:docs/architecture/ELIOT_ARCHITECTURE.md > "$tmp/check_arch_bin.tmp"
+Get-Item "$tmp/adopt_arch.md" | Select-Object Length
+python scripts/docs_shards.py assemble --source implementation --output "$tmp/adopt_impl.md" 2>&1
+Get-Item "$tmp/adopt_impl.md" | Select-Object Length
+python scripts/docs_shards.py assemble --source architecture --output "$tmp/recon_arch.md" 2>&1
+Get-Item "$tmp/recon_arch.md" | Select-Object Length
+Copy-Item docs/architecture/ELIOT_ARCHITECTURE.md "$tmp/facade_arch.md" -Force
+Copy-Item docs/architecture/ELIOT_IMPLEMENTATION.md "$tmp/facade_impl.md" -Force
+Get-Item "$tmp/facade_arch.md","$tmp/facade_impl.md" | Select-Object Name,Length
+TEMP=C:\Users\kleym\AppData\Local\Temp
+
+DOC_SHARDS_ASSEMBLE: PASS source=implementation sha256=40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89 output=C:\Users\kleym\AppData\Local\Temp\adopt_impl.md
+DOC_SHARDS_ASSEMBLE: PASS source=architecture sha256=c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a output=C:\Users\kleym\AppData\Local\Temp\recon_arch.md
+ Length
+ ------
+ 149403
+1003351
+ 149403
+  23333
+ 154307
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython -c "
+import hashlib, subprocess, pathlib, json
+tmp = pathlib.Path(r'C:\Users\kleym\AppData\Local\Temp')
+def info(p):
+    data = (tmp/p).read_bytes()
+    print(p, 'bytes', len(data), 'sha256', hashlib.sha256(data).hexdigest())
+    blob = subprocess.run(['git','hash-object', str(tmp/p)], capture_output=True, text=True).stdout.strip()
+    print('  git-blob', blob)
+for f in ['adopt_arch.md','recon_arch.md','adopt_impl.md','facade_arch.md','facade_impl.md']:
+    info(f)
+print('---expected---')
+print('arch adopted c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a 149403 blob 81ad1508217393ac6dbaecd2386081697405846a')
+print('impl adopted 40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89 1003351')
+print('---git show blobs---')
+import subprocess as sp
+for rev_path in ['c0a880a2:docs/architecture/ELIOT_ARCHITECTURE.md','HEAD:docs/architecture/ELIOT_ARCHITECTURE.md','HEAD:docs/architecture/ELIOT_IMPLEMENTATION.md']:
+    r = sp.run(['git','rev-parse', rev_path], capture_output=True, text=True)
+    print(rev_path, r.stdout.strip())
+print('---pair check---')
+print(open('docs/normative-pair.toml').read())
+"
+echo "---CMP adopt_arch vs recon_arch---"
+fc /B C:\Users\kleym\AppData\Local\Temp\adopt_arch.md C:\Users\kleym\AppData\Local\Temp\recon_arch.md 2>&1 | Select-Object -First 5
+echo "FC_EXIT:$LASTEXITCODE"
+adopt_arch.md bytes 149403 sha256 c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a
+  git-blob 81ad1508217393ac6dbaecd2386081697405846a
+recon_arch.md bytes 149403 sha256 c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a
+  git-blob 81ad1508217393ac6dbaecd2386081697405846a
+adopt_impl.md bytes 1003351 sha256 40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89
+  git-blob 40ffcda406f92e9168388a22b88f0a7c70b6e767
+facade_arch.md bytes 23333 sha256 100d72df90eda0202c138465e49556c62539e7fb5c81fc9567f071d65144eac6
+  git-blob e19800d7db756ca934b10866c573adc3a19cb3b3
+facade_impl.md bytes 154307 sha256 63e6de3bea958b05087907c36f69dd00455904bca990cc658dd04d28147bd0b4
+  git-blob 51a56d3a2ba1fe041b42674a2300a0ae9bf44bd5
+---expected---
+arch adopted c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a 149403 blob 81ad1508217393ac6dbaecd2386081697405846a
+impl adopted 40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89 1003351
+---git show blobs---
+c0a880a2:docs/architecture/ELIOT_ARCHITECTURE.md 81ad1508217393ac6dbaecd2386081697405846a
+HEAD:docs/architecture/ELIOT_ARCHITECTURE.md e19800d7db756ca934b10866c573adc3a19cb3b3
+HEAD:docs/architecture/ELIOT_IMPLEMENTATION.md 51a56d3a2ba1fe041b42674a2300a0ae9bf44bd5
+---pair check---
+schema_version = "eliot-normative-pair-v2-sharded"
+status = "accepted"
+adopted_at = "2026-08-28"
+decision_ref = "github:UnknownAlienHuman/eliot-memory-os#25"
+repository_authority_branch = "main"
+historical_material_location = "git-history-and-issue-pr-records-only"
+
+content_layout = "eliot-doc-shards-v1"
+
+pair_key_algorithm = "sha256-domain-separated-v1"
+pair_key_input = "UTF-8 domain tag eliot-normative-pair-v1 and lowercase document digests separated and terminated by NUL bytes"
+pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
+
+architecture_path = "docs/architecture/architecture/manifest.json"
+architecture_entry_path = "docs/architecture/architecture/README.md"
+architecture_compatibility_path = "docs/architecture/ELIOT_ARCHITECTURE.md"
+architecture_revision = "4.5-draft"
+architecture_edition = "2026-08-28"
+architecture_sha256 = "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a"
+
+implementation_path = "docs/architecture/implementation/manifest.json"
+implementation_entry_path = "docs/architecture/implementation/README.md"
+implementation_compatibility_path = "docs/architecture/ELIOT_IMPLEMENTATION.md"
+implementation_revision = "0.29-draft"
+implementation_edition = "2026-08-28"
+implementation_sha256 = "40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89"
+
+supersedes_architecture_sha256 = "58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8"
+supersedes_implementation_sha256 = "c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b"
+
+---CMP adopt_arch vs recon_arch---
+Format-Custom: 
+Line |
+  23 |  fc /B C:\Users\kleym\AppData\Local\Temp\adopt_arch.md C:\Users\kleym\ .
+     |  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     | A positional parameter cannot be found that accepts argument 'C:\Users\kleym\AppData\Local\Temp\adopt_arch.md'.
+FC_EXIT:0
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mCopy-Item C:\Users\kleym\AppData\Local\Temp\adopt_arch.md docs/architecture/ELIOT_ARCHITECTURE.md -Force
+Copy-Item C:\Users\kleym\AppData\Local\Temp\adopt_impl.md docs/architecture/ELIOT_IMPLEMENTATION.md -Force
+git status --short
+python -c "import hashlib; print(hashlib.sha256(open('docs/architecture/ELIOT_ARCHITECTURE.md','rb').read()).hexdigest()); print(hashlib.sha256(open('docs/architecture/ELIOT_IMPLEMENTATION.md','rb').read()).hexdigest())"
+git hash-object docs/architecture/ELIOT_ARCHITECTURE.md docs/architecture/ELIOT_IMPLEMENTATION.md
+git diff --stat
+M docs/architecture/ELIOT_ARCHITECTURE.md
+ M docs/architecture/ELIOT_IMPLEMENTATION.md
+?? prompt-closure.txt
+?? prompt-provenance.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-prov.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-prov.log
+?? stdout-syncfix.log
+?? stdout.log
+c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a
+40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89
+81ad1508217393ac6dbaecd2386081697405846a
+40ffcda406f92e9168388a22b88f0a7c70b6e767
+ docs/architecture/ELIOT_ARCHITECTURE.md   |  2914 +++-
+ docs/architecture/ELIOT_IMPLEMENTATION.md | 21483 +++++++++++++++++++++++++---
+ 2 files changed, 22433 insertions(+), 1964 deletions(-)
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit add docs/architecture/ELIOT_ARCHITECTURE.md docs/architecture/ELIOT_IMPLEMENTATION.md
+git status --short --branch
+git diff --cached --stat
+git commit -m "docs: adopt current normative byte streams to legacy paths for closure provenance" 2>&1
+echo "EXIT:$LASTEXITCODE"
+git rev-parse HEAD
+git show --stat --oneline HEAD | Select-Object -First 20
+## work/docs-closure-provenance...origin/main
+M  docs/architecture/ELIOT_ARCHITECTURE.md
+M  docs/architecture/ELIOT_IMPLEMENTATION.md
+?? prompt-closure.txt
+?? prompt-provenance.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-prov.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-prov.log
+?? stdout-syncfix.log
+?? stdout.log
+ docs/architecture/ELIOT_ARCHITECTURE.md   |  2914 +++-
+ docs/architecture/ELIOT_IMPLEMENTATION.md | 21483 +++++++++++++++++++++++++---
+ 2 files changed, 22433 insertions(+), 1964 deletions(-)
+[work/docs-closure-provenance d8eec940] docs: adopt current normative byte streams to legacy paths for closure provenance
+ 2 files changed, 22433 insertions(+), 1964 deletions(-)
+EXIT:0
+d8eec94082d5e8786cea5ebc09c9a62598e4d8af
+d8eec940 docs: adopt current normative byte streams to legacy paths for closure provenance
+ docs/architecture/ELIOT_ARCHITECTURE.md   |  2914 +++-
+ docs/architecture/ELIOT_IMPLEMENTATION.md | 21483 +++++++++++++++++++++++++---
+ 2 files changed, 22433 insertions(+), 1964 deletions(-)
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mCopy-Item C:\Users\kleym\AppData\Local\Temp\facade_arch.md docs/architecture/ELIOT_ARCHITECTURE.md -Force
+Copy-Item C:\Users\kleym\AppData\Local\Temp\facade_impl.md docs/architecture/ELIOT_IMPLEMENTATION.md -Force
+git status --short --branch
+python -c "import hashlib; print(hashlib.sha256(open('docs/architecture/ELIOT_ARCHITECTURE.md','rb').read()).hexdigest()); print(hashlib.sha256(open('docs/architecture/ELIOT_IMPLEMENTATION.md','rb').read()).hexdigest())"
+git hash-object docs/architecture/ELIOT_ARCHITECTURE.md docs/architecture/ELIOT_IMPLEMENTATION.md
+git diff --stat
+## work/docs-closure-provenance...origin/main [ahead 1]
+ M docs/architecture/ELIOT_ARCHITECTURE.md
+ M docs/architecture/ELIOT_IMPLEMENTATION.md
+?? prompt-closure.txt
+?? prompt-provenance.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-prov.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-prov.log
+?? stdout-syncfix.log
+?? stdout.log
+100d72df90eda0202c138465e49556c62539e7fb5c81fc9567f071d65144eac6
+63e6de3bea958b05087907c36f69dd00455904bca990cc658dd04d28147bd0b4
+e19800d7db756ca934b10866c573adc3a19cb3b3
+51a56d3a2ba1fe041b42674a2300a0ae9bf44bd5
+ docs/architecture/ELIOT_ARCHITECTURE.md   |  2914 +---
+ docs/architecture/ELIOT_IMPLEMENTATION.md | 21483 +++-------------------------
+ 2 files changed, 1964 insertions(+), 22433 deletions(-)
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit add docs/architecture/ELIOT_ARCHITECTURE.md docs/architecture/ELIOT_IMPLEMENTATION.md
+git commit -m "docs: restore compatibility facades byte-identical after provenance adoption" 2>&1
+echo "EXIT:$LASTEXITCODE"
+git rev-parse HEAD
+git log --oneline -4
+git show --stat --oneline HEAD | Select-Object -First 20
+echo "---DIFF origin/main HEAD---"
+git diff origin/main HEAD --stat
+echo "---DIFF origin/main HEAD name-only---"
+git diff origin/main HEAD --name-only
+[work/docs-closure-provenance b64fdf99] docs: restore compatibility facades byte-identical after provenance adoption
+ 2 files changed, 1964 insertions(+), 22433 deletions(-)
+EXIT:0
+b64fdf990726a34d20dadecf36c4c2d3d7b4a83c
+b64fdf99 docs: restore compatibility facades byte-identical after provenance adoption
+d8eec940 docs: adopt current normative byte streams to legacy paths for closure provenance
+09c2c902 docs: refresh package docs index via code-navigation-sync (just quick navigation gate green) (#2026)
+f0abfe13 fix: update stale architecture doc paths in contracts and assignments (#2024)
+b64fdf99 docs: restore compatibility facades byte-identical after provenance adoption
+ docs/architecture/ELIOT_ARCHITECTURE.md   |  2914 +---
+ docs/architecture/ELIOT_IMPLEMENTATION.md | 21483 +++-------------------------
+ 2 files changed, 1964 insertions(+), 22433 deletions(-)
+---DIFF origin/main HEAD---
+---DIFF origin/main HEAD name-only---
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mjust docs-closure-audit 2>&1; echo "EXIT:$LASTEXITCODE"
+python scripts/docs_closure_audit.py --root .
+DOC_CLOSURE_AUDIT: errors=0 warnings=45 info=27 report=.eliot/docs-closure-audit
+EXIT:0
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mjust quick 2>&1; echo "EXIT:$LASTEXITCODE"
+python scripts/docs_shards.py self-test
+DOC_SHARDS_SELF_TEST: PASS cases=6
+DOC_SHARDS_HARDENING_SELF_TEST: PASS cases=7
+python scripts/docs_shards.py verify --root .
+DOC_SHARDS_VERIFY: PASS pair=sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea architecture_fragments=123 architecture_bytes=149403 architecture_largest=10212 implementation_fragments=504 implementation_bytes=1003351 implementation_largest=25823 markdown_files=829 links=4341
+python scripts/docs_router.py self-test
+DOC_ROUTER_SELF_TEST: PASS cases=5
+DOC_ROUTER_HARDENING_SELF_TEST: PASS cases=3
+python scripts/docs_router.py check --root .
+DOC_ROUTER_CHECK: PASS routes=17 selectors=193 examples=11 tracked_files=3315 payloads_checked=14
+python scripts/docs_read.py self-test
+DOC_READ_SELF_TEST: PASS cases=3
+python scripts/verify-doc-code-conformance.py --self-test
+DOC_CODE_CONFORMANCE_SELF_TEST: PASS cases=18
+DOC_TRACEABILITY_RETIREMENT_SELF_TEST: PASS cases=5
+NORMATIVE_REFERENCE_CONFORMANCE_SELF_TEST: PASS cases=8
+DOC_CODE_CONFORMANCE_PIPELINE_SELF_TEST: PASS cases=19
+python scripts/verify-doc-code-conformance.py --root .
+DOC_CODE_CONFORMANCE: PASS binary_packages=15 decision_anchor_candidates=932 documentation_pipeline_files=2 normative_reference_files=3231 numeric_reference_candidates=2937 owner_bindings=1 reader_generator_scopes=3 reader_surfaces=36 reference_files=2516 repository_path_references=1523 repository_paths_unique=249 scripts=56 traceability_retirement_surfaces=34 workflow_files=4
+python scripts/code_navigation.py self-test
+CODE_NAVIGATION_SELF_TEST: PASS cases=14
+PACKAGE_DOC_INDEX_SELF_TEST: PASS cases=4
+PROTOTYPE_DOC_INDEX_SELF_TEST: PASS cases=5
+python scripts/code_navigation.py check --root .
+CODE_NAVIGATION_CHECK: PASS workspace_members=174 default_members=6 nonmember_packages=11 rust_files=1571 logical_blocks=15
+PACKAGE_DOC_INDEX_CHECK: PASS workspace_members=174 default_members=6 logical_blocks=15
+PROTOTYPE_DOC_INDEX_CHECK: PASS nonmember_prototypes=11
+python scripts/docs_closure_audit.py --root .
+DOC_CLOSURE_AUDIT: errors=0 warnings=45 info=27 report=.eliot/docs-closure-audit
+python scripts/verify-standalone-crates.py --root .
+STANDALONE_CRATE_FAIL: crates/smart/eliot-dreamer-curation-wasm step=test
+       Compiling eliot-epistemic-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-epistemic-contracts)
+       Compiling eliot-dreamer-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-contracts)
+       Compiling eliot-dreamer-curation v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-curation)
+       Compiling eliot-dreamer-curation-wasm v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-curation-wasm)
+        Finished `test` profile [unoptimized + debuginfo] target(s) in 21.28s
+         Running unittests src\lib.rs (C:/Users/kleym/AppData/Local/Eliot/build/rust-env-target\debug\deps\eliot_dreamer_curation_wasm-c8dc9c6a22045651.exe)
+         Running tests\proof.rs (C:/Users/kleym/AppData/Local/Eliot/build/rust-env-target\debug\deps\proof-9a6e511d429bcfdd.exe)
+    error: test failed, to rerun pass `--test proof`
+STANDALONE_CRATE_FAIL: crates/smart/eliot-dreamer-cycle-wasm step=fmt
+    [0m[32m+fn state(
+    [0m[32m+    policy: &CyclePolicy,
+    [0m[32m+    job: &DreamJobAdmission,
+    [0m[32m+    request: PendingRequest,
+    [0m[32m+) -> DreamerCycleState {
+    [0m     let mut state = DreamerCycleState {
+             schema_version: 1,
+             cycle_id: ArtifactId::new("cycle-1").unwrap(),
+STANDALONE_CRATES: FAIL crates=11 failures=2
+error: recipe `standalone-crates` failed on line 44 with exit code 1
+EXIT:1
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython -c "import json; d=json.load(open('.eliot/docs-closure-audit/audit.json')); print('commit', d['commit']); print('summary', d['summary']); print('arch_matches', d['evidence'].get('architecture_original_matches')); print('impl_matches', d['evidence'].get('implementation_original_matches')); print('common', d['evidence'].get('common_original_commits')); print('arch_blob', d['evidence'].get('architecture_reconstructed_blob')); print('impl_blob', d['evidence'].get('implementation_reconstructed_blob')); print('metrics arch/impl', d['metrics'].get('architecture_sha256'), d['metrics'].get('implementation_sha256'))"
+echo "---LOG---"
+git log --oneline -4
+echo "---SHOW A---"
+git show --stat --oneline d8eec940 | Select-Object -First 10
+echo "---SHOW B---"
+git show --stat --oneline b64fdf99 | Select-Object -First 10
+echo "---BLOBS at A---"
+git rev-parse d8eec940:docs/architecture/ELIOT_ARCHITECTURE.md
+git rev-parse d8eec940:docs/architecture/ELIOT_IMPLEMENTATION.md
+echo "---BLOBS at B/HEAD---"
+git rev-parse HEAD:docs/architecture/ELIOT_ARCHITECTURE.md
+git rev-parse HEAD:docs/architecture/ELIOT_IMPLEMENTATION.md
+echo "---BLOBS origin/main---"
+git rev-parse origin/main:docs/architecture/ELIOT_ARCHITECTURE.md
+git rev-parse origin/main:docs/architecture/ELIOT_IMPLEMENTATION.md
+commit b64fdf990726a34d20dadecf36c4c2d3d7b4a83c
+summary {'errors': 0, 'info': 27, 'warnings': 45}
+arch_matches [{'blob': '81ad1508217393ac6dbaecd2386081697405846a', 'commit': 'd8eec94082d5e8786cea5ebc09c9a62598e4d8af'}, {'blob': '81ad1508217393ac6dbaecd2386081697405846a', 'commit': 'c0a880a2af2c94e76972daf03c7e532b7dfb2e86'}]
+impl_matches [{'blob': '40ffcda406f92e9168388a22b88f0a7c70b6e767', 'commit': 'd8eec94082d5e8786cea5ebc09c9a62598e4d8af'}]
+common ['d8eec94082d5e8786cea5ebc09c9a62598e4d8af']
+arch_blob 81ad1508217393ac6dbaecd2386081697405846a
+impl_blob 40ffcda406f92e9168388a22b88f0a7c70b6e767
+metrics arch/impl c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a 40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89
+---LOG---
+b64fdf99 docs: restore compatibility facades byte-identical after provenance adoption
+d8eec940 docs: adopt current normative byte streams to legacy paths for closure provenance
+09c2c902 docs: refresh package docs index via code-navigation-sync (just quick navigation gate green) (#2026)
+f0abfe13 fix: update stale architecture doc paths in contracts and assignments (#2024)
+---SHOW A---
+d8eec940 docs: adopt current normative byte streams to legacy paths for closure provenance
+ docs/architecture/ELIOT_ARCHITECTURE.md   |  2914 +++-
+ docs/architecture/ELIOT_IMPLEMENTATION.md | 21483 +++++++++++++++++++++++++---
+ 2 files changed, 22433 insertions(+), 1964 deletions(-)
+---SHOW B---
+b64fdf99 docs: restore compatibility facades byte-identical after provenance adoption
+ docs/architecture/ELIOT_ARCHITECTURE.md   |  2914 +---
+ docs/architecture/ELIOT_IMPLEMENTATION.md | 21483 +++-------------------------
+ 2 files changed, 1964 insertions(+), 22433 deletions(-)
+---BLOBS at A---
+81ad1508217393ac6dbaecd2386081697405846a
+40ffcda406f92e9168388a22b88f0a7c70b6e767
+---BLOBS at B/HEAD---
+e19800d7db756ca934b10866c573adc3a19cb3b3
+51a56d3a2ba1fe041b42674a2300a0ae9bf44bd5
+---BLOBS origin/main---
+e19800d7db756ca934b10866c573adc3a19cb3b3
+51a56d3a2ba1fe041b42674a2300a0ae9bf44bd5
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit push -u origin work/docs-closure-provenance 2>&1; echo "EXIT:$LASTEXITCODE"; git status --short --branch; git log --oneline -3; git ls-remote --heads origin work/docs-closure-provenance 2>&1 | Select-Object -First 5
+branch 'work/docs-closure-provenance' set up to track 'origin/work/docs-closure-provenance'.
+remote: 
+remote: Create a pull request for 'work/docs-closure-provenance' on GitHub by visiting:        
+remote:      https://github.com/UnknownAlienHuman/eliot-memory-os/pull/new/work/docs-closure-provenance        
+remote: 
+To https://github.com/UnknownAlienHuman/eliot-memory-os.git
+ * [new branch]        work/docs-closure-provenance -> work/docs-closure-provenance
+EXIT:0
+## work/docs-closure-provenance...origin/work/docs-closure-provenance
+?? prompt-closure.txt
+?? prompt-provenance.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-prov.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-prov.log
+?? stdout-syncfix.log
+?? stdout.log
+b64fdf99 docs: restore compatibility facades byte-identical after provenance adoption
+d8eec940 docs: adopt current normative byte streams to legacy paths for closure provenance
+09c2c902 docs: refresh package docs index via code-navigation-sync (just quick navigation gate green) (#2026)
+b64fdf990726a34d20dadecf36c4c2d3d7b4a83c	refs/heads/work/docs-closure-provenance
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mecho "---BRANCH---"; git branch --show-current; git rev-parse HEAD; git rev-parse origin/main; echo "---DIFF TREES---"; git diff origin/main HEAD --stat; echo "(empty above = tip identical)"; echo "---FILES IN COMMITS---"; git diff --name-only d8eec940~1 d8eec940; git diff --name-only b64fdf99~1 b64fdf99; echo "---STATUS---"; git status --short --branch; echo "---REMOTE---"; git log --oneline origin/work/docs-closure-provenance -3 2>&1 | Select-Object -First 5
+---BRANCH---
+work/docs-closure-provenance
+b64fdf990726a34d20dadecf36c4c2d3d7b4a83c
+09c2c902d31bae9ceb7f37ab14b6ea2084b47b9a
+---DIFF TREES---
+(empty above = tip identical)
+---FILES IN COMMITS---
+docs/architecture/ELIOT_ARCHITECTURE.md
+docs/architecture/ELIOT_IMPLEMENTATION.md
+docs/architecture/ELIOT_ARCHITECTURE.md
+docs/architecture/ELIOT_IMPLEMENTATION.md
+---STATUS---
+## work/docs-closure-provenance...origin/work/docs-closure-provenance
+?? prompt-closure.txt
+?? prompt-provenance.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-prov.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-prov.log
+?? stdout-syncfix.log
+?? stdout.log
+---REMOTE---
+b64fdf99 docs: restore compatibility facades byte-identical after provenance adoption
+d8eec940 docs: adopt current normative byte streams to legacy paths for closure provenance
+09c2c902 docs: refresh package docs index via code-navigation-sync (just quick navigation gate green) (#2026)
+> build · muse-spark-1.3-contributor-free

@@ -1,0 +1,4 @@
+You are an OpenCode nested swarm manager on the FREE route. Small bounded tasks only. Analysis only: change nothing, commit nothing, push nothing.
+Repo copy: this worktree (synced to origin/main tip). Your nextgate red report on architecture-boundaries is accepted.
+Task: run just architecture-boundaries (and only it) once more, capture the COMPLETE violation list (all HARD_VIOLATION and AUDIT_SIGNAL lines with file, package, issue number, rule), and group them by owning issue number into a work-package table: issue, violation count, files involved, one-line scope of the fix. Do NOT fix anything. Do NOT run other gates.
+Deliverable: final report with the full grouped table plus raw log tail. Nothing to push.

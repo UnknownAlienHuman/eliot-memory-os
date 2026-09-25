@@ -1,0 +1,25 @@
+Fixing the two standalone WASM proofs — formatting one, hardening the other.
+Branch ready and docs routed — now inspecting the failing proofs.
+I've mapped the sibling fallback pattern — now applying the two scoped edits.
+Formatting fix matches the expected two hunks — now hardening the brittle env lookup.
+Both edits are in and formatting is clean — now running the verification gate.
+Clippy flags the new skip message — mirroring the sibling crate's lint allowance.
+Lint green — now running the test suites.
+Both crates green in isolation — now running the full standalone gate.
+Full gate passes — committing and pushing the branch.
+Done. No merge performed.
+
+**Branch:** `work/standalone-wasm-fixes` created from `origin/main` (`543e8c35`), committed (`da6ae68c`), pushed to `origin/work/standalone-wasm-fixes`, tracking clean.
+
+**Changes (exactly 2 files, nothing else):**
+1. `crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs` — `cargo fmt` only. Verified via `git diff`: only the two expected hunks (contract-import wrap lines 19–22, `fn state` signature wrap line 172). No semantic change.
+2. `crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs` — replaced hard `std::env::var("CARGO_TARGET_DIR").expect(...)` with the cycle-wasm sibling pattern: new `candidate_artifact_paths()` (`option_env!("CARGO_TARGET_DIR")` + manifest-relative `target/...` fallback), artifact inspection skipped with the same `eprintln!` note when absent; descriptor/WIT assertions stay unconditional. One supporting same-file line: added `clippy::print_stderr` to the test allow-list (mirrors cycle-wasm; required for clippy `-D warnings` GREEN).
+
+**Gate log (GREEN, `CARGO_TARGET_DIR` unset/hermetic):**
+- `cycle-wasm`: fmt 0, clippy 0, test 27 passed
+- `curation-wasm`: fmt 0, clippy 0, test 14 passed (incl. previously failing `clean_warm_artifact_hash_size_world_abi_toolchain_and_admission`)
+- Full gate: `STANDALONE_CRATES: PASS crates=11 steps=3 exclude_norun=0`, exit 0
+
+**Diff stat vs `origin/main`:** 2 files changed, 45 insertions(+), 18 deletions(-) — per file: curation `53 ++++---`, cycle `10 ++--`.
+
+**Reading attestation:** routed both path families before mutation; route `sha256:2fc245d3…`, read `sha256:b9cf4b0a…`, bundle `sha256:6e474d1d…` opened and read; receipt IDs recorded in the commit message. Untracked `prompt-*.txt` / `std*.log` local files left out of Git.

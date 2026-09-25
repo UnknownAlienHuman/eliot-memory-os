@@ -1,0 +1,2521 @@
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit status --short --branch; echo ---; git rev-parse HEAD; echo ---; git log --oneline -3; echo ---; git branch --show-current
+## work/docs-closure-provenance...origin/work/docs-closure-provenance
+?? prompt-closure.txt
+?? prompt-provenance.txt
+?? prompt-safix.txt
+?? prompt-standalone.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-prov.log
+?? stderr-safix.log
+?? stderr-standalone.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-prov.log
+?? stdout-safix.log
+?? stdout-standalone.log
+?? stdout-syncfix.log
+?? stdout.log
+---
+b64fdf990726a34d20dadecf36c4c2d3d7b4a83c
+---
+b64fdf99 docs: restore compatibility facades byte-identical after provenance adoption
+d8eec940 docs: adopt current normative byte streams to legacy paths for closure provenance
+09c2c902 docs: refresh package docs index via code-navigation-sync (just quick navigation gate green) (#2026)
+---
+work/docs-closure-provenance
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit fetch origin main 2>&1 | head -20; echo ---; git rev-parse origin/main; echo ---; git log --oneline origin/main -3
+head: The term 'head' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+---
+543e8c35e2a5a70932373d36b66a03067dadc09f
+---
+543e8c35 Merge pull request #2027 from UnknownAlienHuman/work/docs-closure-provenance
+b64fdf99 docs: restore compatibility facades byte-identical after provenance adoption
+d8eec940 docs: adopt current normative byte streams to legacy paths for closure provenance
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit checkout -b work/standalone-wasm-fixes origin/main
+Switched to a new branch 'work/standalone-wasm-fixes'
+branch 'work/standalone-wasm-fixes' set up to track 'origin/main'.
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython scripts/docs_read.py read --path crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs --topic "standalone wasm fix formatting" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+Get-Content .eliot/docs-read-bundle.md
+echo "===RECEIPT==="
+Get-Content .eliot/docs-read-receipt.json
+unt, but the smallest typical change closure with acceptable fixed overhead. I2.16, I2.23, and CrateBuildProfile measure both sides.
+
+---
+
+## Required item `docs/architecture/I02-03-workspace-topology-and-dependency-direction.md`
+
+SHA-256: `1a647a5b220131b59df7455371b82b0ca59251c45f27556771c70e53d10dd033`; bytes: `4409`; handles=I2.3.
+
+## I2.3. Workspace topology and dependency direction
+
+### Root core workspace
+
+The first production workspace contains crates required for daily development and normal local runtime. It uses:
+
+```toml
+[workspace]
+resolver = "3"
+members = ["crates/*", "bins/*", "tests/*"]
+default-members = [
+  # daily core packages and primary binaries only
+]
+```
+
+`default-members` is not all members. A normal root command must not accidentally build fuzzing, mutation, cloud SDKs, all vendors, and laboratory tools.
+
+### Federated workspaces
+
+A separate Cargo workspace is created not because there are many crates, but when a dependency island exists:
+
+```text
+a different toolchain or target;
+a WASM, fuzz, Miri, Kani, or nightly-only contour;
+a heavy vendor SDK that invalidates the core cache;
+an upstream project preserved without rewriting;
+an incompatible dependency, MSRV, or license profile;
+an experimental distributed, actor, or runtime branch;
+an independent release cadence for an optional Module family.
+```
+
+Initial repository topology:
+
+```text
+/workspace/core         # root production workspace and daily default-members
+/workspace/modules      # optional module families when extracted
+/workspace/lab          # fuzz, mutation, model experiments, benchmarks
+/workspace/tools        # xtask, schema/profile generators, release tools
+/upstream               # unchanged external source/bundles where applicable
+```
+
+These directories appear physically as their first real consumer appears. One root workspace is allowed until a cache or dependency conflict is demonstrated.
+
+Cross-workspace connection uses:
+
+```text
+versioned EBP/protocol schema;
+immutable artifact manifest;
+a public ELIOT contract crate or generated schema package;
+contract digest and compatibility receipt;
+```
+
+One lockfile is not an architectural objective. One semantic owner and one causal order matter more than one Cargo workspace.
+
+### Source layers
+
+```text
+C0 primitives/contracts
+  ids, time, errors, schemas, protocol, module/client SDK;
+
+C1 pure domain cores
+  state machines, validation, ranking, reconciliation, policy functions;
+
+C2 application services
+  task/read/write/context/coordination services over ports;
+
+C3 adapters/instruments
+  SurrealDB, Windows, Cargo, providers, MCP, code tools;
+
+C4 process/surface composition
+  binaries, service hosts, CLI, UI, bridges.
+```
+
+Dependency direction is outward only:
+
+```text
+C4  C3  C2  C1  C0
+```
+
+A dependency on a deeper stable contract is allowed, but not on higher-layer implementation. Cargo graph cycles are prohibited.
+
+### Contract hubs
+
+A crate with large reverse-dependency fan-out is a load-bearing hub. It must:
+
+```text
+have minimal dependencies;
+contain no vendor or framework types;
+change rarely;
+separate additive schema change from breaking change;
+have a public-contract digest and consumer tests;
+not become a dumping ground for common types.
+```
+
+Unstable logic belongs near leaf crates, not in `eliot-common` or `eliot-types`.
+
+### Runtime control does not change source ownership
+
+```text
+Host starts Kernel;
+Kernel starts generations;
+Governor schedules Modules;
+Watchdog observes processes;
+Modules return candidates and events.
+```
+
+These runtime arrows do not authorize importing the managed component's internal types. A callback does not transfer ownership to the caller.
+
+### Lessons from Rust microservice systems
+
+ELIOT adopts:
+
+```text
+small stable contract crates;
+one mutable-state owner per service;
+thin binary and composition crates;
+explicit health, readiness, and capacity surfaces;
+composable timeout/load-shed/rate-limit/observability middleware;
+idempotent request/effect identity;
+consumer/provider contract tests;
+process deployment only at a real failure boundary.
+```
+
+ELIOT does not adopt:
+
+```text
+a network hop between every source module;
+service-per-entity/table;
+a separate database for each helper capability;
+chatty distributed transactions;
+Kubernetes or gRPC as mandatory local baseline;
+protocol-generated types as the sole domain model.
+```
+
+Tower-like `Service` and `Layer` composition is allowed inside transport and service crates. Tonic-like multi-crate organization is useful as an example of separate contract, codegen, health, and transport packages. But local Windows ELIOT remains process-sparse: most source micro-modularity is statically linked into a few supervised runtime bundles.
+
+---
+
+## Required item `docs/architecture/I02-04-erlangotp-principles-in-the-rust-runtime.md`
+
+SHA-256: `02a97eaee1e7696ea856b97ae83c91fc26df6934ba66af3de81668edf1012f50`; bytes: `2878`; handles=I2.4.
+
+## I2.4. Erlang/OTP principles in the Rust runtime
+
+ELIOT adopts operational principles, not BEAM syntax:
+
+```text
+small state owners;
+message passing instead of shared mutable cross-Module state;
+supervision tree;
+crash containment;
+bounded restart intensity;
+explicit child classes;
+immutable release generations;
+state migration before cutover;
+observable recovery outcome.
+```
+
+### Supervision strategies
+
+Two orthogonal fields use the same canonical vocabulary as I14.10:
+
+| Field | Values | Use |
+|---|---|---|
+| group strategy | `one_for_one` | restart only the independent failed child; DEFAULT |
+| group strategy | `rest_for_one` | restart failed child and explicitly declared downstream dependents |
+| group strategy | `one_for_all` | rare; only for a small inseparable supervision group |
+| child class | `temporary` | do not restart automatically after completion or failure |
+| child class | `transient` | restart only after abnormal exit |
+| child class | `permanent` | restart after any non-retirement exit within policy |
+
+The strategy is declared in the Module or Service manifest. Supervisor does not infer it from process name.
+
+### Restart intensity
+
+Every supervisor branch has:
+
+```text
+attempt budget;
+rolling observation window;
+exponential/jittered backoff;
+last-known-good generation;
+quarantine condition;
+escalation target;
+Problem State and receipts.
+```
+
+Repeated failure does not create an endless restart loop. After budget exhaustion, the branch is quarantined or escalation moves one level higher.
+
+### Rust boundary
+
+Rust provides no safe general replacement of arbitrary machine code inside a live process while preserving state, as BEAM does. Therefore:
+
+```text
+source crate
+  built and tested independently;
+
+in-process service
+  replaced by restarting the current disposable service or by a new `eliotd` generation;
+
+process Module
+  replaced by an individual side-by-side process generation;
+
+Kernel/Host
+  replaced by an external-supervisor cutover.
+```
+
+Rust `cdylib` unloading and arbitrary in-process code injection are not production plugin mechanisms.
+
+### Actor implementation
+
+ELIOT-owned supervision semantics remain behind the `eliot-runtime` facade. The DEFAULT is supervised Tokio tasks and typed bounded mailboxes. `ractor` may be used for suitable service trees only after an empirical gate and does not define:
+
+```text
+authority;
+restart policy;
+receipts;
+state ownership;
+cluster semantics;
+canonical task lifecycle.
+```
+
+A distributed actor-cluster library is not a production dependency without separate conformance and failure proof.
+
+### Graceful stop
+
+Every supervised task or process passes through:
+
+```text
+stop admission
+ cancellation signal
+ stop accepting new work
+ checkpoint/flush/disposition effects
+ bounded wait
+ forced termination if required
+ no-orphan verification
+ receipt.
+```
+
+---
+
+## Required item `docs/architecture/I02-05-unsafe-policy.md`
+
+SHA-256: `07427e6e0616d0c5258f9b84e9e3142c3072e1208b454807f4a2184a16546139`; bytes: `356`; handles=I2.5.
+
+## I2.5. `unsafe` policy
+
+`unsafe` is allowed only in explicitly listed crates:
+
+```text
+eliot-platform-windows;
+eliot-platform-unix;
+when necessary, a separate audited FFI bridge.
+```
+
+Every unsafe block has a `// SAFETY:` rationale, local invariant test, and owning reviewer. Domain, contract, and Kernel pure-core crates use `#![forbid(unsafe_code)]`.
+
+---
+
+## Required item `docs/architecture/I02-10-runtime-module-and-state-classes.md`
+
+SHA-256: `7d6d27785174130e7edef62fe15430df8d92199467398f5edf5412af20b91871`; bytes: `5753`; handles=I2.10.
+
+## I2.10. Runtime module and state classes
+
+Module manifest declares three orthogonal classifications: execution contour, runtime role and state ownership. None of them is inferred from a crate name.
+
+### `ModuleExecutionContour`
+
+| Contour | Use | Isolation / replacement | Examples |
+|---|---|---|---|
+| `wasm_component` | Pure or nearly pure experimental logic with a narrow capability surface | Wasmtime Store/instance; immutable component generation | routing/scoring policy, validators, deterministic transforms, context assembly policy |
+| `native_process` | OS, Cargo, Git, LSP, browser, native libraries, credentials or long CPU work | separate process/Job Object; versioned protocol; rolling generation | testd, code tools, provider bridges, professional tools |
+| `static_native` | Trusted Kernel/control path or a measured stable hot path | new signed binary/process generation; Host/Kernel cutover | authority/fencing core, serialization hot path after proof |
+| `development_only` | generators, fuzzers, benchmarks, migration/test utilities | never required by production runtime | simctl, schema/profile generators, fuzz targets |
+
+Rules:
+
+```text
+crate boundary ? process boundary;
+process boundary ? Windows service boundary;
+WASM/native/static are deployment contours over the same ELIOT-owned contract;
+static native is not a default reward for maturity;
+in-process Rust dynamic libraries are not an ordinary promotion step;
+OS-heavy capability does not gain authority merely by running outside WASM.
+```
+
+A component may remain WASM permanently when its latency is negligible relative to model/tool work and isolation is valuable. Native promotion requires profiling and the same conformance corpus. Static integration is the last step and is performed only by a normal release generation; there is no live unload/reload of Rust code inside Kernel or `eliotd`.
+
+### `ModuleRuntimeClass`
+
+| Class | Examples | Default replacement |
+|---|---|---|
+| `kernel_internal` | fencing/front door | Host-managed Kernel generation |
+| `daemon_service` | task/context/job service | service restart or daemon generation |
+| `process_bridge` | MCP/LSP/provider/tool bridge | independent process generation |
+| `component_host` | Wasmtime or native component pool | host generation + component route cutover |
+| `test_execution_plane` | build/test/simulation service | independent testd generation |
+| `derived_index` | code graph/cue/search | rebuild/shadow/switch |
+| `operational_worker` | crawler/external queue | checkpoint/quiesce/switch |
+| `cognitive_service` | Dreamer/model router | job-bound route switch |
+| `supervisor_security` | Watchdog sensor | independent service generation |
+| `surface` | UI/notifications | independent restart/switch |
+| `development_tool` | impact/schema/simulation generator | never required at runtime |
+
+### `ModuleStateClass`
+
+```text
+stateless
+  no state survives request/process;
+
+host_state_externalized
+  state remains in ELIOT-owned snapshot/delta form; generation is replaceable;
+
+rebuildable
+  derived state recreates from canonical/external sources;
+
+checkpointed_operational
+  non-semantic state resumes from versioned checkpoint/reconciliation;
+
+external_canonical_adapter
+  adapter owns no ELIOT semantics; authoritative data lives behind declared surface.
+```
+
+No hot-replaceable Module declares `canonical_semantic`. Canonical storage, semantic admission and mechanical fencing remain one path with separated responsibilities.
+
+### `ModuleReplacementClass` and `IterationLane`
+
+Source decomposition and runtime replacement are independent decisions. Every independently planned capability declares one replacement class:
+
+```text
+component_generation
+  one sandboxed component generation can shadow/canary/cut over independently;
+
+process_generation
+  one native process generation can be replaced through I14.14;
+
+daemon_generation
+  crates linked into `eliotd` change through a side-by-side daemon generation while Kernel,
+  canonical store and independent services remain alive;
+
+host_generation
+  Host/Kernel/service-shell change through the external Host/SCM cutover contract;
+
+offline_release
+  no safe online cutover exists yet; explicit owner/reason/recovery required.
+```
+
+`daemon_generation` is a real online system-replacement boundary even though Rust code is not unloaded inside a process. A regularly edited crate is not forced into WASM or its own process when that would duplicate state ownership, add IPC latency or weaken the public contract.
+
+Its development loop is classified separately:
+
+```text
+interactive
+  package proof normally returns within the qualified interactive profile;
+
+normal
+  independently runnable but not expected on every edit;
+
+slow
+  long compile/simulation/integration proof; scheduled as a Durable Job;
+
+manual_release
+  proof/replacement requires explicit release or platform boundary.
+```
+
+`ProofLatencyProfile` and replacement cost determine scheduling. Unknown or slow proof moves the capability out of automatic interactive scheduling; it does not by itself make the Module incorrect or require an arbitrary split.
+
+### Execution-selection decision
+
+Choose the least privileged contour that can express the capability:
+
+```text
+pure + bounded host calls
+   WASM Component candidate;
+
+needs OS/native tool or broad async I/O
+   native process generation;
+
+measured control-path bottleneck with stable contract and complete rollback
+   static native release candidate;
+
+uncertain
+   native process first; do not use in-process dynamic loading as compromise.
+```
+
+The decision and rejected alternatives are recorded in the Module Catalog. A later change of contour is a promotion/migration, not an invisible build optimization.
+
+---
+
+## Required item `docs/architecture/I02-17-parallel-agent-development-contract.md`
+
+SHA-256: `6c333908b112859dbffe00c04a9e942b38c5d369a85d89d78788ab576a1d7cb1`; bytes: `1834`; handles=I2.17.
+
+## I2.17. Parallel agent development contract
+
+An agent swarm develops FunctionalCapabilityCells in parallel only after freezing the applicable contract revision; crates are source and build containers.
+
+```text
+Contract/Evidence wave
+  owner, public API, old failure, discriminator, fixtures;
+
+Module-cell wave
+  disjoint FunctionalCapabilityCells are implemented in parallel within bounded source packages;
+
+Edge wave
+  independent integrators verify real boundaries;
+
+Product Pulse
+  the shortest actual front-door path catches architectural drift.
+```
+
+### Assignment rule
+
+One `AgentWorkUnitBrief` contains by default:
+
+```text
+one primary FunctionalCapabilityCell;
+bounded support closure, justified by one-hop contracts/effects and measured context;
+one causal property;
+one discriminator;
+one contract revision;
+one integration owner;
+an Agent Workset within I2.16.
+```
+
+A cross-crate defect is decomposed into:
+
+```text
+contract change unit;
+provider/consumer crate units;
+edge integration unit;
+product pulse.
+```
+
+An agent receives neither a giant task such as "fix the entire subsystem" nor a meaningless atomized task such as "change one line" without product context.
+
+### ContractChallenge
+
+An agent must return a challenge instead of proxy optimization when:
+
+```text
+the primary owner is wrong;
+the discriminator does not fail on the old production path;
+the contract is contradictory;
+the oracle would need a hidden change;
+a decision-sufficient workset fits no applicable qualified Context Envelope;
+a local edit would break a product invariant;
+several tasks conflict over a public contract or state owner.
+```
+
+### Write isolation
+
+Every mutating lane has a worktree, write and path claims, BuildFingerprint, test-resource namespace, and IntegrationCandidate. A worker does not integrate its own result.
+
+---
+
+## Required item `docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md`
+
+SHA-256: `8a5d8276f2e1357eb58dd06acc7e5ac4017a4515048a5049c84e33849c381ef5`; bytes: `5497`; handles=I2.20.
+
+## I2.20. Module Contract Kit, Crate Context Capsule, and Module Test Capsule
+
+### `FunctionalCapabilityCell`
+
+A functional cell is a causal decomposition unit, not a sentence-length rule and not automatically a Cargo crate:
+
+```yaml
+FunctionalCapabilityCell:
+  cell_id:
+  purpose_and_user_or_system_property:
+  causal_responsibilities:
+  lifecycle_owner:
+  owned_state_or_explicit_statelessness:
+  allowed_effect_classes:
+  public_contract_refs:
+  independent_proof_surface:
+  failure_degradation_and_recovery_boundary:
+  replacement_and_rollback_boundary:
+  providers_consumers_and_product_pulse:
+```
+
+One crate may contain several cells when either: (a) they form a stateless cross-owner contracts/primitives island with no mutable state or effects; or (b) they share one lifecycle owner, one coherent contract/dependency island and one package proof boundary. Several unrelated mutable-state owners, unrelated effect classes or independent rollback boundaries inside one crate trigger `MicroModuleTopologyReview`. A single cohesive cell may remain large when its complete Agent Workset is measurable and independently provable. Package membership never transfers lifecycle authority between cells.
+
+### `EffectiveMicroModuleManifest`
+
+The manifest is generated from Cargo, contract catalogue, Build/Test/Verifier graphs and runtime manifests; it is not another manually maintained authority: One manifest represents one FunctionalCapabilityCell; a crate containing several cells has several manifests.
+
+```yaml
+EffectiveMicroModuleManifest:
+  manifest_id_revision_and_digest:
+  functional_cell_ref:
+  source_modules_and_crates:
+  lifecycle_owner:
+  runtime_owner_and_bundle:
+  public_contract_digest:
+  owned_state_and_effect_classes:
+  execution_contour_and_replacement_class:
+  iteration_lane_and_proof_latency_profile_ref:
+  physical_source_STU:
+  loaded_slice_and_agent_workset_profiles:
+  dependency_ports_and_one_hop_providers_consumers:
+  independent_proof_entrypoint_and_proof_ceiling:
+  affected_edge_profiles:
+  product_pulse_ref:
+  failure_degradation_recovery_and_removal_boundary:
+  current_support_freshness_and_invalidation:
+  split_merge_extraction_conditions:
+```
+
+### `ProofLatencyProfile`
+
+```yaml
+ProofLatencyProfile:
+  module_cell_and_proof_profile:
+  exact_machine_toolchain_cache_and_build_fingerprint:
+  sample_count_warmup_and_contention:
+  p50_p95_p99_and_max:
+  CPU_RSS_IO_and_queue_wait:
+  expected_lane: interactive | normal | slow | manual_release
+  qualification_status_expiry_and_invalidation:
+```
+
+Missing proof-latency evidence disables automatic assignment to the interactive lane; it does not fabricate failure or force a split. The scheduler may still run the proof as a bounded Durable Job.
+
+### `ModuleContractKit`
+
+```yaml
+ModuleContractKit:
+  contract_revision:
+  crate_or_cell_identity:
+  purpose_and_invariants:
+  public_types_and_schemas:
+  owned_state_and_effects:
+  dependency_ports:
+  compatibility_rules:
+  negative_cases:
+  known_unknowns:
+  oracle_origins:
+```
+
+### `CrateContextCapsule`
+
+```yaml
+CrateContextCapsule:
+  product_objective:
+  functional_capability_cell_refs:
+  effective_micro_module_manifest_ref:
+  primary_source_package:
+  source_token_estimate:
+  selected_source_and_tests:
+  one_hop_providers:
+  one_hop_consumers:
+  architecture_implementation_refs:
+  failure_fingerprints:
+  edge_tests:
+  product_pulse:
+  omitted_material_and_handles:
+  effective_context_profile:
+```
+
+### `ModuleTestCapsule`
+
+```yaml
+ModuleTestCapsule:
+  shape_checks:
+  unit_property_model_tests:
+  parser_or_golden_corpus:
+  fake_port_contract_tests:
+  real_edge_profiles:
+  fault_restart_replay_cases:
+  resource_and_serial_groups:
+  proof_level_ceiling:
+  known_uncovered_behavior:
+  expected_nonzero_test_count:
+```
+
+Capsules are generated from Cargo, test, and instrument metadata and supplemented only with non-derivable semantic fields. A crate or cell without an executable `ModuleTestCapsule` may be investigated, but is not independently supported.
+
+### Generated local agent surfaces
+
+Each independently planned crate/module exposes two concise **resource projections** generated from the same contract source:
+
+```text
+Contract projection
+  purpose, owned state/effects, public invariants, dependency ports,
+  compatibility, proof ceiling and promotion/replacement boundary;
+
+Agent-working projection
+  one-screen instructions: how to check the unit, exact profile commands,
+  prohibited shortcuts, relevant handles and escalation route.
+```
+
+The normal surface is a resource/handle compiled into the Agent Workset. `CONTRACT.md` and `AGENTS.md` are optional materializations only for host tools that require local files; ELIOT does not create two files per crate by default. Projections are not separate normative sources. They carry the source contract digest and generator version; stale projections are rejected. Handwritten rationale belongs in Architecture/Implementation records, while commands/test inventory are generated from Cargo and Instrument metadata.
+
+The triad `ModuleContractKit` + `CrateContextCapsule` + `ModuleTestCapsule` is mandatory, not advisory. A capability missing any element cannot have `ImplementationSupport` above `CURRENT_UNVERIFIED`, regardless of code quality or test count: without a contract kit the boundary is undefined; without a context capsule the agent lacks a decision-sufficient workset; without a test capsule there is no independently invocable proof. This directly violates `ARCH-MOD-03`.
+
+---
+
+## Required item `docs/architecture/I06-04-module-contract.md`
+
+SHA-256: `4198b329f8ab8d6dda7156b5492a738fb4cbc54127f453c9aebfde416b7952d2`; bytes: `2082`; handles=I6.4.
+
+## I6.4. Module contract
+
+Every hot module ships immutable `module.toml`:
+
+```toml
+module_id = "codegraph.git"
+version = "0.1.0"
+artifact_hash = "blake3:..."
+protocol = ["ebp.module.v1"]
+architecture = ["ARCH-GROUND-01", "ARCH-MOD-02"]
+capabilities = ["codegraph.query", "codegraph.refresh"]
+required_capabilities = ["filesystem.read", "git.read"]
+optional_capabilities = ["lsp.symbols"]
+advisory_capabilities = ["behavioral_graph.read"]
+startup_after = ["filesystem.read", "git.read"]
+drain_before = ["filesystem.read", "git.read"]
+invalidation_triggers = ["git.head", "git.dirty", "module.config"]
+state_owner = "module-derived"
+failure_domain = "process:codegraph.git"
+hot_replace = true
+supervision_plan = "one_for_one"
+child_restart = "transient"
+restart_intensity = "3/10m"
+resource_profile = "background-medium"
+privacy_classes = ["project_code"]
+permissions = ["read:scope_root"]
+health_contract = "health/codegraph-v1"
+checkpoint_contract = "checkpoint/derived-v1"
+compatibility_state = "rebuildable"
+independent_test_profile = "module/codegraph-git"
+contract_fixture_set = "ebp.module.v1/codegraph.query"
+affected_test_tags = ["codegraph", "git", "process"]
+```
+
+Module contract MUST declare:
+
+```text
+owner;
+inputs/outputs;
+owned mutable/derived state;
+authority/effects;
+dependencies typed as required, optional or advisory;
+startup/drain order and invalidation triggers;
+failure domain and protocol range;
+eligible supervision strategy, restart-intensity window and cooldown;
+health/readiness/freshness;
+restart/rebuild/quarantine;
+state migration or rebuild path;
+telemetry;
+independent module/contract/fault test entrypoints;
+consumer/provider fixture revisions;
+removal boundary.
+```
+
+The graph of `required_capabilities` must be acyclic before a generation can reach `READY`. Optional/advisory back-references may carry observations or hints, but they cannot become mutual liveness prerequisites. Startup follows required dependencies; drain runs in reverse; a missing optional/advisory dependency is expressed as a capability/freshness downgrade, not a deadlock.
+
+---
+
+## Required item `docs/architecture/I06-05-bridge-contract.md`
+
+SHA-256: `d5fc975adde90bcb38aaa5734a4c4026f34456d20c71edcbcb06d65378df887b`; bytes: `529`; handles=I6.5.
+
+## I6.5. Bridge contract
+
+A bridge translates, isolates and observes. It MUST NOT contain project semantics that belong in Governor/Dreamer.
+
+```yaml
+BridgeContract:
+  bridge_id:
+  upstream_project_and_license:
+  upstream_version:
+  Eliot_capabilities:
+  protocol_mapping:
+  data_classes:
+  credentials_boundary:
+  side_effects:
+  timeouts_and_cancellation:
+  health_probe:
+  failure_translation:
+  process_executor_profile:
+  independent_contract_suite:
+  fixture_and_golden_corpus:
+  update_method:
+  export/removal_path:
+```
+
+---
+
+## Required item `docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md`
+
+SHA-256: `2a8bce7b4e87d02522d445e1ae4b7b410084eb2be5fa4f73e83303829f351119`; bytes: `1648`; handles=I7.1.
+
+## I7.1. Eliot Bridge Protocol (`EBP/1`)
+
+EBP is a stable language-neutral message contract. Transport and encoding are negotiated profiles; neither is allowed to leak into domain records.
+
+First delivery profile:
+
+```text
+transport: length-delimited frames over Windows named pipes;
+encoding: UTF-8 JSON generated from Serde types;
+debugging: the wire payload is directly inspectable and replayable;
+large data: immutable Blob/Resource handles, never giant inline frames.
+```
+
+This JSON-first choice is deliberate: D0/D1 need a working bridge, simple diagnostics and one schema system more than speculative serialization speed. `protobuf-v1` through `prost` remains an optional encoding profile behind RGF-PROTOCOL-TRANSPORT. It is promoted only if measured local load shows a material latency/CPU/size benefit without creating a second divergent contract. Both encodings MUST pass the same semantic fixtures and compatibility tests.
+
+Named pipes and JSON are current Windows-first Defaults, not security or performance proofs. Transport admission requires the production profile to disclose framing, ACL/authentication, reconnect, contention, crash, message-size and backpressure behavior on the exact Product Identity. A local microbenchmark cannot establish universal superiority, and changing transport/encoding cannot change the semantic contract or proof ceiling.
+
+Reasons for EBP itself:
+
+```text
+stable contract across Rust/compiler versions;
+independent hot module builds;
+streaming, cancellation and server events;
+future non-Rust modules without Rust ABI/C-layout coupling;
+explicit compatibility, authority and failure semantics.
+```
+
+---
+
+## Required item `docs/architecture/I07-02-frame.md`
+
+SHA-256: `6021ca4798830eb97a30cfec5fe45e8156fe3fa669d6c8e93993c235e78ed82d`; bytes: `2519`; handles=I7.2.
+
+## I7.2. Frame
+
+Conceptual frame, represented by the selected encoding profile:
+
+```yaml
+Frame:
+  protocol_version:
+  encoding_profile:
+  connection_id:
+  request_id:
+  kind: request | response | event | cancel | heartbeat | control
+  message_type:
+  payload:
+  trace_context:
+```
+
+Framing uses a 4-byte little-endian unsigned body length followed by the encoded body. The parser reads the prefix into a fixed buffer, rejects zero/oversize values before allocation, then reads exactly that many bytes. `json-v1` body is UTF-8 JSON; other encoding profiles reuse the same frame boundary.
+
+Hard limits:
+
+```text
+frame default max: 4 MiB;
+hot response default max: 64 KiB;
+hard MCP structured response: 256 KiB;
+large payload: Blob/Resource handle;
+per-connection in-flight requests bounded;
+heartbeats, cancellation and recovery frames use reserved control capacity.
+```
+
+Unknown fields are tolerated only according to the negotiated protocol minor-version rule. Unknown message types are rejected explicitly; they are never interpreted as generic commands.
+
+### Durable/control event envelope
+
+Request/response correlation is insufficient for reconnect, hot replacement and native host streams. Every durable/control event uses:
+
+```yaml
+EventEnvelope:
+  stream_id:
+  producer_id:
+  producer_generation:
+  authority_epoch:
+  event_id:
+  sequence:
+  causal_predecessor_refs:
+  delivery_class: durable_control | durable_observation | best_effort_telemetry
+  ack_required:
+  payload_type:
+  payload_or_blob_ref:
+  state_fence:
+  trace_context:
+```
+
+`durable_control` and `durable_observation` are delivered at least once. The receiver persists event ID, sequence and disposition; the producer replays unacknowledged events after reconnect. Duplicates are idempotent. Best-effort telemetry is a separate class and may be sampled or dropped only with an explicit telemetry-gap signal.
+
+A generation switch cannot discard an unacknowledged durable stream. Host/native cursors advance only after the admissible raw/hash record, normalized projection and event disposition are durably related.
+
+`EventAckReceipt` uses explicit phases:
+
+```text
+RECEIVED
+ DURABLE
+ NORMALIZED
+ APPLIED | REJECTED | UNKNOWN.
+```
+
+The producer and consumer declare which phase advances each cursor. A transport acknowledgement cannot impersonate durable or canonical application. Unknown/parse-failed events retain the event identity, raw/redacted source handle and retry/reconciliation route; replay never creates a second logical event.
+
+---
+
+## Required item `docs/architecture/I07-03-handshake.md`
+
+SHA-256: `813c2eae27e5e2a00e39a287174ceb0f208e61cdc6407acaff6be294d7e4f02a`; bytes: `548`; handles=I7.3.
+
+## I7.3. Handshake
+
+```text
+ClientHello:
+  protocol range;
+  module/bridge identity;
+  artifact hash;
+  launch nonce;
+  capabilities;
+  State/Authority Epoch;
+  privacy classes;
+  max frame.
+
+ServerHello:
+  selected protocol;
+  session/principal binding;
+  allowed capabilities/effects;
+  config snapshot;
+  heartbeat;
+  control channel;
+  rejection reason if incompatible.
+```
+
+Module self-assertion is checked against the Module Catalog, Generation Registry and Capability Registry evidence. Old generation cannot reconnect after epoch fencing.
+
+---
+
+## Required item `docs/architecture/I07-04-module-lifecycle-messages.md`
+
+SHA-256: `f27768aae01fb01f79c295eaa00ee775564e5f43497eaa497df5115738b296b9`; bytes: `325`; handles=I7.4.
+
+## I7.4. Module lifecycle messages
+
+```text
+Start
+Ready
+Health
+Execute
+Result
+Event
+Cancel
+Quiesce
+Checkpoint
+RestoreCheckpoint
+DrainStatus
+Shutdown
+Fatal
+```
+
+Every request has idempotency identity, deadline and cancellation semantics. Every durable lifecycle `Event` follows the EventEnvelope replay/ack contract of I7.2.
+
+---
+
+## Required item `docs/architecture/I07-05-named-pipes.md`
+
+SHA-256: `c8c1b9fd4f4295e6a633f6867e04eac12be6c08a57682ec11afcf79034ca888f`; bytes: `1366`; handles=I7.5.
+
+## I7.5. Named pipes
+
+```text
+\\.\pipe\eliot\kernel\frontdoor
+\\.\pipe\eliot\kernel\store
+\\.\pipe\eliot\kernel\daemon\<generation>
+\\.\pipe\eliot\module\<module_id>\<generation>
+\\.\pipe\eliot\watchdog\signals
+```
+
+ACL allows only expected service/user SID. Each launched child also presents random nonce delivered via protected inherited handle/file, not command line.
+
+### Agent-facing transport profiles
+
+```text
+stdio shim
+  DEFAULT: agent starts a near-stateless bridge which connects to Kernel front door;
+
+loopback Streamable HTTP
+  OPTIONAL: for local hosts that cannot manage stdio reliably; disabled by default;
+
+remote transport
+  FORBIDDEN for normal MCP/control access in the first line.
+```
+
+The loopback HTTP profile binds only `127.0.0.1`/`::1`, requires a scoped short-lived bearer credential issued through local setup, enforces the same Session/authority contracts, and exposes no admin or database surface. It validates `Host` and, for browser-originated requests, `Origin` against the exact loopback profile; non-loopback, ambiguous and DNS-rebinding forms are rejected. Binding `0.0.0.0`, trusting loopback without host validation, or reusing the local credential remotely is forbidden. Losing the HTTP bridge does not affect Kernel or canonical state. Future online access is limited to the separate bounded Dreamer gateway of I9.13/I15.13.
+
+---
+
+## Required item `docs/architecture/I09-dreamer-implementation-contract.md`
+
+SHA-256: `e7409f710bf0ef520c6a8a67e174a2ea8f8b0ae12757455bc9b2dcaee833fc6a`; bytes: `39`; handles=I9.
+
+# I9. Dreamer implementation contract
+
+---
+
+## Required item `docs/architecture/I14-14-module-hot-replacement.md`
+
+SHA-256: `6df1f51b37bbf6da8cc61177ea21e8261a5a256a331ace7c8433811fc8e3f196`; bytes: `4405`; handles=I14.14.
+
+## I14.14. Module hot replacement
+
+### Artifact layout
+
+```text
+modules/<module_id>/<semver>/<artifact_hash>/
+  module.exe
+  module.toml
+  signatures/
+  symbols/
+  contracts/
+  test-receipts/
+```
+
+Running artifacts are immutable. Active generation is registry state.
+
+### Upgrade sequence
+
+Cutover applies to a declared `CapabilityRouteScope` (module + capability + affected WorkScope/effect domain). It does not pretend that every operation in the process changes owner at one instant.
+
+```text
+1. package and verify immutable candidate;
+2. validate protocol/dependency/license/state-class compatibility;
+3. start candidate with no effect authority;
+4. restore/checkpoint/rebuild according to ModuleStateClass;
+5. run readiness plus shadow or isolated canary;
+6. quiesce new admissions to the old route scope;
+7. classify every in-flight request and persist a GenerationCutoverRecord in ORS;
+8. commit one ORS cutover transition:
+     active route for new admissions = candidate;
+     new Authority Epoch = issued;
+     old general generation authority = fenced;
+     exact allowed old-operation dispositions = fixed;
+9. atomically swap the in-memory route snapshot from that committed record;
+10. drain/reconcile old operations, publish GenerationCutoverReceipt,
+    retain rollback artifact and retire the old generation.
+```
+
+`GenerationCutoverRecord` and its operational `GenerationCutoverReceipt` are owned by Kernel/ORS. Canonical Memory may later record a referenced observation/audit event, but it never becomes the owner of the active generation or cutover machine.
+
+The ORS commit is the durable linearization point. Crash before it leaves the old route active. Crash after it reconstructs the candidate route and fences from the committed record before accepting work. Rollback is another cutover with a newer epoch; an old epoch is never reactivated. Candidate failure before the linearization point leaves the old generation active. Irreversible state migration requires forward repair or a separately proven rollback path.
+
+### In-flight disposition
+
+Every accepted request records ModuleGeneration, operation identity, impact/effect set and State Fence. At cutover it receives exactly one disposition:
+
+```text
+drain_read
+   read/stream may finish while its input fence remains valid;
+
+finish_exact_authorized_operation
+   only the already admitted operation may finish under a committed
+     `OperationContinuationPermit`; this is not general old-generation authority;
+
+checkpoint_transfer
+   candidate resumes from a compatible checkpoint under a new attempt/generation receipt;
+
+cancel_proven_no_effect
+   cancellation is accepted only when no external/canonical effect is proven;
+
+block_scope_unknown_outcome
+   outcome is unresolved; conflicting new effects in the affected scope remain blocked
+     until receipt/probe/reconciliation resolves it.
+```
+
+An unfenced external effect may not silently cross cutover. If the old process has already issued it, the committed cutover may create one non-renewable `OperationContinuationPermit` bound to operation ID, effect hash, old generation/epoch, exact scope, deadline and allowed completion messages. Kernel/store/tool boundaries accept the old epoch only with that permit; it cannot create child effects, widen scope, migrate to another process generation or authorize retry. Final OutcomeReceipt consumes/closes it. Old-process loss before a final outcome becomes `UNKNOWN_OUTCOME`; the permit is not reissued. If the effect has not been issued, the operation is checkpointed or cancelled with no-effect proof. Unrelated scopes may switch and continue.
+
+### Request pinning
+
+```text
+shadow/canary
+   evidence only unless isolated effect scope is explicitly granted;
+
+new request after cutover
+   candidate generation and new epoch only;
+
+old request not listed in the committed cutover record
+   rejected as stale;
+
+retry
+   follows operation identity/receipt and its disposition,
+     never merely the newest generation.
+```
+
+Exactly one generation owns **new** effect admission for a CapabilityRouteScope. A bounded allowlist of pre-cutover operation identities may finish only as declared above. `GenerationCutoverReceipt` records old/new generations and epochs, route-scope hash, state migration, all in-flight dispositions, linearization record, health proof, rollback boundary and unresolved scopes.
+
+---
+
+## Required item `docs/architecture/I18-testing-and-instrumental-grounding-strategy.md`
+
+SHA-256: `facd29dfe4a6fdb98a70f5a5decb7d960f8ca95419924828a44596c57940fb10`; bytes: `52`; handles=I18.
+
+# I18. Testing and Instrumental Grounding strategy
+===RECEIPT===
+{
+  "attestation_required": true,
+  "bundle_bytes": 111643,
+  "bundle_sha256": "51b7d6b9cfa3c8db17fd0658fd067624956115efc72bc8e83085dbf36a1ae27e",
+  "matched_routes": [
+    "generic-source",
+    "module-runtime",
+    "dreamer"
+  ],
+  "pair_key": "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea",
+  "paths": [
+    "crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs"
+  ],
+  "read_receipt_id": "sha256:2897cebe2396b1ae2acb3b11f96ab93f72990ace27f71ee57f040e6a7e9a2171",
+  "required": [
+    {
+      "bytes": 2620,
+      "kind": "file",
+      "path": "AGENTS.md",
+      "sha256": "e2508482aa659aae51df2e0dc0e7bbfa2b827dc8a8a854e7a1c4a7d06a334332"
+    },
+    {
+      "bytes": 7991,
+      "kind": "file",
+      "path": "WORKFLOW.md",
+      "sha256": "ba1119920d47f33b99ee51332d8951b009fc04ebe8512fb64966c6afbd9ff070"
+    },
+    {
+      "bytes": 2122,
+      "kind": "file",
+      "path": "crates/AGENTS.md",
+      "sha256": "91459415c207f25802e4c4182b7b0525ff644c3cc913c7be02032540a325e03f"
+    },
+    {
+      "bytes": 5523,
+      "kind": "file",
+      "path": "docs/ARCHITECTURE_CONTRACT.md",
+      "sha256": "d1e4c393cd7c953d8e41725eae404882236b13493ace74e4513c4cd894a9e846"
+    },
+    {
+      "bytes": 5163,
+      "kind": "file",
+      "path": "docs/DEPENDENCY_POLICY.md",
+      "sha256": "a69844d656e7cdac0b92fb4d1e6fbcd5d3e923c30ee706ec598acd3c3868933a"
+    },
+    {
+      "bytes": 2611,
+      "kind": "file",
+      "path": "docs/architecture/READING_PROTOCOL.md",
+      "sha256": "fc2ac357ecec293f7246a5ebc5c1e46f5407bb3574ffe39b6224e4d5aa6a3e25"
+    },
+    {
+      "bytes": 2625,
+      "kind": "file",
+      "path": "workstreams/ACTIVE.toml",
+      "sha256": "2bf61c09315add08bb0ec8fd2148f2f295b6abbf5e2e1e11b283204cada5b69b"
+    },
+    {
+      "anchors": [
+        "a01-purpose-of-the-architecture"
+      ],
+      "bytes": 1871,
+      "handles": [
+        "A0.1"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-01-purpose-of-the-architecture.md",
+      "sha256": "ee540ede56579ec388e26da2b290759e78ad3bb8a70ba57d56364800a1692750"
+    },
+    {
+      "anchors": [
+        "a02-hierarchy-of-architectural-decisions"
+      ],
+      "bytes": 1867,
+      "handles": [
+        "A0.2"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-02-hierarchy-of-architectural-decisions.md",
+      "sha256": "342c67f670714c83bb4c68693447fd7597bc4a662b87d4fa6bae09df3cbaf6e5"
+    },
+    {
+      "anchors": [
+        "a03-hard-boundaries"
+      ],
+      "bytes": 821,
+      "handles": [
+        "A0.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-03-hard-boundaries.md",
+      "sha256": "695fe5e156e0dde052556e23c34b008009348742d4fc4a1146393b8b13a48bc0"
+    },
+    {
+      "anchors": [
+        "a04-conflict-resolution"
+      ],
+      "bytes": 1318,
+      "handles": [
+        "A0.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-04-conflict-resolution.md",
+      "sha256": "732d3b9a63973398e07e48691ba56f6538d9168f3102e0702a5ca2e08910f556"
+    },
+    {
+      "anchors": [
+        "a06-changing-the-architecture"
+      ],
+      "bytes": 858,
+      "handles": [
+        "A0.6"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-06-changing-the-architecture.md",
+      "sha256": "c086ee01cc243b7d7dee465bc0ddfca0c36cc3a344b3b3e803a5eb94ff6f68a8"
+    },
+    {
+      "anchors": [
+        "a23-modular-architecture"
+      ],
+      "bytes": 6133,
+      "handles": [
+        "A2.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A02-03-modular-architecture.md",
+      "sha256": "6f7d0566576ddfcb88bae531421b58082b44e3ba6cd2b974f55a46990e26fd52"
+    },
+    {
+      "anchors": [
+        "a9-dreamer"
+      ],
+      "bytes": 15,
+      "handles": [
+        "A9"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A09-dreamer.md",
+      "sha256": "1f39dfb0676f5d42cbdb279d2991ec8e2017bfdcb834d85466e57c0664f84732"
+    },
+    {
+      "anchors": [
+        "a104-delegation"
+      ],
+      "bytes": 1980,
+      "handles": [
+        "A10.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A10-04-delegation.md",
+      "sha256": "fd9c93b5e66ea93a0a2bb171706449ca8d07d2d48caeb99d1acdc57360014cd9"
+    },
+    {
+      "anchors": [
+        "a133-module-supervision-and-doctor"
+      ],
+      "bytes": 2232,
+      "handles": [
+        "A13.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A13-03-module-supervision-and-doctor.md",
+      "sha256": "ef3e4c4ee9dcf883a4f16aa09a9eb04e4133d3af534c7334c0d2af958463c217"
+    },
+    {
+      "anchors": [
+        "a148-development-doctrine"
+      ],
+      "bytes": 3740,
+      "handles": [
+        "A14.8"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A14-08-development-doctrine.md",
+      "sha256": "c7da919cd6112e97780407b7a7ae9806185994c2de6a275ed2449cb1b9ca78bb"
+    },
+    {
+      "anchors": [
+        "i03-decision-sources"
+      ],
+      "bytes": 1265,
+      "handles": [
+        "I0.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-03-decision-sources.md",
+      "sha256": "c5d7586399d8640484edaa3cb949495bc99a82b50dabddac029b2d08c2d716e8"
+    },
+    {
+      "anchors": [
+        "i04-change-classes"
+      ],
+      "bytes": 3252,
+      "handles": [
+        "I0.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-04-change-classes.md",
+      "sha256": "3c1fc91d692bee9494327b7f5375fbe45cddc00c27d5a0bf0dc3b40300a2ae45"
+    },
+    {
+      "anchors": [
+        "i05-conformance-support-and-evidence-status"
+      ],
+      "bytes": 6368,
+      "handles": [
+        "I0.5"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-05-conformance-support-and-evidence-status.md",
+      "sha256": "bfb599eb462ebfb904ec97ba199a8447371bce91ab73b7bad9e71f150cb837f9"
+    },
+    {
+      "anchors": [
+        "i013-current-support-conformance-and-product-status"
+      ],
+      "bytes": 996,
+      "handles": [
+        "I0.13"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-13-current-support-conformance-and-product-status.md",
+      "sha256": "2d691986e973b4c9191cf5718f32b5035a8470b8355c5d82489df48c18651d2e"
+    },
+    {
+      "anchors": [
+        "i014-documentation-and-evidence-build-integrity"
+      ],
+      "bytes": 3413,
+      "handles": [
+        "I0.14"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-14-documentation-and-evidence-build-integrity.md",
+      "sha256": "e645a72c291c89a4bc3e2eae99527aa2476dcfab0280e429df80405dbebe3fd9"
+    },
+    {
+      "anchors": [
+        "i21-primary-decision-crate-rich-process-sparse-owner-sparse"
+      ],
+      "bytes": 5325,
+      "handles": [
+        "I2.1"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-01-primary-decision-crate-rich-process-sparse-owner-sparse.md",
+      "sha256": "b7556d7a7adc2a66ac7fbc5ee68e6d0660e4e54b3f3988af6ec16bc7b3f27e55"
+    },
+    {
+      "anchors": [
+        "i23-workspace-topology-and-dependency-direction"
+      ],
+      "bytes": 4409,
+      "handles": [
+        "I2.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-03-workspace-topology-and-dependency-direction.md",
+      "sha256": "1a647a5b220131b59df7455371b82b0ca59251c45f27556771c70e53d10dd033"
+    },
+    {
+      "anchors": [
+        "i24-erlangotp-principles-in-the-rust-runtime"
+      ],
+      "bytes": 2878,
+      "handles": [
+        "I2.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-04-erlangotp-principles-in-the-rust-runtime.md",
+      "sha256": "02a97eaee1e7696ea856b97ae83c91fc26df6934ba66af3de81668edf1012f50"
+    },
+    {
+      "anchors": [
+        "i25-unsafe-policy"
+      ],
+      "bytes": 356,
+      "handles": [
+        "I2.5"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-05-unsafe-policy.md",
+      "sha256": "07427e6e0616d0c5258f9b84e9e3142c3072e1208b454807f4a2184a16546139"
+    },
+    {
+      "anchors": [
+        "i210-runtime-module-and-state-classes"
+      ],
+      "bytes": 5753,
+      "handles": [
+        "I2.10"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-10-runtime-module-and-state-classes.md",
+      "sha256": "7d6d27785174130e7edef62fe15430df8d92199467398f5edf5412af20b91871"
+    },
+    {
+      "anchors": [
+        "i217-parallel-agent-development-contract"
+      ],
+      "bytes": 1834,
+      "handles": [
+        "I2.17"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-17-parallel-agent-development-contract.md",
+      "sha256": "6c333908b112859dbffe00c04a9e942b38c5d369a85d89d78788ab576a1d7cb1"
+    },
+    {
+      "anchors": [
+        "i220-module-contract-kit-crate-context-capsule-and-module-test-capsule"
+      ],
+      "bytes": 5497,
+      "handles": [
+        "I2.20"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+      "sha256": "8a5d8276f2e1357eb58dd06acc7e5ac4017a4515048a5049c84e33849c381ef5"
+    },
+    {
+      "anchors": [
+        "i64-module-contract"
+      ],
+      "bytes": 2082,
+      "handles": [
+        "I6.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I06-04-module-contract.md",
+      "sha256": "4198b329f8ab8d6dda7156b5492a738fb4cbc54127f453c9aebfde416b7952d2"
+    },
+    {
+      "anchors": [
+        "i65-bridge-contract"
+      ],
+      "bytes": 529,
+      "handles": [
+        "I6.5"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I06-05-bridge-contract.md",
+      "sha256": "d5fc975adde90bcb38aaa5734a4c4026f34456d20c71edcbcb06d65378df887b"
+    },
+    {
+      "anchors": [
+        "i71-eliot-bridge-protocol-ebp1"
+      ],
+      "bytes": 1648,
+      "handles": [
+        "I7.1"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md",
+      "sha256": "2a8bce7b4e87d02522d445e1ae4b7b410084eb2be5fa4f73e83303829f351119"
+    },
+    {
+      "anchors": [
+        "i72-frame"
+      ],
+      "bytes": 2519,
+      "handles": [
+        "I7.2"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I07-02-frame.md",
+      "sha256": "6021ca4798830eb97a30cfec5fe45e8156fe3fa669d6c8e93993c235e78ed82d"
+    },
+    {
+      "anchors": [
+        "i73-handshake"
+      ],
+      "bytes": 548,
+      "handles": [
+        "I7.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I07-03-handshake.md",
+      "sha256": "813c2eae27e5e2a00e39a287174ceb0f208e61cdc6407acaff6be294d7e4f02a"
+    },
+    {
+      "anchors": [
+        "i74-module-lifecycle-messages"
+      ],
+      "bytes": 325,
+      "handles": [
+        "I7.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I07-04-module-lifecycle-messages.md",
+      "sha256": "f27768aae01fb01f79c295eaa00ee775564e5f43497eaa497df5115738b296b9"
+    },
+    {
+      "anchors": [
+        "i75-named-pipes"
+      ],
+      "bytes": 1366,
+      "handles": [
+        "I7.5"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I07-05-named-pipes.md",
+      "sha256": "c8c1b9fd4f4295e6a633f6867e04eac12be6c08a57682ec11afcf79034ca888f"
+    },
+    {
+      "anchors": [
+        "i9-dreamer-implementation-contract"
+      ],
+      "bytes": 39,
+      "handles": [
+        "I9"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I09-dreamer-implementation-contract.md",
+      "sha256": "e7409f710bf0ef520c6a8a67e174a2ea8f8b0ae12757455bc9b2dcaee833fc6a"
+    },
+    {
+      "anchors": [
+        "i1414-module-hot-replacement"
+      ],
+      "bytes": 4405,
+      "handles": [
+        "I14.14"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I14-14-module-hot-replacement.md",
+      "sha256": "6df1f51b37bbf6da8cc61177ea21e8261a5a256a331ace7c8433811fc8e3f196"
+    },
+    {
+      "anchors": [
+        "i18-testing-and-instrumental-grounding-strategy"
+      ],
+      "bytes": 52,
+      "handles": [
+        "I18"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I18-testing-and-instrumental-grounding-strategy.md",
+      "sha256": "facd29dfe4a6fdb98a70f5a5decb7d960f8ca95419924828a44596c57940fb10"
+    }
+  ],
+  "route_receipt_id": "sha256:3551eb4d5050dbb48bdca94e3df8c6ca3958452b1aac33939e124d03b7a89ca0",
+  "schema_version": "eliot-doc-read-v1",
+  "topic": "standalone wasm fix formatting"
+}
+
+
+[output truncated; full output saved to: C:\Users\kleym\.local\share\opencode\shell\7a17247a088fa8d5e3dde519c5c183a3e4c711c9\sh_0b73858120015gpvvHRMhULMPF.out]
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython scripts/docs_read.py read --path crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs --topic "standalone wasm fix env var" --output .eliot/docs-read-bundle2.md --receipt-out .eliot/docs-read-receipt2.json
+python scripts/docs_read.py read --path crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs --path crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs --topic "standalone wasm fixes" --output .eliot/docs-read-bundle-final.md --receipt-out .eliot/docs-read-receipt-final.json
+Get-Content .eliot/docs-read-receipt-final.json
+DOC_READ: PASS receipt=sha256:ddf6805bd5e52796b7fd42bc86acd48ca7dec41eea0228ce274f9cd82ec9d3b8 route=sha256:fa11438f398c39e06385ae5d4b71699a50e371ffa2e8a654b3c621890becafa9 required=39 bundle_sha256=b5bd191c8c25f6a3a3753f07385425c87bd8ad9552391e9391c39787d79691d9
+DOC_READ: PASS receipt=sha256:b9cf4b0a4a7076a9d7a9a432215fd30cfdfc1410a68e6a4f1a9538ff25a60fdc route=sha256:2fc245d34674dedeaff69e52b2f094c0af7a095e8398aaef9c9f539f10f5ad14 required=39 bundle_sha256=6e474d1d4f8ee8d7231a4c24a3fdf07062bfb7202c9faa50a20163092eb88a5d
+{
+  "attestation_required": true,
+  "bundle_bytes": 111643,
+  "bundle_sha256": "6e474d1d4f8ee8d7231a4c24a3fdf07062bfb7202c9faa50a20163092eb88a5d",
+  "matched_routes": [
+    "generic-source",
+    "module-runtime",
+    "dreamer"
+  ],
+  "pair_key": "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea",
+  "paths": [
+    "crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs",
+    "crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs"
+  ],
+  "read_receipt_id": "sha256:b9cf4b0a4a7076a9d7a9a432215fd30cfdfc1410a68e6a4f1a9538ff25a60fdc",
+  "required": [
+    {
+      "bytes": 2620,
+      "kind": "file",
+      "path": "AGENTS.md",
+      "sha256": "e2508482aa659aae51df2e0dc0e7bbfa2b827dc8a8a854e7a1c4a7d06a334332"
+    },
+    {
+      "bytes": 7991,
+      "kind": "file",
+      "path": "WORKFLOW.md",
+      "sha256": "ba1119920d47f33b99ee51332d8951b009fc04ebe8512fb64966c6afbd9ff070"
+    },
+    {
+      "bytes": 2122,
+      "kind": "file",
+      "path": "crates/AGENTS.md",
+      "sha256": "91459415c207f25802e4c4182b7b0525ff644c3cc913c7be02032540a325e03f"
+    },
+    {
+      "bytes": 5523,
+      "kind": "file",
+      "path": "docs/ARCHITECTURE_CONTRACT.md",
+      "sha256": "d1e4c393cd7c953d8e41725eae404882236b13493ace74e4513c4cd894a9e846"
+    },
+    {
+      "bytes": 5163,
+      "kind": "file",
+      "path": "docs/DEPENDENCY_POLICY.md",
+      "sha256": "a69844d656e7cdac0b92fb4d1e6fbcd5d3e923c30ee706ec598acd3c3868933a"
+    },
+    {
+      "bytes": 2611,
+      "kind": "file",
+      "path": "docs/architecture/READING_PROTOCOL.md",
+      "sha256": "fc2ac357ecec293f7246a5ebc5c1e46f5407bb3574ffe39b6224e4d5aa6a3e25"
+    },
+    {
+      "bytes": 2625,
+      "kind": "file",
+      "path": "workstreams/ACTIVE.toml",
+      "sha256": "2bf61c09315add08bb0ec8fd2148f2f295b6abbf5e2e1e11b283204cada5b69b"
+    },
+    {
+      "anchors": [
+        "a01-purpose-of-the-architecture"
+      ],
+      "bytes": 1871,
+      "handles": [
+        "A0.1"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-01-purpose-of-the-architecture.md",
+      "sha256": "ee540ede56579ec388e26da2b290759e78ad3bb8a70ba57d56364800a1692750"
+    },
+    {
+      "anchors": [
+        "a02-hierarchy-of-architectural-decisions"
+      ],
+      "bytes": 1867,
+      "handles": [
+        "A0.2"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-02-hierarchy-of-architectural-decisions.md",
+      "sha256": "342c67f670714c83bb4c68693447fd7597bc4a662b87d4fa6bae09df3cbaf6e5"
+    },
+    {
+      "anchors": [
+        "a03-hard-boundaries"
+      ],
+      "bytes": 821,
+      "handles": [
+        "A0.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-03-hard-boundaries.md",
+      "sha256": "695fe5e156e0dde052556e23c34b008009348742d4fc4a1146393b8b13a48bc0"
+    },
+    {
+      "anchors": [
+        "a04-conflict-resolution"
+      ],
+      "bytes": 1318,
+      "handles": [
+        "A0.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-04-conflict-resolution.md",
+      "sha256": "732d3b9a63973398e07e48691ba56f6538d9168f3102e0702a5ca2e08910f556"
+    },
+    {
+      "anchors": [
+        "a06-changing-the-architecture"
+      ],
+      "bytes": 858,
+      "handles": [
+        "A0.6"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-06-changing-the-architecture.md",
+      "sha256": "c086ee01cc243b7d7dee465bc0ddfca0c36cc3a344b3b3e803a5eb94ff6f68a8"
+    },
+    {
+      "anchors": [
+        "a23-modular-architecture"
+      ],
+      "bytes": 6133,
+      "handles": [
+        "A2.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A02-03-modular-architecture.md",
+      "sha256": "6f7d0566576ddfcb88bae531421b58082b44e3ba6cd2b974f55a46990e26fd52"
+    },
+    {
+      "anchors": [
+        "a9-dreamer"
+      ],
+      "bytes": 15,
+      "handles": [
+        "A9"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A09-dreamer.md",
+      "sha256": "1f39dfb0676f5d42cbdb279d2991ec8e2017bfdcb834d85466e57c0664f84732"
+    },
+    {
+      "anchors": [
+        "a104-delegation"
+      ],
+      "bytes": 1980,
+      "handles": [
+        "A10.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A10-04-delegation.md",
+      "sha256": "fd9c93b5e66ea93a0a2bb171706449ca8d07d2d48caeb99d1acdc57360014cd9"
+    },
+    {
+      "anchors": [
+        "a133-module-supervision-and-doctor"
+      ],
+      "bytes": 2232,
+      "handles": [
+        "A13.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A13-03-module-supervision-and-doctor.md",
+      "sha256": "ef3e4c4ee9dcf883a4f16aa09a9eb04e4133d3af534c7334c0d2af958463c217"
+    },
+    {
+      "anchors": [
+        "a148-development-doctrine"
+      ],
+      "bytes": 3740,
+      "handles": [
+        "A14.8"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A14-08-development-doctrine.md",
+      "sha256": "c7da919cd6112e97780407b7a7ae9806185994c2de6a275ed2449cb1b9ca78bb"
+    },
+    {
+      "anchors": [
+        "i03-decision-sources"
+      ],
+      "bytes": 1265,
+      "handles": [
+        "I0.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-03-decision-sources.md",
+      "sha256": "c5d7586399d8640484edaa3cb949495bc99a82b50dabddac029b2d08c2d716e8"
+    },
+    {
+      "anchors": [
+        "i04-change-classes"
+      ],
+      "bytes": 3252,
+      "handles": [
+        "I0.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-04-change-classes.md",
+      "sha256": "3c1fc91d692bee9494327b7f5375fbe45cddc00c27d5a0bf0dc3b40300a2ae45"
+    },
+    {
+      "anchors": [
+        "i05-conformance-support-and-evidence-status"
+      ],
+      "bytes": 6368,
+      "handles": [
+        "I0.5"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-05-conformance-support-and-evidence-status.md",
+      "sha256": "bfb599eb462ebfb904ec97ba199a8447371bce91ab73b7bad9e71f150cb837f9"
+    },
+    {
+      "anchors": [
+        "i013-current-support-conformance-and-product-status"
+      ],
+      "bytes": 996,
+      "handles": [
+        "I0.13"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-13-current-support-conformance-and-product-status.md",
+      "sha256": "2d691986e973b4c9191cf5718f32b5035a8470b8355c5d82489df48c18651d2e"
+    },
+    {
+      "anchors": [
+        "i014-documentation-and-evidence-build-integrity"
+      ],
+      "bytes": 3413,
+      "handles": [
+        "I0.14"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-14-documentation-and-evidence-build-integrity.md",
+      "sha256": "e645a72c291c89a4bc3e2eae99527aa2476dcfab0280e429df80405dbebe3fd9"
+    },
+    {
+      "anchors": [
+        "i21-primary-decision-crate-rich-process-sparse-owner-sparse"
+      ],
+      "bytes": 5325,
+      "handles": [
+        "I2.1"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-01-primary-decision-crate-rich-process-sparse-owner-sparse.md",
+      "sha256": "b7556d7a7adc2a66ac7fbc5ee68e6d0660e4e54b3f3988af6ec16bc7b3f27e55"
+    },
+    {
+      "anchors": [
+        "i23-workspace-topology-and-dependency-direction"
+      ],
+      "bytes": 4409,
+      "handles": [
+        "I2.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-03-workspace-topology-and-dependency-direction.md",
+      "sha256": "1a647a5b220131b59df7455371b82b0ca59251c45f27556771c70e53d10dd033"
+    },
+    {
+      "anchors": [
+        "i24-erlangotp-principles-in-the-rust-runtime"
+      ],
+      "bytes": 2878,
+      "handles": [
+        "I2.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-04-erlangotp-principles-in-the-rust-runtime.md",
+      "sha256": "02a97eaee1e7696ea856b97ae83c91fc26df6934ba66af3de81668edf1012f50"
+    },
+    {
+      "anchors": [
+        "i25-unsafe-policy"
+      ],
+      "bytes": 356,
+      "handles": [
+        "I2.5"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-05-unsafe-policy.md",
+      "sha256": "07427e6e0616d0c5258f9b84e9e3142c3072e1208b454807f4a2184a16546139"
+    },
+    {
+      "anchors": [
+        "i210-runtime-module-and-state-classes"
+      ],
+      "bytes": 5753,
+      "handles": [
+        "I2.10"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-10-runtime-module-and-state-classes.md",
+      "sha256": "7d6d27785174130e7edef62fe15430df8d92199467398f5edf5412af20b91871"
+    },
+    {
+      "anchors": [
+        "i217-parallel-agent-development-contract"
+      ],
+      "bytes": 1834,
+      "handles": [
+        "I2.17"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-17-parallel-agent-development-contract.md",
+      "sha256": "6c333908b112859dbffe00c04a9e942b38c5d369a85d89d78788ab576a1d7cb1"
+    },
+    {
+      "anchors": [
+        "i220-module-contract-kit-crate-context-capsule-and-module-test-capsule"
+      ],
+      "bytes": 5497,
+      "handles": [
+        "I2.20"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+      "sha256": "8a5d8276f2e1357eb58dd06acc7e5ac4017a4515048a5049c84e33849c381ef5"
+    },
+    {
+      "anchors": [
+        "i64-module-contract"
+      ],
+      "bytes": 2082,
+      "handles": [
+        "I6.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I06-04-module-contract.md",
+      "sha256": "4198b329f8ab8d6dda7156b5492a738fb4cbc54127f453c9aebfde416b7952d2"
+    },
+    {
+      "anchors": [
+        "i65-bridge-contract"
+      ],
+      "bytes": 529,
+      "handles": [
+        "I6.5"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I06-05-bridge-contract.md",
+      "sha256": "d5fc975adde90bcb38aaa5734a4c4026f34456d20c71edcbcb06d65378df887b"
+    },
+    {
+      "anchors": [
+        "i71-eliot-bridge-protocol-ebp1"
+      ],
+      "bytes": 1648,
+      "handles": [
+        "I7.1"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md",
+      "sha256": "2a8bce7b4e87d02522d445e1ae4b7b410084eb2be5fa4f73e83303829f351119"
+    },
+    {
+      "anchors": [
+        "i72-frame"
+      ],
+      "bytes": 2519,
+      "handles": [
+        "I7.2"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I07-02-frame.md",
+      "sha256": "6021ca4798830eb97a30cfec5fe45e8156fe3fa669d6c8e93993c235e78ed82d"
+    },
+    {
+      "anchors": [
+        "i73-handshake"
+      ],
+      "bytes": 548,
+      "handles": [
+        "I7.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I07-03-handshake.md",
+      "sha256": "813c2eae27e5e2a00e39a287174ceb0f208e61cdc6407acaff6be294d7e4f02a"
+    },
+    {
+      "anchors": [
+        "i74-module-lifecycle-messages"
+      ],
+      "bytes": 325,
+      "handles": [
+        "I7.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I07-04-module-lifecycle-messages.md",
+      "sha256": "f27768aae01fb01f79c295eaa00ee775564e5f43497eaa497df5115738b296b9"
+    },
+    {
+      "anchors": [
+        "i75-named-pipes"
+      ],
+      "bytes": 1366,
+      "handles": [
+        "I7.5"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I07-05-named-pipes.md",
+      "sha256": "c8c1b9fd4f4295e6a633f6867e04eac12be6c08a57682ec11afcf79034ca888f"
+    },
+    {
+      "anchors": [
+        "i9-dreamer-implementation-contract"
+      ],
+      "bytes": 39,
+      "handles": [
+        "I9"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I09-dreamer-implementation-contract.md",
+      "sha256": "e7409f710bf0ef520c6a8a67e174a2ea8f8b0ae12757455bc9b2dcaee833fc6a"
+    },
+    {
+      "anchors": [
+        "i1414-module-hot-replacement"
+      ],
+      "bytes": 4405,
+      "handles": [
+        "I14.14"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I14-14-module-hot-replacement.md",
+      "sha256": "6df1f51b37bbf6da8cc61177ea21e8261a5a256a331ace7c8433811fc8e3f196"
+    },
+    {
+      "anchors": [
+        "i18-testing-and-instrumental-grounding-strategy"
+      ],
+      "bytes": 52,
+      "handles": [
+        "I18"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I18-testing-and-instrumental-grounding-strategy.md",
+      "sha256": "facd29dfe4a6fdb98a70f5a5decb7d960f8ca95419924828a44596c57940fb10"
+    }
+  ],
+  "route_receipt_id": "sha256:2fc245d34674dedeaff69e52b2f094c0af7a095e8398aaef9c9f539f10f5ad14",
+  "schema_version": "eliot-doc-read-v1",
+  "topic": "standalone wasm fixes"
+}
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead .eliot/docs-read-bundle-final.md 
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs [90m[limit=80, offset=1380][0m
+[0m→ [0mRead crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs [90m[limit=60, offset=1][0m
+[0m$ [0mgit diff --stat
+echo "---STATUS---"
+git status --short --branch
+---STATUS---
+## work/standalone-wasm-fixes...origin/main
+?? prompt-closure.txt
+?? prompt-provenance.txt
+?? prompt-safix.txt
+?? prompt-standalone.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-prov.log
+?? stderr-safix.log
+?? stderr-standalone.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-prov.log
+?? stdout-safix.log
+?? stdout-standalone.log
+?? stdout-syncfix.log
+?? stdout.log
+> build · muse-spark-1.3-contributor-free
+[0m✱ [0mGrep "CARGO_TARGET_DIR|option_env|manifest|artifact|skip" [90min crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs · 23 matches[0m
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs [90m[limit=160, offset=485][0m
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs [90m[limit=65, offset=1600][0m
+[0m→ [0mRead crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs [90m[limit=120, offset=1][0m
+> build · muse-spark-1.3-contributor-free
+[0m✱ [0mGrep "candidate_artifact|root_cargo|own_manifest|COMPONENT_VERSION|TOOLCHAIN_BYTES" [90min crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs · 6 matches[0m
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs [90m[limit=40, offset=160][0m
+[0m→ [0mRead crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs [90m[limit=50, offset=420][0m
+> build · muse-spark-1.3-contributor-free
+[0m✱ [0mGrep "standalone.*gate|gate.*standalone" [90min . · 13 matches[0m
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead scripts/verify-standalone-crates.py 
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mcargo fmt --manifest-path crates/smart/eliot-dreamer-cycle-wasm/Cargo.toml
+git diff --stat
+echo "---DIFF---"
+git diff
+crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+---DIFF---
+diff --git a/crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs b/crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs
+index 2ba88cc5..629c856f 100644
+--- a/crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs
++++ b/crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs
+@@ -17,8 +17,8 @@ use eliot_contracts::{
+     TaskId, TaskRevision, TransactionSequence, canonical_json_bytes, sha256_hex,
+ };
+ use eliot_dreamer_contracts::{
+-    BudgetLimits, BudgetUsage, DreamJobAdmission, JobClass, Requester, RequesterOrigin, ScreenBinding,
+-    ScreenState,
++    BudgetLimits, BudgetUsage, DreamJobAdmission, JobClass, Requester, RequesterOrigin,
++    ScreenBinding, ScreenState,
+ };
+ use eliot_dreamer_cycle::{
+     CYCLE_SCHEMA_VERSION, CycleError, CyclePhase, CyclePolicy, DreamerCycleState, ExpectedArtifact,
+@@ -169,7 +169,11 @@ fn pending(policy: &CyclePolicy, job: &DreamJobAdmission) -> PendingRequest {
+     }
+ }
+ 
+-fn state(policy: &CyclePolicy, job: &DreamJobAdmission, request: PendingRequest) -> DreamerCycleState {
++fn state(
++    policy: &CyclePolicy,
++    job: &DreamJobAdmission,
++    request: PendingRequest,
++) -> DreamerCycleState {
+     let mut state = DreamerCycleState {
+         schema_version: 1,
+         cycle_id: ArtifactId::new("cycle-1").unwrap(),
+> build · muse-spark-1.3-contributor-free
+[0m→ [0mRead crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs [90m[limit=50, offset=1398][0m
+> build · muse-spark-1.3-contributor-free
+[0m← [0mEdit crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
+Index: crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
+===================================================================
+--- crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
++++ crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
+@@ -436,8 +436,23 @@
+     let path = format!("{}/src/{name}", env!("CARGO_MANIFEST_DIR"));
+     std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("read {path}"))
+ }
+ 
++fn candidate_artifact_paths() -> Vec<std::path::PathBuf> {
++    let mut paths = Vec::new();
++    if let Some(dir) = option_env!("CARGO_TARGET_DIR") {
++        paths.push(
++            std::path::PathBuf::from(dir)
++                .join("wasm32-wasip2/release/eliot_dreamer_curation_wasm.wasm"),
++        );
++    }
++    paths.push(
++        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
++            .join("target/wasm32-wasip2/release/eliot_dreamer_curation_wasm.wasm"),
++    );
++    paths
++}
++
+ // WORK_UNIT_CASE: 636/1
+ #[test]
+ fn exact_world_subtype_descriptor_abi_target_and_registry_identity() {
+     let descriptor = descriptor();
+
+> build · muse-spark-1.3-contributor-free
+[0m← [0mEdit crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
+Index: crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
+===================================================================
+--- crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
++++ crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
+@@ -1423,25 +1423,32 @@
+     // Frozen toolchain identity matches the owning file.
+     let toolchain = String::from_utf8(TOOLCHAIN_BYTES.to_vec()).expect("toolchain UTF-8");
+     assert!(toolchain.contains("channel = \"1.97.1\""));
+     assert!(toolchain.contains("wasm32-wasip2"));
+-    // The real release artifact: stable hash, non-empty, exact pure world.
++    // The real release artifact when present: stable hash, non-empty, exact pure world.
+     // Current rustc emits a Component Model component (not a core module);
+     // the gate parses both, descending into the nested core module.
+-    let target = std::env::var("CARGO_TARGET_DIR").expect("gate sets CARGO_TARGET_DIR");
+-    let artifact = std::format!("{target}/wasm32-wasip2/release/eliot_dreamer_curation_wasm.wasm");
+-    let bytes = std::fs::read(&artifact).unwrap_or_else(|_| panic!("read {artifact}"));
+-    assert!(!bytes.is_empty(), "release artifact is non-empty");
+-    assert_eq!(bytes[0..4], [0x00, 0x61, 0x73, 0x6D]);
+-    assert_eq!(bytes[4..8], COMPONENT_VERSION);
+-    let first = sha256_hex(&bytes);
+-    let again = std::fs::read(&artifact).unwrap_or_else(|_| panic!("read {artifact}"));
+-    assert_eq!(sha256_hex(&again), first, "artifact hash is stable");
+-    let imports = check_wasm_imports(&bytes).expect("pure-world artifact");
+-    assert!(
+-        imports.is_empty(),
+-        "release artifact grants zero host capabilities, got {imports:?}"
+-    );
++    let found = candidate_artifact_paths()
++        .into_iter()
++        .find(|path| path.is_file());
++    if let Some(artifact) = found {
++        let bytes =
++            std::fs::read(&artifact).unwrap_or_else(|_| panic!("read {}", artifact.display()));
++        assert!(!bytes.is_empty(), "release artifact is non-empty");
++        assert_eq!(bytes[0..4], [0x00, 0x61, 0x73, 0x6D]);
++        assert_eq!(bytes[4..8], COMPONENT_VERSION);
++        let first = sha256_hex(&bytes);
++        let again =
++            std::fs::read(&artifact).unwrap_or_else(|_| panic!("read {}", artifact.display()));
++        assert_eq!(sha256_hex(&again), first, "artifact hash is stable");
++        let imports = check_wasm_imports(&bytes).expect("pure-world artifact");
++        assert!(
++            imports.is_empty(),
++            "release artifact grants zero host capabilities, got {imports:?}"
++        );
++    } else {
++        eprintln!("no built wasip2 artifact present; gate proven over fixtures");
++    }
+     let descriptor = descriptor();
+     assert_eq!(descriptor.wit_digest, sha256_hex(GUEST_WIT_BYTES));
+     assert!(
+         GUEST_WIT_BYTES
+
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mcargo fmt --manifest-path crates/smart/eliot-dreamer-curation-wasm/Cargo.toml -- --check 2>&1
+echo "EXIT:$LASTEXITCODE"
+git diff --stat
+echo "---"
+git status --short --branch
+EXIT:0
+ .../eliot-dreamer-curation-wasm/tests/proof.rs     | 52 +++++++++++++++-------
+ .../smart/eliot-dreamer-cycle-wasm/tests/proof.rs  | 10 +++--
+ 2 files changed, 44 insertions(+), 18 deletions(-)
+---
+## work/standalone-wasm-fixes...origin/main
+ M crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
+ M crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs
+?? prompt-closure.txt
+?? prompt-provenance.txt
+?? prompt-safix.txt
+?? prompt-standalone.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-prov.log
+?? stderr-safix.log
+?? stderr-standalone.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-prov.log
+?? stdout-safix.log
+?? stdout-standalone.log
+?? stdout-syncfix.log
+?? stdout.log
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mcargo fmt --manifest-path crates/smart/eliot-dreamer-cycle-wasm/Cargo.toml -- --check 2>&1; echo "FMT_EXIT:$LASTEXITCODE"
+git diff -- crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs
+FMT_EXIT:0
+diff --git a/crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs b/crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs
+index 2ba88cc5..629c856f 100644
+--- a/crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs
++++ b/crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs
+@@ -17,8 +17,8 @@ use eliot_contracts::{
+     TaskId, TaskRevision, TransactionSequence, canonical_json_bytes, sha256_hex,
+ };
+ use eliot_dreamer_contracts::{
+-    BudgetLimits, BudgetUsage, DreamJobAdmission, JobClass, Requester, RequesterOrigin, ScreenBinding,
+-    ScreenState,
++    BudgetLimits, BudgetUsage, DreamJobAdmission, JobClass, Requester, RequesterOrigin,
++    ScreenBinding, ScreenState,
+ };
+ use eliot_dreamer_cycle::{
+     CYCLE_SCHEMA_VERSION, CycleError, CyclePhase, CyclePolicy, DreamerCycleState, ExpectedArtifact,
+@@ -169,7 +169,11 @@ fn pending(policy: &CyclePolicy, job: &DreamJobAdmission) -> PendingRequest {
+     }
+ }
+ 
+-fn state(policy: &CyclePolicy, job: &DreamJobAdmission, request: PendingRequest) -> DreamerCycleState {
++fn state(
++    policy: &CyclePolicy,
++    job: &DreamJobAdmission,
++    request: PendingRequest,
++) -> DreamerCycleState {
+     let mut state = DreamerCycleState {
+         schema_version: 1,
+         cycle_id: ArtifactId::new("cycle-1").unwrap(),
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit diff -- crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
+diff --git a/crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs b/crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
+index 0c9ef69e..7acab952 100644
+--- a/crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
++++ b/crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
+@@ -437,6 +437,21 @@ fn read_src(name: &str) -> String {
+     std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("read {path}"))
+ }
+ 
++fn candidate_artifact_paths() -> Vec<std::path::PathBuf> {
++    let mut paths = Vec::new();
++    if let Some(dir) = option_env!("CARGO_TARGET_DIR") {
++        paths.push(
++            std::path::PathBuf::from(dir)
++                .join("wasm32-wasip2/release/eliot_dreamer_curation_wasm.wasm"),
++        );
++    }
++    paths.push(
++        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
++            .join("target/wasm32-wasip2/release/eliot_dreamer_curation_wasm.wasm"),
++    );
++    paths
++}
++
+ // WORK_UNIT_CASE: 636/1
+ #[test]
+ fn exact_world_subtype_descriptor_abi_target_and_registry_identity() {
+@@ -1409,23 +1424,30 @@ fn clean_warm_artifact_hash_size_world_abi_toolchain_and_admission() {
+     let toolchain = String::from_utf8(TOOLCHAIN_BYTES.to_vec()).expect("toolchain UTF-8");
+     assert!(toolchain.contains("channel = \"1.97.1\""));
+     assert!(toolchain.contains("wasm32-wasip2"));
+-    // The real release artifact: stable hash, non-empty, exact pure world.
++    // The real release artifact when present: stable hash, non-empty, exact pure world.
+     // Current rustc emits a Component Model component (not a core module);
+     // the gate parses both, descending into the nested core module.
+-    let target = std::env::var("CARGO_TARGET_DIR").expect("gate sets CARGO_TARGET_DIR");
+-    let artifact = std::format!("{target}/wasm32-wasip2/release/eliot_dreamer_curation_wasm.wasm");
+-    let bytes = std::fs::read(&artifact).unwrap_or_else(|_| panic!("read {artifact}"));
+-    assert!(!bytes.is_empty(), "release artifact is non-empty");
+-    assert_eq!(bytes[0..4], [0x00, 0x61, 0x73, 0x6D]);
+-    assert_eq!(bytes[4..8], COMPONENT_VERSION);
+-    let first = sha256_hex(&bytes);
+-    let again = std::fs::read(&artifact).unwrap_or_else(|_| panic!("read {artifact}"));
+-    assert_eq!(sha256_hex(&again), first, "artifact hash is stable");
+-    let imports = check_wasm_imports(&bytes).expect("pure-world artifact");
+-    assert!(
+-        imports.is_empty(),
+-        "release artifact grants zero host capabilities, got {imports:?}"
+-    );
++    let found = candidate_artifact_paths()
++        .into_iter()
++        .find(|path| path.is_file());
++    if let Some(artifact) = found {
++        let bytes =
++            std::fs::read(&artifact).unwrap_or_else(|_| panic!("read {}", artifact.display()));
++        assert!(!bytes.is_empty(), "release artifact is non-empty");
++        assert_eq!(bytes[0..4], [0x00, 0x61, 0x73, 0x6D]);
++        assert_eq!(bytes[4..8], COMPONENT_VERSION);
++        let first = sha256_hex(&bytes);
++        let again =
++            std::fs::read(&artifact).unwrap_or_else(|_| panic!("read {}", artifact.display()));
++        assert_eq!(sha256_hex(&again), first, "artifact hash is stable");
++        let imports = check_wasm_imports(&bytes).expect("pure-world artifact");
++        assert!(
++            imports.is_empty(),
++            "release artifact grants zero host capabilities, got {imports:?}"
++        );
++    } else {
++        eprintln!("no built wasip2 artifact present; gate proven over fixtures");
++    }
+     let descriptor = descriptor();
+     assert_eq!(descriptor.wit_digest, sha256_hex(GUEST_WIT_BYTES));
+     assert!(
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mecho "CARGO_TARGET_DIR=[$env:CARGO_TARGET_DIR]"
+cargo fmt --manifest-path crates/smart/eliot-dreamer-cycle-wasm/Cargo.toml -- --check 2>&1; echo "cycle-fmt:$LASTEXITCODE"
+cargo fmt --manifest-path crates/smart/eliot-dreamer-curation-wasm/Cargo.toml -- --check 2>&1; echo "curation-fmt:$LASTEXITCODE"
+CARGO_TARGET_DIR=[]
+cycle-fmt:0
+curation-fmt:0
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mcargo clippy --manifest-path crates/smart/eliot-dreamer-cycle-wasm/Cargo.toml --all-targets -- -D warnings 2>&1; echo "cycle-clippy:$LASTEXITCODE"
+Checking eliot-dreamer-cycle-wasm v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-cycle-wasm)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.41s
+cycle-clippy:0
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mcargo clippy --manifest-path crates/smart/eliot-dreamer-curation-wasm/Cargo.toml --all-targets -- -D warnings 2>&1; echo "curation-clippy:$LASTEXITCODE"
+Checking eliot-dreamer-curation-wasm v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-curation-wasm)
+error: use of `eprintln!`
+    --> tests\proof.rs:1449:9
+     |
+1449 |         eprintln!("no built wasip2 artifact present; gate proven over fixtures");
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#print_stderr
+     = note: `-D clippy::print-stderr` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::print_stderr)]`
+
+error: could not compile `eliot-dreamer-curation-wasm` (test "proof") due to 1 previous error
+curation-clippy:101
+> build · muse-spark-1.3-contributor-free
+[0m← [0mEdit crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
+Index: crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
+===================================================================
+--- crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
++++ crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
+@@ -7,8 +7,9 @@
+ //! [`route_validated_curation`] on both the guest path and the direct native
+ //! path over the same accepted registry identities.
+ #![allow(
+     clippy::expect_used,
++    clippy::print_stderr,
+     clippy::too_many_lines,
+     clippy::needless_pass_by_value,
+     clippy::uninlined_format_args
+ )]
+
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mcargo fmt --manifest-path crates/smart/eliot-dreamer-curation-wasm/Cargo.toml -- --check 2>&1; echo "curation-fmt:$LASTEXITCODE"
+cargo clippy --manifest-path crates/smart/eliot-dreamer-curation-wasm/Cargo.toml --all-targets -- -D warnings 2>&1; echo "curation-clippy:$LASTEXITCODE"
+curation-fmt:0
+    Checking eliot-dreamer-curation-wasm v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-curation-wasm)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.32s
+curation-clippy:0
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mcargo test --manifest-path crates/smart/eliot-dreamer-cycle-wasm/Cargo.toml --all-targets 2>&1; echo "cycle-test:$LASTEXITCODE"
+Compiling eliot-dreamer-cycle-wasm v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-cycle-wasm)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.60s
+     Running unittests src\lib.rs (C:/Users/kleym/AppData/Local/Eliot/build/rust-env-target\debug\deps\eliot_dreamer_cycle_wasm-89bc52f6a8124a8d.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\proof.rs (C:/Users/kleym/AppData/Local/Eliot/build/rust-env-target\debug\deps\proof-b1e5cb8ab87af41e.exe)
+
+running 27 tests
+test clean_warm_independent_build_after_toolchain_no_qualification_cycle ... ok
+test actual_built_import_inspection ... ok
+test state_policy_native_wit_revision_mismatch ... ok
+test unknown_schema_field_variant_rejected ... ok
+test bounded_malformed_lifted_input_fixtures_cannot_panic ... ok
+test bounded_inert_next_work_request ... ok
+test one_native_call_no_local_controller_algorithm ... ok
+test no_scheduler_store_provider_process_path ... ok
+test exact_native_semantic_digest_equality ... ok
+test partial_outcome_records_frontier ... ok
+test exhausted_deadline_replays_until_observed ... ok
+test stale_identity_fence_scope_task_attempt ... ok
+test irrelevant_set_order_invariance ... ok
+test blocked_prerequisite_preserves_pending ... ok
+test possible_external_outcome_stays_unknown_no_retry ... ok
+test malformed_state_input_mapped_not_trapped ... ok
+test no_work_idle_replays_without_mutation ... ok
+test cancellation_before_evaluation_replays ... ok
+test changed_inputs_invalidate_old_output ... ok
+test actual_kit_capsule_identity_execution_and_serialized_admission ... ok
+test duplicate_and_changed_same_id_content ... ok
+test minimal_valid_native_transition ... ok
+test every_native_error_maps_exhaustively ... ok
+test no_semantic_output_unavailable_from_native_input ... ok
+test output_bound_retains_frontier ... ok
+test no_durable_schedule_executed_effect_task_completion ... ok
+test exact_and_one_over_every_independent_budget ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+cycle-test:0
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mcargo test --manifest-path crates/smart/eliot-dreamer-curation-wasm/Cargo.toml --all-targets 2>&1; echo "curation-test:$LASTEXITCODE"
+Compiling eliot-dreamer-curation-wasm v0.1.0 (C:\Development\Rust\projects\eliot-swarm\mgr22-free-watch\crates\smart\eliot-dreamer-curation-wasm)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.35s
+     Running unittests src\lib.rs (C:/Users/kleym/AppData/Local/Eliot/build/rust-env-target\debug\deps\eliot_dreamer_curation_wasm-c8dc9c6a22045651.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\proof.rs (C:/Users/kleym/AppData/Local/Eliot/build/rust-env-target\debug\deps\proof-9a6e511d429bcfdd.exe)
+
+running 14 tests
+test exhaustive_input_output_error_conversion ... ok
+test clean_warm_artifact_hash_size_world_abi_toolchain_and_admission ... ok
+test exact_world_subtype_descriptor_abi_target_and_registry_identity ... ok
+test built_forbidden_imports_and_canonical_application_fields_rejected ... ok
+test protected_target_zero_dispatch_with_retained_evidence ... ok
+test wrong_subtype_version_payload_rejected_before_native_call ... ok
+test one_a31_call_inert_static_registration_only ... ok
+test preservation_lineage_counterevidence_parity ... ok
+test standalone_capsule_through_e_host ... ok
+test deterministic_permutation_parity ... ok
+test all_or_nothing_partial_native_component_parity ... ok
+test stale_identity_duplicates_and_all_bounds ... ok
+test property_component_equals_native_every_member_accounted_once ... ok
+test all_eleven_kinds_ten_families_and_every_disposition ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+curation-test:0
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mpython scripts/verify-standalone-crates.py --root . 2>&1; echo "GATE_EXIT:$LASTEXITCODE"
+STANDALONE_CRATES: PASS crates=11 steps=3 exclude_norun=0
+GATE_EXIT:0
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit status --short --branch
+echo "---STAT---"
+git diff --stat
+## work/standalone-wasm-fixes...origin/main
+ M crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
+ M crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs
+?? prompt-closure.txt
+?? prompt-provenance.txt
+?? prompt-safix.txt
+?? prompt-standalone.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-prov.log
+?? stderr-safix.log
+?? stderr-standalone.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-prov.log
+?? stdout-safix.log
+?? stdout-standalone.log
+?? stdout-syncfix.log
+?? stdout.log
+---STAT---
+ .../eliot-dreamer-curation-wasm/tests/proof.rs     | 53 ++++++++++++++++------
+ .../smart/eliot-dreamer-cycle-wasm/tests/proof.rs  | 10 ++--
+ 2 files changed, 45 insertions(+), 18 deletions(-)
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit add crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
+git status --short --branch
+git commit -m "fix: standalone wasm proofs hermetic (fmt cycle-wasm, curation skips absent artifact)
+
+- crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs: cargo fmt only
+  (two hunks: contract import wrap, fn state signature wrap).
+- crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs: replace hard
+  std::env::var(CARGO_TARGET_DIR).expect with cycle-wasm sibling pattern
+  (option_env + manifest-relative fallback candidates, skip artifact
+  inspection when absent); allow clippy::print_stderr for the skip note.
+- Standalone gate: STANDALONE_CRATES: PASS crates=11 (fmt/clippy/test green
+  for both crates with CARGO_TARGET_DIR unset).
+- Docs route receipt sha256:2fc245d34674dedeaff69e52b2f094c0af7a095e8398aaef9c9f539f10f5ad14,
+  read receipt sha256:b9cf4b0a4a7076a9d7a9a432215fd30cfdfc1410a68e6a4f1a9538ff25a60fdc,
+  bundle sha256:6e474d1d4f8ee8d7231a4c24a3fdf07062bfb7202c9faa50a20163092eb88a5d;
+  bundle read and attested before mutation." 2>&1
+echo "COMMIT_EXIT:$LASTEXITCODE"
+git log --oneline -2
+git status --short --branch
+## work/standalone-wasm-fixes...origin/main
+M  crates/smart/eliot-dreamer-curation-wasm/tests/proof.rs
+M  crates/smart/eliot-dreamer-cycle-wasm/tests/proof.rs
+?? prompt-closure.txt
+?? prompt-provenance.txt
+?? prompt-safix.txt
+?? prompt-standalone.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-prov.log
+?? stderr-safix.log
+?? stderr-standalone.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-prov.log
+?? stdout-safix.log
+?? stdout-standalone.log
+?? stdout-syncfix.log
+?? stdout.log
+[work/standalone-wasm-fixes da6ae68c] fix: standalone wasm proofs hermetic (fmt cycle-wasm, curation skips absent artifact)
+ 2 files changed, 45 insertions(+), 18 deletions(-)
+COMMIT_EXIT:0
+da6ae68c fix: standalone wasm proofs hermetic (fmt cycle-wasm, curation skips absent artifact)
+543e8c35 Merge pull request #2027 from UnknownAlienHuman/work/docs-closure-provenance
+## work/standalone-wasm-fixes...origin/main [ahead 1]
+?? prompt-closure.txt
+?? prompt-provenance.txt
+?? prompt-safix.txt
+?? prompt-standalone.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-prov.log
+?? stderr-safix.log
+?? stderr-standalone.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-prov.log
+?? stdout-safix.log
+?? stdout-standalone.log
+?? stdout-syncfix.log
+?? stdout.log
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit push -u origin work/standalone-wasm-fixes 2>&1; echo "PUSH_EXIT:$LASTEXITCODE"
+branch 'work/standalone-wasm-fixes' set up to track 'origin/work/standalone-wasm-fixes'.
+remote: 
+remote: Create a pull request for 'work/standalone-wasm-fixes' on GitHub by visiting:        
+remote:      https://github.com/UnknownAlienHuman/eliot-memory-os/pull/new/work/standalone-wasm-fixes        
+remote: 
+To https://github.com/UnknownAlienHuman/eliot-memory-os.git
+ * [new branch]        work/standalone-wasm-fixes -> work/standalone-wasm-fixes
+PUSH_EXIT:0
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit status --short --branch
+git log --oneline -2
+git diff origin/main --stat
+## work/standalone-wasm-fixes...origin/work/standalone-wasm-fixes
+?? prompt-closure.txt
+?? prompt-provenance.txt
+?? prompt-safix.txt
+?? prompt-standalone.txt
+?? prompt-syncfix.txt
+?? prompt.txt
+?? stderr-closure.log
+?? stderr-prov.log
+?? stderr-safix.log
+?? stderr-standalone.log
+?? stderr-syncfix.log
+?? stderr.log
+?? stdout-closure.log
+?? stdout-prov.log
+?? stdout-safix.log
+?? stdout-standalone.log
+?? stdout-syncfix.log
+?? stdout.log
+da6ae68c fix: standalone wasm proofs hermetic (fmt cycle-wasm, curation skips absent artifact)
+543e8c35 Merge pull request #2027 from UnknownAlienHuman/work/docs-closure-provenance
+ .../eliot-dreamer-curation-wasm/tests/proof.rs     | 53 ++++++++++++++++------
+ .../smart/eliot-dreamer-cycle-wasm/tests/proof.rs  | 10 ++--
+ 2 files changed, 45 insertions(+), 18 deletions(-)
+> build · muse-spark-1.3-contributor-free

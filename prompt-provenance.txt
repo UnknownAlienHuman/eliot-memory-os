@@ -1,0 +1,6 @@
+You are an OpenCode nested swarm manager on the FREE route. Small bounded tasks only. Your root-cause report on the docs-closure errors is accepted (pre-existing on main, I9.4 plus resync provenance gap). Now implement your own recommended minimal fix.
+Repo copy: this worktree. Create new branch work/docs-closure-provenance from origin/main 09c2c902 and work only there.
+Task: execute the two-commit adopt-then-restore exactly as planned: commit A writes the two exact adopted byte streams to the legacy monolith paths (arch bytes from git show c0a880a2, impl bytes from deterministic manifest reconstruction via scripts, verified with git hash-object); commit B restores both facades byte-identical. Bytes must be machine-generated, never hand-edited. First confirm SPLIT_REPORT.md and READING_PROTOCOL.md do not forbid transient full-text commits; if they do, stop and report instead of implementing.
+Then verify: just docs-closure-audit must be GREEN, then full just quick result reported. Push the branch to origin.
+Forbidden: touching manifests, normative-pair, code, tests, or any other files; reverting I9.4; editing facades as final state; merge, close.
+Deliverable: pushed branch, gate logs (closure GREEN plus full quick result), commit SHAs, final report. No merge.
