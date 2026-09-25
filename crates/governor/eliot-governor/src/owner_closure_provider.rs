@@ -1706,11 +1706,7 @@ mod owner_closure_provider_tests {
     /// expiry, or use budget (I6.15). Without that, the graph refuses with
     /// `GrantNotNarrower` and no provider, revision, or closure exists to
     /// exercise.
-    fn grant_entry(
-        fence: &StateFence,
-        grant_id: &str,
-        parent: Option<&str>,
-    ) -> CapabilityGrant {
+    fn grant_entry(fence: &StateFence, grant_id: &str, parent: Option<&str>) -> CapabilityGrant {
         let delegated = parent.is_some();
         CapabilityGrant {
             grant_id: GrantId::new(grant_id).expect("id"),
