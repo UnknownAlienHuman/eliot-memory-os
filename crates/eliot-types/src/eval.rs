@@ -28,6 +28,7 @@ pub enum EvalFamily {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalCase {
     pub eval_case_id: EvalCaseId,
     pub project_id: ProjectId,
@@ -47,6 +48,7 @@ pub struct EvalCase {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalCriterion {
     pub criterion_id: String,
     pub description: String,
@@ -55,6 +57,7 @@ pub struct EvalCriterion {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalMeasurementSpec {
     pub measurement_id: String,
     pub description: String,
@@ -77,6 +80,7 @@ pub enum EvalMeasurementKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalBudget {
     pub max_runtime_ms: u64,
     pub max_input_tokens: u64,
@@ -85,6 +89,7 @@ pub struct EvalBudget {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalSuite {
     pub eval_suite_id: EvalSuiteId,
     pub project_id: ProjectId,
@@ -102,6 +107,7 @@ pub struct EvalSuite {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalDatasetManifest {
     pub eval_dataset_manifest_id: EvalDatasetManifestId,
     pub suite_id: EvalSuiteId,
@@ -115,12 +121,14 @@ pub struct EvalDatasetManifest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalFixtureChecksum {
     pub fixture_ref: String,
     pub checksum: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalRun {
     pub eval_run_id: EvalRunId,
     pub project_id: ProjectId,
@@ -138,6 +146,7 @@ pub struct EvalRun {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalRunProfile {
     pub profile_id: String,
     pub deterministic: bool,
@@ -161,6 +170,7 @@ pub enum EvalRunStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalCaseResult {
     pub result_id: String,
     pub eval_case_id: EvalCaseId,
@@ -183,6 +193,7 @@ pub enum EvalCaseStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalMeasurementResult {
     pub measurement_id: String,
     pub passed: bool,
@@ -192,6 +203,7 @@ pub struct EvalMeasurementResult {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
+#[serde(deny_unknown_fields)]
 pub struct EvalVerdict {
     pub eval_verdict_id: EvalVerdictId,
     pub eval_run_id: EvalRunId,
@@ -220,6 +232,7 @@ pub enum EvalVerdictStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalFamilyScore {
     pub family: EvalFamily,
     pub passed: u32,
@@ -230,6 +243,7 @@ pub struct EvalFamilyScore {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalFailureCluster {
     pub eval_failure_cluster_id: EvalFailureClusterId,
     pub eval_run_id: EvalRunId,
@@ -242,6 +256,7 @@ pub struct EvalFailureCluster {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BenchmarkIntegrityReceipt {
     pub benchmark_integrity_receipt_id: crate::BenchmarkIntegrityReceiptId,
     pub suite_id: EvalSuiteId,
@@ -255,7 +270,11 @@ pub struct BenchmarkIntegrityReceipt {
     pub created_at: OffsetDateTime,
 }
 
+/// Decoder: derived and closed. The `#[serde(default)]` meta fields keep
+/// pre-meta harness records readable and decode as absent or explicitly
+/// uncertain (`InsufficientEvidence`); none of them can promote a candidate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HarnessExperimentRecord {
     pub harness_experiment_record_id: HarnessExperimentRecordId,
     pub eval_run_id: EvalRunId,
@@ -339,7 +358,12 @@ pub enum MetaExperimentDecision {
     InsufficientEvidence,
 }
 
+/// Decoder: derived and closed. Version meaning stays with the owner
+/// (`eliot-engine` `validate_replay_threshold_policy` pins `schema_version`
+/// and rejects an empty `evaluator_version`); the decoder only fixes the key
+/// set and refuses unknown tags, wrong payloads and duplicate keys.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayThresholdPolicyV1 {
     pub schema_version: String,
     pub evaluator_version: String,
@@ -347,8 +371,12 @@ pub struct ReplayThresholdPolicyV1 {
     pub maximum_counter_regressions: u16,
 }
 
+/// Decoder: internally tagged on `policy_kind`; an unknown tag or a mismatched
+/// payload shape is refused, and unknown keys inside either variant are refused
+/// too. `Unsupported.payload` stays a free-form `Value` by wire contract: bytes
+/// inside that payload are not certified duplicate-free here.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "policy_kind", rename_all = "snake_case")]
+#[serde(tag = "policy_kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExperimentalMetaPolicyPayload {
     ReplayThresholdV1 { policy: ReplayThresholdPolicyV1 },
     Unsupported { kind: String, payload: Value },
@@ -364,6 +392,7 @@ pub enum ExperimentalMetaPolicyState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExperimentalMetaPolicyCandidate {
     pub candidate_id: String,
     pub project_id: ProjectId,
@@ -378,6 +407,7 @@ pub struct ExperimentalMetaPolicyCandidate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetaIsolationFence {
     pub evaluator_version: String,
     pub evaluator_hash: String,
@@ -388,6 +418,7 @@ pub struct MetaIsolationFence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalMetaMetricEvidence {
     pub metric_name: String,
     pub fixed_replay_run_ref: String,
@@ -402,6 +433,7 @@ pub struct CanonicalMetaMetricEvidence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetaIsolationRejectionRecord {
     pub rejection_id: String,
     pub project_id: ProjectId,
@@ -417,6 +449,7 @@ pub struct MetaIsolationRejectionRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalMetaExperimentRecordSet {
     pub experiment: HarnessExperimentRecord,
     pub metric_evidence: Vec<CanonicalMetaMetricEvidence>,
@@ -431,6 +464,7 @@ pub enum MetaPolicyExecutionAction {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetaPolicyAuthorization {
     pub operator_command_ref: String,
     pub expected_action_hash: String,
@@ -438,6 +472,7 @@ pub struct MetaPolicyAuthorization {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetaPolicyExecutionReceipt {
     pub execution_id: String,
     pub candidate_id: String,
@@ -456,6 +491,7 @@ pub struct MetaPolicyExecutionReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalCoverageMatrix {
     pub matrix_id: String,
     pub project_id: ProjectId,
@@ -469,6 +505,7 @@ pub struct EvalCoverageMatrix {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalFamilyCoverage {
     pub family: EvalFamily,
     pub case_count: u64,
@@ -489,6 +526,7 @@ pub enum EvalCoverageStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalComponentCoverage {
     pub component: String,
     pub eval_case_refs: Vec<String>,
@@ -497,6 +535,7 @@ pub struct EvalComponentCoverage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalRiskCoverage {
     pub risk_id: String,
     pub description: String,
@@ -506,6 +545,7 @@ pub struct EvalRiskCoverage {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalBaseline {
     pub baseline_id: String,
     pub suite_id: String,
@@ -520,6 +560,7 @@ pub struct EvalBaseline {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalCandidateComparison {
     pub comparison_id: String,
     pub suite_id: String,
@@ -536,6 +577,7 @@ pub struct EvalCandidateComparison {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalFamilyDelta {
     pub family: EvalFamily,
     pub baseline_score: f64,
@@ -565,6 +607,7 @@ pub enum EvalComparisonVerdict {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalRegressionGateProfile {
     pub profile_id: String,
     pub name: String,
@@ -581,6 +624,7 @@ pub struct EvalRegressionGateProfile {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalFamilyThreshold {
     pub family: EvalFamily,
     pub min_score: f64,
@@ -588,6 +632,7 @@ pub struct EvalFamilyThreshold {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalGateDecision {
     pub decision_id: String,
     pub profile_id: String,
@@ -612,6 +657,7 @@ pub enum EvalGateDecisionKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalTrendReport {
     pub trend_report_id: String,
     pub suite_id: String,
@@ -624,6 +670,7 @@ pub struct EvalTrendReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalFamilyTrend {
     pub family: EvalFamily,
     pub scores: Vec<f64>,
@@ -640,6 +687,7 @@ pub enum EvalTrendDirection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalFixtureStabilityReport {
     pub report_id: String,
     pub suite_id: String,
