@@ -2,7 +2,14 @@ use crate::{ConfigError, CredentialProviderKind, SCHEMA_VERSION};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`;
+/// nested section structs are closed too. `supervision`,
+/// `delegation_calibration` and `ul` stay `#[serde(default)]`: approved
+/// operational sections (the in-repo `config/eliot-governor.toml` omits two of
+/// them), still enforced afterwards by `GovernorConfig::validate`.
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GovernorConfig {
     pub schema_version: String,
     pub service: ServiceConfig,
@@ -18,7 +25,10 @@ pub struct GovernorConfig {
     pub ul: UlConfig,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeSupervisionConfig {
     pub watchdog_interval_ms: u64,
 }
@@ -31,13 +41,20 @@ impl Default for RuntimeSupervisionConfig {
     }
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`;
+/// nested `UlActivationConfig` is closed too.
 #[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlConfig {
     #[serde(default)]
     pub activation: UlActivationConfig,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlActivationConfig {
     pub enable_min_edges: u32,
 }
@@ -50,7 +67,10 @@ impl Default for UlActivationConfig {
     }
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationCalibrationConfig {
     pub minimum_real_tasks_total: u32,
     pub minimum_real_tasks_per_family: u32,
@@ -79,13 +99,20 @@ impl Default for DelegationCalibrationConfig {
     }
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     pub service_name: String,
     pub instance_id: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`;
+/// nested `SurrealServerConfig` is closed too.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DbConfig {
     pub mode: DbMode,
     pub surreal: SurrealServerConfig,
@@ -100,7 +127,15 @@ pub enum DbMode {
     SurrealSdkExperimental,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`;
+/// nested `SurrealCapabilities` is closed too. The credential
+/// `#[serde(default)]`s stay: the approved secure authority
+/// (`WindowsCredentialManager`, never the legacy file) is what an unspecified
+/// config resolves to, pinned by
+/// `an_unspecified_credential_provider_resolves_to_the_windows_credential_manager`.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SurrealServerConfig {
     pub exe: String,
     pub bind: String,
@@ -124,7 +159,10 @@ pub struct SurrealServerConfig {
     pub capabilities: SurrealCapabilities,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SurrealCapabilities {
     pub deny_all: bool,
     pub allow_funcs: Vec<String>,
@@ -133,17 +171,26 @@ pub struct SurrealCapabilities {
     pub allow_guests: bool,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControlWalConfig {
     pub path: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlobStoreConfig {
     pub root: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// and duplicate member keys are already refused by the derived `MapAccess`.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoreConfig {
     pub surql_dir: String,
     pub migrations_dir: String,
