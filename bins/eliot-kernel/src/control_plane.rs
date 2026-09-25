@@ -22,6 +22,7 @@ use super::*;
 
 const RUNTIME_LEASE_TTL_MS: u64 = 5 * 60 * 1_000;
 const RUNTIME_LEASE_RENEW_BEFORE_MS: u64 = 60 * 1_000;
+const HOST_DEMAND_OWNER_TTL_MS: u64 = 60 * 60 * 1_000;
 
 #[derive(Clone, Debug)]
 enum RuntimeLeaseOwnerRef {
@@ -505,6 +506,7 @@ impl KernelComposition {
         let _runtime_lease_gate = if matches!(
             &request.command,
             KernelControlCommand::ProbeReady
+                | KernelControlCommand::RegisterHostDemandStartOwner(_)
                 | KernelControlCommand::AcquireRuntimeLease(_)
                 | KernelControlCommand::RenewRuntimeLease(_)
                 | KernelControlCommand::RevokeRuntimeLease(_)
@@ -870,6 +872,7 @@ impl KernelComposition {
                 | KernelControlCommand::RebindStore(_)
                 | KernelControlCommand::ReconcileRebindStore(_)
                 | KernelControlCommand::ReportHostStartupEvidence(_)
+                | KernelControlCommand::RegisterHostDemandStartOwner(_)
                 | KernelControlCommand::AcquireRuntimeLease(_)
                 | KernelControlCommand::RenewRuntimeLease(_)
                 | KernelControlCommand::RevokeRuntimeLease(_)
@@ -891,7 +894,19 @@ impl KernelComposition {
         {
             self.promote_agent_bridge_profile(next)?;
         }
+        let runtime_lease_admission = match &request.command {
+            KernelControlCommand::RegisterHostDemandStartOwner(registration) => Some(
+                self.register_host_demand_start_owner(&request, registration)?,
+            ),
+            _ => None,
+        };
         let runtime_lease = match &request.command {
+            KernelControlCommand::RegisterHostDemandStartOwner(_) => {
+                let admission = runtime_lease_admission
+                    .as_ref()
+                    .ok_or(TransportError::SessionFenced)?;
+                Some(self.acquire_runtime_lease(&request, admission)?)
+            }
             KernelControlCommand::AcquireRuntimeLease(admission) => {
                 Some(self.acquire_runtime_lease(&request, admission)?)
             }
@@ -1027,6 +1042,7 @@ impl KernelComposition {
             store_rebind_receipt,
             supervision_lease,
             runtime_lease,
+            runtime_lease_admission,
             runtime_lease_census,
             error: control_error,
             payload_digest: String::new(),
@@ -1225,6 +1241,29 @@ impl KernelComposition {
                     format!("host-request-payload:{}", record.payload_digest),
                     format!("host-request-fence:{}", record.fence_digest),
                     format!("host-request-deadline:{}", record.deadline_unix_ms),
+                    format!("host-request-connection:{}", record.connection_ref.as_str()),
+                    format!(
+                        "host-request-session:{}",
+                        record
+                            .session_ref
+                            .as_ref()
+                            .map_or("none", eliot_ors::OpaqueLabel::as_str)
+                    ),
+                    format!(
+                        "host-request-task:{}",
+                        record
+                            .task_ref
+                            .as_ref()
+                            .map_or("none", eliot_ors::OpaqueLabel::as_str)
+                    ),
+                    format!(
+                        "host-request-scope:{}",
+                        record
+                            .scope_ref
+                            .as_ref()
+                            .map_or("none", eliot_ors::OpaqueLabel::as_str)
+                    ),
+                    format!("host-request-capability:{}", record.capability_ref.as_str()),
                 ]);
                 renewal_evidence.extend(immutable_evidence.iter().cloned());
                 renewal_evidence.push(format!("host-request-state:{:?}", record.state));
@@ -1493,6 +1532,162 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         Ok(observed)
+    }
+
+    fn register_host_demand_start_owner(
+        &self,
+        request: &KernelControlRequest,
+        registration: &eliot_kernel_service::HostDemandStartOwnerRegistration,
+    ) -> Result<RuntimeLeaseAdmission, TransportError> {
+        registration
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let state = self
+            .service_state()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let current_fence =
+            StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
+        if state != KernelServiceState::Ready || registration.state_fence != current_fence {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let operation_material = (
+            "eliot-host-demand-start-owner:v1",
+            registration.host_request_id.as_str(),
+            registration.host_request_digest.as_str(),
+        );
+        let operation_id = eliot_ors::OperationIdentity::new(format!(
+            "host-demand-owner:{}",
+            sha256_json(&operation_material).map_err(|_| TransportError::SessionFenced)?
+        ))
+        .map_err(|_| TransportError::SessionFenced)?;
+        let payload_digest =
+            sha256_json(registration).map_err(|_| TransportError::SessionFenced)?;
+        let label = |value: String| {
+            eliot_ors::OpaqueLabel::new(value).map_err(|_| TransportError::SessionFenced)
+        };
+        let session_ref = format!(
+            "principal:{}@session:{}",
+            registration.principal_sid.as_str(),
+            registration.session_id.as_str()
+        );
+        let process_ref = format!(
+            "process:{}:{}:image:{}",
+            registration.process_id,
+            registration.process_start_time_100ns,
+            registration.process_image_binding_sha256
+        );
+        let deadline_unix_ms = unix_ms().saturating_add(HOST_DEMAND_OWNER_TTL_MS);
+        let requested = eliot_ors::HostRequestRecord {
+            contract_version: eliot_ors::CONTRACT_VERSION,
+            operation_id: operation_id.clone(),
+            kind: eliot_ors::HostRequestKind::Invocation,
+            request_id: label(registration.host_request_id.as_str().to_owned())?,
+            idempotency_key: label(format!(
+                "host-demand-idempotency:{}",
+                registration.host_request_digest
+            ))?,
+            cancellation_id: label(format!(
+                "host-demand-cancel:{}",
+                registration.host_request_digest
+            ))?,
+            parent_operation_id: None,
+            request_digest: registration.host_request_digest.clone(),
+            payload_digest,
+            connection_ref: label(format!(
+                "host-control-connection:{}",
+                registration.connection_id.as_str()
+            ))?,
+            session_ref: Some(label(session_ref)?),
+            task_ref: Some(label(process_ref)?),
+            scope_ref: Some(label(registration.candidate_scope.as_str().to_owned())?),
+            capability_ref: label(registration.capability.as_str().to_owned())?,
+            fence_digest: runtime_lease_state_fence_digest(&registration.state_fence)?,
+            authority_epoch: registration.state_fence.authority_epoch.clone(),
+            generation: registration.state_fence.resource_generation.value(),
+            deadline_unix_ms,
+            state: eliot_ors::HostRequestState::Requested,
+            result_digest: None,
+            result_response: None,
+            commit_order: 0,
+        };
+
+        // Reuse the original durable deadline on retry so a lost response
+        // cannot turn the same peer-bound request into a conflicting owner.
+        let existing = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation_id, &registration.host_request_digest)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let requested = existing
+            .as_ref()
+            .map(|record| {
+                let mut stable = requested.clone();
+                stable.deadline_unix_ms = record.deadline_unix_ms;
+                stable
+            })
+            .unwrap_or(requested);
+        let staged = self
+            .generation_gateway
+            .ors
+            .stage_host_request(&requested)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !staged.same_binding(&requested) {
+            return Err(TransportError::SessionFenced);
+        }
+        if staged.state == eliot_ors::HostRequestState::Requested {
+            self.generation_gateway
+                .ors
+                .advance_host_request(
+                    &operation_id,
+                    &registration.host_request_digest,
+                    eliot_ors::HostRequestState::Admitted,
+                    None,
+                )
+                .map_err(|_| TransportError::SessionFenced)?
+                .ok_or(TransportError::SessionFenced)?;
+        }
+        let readback = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation_id, &registration.host_request_digest)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::SessionFenced)?;
+        if !readback.same_binding(&requested)
+            || !runtime_lease_host_request_active(readback.state)
+            || readback.deadline_unix_ms <= unix_ms()
+            || readback.connection_ref.as_str()
+                != format!("host-control-connection:{}", registration.connection_id.as_str())
+            || readback.session_ref.as_ref().map(eliot_ors::OpaqueLabel::as_str)
+                != Some(session_ref.as_str())
+            || readback.task_ref.as_ref().map(eliot_ors::OpaqueLabel::as_str)
+                != Some(process_ref.as_str())
+            || readback.scope_ref.as_ref().map(eliot_ors::OpaqueLabel::as_str)
+                != Some(registration.candidate_scope.as_str())
+            || readback.capability_ref.as_str() != registration.capability.as_str()
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let owner_ref = runtime_lease_handle(runtime_lease_owner_ref_string(
+            &RuntimeLeaseOwnerRef::HostRequest {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: registration.host_request_digest.clone(),
+            },
+        ))?;
+        let owner = self.resolve_runtime_lease_owner(
+            request,
+            &owner_ref,
+            None,
+            Some(&registration.state_fence),
+        )?;
+        if !owner.active
+            || owner.admission.state_fence != current_fence
+            || owner.admission.required_capabilities
+                != vec![registration.capability.clone()]
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(owner.admission)
     }
 
     /// Reconciles one complete exact-fence RuntimeLease set from the canonical

@@ -692,6 +692,207 @@ fn validate_runtime_lease_response(
 }
 
 #[cfg(windows)]
+async fn send_host_demand_owner_registration(
+    transport: &mut NamedPipeTransport,
+    candidate: &HostKernelCandidateBinding,
+    generation: ResourceGeneration,
+    registration: &eliot_kernel_service::HostDemandStartOwnerRegistration,
+    sequence: u64,
+    connection_id: String,
+) -> Result<(eliot_kernel_service::RuntimeLeaseAdmission, RuntimeLease), HostError> {
+    let request = kernel_control_request(
+        candidate,
+        generation,
+        KernelControlCommand::RegisterHostDemandStartOwner(registration.clone()),
+        sequence,
+    )?;
+    let frame = control_request_frame(connection_id, &request)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    match transport
+        .send_frame(&frame, TransportLimits::default())
+        .await
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+    {
+        DeliveryOutcome::Delivered => {}
+        DeliveryOutcome::UnknownOutcome => {
+            return Err(HostError::RecoveryRequired(
+                "Kernel demand owner registration/acquisition outcome is unknown".to_owned(),
+            ));
+        }
+    }
+    let response = transport
+        .receive_frame(TransportLimits::default())
+        .await
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    let response = decode_control_response_frame(&response)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    validate_host_demand_owner_response(&request, registration, &response)
+}
+
+#[cfg(windows)]
+fn validate_host_demand_owner_response(
+    request: &KernelControlRequest,
+    registration: &eliot_kernel_service::HostDemandStartOwnerRegistration,
+    response: &KernelControlResponse,
+) -> Result<(eliot_kernel_service::RuntimeLeaseAdmission, RuntimeLease), HostError> {
+    request
+        .validate()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    response
+        .validate()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    if !matches!(
+        &request.command,
+        KernelControlCommand::RegisterHostDemandStartOwner(value) if value == registration
+    ) || response.message_id != request.message_id
+        || response.request_digest != request.payload_digest
+        || response.state != KernelServiceState::Ready
+        || response.error.is_some()
+        || response.receipt.is_some()
+        || response.runtime_health.is_some()
+        || response.activation_receipt.is_some()
+        || response.store_rebind_receipt.is_some()
+        || response.supervision_lease.is_some()
+        || response.runtime_lease_census.is_some()
+    {
+        return Err(HostError::ProcessContour(
+            "Kernel demand owner registration response binding failed".to_owned(),
+        ));
+    }
+    let admission = response
+        .runtime_lease_admission
+        .clone()
+        .ok_or_else(|| {
+            HostError::OwnerLeaseRecovery(
+                "Kernel omitted the durable HostRequest admission readback".to_owned(),
+            )
+        })?;
+    admission
+        .validate()
+        .map_err(|error| HostError::OwnerLeaseRecovery(error.to_string()))?;
+    let owner = admission.owner_admission.as_ref().ok_or_else(|| {
+        HostError::OwnerLeaseRecovery(
+            "Kernel demand owner response has no durable owner reference".to_owned(),
+        )
+    })?;
+    let operation_material = (
+        "eliot-host-demand-start-owner:v1",
+        registration.host_request_id.as_str(),
+        registration.host_request_digest.as_str(),
+    );
+    let operation_id = format!(
+        "host-demand-owner:{}",
+        sha256_json(&operation_material)?
+    );
+    let owner_ref = format!(
+        "owner:host-request:{}::{}",
+        operation_id, registration.host_request_digest
+    );
+    let session_ref = format!(
+        "principal:{}@session:{}",
+        registration.principal_sid.as_str(),
+        registration.session_id.as_str()
+    );
+    let process_ref = format!(
+        "process:{}:{}:image:{}",
+        registration.process_id,
+        registration.process_start_time_100ns,
+        registration.process_image_binding_sha256
+    );
+    let payload_digest = sha256_json(registration)?;
+    let fence_digest = sha256_json(&registration.state_fence)?;
+    let expected_evidence = [
+        format!("host-request-request:{}", registration.host_request_digest),
+        format!("host-request-payload:{payload_digest}"),
+        format!("host-request-fence:{fence_digest}"),
+        format!(
+            "host-request-connection:host-control-connection:{}",
+            registration.connection_id.as_str()
+        ),
+        format!("host-request-session:{session_ref}"),
+        format!("host-request-task:{process_ref}"),
+        format!(
+            "host-request-scope:{}",
+            registration.candidate_scope.as_str()
+        ),
+        format!(
+            "host-request-capability:{}",
+            registration.capability.as_str()
+        ),
+    ];
+    if owner.kind != eliot_kernel_service::RuntimeLeaseOwnerKind::Session
+        || owner.owner_ref.as_str() != owner_ref
+        || owner.admission_digest != registration.host_request_digest
+        || owner.fence_digest != fence_digest
+        || admission.state_fence != registration.state_fence
+        || admission.required_capabilities != vec![registration.capability.clone()]
+        || admission.obligation_refs.len() != 1
+        || admission.obligation_refs[0] != owner.owner_ref
+        || expected_evidence.iter().any(|value| {
+            PlatformHandle::new(value.clone())
+                .map(|expected| !admission.evidence_refs.contains(&expected))
+                .unwrap_or(true)
+        })
+    {
+        return Err(HostError::OwnerLeaseRecovery(
+            "Kernel HostRequest readback does not preserve the authenticated peer, capability, and exact fence"
+                .to_owned(),
+        ));
+    }
+    let runtime_lease = response.runtime_lease.clone().ok_or_else(|| {
+        HostError::OwnerLeaseRecovery(
+            "Kernel omitted the RuntimeLease acquired from the durable owner readback".to_owned(),
+        )
+    })?;
+    let now_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?
+            .as_millis(),
+    )
+    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let expected_lease_id =
+        expected_runtime_lease_id(&request.candidate, request.generation, &admission)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    if runtime_lease.lease_id != expected_lease_id
+        || runtime_lease.state_fence != registration.state_fence
+        || runtime_lease.state != eliot_runtime_contracts::LeaseState::Active
+        || runtime_lease.obligation.expires_at_ms <= now_ms
+    {
+        return Err(HostError::OwnerLeaseRecovery(
+            "Kernel RuntimeLease is not bound to the exact durable demand owner".to_owned(),
+        ));
+    }
+    let expected = expected_runtime_lease(
+        &request.candidate,
+        request.generation,
+        &admission,
+        runtime_lease.obligation.issued_at_ms,
+        runtime_lease.obligation.expires_at_ms,
+        runtime_lease.obligation.renew_before_ms,
+    )
+    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    if runtime_lease.lease_id != expected.lease_id
+        || runtime_lease.scope_ref != expected.scope_ref
+        || runtime_lease.authority_epoch != expected.authority_epoch
+        || runtime_lease.state_fence != expected.state_fence
+        || runtime_lease.obligation.holder != expected.obligation.holder
+        || runtime_lease.obligation.reason != expected.obligation.reason
+        || runtime_lease.obligation.required_runtime_branches
+            != expected.obligation.required_runtime_branches
+        || runtime_lease.obligation.required_capabilities
+            != expected.obligation.required_capabilities
+        || runtime_lease.obligation.obligation_refs != expected.obligation.obligation_refs
+        || runtime_lease.obligation.evidence_refs != expected.obligation.evidence_refs
+    {
+        return Err(HostError::OwnerLeaseRecovery(
+            "Kernel RuntimeLease readback differs from its durable owner admission".to_owned(),
+        ));
+    }
+    Ok((admission, runtime_lease))
+}
+
+#[cfg(windows)]
 async fn send_runtime_lease_acquire(
     transport: &mut NamedPipeTransport,
     candidate: &HostKernelCandidateBinding,
@@ -1993,33 +2194,34 @@ impl HostJobBranches {
                     "Kernel ProbeReady response lost its supervision readback".to_owned(),
                 )
             })?;
-            let runtime_lease = if let Some(demand) = demand {
-                let admission = demand.runtime_lease_admission.as_ref().ok_or_else(|| {
-                    HostError::OwnerLeaseRecovery(
-                        "demand-start has no authenticated RuntimeLease owner admission".to_owned(),
-                    )
-                })?;
-                if admission.state_fence != demand.state_fence {
+            let runtime_lease = if let Some((request, demand, peer)) = demand {
+                let state_fence = supervision_lease.record.binding.state_fence.clone();
+                if demand
+                    .state_fence
+                    .as_ref()
+                    .is_some_and(|legacy_fence| legacy_fence != &state_fence)
+                {
                     return Err(HostError::OwnerLeaseRecovery(
-                        "demand-start RuntimeLease admission fence differs from demand fence"
+                        "legacy demand fence differs from the current Kernel supervision readback"
                             .to_owned(),
                     ));
                 }
-                Some(
-                    send_runtime_lease_acquire(
-                        &mut transport,
-                        &candidate,
-                        launch.authority_generation,
-                        admission,
-                        probe_sequence + 2,
-                        format!(
-                            "host-control:{}:{}:runtime-lease",
-                            generation.as_str(),
-                            candidate.activation_id.as_str()
-                        ),
-                    )
-                    .await?,
+                let registration =
+                    demand_owner_registration(request, demand, peer, &state_fence)?;
+                let (_admission, lease) = send_host_demand_owner_registration(
+                    &mut transport,
+                    &candidate,
+                    launch.authority_generation,
+                    &registration,
+                    probe_sequence + 2,
+                    format!(
+                        "host-control:{}:{}:demand-owner",
+                        generation.as_str(),
+                        candidate.activation_id.as_str()
+                    ),
                 )
+                .await?;
+                Some(lease)
             } else {
                 None
             };
@@ -2063,23 +2265,11 @@ impl HostJobBranches {
     #[cfg(windows)]
     fn acquire_runtime_lease_for_demand(
         &mut self,
+        request: &HostRuntimeControlRequest,
         demand: &HostDemandStartRuntimeRequest,
         peer: &AuthenticatedHostRuntimePeer,
     ) -> Result<(), HostError> {
         validate_authenticated_demand_peer(demand, peer)?;
-        let admission = demand.runtime_lease_admission.as_ref().ok_or_else(|| {
-            HostError::OwnerLeaseRecovery(
-                "demand-start has no authenticated RuntimeLease owner admission".to_owned(),
-            )
-        })?;
-        admission
-            .validate()
-            .map_err(|error| HostError::OwnerLeaseRecovery(error.to_string()))?;
-        if admission.state_fence != demand.state_fence {
-            return Err(HostError::OwnerLeaseRecovery(
-                "demand-start RuntimeLease admission fence differs from demand fence".to_owned(),
-            ));
-        }
         let candidate = self.kernel_candidate.clone().ok_or_else(|| {
             HostError::OwnerLeaseRecovery(
                 "demand-start cannot acquire a lease without the current Kernel candidate"
@@ -2104,12 +2294,35 @@ impl HostJobBranches {
             .ok_or_else(|| HostError::ProcessContour("Kernel image is missing".to_owned()))?
             .clone();
         let generation = launch.authority_generation;
-        let admission = admission.clone();
+        let state_fence = self
+            .kernel_supervision_lease
+            .as_ref()
+            .ok_or_else(|| {
+                HostError::OwnerLeaseRecovery(
+                    "demand-start has no Kernel-owned supervision readback after readiness"
+                        .to_owned(),
+                )
+            })?
+            .record
+            .binding
+            .state_fence
+            .clone();
+        if demand
+            .state_fence
+            .as_ref()
+            .is_some_and(|legacy_fence| legacy_fence != &state_fence)
+        {
+            return Err(HostError::OwnerLeaseRecovery(
+                "legacy demand fence differs from the current Kernel supervision readback"
+                    .to_owned(),
+            ));
+        }
+        let registration = demand_owner_registration(request, demand, peer, &state_fence)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let lease = runtime.block_on(async {
+        let (admission, lease) = runtime.block_on(async {
             let mut transport = connect_authenticated_kernel_front_door(&candidate, &process)
                 .await
                 .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
@@ -2120,20 +2333,21 @@ impl HostJobBranches {
                 &expected_kernel_image,
             )
             .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
-            send_runtime_lease_acquire(
+            send_host_demand_owner_registration(
                 &mut transport,
                 &candidate,
                 generation,
-                &admission,
+                &registration,
                 1,
-                format!(
-                    "host-demand-runtime-lease:{}:{}",
-                    candidate.activation_id.as_str(),
-                    demand.state_fence.resource_generation.value()
-                ),
+                format!("host-demand-owner:{}", candidate.activation_id.as_str()),
             )
             .await
         })?;
+        // The returned projection has already been matched to the peer-bound
+        // registration and the exact ORS readback by the Kernel response gate.
+        admission
+            .validate()
+            .map_err(|error| HostError::OwnerLeaseRecovery(error.to_string()))?;
         self.kernel_runtime_lease = Some(lease);
         Ok(())
     }
@@ -3932,8 +4146,7 @@ fn bind_demand_activation(
         .trigger_evidence
         .extend(authenticated_demand_peer_evidence(
             peer,
-            &demand.state_fence,
-            demand.runtime_lease_admission.as_ref(),
+            demand.state_fence.as_ref(),
         )?);
     activation.requester_principal_session_or_scheduler =
         PlatformHandle::new(format!("{}@{}", peer.principal_sid(), peer.session_id()))
@@ -3946,13 +4159,12 @@ fn bind_demand_activation(
 #[cfg(windows)]
 fn authenticated_demand_peer_evidence(
     peer: &AuthenticatedHostRuntimePeer,
-    state_fence: &eliot_contracts::StateFence,
-    admission: Option<&eliot_kernel_service::RuntimeLeaseAdmission>,
+    state_fence: Option<&eliot_contracts::StateFence>,
 ) -> Result<Vec<PlatformHandle>, HostError> {
     let process = peer.process_binding();
     let image_binding = sha256_json(&(process.image_path(), process.executable_file_identity()))?;
-    let fence_binding = sha256_json(state_fence)?;
     let mut evidence = vec![
+        format!("host-control-principal:{}", peer.principal_sid()),
         format!("host-control-session:{}", peer.session_id()),
         format!("host-control-connection:{}", peer.connection_id()),
         format!("host-control-process-id:{}", process.process_id()),
@@ -3961,23 +4173,12 @@ fn authenticated_demand_peer_evidence(
             process.start_time_100ns()
         ),
         format!("host-control-process-image:{image_binding}"),
-        format!("host-control-state-fence:{fence_binding}"),
     ];
-    if let Some(admission) = admission {
-        let owner = admission.owner_admission.as_ref().ok_or_else(|| {
-            HostError::OwnerLeaseRecovery(
-                "authenticated demand has no durable RuntimeLease owner binding".to_owned(),
-            )
-        })?;
-        let admission_digest = sha256_json(admission)?;
-        evidence.extend([
-            format!("host-control-runtime-owner:{}", owner.owner_ref.as_str()),
-            format!(
-                "host-control-runtime-owner-admission:{}",
-                owner.admission_digest
-            ),
-            format!("host-control-runtime-admission:{admission_digest}"),
-        ]);
+    if let Some(state_fence) = state_fence {
+        evidence.push(format!(
+            "host-control-state-fence:{}",
+            sha256_json(state_fence)?
+        ));
     }
     evidence
         .into_iter()
@@ -3997,29 +4198,49 @@ fn validate_authenticated_demand_peer(
             "demand-start principal differs from the authenticated pipe peer".to_owned(),
         ));
     }
-    let admission = demand.runtime_lease_admission.as_ref().ok_or_else(|| {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn demand_owner_registration(
+    request: &HostRuntimeControlRequest,
+    demand: &HostDemandStartRuntimeRequest,
+    peer: &AuthenticatedHostRuntimePeer,
+    state_fence: &eliot_contracts::StateFence,
+) -> Result<eliot_kernel_service::HostDemandStartOwnerRegistration, HostError> {
+    validate_authenticated_demand_peer(demand, peer)?;
+    let process = peer.process_binding();
+    let capability = demand.requested_capabilities.first().ok_or_else(|| {
         HostError::OwnerLeaseRecovery(
-            "demand-start has no durable RuntimeLease owner admission".to_owned(),
+            "demand-start has no single requested capability to admit".to_owned(),
         )
     })?;
-    admission
-        .validate()
-        .map_err(|error| HostError::OwnerLeaseRecovery(error.to_string()))?;
-    let owner = admission.owner_admission.as_ref().ok_or_else(|| {
-        HostError::OwnerLeaseRecovery(
-            "demand-start RuntimeLease admission has no owner readback reference".to_owned(),
-        )
-    })?;
-    if owner.kind != eliot_kernel_service::RuntimeLeaseOwnerKind::Session
-        || !owner.owner_ref.as_str().starts_with("owner:host-request:")
-        || admission.state_fence != demand.state_fence
-    {
+    if demand.requested_capabilities.len() != 1 {
         return Err(HostError::OwnerLeaseRecovery(
-            "demand-start lease is not bound to the current HostRequest session and fence"
-                .to_owned(),
+            "demand-start owner registration admits exactly one capability".to_owned(),
         ));
     }
-    Ok(())
+    Ok(eliot_kernel_service::HostDemandStartOwnerRegistration {
+        host_request_id: request.request_id.clone(),
+        host_request_digest: request.request_digest.as_str().to_owned(),
+        principal_sid: PlatformHandle::new(peer.principal_sid().to_owned())
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        session_id: PlatformHandle::new(peer.session_id().to_string())
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        connection_id: PlatformHandle::new(peer.connection_id().to_owned())
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        process_id: process.process_id(),
+        process_start_time_100ns: process.start_time_100ns(),
+        process_image_binding_sha256: sha256_json(&(
+            process.image_path(),
+            process.executable_file_identity(),
+        ))?,
+        candidate_scope: demand.candidate_scope.clone(),
+        capability: capability.clone(),
+        trigger_class: demand.trigger_class.clone(),
+        trigger_evidence: demand.trigger_evidence.clone(),
+        state_fence: state_fence.clone(),
+    })
 }
 
 fn record_fence(
@@ -5511,7 +5732,8 @@ impl HostComposition {
                         "demand-start reconcile did not prove readiness: {disposition:?}"
                     )));
                 }
-                self.jobs.acquire_runtime_lease_for_demand(demand, peer)?;
+                self.jobs
+                    .acquire_runtime_lease_for_demand(request, demand, peer)?;
                 self.bind_verified_demand_leases(demand)?;
                 self.transition_activation_with_drain_disposition(
                     ActivationState::Active,
@@ -5548,7 +5770,8 @@ impl HostComposition {
                         "demand-start reconcile did not prove readiness: {disposition:?}"
                     )));
                 }
-                self.jobs.acquire_runtime_lease_for_demand(demand, peer)?;
+                self.jobs
+                    .acquire_runtime_lease_for_demand(request, demand, peer)?;
                 self.bind_verified_demand_leases(demand)?;
             }
             ActivationState::Draining => {
@@ -5593,7 +5816,8 @@ impl HostComposition {
                         "demand-start drain cancellation could not revalidate readiness".to_owned(),
                     ));
                 }
-                self.jobs.acquire_runtime_lease_for_demand(demand, peer)?;
+                self.jobs
+                    .acquire_runtime_lease_for_demand(request, demand, peer)?;
                 self.bind_verified_demand_leases(demand)?;
                 self.transition_activation_with_drain_disposition(
                     ActivationState::Active,
@@ -5681,10 +5905,33 @@ impl HostComposition {
         let activation = snapshot.activation.ok_or_else(|| {
             HostError::OwnerLeaseRecovery("demand-start WakeIntent has no activation".to_owned())
         })?;
+        let state_fence = self
+            .jobs
+            .kernel_supervision_lease
+            .as_ref()
+            .ok_or_else(|| {
+                HostError::OwnerLeaseRecovery(
+                    "post-commit WakeIntent has no current Kernel supervision readback".to_owned(),
+                )
+            })?
+            .record
+            .binding
+            .state_fence
+            .clone();
+        if demand
+            .state_fence
+            .as_ref()
+            .is_some_and(|legacy_fence| legacy_fence != &state_fence)
+        {
+            return Err(HostError::OwnerLeaseRecovery(
+                "post-commit WakeIntent fence differs from current Kernel supervision readback"
+                    .to_owned(),
+            ));
+        }
         let intent = WakeIntent {
             wake_id: wake.wake_id.as_str().to_owned(),
             reason: wake.reason.as_str().to_owned(),
-            state_fence: demand.state_fence.clone(),
+            state_fence: state_fence.clone(),
             state: WakeIntentState::Pending,
         };
         let safety_class = match wake.safety_class {
@@ -5708,11 +5955,7 @@ impl HostComposition {
                 .trigger_evidence
                 .iter()
                 .cloned()
-                .chain(authenticated_demand_peer_evidence(
-                    peer,
-                    &demand.state_fence,
-                    demand.runtime_lease_admission.as_ref(),
-                )?)
+                .chain(authenticated_demand_peer_evidence(peer, Some(&state_fence))?)
                 .collect(),
             earliest_start: wake.earliest_start.clone(),
             deadline: wake.deadline.clone(),

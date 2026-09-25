@@ -1340,6 +1340,16 @@ impl KernelControlRequest {
         if let KernelControlCommand::ReconcileRebindStore(query) = &self.command {
             query.validate()?;
         }
+        if let KernelControlCommand::RegisterHostDemandStartOwner(registration) = &self.command {
+            registration.validate()?;
+            let expected_fence =
+                StateFence::new(self.candidate.kernel_epoch.clone(), self.generation);
+            if registration.state_fence != expected_fence {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "demand_owner.current_candidate_fence",
+                });
+            }
+        }
         if let KernelControlCommand::AcquireRuntimeLease(admission) = &self.command {
             admission.validate()?;
             if admission.state_fence.resource_generation != self.generation
@@ -1503,6 +1513,10 @@ pub struct KernelControlResponse {
     /// Host may use its identity only after validating this response and the
     /// matching readiness/scope fence.
     pub runtime_lease: Option<RuntimeLease>,
+    /// Kernel-derived RuntimeLease admission returned only after the exact
+    /// HostRequest owner has been durably staged and read back from ORS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_lease_admission: Option<RuntimeLeaseAdmission>,
     /// Exact-fence ORS census returned only for a read-only retirement query.
     pub runtime_lease_census: Option<RuntimeLeaseCensus>,
     /// Stable rejection detail, when the command was not accepted.
@@ -1527,6 +1541,7 @@ impl KernelControlResponse {
             store_rebind_receipt: &'a Option<StoreRebindReceipt>,
             supervision_lease: &'a Option<SupervisionLeaseSnapshot>,
             runtime_lease: &'a Option<RuntimeLease>,
+            runtime_lease_admission: &'a Option<RuntimeLeaseAdmission>,
             runtime_lease_census: &'a Option<RuntimeLeaseCensus>,
             error: &'a Option<String>,
         }
@@ -1542,6 +1557,7 @@ impl KernelControlResponse {
             store_rebind_receipt: &self.store_rebind_receipt,
             supervision_lease: &self.supervision_lease,
             runtime_lease: &self.runtime_lease,
+            runtime_lease_admission: &self.runtime_lease_admission,
             runtime_lease_census: &self.runtime_lease_census,
             error: &self.error,
         })
@@ -1605,7 +1621,39 @@ impl KernelControlResponse {
                 .map_err(|_| KernelServiceError::InvalidField {
                     field: "control.runtime_lease",
                     reason: "must be an exact validated Kernel-owned lease",
+            })?;
+        }
+        if let Some(admission) = &self.runtime_lease_admission {
+            admission
+                .validate()
+                .map_err(|_| KernelServiceError::InvalidField {
+                    field: "control.runtime_lease_admission",
+                    reason: "must be a Kernel-derived durable owner projection",
                 })?;
+            let runtime_lease = self.runtime_lease.as_ref().ok_or(
+                KernelServiceError::InvalidField {
+                    field: "control.runtime_lease_admission",
+                    reason: "must accompany the lease acquired from that owner readback",
+                },
+            )?;
+            if runtime_lease.state_fence != admission.state_fence {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "control.runtime_lease_admission.fence",
+                });
+            }
+            if self.receipt.is_some()
+                || self.runtime_health.is_some()
+                || self.activation_receipt.is_some()
+                || self.store_rebind_receipt.is_some()
+                || self.supervision_lease.is_some()
+                || self.runtime_lease_census.is_some()
+                || self.error.is_some()
+            {
+                return Err(KernelServiceError::InvalidField {
+                    field: "control.runtime_lease_admission",
+                    reason: "must be returned without unrelated control results",
+                });
+            }
         }
         if let Some(census) = &self.runtime_lease_census {
             census
@@ -3377,6 +3425,90 @@ impl RuntimeLeaseAdmission {
     }
 }
 
+/// Peer-bound demand owner material registered by Host only after Kernel has
+/// proved readiness. Kernel derives the fence from its authenticated control
+/// candidate, persists the corresponding HostRequest in ORS, reads it back,
+/// and only then returns a `RuntimeLeaseAdmission` projection.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostDemandStartOwnerRegistration {
+    /// Original Host runtime-control request identity.
+    pub host_request_id: PlatformHandle,
+    /// Digest of the immutable Host runtime-control request.
+    pub host_request_digest: String,
+    /// Principal SID observed from the authenticated Host runtime-control pipe.
+    pub principal_sid: PlatformHandle,
+    /// Windows session identity observed from that same pipe handle.
+    pub session_id: PlatformHandle,
+    /// Server-minted Host runtime-control connection identity.
+    pub connection_id: PlatformHandle,
+    /// Client PID observed through the connected named-pipe handle.
+    pub process_id: u32,
+    /// Process creation time observed through the same process handle.
+    pub process_start_time_100ns: u64,
+    /// Digest of the observed image path and executable file identity.
+    pub process_image_binding_sha256: String,
+    /// Exact candidate scope carried by the demand intent.
+    pub candidate_scope: PlatformHandle,
+    /// Exact single capability requested by this demand.
+    pub capability: PlatformHandle,
+    /// Bounded trigger classification carried by the demand intent.
+    pub trigger_class: PlatformHandle,
+    /// Trigger evidence carried by the demand intent and authenticated peer.
+    pub trigger_evidence: Vec<PlatformHandle>,
+    /// Exact current Kernel fence, derived by Host after readiness and
+    /// independently checked against this control request's candidate.
+    pub state_fence: StateFence,
+}
+
+impl HostDemandStartOwnerRegistration {
+    /// Validates the peer-bound registration shape. Currentness is checked by
+    /// the Kernel control-plane against its authenticated candidate and ORS.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        for (value, field) in [
+            (&self.host_request_id, "demand_owner.host_request_id"),
+            (&self.principal_sid, "demand_owner.principal_sid"),
+            (&self.session_id, "demand_owner.session_id"),
+            (&self.connection_id, "demand_owner.connection_id"),
+            (&self.candidate_scope, "demand_owner.candidate_scope"),
+            (&self.capability, "demand_owner.capability"),
+            (&self.trigger_class, "demand_owner.trigger_class"),
+        ] {
+            handle(value, field)?;
+        }
+        validate_digest(
+            &self.host_request_digest,
+            "demand_owner.host_request_digest",
+        )?;
+        validate_digest(&self.host_request_digest, "demand_owner.host_request_digest")?;
+        validate_digest(
+            &self.process_image_binding_sha256,
+            "demand_owner.process_image_binding_sha256",
+        )?;
+        if self.process_id == 0 || self.process_start_time_100ns == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "demand_owner.process_identity",
+                reason: "observed PID and process creation time must be non-zero",
+            });
+        }
+        if self.trigger_evidence.is_empty() {
+            return Err(KernelServiceError::InvalidField {
+                field: "demand_owner.trigger_evidence",
+                reason: "authenticated trigger and peer evidence are required",
+            });
+        }
+        for value in &self.trigger_evidence {
+            handle(value, "demand_owner.trigger_evidence")?;
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "demand_owner.state_fence",
+                reason: "must be a valid non-zero StateFence",
+            })
+    }
+}
+
 /// Fresh observable progress or an explicitly admitted wait that may renew a
 /// current RuntimeLease revision. Process liveness alone cannot populate this.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -3607,6 +3739,10 @@ pub enum KernelControlCommand {
     /// Ask Kernel to prove readiness from live observations and self-author a
     /// receipt.  No caller-shaped receipt is accepted on this wire.
     ProbeReady,
+    /// Persist one authenticated Host demand owner at the current ready
+    /// candidate, read the exact HostRequest back from ORS, derive its lease
+    /// admission, and acquire that lease under the same Kernel gate.
+    RegisterHostDemandStartOwner(HostDemandStartOwnerRegistration),
     /// Issue one obligation-bound RuntimeLease through the Kernel ORS owner.
     AcquireRuntimeLease(RuntimeLeaseAdmission),
     /// Renew one current RuntimeLease only with fresh progress or an admitted

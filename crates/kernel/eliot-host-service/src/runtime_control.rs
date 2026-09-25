@@ -242,13 +242,12 @@ impl HostDemandStartWakeRequest {
     }
 }
 
-/// Authenticated demand-start input accepted by Host.
+/// Authenticated demand-start intent accepted by Host.
 ///
-/// Lease references are optional at the pre-start boundary: a stopped
-/// installation cannot require a RuntimeLease from the Kernel that it is
-/// asking Host to start. When present, they are opaque owner references that
-/// Host compares with the current Kernel readback; Host never manufactures
-/// either lease or treats a caller-shaped reference as authority.
+/// A stopped installation cannot require a Kernel StateFence or RuntimeLease
+/// before asking Host to start Kernel. The optional legacy projections remain
+/// decodable for wire compatibility, but Host rejects them as authority and
+/// obtains the exact fence and owner admission from the ready Kernel.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostDemandStartRuntimeRequest {
@@ -257,7 +256,8 @@ pub struct HostDemandStartRuntimeRequest {
     pub trigger_class: PlatformHandle,
     pub trigger_evidence: Vec<PlatformHandle>,
     pub requested_capabilities: Vec<PlatformHandle>,
-    pub state_fence: StateFence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_fence: Option<StateFence>,
     /// The authenticated owner projection used for the post-start Kernel
     /// RuntimeLease admission.  It is optional on the wire only so older
     /// callers remain decodable; Host fails closed before demand activation
@@ -300,14 +300,22 @@ impl HostDemandStartRuntimeRequest {
             "demand_start.requested_capabilities",
             true,
         )?;
-        self.state_fence
-            .validate()
-            .map_err(|error| format!("demand_start.state_fence is invalid: {error}"))?;
+        if self.requested_capabilities.len() != 1 {
+            return Err(
+                "demand_start currently binds exactly one requested capability per owner admission"
+                    .to_owned(),
+            );
+        }
+        if let Some(state_fence) = &self.state_fence {
+            state_fence
+                .validate()
+                .map_err(|error| format!("demand_start.state_fence is invalid: {error}"))?;
+        }
         if let Some(admission) = &self.runtime_lease_admission {
             admission.validate().map_err(|error| {
                 format!("demand_start.runtime_lease_admission is invalid: {error}")
             })?;
-            if admission.state_fence != self.state_fence {
+            if self.state_fence.as_ref() != Some(&admission.state_fence) {
                 return Err(
                     "demand_start.runtime_lease_admission.state_fence does not match demand_start.state_fence"
                         .to_owned(),
