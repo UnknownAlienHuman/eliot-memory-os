@@ -687,17 +687,121 @@ fn fold_attempt_evidence(
 }
 
 /// Execution counters folded from exact step/artifact/verifier evidence.
-struct ExecutionFold {
-    executed: u64,
-    verified: u64,
-    failed: u64,
-    uncertain: u64,
+/// Public so production evidence ingest (daemon execution drive) and the
+/// lifecycle derivation fold through the same named counter type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutionFold {
+    /// Presented executions with a fully observed outcome.
+    pub executed: u64,
+    /// Observed executions carrying verifier refs.
+    pub verified: u64,
+    /// Presented executions with a known failed outcome.
+    pub failed: u64,
+    /// Presented executions with unknown effects.
+    pub uncertain: u64,
+}
+
+/// Production verdict of the unknown-effects reconciliation gate (issue
+/// #1191).
+///
+/// Counts the exact presented step/artifact/verifier evidence by outcome and
+/// names every execution still [`ExecutionOutcome::Uncertain`]. Retry is
+/// permitted only when nothing is uncertain: an uncertain execution has
+/// unknown effects, and an unknown effect must be reconciled — superseded by
+/// exact observed or failed evidence for the same execution — before the next
+/// attempt. Absence of an execution record is absence of evidence, never an
+/// observed claim: only presented records fold, so uninstrumented executions
+/// stay unknown instead of proving success.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnknownEffectsVerdict {
+    /// Presented executions with a fully observed outcome.
+    pub observed: u64,
+    /// Presented executions with a known failed outcome.
+    pub failed: u64,
+    /// `execution_ref`s whose effects are still unknown.
+    pub uncertain_pending_refs: Vec<String>,
+}
+
+impl UnknownEffectsVerdict {
+    pub fn validate(&self) -> Result<(), SkillError> {
+        unique(
+            self.uncertain_pending_refs.iter().cloned(),
+            "verdict.uncertain_pending_refs",
+        )?;
+        for reference in &self.uncertain_pending_refs {
+            text(reference, "verdict.uncertain_pending_ref")?;
+        }
+        Ok(())
+    }
+
+    /// Retry is permitted only when no presented execution has unknown
+    /// effects. A failed execution is a known effect — the retry is a new
+    /// attempt, not a repeated unknown — while an uncertain one blocks until
+    /// reconciled.
+    #[must_use]
+    pub const fn retry_permitted(&self) -> bool {
+        self.uncertain_pending_refs.is_empty()
+    }
+}
+
+/// Reconciles unknown execution effects before retry (issue #1191).
+///
+/// Validates every presented [`SkillExecutionEvidence`] and folds the exact
+/// outcome counts through [`fold_execution_evidence`]: observed executions
+/// require exact step refs, causal credit stays denied, and missing
+/// instrumentation never becomes an observed claim — unreported executions
+/// simply do not fold. The returned verdict names the still-uncertain
+/// execution refs; the caller refuses retry while [`UnknownEffectsVerdict::retry_permitted`]
+/// is false.
+pub fn reconcile_unknown_effects(
+    executions: &[SkillExecutionEvidence],
+) -> Result<UnknownEffectsVerdict, SkillError> {
+    let mut observed = 0_u64;
+    let mut failed = 0_u64;
+    let mut uncertain_pending_refs = Vec::new();
+    for execution in executions {
+        execution.validate()?;
+        match execution.outcome {
+            ExecutionOutcome::Observed => {
+                observed = observed.saturating_add(1);
+            }
+            ExecutionOutcome::Failed => {
+                failed = failed.saturating_add(1);
+            }
+            ExecutionOutcome::Uncertain => {
+                if !uncertain_pending_refs.contains(&execution.execution_ref) {
+                    uncertain_pending_refs.push(execution.execution_ref.clone());
+                }
+            }
+        }
+    }
+    // The shared fold is the single counter implementation: the verdict must
+    // agree with it exactly, so a divergence fails closed here instead of
+    // publishing two truths.
+    let fold = fold_execution_evidence(executions)?;
+    let uncertain_matches = usize::try_from(fold.uncertain)
+        .is_ok_and(|narrowed| narrowed == uncertain_pending_refs.len());
+    if fold.executed != observed || fold.failed != failed || !uncertain_matches {
+        return Err(SkillError::IdentityMismatch);
+    }
+    let verdict = UnknownEffectsVerdict {
+        observed,
+        failed,
+        uncertain_pending_refs,
+    };
+    verdict.validate()?;
+    Ok(verdict)
 }
 
 /// Counts execution evidence by outcome; observed executions with verifier
 /// refs count as verified. Causal credit is never assigned: evidence
-/// validation already forces `NoCausalCredit`.
-fn fold_execution_evidence(
+/// validation already forces `NoCausalCredit`. This is the single production
+/// outcome fold — [`reconcile_unknown_effects`] and
+/// [`derive_lifecycle_view`] both count through it, so the daemon execution
+/// ingest and the lifecycle derivation can never publish divergent counters
+/// for the same evidence window.
+pub fn fold_execution_evidence(
     executions: &[SkillExecutionEvidence],
 ) -> Result<ExecutionFold, SkillError> {
     let mut fold = ExecutionFold {
