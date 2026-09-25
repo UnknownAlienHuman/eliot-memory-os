@@ -61,14 +61,15 @@ use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestKind as OrsHostRequestKind,
     HostRequestRecord, HostRequestState, OpaqueLabel, OperationIdentity, OrsError,
+    RedbRecoveryStore,
 };
 use eliot_protocol::{
     AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID, AgentActivationResolutionResult,
-    AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding, HOST_REQUEST_INVOKE_READ_WIRE_ID,
-    HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestAdmissionReceipt, HostRequestEnvelope,
-    HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
-    WatchdogIntentKind, WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission,
-    host_request_operation_id,
+    AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding, DeliveryClass, EventEnvelope,
+    HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_RESULT_BODY_WIRE_ID,
+    HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestInvokeReadPayload,
+    HostRequestKind, HostRequestResultBody, LocalReadAttempt, WatchdogIntentKind,
+    WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission, host_request_operation_id,
 };
 use eliot_store_api::{EVIDENCE_PACK_MAX_RECORDS, ScopeId};
 
@@ -103,6 +104,27 @@ pub(crate) const AGENT_HOST_REQUEST_REHYDRATE_OPERATION: &str = "agent_host_requ
 /// is the admitted one.
 pub(crate) const AGENT_HOST_REQUEST_INVOKE_READ_OPERATION: &str = "agent_host_request_invoke_read";
 
+/// Closed agent-bridge event-delivery entries (Implements #2561, I7.2/I7.23).
+///
+/// The four forwarding methods ride the same admitted front-door transport
+/// through this closed gateway — no second transport, no generic command
+/// dispatch. Each payload carries its typed envelope under `envelope` (the
+/// durable/control [`EventEnvelope`] for forward, the digest-bound hook JSON
+/// for hook, the coverage gap JSON for gap, the reconcile scope for
+/// reconcile); the operation string only selects which closed entry consumes
+/// it. Events are never submitted as host requests, and host-request
+/// submit/cancel/reconcile entries never read the bridge-event tables.
+pub(crate) const AGENT_BRIDGE_EVENT_FORWARD_OPERATION: &str = "agent_bridge_event_forward";
+/// Closed hook-observation entry: digest-bound RECEIVED observation without a
+/// durable phase (the hook signature carries no acknowledgement).
+pub(crate) const AGENT_BRIDGE_HOOK_FORWARD_OPERATION: &str = "agent_bridge_hook_forward";
+/// Closed coverage-gap entry: persists missing-coverage accounting without
+/// moving any cursor.
+pub(crate) const AGENT_BRIDGE_EVENT_GAP_OPERATION: &str = "agent_bridge_event_gap";
+/// Closed event-ownership/cursor reconciliation entry: reads the bridge-event
+/// tables only, never the host-request ledger.
+pub(crate) const AGENT_BRIDGE_EVENT_RECONCILE_OPERATION: &str = "agent_bridge_event_reconcile";
+
 /// Bound on queued local-read pairs for the outbound-only eliotd poller.
 ///
 /// Mirrors the bounded activation replay/result ledgers (64): the durable ORS
@@ -111,6 +133,11 @@ pub(crate) const AGENT_HOST_REQUEST_INVOKE_READ_OPERATION: &str = "agent_host_re
 const MAX_QUEUED_LOCAL_READS: usize = 64;
 
 /// Returns whether the operation string selects the P-04 host-request route.
+///
+/// The closed agent-bridge event-delivery entries ride this same predicate:
+/// they cross the same admitted front-door gateway and the same
+/// `dispatch_host_request_frame` entry, which fans out to the event handlers
+/// before any host-request envelope decode.
 pub(crate) fn is_host_request_operation(operation: &str) -> bool {
     matches!(
         operation,
@@ -119,6 +146,22 @@ pub(crate) fn is_host_request_operation(operation: &str) -> bool {
             | AGENT_HOST_REQUEST_RECONCILE_OPERATION
             | AGENT_HOST_REQUEST_REHYDRATE_OPERATION
             | AGENT_HOST_REQUEST_INVOKE_READ_OPERATION
+            | AGENT_BRIDGE_EVENT_FORWARD_OPERATION
+            | AGENT_BRIDGE_HOOK_FORWARD_OPERATION
+            | AGENT_BRIDGE_EVENT_GAP_OPERATION
+            | AGENT_BRIDGE_EVENT_RECONCILE_OPERATION
+    )
+}
+
+/// Returns whether the operation string selects the closed agent-bridge
+/// event-delivery entries (the #2561 subset of [`is_host_request_operation`]).
+pub(crate) fn is_bridge_event_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        AGENT_BRIDGE_EVENT_FORWARD_OPERATION
+            | AGENT_BRIDGE_HOOK_FORWARD_OPERATION
+            | AGENT_BRIDGE_EVENT_GAP_OPERATION
+            | AGENT_BRIDGE_EVENT_RECONCILE_OPERATION
     )
 }
 
@@ -1936,6 +1979,15 @@ impl KernelComposition {
         if !is_host_request_operation(operation) {
             return Err(TransportError::SessionFenced);
         }
+        if is_bridge_event_operation(operation) {
+            // Agent-bridge event delivery rides the same admitted gateway but
+            // never the host-request envelope: the event handlers below join
+            // the retained Session (connection plus live fence) against the
+            // presented durable/control envelope and stage into the disjoint
+            // bridge-event ORS tables. A refused event is never resubmitted
+            // as a host request.
+            return self.dispatch_bridge_event_frame(session, frame, operation);
+        }
         let envelope = host_request_envelope_from_payload(&payload)?;
         if envelope.connection_id != session.connection_id
             || frame.connection_id != session.connection_id
@@ -1982,8 +2034,453 @@ impl KernelComposition {
         Ok(KernelFrameAction::Reply(reply))
     }
 
-    /// Dispatches one fenced Watchdog intent batch from the admitted front door.
+    /// Dispatches one admitted agent-bridge event frame (Implements #2561,
+    /// I7.2/I7.23).
     ///
+    /// The caller ([`Self::dispatch_host_request_frame`]) has already run the
+    /// closed gateway gates (service state, peer, correlation, live-fence
+    /// compatibility); those joins are re-checked here so a direct caller
+    /// cannot bypass them. The frame must ride the same connection as the
+    /// presenting admitted Session. Each closed entry stages into (or reads
+    /// from) the disjoint bridge-event ORS tables; none touches the
+    /// host-request ledger, and a refused event is never resubmitted as a
+    /// host request. This entry creates no Session, grants no capability,
+    /// completes no task, mints no canonical truth, and never produces a
+    /// Problem or Incident decision: it returns durable phases and cursor
+    /// facts only.
+    pub(crate) fn dispatch_bridge_event_frame(
+        &self,
+        session: &Session,
+        frame: &Frame,
+        operation: &str,
+    ) -> Result<KernelFrameAction, TransportError> {
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let request_id = frame
+            .request_id
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        let identity = frame
+            .request_identity
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        if !session
+            .module_generation
+            .state_fence
+            .is_compatible_with(&identity.request.state_fence)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if frame.connection_id != session.connection_id {
+            return Err(TransportError::SessionFenced);
+        }
+        let payload = match &frame.payload {
+            ProtocolPayload::Json(payload) => payload.clone(),
+            _ => return Err(TransportError::SessionFenced),
+        };
+        if payload.get("operation").and_then(serde_json::Value::as_str) != Some(operation) {
+            return Err(TransportError::SessionFenced);
+        }
+        if !is_bridge_event_operation(operation) {
+            return Err(TransportError::SessionFenced);
+        }
+        let value = match operation {
+            AGENT_BRIDGE_EVENT_FORWARD_OPERATION => {
+                let event = bridge_event_envelope_from_payload(&payload)?;
+                self.admit_bridge_event_envelope(
+                    session,
+                    &event,
+                    &identity.request.state_fence,
+                    identity.deadline_unix_ms,
+                )?
+            }
+            AGENT_BRIDGE_HOOK_FORWARD_OPERATION => {
+                let hook = bridge_hook_from_payload(&payload)?;
+                self.admit_bridge_hook_observation(session, &hook)?
+            }
+            AGENT_BRIDGE_EVENT_GAP_OPERATION => {
+                let gap = bridge_gap_from_payload(&payload, &session.connection_id)?;
+                self.admit_bridge_event_gap(&gap)?
+            }
+            AGENT_BRIDGE_EVENT_RECONCILE_OPERATION => {
+                let scope = bridge_reconcile_scope_from_payload(&payload)?;
+                self.answer_bridge_event_reconcile(session, &scope, &identity.request.state_fence)?
+            }
+            _ => return Err(TransportError::SessionFenced),
+        };
+        let mut reply = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+        reply.request_id = Some(request_id);
+        reply
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(KernelFrameAction::Reply(reply))
+    }
+
+    /// Admits one durable/control event envelope for bridge-event delivery.
+    ///
+    /// Runs the mechanical authority, fence, generation, deadline, privacy,
+    /// and durability checks in order, stages the ORS bridge-event row before
+    /// answering, records the Governor-intake handoff, and returns the
+    /// durable outcome. An exact replay returns the existing outcome without
+    /// advancing anything; a changed binding under the same identity is an
+    /// identity conflict. Durable delivery classes stage; best-effort
+    /// telemetry is received without a durability claim (transport
+    /// observation only).
+    ///
+    /// Privacy (I7.23) is decided before persistence: the disclosure
+    /// decision over the canonical envelope bytes is computed through the
+    /// ORS persistence owner and carried into the staged row, so denied
+    /// content stages as the deterministic redacted projection plus its
+    /// redaction receipt — never as verbatim raw. The handoff (I5(i)) is the
+    /// persisted leg of the intake conversion the Governor/coordinator
+    /// intake consumes on recovery: it binds the staged envelope digest and
+    /// is later reconciled by [`Self::answer_bridge_event_reconcile`].
+    fn admit_bridge_event_envelope(
+        &self,
+        session: &Session,
+        event: &EventEnvelope,
+        frame_fence: &eliot_contracts::StateFence,
+        deadline_unix_ms: u64,
+    ) -> Result<serde_json::Value, TransportError> {
+        // Authority check against the retained Session, never caller text:
+        // the event must cohere with the presenting live fence (same
+        // authority epoch; producer and fence generations equal the live
+        // generation). A stale or future producer generation is fenced and
+        // recovers through reconcile, never by relabeling history as produced
+        // by the new generation.
+        if !event
+            .authority_epoch
+            .is_same_authority(&frame_fence.authority_epoch)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let live_generation = frame_fence.resource_generation.value();
+        if live_generation == 0
+            || event.producer_generation.value() != live_generation
+            || event.state_fence.resource_generation.value() != live_generation
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let envelope_bytes = eliot_contracts::canonical_json_bytes(event)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let envelope_sha = eliot_contracts::sha256_hex(&envelope_bytes);
+        // Privacy decision precedes persistence: the ORS owner decides the
+        // disclosure disposition over these exact bytes, and the stage entry
+        // re-verifies the presented decision before any durable write. The
+        // decision object travels into the durable stage below.
+        let privacy = RedbRecoveryStore::bridge_event_privacy_decision(&envelope_bytes);
+        let now = unix_ms();
+        let expired = activation_deadline_expired(now, deadline_unix_ms);
+        // `Ready` admits delivery; `Degraded` keeps only recovery (gap and
+        // reconcile) while delivery sheds load with typed backpressure, so
+        // the producer retries instead of losing the event. This mirrors the
+        // host-request `Ready | Degraded` gate with per-entry recovery legs.
+        let degraded = matches!(
+            self.service_state()
+                .map_err(|_| TransportError::SessionFenced)?,
+            KernelServiceState::Degraded
+        );
+        match event.delivery_class {
+            DeliveryClass::DurableControl | DeliveryClass::DurableObservation => {
+                if degraded {
+                    return Err(TransportError::Backpressure);
+                }
+                self.stage_bridge_event_durable(session, event, &envelope_sha, &privacy, expired)
+            }
+            DeliveryClass::BestEffortTelemetry => {
+                if degraded {
+                    // Best-effort loss under degradation emits the typed
+                    // telemetry gap through the bridge's gap leg instead of a
+                    // silent drop: the reply carries the loss with its reason.
+                    return Ok(bridge_event_best_effort_response(
+                        event,
+                        false,
+                        "kernel-degraded",
+                    ));
+                }
+                Ok(bridge_event_best_effort_response(event, true, ""))
+            }
+        }
+    }
+
+    /// Stages one durable/control event with its pre-persistence privacy
+    /// decision and records the Governor-intake handoff (Implements #2561,
+    /// I7.23 + I5(i)).
+    ///
+    /// The caller ([`Self::admit_bridge_event_envelope`]) has already run the
+    /// authority, fence, generation, and deadline gates and decided the
+    /// disclosure disposition over the canonical envelope bytes; `privacy`
+    /// carries that decision object. This entry stages the ORS row (the
+    /// stage entry re-verifies the decision before any durable write),
+    /// answers the determined conflict on changed bytes under a known
+    /// identity, stages-then-times-out on an elapsed absolute deadline, and
+    /// records the idempotent intake handoff before answering `DURABLE`.
+    fn stage_bridge_event_durable(
+        &self,
+        session: &Session,
+        event: &EventEnvelope,
+        envelope_sha: &str,
+        privacy: &serde_json::Value,
+        expired: bool,
+    ) -> Result<serde_json::Value, TransportError> {
+        let privacy_disposition = privacy
+            .get("privacy_disposition")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        let redacted_classes = privacy
+            .get("redacted_classes")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let redaction_reason = privacy
+            .get("redaction_reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let staged = serde_json::json!({
+            "stream_id": event.stream_id,
+            "event_id": event.event_id,
+            "sequence": event.sequence,
+            "producer_id": event.producer_id,
+            "producer_generation": event.producer_generation.value(),
+            "authority_epoch": bridge_epoch_text(&event.authority_epoch),
+            "envelope": serde_json::to_value(event)
+                .map_err(|_| TransportError::SessionFenced)?,
+            "envelope_sha256": envelope_sha,
+            "staging_connection": session.connection_id,
+            "privacy_disposition": privacy_disposition,
+            "redacted_classes": redacted_classes,
+            "redaction_reason": redaction_reason,
+        });
+        let outcome = self.generation_gateway.ors.stage_bridge_event(&staged);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(OrsError::DuplicateConflict) => {
+                // Changed bytes under a known identity are a
+                // determined rejection, not an unknown outcome: answer
+                // the conflict with its existing cursor facts so the
+                // bridge surfaces the typed conflict instead of
+                // guessing. The durable row is untouched.
+                return self.bridge_event_conflict_response(event, envelope_sha);
+            }
+            Err(error) => {
+                return Err(match error {
+                    OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
+                        TransportError::Backpressure
+                    }
+                    _ => TransportError::SessionFenced,
+                });
+            }
+        };
+        // An elapsed absolute deadline is staged honestly, then
+        // reported as a timeout instead of an admission: the durable
+        // record preserves the late presentation for reconcile, while
+        // the caller observes the timeout. Exact replays ignore the
+        // deadline and return the stored outcome (lookup path).
+        if expired && outcome.get("fresh").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Err(TransportError::Timeout);
+        }
+        let phase = outcome
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        if phase != BRIDGE_EVENT_PHASE_DURABLE {
+            return Err(TransportError::SessionFenced);
+        }
+        // Handoff persist (I5(i)): the staged durable event is handed
+        // toward Governor/coordinator intake under its envelope
+        // digest. The handoff entry is idempotent, so a lost
+        // acknowledgement replays to the existing handoff instead of
+        // a second record; a handoff failure fails closed here while
+        // the durable row stays staged for reconcile recovery.
+        let handoff = serde_json::json!({
+            "stream_id": event.stream_id,
+            "event_id": event.event_id,
+            "sequence": event.sequence,
+            "envelope_sha256": envelope_sha,
+            "staging_connection": session.connection_id,
+        });
+        self.generation_gateway
+            .ors
+            .record_bridge_event_handoff(&handoff)
+            .map_err(|error| match error {
+                OrsError::DuplicateConflict => TransportError::IdentityConflict,
+                _ => TransportError::SessionFenced,
+            })?;
+        Ok(bridge_event_forward_response(&outcome, true))
+    }
+
+    /// Answers a same-identity content conflict with the existing cursor
+    /// facts and the `REJECTED`/`conflict` phase pair.
+    ///
+    /// The durable row is untouched; the reply binds the presented digest so
+    /// the bridge can prove the alteration. The bridge maps this determined
+    /// rejection to its typed conflict outcome — never to a guessed phase
+    /// and never to a second record.
+    fn bridge_event_conflict_response(
+        &self,
+        event: &EventEnvelope,
+        presented_sha: &str,
+    ) -> Result<serde_json::Value, TransportError> {
+        let existing = self
+            .generation_gateway
+            .ors
+            .load_bridge_event(&event.stream_id, &event.event_id)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let (existing_sha, durable, acked) = existing
+            .as_ref()
+            .map(|row| {
+                (
+                    row.get("envelope_sha256")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    row.get("durable_cursor")
+                        .and_then(serde_json::Value::as_u64),
+                    row.get("acked_cursor").and_then(serde_json::Value::as_u64),
+                )
+            })
+            .unwrap_or_default();
+        Ok(serde_json::json!({ "status": "known", "value": {
+            "accepted": false,
+            "phase": "REJECTED",
+            "disposition": "conflict",
+            "stream_id": event.stream_id,
+            "event_id": event.event_id,
+            "sequence": event.sequence,
+            "envelope_sha256": presented_sha,
+            "existing_envelope_sha256": existing_sha,
+            "durable_cursor": durable,
+            "acked_cursor": acked,
+            "fresh": false,
+        } }))
+    }
+
+    /// Admits one digest-bound hook observation without a durable phase.
+    ///
+    /// The hook signature carries no acknowledgement, so no durability is
+    /// claimed: the reply answers RECEIVED transport observation bound to the
+    /// exact hook digest. The bridge journal (core `observe_host_event`) owns
+    /// the diagnostic history; no ORS row is staged here.
+    fn admit_bridge_hook_observation(
+        &self,
+        session: &Session,
+        hook: &BridgeHookObservation,
+    ) -> Result<serde_json::Value, TransportError> {
+        if !matches!(
+            self.service_state()
+                .map_err(|_| TransportError::SessionFenced)?,
+            KernelServiceState::Ready
+        ) {
+            return Err(TransportError::Backpressure);
+        }
+        let _ = session;
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "accepted": true,
+                "received": true,
+                "event_id": hook.event_id,
+                "sequence": hook.sequence,
+                "hook_digest": hook.digest,
+            },
+        }))
+    }
+
+    /// Admits one forwarded coverage gap into durable coverage without moving
+    /// any cursor. Gap rows stay visible through reconcile; absent events are
+    /// accounted for, never converted into applied events.
+    fn admit_bridge_event_gap(
+        &self,
+        gap: &serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        if !matches!(
+            self.service_state()
+                .map_err(|_| TransportError::SessionFenced)?,
+            KernelServiceState::Ready | KernelServiceState::Degraded
+        ) {
+            return Err(TransportError::SessionFenced);
+        }
+        let outcome = self
+            .generation_gateway
+            .ors
+            .record_bridge_event_gap(gap)
+            .map_err(|error| match error {
+                OrsError::DuplicateConflict => TransportError::IdentityConflict,
+                OrsError::ProjectionLimitExceeded => TransportError::Backpressure,
+                _ => TransportError::SessionFenced,
+            })?;
+        let accepted = outcome
+            .get("accepted")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or(TransportError::SessionFenced)?;
+        if !accepted {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(serde_json::json!({ "status": "known", "value": outcome }))
+    }
+
+    /// Answers event-ownership/cursor reconciliation from the bridge-event
+    /// tables only — never from the host-request ledger.
+    ///
+    /// Applies the presented consumed frontier first (monotonic acks at or
+    /// below the durable cursor; anything past it fails the whole scope),
+    /// then enumerates the in-scope streams with their cursors, pending first
+    /// pages, and gaps, binds the reply digest as the reconciliation key
+    /// the bridge carries as its receipt reference, and finally reconciles
+    /// the Governor-intake handoffs covered by the consumed frontier under
+    /// that key (I5(i)). Handoff reconcile is idempotent, so a lost
+    /// reconciliation answer replays to the existing handoff states.
+    fn answer_bridge_event_reconcile(
+        &self,
+        session: &Session,
+        scope: &BridgeReconcileScope,
+        frame_fence: &eliot_contracts::StateFence,
+    ) -> Result<serde_json::Value, TransportError> {
+        if !matches!(
+            self.service_state()
+                .map_err(|_| TransportError::SessionFenced)?,
+            KernelServiceState::Ready | KernelServiceState::Degraded
+        ) {
+            return Err(TransportError::SessionFenced);
+        }
+        let live_generation = frame_fence.resource_generation.value();
+        if live_generation == 0 {
+            return Err(TransportError::SessionFenced);
+        }
+        for (stream_id, sequence) in &scope.consumed {
+            self.generation_gateway
+                .ors
+                .acknowledge_bridge_events(stream_id, *sequence)
+                .map_err(|_| TransportError::SessionFenced)?;
+        }
+        let mut reconciliation = self
+            .generation_gateway
+            .ors
+            .reconcile_bridge_events(&session.connection_id, live_generation)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let key_bytes = eliot_contracts::canonical_json_bytes(&reconciliation)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let reconcile_key = eliot_contracts::sha256_hex(&key_bytes);
+        reconciliation["reconcile_key"] = serde_json::Value::String(reconcile_key.clone());
+        let mut handoffs_reconciled = 0_u64;
+        for (stream_id, sequence) in &scope.consumed {
+            let marked = self
+                .generation_gateway
+                .ors
+                .reconcile_bridge_event_handoffs(stream_id, *sequence, &reconcile_key)
+                .map_err(|_| TransportError::SessionFenced)?;
+            handoffs_reconciled += marked
+                .get("reconciled")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+        }
+        reconciliation["handoffs_reconciled"] = serde_json::Value::from(handoffs_reconciled);
+        Ok(serde_json::json!({ "status": "known", "value": {
+            "accepted": true,
+            "reconciliation": reconciliation,
+        } }))
+    }
     /// The caller ([`crate::KernelComposition::dispatch_frame`]) has already run
     /// the closed gateway gates; those joins are re-checked here so a direct
     /// caller cannot bypass them. The frame must ride the same connection as
@@ -2264,6 +2761,222 @@ pub(crate) fn host_request_envelope_from_payload(
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
     Ok(envelope)
+}
+
+/// Stored phase persisted by the bridge-event stage entry. The route answers
+/// `DURABLE` only on this exact persisted phase; anything else fails closed
+/// instead of promoting a weaker fact.
+const BRIDGE_EVENT_PHASE_DURABLE: &str = "DURABLE";
+/// Bound on consumed-frontier entries carried by one reconcile scope.
+const MAX_BRIDGE_RECONCILE_CONSUMED: usize = 1024;
+
+/// Canonical text of a lineage-aware authority epoch (`lineage:sequence`).
+/// Compared exactly by the store row; never coerced to a scalar.
+fn bridge_epoch_text(epoch: &eliot_contracts::EpochId) -> String {
+    format!("{}:{}", epoch.lineage_id.as_str(), epoch.sequence.get())
+}
+
+/// Decodes the exact typed durable/control event envelope from a bridge-event
+/// payload.
+///
+/// The payload must carry the closed operation string plus the full typed
+/// envelope; the envelope shape, sequencing, and fence/authority coherence
+/// are re-validated here, so this is typed dispatch rather than generic JSON
+/// routing.
+pub(crate) fn bridge_event_envelope_from_payload(
+    payload: &serde_json::Value,
+) -> Result<EventEnvelope, TransportError> {
+    let envelope_value = payload
+        .get("envelope")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)?;
+    let envelope: EventEnvelope =
+        serde_json::from_value(envelope_value).map_err(|_| TransportError::SessionFenced)?;
+    envelope
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    Ok(envelope)
+}
+
+/// One digest-bound hook observation: the hook identity plus the exact digest
+/// of its canonical bytes. The Kernel binds the digest without interpreting
+/// hook semantics; the typed [`HostEventEnvelope`] contract lives
+/// bridge-side, where it is validated before sending.
+pub(crate) struct BridgeHookObservation {
+    pub(crate) event_id: String,
+    pub(crate) sequence: u64,
+    pub(crate) digest: String,
+}
+
+/// Decodes one digest-bound hook observation from a hook payload.
+///
+/// The payload carries the closed operation string, the hook JSON under
+/// `hook_envelope`, and its canonical digest under `hook_digest`. The digest
+/// is recomputed over the canonical bytes and must match exactly, so the
+/// reply binds the immutable observation the bridge presented.
+pub(crate) fn bridge_hook_from_payload(
+    payload: &serde_json::Value,
+) -> Result<BridgeHookObservation, TransportError> {
+    let hook_value = payload
+        .get("hook_envelope")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)?;
+    let presented = payload
+        .get("hook_digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(TransportError::SessionFenced)?;
+    let bytes = eliot_contracts::canonical_json_bytes(&hook_value)
+        .map_err(|_| TransportError::SessionFenced)?;
+    let digest = eliot_contracts::sha256_hex(&bytes);
+    if digest != presented {
+        return Err(TransportError::SessionFenced);
+    }
+    let event_id = hook_value
+        .get("event_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.trim().is_empty() && !text.chars().any(char::is_control))
+        .ok_or(TransportError::SessionFenced)?;
+    let sequence = hook_value
+        .get("sequence")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|sequence| *sequence != 0)
+        .ok_or(TransportError::SessionFenced)?;
+    Ok(BridgeHookObservation {
+        event_id: event_id.to_owned(),
+        sequence,
+        digest,
+    })
+}
+
+/// Decodes one forwarded coverage gap into the store gap object.
+///
+/// The payload carries the closed operation string, the gap JSON under `gap`
+/// (identity, reason, affected interval, evidence), and the optional stream
+/// scope under `stream_id` (empty when the forwarding port carries no stream
+/// scope; the gap then reconciles unscoped under its staging connection).
+/// Interval and identity fields are validated here; cursor movement never
+/// happens on this path by construction of the store entry.
+pub(crate) fn bridge_gap_from_payload(
+    payload: &serde_json::Value,
+    staging_connection: &str,
+) -> Result<serde_json::Value, TransportError> {
+    let gap_value = payload
+        .get("gap")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)?;
+    let gap_id = gap_value
+        .get("gap_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.trim().is_empty() && !text.chars().any(char::is_control))
+        .ok_or(TransportError::SessionFenced)?;
+    let reason_ref = gap_value
+        .get("reason_ref")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.trim().is_empty() && !text.chars().any(char::is_control))
+        .ok_or(TransportError::SessionFenced)?;
+    let interval = gap_value
+        .get("affected_interval")
+        .ok_or(TransportError::SessionFenced)?;
+    let start = interval
+        .get("start")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|start| *start != 0)
+        .ok_or(TransportError::SessionFenced)?;
+    let end = interval
+        .get("end")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|end| *end != 0)
+        .ok_or(TransportError::SessionFenced)?;
+    if end < start {
+        return Err(TransportError::SessionFenced);
+    }
+    let stream_id = payload
+        .get("stream_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if stream_id.chars().any(char::is_control) || stream_id.contains("::") {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(serde_json::json!({
+        "gap_id": gap_id,
+        "stream_id": stream_id,
+        "start_sequence": start,
+        "end_sequence": end,
+        "reason_ref": reason_ref,
+        "staging_connection": staging_connection,
+    }))
+}
+
+/// Consumed-frontier scope carried by one event reconcile request: the
+/// bridge-owned delivered frontier per stream. Applied monotonically at or
+/// below the durable cursor before enumeration.
+pub(crate) struct BridgeReconcileScope {
+    pub(crate) consumed: Vec<(String, u64)>,
+}
+
+/// Decodes the reconcile scope: a bounded list of `{stream_id, sequence}`
+/// consumed-frontier entries. The list may be empty (pure ownership/cursor
+/// read); anything malformed fails the whole scope.
+pub(crate) fn bridge_reconcile_scope_from_payload(
+    payload: &serde_json::Value,
+) -> Result<BridgeReconcileScope, TransportError> {
+    let consumed_value = payload
+        .get("consumed")
+        .ok_or(TransportError::SessionFenced)?;
+    let consumed_array = consumed_value
+        .as_array()
+        .ok_or(TransportError::SessionFenced)?;
+    if consumed_array.len() > MAX_BRIDGE_RECONCILE_CONSUMED {
+        return Err(TransportError::SessionFenced);
+    }
+    let mut consumed = Vec::with_capacity(consumed_array.len());
+    for entry in consumed_array {
+        let stream_id = entry
+            .get("stream_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| {
+                !text.trim().is_empty()
+                    && !text.chars().any(char::is_control)
+                    && !text.contains("::")
+            })
+            .ok_or(TransportError::SessionFenced)?;
+        let sequence = entry
+            .get("sequence")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|sequence| *sequence != 0)
+            .ok_or(TransportError::SessionFenced)?;
+        consumed.push((stream_id.to_owned(), sequence));
+    }
+    Ok(BridgeReconcileScope { consumed })
+}
+
+/// Typed answer for one staged durable event: the store outcome plus the
+/// closed `known`/`accepted` envelope the bridge joins to its sent envelope.
+/// Carries the independently verifiable phase from the persistent owner.
+fn bridge_event_forward_response(outcome: &serde_json::Value, accepted: bool) -> serde_json::Value {
+    let mut value = outcome.clone();
+    if let Some(object) = value.as_object_mut() {
+        object.insert("accepted".to_owned(), serde_json::Value::Bool(accepted));
+    }
+    serde_json::json!({ "status": "known", "value": value })
+}
+
+/// Typed answer for one best-effort event: transport observation without a
+/// durability claim. A loss carries `forwarded: false` with its exact reason
+/// so the bridge emits the typed telemetry gap instead of dropping silently.
+fn bridge_event_best_effort_response(
+    event: &EventEnvelope,
+    forwarded: bool,
+    reason: &str,
+) -> serde_json::Value {
+    serde_json::json!({ "status": "known", "value": {
+        "accepted": true,
+        "forwarded": forwarded,
+        "reason": reason,
+        "stream_id": event.stream_id,
+        "event_id": event.event_id,
+        "sequence": event.sequence,
+    } })
 }
 
 /// Decodes the exact canonical tool bytes from an invoke-read payload.

@@ -71,6 +71,31 @@ pub const MAX_REDACTED_CLASSES: usize = 16;
 pub const MAX_REDACTED_CLASS_BYTES: usize = 128;
 /// Maximum normalization warnings carried by one durable record.
 pub const MAX_INGEST_WARNINGS: usize = 16;
+/// Maximum staged-plus-committed records held by one journal.
+///
+/// I14.2 sizes the canonical-writes pool at 2048 items plus a byte cap with
+/// `STORAGE_BACKPRESSURE` when no durable staging is available. The journal
+/// mirrors that pool bound: staging past it fails closed with
+/// [`IngestError::CapacityExhausted`] (typed backpressure), never with silent
+/// loss or a best-effort downgrade of a durable event.
+pub const MAX_JOURNAL_RECORDS: usize = 2048;
+/// Maximum total stored payload bytes (raw plus redacted projections) held by
+/// one journal. Bounds the byte half of the I14.2 canonical-writes pool.
+/// Breach fails closed with [`IngestError::CapacityExhausted`].
+pub const MAX_JOURNAL_STORED_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum retained best-effort drop gaps. Gaps are coverage evidence, so a
+/// full buffer first compacts gaps the acked cursor already passed and only
+/// then retains the newest; unacknowledged coverage is never compacted away.
+pub const MAX_DROPPED_GAPS: usize = 512;
+/// Maximum replay items served by one reconnect page. Restart enumeration
+/// walks [`DurableHostEventJournal::pending_page_for_reconnect`] with a
+/// continuation instead of materializing an unbounded vector.
+pub const MAX_PENDING_PAGE_ITEMS: usize = 128;
+/// Committed-and-acknowledged records retained per stream for duplicate
+/// suppression. Compaction evicts only acked records older than this window;
+/// the per-stream durable/acked cursor facts in `progress` are never evicted,
+/// so no cursor resets to zero and no unresolved stream is discarded.
+pub const RETAIN_ACKED_RECORDS_PER_STREAM: usize = 512;
 
 /// Substrings that must never be persisted as admissible raw bytes. Matched
 /// case-insensitively against the lossy UTF-8 decoding of the transport bytes.
@@ -114,6 +139,13 @@ pub enum IngestError {
     /// Acknowledgement reaches past the last durably committed sequence.
     #[error("acknowledgement reaches past the durable cursor")]
     AckBeyondDurable,
+    /// A durable bound (record count or stored bytes) is exhausted. Typed
+    /// backpressure in the I14.4 `STORAGE_BACKPRESSURE` sense: the staging is
+    /// refused, the cursor does not move, and a durable event is never
+    /// silently downgraded to best-effort. Idempotent replays of already
+    /// stored records still succeed at capacity.
+    #[error("durable ingest bound reached; staging refused under backpressure")]
+    CapacityExhausted,
     /// A shared digest or envelope primitive rejected a value.
     #[error("contract primitive rejected the ingest value")]
     Contract(#[from] ContractError),
@@ -213,16 +245,69 @@ impl StoredPayload {
     }
 }
 
+/// Durable phase of one normalized `HostEventEnvelope`, mirroring the I7.2
+/// `EventAckReceipt` phases.
+///
+/// Advancing conditions (declared per cursor/record, enforced by the journal):
+///
+/// ```text
+/// RECEIVED   staged raw/hash record plus bound envelope; cursor unadvanced.
+/// DURABLE    committed: raw/hash record, normalized projection, and
+///            disposition durably related; per-stream durable cursor advanced
+///            contiguously (commit), never past a gap.
+/// NORMALIZED committed with the linked normalized projection re-verified
+///            live on every read (envelope digest recomputed against the
+///            stored bytes and the declared output digest); failed
+///            re-verification reports DURABLE, never a higher phase. The
+///            commit-time `normalized` memo is never trusted here.
+/// APPLIED    committed envelope applied to state exactly once with a
+///            canonical application receipt bound by the state-application
+///            owner (never self-minted by this journal); duplicate replays
+///            return the existing receipt without a second application.
+///            Until that owner binds its receipt the record reports
+///            NORMALIZED-with-application-counted, never APPLIED.
+/// ```
+///
+/// Rejections and unknown outcomes are never fabricated into records: they are
+/// the typed [`IngestError`] returns (each carrying its exact reason) and, for
+/// dropped best-effort observations, the retained [`BestEffortDropGap`]
+/// coverage evidence. A forwarded gap accounts for missing coverage; it never
+/// advances a cursor or converts absent events into applied ones.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordPhase {
+    /// Staged but not yet durably committed.
+    Received,
+    /// Committed durable relation; projection linkage not (re-)verified.
+    Durable,
+    /// Committed with the linked normalized projection verified.
+    Normalized,
+    /// Committed envelope applied exactly once with bound receipt.
+    Applied,
+}
+
 /// Durable disposition of one normalized `HostEventEnvelope`: whether the
-/// raw/hash, envelope, and disposition relation is committed, how many times
-/// the envelope was applied to state, and whether it was acknowledged.
+/// raw/hash, envelope, and disposition relation is committed, whether the
+/// linked normalized projection verified at commit time, how many times the
+/// envelope was applied to state, the bound application receipt, and whether
+/// it was acknowledged.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordDisposition {
     /// True once the durable relation is committed and the cursor published.
     pub committed: bool,
+    /// Commit-time memo that the linked normalized projection verified when
+    /// the durable relation was committed. Never trusted by
+    /// [`DurableHostEventRecord::phase`], which re-verifies the linkage live
+    /// on every read; a corrupted projection still reports DURABLE.
+    pub normalized: bool,
     /// Number of state applications (0 or 1; duplicates never re-apply).
     pub applied_count: u32,
+    /// Canonical application receipt bound by the state-application owner on
+    /// the single recorded application. This journal never mints it: a lost
+    /// acknowledgement after commit replays to the existing count/phase, and
+    /// only the owner's bound receipt advances the phase to APPLIED.
+    /// `None` until the owner binds its receipt.
+    pub applied_receipt: Option<LowercaseSha256>,
     /// True once acknowledged at or past this sequence.
     pub acked: bool,
 }
@@ -260,6 +345,50 @@ pub struct DurableHostEventRecord {
     pub disposition: RecordDisposition,
 }
 
+impl DurableHostEventRecord {
+    /// Returns the independently verifiable durable phase of this record.
+    ///
+    /// APPLIED requires the single recorded application with the canonical
+    /// application receipt bound by the state-application owner; NORMALIZED
+    /// requires the commit plus a live re-verification of the linked
+    /// normalized projection on every read (envelope digest recomputed
+    /// against the stored bytes and the declared output digest), so a
+    /// corrupted projection reports DURABLE and never a higher phase — the
+    /// commit-time `normalized` memo is evidence of what verified at commit,
+    /// never a substitute for live verification. Anything staged but
+    /// uncommitted is RECEIVED. Failed normalization never creates a record
+    /// at all: it stays a typed [`IngestError`] with its exact reason.
+    #[must_use]
+    pub fn phase(&self) -> RecordPhase {
+        if self.disposition.applied_count > 0 && self.disposition.applied_receipt.is_some() {
+            return RecordPhase::Applied;
+        }
+        if self.disposition.committed {
+            let linked = self
+                .envelope
+                .compute_digest()
+                .is_ok_and(|digest| digest == self.envelope_digest)
+                && self.envelope_digest == self.envelope.normalization.output_digest;
+            if linked {
+                return RecordPhase::Normalized;
+            }
+            return RecordPhase::Durable;
+        }
+        RecordPhase::Received
+    }
+
+    /// Returns the linked normalization receipt (the normalized projection
+    /// facts minted by the provider normalizer), or `None` before commit.
+    /// The receipt travels with the record instead of being re-minted, so the
+    /// Governor/coordinator intake re-verifies the same facts.
+    #[must_use]
+    pub fn normalization_receipt(&self) -> Option<&eliot_agent_api::HostEventNormalizationReceipt> {
+        self.disposition
+            .committed
+            .then_some(&self.envelope.normalization)
+    }
+}
+
 /// Outcome of staging one event: its key plus whether it was freshly staged
 /// (`true`) or an idempotent replay of an identical delivery (`false`).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -271,7 +400,10 @@ pub struct StageOutcome {
 }
 
 /// One event awaiting (re)delivery on reconnect: sequences after the last
-/// acknowledged cursor, in ascending order, flagged by commit state.
+/// acknowledged cursor, in ascending order, flagged by commit state and
+/// carrying the independently verifiable durable phase for acknowledgement
+/// recovery (a lost acknowledgement after commit replays to this existing
+/// phase/receipt, never to a duplicate normalization or application).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplayItem {
     /// Sequence to redeliver.
@@ -279,10 +411,53 @@ pub struct ReplayItem {
     /// True when the durable relation is committed (acknowledgement pending);
     /// false when staged but uncommitted (commit pending).
     pub committed: bool,
+    /// Durable phase of the record (RECEIVED when staged-but-uncommitted,
+    /// NORMALIZED-or-better once committed; see [`RecordPhase`]).
+    pub phase: RecordPhase,
     /// Immutable transport hash of the event.
     pub transport_hash: LowercaseSha256,
     /// Canonical digest of the normalized envelope.
     pub envelope_digest: LowercaseSha256,
+}
+
+/// Exact authorized scope for one bounded reconnect page.
+///
+/// The scope names exactly one stream. Restart enumeration serves only the
+/// presented stream: there is no wildcard, no listing, and no cross-stream
+/// read, so a caller can only page the stream its scope authorizes. The
+/// journal enforces the equality; the persistence owner binds the scope to
+/// its own authorization before calling.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingScope {
+    stream_id: String,
+}
+
+impl PendingScope {
+    /// Presents the authorized stream for one bounded page walk.
+    pub fn new(stream_id: &str) -> Result<Self, IngestError> {
+        validate_stream_id(stream_id)?;
+        Ok(Self {
+            stream_id: stream_id.to_owned(),
+        })
+    }
+
+    /// Returns the authorized stream identifier.
+    #[must_use]
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+}
+
+/// One bounded reconnect page: at most `MAX_PENDING_PAGE_ITEMS` replay items
+/// in ascending sequence order plus the continuation for the next page
+/// (`None` when the walk is complete). Bounded pages with continuations are
+/// the only restart enumeration; nothing materializes an unbounded vector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingPage {
+    /// Replay items of this page, in ascending sequence order.
+    pub items: Vec<ReplayItem>,
+    /// Resume-after sequence for the next page, or `None` when complete.
+    pub continuation: Option<u64>,
 }
 
 /// Why a best-effort observation was dropped instead of retained.
@@ -485,15 +660,24 @@ fn validate_classes(classes: &[String]) -> Result<Vec<String>, IngestError> {
 /// Records are staged (uncommitted) and then committed as one durable unit;
 /// only commits advance the per-stream durable cursor, only acknowledgements
 /// up to the durable cursor advance the acked cursor, and reconnect replays
-/// everything after the acked cursor. The journal is an in-memory durable
+/// everything after the acked cursor through bounded pages with continuations
+/// ([`DurableHostEventJournal::pending_page_for_reconnect`]). Identity is
+/// stronger than content: deduplication keys on the admitted
+/// producer/stream/event plus sequence relation, so identical transport bytes
+/// staged under two distinct stream cursors are two distinct occurrences,
+/// while changed bytes under one staged cursor are a quarantined
+/// [`IngestError::ConflictingDuplicate`]. The journal is an in-memory durable
 /// relation used by the bridge persistence owner; it performs no I/O, spawns
-/// nothing, and grants no authority.
+/// nothing, and grants no authority. Record/byte/gap/page bounds fail closed
+/// with [`IngestError::CapacityExhausted`] (I14.4 `STORAGE_BACKPRESSURE`
+/// semantics); compaction evicts only acknowledged records past the per-stream
+/// retention window and never resets a cursor.
 #[derive(Clone, Debug, Default)]
 pub struct DurableHostEventJournal {
     progress: BTreeMap<String, StreamProgress>,
     records: BTreeMap<(String, u64), DurableHostEventRecord>,
-    by_transport_hash: BTreeMap<String, (String, u64)>,
     dropped_gaps: Vec<BestEffortDropGap>,
+    stored_bytes: u64,
 }
 
 impl DurableHostEventJournal {
@@ -568,12 +752,17 @@ impl DurableHostEventJournal {
 
     /// Stages admissible raw bytes plus their normalized envelope.
     ///
-    /// Fails closed with [`IngestError::PrivacyViolation`] when the bytes
-    /// carry denied content, and with [`IngestError::EnvelopeMismatch`] when
-    /// the envelope does not bind the stored bytes under its declared
+    /// Disclosure/retention resolves before any durable write: the envelope
+    /// must carry the positive `PublicSummary` privacy attestation from its
+    /// declared contract (a caller safe flag or the mere absence of known
+    /// substrings is not proof), and the bytes must additionally pass the
+    /// denied-content quarantine scan. Anything else fails closed with
+    /// [`IngestError::PrivacyViolation`] and the caller must use the explicit
+    /// redacted path. An [`IngestError::EnvelopeMismatch`] fires when the
+    /// envelope does not bind the stored bytes under its declared
     /// source-digest algorithm. An identical
     /// redelivery returns the existing key with `fresh: false`; a conflicting
-    /// same-cursor or same-hash delivery is quarantined with
+    /// same-cursor delivery is quarantined with
     /// [`IngestError::ConflictingDuplicate`]. Staging alone never advances a
     /// cursor.
     pub fn stage_allowed(
@@ -587,6 +776,9 @@ impl DurableHostEventJournal {
             &request.warnings,
             request.transformation_version,
         )?;
+        if request.envelope.normalization.privacy_class != HostEventPrivacyClass::PublicSummary {
+            return Err(IngestError::PrivacyViolation);
+        }
         if contains_forbidden_content(request.transport_bytes) {
             return Err(IngestError::PrivacyViolation);
         }
@@ -687,6 +879,18 @@ impl DurableHostEventJournal {
         progress.last_durable_sequence = key.sequence;
         if let Some(record) = self.records.get_mut(&(key.stream_id.clone(), key.sequence)) {
             record.disposition.committed = true;
+            // The commit durably relates the raw/hash record, the normalized
+            // projection, and the disposition together. The `normalized` memo
+            // is set only when the linkage verifies live right here
+            // (envelope digest recomputed against the stored bytes and the
+            // declared output digest); [`DurableHostEventRecord::phase`] still
+            // re-verifies live on every read and never trusts this memo.
+            let linked = record
+                .envelope
+                .compute_digest()
+                .is_ok_and(|digest| digest == record.envelope_digest)
+                && record.envelope_digest == record.envelope.normalization.output_digest;
+            record.disposition.normalized = linked;
         }
         Ok(self.cursor(&key.stream_id))
     }
@@ -717,7 +921,54 @@ impl DurableHostEventJournal {
                 record.disposition.acked = true;
             }
         }
+        // Acknowledgement is the only compaction trigger: acknowledged records
+        // past the per-stream retention window (and their passed coverage
+        // gaps) become eligible for eviction here, never anywhere else.
+        self.compact_acknowledged(stream_id);
         Ok(self.cursor(stream_id))
+    }
+
+    /// Evicts committed-and-acknowledged records older than the per-stream
+    /// retention window, plus the coverage gaps their acked cursor passed.
+    ///
+    /// Only records with `sequence <= last_acked - RETAIN_ACKED_RECORDS…`
+    /// are eligible: staged-but-uncommitted records, unacknowledged records,
+    /// the retention window itself (duplicate suppression frontier), and the
+    /// per-stream cursor facts are never touched, so compaction cannot reset
+    /// a cursor or discard an unresolved stream. Returns the evicted record
+    /// count.
+    fn compact_acknowledged(&mut self, stream_id: &str) -> usize {
+        let acked = self
+            .progress
+            .get(stream_id)
+            .map_or(0, |progress| progress.last_acked_sequence);
+        let floor = acked.saturating_sub(RETAIN_ACKED_RECORDS_PER_STREAM as u64);
+        if floor == 0 {
+            return 0;
+        }
+        let evictable: Vec<(String, u64)> = self
+            .records
+            .iter()
+            .filter(|((record_stream, sequence), record)| {
+                *record_stream == stream_id
+                    && *sequence <= floor
+                    && record.disposition.committed
+                    && record.disposition.acked
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut evicted = 0;
+        for key in evictable {
+            if let Some(record) = self.records.remove(&key) {
+                self.stored_bytes = self
+                    .stored_bytes
+                    .saturating_sub(record.stored.bytes().len() as u64);
+                evicted += 1;
+            }
+        }
+        self.dropped_gaps
+            .retain(|gap| gap.stream_id != stream_id || gap.sequence > floor);
+        evicted
     }
 
     /// Replays everything after the last acknowledged cursor for a stream, in
@@ -725,33 +976,92 @@ impl DurableHostEventJournal {
     /// acknowledgement recovery, and staged-but-uncommitted records (for
     /// example after a pre-commit interruption) for commit recovery. Never
     /// synthesizes events; an empty journal replays nothing.
+    ///
+    /// The walk is a bounded-page loop over
+    /// [`Self::pending_page_for_reconnect`] (`MAX_PENDING_PAGE_ITEMS` per
+    /// page with a resume continuation), so replay work stays bounded even
+    /// though the collected result covers the whole unacknowledged tail.
     #[must_use]
     pub fn pending_for_reconnect(&self, stream_id: &str) -> Vec<ReplayItem> {
-        let acked = self
+        let Ok(scope) = PendingScope::new(stream_id) else {
+            return Vec::new();
+        };
+        let mut items = Vec::new();
+        let mut after = self
             .progress
             .get(stream_id)
             .map_or(0, |progress| progress.last_acked_sequence);
-        let mut pending: Vec<ReplayItem> = self
+        while let Ok(page) = self.pending_page_for_reconnect(&scope, after, MAX_PENDING_PAGE_ITEMS)
+        {
+            let complete = page.continuation.is_none();
+            if let Some(last) = page.items.last() {
+                after = last.sequence;
+            }
+            items.extend(page.items);
+            if complete {
+                break;
+            }
+        }
+        items
+    }
+
+    /// Serves one bounded reconnect page under an exact authorized scope.
+    ///
+    /// `after_sequence` resumes after the last item of the previous page (the
+    /// acked cursor for the first page); `page_limit` must be within
+    /// `1..=MAX_PENDING_PAGE_ITEMS`. The scope serves exactly its own stream:
+    /// cross-stream reads are impossible by construction (no listing, no
+    /// wildcard), which is the scope authorization for restart enumeration.
+    /// `continuation` resumes the walk, or is `None` when the tail is fully
+    /// served. Never synthesizes events.
+    pub fn pending_page_for_reconnect(
+        &self,
+        scope: &PendingScope,
+        after_sequence: u64,
+        page_limit: usize,
+    ) -> Result<PendingPage, IngestError> {
+        if page_limit == 0 || page_limit > MAX_PENDING_PAGE_ITEMS {
+            return Err(IngestError::InvalidInput("page_limit"));
+        }
+        let stream_id = scope.stream_id();
+        let mut items: Vec<ReplayItem> = self
             .records
             .iter()
             .filter(|((record_stream, record_sequence), _)| {
-                *record_stream == stream_id && *record_sequence > acked
+                *record_stream == stream_id && *record_sequence > after_sequence
             })
             .map(|((_, sequence), record)| ReplayItem {
                 sequence: *sequence,
                 committed: record.disposition.committed,
+                phase: record.phase(),
                 transport_hash: record.transport_hash.clone(),
                 envelope_digest: record.envelope_digest.clone(),
             })
             .collect();
-        pending.sort_by_key(|item| item.sequence);
-        pending
+        items.sort_by_key(|item| item.sequence);
+        let continuation = if items.len() > page_limit {
+            items.truncate(page_limit);
+            items.last().map(|item| item.sequence)
+        } else {
+            None
+        };
+        Ok(PendingPage {
+            items,
+            continuation,
+        })
     }
 
     /// Applies one committed envelope to state. The first call returns `true`;
     /// every later call for the same key returns `false` without a second
     /// application, so duplicate replays create no second state application.
     /// Staged-but-uncommitted records report [`IngestError::NotCommitted`].
+    /// The first application records the application count only: this journal
+    /// never mints the canonical application receipt (a self-minted envelope
+    /// digest would claim application without performing any), so the phase
+    /// stays NORMALIZED-with-application-counted until the
+    /// state-application owner binds its canonical receipt, and a lost
+    /// acknowledgement after commit replays to the existing count/phase
+    /// instead of duplicating the application.
     pub fn record_application(&mut self, key: &EventKey) -> Result<bool, IngestError> {
         let record = self
             .records
@@ -772,7 +1082,10 @@ impl DurableHostEventJournal {
     /// durable conflicts stay errors without gap evidence. Gap recording is
     /// the only mutation on these paths; the call returns before any commit
     /// or acknowledgement, so acknowledgement and cursor advancement stay
-    /// suppressed by construction.
+    /// suppressed by construction. The retained gap buffer is bounded at
+    /// `MAX_DROPPED_GAPS`: a full buffer first compacts gaps the acked cursor
+    /// already passed, then retains the newest, so unacknowledged coverage is
+    /// never compacted away while the buffer itself cannot grow without limit.
     #[allow(clippy::too_many_arguments)]
     fn record_best_effort_drop(
         &mut self,
@@ -793,10 +1106,38 @@ impl DurableHostEventJournal {
             envelope_digest: envelope_digest.clone(),
             reason,
         });
+        if self.dropped_gaps.len() <= MAX_DROPPED_GAPS {
+            return;
+        }
+        // Bounded retention: first compact gaps whose stream cursor already
+        // acknowledged them (eligible under the acknowledged rule); only under
+        // sustained overflow past that does the buffer retain the newest and
+        // release the oldest.
+        let progress = &self.progress;
+        self.dropped_gaps.retain(|gap| {
+            gap.sequence
+                > progress
+                    .get(gap.stream_id.as_str())
+                    .map_or(0, |state| state.last_acked_sequence)
+        });
+        if self.dropped_gaps.len() > MAX_DROPPED_GAPS {
+            let overflow = self.dropped_gaps.len() - MAX_DROPPED_GAPS;
+            self.dropped_gaps.drain(..overflow);
+        }
     }
 
     /// Shared staging core: envelope linkage checks, idempotent-duplicate
     /// detection, and staged insertion. Never advances a cursor.
+    ///
+    /// Identity is stronger than content: the deduplication key is the
+    /// admitted stream cursor `(stream_id, sequence)`. An identical redelivery
+    /// under one cursor is idempotent; changed bytes under one cursor are a
+    /// quarantined [`IngestError::ConflictingDuplicate`]; identical transport
+    /// bytes under two distinct stream cursors are two distinct occurrences
+    /// and stage independently (no cross-stream content index exists by
+    /// design). Record and byte bounds fail closed with
+    /// [`IngestError::CapacityExhausted`]; idempotent replays succeed at
+    /// capacity because they store nothing new.
     #[allow(clippy::too_many_arguments)]
     fn stage(
         &mut self,
@@ -858,17 +1199,6 @@ impl DurableHostEventJournal {
             );
             return Err(IngestError::ConflictingDuplicate);
         }
-        if self.by_transport_hash.contains_key(&hash_hex) {
-            self.record_best_effort_drop(
-                stream_id,
-                sequence,
-                &transport_hash,
-                &envelope_digest,
-                envelope.delivery,
-                BestEffortDropReason::ConflictingDuplicate,
-            );
-            return Err(IngestError::ConflictingDuplicate);
-        }
         let durable = self
             .progress
             .get(stream_id)
@@ -887,6 +1217,19 @@ impl DurableHostEventJournal {
         if envelope.producer_adapter_identity != ACP_NORMALIZER_IDENTITY {
             return Err(IngestError::EnvelopeMismatch("producer_adapter_identity"));
         }
+        if self.records.len() >= MAX_JOURNAL_RECORDS {
+            return Err(IngestError::CapacityExhausted);
+        }
+        if self
+            .stored_bytes
+            .saturating_add(stored.bytes().len() as u64)
+            > MAX_JOURNAL_STORED_BYTES
+        {
+            return Err(IngestError::CapacityExhausted);
+        }
+        self.stored_bytes = self
+            .stored_bytes
+            .saturating_add(stored.bytes().len() as u64);
         self.records.insert(
             (stream_id.to_owned(), sequence),
             DurableHostEventRecord {
@@ -904,13 +1247,13 @@ impl DurableHostEventJournal {
                 warnings,
                 disposition: RecordDisposition {
                     committed: false,
+                    normalized: false,
                     applied_count: 0,
+                    applied_receipt: None,
                     acked: false,
                 },
             },
         );
-        self.by_transport_hash
-            .insert(hash_hex, (stream_id.to_owned(), sequence));
         Ok(StageOutcome { key, fresh: true })
     }
 
