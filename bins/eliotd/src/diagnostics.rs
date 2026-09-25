@@ -29,7 +29,7 @@ use std::sync::OnceLock;
 
 use eliot_protocol::{AgentActivationResolutionDisposition, AgentActivationResultAckOutcome};
 
-use super::agent_fabric::{FabricAdmission, FabricError, Reservation};
+use super::agent_fabric::{FabricAdmission, FabricError, FabricPortId, Reservation};
 use super::{DaemonError, PROTOCOL_VERSION, SERVICE_NAME};
 
 /// Marker recorded when an identity was not available from its owner.
@@ -922,6 +922,32 @@ pub fn fabric_rejection_of(error: &FabricError) -> (RejectionReason, OwningCompo
         }
         FabricError::ProviderEvidenceRequired => {
             (RejectionReason::Contract, OwningComponent::AgentFabric)
+        }
+        // #1700: the typed residual already names the exact port, owner,
+        // state, blocked operation/work, disposition and next action (also
+        // carried verbatim in the record detail via its `Display`), so the
+        // projection keeps the closest existing reason/owner per port. No
+        // new reason or owner is introduced: both enums are pinned by the
+        // daemon diagnostics proof.
+        FabricError::MissingPrerequisite(residual) => {
+            let owner = match residual.port {
+                FabricPortId::ModelRegistry => OwningComponent::ModelRegistry,
+                FabricPortId::AdmissionAuthority => OwningComponent::AdmissionAuthority,
+                FabricPortId::ActivationAuthority => OwningComponent::ActivationProjection,
+                FabricPortId::DispatchEgress => OwningComponent::DispatchEgress,
+                FabricPortId::PeerChannel | FabricPortId::SwarmControl => {
+                    OwningComponent::AgentFabric
+                }
+            };
+            let reason = match residual.port {
+                FabricPortId::ModelRegistry => RejectionReason::NoRoute,
+                FabricPortId::AdmissionAuthority => RejectionReason::AdmissionIncomplete,
+                FabricPortId::DispatchEgress => RejectionReason::DispatchUnavailable,
+                FabricPortId::PeerChannel
+                | FabricPortId::SwarmControl
+                | FabricPortId::ActivationAuthority => RejectionReason::Contract,
+            };
+            (reason, owner)
         }
     }
 }
