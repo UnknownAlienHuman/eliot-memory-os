@@ -8,6 +8,7 @@ use serde_json::Value;
 use time::OffsetDateTime;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TraceCompletenessContract {
     pub contract_id: String,
     pub project_id: ProjectId,
@@ -54,6 +55,7 @@ pub enum MissingTracePart {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayCase {
     pub replay_case_id: ReplayCaseId,
     pub project_id: ProjectId,
@@ -85,6 +87,7 @@ pub enum ReplayCaseKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplaySuccessCriterion {
     pub criterion_id: String,
     pub description: String,
@@ -107,6 +110,7 @@ pub enum ReplayMeasurement {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplaySet {
     pub replay_set_id: ReplaySetId,
     pub project_id: ProjectId,
@@ -121,6 +125,7 @@ pub struct ReplaySet {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayInputSnapshot {
     pub snapshot_id: String,
     pub replay_case_id: ReplayCaseId,
@@ -134,6 +139,7 @@ pub struct ReplayInputSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayRun {
     pub replay_run_id: ReplayRunId,
     pub project_id: ProjectId,
@@ -142,11 +148,8 @@ pub struct ReplayRun {
     pub baseline_ref: Option<String>,
     pub run_profile: ReplayRunProfile,
     pub case_results: Vec<ReplayCaseResult>,
-    #[serde(default)]
     pub sealed_input_hash: String,
-    #[serde(default)]
     pub reproducibility_hash: String,
-    #[serde(default)]
     pub uncertainty: String,
     #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
@@ -156,6 +159,7 @@ pub struct ReplayRun {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayRunProfile {
     pub profile_id: String,
     pub deterministic: bool,
@@ -177,6 +181,7 @@ pub enum ReplayRunStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayCaseResult {
     pub result_id: String,
     pub replay_case_id: ReplayCaseId,
@@ -198,6 +203,7 @@ pub enum ReplayCaseStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayMeasurementResult {
     pub criterion_id: String,
     pub passed: bool,
@@ -206,6 +212,7 @@ pub struct ReplayMeasurementResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayVerdict {
     pub verdict_id: String,
     pub replay_run_id: ReplayRunId,
@@ -229,6 +236,7 @@ pub enum ReplayDecision {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayAudit {
     pub audit_id: String,
     pub replay_run_id: ReplayRunId,
@@ -242,6 +250,7 @@ pub struct ReplayAudit {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SleepConsolidationRun {
     pub sleep_run_id: String,
     pub project_id: ProjectId,
@@ -251,21 +260,13 @@ pub struct SleepConsolidationRun {
     pub recent_failures: Vec<String>,
     pub repeated_patterns: Vec<String>,
     pub outputs: Vec<SleepOutputRef>,
-    #[serde(default)]
     pub excluded_trace_contract_refs: Vec<String>,
-    #[serde(default)]
     pub reasoning_route_ref: String,
-    #[serde(default)]
     pub input_bytes: u32,
-    #[serde(default)]
     pub input_budget_bytes: u32,
-    #[serde(default)]
     pub reasoning_attempts: u8,
-    #[serde(default)]
     pub reasoning_retry_limit: u8,
-    #[serde(default)]
     pub deterministic_fallback: bool,
-    #[serde(default)]
     pub degraded: bool,
     pub replay_requirement: SkillReplayRequirement,
     pub taint: TaintClass,
@@ -288,6 +289,7 @@ pub enum SleepTrigger {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SleepInputScope {
     pub project_id: ProjectId,
     pub task_ids: Vec<TaskId>,
@@ -298,6 +300,7 @@ pub struct SleepInputScope {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SleepOutputRef {
     pub output_ref: String,
     pub output_kind: SleepOutputKind,
@@ -329,14 +332,13 @@ pub enum SleepConsolidationStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DreamCandidate {
     pub dream_candidate_id: DreamCandidateId,
     pub project_id: ProjectId,
     pub candidate_kind: DreamCandidateKind,
     pub source_traces: Vec<String>,
-    #[serde(default)]
     pub source_trace_contract_refs: Vec<String>,
-    #[serde(default)]
     pub reasoning_route_ref: String,
     pub rationale: String,
     pub proposed_refs: Vec<String>,
@@ -376,6 +378,7 @@ pub enum ProhibitedDreamEffect {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemorySynthesisTaint {
     pub taint_id: String,
     pub candidate_ref: String,
@@ -453,6 +456,7 @@ impl CanonicalTraceEvidenceKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalTraceDerivation {
     pub algorithm_version: String,
     pub input_refs: Vec<String>,
@@ -461,6 +465,7 @@ pub struct CanonicalTraceDerivation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalTraceReceiptBinding {
     pub receipt: WriteReceiptRef,
     pub command_kind: SemanticCommandKind,
@@ -469,7 +474,7 @@ pub struct CanonicalTraceReceiptBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "source", rename_all = "snake_case")]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CanonicalTraceEvidenceSource {
     CanonicalReceipt {
         binding: CanonicalTraceReceiptBinding,
@@ -480,6 +485,7 @@ pub enum CanonicalTraceEvidenceSource {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalTraceEvidence {
     pub kind: CanonicalTraceEvidenceKind,
     pub canonical_kind: String,
@@ -493,6 +499,7 @@ pub struct CanonicalTraceEvidence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalTraceCompletenessContract {
     pub contract_id: String,
     pub project_id: ProjectId,
@@ -515,6 +522,7 @@ pub enum ReplaySetRole {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SealedReplayCaseRecord {
     pub record_id: String,
     pub replay_set_id: ReplaySetId,
@@ -523,6 +531,7 @@ pub struct SealedReplayCaseRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SealedReplayInputSnapshotRecord {
     pub record_id: String,
     pub replay_set_id: ReplaySetId,
@@ -531,6 +540,7 @@ pub struct SealedReplayInputSnapshotRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SealedReplaySetRecord {
     pub record_id: String,
     pub set: ReplaySet,
@@ -549,6 +559,7 @@ pub struct SealedReplaySetRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalReplayObservationEvidence {
     pub replay_case_id: ReplayCaseId,
     pub snapshot_hash: String,
@@ -556,6 +567,7 @@ pub struct CanonicalReplayObservationEvidence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalReplayExecutionRecord {
     pub execution_id: String,
     pub sealed_set_ref: String,
@@ -571,6 +583,7 @@ pub struct CanonicalReplayExecutionRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalReplayAuthority {
     pub input_fingerprint: String,
     pub sealed_set: SealedReplaySetRecord,
@@ -607,6 +620,7 @@ impl SleepCandidateArtifactKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SleepCandidateArtifact {
     pub artifact_id: String,
     pub project_id: ProjectId,
@@ -623,6 +637,7 @@ pub struct SleepCandidateArtifact {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SleepConsolidationBundle {
     pub bundle_id: String,
     pub bundle_hash: String,

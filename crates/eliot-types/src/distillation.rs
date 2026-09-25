@@ -3,9 +3,54 @@ use crate::{
     WriteReceiptRef,
 };
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fmt;
+use std::marker::PhantomData;
+
+/// Deserialize a map while refusing a repeated key before insertion.
+///
+/// Derived map decoding keeps the last entry and silently drops earlier
+/// ones, so a lexical duplicate would rewrite a signal or tier count without
+/// evidence. Every valid single-key encoding decodes exactly as before.
+fn deserialize_strict_btree_map<'de, D, K, V>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    K: Deserialize<'de> + Ord,
+    V: Deserialize<'de>,
+{
+    struct StrictMapVisitor<K, V>(PhantomData<fn() -> BTreeMap<K, V>>);
+
+    impl<'de, K, V> de::Visitor<'de> for StrictMapVisitor<K, V>
+    where
+        K: Deserialize<'de> + Ord,
+        V: Deserialize<'de>,
+    {
+        type Value = BTreeMap<K, V>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a map with unique keys")
+        }
+
+        fn visit_map<A>(self, mut access: A) -> Result<BTreeMap<K, V>, A::Error>
+        where
+            A: de::MapAccess<'de>,
+        {
+            let mut values = BTreeMap::new();
+            while let Some(key) = access.next_key::<K>()? {
+                if values.contains_key(&key) {
+                    return Err(de::Error::custom("duplicate map key"));
+                }
+                let value = access.next_value::<V>()?;
+                values.insert(key, value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_map(StrictMapVisitor(PhantomData))
+}
 
 #[derive(
     Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
@@ -48,6 +93,7 @@ pub enum MemoryUtilitySignalKind {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryUtilitySourceRecord {
     pub record_ref: String,
     pub record_kind: String,
@@ -62,8 +108,10 @@ pub struct MemoryUtilitySourceRecord {
 }
 
 #[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryUtilityLedgerEntry {
     pub target_ref: String,
+    #[serde(deserialize_with = "deserialize_strict_btree_map")]
     pub signal_counts: BTreeMap<MemoryUtilitySignalKind, u64>,
     pub beneficial_use_count: u64,
     pub prevented_failure_count: u64,
@@ -84,6 +132,7 @@ pub struct MemoryUtilityLedgerEntry {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalMemoryUtilityLedger {
     pub project_id: ProjectId,
     #[schemars(with = "u64")]
@@ -95,6 +144,7 @@ pub struct CanonicalMemoryUtilityLedger {
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryDistillationCorpusItem {
     pub record_ref: String,
     pub target_ref: String,
@@ -123,11 +173,13 @@ pub struct MemoryDistillationCorpusItem {
 }
 
 #[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryDistillationCorpusProfile {
     pub physical_records: usize,
     pub logical_items: usize,
     pub total_bytes: u64,
     pub active_bytes: u64,
+    #[serde(deserialize_with = "deserialize_strict_btree_map")]
     pub tier_counts: BTreeMap<MemoryTier, usize>,
 }
 
@@ -170,6 +222,7 @@ pub enum MemoryDistillationAction {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryDistillationCandidate {
     pub candidate_id: String,
     pub target_refs: Vec<String>,
@@ -184,6 +237,7 @@ pub struct MemoryDistillationCandidate {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryDistillationPlan {
     pub plan_id: String,
     pub project_id: ProjectId,
@@ -200,6 +254,7 @@ pub struct MemoryDistillationPlan {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryDistillationInput {
     pub project_id: ProjectId,
     #[schemars(with = "u64")]
@@ -211,6 +266,7 @@ pub struct MemoryDistillationInput {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryCompressionArtifact {
     pub compression_id: String,
     pub source_refs: Vec<String>,
@@ -229,6 +285,7 @@ pub struct MemoryCompressionArtifact {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryDistillationApplySelection {
     pub candidate_id: String,
     pub target_ref: String,
@@ -239,6 +296,7 @@ pub struct MemoryDistillationApplySelection {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryDistillationApplyReceipt {
     pub apply_id: String,
     pub plan_id: String,
@@ -261,6 +319,7 @@ pub enum MemoryDistillationTrigger {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryDistillationScheduleRequest {
     pub project_id: ProjectId,
     pub trigger: MemoryDistillationTrigger,
@@ -272,6 +331,7 @@ pub struct MemoryDistillationScheduleRequest {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryDistillationCheckpoint {
     pub project_id: ProjectId,
     pub trigger: MemoryDistillationTrigger,
