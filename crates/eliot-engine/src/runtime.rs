@@ -1,4 +1,4 @@
-use crate::{EngineError, ServiceContext, ServiceHandle, ServiceLifecycle};
+use crate::{EngineError, ServiceContext, ServiceHandle, ServiceLifecycle, SingleInstanceRefusal};
 use eliot_types::{
     AuthorityHeader, CausalityHeader, EliotExchangeEnvelope, EliotLogEvent, ExchangeKind,
     ExchangeParty, LogEventKind, LogLevel, ModuleCapability, ModuleEndpoint, ModuleHealth,
@@ -204,36 +204,64 @@ impl LifecycleService {
     }
 
     pub fn acquire_single_instance(&self) -> Result<RuntimeLock, EngineError> {
+        self.acquire_single_instance_with_observations(&SingleInstanceObservations::none())
+    }
+
+    /// Acquires the runtime-root single-instance lock, binding app-supplied
+    /// owner observations into the one lifecycle-owned recovery protocol.
+    ///
+    /// `observations` carries file evidence the caller read (lock/PID bytes
+    /// plus the app-validated publication owner PID). The lifecycle owner
+    /// re-reads the bound runtime directory itself and refuses when the
+    /// caller observation no longer matches local state, so a stale observer
+    /// can never authorize mutation of a replacement owner's objects.
+    ///
+    /// At most one bounded recovery-to-reacquire attempt runs per call: a
+    /// refused or failed recovery is returned with its cause preserved and
+    /// is never retried here. Callers must not add a second retry loop.
+    pub fn acquire_single_instance_with_observations(
+        &self,
+        observations: &SingleInstanceObservations,
+    ) -> Result<RuntimeLock, EngineError> {
         let runtime_dir = self.data_root.join("runtime");
         std::fs::create_dir_all(&runtime_dir)?;
         let lock_path = runtime_dir.join("daemon.lock");
-        let mut file = match create_single_instance_lock_file(&lock_path) {
-            Ok(file) => file,
-            Err(error) => {
-                if is_single_instance_lock_collision(&error)
-                    && recover_stale_single_instance_lock(&self.data_root)
-                {
-                    create_single_instance_lock_file(&lock_path).map_err(|_| error)?
-                } else {
-                    return Err(error);
+        match create_single_instance_lock_file(&lock_path) {
+            LockCreateOutcome::Created(file) => {
+                establish_single_instance_ownership(&runtime_dir, &lock_path, file)
+            }
+            LockCreateOutcome::Exists => {
+                recover_stale_single_instance_lock(&self.data_root, observations)?;
+                match create_single_instance_lock_file(&lock_path) {
+                    LockCreateOutcome::Created(file) => {
+                        establish_single_instance_ownership(&runtime_dir, &lock_path, file)
+                    }
+                    LockCreateOutcome::Exists => Err(single_instance_contention(
+                        &lock_path,
+                        SingleInstanceRefusal::ReplacementDetected,
+                        "a competing starter holds the single-instance lock after one bounded recovery attempt",
+                    )),
+                    LockCreateOutcome::Io(error) => Err(EngineError::Io(error)),
                 }
             }
-        };
-        let owner_pid = std::process::id().to_string();
-        file.write_all(owner_pid.as_bytes())?;
-        file.sync_all()?;
-        let pid_path = runtime_dir.join("daemon.pid");
-        std::fs::write(&pid_path, &owner_pid)?;
-        std::fs::write(
-            runtime_dir.join("startup.marker"),
-            OffsetDateTime::now_utc().to_string(),
-        )?;
-        Ok(RuntimeLock {
-            lock_path,
-            pid_path,
-            clean_marker_path: runtime_dir.join("clean-shutdown.marker"),
-            _file: file,
-        })
+            LockCreateOutcome::Io(error) => Err(EngineError::Io(error)),
+        }
+    }
+
+    /// Runs one bounded stale-owner recovery attempt without acquiring.
+    ///
+    /// Client-side startup (which spawns the daemon child that will acquire)
+    /// delegates unlink decisions to this lifecycle-owned protocol instead of
+    /// implementing a second removal policy. Returns `Ok(true)` only when a
+    /// stale lock proven to belong to a dead owner of this runtime root was
+    /// reclaimed, `Ok(false)` when no lock needs recovery, and a typed
+    /// contention/failure error otherwise. Recovery errors are never
+    /// collapsed to `false`.
+    pub fn try_recover_stale_single_instance(
+        &self,
+        observations: &SingleInstanceObservations,
+    ) -> Result<bool, EngineError> {
+        recover_stale_single_instance_lock(&self.data_root, observations)
     }
 
     pub fn status(&self) -> Result<Value, EngineError> {
@@ -250,134 +278,813 @@ impl LifecycleService {
     }
 }
 
-/// Attempts to recover a provably-dead single-instance owner.
+/// Owner observations supplied by app startup paths for one bound runtime
+/// root.
+///
+/// File evidence distinguishes a missing file (no evidence) from an
+/// unreadable one (refuse mutation) and from present bytes. The lifecycle
+/// owner re-reads the same directory itself; caller evidence that no longer
+/// matches local state proves the world rotated and refuses mutation.
+/// `publication_pid` is the app-validated publication owner: it supplies an
+/// observation, never authentication.
+#[derive(Clone, Debug)]
+pub struct SingleInstanceObservations {
+    pub lock: SingleInstanceFileEvidence,
+    pub pid_file: SingleInstanceFileEvidence,
+    pub publication_pid: Option<u32>,
+}
+
+/// One observed file state: missing, inaccessible, or present bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SingleInstanceFileEvidence {
+    Missing,
+    Inaccessible { detail: String },
+    Present(Vec<u8>),
+}
+
+impl SingleInstanceObservations {
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            lock: SingleInstanceFileEvidence::Missing,
+            pid_file: SingleInstanceFileEvidence::Missing,
+            publication_pid: None,
+        }
+    }
+
+    #[must_use]
+    pub fn publication_owner(pid: u32) -> Self {
+        Self {
+            lock: SingleInstanceFileEvidence::Missing,
+            pid_file: SingleInstanceFileEvidence::Missing,
+            publication_pid: Some(pid),
+        }
+    }
+
+    /// Reads local evidence for the bound runtime directory. Missing and
+    /// inaccessible files are different outcomes; nothing here decides.
+    pub fn read(runtime_dir: &Path) -> Self {
+        Self {
+            lock: read_file_evidence(&runtime_dir.join("daemon.lock")),
+            pid_file: read_file_evidence(&runtime_dir.join("daemon.pid")),
+            publication_pid: None,
+        }
+    }
+}
+
+/// Attempts the one lifecycle-owned recovery of a provably-dead
+/// single-instance owner for `runtime_root`.
 ///
 /// `runtime_root` is the data root whose `runtime/` subdirectory holds
 /// `daemon.lock`, `daemon.pid`, `startup.marker`, and
 /// `clean-shutdown.marker`.
 ///
-/// Returns `true` only when a stale `daemon.lock` (plus its `daemon.pid`)
-/// was removed because the recorded owner PID is provably dead and the
-/// marker pair reports an unclean prior owner (`startup.marker` present
-/// without `clean-shutdown.marker`, mirroring
-/// `StartupRecoveryService::scan`). Returns `false` — removing nothing —
-/// when no lock file exists, the owner PID is alive, the shutdown was
-/// clean, the recorded PID is missing or unparseable, the liveness probe
-/// errors, or the lock changed under observation.
-pub fn recover_stale_single_instance_lock(runtime_root: &Path) -> bool {
+/// Returns `Ok(true)` only when a stale `daemon.lock` was reclaimed after
+/// the recorded owner PID was proven dead for this exact runtime root:
+/// every present identity source (PID file, lock bytes, app-validated
+/// publication) agrees on one PID, the liveness probe reports that PID
+/// dead twice, and the lock file object still matches the validated
+/// snapshot (byte content and platform object identity) at removal and at
+/// exclusive re-creation, so two contenders cannot both reclaim and a stale
+/// observer cannot unlink a replacement lock.
+///
+/// Returns `Ok(false)` — removing nothing — when no lock file exists.
+/// A live owner, contradictory or malformed identity, inaccessible or
+/// unknown-owner evidence, a replaced lock, or an unsupported platform
+/// refuses mutation with a typed `SingleInstanceContention` error; genuine
+/// I/O failures surface as `EngineError::Io`. The previous owner's clean
+/// indication never decides recovery: a historic clean marker cannot make a
+/// later crashed owner unrecoverable, and an ambiguous lineage is never
+/// treated as clean.
+pub fn recover_stale_single_instance_lock(
+    runtime_root: &Path,
+    observations: &SingleInstanceObservations,
+) -> Result<bool, EngineError> {
     let runtime_dir = runtime_root.join("runtime");
     let lock_path = runtime_dir.join("daemon.lock");
-    let Ok(lock_snapshot) = std::fs::read(&lock_path) else {
-        return false;
-    };
-    let unclean_prior_owner = runtime_dir.join("startup.marker").is_file()
-        && !runtime_dir.join("clean-shutdown.marker").exists();
-    if !unclean_prior_owner {
-        return false;
-    }
     let pid_path = runtime_dir.join("daemon.pid");
-    let pid_snapshot = std::fs::read(&pid_path).ok();
-    let Some(owner_pid) = parse_single_instance_owner_pid(pid_snapshot.as_deref())
-        .or_else(|| parse_single_instance_owner_pid(Some(lock_snapshot.as_slice())))
-    else {
-        return false;
-    };
-    if single_instance_owner_is_alive(owner_pid) != Some(false) {
-        return false;
-    }
-    if std::fs::read(&lock_path).ok().as_deref() != Some(lock_snapshot.as_slice()) {
-        return false;
-    }
-    match &pid_snapshot {
-        Some(snapshot) if std::fs::read(&pid_path).ok().as_deref() == Some(snapshot.as_slice()) => {
+    let local = SingleInstanceObservations::read(&runtime_dir);
+    require_no_rotation(&lock_path, "daemon.lock", &observations.lock, &local.lock)?;
+    require_no_rotation(
+        &lock_path,
+        "daemon.pid",
+        &observations.pid_file,
+        &local.pid_file,
+    )?;
+    let lock_snapshot = match &local.lock {
+        SingleInstanceFileEvidence::Present(bytes) => bytes.clone(),
+        SingleInstanceFileEvidence::Missing => return Ok(false),
+        SingleInstanceFileEvidence::Inaccessible { detail } => {
+            return Err(single_instance_contention(
+                &lock_path,
+                SingleInstanceRefusal::InaccessibleEvidence,
+                format!("cannot read daemon.lock: {detail}"),
+            ));
         }
-        Some(_) => return false,
-        None if pid_path.exists() => return false,
-        None => {}
+    };
+    let pid_snapshot = match &local.pid_file {
+        SingleInstanceFileEvidence::Present(bytes) => Some(bytes.clone()),
+        SingleInstanceFileEvidence::Missing => None,
+        SingleInstanceFileEvidence::Inaccessible { detail } => {
+            return Err(single_instance_contention(
+                &lock_path,
+                SingleInstanceRefusal::InaccessibleEvidence,
+                format!("cannot read daemon.pid: {detail}"),
+            ));
+        }
+    };
+    let owner_pid = agree_single_owner_pid(
+        &lock_path,
+        pid_snapshot.as_deref(),
+        Some(lock_snapshot.as_slice()),
+        observations.publication_pid,
+    )?;
+    probe_owner_dead(&lock_path, owner_pid)?;
+    // Re-verify the validated snapshot immediately before mutation: byte
+    // equality against the snapshot plus existence-serialized removal plus
+    // exclusive re-creation is the serialization. (File-index object
+    // identity is unavailable: `MetadataExt::file_index` is unstable
+    // (`windows_by_handle`) on the pinned toolchain and `unsafe_code` is
+    // forbidden workspace-wide, so a raw Win32 identity query cannot live
+    // here; the post-creation ownership proof below closes the residual
+    // replacement window instead — see `path_names_owned_lock`.)
+    if std::fs::read(&lock_path).ok().as_deref() != Some(lock_snapshot.as_slice()) {
+        return Err(single_instance_contention(
+            &lock_path,
+            SingleInstanceRefusal::ReplacementDetected,
+            "daemon.lock was replaced during stale-owner validation; refusing removal",
+        ));
     }
-    if single_instance_owner_is_alive(owner_pid) != Some(false) {
-        return false;
+    if pid_snapshot.is_some() {
+        match std::fs::read(&pid_path).ok() {
+            Some(current) if Some(current.as_slice()) == pid_snapshot.as_deref() => {}
+            _ => {
+                return Err(single_instance_contention(
+                    &lock_path,
+                    SingleInstanceRefusal::ReplacementDetected,
+                    "daemon.pid was replaced during stale-owner validation; refusing removal",
+                ));
+            }
+        }
+    } else if pid_path.exists() {
+        return Err(single_instance_contention(
+            &lock_path,
+            SingleInstanceRefusal::ReplacementDetected,
+            "daemon.pid appeared during stale-owner validation; refusing removal",
+        ));
     }
-    if std::fs::remove_file(&lock_path).is_err() {
-        return false;
+    probe_owner_dead(&lock_path, owner_pid)?;
+    match std::fs::remove_file(&lock_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(single_instance_contention(
+                &lock_path,
+                SingleInstanceRefusal::ReplacementDetected,
+                "daemon.lock vanished during stale-owner recovery; a competing starter reclaimed it",
+            ));
+        }
+        Err(error) => return Err(EngineError::Io(error)),
     }
-    if std::fs::read(&pid_path).ok().as_deref() == pid_snapshot.as_deref() {
+    if let Some(snapshot) = pid_snapshot.as_deref()
+        && std::fs::read(&pid_path).ok().as_deref() == Some(snapshot)
+    {
         match std::fs::remove_file(&pid_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return false,
+            Err(error) => return Err(EngineError::Io(error)),
         }
     }
-    true
+    Ok(true)
 }
 
-fn create_single_instance_lock_file(lock_path: &Path) -> Result<File, EngineError> {
-    OpenOptions::new()
+/// Establishes coherent owner state on a freshly created exclusive lock.
+///
+/// Writes the owner PID through the owned handle, proves the path still
+/// names the created owner bytes, records the PID file, retires the
+/// previous owner's clean indication, and writes the new owner-scoped
+/// startup state — all under the same ownership. A halfway failure removes
+/// only objects proven to belong to this attempt and reports the cleanup
+/// disposition with the primary failure, so the next contender meets a
+/// recoverable state.
+///
+/// Serialization rests on the platform's exclusive-creation primitive:
+/// exactly one `create_new` succeeds, every removal re-proves the expected
+/// bytes first, and a final triple verification (lock bytes, PID bytes,
+/// startup owner) gates the return, so a stale observer that unlinked a
+/// replacement lock meets a verification failure instead of becoming a
+/// second owner.
+fn establish_single_instance_ownership(
+    runtime_dir: &Path,
+    lock_path: &Path,
+    mut file: File,
+) -> Result<RuntimeLock, EngineError> {
+    let owner_pid = std::process::id();
+    let owner_text = owner_pid.to_string();
+    let pid_path = runtime_dir.join("daemon.pid");
+    let clean_marker_path = runtime_dir.join("clean-shutdown.marker");
+    let startup_marker_path = runtime_dir.join("startup.marker");
+    if file
+        .write_all(owner_text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .is_err()
+    {
+        drop(file);
+        let cleanup = abandon_partial_claim(
+            lock_path,
+            &pid_path,
+            &startup_marker_path,
+            &clean_marker_path,
+            owner_pid,
+            MarkerBackup::Unknown,
+            MarkerBackup::Unknown,
+        );
+        return Err(EngineError::SingleInstanceAcquisitionFailed {
+            stage: "claim-lock".to_owned(),
+            detail: format!("cannot record the owner PID in the created lock; {cleanup}"),
+        });
+    }
+    if !path_names_owned_lock(lock_path, owner_text.as_bytes()) {
+        return Err(single_instance_contention(
+            lock_path,
+            SingleInstanceRefusal::ReplacementDetected,
+            "the lock path no longer names the created owner bytes; refusing to proceed on a replacement lock",
+        ));
+    }
+    if let Err(error) = std::fs::write(&pid_path, &owner_text) {
+        let cleanup = abandon_partial_claim(
+            lock_path,
+            &pid_path,
+            &startup_marker_path,
+            &clean_marker_path,
+            owner_pid,
+            MarkerBackup::Unknown,
+            MarkerBackup::Unknown,
+        );
+        return Err(EngineError::SingleInstanceAcquisitionFailed {
+            stage: "record-pid".to_owned(),
+            detail: format!("cannot record {error}; {cleanup}"),
+        });
+    }
+    let backups = establish_owner_markers(
+        lock_path,
+        &pid_path,
+        &startup_marker_path,
+        &clean_marker_path,
+        owner_pid,
+    )?;
+    if !verify_owned_establishment(lock_path, &pid_path, &startup_marker_path, owner_pid) {
+        let cleanup = abandon_partial_claim(
+            lock_path,
+            &pid_path,
+            &startup_marker_path,
+            &clean_marker_path,
+            owner_pid,
+            backups.clean,
+            backups.startup,
+        );
+        return Err(single_instance_contention(
+            lock_path,
+            SingleInstanceRefusal::ReplacementDetected,
+            format!(
+                "ownership verification failed after establishment; a replacement won the race; {cleanup}"
+            ),
+        ));
+    }
+    Ok(RuntimeLock {
+        lock_path: lock_path.to_path_buf(),
+        pid_path,
+        clean_marker_path,
+        owner_pid,
+        _file: file,
+    })
+}
+
+/// Owner-scoped marker state changes, run under the freshly created
+/// exclusive lock: retire the previous owner's clean indication, then
+/// record the new owner-scoped startup state. Any failure abandons the
+/// partial claim (removing only this attempt's objects) and reports the
+/// cleanup disposition with the primary failure.
+#[allow(clippy::too_many_arguments)]
+fn establish_owner_markers(
+    lock_path: &Path,
+    pid_path: &Path,
+    startup_marker_path: &Path,
+    clean_marker_path: &Path,
+    owner_pid: u32,
+) -> Result<OwnerMarkerBackups, EngineError> {
+    let fail = |stage: &str, detail: String, clean: MarkerBackup, startup: MarkerBackup| {
+        let cleanup = abandon_partial_claim(
+            lock_path,
+            pid_path,
+            startup_marker_path,
+            clean_marker_path,
+            owner_pid,
+            clean,
+            startup,
+        );
+        EngineError::SingleInstanceAcquisitionFailed {
+            stage: stage.to_owned(),
+            detail: format!("{detail}; {cleanup}"),
+        }
+    };
+    let clean_backup = match MarkerBackup::capture(clean_marker_path) {
+        Ok(backup) => backup,
+        Err(detail) => {
+            return Err(fail(
+                "retire-clean-marker",
+                format!("cannot inspect the previous clean indication: {detail}"),
+                MarkerBackup::Unknown,
+                MarkerBackup::Unknown,
+            ));
+        }
+    };
+    if let Err(error) = remove_optional_file(clean_marker_path) {
+        return Err(fail(
+            "retire-clean-marker",
+            format!("cannot retire the previous clean indication: {error}"),
+            clean_backup,
+            MarkerBackup::Unknown,
+        ));
+    }
+    let startup_backup = match MarkerBackup::capture(startup_marker_path) {
+        Ok(backup) => backup,
+        Err(detail) => {
+            return Err(fail(
+                "record-startup",
+                format!("cannot inspect the previous startup state: {detail}"),
+                clean_backup,
+                MarkerBackup::Unknown,
+            ));
+        }
+    };
+    if let Err(error) = std::fs::write(startup_marker_path, format_owner_marker(owner_pid)) {
+        return Err(fail(
+            "record-startup",
+            format!("cannot record owner startup state: {error}"),
+            clean_backup,
+            startup_backup,
+        ));
+    }
+    Ok(OwnerMarkerBackups {
+        clean: clean_backup,
+        startup: startup_backup,
+    })
+}
+
+struct OwnerMarkerBackups {
+    clean: MarkerBackup,
+    startup: MarkerBackup,
+}
+
+/// Previous marker content captured before an owned overwrite, so a halfway
+/// failure can restore exactly what it found. `Unknown` means the previous
+/// state was never established: leave the marker alone.
+#[derive(Clone)]
+enum MarkerBackup {
+    Unknown,
+    WasMissing,
+    Previous(Vec<u8>),
+}
+
+impl MarkerBackup {
+    fn capture(path: &Path) -> Result<Self, String> {
+        match read_optional_bytes(path) {
+            Ok(None) => Ok(Self::WasMissing),
+            Ok(Some(bytes)) => Ok(Self::Previous(bytes)),
+            Err(detail) => Err(detail),
+        }
+    }
+}
+
+/// Final establishment gate: the lock path, the PID file, and the startup
+/// marker must all name this owner at once. Any mismatch means a competing
+/// starter replaced our objects after our last check; the caller unwinds
+/// and refuses instead of running as a second owner.
+fn verify_owned_establishment(
+    lock_path: &Path,
+    pid_path: &Path,
+    startup_marker_path: &Path,
+    owner_pid: u32,
+) -> bool {
+    let owner_text = owner_pid.to_string();
+    path_names_owned_lock(lock_path, owner_text.as_bytes())
+        && std::fs::read(pid_path).ok().as_deref() == Some(owner_text.as_bytes())
+        && std::fs::read(startup_marker_path)
+            .ok()
+            .is_some_and(|current| parse_owner_marker(&current) == Some(owner_pid))
+}
+
+/// Removes only objects proven to belong to the failed acquisition attempt
+/// and restores the previous marker indications when they were captured.
+/// Never touches objects owned by anyone else; reports what was left behind
+/// so the primary failure preserves its cleanup uncertainty.
+#[allow(clippy::too_many_arguments)]
+fn abandon_partial_claim(
+    lock_path: &Path,
+    pid_path: &Path,
+    startup_marker_path: &Path,
+    clean_marker_path: &Path,
+    owner_pid: u32,
+    clean_backup: MarkerBackup,
+    startup_backup: MarkerBackup,
+) -> String {
+    let owner_text = owner_pid.to_string();
+    let mut notes: Vec<String> = Vec::new();
+    if path_names_owned_lock(lock_path, owner_text.as_bytes()) {
+        match std::fs::remove_file(lock_path) {
+            Ok(()) => notes.push("removed own lock".to_owned()),
+            Err(error) => notes.push(match error.kind() {
+                std::io::ErrorKind::NotFound => "own lock already gone".to_owned(),
+                _ => "own lock removal failed; residue remains for bounded recovery".to_owned(),
+            }),
+        }
+    } else {
+        notes.push("lock left in place: not provably this attempt".to_owned());
+    }
+    match std::fs::read(pid_path).ok() {
+        Some(current) if current == owner_text.as_bytes() => match std::fs::remove_file(pid_path) {
+            Ok(()) => notes.push("removed own PID file".to_owned()),
+            Err(_) => notes.push("own PID file removal failed; residue remains".to_owned()),
+        },
+        _ => notes.push("PID file left in place: not provably this attempt".to_owned()),
+    }
+    restore_marker_or_remove(
+        startup_marker_path,
+        startup_backup,
+        owner_pid,
+        "startup marker",
+        &mut notes,
+    );
+    restore_marker_or_remove(
+        clean_marker_path,
+        clean_backup,
+        owner_pid,
+        "clean marker",
+        &mut notes,
+    );
+    format!("cleanup: {}", notes.join("; "))
+}
+
+fn restore_marker_or_remove(
+    path: &Path,
+    backup: MarkerBackup,
+    owner_pid: u32,
+    role: &str,
+    notes: &mut Vec<String>,
+) {
+    match backup {
+        MarkerBackup::Unknown => {
+            notes.push(format!("{role} left in place: previous state unknown"));
+        }
+        MarkerBackup::WasMissing => {
+            let own = std::fs::read(path)
+                .ok()
+                .is_some_and(|current| parse_owner_marker(&current) == Some(owner_pid));
+            if own {
+                match std::fs::remove_file(path) {
+                    Ok(()) => notes.push(format!("removed own {role}")),
+                    Err(_) => notes.push(format!("own {role} removal failed; residue remains")),
+                }
+            } else {
+                notes.push(format!("{role} left in place: not provably this attempt"));
+            }
+        }
+        MarkerBackup::Previous(previous) => match std::fs::write(path, &previous) {
+            Ok(()) => notes.push(format!("restored previous {role}")),
+            Err(_) => {
+                notes.push(format!(
+                    "previous {role} restore failed; disposition uncertain"
+                ));
+            }
+        },
+    }
+}
+
+/// Exclusive-creation outcome. `Exists` means a competing starter holds the
+/// path; only the lifecycle-owned recovery protocol may act on it.
+enum LockCreateOutcome {
+    Created(File),
+    Exists,
+    Io(std::io::Error),
+}
+
+fn create_single_instance_lock_file(lock_path: &Path) -> LockCreateOutcome {
+    match OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(lock_path)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                EngineError::ServiceNotReady {
-                    service: "lifecycle".to_owned(),
-                    reason: format!(
-                        "single-instance lock already exists: {}",
-                        lock_path.display()
-                    ),
-                }
-            } else {
-                EngineError::Io(error)
-            }
-        })
-}
-
-fn is_single_instance_lock_collision(error: &EngineError) -> bool {
-    matches!(
-        error,
-        EngineError::ServiceNotReady { service, .. } if service == "lifecycle"
-    )
-}
-
-fn parse_single_instance_owner_pid(bytes: Option<&[u8]>) -> Option<u32> {
-    let text = std::str::from_utf8(bytes?).ok()?;
-    let pid: u32 = text.trim().parse().ok()?;
-    if pid == 0 {
-        return None;
+    {
+        Ok(file) => LockCreateOutcome::Created(file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            LockCreateOutcome::Exists
+        }
+        Err(error) => LockCreateOutcome::Io(error),
     }
-    Some(pid)
+}
+
+fn single_instance_contention(
+    lock_path: &Path,
+    refusal: SingleInstanceRefusal,
+    detail: impl Into<String>,
+) -> EngineError {
+    EngineError::SingleInstanceContention {
+        lock_path: lock_path.to_path_buf(),
+        refusal,
+        detail: detail.into(),
+    }
+}
+
+fn read_file_evidence(path: &Path) -> SingleInstanceFileEvidence {
+    match std::fs::read(path) {
+        Ok(bytes) => SingleInstanceFileEvidence::Present(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            SingleInstanceFileEvidence::Missing
+        }
+        Err(error) => SingleInstanceFileEvidence::Inaccessible {
+            detail: error.to_string(),
+        },
+    }
+}
+
+/// Refuses when caller-supplied present evidence no longer matches the
+/// locally re-read state: the world rotated between observation and
+/// decision, so acting would risk a replacement owner's objects. A caller
+/// observation of a now-vanished file is not a contradiction — there is
+/// simply nothing left to unlink.
+fn require_no_rotation(
+    lock_path: &Path,
+    role: &str,
+    observed: &SingleInstanceFileEvidence,
+    local: &SingleInstanceFileEvidence,
+) -> Result<(), EngineError> {
+    match (observed, local) {
+        (
+            SingleInstanceFileEvidence::Present(expected),
+            SingleInstanceFileEvidence::Present(actual),
+        ) if expected != actual => Err(single_instance_contention(
+            lock_path,
+            SingleInstanceRefusal::ContradictoryIdentity,
+            format!("{role} changed between observation and decision; refusing removal"),
+        )),
+        (SingleInstanceFileEvidence::Present(_), SingleInstanceFileEvidence::Missing) => {
+            Err(single_instance_contention(
+                lock_path,
+                SingleInstanceRefusal::ReplacementDetected,
+                format!("{role} vanished between observation and decision; refusing removal"),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Binds every present identity source to exactly one owner PID.
+/// Empty byte sources carry no evidence (a halfway write), never identity;
+/// non-empty unparseable sources, zero PIDs, and disagreements between the
+/// PID file, the lock bytes, and the app-validated publication all refuse
+/// mutation instead of guessing.
+fn agree_single_owner_pid(
+    lock_path: &Path,
+    pid_file_bytes: Option<&[u8]>,
+    lock_bytes: Option<&[u8]>,
+    publication_pid: Option<u32>,
+) -> Result<u32, EngineError> {
+    let mut candidates = Vec::new();
+    if let Some(bytes) = pid_file_bytes
+        && let Some(pid) = parse_owner_pid_bytes(bytes, "daemon.pid", lock_path)?
+    {
+        candidates.push(pid);
+    }
+    if let Some(bytes) = lock_bytes
+        && let Some(pid) = parse_owner_pid_bytes(bytes, "daemon.lock", lock_path)?
+    {
+        candidates.push(pid);
+    }
+    if let Some(pid) = publication_pid {
+        candidates.push(pid);
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [pid] => Ok(*pid),
+        [] => Err(single_instance_contention(
+            lock_path,
+            SingleInstanceRefusal::UnknownOwner,
+            "no owner PID in the PID file, the lock, or the publication; refusing unproven removal",
+        )),
+        _ => Err(single_instance_contention(
+            lock_path,
+            SingleInstanceRefusal::ContradictoryIdentity,
+            format!("identity sources disagree on the lock owner {candidates:?}; refusing removal"),
+        )),
+    }
+}
+
+/// Parses one identity source. Empty content is absent evidence (`None`);
+/// anything non-empty that is not a non-zero PID is malformed and refuses.
+fn parse_owner_pid_bytes(
+    bytes: &[u8],
+    role: &str,
+    lock_path: &Path,
+) -> Result<Option<u32>, EngineError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        single_instance_contention(
+            lock_path,
+            SingleInstanceRefusal::MalformedIdentity,
+            format!("{role} owner identity is not UTF-8; refusing removal"),
+        )
+    })?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let pid = trimmed.parse::<u32>().map_err(|_| {
+        single_instance_contention(
+            lock_path,
+            SingleInstanceRefusal::MalformedIdentity,
+            format!("{role} owner identity is not a PID; refusing removal"),
+        )
+    })?;
+    if pid == 0 {
+        return Err(single_instance_contention(
+            lock_path,
+            SingleInstanceRefusal::MalformedIdentity,
+            format!("{role} names the impossible zero PID; refusing removal"),
+        ));
+    }
+    Ok(Some(pid))
+}
+
+/// Requires the agreed owner PID to be provably dead. A live owner, a
+/// denied liveness probe, and an unsupported platform all refuse takeover;
+/// only an observed death of the bound owner authorizes it. PID reuse can
+/// never authorize: a recycled live PID reports live and refuses.
+fn probe_owner_dead(lock_path: &Path, owner_pid: u32) -> Result<(), EngineError> {
+    match probe_owner_liveness(owner_pid) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(single_instance_contention(
+            lock_path,
+            SingleInstanceRefusal::LiveOwner,
+            format!("owner PID {owner_pid} is alive; refusing competing startup"),
+        )),
+        Err(detail) => Err(single_instance_contention(
+            lock_path,
+            liveness_refusal(),
+            format!("cannot prove owner PID {owner_pid} dead: {detail}"),
+        )),
+    }
 }
 
 #[cfg(windows)]
-fn single_instance_owner_is_alive(pid: u32) -> Option<bool> {
-    eliot_windows_ipc::process_is_alive(pid).ok()
+fn probe_owner_liveness(pid: u32) -> Result<bool, String> {
+    eliot_windows_ipc::process_is_alive(pid).map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+fn liveness_refusal() -> SingleInstanceRefusal {
+    SingleInstanceRefusal::InaccessibleEvidence
 }
 
 #[cfg(not(windows))]
-fn single_instance_owner_is_alive(_pid: u32) -> Option<bool> {
-    None
+fn probe_owner_liveness(_pid: u32) -> Result<bool, String> {
+    Err("single-instance identity recovery is a Windows-runtime concern".to_owned())
+}
+
+#[cfg(not(windows))]
+fn liveness_refusal() -> SingleInstanceRefusal {
+    SingleInstanceRefusal::UnsupportedPlatform
+}
+
+/// Platform file-object identity cannot back the ownership proof on the
+/// pinned toolchain: `MetadataExt::file_index`/`volume_serial_number` are
+/// unstable (`windows_by_handle`) on Rust 1.97.1 and `unsafe_code` is
+/// forbidden workspace-wide, so no raw Win32 identity query may live here.
+/// Ownership is proven by byte content instead: the agreed owner PID is
+/// unique among live processes, so a path carrying our PID bytes names our
+/// claim, and every removal re-proves those bytes first. Combined with
+/// exclusive creation (exactly one `create_new` succeeds) and the final
+/// triple verification in `establish_single_instance_ownership`, a stale
+/// observer cannot unlink a replacement lock without meeting a
+/// `ReplacementDetected` refusal instead of becoming a second owner.
+fn path_names_owned_lock(lock_path: &Path, owner_bytes: &[u8]) -> bool {
+    std::fs::read(lock_path).ok().as_deref() == Some(owner_bytes)
+}
+
+/// Reads an optional marker file. Missing is `Ok(None)`; any read failure
+/// is reported with its cause so owned setup can fail closed with the
+/// reason preserved. Missing and inaccessible stay different outcomes:
+/// only a missing marker lets setup proceed.
+fn read_optional_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+/// Removes a marker file that must already be absent-or-owned. A missing
+/// file is fine; any other removal error is returned.
+fn remove_optional_file(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Owner-scoped marker content binding the marker to one owner PID.
+/// Legacy bare-timestamp markers parse to `None`: historic and ambiguous,
+/// never attributed to any owner.
+fn format_owner_marker(owner_pid: u32) -> String {
+    format!(
+        "owner_pid={owner_pid}\nestablished_at={}\n",
+        OffsetDateTime::now_utc()
+    )
+}
+
+fn parse_owner_marker(bytes: &[u8]) -> Option<u32> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let pid = text
+        .lines()
+        .next()?
+        .strip_prefix("owner_pid=")?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    if pid == 0 { None } else { Some(pid) }
 }
 
 pub struct RuntimeLock {
     lock_path: PathBuf,
     pid_path: PathBuf,
     clean_marker_path: PathBuf,
+    owner_pid: u32,
     _file: File,
 }
 
 impl RuntimeLock {
+    /// Records a clean shutdown for this owner only, after IPC/publication
+    /// and owned database shutdown have actually completed (the caller
+    /// orders those first). Refuses to mark clean when the lock no longer
+    /// proves this owner: a successor's objects are never unlinked and
+    /// another owner is never marked clean. Missing and inaccessible lock
+    /// files are different outcomes: a missing lock is a lost ownership
+    /// refusal, a denied read refuses as inaccessible evidence.
     pub fn mark_clean_shutdown(&self) -> Result<(), EngineError> {
-        std::fs::write(
-            &self.clean_marker_path,
-            OffsetDateTime::now_utc().to_string(),
-        )?;
+        let owner_text = self.owner_pid.to_string();
+        match std::fs::read(&self.lock_path) {
+            Ok(current) if current == owner_text.as_bytes() => {}
+            Ok(_) => {
+                return Err(single_instance_contention(
+                    &self.lock_path,
+                    SingleInstanceRefusal::ReplacementDetected,
+                    "the lock no longer names this owner; refusing to mark another owner clean",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(single_instance_contention(
+                    &self.lock_path,
+                    SingleInstanceRefusal::ReplacementDetected,
+                    "the lock is gone; refusing to mark a lost ownership clean",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(single_instance_contention(
+                    &self.lock_path,
+                    SingleInstanceRefusal::InaccessibleEvidence,
+                    format!("cannot prove lock ownership: access denied: {error}"),
+                ));
+            }
+            Err(error) => return Err(EngineError::Io(error)),
+        }
+        if !(path_names_owned_lock(&self.lock_path, owner_text.as_bytes())
+            && std::fs::read(&self.pid_path).ok().as_deref() == Some(owner_text.as_bytes()))
+        {
+            return Err(single_instance_contention(
+                &self.lock_path,
+                SingleInstanceRefusal::ReplacementDetected,
+                "the lock or PID file no longer names this owner; refusing to mark another owner clean",
+            ));
+        }
+        std::fs::write(&self.clean_marker_path, format_owner_marker(self.owner_pid))?;
         Ok(())
     }
 }
 
 impl Drop for RuntimeLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.lock_path);
-        let _ = std::fs::remove_file(&self.pid_path);
+        // Release only owned resources: a successor's lock, PID file, or
+        // clean indication is never removed or written here. A paused stale
+        // recovery or a finishing old Drop therefore cannot delete the new
+        // owner's objects — every removal re-proves bytes and object
+        // identity first.
+        if path_names_owned_lock(&self.lock_path, self.owner_pid.to_string().as_bytes()) {
+            let _ = std::fs::remove_file(&self.lock_path);
+        }
+        if std::fs::read(&self.pid_path).ok().as_deref()
+            == Some(self.owner_pid.to_string().as_bytes())
+        {
+            let _ = std::fs::remove_file(&self.pid_path);
+        }
     }
 }
 

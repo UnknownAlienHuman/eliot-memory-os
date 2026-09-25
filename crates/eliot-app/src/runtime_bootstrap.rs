@@ -67,7 +67,9 @@ pub(crate) async fn ensure_daemon_ready(
         ),
         Err(error) => error.to_string(),
     };
-    let stale_runtime_recovered = recover_stale_runtime(&instance, protocol_version)?;
+    let stale_runtime_recovered = eliot_engine::LifecycleService::new(instance.publication_root())
+        .try_recover_stale_single_instance(&stale_owner_observations(&instance, protocol_version))
+        .context("recover stale Eliot daemon single-instance lock")?;
     let mut command = Command::new(governor);
     command
         .arg("--config")
@@ -140,116 +142,40 @@ async fn stop_owned_daemon(
     Ok(())
 }
 
-#[cfg(windows)]
-/// Removes a stale daemon single-instance lock whose owner PID is dead.
+/// Reads stale-owner observations for the lifecycle-owned single-instance
+/// recovery protocol without mutating anything.
 ///
-/// Shared by client-side `ensure_daemon_ready` recovery and daemon-side
-/// `run_daemon_instance` startup retry so both paths delegate to the same
-/// liveness/removal logic. Returns `Ok(true)` only when a stale lock was
-/// actually removed; refuses removal while the owner is alive.
-pub(crate) fn recover_stale_runtime(
+/// This replaces the former client-side unlink policy: lock/PID bytes are
+/// observed (missing and unreadable stay distinct) and the app-validated
+/// publication contributes its owner PID as one observation among others.
+/// The engine lifecycle owner re-reads the same directory, requires every
+/// present source to agree, proves the owner dead, and performs the single
+/// bounded recovery-to-reacquire attempt itself. A publication or PID
+/// string is never treated as authentication here.
+pub(crate) fn stale_owner_observations(
     instance: &RuntimeInstance,
     protocol_version: &str,
-) -> Result<bool> {
-    let lock_path = instance.runtime_dir().join("daemon.lock");
-    if !lock_path.is_file() {
-        return Ok(false);
+) -> eliot_engine::SingleInstanceObservations {
+    let runtime_dir = instance.runtime_dir();
+    eliot_engine::SingleInstanceObservations {
+        lock: read_owner_evidence(&runtime_dir.join("daemon.lock")),
+        pid_file: read_owner_evidence(&runtime_dir.join("daemon.pid")),
+        publication_pid: instance
+            .read_publication_any_state(protocol_version)
+            .ok()
+            .map(|publication| publication.daemon_pid),
     }
-    let lock_snapshot = std::fs::read(&lock_path)
-        .with_context(|| format!("read Eliot daemon lock {}", lock_path.display()))?;
-    let pid_path = instance.runtime_dir().join("daemon.pid");
-    let pid_snapshot = std::fs::read(&pid_path).ok();
-    let publication_snapshot = instance.read_publication_any_state(protocol_version).ok();
-    let owner_pid = pid_snapshot
-        .as_deref()
-        .filter(|bytes| !bytes.is_empty())
-        .map(|bytes| parse_pid(bytes, &pid_path))
-        .or_else(|| {
-            (!lock_snapshot.is_empty()).then(|| parse_pid(&lock_snapshot, &lock_path))
-        })
-        .transpose()?
-        .or_else(|| publication_snapshot.as_ref().map(|publication| publication.daemon_pid))
-        .context(
-            "Eliot daemon lock has no owner PID or publication; refusing unproven stale-lock removal",
-        )?;
-    if process_is_alive(owner_pid)? {
-        bail!(
-            "Eliot daemon pid {owner_pid} is alive but authenticated IPC is not ready; refusing competing startup"
-        );
-    }
-
-    if std::fs::read(&lock_path).ok().as_deref() != Some(lock_snapshot.as_slice()) {
-        bail!("Eliot daemon lock changed during stale-runtime recovery");
-    }
-    match &pid_snapshot {
-        Some(snapshot) if std::fs::read(&pid_path).ok().as_deref() == Some(snapshot.as_slice()) => {
-        }
-        Some(_) => bail!("Eliot daemon PID changed during stale-runtime recovery"),
-        None if pid_path.exists() => {
-            bail!("Eliot daemon PID appeared during stale-runtime recovery");
-        }
-        None => {}
-    }
-    if pid_snapshot.is_none()
-        && lock_snapshot.is_empty()
-        && let Some(observed) = &publication_snapshot
-    {
-        let current = instance.read_publication_any_state(protocol_version)?;
-        if current.runtime_id != observed.runtime_id
-            || current.auth_generation != observed.auth_generation
-        {
-            bail!("Eliot runtime publication rotated during stale-runtime recovery");
-        }
-    }
-    if process_is_alive(owner_pid)? {
-        bail!(
-            "Eliot daemon pid {owner_pid} became live during stale-runtime recovery; refusing lock removal"
-        );
-    }
-    if pid_snapshot.is_some() {
-        remove_file_if_present(&pid_path)?;
-    }
-    remove_file_if_present(&lock_path)?;
-    Ok(true)
 }
 
-#[cfg(windows)]
-fn parse_pid(bytes: &[u8], source: &Path) -> Result<u32> {
-    let text = std::str::from_utf8(bytes)
-        .with_context(|| format!("Eliot daemon PID source is not UTF-8: {}", source.display()))?;
-    let pid = text
-        .trim()
-        .parse::<u32>()
-        .with_context(|| format!("invalid Eliot daemon PID in {}", source.display()))?;
-    if pid == 0 {
-        bail!("invalid zero Eliot daemon PID in {}", source.display());
-    }
-    Ok(pid)
-}
-
-#[cfg(windows)]
-fn process_is_alive(pid: u32) -> Result<bool> {
-    eliot_windows_ipc::process_is_alive(pid)
-        .with_context(|| format!("verify liveness of Eliot daemon pid {pid}"))
-}
-
-#[cfg(not(windows))]
-/// Non-Windows counterpart: single-instance stale-lock recovery is a
-/// Windows-runtime concern, so this always reports no recovery.
-pub(crate) fn recover_stale_runtime(
-    _instance: &RuntimeInstance,
-    _protocol_version: &str,
-) -> Result<bool> {
-    Ok(false)
-}
-
-fn remove_file_if_present(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("remove stale runtime file {}", path.display()))
+fn read_owner_evidence(path: &Path) -> eliot_engine::SingleInstanceFileEvidence {
+    match std::fs::read(path) {
+        Ok(bytes) => eliot_engine::SingleInstanceFileEvidence::Present(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eliot_engine::SingleInstanceFileEvidence::Missing
         }
+        Err(error) => eliot_engine::SingleInstanceFileEvidence::Inaccessible {
+            detail: error.to_string(),
+        },
     }
 }
 

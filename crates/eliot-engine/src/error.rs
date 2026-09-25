@@ -1,9 +1,48 @@
+use std::path::PathBuf;
 use thiserror::Error;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SingleInstanceRefusal {
+    LiveOwner,
+    ContradictoryIdentity,
+    MalformedIdentity,
+    InaccessibleEvidence,
+    UnknownOwner,
+    AmbiguousLineage,
+    ReplacementDetected,
+    UnsupportedPlatform,
+}
+
+impl std::fmt::Display for SingleInstanceRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code = match self {
+            Self::LiveOwner => "live-owner",
+            Self::ContradictoryIdentity => "contradictory-identity",
+            Self::MalformedIdentity => "malformed-identity",
+            Self::InaccessibleEvidence => "inaccessible-evidence",
+            Self::UnknownOwner => "unknown-owner",
+            Self::AmbiguousLineage => "ambiguous-lineage",
+            Self::ReplacementDetected => "replacement-detected",
+            Self::UnsupportedPlatform => "unsupported-platform",
+        };
+        write!(formatter, "{code}")
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("service {service} is not ready: {reason}")]
     ServiceNotReady { service: String, reason: String },
+
+    #[error("single-instance lock contention at {lock_path}: {refusal} ({detail})")]
+    SingleInstanceContention {
+        lock_path: PathBuf,
+        refusal: SingleInstanceRefusal,
+        detail: String,
+    },
+
+    #[error("single-instance acquisition failed at {stage}: {detail}")]
+    SingleInstanceAcquisitionFailed { stage: String, detail: String },
 
     #[error("write rejected: {0}")]
     WriteRejected(String),
