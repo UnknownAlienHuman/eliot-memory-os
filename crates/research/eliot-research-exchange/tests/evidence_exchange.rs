@@ -725,10 +725,7 @@ fn exhausted_bundle_must_carry_budget_exhausted_gap() {
     // Below budget the same non-budget gaps still close: the gate keys off
     // exhaustion, not off the degraded disposition.
     let (mut fresh, fresh_job) = submitted_job();
-    let unexhausted = degraded_close(
-        &fresh_job,
-        vec![gap("src-b", CoverageGapKind::Timeout)],
-    );
+    let unexhausted = degraded_close(&fresh_job, vec![gap("src-b", CoverageGapKind::Timeout)]);
     unexhausted
         .validate_against(&request())
         .expect("valid below budget");
@@ -740,9 +737,7 @@ fn exhausted_bundle_must_carry_budget_exhausted_gap() {
     // closed instead of hiding the exhaustion.
     let req = request();
     let (mut exchange, job_id) = submitted_job();
-    exchange
-        .mark_running(&job_id, &fence())
-        .expect("running");
+    exchange.mark_running(&job_id, &fence()).expect("running");
     exchange
         .record_progress(&job_id, &fence(), req.budget_units)
         .expect("spend reaches budget");
@@ -763,8 +758,7 @@ fn exhausted_bundle_must_carry_budget_exhausted_gap() {
             ResearchContractError::InvalidDisposition
         ))
     ));
-    let hiding_unknown =
-        degraded_close(&job_id, vec![gap("src-b", CoverageGapKind::Unknown)]);
+    let hiding_unknown = degraded_close(&job_id, vec![gap("src-b", CoverageGapKind::Unknown)]);
     assert!(matches!(
         exchange.import_bundle(hiding_unknown),
         Err(ExchangeError::Contract(

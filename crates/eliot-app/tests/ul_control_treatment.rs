@@ -3,8 +3,8 @@ mod support;
 
 use eliot_types::{
     AgentId, CapsuleBuild, ClaimCardInput, ClaimId, CommandContext, ConceptKind, ConceptNode,
-    CueBinding, LegacyCueKindV1, CueMatchMode, CueStrength, DependencyManifest, EpistemicStatus,
-    InjectionReceipt, LifecycleStatus, ObservabilityKind, ProjectId, PyramidBuildStatus,
+    CueBinding, CueMatchMode, CueStrength, DependencyManifest, EpistemicStatus, InjectionReceipt,
+    LegacyCueKindV1, LifecycleStatus, ObservabilityKind, ProjectId, PyramidBuildStatus,
     PyramidTargetKind, RelationInput, RelationType, SemanticCommand, SubsystemCapsule, TaintClass,
     TaskId, UlArtifact, UlArtifactBatchRecordCommand, UlInjectionMode, UlTaskClassPolicy,
     Visibility, WriteId, ul_token_estimate,

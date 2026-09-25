@@ -19,8 +19,8 @@
 //! resolved identity so the owning observer can report without a live
 //! attach.
 
-use super::{ReactiveInjectionError, UseOutcome};
 use super::BridgeRunner;
+use super::{ReactiveInjectionError, UseOutcome};
 use eliot_agent_bridge_core::BridgeError;
 
 /// One observer handle resolved to its exact ledger identity.
@@ -90,9 +90,7 @@ impl BridgeRunner {
         let ledger_session = self
             .reactive_ledger
             .item_session(&resolved.item_id)
-            .ok_or_else(|| {
-                super::reactive_ledger_error(&ReactiveInjectionError::UnknownItem)
-            })?;
+            .ok_or_else(|| super::reactive_ledger_error(&ReactiveInjectionError::UnknownItem))?;
         if ledger_session != resolved.session_id {
             return Err(super::reactive_ledger_error(
                 &ReactiveInjectionError::IllegalTransition {
@@ -116,8 +114,8 @@ mod tests {
     use super::{ResolvedMemoryHandle, parse_memory_handle};
     use eliot_agent_bridge_core::{
         ActivationPortOutcome, ActivationPortResult, AttachRequest, DemandId, FencingToken,
-        Generation, HostActivationPort, PrincipalId, ProviderFailure, ProviderReadiness,
-        SessionId, TaskId, WorkUnitId,
+        Generation, HostActivationPort, PrincipalId, ProviderFailure, ProviderReadiness, SessionId,
+        TaskId, WorkUnitId,
     };
     use eliot_contracts::{EpochId, EpochLineageId};
 
@@ -125,8 +123,7 @@ mod tests {
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
     const TEST_SESSION: &str = "session-join-1";
-    const TEST_DIGEST: &str =
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const TEST_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     struct StaticActivation {
         result: ActivationPortResult,
@@ -268,10 +265,7 @@ mod tests {
             .reactive_receipt(&receipt_id)
             .expect("delivery issued a receipt");
         assert!(
-            matches!(
-                receipt.use_status,
-                UseOutcome::ObservedUse { .. }
-            ),
+            matches!(receipt.use_status, UseOutcome::ObservedUse { .. }),
             "later use status follows the item"
         );
     }

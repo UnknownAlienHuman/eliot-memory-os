@@ -70,7 +70,11 @@ fn production_dependency_selects_package(
                 .get("dependencies")
                 .and_then(toml::Value::as_table)
             {
-                scan_table(table, &format!("target.{target}.dependencies"), &mut matches);
+                scan_table(
+                    table,
+                    &format!("target.{target}.dependencies"),
+                    &mut matches,
+                );
             }
         }
     }
@@ -92,8 +96,7 @@ fn retire_candidate_disposition_is_recorded() -> TestResult {
 fn no_production_binary_selects_the_crate() -> TestResult {
     let root = workspace_root()?;
     let mut offenders = Vec::new();
-    let mut entries: Vec<_> =
-        std::fs::read_dir(root.join("bins"))?.collect::<Result<_, _>>()?;
+    let mut entries: Vec<_> = std::fs::read_dir(root.join("bins"))?.collect::<Result<_, _>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         let manifest = entry.path().join("Cargo.toml");

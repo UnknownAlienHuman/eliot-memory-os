@@ -16,10 +16,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use eliot_watchdog::{
     GapRecoveryReason, IndependentKernelSensor, SERVICE_NAME, SpoolAppendOutcome, SpoolError,
     WatchdogExportSink, WatchdogSpoolExportLimits, WatchdogSpoolPayload, export_once,
-    watchog_entry_views, watchdog_entry_views,
+    watchdog_entry_views, watchog_entry_views,
 };
 use eliot_watchdog_core::{
-    WatchdogSpoolAcknowledgement, WatchdogSpoolExportBatch, WatchdogSpoolEntryDisposition,
+    WatchdogSpoolAcknowledgement, WatchdogSpoolEntryDisposition, WatchdogSpoolExportBatch,
     WatchdogSpoolPayloadKind, WatchdogSpoolSinkDisposition, export_retry_identity_equal,
     is_duplicate_ack,
 };
@@ -194,7 +194,9 @@ fn export_through_admission_advances_once() {
         vec![2, 3]
     );
 
-    let ack = sink.submit(&probe).expect("rebuild terminal acknowledgement");
+    let ack = sink
+        .submit(&probe)
+        .expect("rebuild terminal acknowledgement");
     assert!(is_duplicate_ack(advanced, &ack));
     assert!(!is_duplicate_ack(0, &ack));
     let duplicate = sensor
@@ -219,9 +221,7 @@ fn export_through_admission_advances_once() {
         .retained_spool_entries_for_export_driver_test()
         .expect("read retained tail");
     assert_eq!(
-        tail.iter()
-            .map(|entry| entry.sequence)
-            .collect::<Vec<_>>(),
+        tail.iter().map(|entry| entry.sequence).collect::<Vec<_>>(),
         vec![3]
     );
 

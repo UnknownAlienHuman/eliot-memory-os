@@ -24,25 +24,21 @@ fn t04_touched_set_extracts_expected_cues() {
     );
 
     assert!(
-        observed
-            .iter()
-            .any(|cue| { cue.kind == LegacyCueKindV1::FilePath && cue.value == "src/net/session.rs" })
+        observed.iter().any(|cue| {
+            cue.kind == LegacyCueKindV1::FilePath && cue.value == "src/net/session.rs"
+        })
     );
+    assert!(observed.iter().any(|cue| {
+        cue.kind == LegacyCueKindV1::Symbol && cue.value == "net::session::connect"
+    }));
     assert!(
-        observed
-            .iter()
-            .any(|cue| { cue.kind == LegacyCueKindV1::Symbol && cue.value == "net::session::connect" })
+        observed.iter().any(|cue| {
+            cue.kind == LegacyCueKindV1::CommandPattern && cue.value == "cargo test"
+        })
     );
-    assert!(
-        observed
-            .iter()
-            .any(|cue| { cue.kind == LegacyCueKindV1::CommandPattern && cue.value == "cargo test" })
-    );
-    assert!(
-        observed
-            .iter()
-            .any(|cue| { cue.kind == LegacyCueKindV1::ErrorSignature && cue.value.starts_with("sig:") })
-    );
+    assert!(observed.iter().any(|cue| {
+        cue.kind == LegacyCueKindV1::ErrorSignature && cue.value.starts_with("sig:")
+    }));
 
     for index in 0..140 {
         registry.observe_arguments(

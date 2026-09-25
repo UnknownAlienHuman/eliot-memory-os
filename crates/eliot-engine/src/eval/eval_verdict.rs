@@ -17,7 +17,7 @@ use eliot_types::{
 };
 use time::OffsetDateTime;
 
-use super::{u32_count, u8_count};
+use super::{u8_count, u32_count};
 
 pub struct EvalVerdictService;
 

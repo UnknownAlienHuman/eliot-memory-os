@@ -34,8 +34,7 @@ use crate::{
     ApprovedGenerationRegistry, HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt,
     HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt, InstallationActivationApproval,
     InstallationError, PendingActivation, PendingActivationAbortReceipt, WindowsPathIdentity,
-    activation_terminal_digest,
-    candidate_manifest_digest, valid_installation_key,
+    activation_terminal_digest, candidate_manifest_digest, valid_installation_key,
 };
 
 pub(super) const REGISTRY_TABLE: TableDefinition<&str, &[u8]> =
@@ -441,11 +440,8 @@ impl RedbInstallationRegistry {
         plan_digest: &PlatformHandle,
         generation: &PlatformHandle,
     ) -> Result<ActivationCommitReceipt, InstallationError> {
-        self.load()?.read_committed_activation_receipt(
-            transaction_id,
-            plan_digest,
-            generation,
-        )
+        self.load()?
+            .read_committed_activation_receipt(transaction_id, plan_digest, generation)
     }
 
     /// Loads the sealed transaction and atomically stages its exact pending
@@ -1119,16 +1115,17 @@ impl RedbInstallationRegistry {
             if let Some(pending) = registry.pending_activation.as_ref() {
                 self.validate_host_owner_binding(host, pending)?;
                 if pending.approval != approval
-                    || pending.activation_intent_digest.as_ref()
-                        != Some(&activation_intent_digest)
+                    || pending.activation_intent_digest.as_ref() != Some(&activation_intent_digest)
                 {
                     return Err(InstallationError::IdentityConflict);
                 }
-            } else if let Some(receipt) = registry.aborted_activation_receipts.iter().find(|receipt| {
-                receipt.transaction_id == approval.transaction_id
-                    && receipt.plan_digest == approval.installer_plan_digest
-                    && receipt.generation == approval.generation
-            }) {
+            } else if let Some(receipt) =
+                registry.aborted_activation_receipts.iter().find(|receipt| {
+                    receipt.transaction_id == approval.transaction_id
+                        && receipt.plan_digest == approval.installer_plan_digest
+                        && receipt.generation == approval.generation
+                })
+            {
                 receipt.validate()?;
                 self.validate_host_owner_binding_for_abort_receipt(host, receipt)?;
                 if !receipt.approval.matches_approval(&approval)

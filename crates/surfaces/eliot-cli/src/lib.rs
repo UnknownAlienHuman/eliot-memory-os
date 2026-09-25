@@ -435,9 +435,7 @@ pub mod kernel_client {
         ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
         ProtocolVersion, RequestIdentity, ServerHello,
     };
-    pub use eliot_user_broker_core::{
-        OperatorLaunchReceipt, OperatorLaunchRestartReceipt,
-    };
+    pub use eliot_user_broker_core::{OperatorLaunchReceipt, OperatorLaunchRestartReceipt};
     use serde::Deserialize;
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
@@ -1079,22 +1077,21 @@ pub mod kernel_client {
                 "Kernel operator launch request identity is invalid".to_owned(),
             ));
         }
-        let envelope: OperatorLaunchWireEnvelope = serde_json::from_value(served.clone())
-            .map_err(|error| {
+        let envelope: OperatorLaunchWireEnvelope =
+            serde_json::from_value(served.clone()).map_err(|error| {
                 KernelClientError::UnknownOutcome(format!(
                     "Kernel operator launch reply is not a closed envelope: {error}"
                 ))
             })?;
         if envelope.operation_id != expected_operation_id {
             return Err(KernelClientError::UnknownOutcome(
-                "Kernel operator launch receipt identity does not match the request"
-                    .to_owned(),
+                "Kernel operator launch receipt identity does not match the request".to_owned(),
             ));
         }
         match envelope.status.as_str() {
             "admitted" => {
-                let receipt: OperatorLaunchReceipt =
-                    serde_json::from_value(envelope.receipt).map_err(|error| {
+                let receipt: OperatorLaunchReceipt = serde_json::from_value(envelope.receipt)
+                    .map_err(|error| {
                         KernelClientError::UnknownOutcome(format!(
                             "Kernel operator launch admitted receipt is not typed: {error}"
                         ))
@@ -1247,8 +1244,8 @@ pub mod kernel_client {
                 "status": "admitted",
                 "receipt": valid_operator_launch_receipt("op-launch-1"),
             });
-            let (status, receipt) = decode_operator_launch_receipt(&admitted, "op-launch-1")
-                .expect("admitted receipt");
+            let (status, receipt) =
+                decode_operator_launch_receipt(&admitted, "op-launch-1").expect("admitted receipt");
             assert_eq!(status, OperatorLaunchStatus::Admitted);
             assert_eq!(receipt, admitted["receipt"]);
             let restart = serde_json::json!({
@@ -1256,8 +1253,8 @@ pub mod kernel_client {
                 "status": "restart_required",
                 "receipt": valid_operator_restart_receipt("op-launch-2"),
             });
-            let (status, receipt) = decode_operator_launch_receipt(&restart, "op-launch-2")
-                .expect("restart receipt");
+            let (status, receipt) =
+                decode_operator_launch_receipt(&restart, "op-launch-2").expect("restart receipt");
             assert_eq!(status, OperatorLaunchStatus::RestartRequired);
             assert_eq!(receipt, restart["receipt"]);
         }
@@ -2460,9 +2457,7 @@ pub mod antigravity_terminal {
 
     /// Which surface produced one terminal view. The three views are compared
     /// for agreement; no origin is authoritative over another.
-    #[derive(
-        Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize,
-    )]
+    #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
     #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
     pub enum ViewOrigin {
         Supervisor,
@@ -2473,9 +2468,7 @@ pub mod antigravity_terminal {
     /// Projected attempt lifecycle mirroring canonical `AttemptState`
     /// (`crates/agent/eliot-agent-api/src/lib.rs:610`). No default, no
     /// completion inference.
-    #[derive(
-        Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize,
-    )]
+    #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
     #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
     pub enum ProjectedAttemptState {
         Admitted,
@@ -2509,9 +2502,7 @@ pub mod antigravity_terminal {
     /// Projected candidate disposition mirroring canonical `ResultDisposition`.
     /// There is no completion variant; the strongest positive is
     /// `CandidateSucceeded`.
-    #[derive(
-        Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize,
-    )]
+    #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
     #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
     pub enum ProjectedDisposition {
         CandidateSucceeded,

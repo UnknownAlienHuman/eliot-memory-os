@@ -9,10 +9,10 @@
 //! are both caller-provided. Absent either, there is nothing to drive and
 //! the caller must not call.
 
-use crate::dispatch_drive::map_invocation_result;
-use crate::dispatch_drive::{drive_admission, DispatchDriveResponse, DriveError};
-use crate::dispatch_material::ValidatedDispatchMaterial;
 use crate::WasmHostRunner;
+use crate::dispatch_drive::map_invocation_result;
+use crate::dispatch_drive::{DispatchDriveResponse, DriveError, drive_admission};
+use crate::dispatch_material::ValidatedDispatchMaterial;
 
 /// Drives one owner-admitted parent dispatch to the canonical response.
 ///

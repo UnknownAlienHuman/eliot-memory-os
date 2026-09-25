@@ -350,7 +350,11 @@ fn extract_cues(
                     .filter_map(Value::as_str)
                     .map(ToOwned::to_owned)
                     .collect::<Vec<_>>();
-                push_cue(observed, LegacyCueKindV1::CommandPattern, command_pattern(&argv));
+                push_cue(
+                    observed,
+                    LegacyCueKindV1::CommandPattern,
+                    command_pattern(&argv),
+                );
             }
             for child in values {
                 extract_cues(tool_name, key, child, observed);
@@ -359,7 +363,11 @@ fn extract_cues(
         Value::String(raw) if raw.len() <= MAX_TOUCHED_STRING_BYTES => {
             let field = key.unwrap_or_default();
             if is_path_key(field) && (field != "resource_ref" || looks_like_path(raw)) {
-                push_cue(observed, LegacyCueKindV1::FilePath, normalize_observed_path(raw));
+                push_cue(
+                    observed,
+                    LegacyCueKindV1::FilePath,
+                    normalize_observed_path(raw),
+                );
             } else if is_symbol_key(field) {
                 push_cue(observed, LegacyCueKindV1::Symbol, normalize_symbol(raw));
             } else if is_command_key(field) {
@@ -367,7 +375,11 @@ fn extract_cues(
                     .split_whitespace()
                     .map(ToOwned::to_owned)
                     .collect::<Vec<_>>();
-                push_cue(observed, LegacyCueKindV1::CommandPattern, command_pattern(&argv));
+                push_cue(
+                    observed,
+                    LegacyCueKindV1::CommandPattern,
+                    command_pattern(&argv),
+                );
             } else if is_signature_key(field) {
                 let signature = if raw.starts_with("sig:") {
                     raw.to_owned()

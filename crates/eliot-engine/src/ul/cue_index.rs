@@ -1,8 +1,8 @@
 use crate::EngineError;
 use eliot_store::CanonicalStore;
 use eliot_types::{
-    CognitiveProjectionReadState, CueIndexRow, LegacyCueKindV1, CueRecordSource, CueStrength,
-    CurrentStateRequest, MemoryRevision, ObservedCue, ProjectId, ReadConsistencyMode, cue_row_id,
+    CognitiveProjectionReadState, CueIndexRow, CueRecordSource, CueStrength, CurrentStateRequest,
+    LegacyCueKindV1, MemoryRevision, ObservedCue, ProjectId, ReadConsistencyMode, cue_row_id,
     normalize_binding, normalize_path, normalize_symbol, ul_token_estimate,
 };
 use serde::{Deserialize, Serialize};
@@ -344,7 +344,10 @@ fn matching_rows(shard: &ProjectCueShard, cues: &[ObservedCue]) -> Vec<(CueIndex
         if let Some(rows) = shard.exact.get(&(cue.kind, cue.value.clone())) {
             hits.extend(rows.iter().cloned().map(|row| (row, cue.clone())));
         }
-        if matches!(cue.kind, LegacyCueKindV1::FilePath | LegacyCueKindV1::DirPath) {
+        if matches!(
+            cue.kind,
+            LegacyCueKindV1::FilePath | LegacyCueKindV1::DirPath
+        ) {
             hits.extend(
                 shard
                     .dir_prefix

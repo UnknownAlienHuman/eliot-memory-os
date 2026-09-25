@@ -41,12 +41,12 @@ use crate::{
     AuthorityHandoffState, AuthorityRevocation, AuthorityRevocationReceipt,
     AuthoritySnapshotReceipt, CanonicalDisposition, CanonicalReconciliation,
     CapabilityGrantActivation, CapabilityGrantProjection, CapabilityGrantRevocation,
-    CapabilityIntroductionActivation, CapabilityIntroductionFence, CapabilityIntroductionProjection,
-    CapabilityIntroductionReceipt,
-    DeliveryAcknowledgement, DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity,
-    EpochLineage, GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
-    GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit, GrantClosureCommitReceipt,
-    GrantClosureProjection, HostRequestRecord, HostRequestState,
+    CapabilityIntroductionActivation, CapabilityIntroductionFence,
+    CapabilityIntroductionProjection, CapabilityIntroductionReceipt, DeliveryAcknowledgement,
+    DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity, EpochLineage,
+    GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
+    GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit,
+    GrantClosureCommitReceipt, GrantClosureProjection, HostRequestRecord, HostRequestState,
     JobCheckpoint, KernelAuthoritySnapshot, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
     NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationalMutationReceipt,
     OperationalPhase, OperationalRecordContext, OperationalRecordInput, OrsError,
@@ -4854,7 +4854,11 @@ impl RedbRecoveryStore {
             drop(write.open_table(DOCTOR_BUDGETS).map_err(storage)?);
             drop(write.open_table(RECOVERY_PROBLEMS).map_err(storage)?);
             drop(write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?);
-            drop(write.open_table(GRANT_GRAPH_REVISION_CURRENT).map_err(storage)?);
+            drop(
+                write
+                    .open_table(GRANT_GRAPH_REVISION_CURRENT)
+                    .map_err(storage)?,
+            );
             if initialize_resolution_schema {
                 let mut meta = write.open_table(META).map_err(storage)?;
                 meta.insert(
@@ -5492,8 +5496,7 @@ impl RedbRecoveryStore {
         let Some(value) = current.get(key.as_str()).map_err(storage)? else {
             return Ok(None);
         };
-        let row: DurableGrantGraphRevision =
-            decode_named(value.value(), "grant_graph_revision")?;
+        let row: DurableGrantGraphRevision = decode_named(value.value(), "grant_graph_revision")?;
         if row.root.as_str() != authority_root {
             return Err(OrsError::IntegrityProblem {
                 record_type: "grant_graph_revision",
@@ -6790,7 +6793,9 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             current
                 .get(key.as_str())
                 .map_err(storage)?
-                .map(|value| decode_named::<DurableGrantClosureRecord>(value.value(), "grant_closure"))
+                .map(|value| {
+                    decode_named::<DurableGrantClosureRecord>(value.value(), "grant_closure")
+                })
                 .transpose()?
         };
         if let Some(existing) = existing {
@@ -6801,9 +6806,9 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 });
             }
             if existing.commit == closure && existing.phase == phase {
-                return Ok(GrantClosureCommitReceipt::from_receipt(Self::closure_receipt_for(
-                    &existing,
-                )?));
+                return Ok(GrantClosureCommitReceipt::from_receipt(
+                    Self::closure_receipt_for(&existing)?,
+                ));
             }
             return Err(OrsError::DuplicateConflict);
         }
@@ -6816,7 +6821,9 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         let encoded = encode(&record)?;
         {
             let mut current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
-            current.insert(key.as_str(), encoded.as_str()).map_err(storage)?;
+            current
+                .insert(key.as_str(), encoded.as_str())
+                .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
         Ok(GrantClosureCommitReceipt::from_receipt(
@@ -6834,8 +6841,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         let Some(value) = current.get(key.as_str()).map_err(storage)? else {
             return Ok(None);
         };
-        let record: DurableGrantClosureRecord =
-            decode_named(value.value(), "grant_closure")?;
+        let record: DurableGrantClosureRecord = decode_named(value.value(), "grant_closure")?;
         if record.commit.operation_id.as_str() != operation_id.as_str() {
             return Err(OrsError::IntegrityProblem {
                 record_type: "grant_closure",
@@ -6871,8 +6877,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         let mut resolved_root: Option<String> = None;
         for row in current.iter().map_err(storage)? {
             let (key, value) = row.map_err(storage)?;
-            let record: DurableGrantClosureRecord =
-                decode_named(value.value(), "grant_closure")?;
+            let record: DurableGrantClosureRecord = decode_named(value.value(), "grant_closure")?;
             let expected = format!("grant_closure:{}", record.commit.operation_id.as_str());
             if key.value() != expected.as_str() {
                 return Err(OrsError::IntegrityProblem {

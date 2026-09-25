@@ -1023,10 +1023,7 @@ impl CoordinationOwner {
                 | WorkState::Running
                 | WorkState::Checkpointed
                 | WorkState::Reassigned => {
-                    unresolved_refs.push(format!(
-                        "work:{}:{:?}",
-                        item.work_item_id, item.state
-                    ));
+                    unresolved_refs.push(format!("work:{}:{:?}", item.work_item_id, item.state));
                 }
             }
         }
@@ -1037,20 +1034,18 @@ impl CoordinationOwner {
         unresolved_refs.dedup();
         terminal_event_bindings.sort();
         terminal_event_bindings.dedup();
-        let descendant_receipt_ref = if found
-            && unresolved_refs.is_empty()
-            && !terminal_event_bindings.is_empty()
-        {
-            // Content-address the joined immutable owner events, rather than
-            // terminal state labels or result strings. Their event references
-            // are also retained in artifact_refs for direct readback.
-            let digest_input = (task_id, state_fence, &terminal_event_bindings);
-            let bytes = canonical_json_bytes(&digest_input)
-                .map_err(|_| CoordinationError::InvalidState)?;
-            Some(format!("coordination:descendants:{}", sha256_hex(&bytes)))
-        } else {
-            None
-        };
+        let descendant_receipt_ref =
+            if found && unresolved_refs.is_empty() && !terminal_event_bindings.is_empty() {
+                // Content-address the joined immutable owner events, rather than
+                // terminal state labels or result strings. Their event references
+                // are also retained in artifact_refs for direct readback.
+                let digest_input = (task_id, state_fence, &terminal_event_bindings);
+                let bytes = canonical_json_bytes(&digest_input)
+                    .map_err(|_| CoordinationError::InvalidState)?;
+                Some(format!("coordination:descendants:{}", sha256_hex(&bytes)))
+            } else {
+                None
+            };
         if !found {
             unresolved_refs.push(format!("coordination:no-descendants:{task_id}"));
         }

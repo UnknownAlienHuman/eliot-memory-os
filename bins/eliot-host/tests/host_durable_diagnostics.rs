@@ -1533,6 +1533,12 @@ fn durable_26_actual_path_and_diff_guard() {
     // No duplicate evaluation: terminal emission sites are singular per code
     // (proven in case 22); phase observations are pure static literals with
     // no computed values to evaluate twice.
-    assert_eq!(fixture["allowed_diff"]["single_terminal_per_failed_op"].as_bool(), Some(true));
-    assert_eq!(fixture["allowed_diff"]["no_new_logging_subsystem"].as_bool(), Some(true));
+    assert_eq!(
+        fixture["allowed_diff"]["single_terminal_per_failed_op"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        fixture["allowed_diff"]["no_new_logging_subsystem"].as_bool(),
+        Some(true)
+    );
 }

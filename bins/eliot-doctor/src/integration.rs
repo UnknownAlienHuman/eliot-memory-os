@@ -507,11 +507,13 @@ mod tests {
         let value =
             verify_profile("demo", &expectation_path, &observation_path).expect("gate runs");
         assert_eq!(value["file_hash"]["ok"], false);
-        assert!(value["file_hash"]["gaps"]
-            .as_array()
-            .expect("gaps array")
-            .iter()
-            .any(|gap| gap == &missing));
+        assert!(
+            value["file_hash"]["gaps"]
+                .as_array()
+                .expect("gaps array")
+                .iter()
+                .any(|gap| gap == &missing)
+        );
         assert_eq!(value["installed"], false);
         assert_eq!(value["live"], false);
         assert_eq!(value["disposition"], "NOT_INSTALLED");

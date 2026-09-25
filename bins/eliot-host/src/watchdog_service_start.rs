@@ -234,7 +234,12 @@ where
                     // an unverifiable branch fails closed here. SCM liveness
                     // only, never a supervision proof. Read-only: no Job,
                     // kill-handle, or SCM stop is introduced.
-                    verify_watchdog_scm_running(registration, state, wait_hint_ms, process.as_ref())?;
+                    verify_watchdog_scm_running(
+                        registration,
+                        state,
+                        wait_hint_ms,
+                        process.as_ref(),
+                    )?;
                     return Ok(());
                 }
                 ServiceState::Starting => {

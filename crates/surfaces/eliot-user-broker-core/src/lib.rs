@@ -488,11 +488,9 @@ pub struct LaunchReceipt {
 /// authenticated Operator launch boundary.  The private [`OperationPermit`]
 /// is deliberately excluded: it remains inside [`UserBroker`] and cannot be
 /// manufactured by a UI, CLI, or wire decoder.
-pub const OPERATOR_LAUNCH_RECEIPT_WIRE_ID: &str =
-    "eliot.user-broker.operator-launch-receipt";
+pub const OPERATOR_LAUNCH_RECEIPT_WIRE_ID: &str = "eliot.user-broker.operator-launch-receipt";
 pub const OPERATOR_LAUNCH_RECEIPT_WIRE_VERSION: u16 = 1;
-pub const OPERATOR_LAUNCH_RESTART_WIRE_ID: &str =
-    "eliot.user-broker.operator-restart-receipt";
+pub const OPERATOR_LAUNCH_RESTART_WIRE_ID: &str = "eliot.user-broker.operator-restart-receipt";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -548,7 +546,9 @@ impl OperatorLaunchReceipt {
         if self.proof_ceiling != ProofCeiling::Observation
             || self.disposition != LaunchDisposition::Active
         {
-            return Err(BrokerError::InvalidField("operator_launch_receipt_disposition"));
+            return Err(BrokerError::InvalidField(
+                "operator_launch_receipt_disposition",
+            ));
         }
         self.process_receipt
             .validate()
@@ -596,7 +596,9 @@ impl OperatorLaunchRestartReceipt {
         hex_digest(&self.registration_digest, "operator_registration_digest")?;
         text(&self.fence_id, "operator_fence_id")?;
         if self.user_broker_epoch == 0 {
-            return Err(BrokerError::InvalidField("operator_restart_receipt_binding"));
+            return Err(BrokerError::InvalidField(
+                "operator_restart_receipt_binding",
+            ));
         }
         Ok(())
     }

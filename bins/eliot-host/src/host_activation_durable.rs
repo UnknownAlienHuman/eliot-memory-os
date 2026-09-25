@@ -937,11 +937,12 @@ impl HostComposition {
     ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 893/14 — pending activation abort requested.
         host_activation_observe("host.activation abort requested");
-        let activation_intent_digest = pending.activation_intent_digest.as_ref().ok_or_else(|| {
-            HostError::RecoveryRequired(
-                "pending activation has no transaction-owned intent digest".to_owned(),
-            )
-        })?;
+        let activation_intent_digest =
+            pending.activation_intent_digest.as_ref().ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "pending activation has no transaction-owned intent digest".to_owned(),
+                )
+            })?;
 
         // A prior exact receipt is the only replay acknowledgement.  It is
         // checked before any new mutation so a lost CAS response cannot cause

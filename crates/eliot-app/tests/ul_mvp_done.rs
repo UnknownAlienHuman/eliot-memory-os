@@ -3,8 +3,8 @@ mod support;
 
 use eliot_engine::{GitMiningService, ModuleCardService};
 use eliot_types::{
-    AgentId, ClaimId, CommandContext, CueBinding, LegacyCueKindV1, CueMatchMode, CueStrength,
-    InjectionReceipt, LifecycleStatus, MaterialPacketFrame, MemoryInfluenceTrace, ModuleCard,
+    AgentId, ClaimId, CommandContext, CueBinding, CueMatchMode, CueStrength, InjectionReceipt,
+    LegacyCueKindV1, LifecycleStatus, MaterialPacketFrame, MemoryInfluenceTrace, ModuleCard,
     ObservabilityKind, PredictionRecord, PredictionResolution, ProjectCharter, ProjectId,
     RelationType, SemanticCommand, SubsystemCapsule, SystemMap, TaintClass, TaskId, Visibility,
     WriteId, compile_packet_input_schema,

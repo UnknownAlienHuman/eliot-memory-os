@@ -4,9 +4,9 @@ use eliot_engine::{
     summarize_field_evidence,
 };
 use eliot_types::{
-    ConceptKind, ConceptNode, CoverageClass, CueBinding, LegacyCueKindV1, CueMatchMode, CueRecordSource,
-    CueStrength, DependencyManifest, InjectionReceipt, ModuleCard, ProjectId, SessionId,
-    SubsystemCapsule, TaskId, UL_FIELD_VALIDATION_BASELINE_COMMIT,
+    ConceptKind, ConceptNode, CoverageClass, CueBinding, CueMatchMode, CueRecordSource,
+    CueStrength, DependencyManifest, InjectionReceipt, LegacyCueKindV1, ModuleCard, ProjectId,
+    SessionId, SubsystemCapsule, TaskId, UL_FIELD_VALIDATION_BASELINE_COMMIT,
     UL_FIELD_VALIDATION_SCHEMA_VERSION, UlExperimentArm, UlFieldTaskAnnotation,
     UlFieldValidationManifest, UlInjectionMode, UlReadinessInventory, UlReadinessState,
     UlTaskClass, UlTaskExperimentAssignment, UlTaskLedger,

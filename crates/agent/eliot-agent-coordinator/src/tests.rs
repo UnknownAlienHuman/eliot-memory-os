@@ -4231,7 +4231,10 @@ fn work_class_unknown_blank_and_mixed_reject_before_capacity() -> TestResult {
     let mut valid_json = serde_json::to_value(classified_request("wcx", "swarm")?)?;
     valid_json["work_class"] = serde_json::json!("proton");
     let decoded: Result<StaffingPlanRequest, _> = serde_json::from_value(valid_json);
-    let message = decoded.err().map(|error| error.to_string()).unwrap_or_default();
+    let message = decoded
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
     assert!(
         message.contains("unknown work class: proton"),
         "decode must reject unknown class, got {message:?}"
@@ -4264,7 +4267,10 @@ fn work_class_unknown_blank_and_mixed_reject_before_capacity() -> TestResult {
     );
     // No silent default: a missing `work_class` field fails decode.
     let mut missing_json = serde_json::to_value(classified_request("wcmiss", "swarm")?)?;
-    missing_json.as_object_mut().ok_or("request must be an object")?.remove("work_class");
+    missing_json
+        .as_object_mut()
+        .ok_or("request must be an object")?
+        .remove("work_class");
     assert!(serde_json::from_value::<StaffingPlanRequest>(missing_json).is_err());
     Ok(())
 }

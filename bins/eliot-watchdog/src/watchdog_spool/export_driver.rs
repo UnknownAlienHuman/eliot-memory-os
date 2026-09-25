@@ -26,13 +26,7 @@ use crate::{IndependentKernelSensor, SpoolError, WatchdogSpoolExportLimits};
 /// kind, record digest, payload digest, observed timestamp. The kind is the
 /// owner-neutral core payload class; the Governor lane maps it 1:1 onto its
 /// own admission kind without a Watchdog dependency from this crate.
-pub type WatchdogEntryView = (
-    u64,
-    WatchdogSpoolPayloadKind,
-    String,
-    String,
-    u64,
-);
+pub type WatchdogEntryView = (u64, WatchdogSpoolPayloadKind, String, String, u64);
 
 /// Transport-agnostic sink for one Watchdog spool export batch.
 ///

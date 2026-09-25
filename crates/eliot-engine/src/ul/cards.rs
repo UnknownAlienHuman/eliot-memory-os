@@ -1,7 +1,7 @@
 use crate::EngineError;
 use eliot_types::{
-    CoChangeEdge, CueBinding, LegacyCueKindV1, CueMatchMode, CueStrength, DependencyManifest,
-    FileDependency, HotspotScore, ModuleCard, ProjectId, normalize_bindings, ul_token_estimate,
+    CoChangeEdge, CueBinding, CueMatchMode, CueStrength, DependencyManifest, FileDependency,
+    HotspotScore, LegacyCueKindV1, ModuleCard, ProjectId, normalize_bindings, ul_token_estimate,
 };
 use serde_json::json;
 use std::cmp::Ordering;

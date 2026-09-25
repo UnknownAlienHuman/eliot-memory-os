@@ -824,12 +824,8 @@ impl RegistryFixture {
     /// way Phase-A source-bundle materialization digests role bytes before
     /// binding them into the launch descriptor.
     fn artifact_digest(path: &Path) -> String {
-        let bytes = std::fs::read(path).unwrap_or_else(|error| {
-            panic!(
-                "read fixture artifact {}: {error}",
-                path.display()
-            )
-        });
+        let bytes = std::fs::read(path)
+            .unwrap_or_else(|error| panic!("read fixture artifact {}: {error}", path.display()));
         sha256_hex(&bytes)
     }
 

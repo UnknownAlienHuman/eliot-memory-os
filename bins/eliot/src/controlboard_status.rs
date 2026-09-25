@@ -17,8 +17,8 @@
 //! board.
 
 use eliot_runtime_status::{
-    ControlBoardTransportMessage, RenderedControlBoard, CONTROLBOARD_CONSUMER_CONTRACT,
-    CONTROLBOARD_TRANSPORT_CONTRACT,
+    CONTROLBOARD_CONSUMER_CONTRACT, CONTROLBOARD_TRANSPORT_CONTRACT, ControlBoardTransportMessage,
+    RenderedControlBoard,
 };
 
 /// Re-exported operation selector so the composition root names the exact
@@ -125,9 +125,9 @@ mod tests {
 
     use eliot_contracts::{EpochId, EpochLineageId, RequestId, ResourceGeneration, StateFence};
     use eliot_runtime_status::{
-        build_controlboard_frame, open_controlboard_frame, ControlBoardInstallation,
-        ControlBoardObservationTime, ControlBoardRecoveryOwner, ControlBoardRowDisposition,
-        ControlBoardSourceDigest, RenderedControlBoardRow,
+        ControlBoardInstallation, ControlBoardObservationTime, ControlBoardRecoveryOwner,
+        ControlBoardRowDisposition, ControlBoardSourceDigest, RenderedControlBoardRow,
+        build_controlboard_frame, open_controlboard_frame,
     };
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -265,9 +265,11 @@ mod tests {
             eliot_runtime_status::CONTROLBOARD_STATUS_OPERATION
         );
         assert_eq!(STATUS_OPERATION, "controlboard.status");
-        assert!(status_request_payload()
-            .as_object()
-            .expect("object")
-            .is_empty());
+        assert!(
+            status_request_payload()
+                .as_object()
+                .expect("object")
+                .is_empty()
+        );
     }
 }

@@ -1,6 +1,8 @@
 //! Borrowed input bounds applied before expensive canonicalization.
 
-use crate::{DreamInputBundle, DreamJobAdmission, GroundedDreamDraft, ModelDraft, PreservationReport};
+use crate::{
+    DreamInputBundle, DreamJobAdmission, GroundedDreamDraft, ModelDraft, PreservationReport,
+};
 
 /// Maximum canonical bytes admitted by this prototype.
 pub const MAX_CANONICAL_BYTES: usize = 1_048_576;

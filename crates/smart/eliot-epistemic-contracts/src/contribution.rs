@@ -38,9 +38,7 @@ use serde::{Deserialize, Serialize};
 use crate::admitted::{
     AdmittedKind, CurrentEpistemicPosition, Currentness, PositionId, PositionRevision,
 };
-use crate::error::{
-    ContractError, MAX_SHORT_TEXT, validate_bounded_text, validate_digest,
-};
+use crate::error::{ContractError, MAX_SHORT_TEXT, validate_bounded_text, validate_digest};
 use crate::identity::ClaimId;
 
 /// Owner-neutral contribution of one admitted epistemic position.
@@ -86,9 +84,7 @@ impl ProviderContribution {
     /// Rejects superseded positions and runs the position's closed
     /// validation first, so completeness is derived from the governing
     /// records, not claimed by the caller.
-    pub fn contribute(
-        position: &CurrentEpistemicPosition,
-    ) -> Result<Self, ContractError> {
+    pub fn contribute(position: &CurrentEpistemicPosition) -> Result<Self, ContractError> {
         if position.currentness != Currentness::Current {
             return Err(ContractError::ImpossibleCombination {
                 field: "contribution.currentness",

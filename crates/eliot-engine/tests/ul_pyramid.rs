@@ -3,8 +3,9 @@ use eliot_engine::{
     capsule_freshness, render_capsule,
 };
 use eliot_types::{
-    CapsuleFreshness, CoChangeEdge, ConceptKind, ConceptNode, CueBinding, LegacyCueKindV1, CueMatchMode,
-    CueStrength, HotspotScore, ManifestPackage, MiningRun, ProjectId, ul_token_estimate,
+    CapsuleFreshness, CoChangeEdge, ConceptKind, ConceptNode, CueBinding, CueMatchMode,
+    CueStrength, HotspotScore, LegacyCueKindV1, ManifestPackage, MiningRun, ProjectId,
+    ul_token_estimate,
 };
 use std::fs;
 use std::path::{Path, PathBuf};

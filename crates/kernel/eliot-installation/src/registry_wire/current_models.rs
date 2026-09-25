@@ -21,8 +21,8 @@ use super::super::{
     ApprovedGenerationRegistry, CandidateManifest, ContractVersion,
     HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt,
     HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt, InstallationActivationApproval,
-    InstallerServiceRegistrationApproval, PendingActivation, PendingActivationState,
-    PendingActivationAbortReceipt, PlatformHandle, ResourceGeneration, StateFence,
+    InstallerServiceRegistrationApproval, PendingActivation, PendingActivationAbortReceipt,
+    PendingActivationState, PlatformHandle, ResourceGeneration, StateFence,
 };
 
 use super::{PendingActivationTerminal, PendingActivationTerminalDisposition};

@@ -49,16 +49,16 @@ pub use authority_controller::{
     ProcessExecutionReplayRecord, ProcessExecutionReplayState, ProcessExecutionReplayStore,
     SealedAuthoritySnapshot, process_admission_digest,
 };
-pub use error::{KernelError, KernelResult};
 pub use durable_owner_bootstrap::{BoundCanonicalOwner, bind_canonical_owner, owner_bundle_digest};
+pub use error::{KernelError, KernelResult};
 pub use governor_closure_source::{
     GovernorClosureRestore, GovernorClosureSource, GovernorClosureSourceHandle,
 };
 pub use grant_activation_port::{
-    CommittedReceipt, GrantActivationIntent, GrantActivationPort, GrantClosureActivationIntent,
-    GrantClosureEnumeration, GrantClosureMember, GrantClosureReceipt, GrantClosureRevocationIntent,
-    GrantClosureSurvivor, GrantRevocationIntent, IntentDisposition, IntroductionActivationIntent,
-    IntroductionRevocationIntent, GRANT_CLOSURE_ENUMERATION_FIELDS, ROOT_GRANT_HYDRATION_FIELDS,
+    CommittedReceipt, GRANT_CLOSURE_ENUMERATION_FIELDS, GrantActivationIntent, GrantActivationPort,
+    GrantClosureActivationIntent, GrantClosureEnumeration, GrantClosureMember, GrantClosureReceipt,
+    GrantClosureRevocationIntent, GrantClosureSurvivor, GrantRevocationIntent, IntentDisposition,
+    IntroductionActivationIntent, IntroductionRevocationIntent, ROOT_GRANT_HYDRATION_FIELDS,
     RootGrantHydration, RootGrantHydrationSource, verify_grant_seal, verify_introduction_seal,
 };
 pub use introduction_lifecycle::{
@@ -88,6 +88,10 @@ pub use module::process_health::{
     CapabilityReadiness, HealthDimensionKind, ProcessHealthStatus, ProcessHealthVector,
 };
 pub use module::recovery_state_view::{RecoveryViewBuilder, project_operational_state};
+pub use module::runtime_health::{
+    CURRENT_ARCHITECTURE_SOURCE_DIGEST, CURRENT_IMPLEMENTATION_SOURCE_DIGEST,
+    CURRENT_NORMATIVE_PAIR_KEY, KernelRuntimeHealthEvidence,
+};
 pub use user_automation::{
     AutomationCapabilityProfile, AutomationDeliveryTarget, AutomationExecutionReference,
     AutomationFailureNotificationProjection, AutomationOccurrenceIdentity, AutomationRecipient,
@@ -105,10 +109,6 @@ pub use user_automation::{
     UserAutomationPreflightProjection, UserAutomationPreflightReceipt, UserAutomationQuery,
     UserAutomationQueryKind, UserAutomationRevision, UserAutomationTrigger,
     UserAutomationTriggerOrigin, user_automation_contract_identity,
-};
-pub use module::runtime_health::{
-    CURRENT_ARCHITECTURE_SOURCE_DIGEST, CURRENT_IMPLEMENTATION_SOURCE_DIGEST,
-    CURRENT_NORMATIVE_PAIR_KEY, KernelRuntimeHealthEvidence,
 };
 
 /// Result of releasing a pre-effect process-start replay reservation.

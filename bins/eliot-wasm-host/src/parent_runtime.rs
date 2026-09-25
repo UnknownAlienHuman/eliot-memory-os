@@ -19,22 +19,22 @@ use eliot_process::{
     Generation, ImageId, JobId, OperationId, ProcessEvidence, ProcessEvidenceSink, ProcessIntent,
     ProcessStartReceipt, ProcessTreeId, ResourceLimits, SessionId,
 };
-use eliot_process_executor::{wasm_p03_adapter::WasmP03ProcessAdapter, WindowsProcessExecutor};
+use eliot_process_executor::{WindowsProcessExecutor, wasm_p03_adapter::WasmP03ProcessAdapter};
 use eliot_wasm_runtime::{
     AuthorityResolutionPort, EngineBinding, GovernorResolutionPort, P03ReceiptVerifierPort,
     PortError, ProcessBinding, ProcessLaunchEnvelope, PromotionVerificationPort, RuntimePorts,
     Sha256Digest, SourceVerificationPort, WasmRuntime,
 };
 
-use crate::child_engine::{IsolatedChildEngine, ISOLATED_CHILD_IMPLEMENTATION_ID};
+use crate::child_engine::{ISOLATED_CHILD_IMPLEMENTATION_ID, IsolatedChildEngine};
 use crate::contour::PINNED_WASMTIME_VERSION;
 use crate::dispatch_drive::{
-    drive_admission, guest_exec_argv, map_invocation_result, DispatchDriveResponse, DriveError,
+    DispatchDriveResponse, DriveError, drive_admission, guest_exec_argv, map_invocation_result,
 };
 use crate::dispatch_material::{
     ValidatedDispatchMaterial, WASM_HOST_GUEST_ARTIFACT_FILE_NAME, WASM_HOST_GUEST_INPUT_FILE_NAME,
 };
-use crate::installed_binary::{resolve_installed_binary, WasmHostBinaryBinding};
+use crate::installed_binary::{WasmHostBinaryBinding, resolve_installed_binary};
 use crate::parent_authority::ParentDispatchAuthority;
 use crate::typed_bindings::typed_wit_digest;
 use crate::wasmtime_provider::provider_configuration_digest;

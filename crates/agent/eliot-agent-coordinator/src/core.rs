@@ -642,11 +642,7 @@ impl AgentCoordinator {
             left.work_class
                 .rank()
                 .cmp(&right.work_class.rank())
-                .then_with(|| {
-                    right
-                        .priority
-                        .cmp(&left.priority)
-                })
+                .then_with(|| right.priority.cmp(&left.priority))
                 .then_with(|| left.work_unit_id.cmp(&right.work_unit_id))
                 .then_with(|| left.role_id.cmp(&right.role_id))
                 .then_with(|| left.attempt_id.cmp(&right.attempt_id))

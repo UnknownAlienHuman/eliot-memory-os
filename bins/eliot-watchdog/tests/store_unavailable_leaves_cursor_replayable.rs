@@ -20,7 +20,7 @@ use eliot_watchdog::{
     watchog_entry_views,
 };
 use eliot_watchdog_core::{
-    WatchdogSpoolAcknowledgement, WatchdogSpoolExportBatch, WatchdogSpoolEntryDisposition,
+    WatchdogSpoolAcknowledgement, WatchdogSpoolEntryDisposition, WatchdogSpoolExportBatch,
     WatchdogSpoolPayloadKind, WatchdogSpoolSinkDisposition, export_retry_identity_equal,
 };
 
@@ -105,8 +105,7 @@ impl WatchdogExportSink for FlakySink {
                             WatchdogSpoolPayloadKind::Heartbeat => {
                                 WatchdogSpoolSinkDisposition::Applied
                             }
-                            WatchdogSpoolPayloadKind::Gap
-                            | WatchdogSpoolPayloadKind::Recovery => {
+                            WatchdogSpoolPayloadKind::Gap | WatchdogSpoolPayloadKind::Recovery => {
                                 WatchdogSpoolSinkDisposition::GapRequiresRecovery
                             }
                         },

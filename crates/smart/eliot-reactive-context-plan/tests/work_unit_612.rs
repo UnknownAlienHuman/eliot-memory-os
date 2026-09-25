@@ -74,12 +74,10 @@ fn case_02_minimal_tool_only_advisory_plan() {
         plan.mode,
         eliot_context_contracts::ReactiveDeliveryMode::ToolOnly
     );
-    assert!(
-        plan.items.iter().any(|item| {
-            item.disposition == DeliveryDisposition::ToolOnlyAdvisory
-                && item.kind == PlannedItemKind::Context
-        })
-    );
+    assert!(plan.items.iter().any(|item| {
+        item.disposition == DeliveryDisposition::ToolOnlyAdvisory
+            && item.kind == PlannedItemKind::Context
+    }));
 }
 
 // WORK_UNIT_CASE: 612/3
@@ -114,7 +112,8 @@ fn case_03_exact_no_injection_with_complete_denominator() {
 // WORK_UNIT_CASE: 612/4
 #[test]
 fn case_04_wrong_task_attempt_scope_fence_rejected() {
-    let (view, activation, mut session, attention, coverage, policy) = support::inputs(false, false);
+    let (view, activation, mut session, attention, coverage, policy) =
+        support::inputs(false, false);
     session.task_id = eliot_contracts::TaskId::new("other-task").unwrap();
     session.snapshot_digest = session.canonical_digest().unwrap();
     let result = plan_pending_context_injection(
@@ -134,7 +133,8 @@ fn case_04_wrong_task_attempt_scope_fence_rejected() {
 // WORK_UNIT_CASE: 612/5
 #[test]
 fn case_05_wrong_admitted_view_assembly_identity_rejected() {
-    let (view, mut activation, session, attention, coverage, policy) = support::inputs(false, false);
+    let (view, mut activation, session, attention, coverage, policy) =
+        support::inputs(false, false);
     activation.expected_view_id = Some(support::a15::id("other-view"));
     let result = plan_pending_context_injection(
         &view,
@@ -144,10 +144,7 @@ fn case_05_wrong_admitted_view_assembly_identity_rejected() {
         &coverage,
         &policy,
     );
-    assert!(matches!(
-        result,
-        ReactiveContextPlanResult::Error(_)
-    ));
+    assert!(matches!(result, ReactiveContextPlanResult::Error(_)));
 }
 
 // WORK_UNIT_CASE: 612/6
@@ -176,7 +173,12 @@ fn case_06_incomplete_safety_floor_cannot_become_complete_plan() {
     match result {
         ReactiveContextPlanResult::NoInjection(noop) => {
             assert_eq!(noop.accounting.planned, 0);
-            assert!(noop.floor_incomplete.is_some() || !noop.frontier.is_empty() || !noop.accounting.budget_fit || noop.reason.contains("FLOOR"));
+            assert!(
+                noop.floor_incomplete.is_some()
+                    || !noop.frontier.is_empty()
+                    || !noop.accounting.budget_fit
+                    || noop.reason.contains("FLOOR")
+            );
         }
         ReactiveContextPlanResult::Error(_) => {}
         other => panic!("incomplete floor must not become complete plan, got {other:?}"),
@@ -186,7 +188,8 @@ fn case_06_incomplete_safety_floor_cannot_become_complete_plan() {
 // WORK_UNIT_CASE: 612/7
 #[test]
 fn case_07_stale_view_measurement_rejected() {
-    let (mut view, activation, session, attention, coverage, policy) = support::inputs(false, false);
+    let (mut view, activation, session, attention, coverage, policy) =
+        support::inputs(false, false);
     view.view.measurement.rendered_utf8_bytes += 1;
     let result = plan_pending_context_injection(
         &view,
@@ -217,7 +220,8 @@ fn case_08_compatible_activation_accepted() {
 // WORK_UNIT_CASE: 612/9
 #[test]
 fn case_09_wrong_activation_snapshot_fence_rejected() {
-    let (view, mut activation, session, attention, coverage, policy) = support::inputs(false, false);
+    let (view, mut activation, session, attention, coverage, policy) =
+        support::inputs(false, false);
     activation.request.state_fence = support::a15::fence();
     // Make the fence differ from the view binding fence by bumping generation.
     activation.request.state_fence = eliot_contracts::StateFence::new(
@@ -238,7 +242,8 @@ fn case_09_wrong_activation_snapshot_fence_rejected() {
 // WORK_UNIT_CASE: 612/10
 #[test]
 fn case_10_partial_activation_retained_with_frontier() {
-    let (view, mut activation, session, attention, coverage, policy) = support::inputs(false, false);
+    let (view, mut activation, session, attention, coverage, policy) =
+        support::inputs(false, false);
     activation.result.completeness = eliot_cue_contracts::Completeness::Partial {
         frontier: vec![eliot_cue_contracts::RelationEdgeId::new("frontier-edge").unwrap()],
     };
@@ -264,7 +269,8 @@ fn case_10_partial_activation_retained_with_frontier() {
 // WORK_UNIT_CASE: 612/11
 #[test]
 fn case_11_absent_from_view_target_cannot_create_item() {
-    let (view, mut activation, session, attention, coverage, policy) = support::inputs(false, false);
+    let (view, mut activation, session, attention, coverage, policy) =
+        support::inputs(false, false);
     let baseline = plan_pending_context_injection(
         &view,
         &activation,
@@ -279,11 +285,14 @@ fn case_11_absent_from_view_target_cannot_create_item() {
         other => panic!("baseline unexpected {other:?}"),
     };
     let extra_key = activation.result.direct[0].matched_key.clone();
-    activation.result.direct.push(eliot_cue_contracts::DirectActivation::new(
-        eliot_cue_contracts::TargetHandle::new("ghost-target").unwrap(),
-        extra_key,
-        eliot_cue_contracts::ActivationStrength(1),
-    ));
+    activation
+        .result
+        .direct
+        .push(eliot_cue_contracts::DirectActivation::new(
+            eliot_cue_contracts::TargetHandle::new("ghost-target").unwrap(),
+            extra_key,
+            eliot_cue_contracts::ActivationStrength(1),
+        ));
     let result = plan_pending_context_injection(
         &view,
         &activation,
@@ -339,7 +348,8 @@ fn case_12_direct_and_derived_evidence_distinct() {
 // WORK_UNIT_CASE: 612/13
 #[test]
 fn case_13_score_grants_no_support_or_block() {
-    let (view, mut activation, session, attention, coverage, policy) = support::inputs(false, false);
+    let (view, mut activation, session, attention, coverage, policy) =
+        support::inputs(false, false);
     activation.result.direct[0].strength = eliot_cue_contracts::ActivationStrength(999);
     let result = plan_pending_context_injection(
         &view,
@@ -354,11 +364,13 @@ fn case_13_score_grants_no_support_or_block() {
         other => panic!("high score must not block planning, got {other:?}"),
     };
     assert!(
-        plan.items.iter().any(|i| i.disposition
-            == DeliveryDisposition::ToolOnlyAdvisory)
+        plan.items
+            .iter()
+            .any(|i| i.disposition == DeliveryDisposition::ToolOnlyAdvisory)
     );
     // Low score also plans the same way.
-    let (view, mut activation, session, attention, coverage, policy) = support::inputs(false, false);
+    let (view, mut activation, session, attention, coverage, policy) =
+        support::inputs(false, false);
     activation.result.direct[0].strength = eliot_cue_contracts::ActivationStrength(1);
     let low = plan_pending_context_injection(
         &view,
@@ -559,7 +571,8 @@ fn case_19_same_text_new_revision_not_duplicate() {
 // WORK_UNIT_CASE: 612/20
 #[test]
 fn case_20_enqueued_is_not_delivered() {
-    let (view, activation, mut session, attention, coverage, policy) = support::inputs(false, false);
+    let (view, activation, mut session, attention, coverage, policy) =
+        support::inputs(false, false);
     let mut record = support::a15::unknown_record();
     let atom = view.view.rendered[0].clone();
     let contract = eliot_protocol::reactive_context_contract_identity().unwrap();
@@ -568,7 +581,10 @@ fn case_20_enqueued_is_not_delivered() {
     record.request_id = eliot_contracts::RequestId::new("other-request-20").unwrap();
     record.idempotency_key = "other-idempotency-20".into();
     record.content.contract = contract.clone();
-    record.content.source_revision.clone_from(&atom.source_revision);
+    record
+        .content
+        .source_revision
+        .clone_from(&atom.source_revision);
     record.content.artifact_id = Some(atom.atom_id.clone());
     record.content.content_sha256 =
         eliot_context_contracts::canonical_planning_digest(&atom.representation).unwrap();
@@ -578,7 +594,10 @@ fn case_20_enqueued_is_not_delivered() {
             .len() as u64,
     );
     record.source.contract = contract;
-    record.source.source_revision.clone_from(&atom.source_revision);
+    record
+        .source
+        .source_revision
+        .clone_from(&atom.source_revision);
     record.source.artifact_id = Some(atom.source_id.clone());
     record.source.content_sha256.clone_from(&atom.source_digest);
     record.source.byte_length = None;
@@ -620,7 +639,8 @@ fn case_20_enqueued_is_not_delivered() {
 // WORK_UNIT_CASE: 612/21
 #[test]
 fn case_21_attempted_is_not_delivered() {
-    let (view, activation, mut session, attention, coverage, policy) = support::inputs(false, false);
+    let (view, activation, mut session, attention, coverage, policy) =
+        support::inputs(false, false);
     let mut record = support::a15::unknown_record();
     let atom = view.view.rendered[0].clone();
     let contract = eliot_protocol::reactive_context_contract_identity().unwrap();
@@ -629,7 +649,10 @@ fn case_21_attempted_is_not_delivered() {
     record.request_id = eliot_contracts::RequestId::new("other-request-21").unwrap();
     record.idempotency_key = "other-idempotency-21".into();
     record.content.contract = contract.clone();
-    record.content.source_revision.clone_from(&atom.source_revision);
+    record
+        .content
+        .source_revision
+        .clone_from(&atom.source_revision);
     record.content.artifact_id = Some(atom.atom_id.clone());
     record.content.content_sha256 =
         eliot_context_contracts::canonical_planning_digest(&atom.representation).unwrap();
@@ -639,7 +662,10 @@ fn case_21_attempted_is_not_delivered() {
             .len() as u64,
     );
     record.source.contract = contract;
-    record.source.source_revision.clone_from(&atom.source_revision);
+    record
+        .source
+        .source_revision
+        .clone_from(&atom.source_revision);
     record.source.artifact_id = Some(atom.source_id.clone());
     record.source.content_sha256.clone_from(&atom.source_digest);
     record.source.byte_length = None;
@@ -681,7 +707,8 @@ fn case_21_attempted_is_not_delivered() {
 // WORK_UNIT_CASE: 612/22
 #[test]
 fn case_22_in_flight_is_not_delivered_duplicate() {
-    let (view, activation, mut session, attention, coverage, policy) = support::inputs(false, false);
+    let (view, activation, mut session, attention, coverage, policy) =
+        support::inputs(false, false);
     let mut record = support::a15::unknown_record();
     let atom = view.view.rendered[0].clone();
     let contract = eliot_protocol::reactive_context_contract_identity().unwrap();
@@ -690,7 +717,10 @@ fn case_22_in_flight_is_not_delivered_duplicate() {
     record.request_id = eliot_contracts::RequestId::new("other-request").unwrap();
     record.idempotency_key = "other-idempotency".into();
     record.content.contract = contract.clone();
-    record.content.source_revision.clone_from(&atom.source_revision);
+    record
+        .content
+        .source_revision
+        .clone_from(&atom.source_revision);
     record.content.artifact_id = Some(atom.atom_id.clone());
     record.content.content_sha256 =
         eliot_context_contracts::canonical_planning_digest(&atom.representation).unwrap();
@@ -700,7 +730,10 @@ fn case_22_in_flight_is_not_delivered_duplicate() {
             .len() as u64,
     );
     record.source.contract = contract;
-    record.source.source_revision.clone_from(&atom.source_revision);
+    record
+        .source
+        .source_revision
+        .clone_from(&atom.source_revision);
     record.source.artifact_id = Some(atom.source_id.clone());
     record.source.content_sha256.clone_from(&atom.source_digest);
     record.profile = policy.delivery_profile.clone();
@@ -747,7 +780,8 @@ fn case_22_in_flight_is_not_delivered_duplicate() {
 // WORK_UNIT_CASE: 612/23
 #[test]
 fn case_23_possible_unknown_delivery_requires_reconciliation() {
-    let (view, activation, mut session, attention, coverage, policy) = support::inputs(false, false);
+    let (view, activation, mut session, attention, coverage, policy) =
+        support::inputs(false, false);
     let mut record = support::a15::unknown_record();
     record.item_id = support::a15::id("atom").to_string();
     record.operation_id = policy.operation_id.clone();
@@ -756,7 +790,10 @@ fn case_23_possible_unknown_delivery_requires_reconciliation() {
     let atom = &view.view.rendered[0];
     let contract = eliot_protocol::reactive_context_contract_identity().unwrap();
     record.content.contract = contract.clone();
-    record.content.source_revision.clone_from(&atom.source_revision);
+    record
+        .content
+        .source_revision
+        .clone_from(&atom.source_revision);
     record.content.artifact_id = Some(atom.atom_id.clone());
     record.content.content_sha256 =
         eliot_context_contracts::canonical_planning_digest(&atom.representation).unwrap();
@@ -766,7 +803,10 @@ fn case_23_possible_unknown_delivery_requires_reconciliation() {
             .len() as u64,
     );
     record.source.contract = contract;
-    record.source.source_revision.clone_from(&atom.source_revision);
+    record
+        .source
+        .source_revision
+        .clone_from(&atom.source_revision);
     record.source.artifact_id = Some(atom.source_id.clone());
     record.source.content_sha256.clone_from(&atom.source_digest);
     record.source.byte_length = None;
@@ -844,16 +884,16 @@ fn case_24_ack_is_not_visibility_or_use() {
 // WORK_UNIT_CASE: 612/25
 #[test]
 fn case_25_stale_history_cannot_suppress_current_item() {
-    let (view, activation, mut session, attention, coverage, policy) = support::inputs(false, false);
+    let (view, activation, mut session, attention, coverage, policy) =
+        support::inputs(false, false);
     let mut record = support::a15::unknown_record();
     record.item_id = support::a15::id("atom").to_string();
     record.operation_id = eliot_contracts::OperationId::new("other-operation-25").unwrap();
     record.request_id = eliot_contracts::RequestId::new("other-request-25").unwrap();
     record.idempotency_key = "other-idempotency-25".into();
-    record.validity =
-        eliot_protocol::reactive_context::ReactiveContextValidity::Superseded {
-            replacement: support::a15::id("replacement"),
-        };
+    record.validity = eliot_protocol::reactive_context::ReactiveContextValidity::Superseded {
+        replacement: support::a15::id("replacement"),
+    };
     record.profile = policy.delivery_profile.clone();
     session.records.push(record);
     session.denominator.observed = 1;
@@ -873,12 +913,13 @@ fn case_25_stale_history_cannot_suppress_current_item() {
         other => panic!("stale history must not suppress, got {other:?}"),
     };
     assert!(
-        plan.items.iter().any(|i| i.item_id
-            == support::a15::id("atom").to_string()
-            && matches!(
-                i.disposition,
-                DeliveryDisposition::ToolOnlyAdvisory | DeliveryDisposition::EventPlan
-            ))
+        plan.items
+            .iter()
+            .any(|i| i.item_id == support::a15::id("atom").to_string()
+                && matches!(
+                    i.disposition,
+                    DeliveryDisposition::ToolOnlyAdvisory | DeliveryDisposition::EventPlan
+                ))
     );
 }
 
@@ -952,14 +993,8 @@ fn case_28_only_exact_external_resolution_ends_stickiness() {
     );
     assert!(matches!(sticky, ReactiveContextPlanResult::Pending(_)));
     let resolved = support::resolved_attention_projection();
-    let result = plan_pending_context_injection(
-        &view,
-        &activation,
-        &session,
-        &resolved,
-        &coverage,
-        &policy,
-    );
+    let result =
+        plan_pending_context_injection(&view, &activation, &session, &resolved, &coverage, &policy);
     let items = match result {
         ReactiveContextPlanResult::Pending(plan) => plan.items,
         ReactiveContextPlanResult::NoInjection(noop) => noop.items,
@@ -1012,22 +1047,17 @@ fn case_29_stale_superseded_resolved_unknown_attention_distinct() {
             .any(|i| i.disposition == DeliveryDisposition::StickyPendingResolution)
     );
     let resolved = support::resolved_attention_projection();
-    let resolved_result = plan_pending_context_injection(
-        &view,
-        &activation,
-        &session,
-        &resolved,
-        &coverage,
-        &policy,
-    );
+    let resolved_result =
+        plan_pending_context_injection(&view, &activation, &session, &resolved, &coverage, &policy);
     let resolved_items = match resolved_result {
         ReactiveContextPlanResult::Pending(plan) => plan.items,
         ReactiveContextPlanResult::NoInjection(noop) => noop.items,
         other => panic!("resolved unexpected {other:?}"),
     };
     assert!(
-        resolved_items.iter().any(|i| i.disposition
-            == DeliveryDisposition::ExplicitNotSelected)
+        resolved_items
+            .iter()
+            .any(|i| i.disposition == DeliveryDisposition::ExplicitNotSelected)
     );
 }
 
@@ -1130,8 +1160,7 @@ fn case_32_tool_only_selects_advisory_pull_only() {
 fn case_33_liveness_claim_cannot_prove_event_integration() {
     let (view, activation, session, attention, mut coverage, mut policy) =
         support::inputs(false, false);
-    coverage.supported_modes =
-        vec![eliot_context_contracts::ReactiveDeliveryMode::EventIntegrated];
+    coverage.supported_modes = vec![eliot_context_contracts::ReactiveDeliveryMode::EventIntegrated];
     // Break exact event capability (stale freshness) so the mode claim alone
     // cannot prove event integration; only a fresh Enforced event qualifies.
     coverage.events[0].freshness = eliot_context_contracts::CoverageFreshness::Stale;
@@ -1139,8 +1168,7 @@ fn case_33_liveness_claim_cannot_prove_event_integration() {
         .canonical_claim_digest()
         .expect("coverage claim");
     coverage.profile_digest = coverage.canonical_digest().unwrap();
-    policy.allowed_modes =
-        vec![eliot_context_contracts::ReactiveDeliveryMode::EventIntegrated];
+    policy.allowed_modes = vec![eliot_context_contracts::ReactiveDeliveryMode::EventIntegrated];
     policy.policy_digest = policy.canonical_digest().unwrap();
     // Coverage event remains tool-only shaped (no fresh Enforced event for the
     // target), so liveness-style mode claims alone must not select event mode.
@@ -1171,36 +1199,28 @@ fn case_34_partial_stale_unavailable_unknown_coverage_distinct() {
     let mut partial = coverage.clone();
     partial.completeness = eliot_context_contracts::SnapshotCompleteness::Partial;
     partial.profile_digest = partial.canonical_digest().unwrap();
-    let partial_result = plan_pending_context_injection(
-        &view,
-        &activation,
-        &session,
-        &attention,
-        &partial,
-        &policy,
-    );
+    let partial_result =
+        plan_pending_context_injection(&view, &activation, &session, &attention, &partial, &policy);
     let mut unknown = coverage.clone();
     unknown.completeness = eliot_context_contracts::SnapshotCompleteness::Unknown;
     unknown.profile_digest = unknown.canonical_digest().unwrap();
-    let unknown_result = plan_pending_context_injection(
-        &view,
-        &activation,
-        &session,
-        &attention,
-        &unknown,
-        &policy,
-    );
+    let unknown_result =
+        plan_pending_context_injection(&view, &activation, &session, &attention, &unknown, &policy);
     // Both retain explicit completeness; they must not collapse to the same
     // selected evidence silently.
     let partial_completeness = match partial_result {
         ReactiveContextPlanResult::Pending(plan) => plan.coverage_completeness,
         ReactiveContextPlanResult::NoInjection(noop) => noop.coverage_completeness,
-        ReactiveContextPlanResult::Error(_) => eliot_context_contracts::SnapshotCompleteness::Partial,
+        ReactiveContextPlanResult::Error(_) => {
+            eliot_context_contracts::SnapshotCompleteness::Partial
+        }
     };
     let unknown_completeness = match unknown_result {
         ReactiveContextPlanResult::Pending(plan) => plan.coverage_completeness,
         ReactiveContextPlanResult::NoInjection(noop) => noop.coverage_completeness,
-        ReactiveContextPlanResult::Error(_) => eliot_context_contracts::SnapshotCompleteness::Unknown,
+        ReactiveContextPlanResult::Error(_) => {
+            eliot_context_contracts::SnapshotCompleteness::Unknown
+        }
     };
     assert_ne!(partial_completeness, unknown_completeness);
 }
@@ -1208,7 +1228,8 @@ fn case_34_partial_stale_unavailable_unknown_coverage_distinct() {
 // WORK_UNIT_CASE: 612/35
 #[test]
 fn case_35_recipient_runtime_host_generation_mismatch_rejected() {
-    let (view, activation, session, attention, mut coverage, policy) = support::inputs(false, false);
+    let (view, activation, session, attention, mut coverage, policy) =
+        support::inputs(false, false);
     coverage.host_generation = eliot_contracts::ResourceGeneration::new(999).unwrap();
     coverage.profile_digest = coverage.canonical_digest().unwrap();
     let result = plan_pending_context_injection(
@@ -1239,10 +1260,7 @@ fn case_36_exact_view_reference_universe_reconciles() {
         other => panic!("view universe must reconcile, got {other:?}"),
     };
     assert_eq!(plan.view_digest, view.view.output_digest);
-    assert_eq!(
-        plan.admitted_set_digest,
-        view.admitted_canonical_sha256
-    );
+    assert_eq!(plan.admitted_set_digest, view.admitted_canonical_sha256);
     assert_eq!(plan.assembly_digest, view.view.selection.output_digest);
 }
 
@@ -1269,13 +1287,7 @@ fn case_37_raw_payload_cannot_enter_plan() {
             assert!(!item.source.is_empty());
         }
     }
-    assert!(
-        !plan
-            .request
-            .items
-            .iter()
-            .any(|i| i.item_id.contains("raw"))
-    );
+    assert!(!plan.request.items.iter().any(|i| i.item_id.contains("raw")));
 }
 
 // WORK_UNIT_CASE: 612/38
@@ -1653,7 +1665,8 @@ fn case_48_closed_current_wire_protected_defaults() {
 // WORK_UNIT_CASE: 612/49
 #[test]
 fn case_49_bounded_panic_free_malformed_inputs() {
-    let (view, activation, session, attention, coverage, mut policy) = support::inputs(false, false);
+    let (view, activation, session, attention, coverage, mut policy) =
+        support::inputs(false, false);
     policy.allowed_modes = Vec::new();
     let result = std::panic::catch_unwind(|| {
         plan_pending_context_injection(&view, &activation, &session, &attention, &coverage, &policy)
@@ -1663,7 +1676,8 @@ fn case_49_bounded_panic_free_malformed_inputs() {
         result.unwrap(),
         ReactiveContextPlanResult::Error(_)
     ));
-    let (view, activation, session, attention, coverage, mut policy) = support::inputs(false, false);
+    let (view, activation, session, attention, coverage, mut policy) =
+        support::inputs(false, false);
     policy.cancelled = true;
     policy.policy_digest = policy.canonical_digest().unwrap();
     let cancelled = plan_pending_context_injection(

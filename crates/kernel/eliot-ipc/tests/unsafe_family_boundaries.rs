@@ -74,8 +74,7 @@ fn heartbeat_frame() -> Frame {
 }
 
 fn fixture_text() -> String {
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/unsafe_family_cases.json");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/unsafe_family_cases.json");
     ok(std::fs::read_to_string(&path))
 }
 
@@ -170,7 +169,9 @@ fn zero_empty_oversize_stay_distinct_and_oversize_clears_for_resync() {
     oversized_prefix.extend_from_slice(&[0_u8; 10]);
     assert!(matches!(
         decoder.push(&oversized_prefix, limits),
-        Err(TransportError::Protocol(ProtocolError::OversizeFrame { .. }))
+        Err(TransportError::Protocol(
+            ProtocolError::OversizeFrame { .. }
+        ))
     ));
     let frame = heartbeat_frame();
     let wire = ok(encode_frame(&frame, limits));
@@ -383,7 +384,9 @@ fn inline_ceilings_reject_before_emit_and_prefix_rejects_before_alloc() {
     prefix.extend_from_slice(&[0_u8; 10]);
     assert!(matches!(
         decoder.push(&prefix, limits),
-        Err(TransportError::Protocol(ProtocolError::OversizeFrame { .. }))
+        Err(TransportError::Protocol(
+            ProtocolError::OversizeFrame { .. }
+        ))
     ));
     let frame = heartbeat_frame();
     let wire = ok(encode_frame(&frame, limits));

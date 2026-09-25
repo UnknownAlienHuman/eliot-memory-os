@@ -137,7 +137,9 @@ pub enum NextestTestStatus {
 /// callers receive only test events which can contribute to verification.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NextestTestEvent {
-    Started { name: String },
+    Started {
+        name: String,
+    },
     Completed {
         name: String,
         status: NextestTestStatus,
@@ -154,10 +156,7 @@ pub fn catalog_test_id(name: &str) -> &str {
     let Some((base, suffix)) = name.rsplit_once('#') else {
         return name;
     };
-    if !base.is_empty()
-        && !suffix.is_empty()
-        && suffix.bytes().all(|byte| byte.is_ascii_digit())
-    {
+    if !base.is_empty() && !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()) {
         base
     } else {
         name
@@ -232,10 +231,10 @@ pub fn parse_jsonl(bytes: &[u8]) -> Result<NextestReport, NextestError> {
             }
         }
     }
-    report.started = u32::try_from(started_names.len())
-        .map_err(|_| NextestError::CounterOverflow)?;
-    report.completed = u32::try_from(final_statuses.len())
-        .map_err(|_| NextestError::CounterOverflow)?;
+    report.started =
+        u32::try_from(started_names.len()).map_err(|_| NextestError::CounterOverflow)?;
+    report.completed =
+        u32::try_from(final_statuses.len()).map_err(|_| NextestError::CounterOverflow)?;
     for status in final_statuses.values() {
         let counter = match status {
             NextestTestStatus::Pass => &mut report.passed,

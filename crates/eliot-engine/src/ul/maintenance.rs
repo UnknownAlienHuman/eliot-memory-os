@@ -5,7 +5,7 @@ use super::{
 use crate::{EngineError, WriteAdmissionService, WriterHandle};
 use eliot_store::{CanonicalRecord, CanonicalStore};
 use eliot_types::{
-    CoChangeEdge, ConceptNode, LegacyCueKindV1, HotspotScore, MiningRun, ModuleCard, ProjectId,
+    CoChangeEdge, ConceptNode, HotspotScore, LegacyCueKindV1, MiningRun, ModuleCard, ProjectId,
     PyramidTargetKind, UlArtifact, UlArtifactDirtyState, UlMaintenanceReport,
 };
 use std::collections::BTreeMap;

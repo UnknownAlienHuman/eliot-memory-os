@@ -77,12 +77,13 @@ pub struct ReactiveRestoreReport {
 /// `None` exactly like the frame fence the pipe already carries. Authority
 /// stays with the binding and the serving owners; this echo mints none.
 fn live_state_fence(binding: &AttachBinding) -> Result<StateFence, BridgeError> {
-    let generation = ResourceGeneration::new(binding.state_fence().generation().get()).map_err(
-        |_| BridgeError::InvalidContract {
-            field: "attach.state_fence.generation",
-            reason: "generation must be non-zero",
-        },
-    )?;
+    let generation =
+        ResourceGeneration::new(binding.state_fence().generation().get()).map_err(|_| {
+            BridgeError::InvalidContract {
+                field: "attach.state_fence.generation",
+                reason: "generation must be non-zero",
+            }
+        })?;
     Ok(StateFence::new(
         binding.state_fence().authority_epoch().clone(),
         generation,
@@ -123,24 +124,26 @@ pub fn restore_reactive_runtime(
         state_fence: live_fence.clone(),
         uris: uris.to_vec(),
     };
-    query.validate().map_err(|error| BridgeError::ProviderContract(
-        error.to_string(),
-    ))?;
-    let reply = port.restore_reactive_state(&query).map_err(|error| match error {
-        PortFailure::FenceMismatch => BridgeError::StaleAuthority,
-        PortFailure::TransportBindingRejected { reason } => BridgeError::ProviderContract(reason),
-        PortFailure::Unsupported { reason, .. } => BridgeError::ProviderContract(reason),
-        PortFailure::PlanGap { reason, .. } => BridgeError::ProviderContract(reason),
-        PortFailure::IdempotencyConflict => BridgeError::InvalidTransition(
-            "restore idempotency identity is bound to different request bytes",
-        ),
-        PortFailure::DeadlineExceeded => {
-            BridgeError::ProviderContract("restore deadline exceeded".to_owned())
-        }
-        PortFailure::Cancelled => {
-            BridgeError::ProviderContract("restore cancelled".to_owned())
-        }
-    })?;
+    query
+        .validate()
+        .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+    let reply = port
+        .restore_reactive_state(&query)
+        .map_err(|error| match error {
+            PortFailure::FenceMismatch => BridgeError::StaleAuthority,
+            PortFailure::TransportBindingRejected { reason } => {
+                BridgeError::ProviderContract(reason)
+            }
+            PortFailure::Unsupported { reason, .. } => BridgeError::ProviderContract(reason),
+            PortFailure::PlanGap { reason, .. } => BridgeError::ProviderContract(reason),
+            PortFailure::IdempotencyConflict => BridgeError::InvalidTransition(
+                "restore idempotency identity is bound to different request bytes",
+            ),
+            PortFailure::DeadlineExceeded => {
+                BridgeError::ProviderContract("restore deadline exceeded".to_owned())
+            }
+            PortFailure::Cancelled => BridgeError::ProviderContract("restore cancelled".to_owned()),
+        })?;
     reply
         .validate()
         .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
@@ -191,8 +194,8 @@ mod tests {
     use super::*;
     use eliot_agent_bridge_core::{
         ActivationPortOutcome, ActivationPortResult, AttachRequest, DemandId, FencingToken,
-        Generation, HostActivationPort, PrincipalId, ProviderFailure, ProviderReadiness,
-        SessionId, TaskId, WorkUnitId,
+        Generation, HostActivationPort, PrincipalId, ProviderFailure, ProviderReadiness, SessionId,
+        TaskId, WorkUnitId,
     };
     use eliot_contracts::{EpochId, EpochLineageId};
     use eliot_mcp::{
@@ -208,8 +211,7 @@ mod tests {
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
     const TEST_SESSION: &str = "session-restore-1";
-    const TEST_DIGEST: &str =
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const TEST_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     struct StaticActivation {
         result: ActivationPortResult,
@@ -241,8 +243,8 @@ mod tests {
 
     fn attached_runner() -> BridgeRunner {
         let generation = Generation::new(7).expect("generation");
-        let fence = FencingToken::new(test_epoch(3), generation, "fence-restore-7")
-            .expect("fence token");
+        let fence =
+            FencingToken::new(test_epoch(3), generation, "fence-restore-7").expect("fence token");
         let result = ActivationPortResult::authenticated(
             PrincipalId::new("principal-restore-1").expect("principal"),
             SessionId::new(TEST_SESSION).expect("session"),
@@ -314,12 +316,15 @@ mod tests {
         }
         let mut ledger = ReactiveInjectionLedger::new();
         ledger
-            .admit(session, cue("rev-1"), Some(firing()), vec![], admission(Severity::Critical))
+            .admit(
+                session,
+                cue("rev-1"),
+                Some(firing()),
+                vec![],
+                admission(Severity::Critical),
+            )
             .expect("critical admits");
-        ledger
-            .to_json_bytes()
-            .expect("ledger serializes")
-            .to_vec()
+        ledger.to_json_bytes().expect("ledger serializes").to_vec()
     }
 
     /// Scripted pipe: returns owner-shaped bytes without a Kernel. The
@@ -509,15 +514,16 @@ mod tests {
         let report = restore_reactive_runtime(&mut runner, &mut port, &[]).expect("restore");
         assert_eq!(report.ledger, LedgerRestoreOutcome::Restored);
         assert_eq!(report.snapshots.len(), 2);
-        assert_eq!(
-            report.snapshots[0].1,
-            SnapshotRestoreOutcome::Published
-        );
+        assert_eq!(report.snapshots[0].1, SnapshotRestoreOutcome::Published);
         assert!(matches!(
             report.snapshots[1].1,
             SnapshotRestoreOutcome::Rejected { .. }
         ));
         assert_eq!(live_ids(&runner).len(), 1, "ledger restore stands");
-        assert_eq!(runner.resource_registry_len(), 1, "only the valid snapshot landed");
+        assert_eq!(
+            runner.resource_registry_len(),
+            1,
+            "only the valid snapshot landed"
+        );
     }
 }

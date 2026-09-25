@@ -34,9 +34,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use eliot_authority::{
-    GrantGraph, GrantGraphRecoverySnapshot, GrantId, RevocationHistoryEvidence,
-};
+use eliot_authority::{GrantGraph, GrantGraphRecoverySnapshot, GrantId, RevocationHistoryEvidence};
 
 use crate::error::{KernelError, validate_id};
 use crate::grant_activation_port::{
@@ -198,9 +196,11 @@ impl GovernorClosureSource {
                 check_preserved_membership(&restore.graph_snapshot, target, survivor)?;
             }
         }
-        let outcome =
-            GrantGraph::from_recovery_snapshot_with_revocation_history(restore.graph_snapshot, Some(history))
-                .map_err(|error| KernelError::RecoveryUnavailable(error.to_string()))?;
+        let outcome = GrantGraph::from_recovery_snapshot_with_revocation_history(
+            restore.graph_snapshot,
+            Some(history),
+        )
+        .map_err(|error| KernelError::RecoveryUnavailable(error.to_string()))?;
         let mut members = BTreeMap::new();
         for member in restore.members {
             validate_id(&member.intent.grant_id, "restore.member.grant_id")?;
@@ -208,7 +208,11 @@ impl GovernorClosureSource {
             // shape/integrity reconstruction before the bytes become the
             // enumeration authority. Epoch agreement re-runs port-side at
             // every use.
-            verify_admitted_grant_seal(&member.intent.grant_id, &member.intent.operation_id, member.durable_record.record())?;
+            verify_admitted_grant_seal(
+                &member.intent.grant_id,
+                &member.intent.operation_id,
+                member.durable_record.record(),
+            )?;
             if members
                 .insert(member.intent.grant_id.clone(), member)
                 .is_some()
@@ -222,7 +226,11 @@ impl GovernorClosureSource {
         let mut roots = BTreeMap::new();
         for root in restore.roots {
             validate_id(&root.intent.grant_id, "restore.root.grant_id")?;
-            verify_admitted_grant_seal(&root.intent.grant_id, &root.intent.operation_id, root.durable_record.record())?;
+            verify_admitted_grant_seal(
+                &root.intent.grant_id,
+                &root.intent.operation_id,
+                root.durable_record.record(),
+            )?;
             if roots.insert(root.intent.grant_id.clone(), root).is_some() {
                 return Err(KernelError::InvalidField {
                     field: "restore.roots",
@@ -247,12 +255,13 @@ impl GovernorClosureSource {
                     "admitted introduction hydration failed validation".to_owned(),
                 )
             })?;
-            verify_admitted_introduction_seal(&hydration.intent.introduction_id, &hydration.intent.operation_id, hydration.durable_record.record())?;
+            verify_admitted_introduction_seal(
+                &hydration.intent.introduction_id,
+                &hydration.intent.operation_id,
+                hydration.durable_record.record(),
+            )?;
             if introductions
-                .insert(
-                    hydration.intent.introduction_id.clone(),
-                    hydration,
-                )
+                .insert(hydration.intent.introduction_id.clone(), hydration)
                 .is_some()
             {
                 return Err(KernelError::InvalidField {
@@ -308,8 +317,7 @@ fn verify_admitted_introduction_seal(
     operation_id: &str,
     record: &eliot_ors::OperationalRecordInput,
 ) -> Result<(), KernelError> {
-    if record.record_id.as_str() != operation_id || record.subject_id.as_str() != introduction_id
-    {
+    if record.record_id.as_str() != operation_id || record.subject_id.as_str() != introduction_id {
         return Err(KernelError::InvalidField {
             field: "restore.durable_record",
             reason: "admitted opaque record identity disagrees with the admitted intent",
@@ -430,7 +438,8 @@ impl RootGrantHydrationSource for GovernorClosureSource {
     fn enumerate_grant_closure(
         &self,
         grant_id: &str,
-    ) -> Result<GrantClosureEnumeration, KernelError> {        validate_id(grant_id, "grant_id")?;
+    ) -> Result<GrantClosureEnumeration, KernelError> {
+        validate_id(grant_id, "grant_id")?;
         let target = GrantId::new(grant_id).map_err(|_| KernelError::InvalidField {
             field: "grant_id",
             reason: "grant identity must validate",
@@ -453,11 +462,7 @@ impl RootGrantHydrationSource for GovernorClosureSource {
                 })?;
             members.push(member);
         }
-        let preserved = state
-            .preserved
-            .get(grant_id)
-            .cloned()
-            .unwrap_or_default();
+        let preserved = state.preserved.get(grant_id).cloned().unwrap_or_default();
         Ok(GrantClosureEnumeration {
             authority_root_ref: delegation.authority_root_ref,
             grant_graph_revision: delegation.revision,
@@ -496,17 +501,19 @@ mod tests {
     }
 
     fn test_binding(epoch: &eliot_contracts::EpochId) -> Result<AuthorityBinding, KernelError> {
-        let fence =
-            StateFence::new(epoch.clone(), ResourceGeneration::new(1).map_err(|_| {
-                KernelError::InvalidField {
-                    field: "generation",
-                    reason: "test generation must validate",
-                }
-            })?);
+        let fence = StateFence::new(
+            epoch.clone(),
+            ResourceGeneration::new(1).map_err(|_| KernelError::InvalidField {
+                field: "generation",
+                reason: "test generation must validate",
+            })?,
+        );
         Ok(AuthorityBinding {
-            authority_id: ContractId::new("authority:test").map_err(|_| KernelError::InvalidField {
-                field: "authority_id",
-                reason: "test authority id must validate",
+            authority_id: ContractId::new("authority:test").map_err(|_| {
+                KernelError::InvalidField {
+                    field: "authority_id",
+                    reason: "test authority id must validate",
+                }
             })?,
             authority_owner: "test-owner".to_owned(),
             authority_epoch: epoch.clone(),

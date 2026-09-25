@@ -24,10 +24,8 @@ use eliot_platform::{NotificationRequest, PlatformHandle};
 use serde_json::{Value, json};
 
 const NOW: u64 = 1_786_000_000_000;
-const PARENT_HASH: &str =
-    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const BODY_DIGEST: &str =
-    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const PARENT_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const BODY_DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
 
 fn fence() -> StateFence {
@@ -67,7 +65,9 @@ fn payload(marker: &str) -> Value {
 fn one_parent_derives_six_distinct_versioned_children() {
     let mut issuer = NotifyIdentityIssuer::new();
     let parent = parent_with_id("parent-78");
-    let g08 = issuer.issue_g08(&parent, &payload("g08"), NOW).expect("g08");
+    let g08 = issuer
+        .issue_g08(&parent, &payload("g08"), NOW)
+        .expect("g08");
     let a08 = issuer
         .issue_a08(&parent, &payload("a08"), Some("source-sha"), NOW)
         .expect("a08");
@@ -156,7 +156,9 @@ fn one_parent_derives_six_distinct_versioned_children() {
 fn exact_retry_returns_the_same_child() {
     let mut issuer = NotifyIdentityIssuer::new();
     let parent = parent_with_id("parent-retry");
-    let first = issuer.issue_g08(&parent, &payload("same"), NOW).expect("first");
+    let first = issuer
+        .issue_g08(&parent, &payload("same"), NOW)
+        .expect("first");
     let second = issuer
         .issue_g08(&parent, &payload("same"), NOW + 700)
         .expect("retry");
@@ -170,8 +172,7 @@ fn exact_retry_returns_the_same_child() {
         second.identity.cancellation_id
     );
     assert_eq!(
-        first.identity.deadline_unix_ms,
-        second.identity.deadline_unix_ms,
+        first.identity.deadline_unix_ms, second.identity.deadline_unix_ms,
         "exact retry reuses the recorded deadline"
     );
 
@@ -188,7 +189,9 @@ fn exact_retry_returns_the_same_child() {
 fn cross_step_reuse_is_identity_conflict() {
     let mut issuer = NotifyIdentityIssuer::new();
     let parent = parent_with_id("parent-conflict");
-    let g08 = issuer.issue_g08(&parent, &payload("g08"), NOW).expect("g08");
+    let g08 = issuer
+        .issue_g08(&parent, &payload("g08"), NOW)
+        .expect("g08");
     let foreign = g08.identity.idempotency_key.clone();
 
     let conflict = issuer.issue_with_idempotency_key(
@@ -200,10 +203,7 @@ fn cross_step_reuse_is_identity_conflict() {
         NOW,
     );
     assert!(
-        matches!(
-            conflict,
-            Err(OperationIdentityError::IdentityConflict(_))
-        ),
+        matches!(conflict, Err(OperationIdentityError::IdentityConflict(_))),
         "cross-step reuse must conflict, got {conflict:?}"
     );
     assert_eq!(issuer.issued_count(), 1);
@@ -252,18 +252,29 @@ fn reserve_and_commit_never_share_an_identity() {
 fn unknown_delivery_step_is_distinct_from_source_and_ledger() {
     let mut issuer = NotifyIdentityIssuer::new();
     let parent = parent_with_id("parent-unknown");
-    let g08 = issuer.issue_g08(&parent, &payload("g08"), NOW).expect("g08");
+    let g08 = issuer
+        .issue_g08(&parent, &payload("g08"), NOW)
+        .expect("g08");
     let delivery_unknown = issuer
-        .issue_delivery(&parent, &json!({"evidence": "unknown"}), Some("admission-sha"), NOW)
+        .issue_delivery(
+            &parent,
+            &json!({"evidence": "unknown"}),
+            Some("admission-sha"),
+            NOW,
+        )
         .expect("delivery unknown");
     let delivery_known = issuer
-        .issue_delivery(&parent, &json!({"evidence": "known"}), Some("admission-sha"), NOW)
+        .issue_delivery(
+            &parent,
+            &json!({"evidence": "known"}),
+            Some("admission-sha"),
+            NOW,
+        )
         .expect("delivery known");
     assert_ne!(g08.request_id, delivery_unknown.request_id);
     assert_ne!(delivery_unknown.request_id, delivery_known.request_id);
     assert_ne!(
-        delivery_unknown.identity.idempotency_key,
-        delivery_known.identity.idempotency_key,
+        delivery_unknown.identity.idempotency_key, delivery_known.identity.idempotency_key,
         "unknown delivery outcome remains distinct from a known one"
     );
 }
@@ -283,7 +294,12 @@ fn crash_after_reserve_reconciles_at_the_exact_step() {
     // reservation reconciles without a duplicate notification.
     let mut restarted = NotifyIdentityIssuer::new();
     let replay = restarted
-        .issue_reserve(&parent, &reserve_payload, Some("admission-sha"), NOW + 5_000)
+        .issue_reserve(
+            &parent,
+            &reserve_payload,
+            Some("admission-sha"),
+            NOW + 5_000,
+        )
         .expect("reserve after restart");
     assert_eq!(first.request_id, replay.request_id);
     assert_eq!(
@@ -297,7 +313,12 @@ fn crash_after_reserve_reconciles_at_the_exact_step() {
     // The commit step is still a different identity: reserve success never
     // impersonates commit success.
     let commit = restarted
-        .issue_commit(&parent, &payload("commit"), Some("reservation-sha"), NOW + 5_000)
+        .issue_commit(
+            &parent,
+            &payload("commit"),
+            Some("reservation-sha"),
+            NOW + 5_000,
+        )
         .expect("commit");
     assert_ne!(replay.request_id, commit.request_id);
 }

@@ -6,11 +6,12 @@ use eliot_engine::{
 };
 use eliot_types::{
     AgentId, CapsuleBuild, CommandContext, ConceptKind, ConceptNode, CoverageClass, CueBinding,
-    LegacyCueKindV1, CueMatchMode, CueStrength, DependencyManifest, InjectionReceipt, LifecycleStatus,
-    ModuleCard, ObservabilityKind, PredictionExpectation, PredictionRecord, PredictionResolution,
-    ProjectCharter, ProjectId, PyramidBuildStatus, PyramidTargetKind, RelationInput, RelationType,
-    SemanticCommand, SessionId, SubsystemCapsule, SystemMap, TaintClass, TaskId, UlArtifact,
-    UlArtifactBatchRecordCommand, VerificationResult, Visibility, WriteId, ul_token_estimate,
+    CueMatchMode, CueStrength, DependencyManifest, InjectionReceipt, LegacyCueKindV1,
+    LifecycleStatus, ModuleCard, ObservabilityKind, PredictionExpectation, PredictionRecord,
+    PredictionResolution, ProjectCharter, ProjectId, PyramidBuildStatus, PyramidTargetKind,
+    RelationInput, RelationType, SemanticCommand, SessionId, SubsystemCapsule, SystemMap,
+    TaintClass, TaskId, UlArtifact, UlArtifactBatchRecordCommand, VerificationResult, Visibility,
+    WriteId, ul_token_estimate,
 };
 use serde_json::{Value, json};
 use std::fs;

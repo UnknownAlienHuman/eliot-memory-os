@@ -112,7 +112,11 @@ fn hex_digest(hex: &str, field: &'static str) -> Result<Sha256Digest, MaterialEr
     Sha256Digest::new(hex.to_owned()).map_err(|_| invalid(field))
 }
 
-fn require_spelling(value: &str, accepted: &[&str], field: &'static str) -> Result<(), MaterialError> {
+fn require_spelling(
+    value: &str,
+    accepted: &[&str],
+    field: &'static str,
+) -> Result<(), MaterialError> {
     if accepted.contains(&value) {
         Ok(())
     } else {
@@ -567,19 +571,18 @@ pub fn admitted_material_path() -> Option<std::path::PathBuf> {
 /// [`MaterialError::Missing`] for an absent file and [`MaterialError::TooLarge`]
 /// before allocating over the ceiling — never a partial read.
 pub fn read_staged_bytes(path: &std::path::Path) -> Result<Vec<u8>, MaterialError> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                MaterialError::Missing
-            } else {
-                MaterialError::Unreadable(error.kind().to_string())
-            }
-        })?;
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            MaterialError::Missing
+        } else {
+            MaterialError::Unreadable(error.kind().to_string())
+        }
+    })?;
     if metadata.len() > DISPATCH_MATERIAL_MAX_BYTES {
         return Err(MaterialError::TooLarge);
     }
-    let bytes = std::fs::read(path)
-        .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
+    let bytes =
+        std::fs::read(path).map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
     if bytes.len() as u64 > DISPATCH_MATERIAL_MAX_BYTES {
         return Err(MaterialError::TooLarge);
     }
@@ -1101,7 +1104,11 @@ fn bind_work(work: &ValidatedWorkInput) -> Result<ValidatedWorkRecord, MaterialE
         return Err(invalid("lease-scope"));
     }
     require_spelling(&work.lease_state, &["active"], "lease-state")?;
-    require_spelling(&work.generation_state, &["ready", "active"], "generation-state")?;
+    require_spelling(
+        &work.generation_state,
+        &["ready", "active"],
+        "generation-state",
+    )?;
     if work.authority_revision == 0
         || work.lifecycle_revision == 0
         || work.verification_revision == 0
@@ -1218,10 +1225,7 @@ fn bind_promotion(
 ) -> Result<ValidatedPromotionRecord, MaterialError> {
     Ok(ValidatedPromotionRecord {
         corpus_digest: hex_digest(&promotion.corpus_digest, "promotion-corpus")?,
-        expected_result_digest: hex_digest(
-            &promotion.expected_result_digest,
-            "promotion-result",
-        )?,
+        expected_result_digest: hex_digest(&promotion.expected_result_digest, "promotion-result")?,
         expected_effect_digest: hex_digest(&promotion.expected_effect_digest, "promotion-effects")?,
         expected_state_delta_digest: hex_digest(
             &promotion.expected_state_delta_digest,
@@ -1570,8 +1574,11 @@ mod tests {
             &input.artifact_bytes,
         )
         .expect("artifact writable");
-        std::fs::write(dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME), &input.input_bytes)
-            .expect("input writable");
+        std::fs::write(
+            dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME),
+            &input.input_bytes,
+        )
+        .expect("input writable");
         dir
     }
 

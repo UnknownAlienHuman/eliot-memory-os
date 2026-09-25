@@ -11,19 +11,22 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 
-use eliot_contracts::{ArtifactId, ContractId, ContractVersion, EpochId, EpochLineageId, ResourceGeneration, SourceId, StateFence, TaskId};
+use eliot_contracts::{
+    ArtifactId, ContractId, ContractVersion, EpochId, EpochLineageId, ResourceGeneration, SourceId,
+    StateFence, TaskId,
+};
 use eliot_dreamer_contracts::ContractViolation;
 use eliot_dreamer_contracts::job::{JobClass, Requester, RequesterOrigin};
 use eliot_dreamer_contracts::probe::{
     PROBE_INPUT_SCHEMA_VERSION, PossibleResultSchema, PossibleResultValue, ProbeAffordanceRef,
-    ProbeCapabilityAvailability, ProbeExternalOwners, ProbeGroundingRef, ProbeInput, ProbeInputParams,
-    ProbeLifecycle, ProbeObjectiveRef, ProbeOwnerRef, ProbeParam, ProbeRepeatRef, ProbeSourceRef,
-    ResultBranch, ResultTarget, ResultUpdate, RivalUpdateMeaning,
+    ProbeCapabilityAvailability, ProbeExternalOwners, ProbeGroundingRef, ProbeInput,
+    ProbeInputParams, ProbeLifecycle, ProbeObjectiveRef, ProbeOwnerRef, ProbeParam, ProbeRepeatRef,
+    ProbeSourceRef, ResultBranch, ResultTarget, ResultUpdate, RivalUpdateMeaning,
 };
 use eliot_dreamer_contracts::rival::{RivalDeclarationSetRef, RivalModelRef, RivalPredictionRef};
 use eliot_epistemic_contracts::{
-    CoverageDenominator, CoverageDenominatorParams, DenominatorKind, FrontierRevision, FrontierSpec,
-    PaginationBounds, QueryRevision, QuerySpec, SnapshotRef, ValidityBounds,
+    CoverageDenominator, CoverageDenominatorParams, DenominatorKind, FrontierRevision,
+    FrontierSpec, PaginationBounds, QueryRevision, QuerySpec, SnapshotRef, ValidityBounds,
 };
 use eliot_evaluation_contracts::{ExpectedObservableSpec, PlannedVerifierRef};
 use eliot_receipts::ProofCeiling;
@@ -132,8 +135,11 @@ fn coverage() -> CoverageDenominator {
                 .expect("valid query"),
         ),
         frontier: Some(
-            FrontierSpec::new("frontier-1073", FrontierRevision("frontier-rev-1073".to_owned()))
-                .expect("valid frontier"),
+            FrontierSpec::new(
+                "frontier-1073",
+                FrontierRevision("frontier-rev-1073".to_owned()),
+            )
+            .expect("valid frontier"),
         ),
         snapshot: SnapshotRef::new(
             "snapshot-coverage-1073",
@@ -323,10 +329,13 @@ fn input_digest_is_canonical_and_deterministic() {
     let with_extra = ProbeInput::new(reordered).expect("extra param must build");
     assert_ne!(first.digest, with_extra.digest);
     let mut swapped = input_params();
-    swapped.params = BTreeSet::from([extra, ProbeParam {
-        name: "param-1073".to_owned(),
-        value: "value-1073".to_owned(),
-    }]);
+    swapped.params = BTreeSet::from([
+        extra,
+        ProbeParam {
+            name: "param-1073".to_owned(),
+            value: "value-1073".to_owned(),
+        },
+    ]);
     let rebuilt = ProbeInput::new(swapped).expect("rebuilt params must build");
     assert_eq!(
         with_extra.digest, rebuilt.digest,

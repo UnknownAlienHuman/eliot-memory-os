@@ -242,7 +242,9 @@ fn auto_observe_bindings(
         candidates.push(eliot_types::CueBinding {
             match_mode: match cue.kind {
                 eliot_types::ul::cue::LegacyCueKindV1::DirPath => eliot_types::CueMatchMode::Prefix,
-                eliot_types::ul::cue::LegacyCueKindV1::ErrorSignature => eliot_types::CueMatchMode::Signature,
+                eliot_types::ul::cue::LegacyCueKindV1::ErrorSignature => {
+                    eliot_types::CueMatchMode::Signature
+                }
                 _ => eliot_types::CueMatchMode::Exact,
             },
             cue_kind: cue.kind,
@@ -602,7 +604,8 @@ fn auto_candidate_bindings(
         && let Some(cue) = recent.iter().find(|cue| {
             matches!(
                 cue.kind,
-                eliot_types::ul::cue::LegacyCueKindV1::FilePath | eliot_types::ul::cue::LegacyCueKindV1::Symbol
+                eliot_types::ul::cue::LegacyCueKindV1::FilePath
+                    | eliot_types::ul::cue::LegacyCueKindV1::Symbol
             )
         })
     {
@@ -627,8 +630,12 @@ fn auto_candidate_bindings(
         .map(|(cue, strength)| {
             Ok(eliot_types::CueBinding {
                 match_mode: match cue.kind {
-                    eliot_types::ul::cue::LegacyCueKindV1::DirPath => eliot_types::CueMatchMode::Prefix,
-                    eliot_types::ul::cue::LegacyCueKindV1::ErrorSignature => eliot_types::CueMatchMode::Signature,
+                    eliot_types::ul::cue::LegacyCueKindV1::DirPath => {
+                        eliot_types::CueMatchMode::Prefix
+                    }
+                    eliot_types::ul::cue::LegacyCueKindV1::ErrorSignature => {
+                        eliot_types::CueMatchMode::Signature
+                    }
                     _ => eliot_types::CueMatchMode::Exact,
                 },
                 cue_kind: cue.kind,

@@ -70,8 +70,8 @@ use eliot_learning_contracts::{
     HarnessActivationReceiptCandidate, LearningContractError, SourceDenominator,
 };
 use eliot_observation_contracts::{
-    BankProjection, FeedbackProjection, JournalProjection, ObservationError, ObservationScope,
-    ProjectionOmission, MAX_PROJECTION_OMISSIONS,
+    BankProjection, FeedbackProjection, JournalProjection, MAX_PROJECTION_OMISSIONS,
+    ObservationError, ObservationScope, ProjectionOmission,
 };
 use eliot_receipts::WorkScopeId;
 use schemars::JsonSchema;
@@ -137,10 +137,7 @@ fn fence_shape(fence: &StateFence, field: &'static str) -> Result<(), QualityErr
     })
 }
 
-fn unique_handles(
-    handles: &[ArtifactId],
-    field: &'static str,
-) -> Result<(), QualityError> {
+fn unique_handles(handles: &[ArtifactId], field: &'static str) -> Result<(), QualityError> {
     let mut seen = BTreeSet::new();
     for handle in handles {
         if !seen.insert(handle.as_str().to_owned()) {
@@ -397,9 +394,7 @@ impl SkillEvidenceProjectionStatus {
 }
 
 /// Closed quality-assessment section marker.
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AssessmentSection {
     /// Order 80 skill-lifecycle section.
@@ -623,9 +618,7 @@ pub fn assess_skill_lifecycle(
         });
     }
     if receipts.len() > MAX_ASSESSMENT_RECEIPTS {
-        return Err(QualityError::Bounds {
-            field: "receipts",
-        });
+        return Err(QualityError::Bounds { field: "receipts" });
     }
     let mut input_digests = Vec::with_capacity(receipts.len() + 1);
     input_digests.push(status.digest.clone());
@@ -704,9 +697,7 @@ pub fn assess_dreamer_economics(
         });
     }
     if receipts.len() > MAX_ASSESSMENT_RECEIPTS {
-        return Err(QualityError::Bounds {
-            field: "receipts",
-        });
+        return Err(QualityError::Bounds { field: "receipts" });
     }
     if job_handles.is_empty() {
         return Err(QualityError::IncompleteDenominator {
@@ -858,9 +849,7 @@ pub fn assess_self_quality(
         });
     }
     if receipts.len() > MAX_ASSESSMENT_RECEIPTS {
-        return Err(QualityError::Bounds {
-            field: "receipts",
-        });
+        return Err(QualityError::Bounds { field: "receipts" });
     }
     let mut denominators = Vec::with_capacity(receipts.len());
     for receipt in receipts {
@@ -936,8 +925,9 @@ pub fn assess_intervention(
             reason: "intervention needs at least one verifier handle for discriminator and outcome evidence",
         });
     }
-    let mut evidence_handles =
-        Vec::with_capacity(problem_handles.len() + improvement_handles.len() + verifier_handles.len());
+    let mut evidence_handles = Vec::with_capacity(
+        problem_handles.len() + improvement_handles.len() + verifier_handles.len(),
+    );
     evidence_handles.extend(problem_handles.iter().cloned());
     evidence_handles.extend(improvement_handles.iter().cloned());
     evidence_handles.extend(verifier_handles.iter().cloned());
@@ -1115,8 +1105,11 @@ pub fn recheck_candidate(
     }
     for bank in &snapshot.banks {
         bank.validate()?;
-        let members: Vec<&ArtifactId> =
-            bank.refs.iter().map(|reference| &reference.handle).collect();
+        let members: Vec<&ArtifactId> = bank
+            .refs
+            .iter()
+            .map(|reference| &reference.handle)
+            .collect();
         collect_projection(
             &bank.projection_id,
             &bank.scope,
@@ -1131,8 +1124,11 @@ pub fn recheck_candidate(
     }
     for feedback in &snapshot.feedbacks {
         feedback.validate()?;
-        let members: Vec<&ArtifactId> =
-            feedback.refs.iter().map(|reference| &reference.handle).collect();
+        let members: Vec<&ArtifactId> = feedback
+            .refs
+            .iter()
+            .map(|reference| &reference.handle)
+            .collect();
         collect_projection(
             &feedback.projection_id,
             &feedback.scope,

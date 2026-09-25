@@ -71,10 +71,9 @@ fn assert_instruction_exactness(
         );
         // Delivery follows the per-item disposition, nothing else.
         let (delivery, status) = match item.disposition {
-            eliot_reactive_context_plan::DeliveryDisposition::EventPlan => (
-                BridgeAdmissionDelivery::HostHook,
-                "EVENT_PLAN",
-            ),
+            eliot_reactive_context_plan::DeliveryDisposition::EventPlan => {
+                (BridgeAdmissionDelivery::HostHook, "EVENT_PLAN")
+            }
             eliot_reactive_context_plan::DeliveryDisposition::ToolOnlyAdvisory => (
                 BridgeAdmissionDelivery::NextBridgeResponse,
                 "TOOL_ONLY_ADVISORY",
@@ -90,7 +89,12 @@ fn assert_instruction_exactness(
 fn tool_only_pending_plan_converts_to_next_response_instructions() {
     let (view, activation, session, attention, coverage, policy) = support::inputs(false, false);
     let result = plan_pending_context_injection(
-        &view, &activation, &session, &attention, &coverage, &policy,
+        &view,
+        &activation,
+        &session,
+        &attention,
+        &coverage,
+        &policy,
     );
     let plan = match result {
         ReactiveContextPlanResult::Pending(plan) => plan,

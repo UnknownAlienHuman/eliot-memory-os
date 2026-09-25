@@ -196,8 +196,7 @@ fn live_derivation() -> GovernorCoverageDerivation {
 
 #[test]
 fn settled_feed_drives_admission_drain_and_receipts() {
-    let (view, activation, session, attention, coverage, policy) =
-        support::inputs(false, false);
+    let (view, activation, session, attention, coverage, policy) = support::inputs(false, false);
     let outcome = eliot_reactive_context_plan::produce_settled_plan_feed(SettledPlanFeedInputs {
         view: &view,
         cue_activation: &activation,
@@ -207,28 +206,27 @@ fn settled_feed_drives_admission_drain_and_receipts() {
         policy: &policy,
     })
     .expect("owner projections must feed");
-    let (live_session, batch_items, plan_items, activation_digest, policy_digest) =
-        match &outcome {
-            SettledPlanFeedOutcome::Ready(feed) => {
-                assert!(
-                    !feed.batch.items.is_empty(),
-                    "tool-only fixture must yield deliverable items"
-                );
-                (
-                    feed.plan.request.session_id.as_str().to_owned(),
-                    feed.batch.items.len(),
-                    feed.plan.items.len(),
-                    feed.plan.activation_digest.clone(),
-                    feed.plan.policy_digest.clone(),
-                )
-            }
-            SettledPlanFeedOutcome::NoSettledPlan(disposition) => {
-                panic!(
-                    "fixture must settle a plan, got no-injection {}",
-                    disposition.reason
-                )
-            }
-        };
+    let (live_session, batch_items, plan_items, activation_digest, policy_digest) = match &outcome {
+        SettledPlanFeedOutcome::Ready(feed) => {
+            assert!(
+                !feed.batch.items.is_empty(),
+                "tool-only fixture must yield deliverable items"
+            );
+            (
+                feed.plan.request.session_id.as_str().to_owned(),
+                feed.batch.items.len(),
+                feed.plan.items.len(),
+                feed.plan.activation_digest.clone(),
+                feed.plan.policy_digest.clone(),
+            )
+        }
+        SettledPlanFeedOutcome::NoSettledPlan(disposition) => {
+            panic!(
+                "fixture must settle a plan, got no-injection {}",
+                disposition.reason
+            )
+        }
+    };
     // The runner attaches under the plan's own owner session: the session
     // gate compares feed text against the live attach, never mints.
     let mut runner = attached_runner(&live_session);
@@ -280,8 +278,7 @@ fn settled_feed_drives_admission_drain_and_receipts() {
 
 #[test]
 fn settled_no_injection_makes_zero_calls() {
-    let (view, activation, _session, attention, coverage, policy) =
-        support::inputs(false, false);
+    let (view, activation, _session, attention, coverage, policy) = support::inputs(false, false);
     let delivered = support::delivered_session(&policy);
     let outcome = eliot_reactive_context_plan::produce_settled_plan_feed(SettledPlanFeedInputs {
         view: &view,

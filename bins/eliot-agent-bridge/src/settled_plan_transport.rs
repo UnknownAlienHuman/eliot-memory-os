@@ -45,8 +45,8 @@ use eliot_reactive_context_plan::{
 };
 
 use super::{
-    AdmissionBasis, BridgeRunner, CueOrigin, FiringEvidence, NormalizedCue,
-    ReactiveInjectionError, RiskTier, Severity,
+    AdmissionBasis, BridgeRunner, CueOrigin, FiringEvidence, NormalizedCue, ReactiveInjectionError,
+    RiskTier, Severity,
 };
 
 /// Bound on transport-side replay keys retained across batches.
@@ -160,10 +160,7 @@ impl std::fmt::Display for PlanAdmissionError {
             ),
             Self::BridgeRejected {
                 dedup_key, reason, ..
-            } => write!(
-                formatter,
-                "bridge rejected plan item {dedup_key}: {reason}"
-            ),
+            } => write!(formatter, "bridge rejected plan item {dedup_key}: {reason}"),
         }
     }
 }
@@ -446,8 +443,8 @@ mod tests {
     use super::*;
     use eliot_agent_bridge_core::{
         ActivationPortOutcome, ActivationPortResult, AttachRequest, DemandId, FencingToken,
-        Generation, HostActivationPort, PrincipalId, ProviderFailure, ProviderReadiness,
-        SessionId, TaskId, WorkUnitId,
+        Generation, HostActivationPort, PrincipalId, ProviderFailure, ProviderReadiness, SessionId,
+        TaskId, WorkUnitId,
     };
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
     use eliot_integration_coverage::{
@@ -463,8 +460,7 @@ mod tests {
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
     const TEST_SESSION: &str = "session-transport-1";
-    const TEST_DIGEST: &str =
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const TEST_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     struct StaticActivation {
         result: ActivationPortResult,
@@ -696,18 +692,14 @@ mod tests {
         for receipt in &receipts {
             assert_eq!(receipt.session_id, TEST_SESSION);
             assert_eq!(receipt.admission.status, "TOOL_ONLY_ADVISORY");
-            assert_eq!(
-                receipt.admission.governance_profile_rev,
-                "policy-digest-1"
-            );
-            assert_eq!(
-                receipt.admission.fence_epoch,
-                format!("{TEST_LINEAGE}:3")
-            );
+            assert_eq!(receipt.admission.governance_profile_rev, "policy-digest-1");
+            assert_eq!(receipt.admission.fence_epoch, format!("{TEST_LINEAGE}:3"));
             assert_eq!(receipt.admission.fence_generation, 7);
         }
-        let risks: Vec<RiskTier> =
-            receipts.iter().map(|receipt| receipt.admission.risk).collect();
+        let risks: Vec<RiskTier> = receipts
+            .iter()
+            .map(|receipt| receipt.admission.risk)
+            .collect();
         assert!(risks.contains(&RiskTier::Severe));
         assert!(risks.contains(&RiskTier::Low));
         let severities: Vec<Severity> = receipts
@@ -945,8 +937,10 @@ mod tests {
         let receipts = runner
             .deliver_reactive_pending_via_response("resp-withhold-1")
             .expect("pending drains");
-        let risks: Vec<RiskTier> =
-            receipts.iter().map(|receipt| receipt.admission.risk).collect();
+        let risks: Vec<RiskTier> = receipts
+            .iter()
+            .map(|receipt| receipt.admission.risk)
+            .collect();
         assert!(risks.contains(&RiskTier::Severe));
         assert!(risks.contains(&RiskTier::Low));
     }

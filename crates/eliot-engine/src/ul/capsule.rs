@@ -1,9 +1,9 @@
 use crate::EngineError;
 use eliot_types::{
-    CapsuleBuild, CapsuleFreshness, CoChangeEdge, ConceptNode, CueBinding, LegacyCueKindV1, CueMatchMode,
-    CueStrength, DependencyManifest, FileDependency, HotspotScore, ModuleCard, ProjectCharter,
-    ProjectId, PyramidBuildStatus, PyramidTargetKind, SubsystemCapsule, SystemFlow, SystemMap,
-    inspect_text_encoding, normalize_bindings, path_matches_boundary, ul_token_estimate,
+    CapsuleBuild, CapsuleFreshness, CoChangeEdge, ConceptNode, CueBinding, CueMatchMode,
+    CueStrength, DependencyManifest, FileDependency, HotspotScore, LegacyCueKindV1, ModuleCard,
+    ProjectCharter, ProjectId, PyramidBuildStatus, PyramidTargetKind, SubsystemCapsule, SystemFlow,
+    SystemMap, inspect_text_encoding, normalize_bindings, path_matches_boundary, ul_token_estimate,
 };
 use serde::Serialize;
 use serde_json::json;
