@@ -1123,6 +1123,7 @@ mod tests {
                 manifest_identity_ref: Some("manifest:one".to_owned()),
             }),
             privacy_class: PrivacyClass::Internal,
+            descriptor_revision: 1,
         }
     }
 
