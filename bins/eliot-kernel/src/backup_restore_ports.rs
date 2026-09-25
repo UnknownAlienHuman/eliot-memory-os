@@ -1442,6 +1442,16 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
         | OrsError::SupervisionLeaseTicketAlreadyCommitted => BackupError::IntegrityMismatch {
             subject: "restore journal supervision ticket".to_owned(),
         },
+        // #1862: a campaign learning-state view or a campaign owner-source
+        // publication that disagrees with its current durable ORS head is an
+        // identity conflict, not a restore-phase mismatch. A journal append can
+        // reach it only through a restore into a Store whose campaign heads no
+        // longer match, so it is reported as an integrity class rather than
+        // gathered into a catch-all.
+        OrsError::CampaignLearningStateViewConflict { .. }
+        | OrsError::CampaignSourcePublicationConflict { .. } => BackupError::IntegrityMismatch {
+            subject: "restore journal campaign learning state".to_owned(),
+        },
     }
 }
 
