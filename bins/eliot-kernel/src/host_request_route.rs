@@ -55,6 +55,7 @@ use eliot_protocol::{
     AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding, HOST_REQUEST_INVOKE_READ_WIRE_ID,
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestAdmissionReceipt, HostRequestEnvelope,
     HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
+    TaskControllerAttempt, TaskControllerInvocation, TaskControllerResultBody,
     host_request_operation_id,
 };
 use eliot_store_api::{CampaignLearningStateViewPublication, EVIDENCE_PACK_MAX_RECORDS, ScopeId};
@@ -133,10 +134,21 @@ pub(crate) struct HostRequestOperationRef {
     pub(crate) request_digest: String,
     pub(crate) local_read_envelope: Option<HostRequestEnvelope>,
     pub(crate) local_read_tool: Option<serde_json::Value>,
-    /// Governed attempt ownership for the queued pair, replacing the former
-    /// time-only claim lease. Never time-expires; only explicit
-    /// retire/fence transitions invalidate it.
+    /// Governed attempt ownership for an admitted `eliot.query` pair. This
+    /// queue is never used for campaign packets.
     pub(crate) local_read_attempt: LocalReadAttemptState,
+    /// Campaign packet pair queued for the packet poller. It has an
+    /// independent queue slot and attempt ledger and can never be claimed by
+    /// the evidence-query poller.
+    pub(crate) campaign_packet_envelope: Option<HostRequestEnvelope>,
+    pub(crate) campaign_packet_tool: Option<serde_json::Value>,
+    pub(crate) campaign_packet_attempt: LocalReadAttemptState,
+    /// Task Controller invocation pair queued for the authenticated daemon
+    /// poller. It is kept separate from the local-read marker so a task
+    /// invocation can never be interpreted as an evidence query.
+    pub(crate) task_controller_envelope: Option<HostRequestEnvelope>,
+    pub(crate) task_controller_tool: Option<serde_json::Value>,
+    pub(crate) task_controller_attempt: LocalReadAttemptState,
 }
 
 /// Governed attempt ownership record for one queued local-read pair.
@@ -392,11 +404,10 @@ impl KernelComposition {
     /// stored bounded result with its revision without re-dispatch; a live
     /// operation returns its admission receipt honestly.
     ///
-    /// No semantic dispatch happens here: producing a fresh answer for
-    /// `eliot.query`/`eliot.packet` requires the Governor read owner
-    /// (`ReadService::query` over the canonical store), which lives outside
-    /// this binary's lane (see the module HANDOFF below). This entry owns
-    /// admission, linkage rejection, and exact readback; the
+    /// No semantic result is produced here: `eliot.query` is dispatched by
+    /// the authenticated query read leg, while `eliot.packet` is queued for
+    /// the production campaign compiler in `eliotd`. This entry owns
+    /// admission, linkage rejection, queueing, and exact readback; the
     /// `KernelHostRequestBinder::invoke_admitted` persist/readback pair owns
     /// the dispatch-then-store leg wherever a Governor is injected.
     pub fn invoke_read_host_request(
@@ -417,14 +428,25 @@ impl KernelComposition {
         .map_err(|_| TransportError::SessionFenced)?;
         let _transition = self.agent_bridge_transition_read()?;
         let (receipt, record) = self.admit_host_request_envelope_under_transition(envelope)?;
-        // Queue admitted `eliot.query` pairs for the outbound-only eliotd
-        // poller (`local_read_claim`, Implements #18). Packet admissions and
-        // malformed selectors never queue; enqueue is best-effort and never
-        // fails admission (the ORS record is already staged above).
-        if record.result_digest.is_none()
-            && matches!(check_local_read_admission(envelope, tool), Ok(Some(_)))
-        {
-            let _ = self.enqueue_local_read_pair_under_transition(envelope, tool);
+        // Queue each admitted shape in its own Kernel-owned lane. A packet is
+        // never handed to the query queue or selector derivation.
+        if record.result_digest.is_none() {
+            match check_local_read_admission(envelope, tool) {
+                Ok(LocalReadAdmission::Query(_)) => {
+                    // Queue admission is part of the same authenticated
+                    // operation. Never acknowledge a request whose bounded
+                    // query queue could not retain it.
+                    self.enqueue_local_read_pair_under_transition(envelope, tool)?;
+                }
+                Ok(LocalReadAdmission::CampaignPacket { .. }) => {
+                    self.enqueue_campaign_packet_pair_under_transition(envelope, tool)?;
+                }
+                Err(_) => {
+                    if check_task_controller_admission(envelope, tool).is_ok() {
+                        self.enqueue_task_controller_pair_under_transition(envelope, tool)?;
+                    }
+                }
+            }
         }
         // Coherence gate before serving: a resulted record must carry a
         // digest-bound body, otherwise the row is never served as an answer.
@@ -948,6 +970,12 @@ impl KernelComposition {
                 local_read_envelope: None,
                 local_read_tool: None,
                 local_read_attempt: LocalReadAttemptState::default(),
+                campaign_packet_envelope: None,
+                campaign_packet_tool: None,
+                campaign_packet_attempt: LocalReadAttemptState::default(),
+                task_controller_envelope: None,
+                task_controller_tool: None,
+                task_controller_attempt: LocalReadAttemptState::default(),
             });
         }
         Ok(())
@@ -969,8 +997,10 @@ impl KernelComposition {
     /// full admission gate, so only linkage-checked `eliot.query` pairs with
     /// valid selectors arrive here. An exact replay (same operation and
     /// digest already queued) is idempotent and never duplicates; when the
-    /// bounded queue is full the oldest queued pair is evicted (daemon-leg
-    /// memory only — the durable ORS record is untouched).
+    /// bounded queue is full, only an unclaimed queued pair may be evicted
+    /// (daemon-leg memory only — the durable ORS record is untouched). A full
+    /// queue of claimed/in-flight attempts returns backpressure rather than
+    /// silently stealing a live attempt.
     pub(crate) fn enqueue_local_read_pair(
         &self,
         envelope: &HostRequestEnvelope,
@@ -985,6 +1015,12 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
     ) -> Result<(), TransportError> {
+        match check_local_read_admission(envelope, tool)? {
+            LocalReadAdmission::Query(_) => {}
+            LocalReadAdmission::CampaignPacket { .. } => {
+                return Err(TransportError::SessionFenced);
+            }
+        }
         let _admission_owner = self
             .agent_activation_pending
             .lock()
@@ -1026,14 +1062,19 @@ impl KernelComposition {
             .filter(|candidate| candidate.local_read_envelope.is_some())
             .count();
         if queued >= MAX_QUEUED_LOCAL_READS {
+            let mut evicted = false;
             for refs in index.values_mut() {
-                if let Some(position) = refs
-                    .iter()
-                    .position(|candidate| candidate.local_read_envelope.is_some())
-                {
+                if let Some(position) = refs.iter().position(|candidate| {
+                    candidate.local_read_envelope.is_some()
+                        && !candidate.local_read_attempt.is_live()
+                }) {
                     refs.remove(position);
+                    evicted = true;
                     break;
                 }
+            }
+            if !evicted {
+                return Err(TransportError::Backpressure);
             }
         }
         let refs = index.entry(envelope.connection_id.clone()).or_default();
@@ -1060,6 +1101,222 @@ impl KernelComposition {
                 local_read_envelope: Some(envelope.clone()),
                 local_read_tool: Some(tool.clone()),
                 local_read_attempt,
+                campaign_packet_envelope: None,
+                campaign_packet_tool: None,
+                campaign_packet_attempt: LocalReadAttemptState::default(),
+                task_controller_envelope: None,
+                task_controller_tool: None,
+                task_controller_attempt: LocalReadAttemptState::default(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Queues one admitted `eliot.packet` pair for the dedicated packet
+    /// poller. It is intentionally not a local-read queue entry.
+    pub(crate) fn enqueue_campaign_packet_pair(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> Result<(), TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        self.enqueue_campaign_packet_pair_under_transition(envelope, tool)
+    }
+
+    fn enqueue_campaign_packet_pair_under_transition(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> Result<(), TransportError> {
+        match check_local_read_admission(envelope, tool)? {
+            LocalReadAdmission::CampaignPacket { .. } => {}
+            LocalReadAdmission::Query(_) => return Err(TransportError::SessionFenced),
+        }
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.host_request_connection_gate_under_transition(envelope)?;
+        let mut index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let operation_id = host_request_operation_id(envelope);
+        let existing_connection = index.iter().find_map(|(connection_id, refs)| {
+            refs.iter()
+                .find(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == envelope.envelope_sha256
+                })
+                .map(|_| connection_id.clone())
+        });
+        if let Some(existing_connection) = existing_connection.as_deref() {
+            if existing_connection != envelope.connection_id {
+                return Err(TransportError::IdentityConflict);
+            }
+            if index
+                .get(existing_connection)
+                .into_iter()
+                .flatten()
+                .any(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == envelope.envelope_sha256
+                        && candidate.campaign_packet_envelope.is_some()
+                })
+            {
+                return Ok(());
+            }
+        }
+        let queued = index
+            .values()
+            .flatten()
+            .filter(|candidate| candidate.campaign_packet_envelope.is_some())
+            .count();
+        if queued >= MAX_QUEUED_LOCAL_READS {
+            let mut evicted = false;
+            for refs in index.values_mut() {
+                if let Some(position) = refs.iter().position(|candidate| {
+                    candidate.campaign_packet_envelope.is_some()
+                        && !candidate.campaign_packet_attempt.is_live()
+                }) {
+                    refs.remove(position);
+                    evicted = true;
+                    break;
+                }
+            }
+            if !evicted {
+                return Err(TransportError::Backpressure);
+            }
+        }
+        let campaign_packet_attempt = LocalReadAttemptState {
+            enqueue_salt: LOCAL_READ_ENQUEUE_SALT.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            ..LocalReadAttemptState::default()
+        };
+        let refs = index.entry(envelope.connection_id.clone()).or_default();
+        if let Some(candidate) = refs.iter_mut().find(|candidate| {
+            candidate.operation_id == operation_id
+                && candidate.request_digest == envelope.envelope_sha256
+        }) {
+            candidate.campaign_packet_envelope = Some(envelope.clone());
+            candidate.campaign_packet_tool = Some(tool.clone());
+            candidate.campaign_packet_attempt = campaign_packet_attempt;
+        } else {
+            refs.push(HostRequestOperationRef {
+                operation_id,
+                request_digest: envelope.envelope_sha256.clone(),
+                local_read_envelope: None,
+                local_read_tool: None,
+                local_read_attempt: LocalReadAttemptState::default(),
+                campaign_packet_envelope: Some(envelope.clone()),
+                campaign_packet_tool: Some(tool.clone()),
+                campaign_packet_attempt,
+                task_controller_envelope: None,
+                task_controller_tool: None,
+                task_controller_attempt: LocalReadAttemptState::default(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Queues one admitted Task Controller invocation for the daemon poller.
+    /// The invocation is kept in a separate queue slot from local reads so its
+    /// owner-native payload can never be decoded as an evidence query.
+    pub(crate) fn enqueue_task_controller_pair(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> Result<(), TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        self.enqueue_task_controller_pair_under_transition(envelope, tool)
+    }
+
+    fn enqueue_task_controller_pair_under_transition(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> Result<(), TransportError> {
+        check_task_controller_admission(envelope, tool)?;
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.host_request_connection_gate_under_transition(envelope)?;
+        let mut index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let operation_id = host_request_operation_id(envelope);
+        let existing_connection = index.iter().find_map(|(connection_id, refs)| {
+            refs.iter()
+                .find(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == envelope.envelope_sha256
+                })
+                .map(|_| connection_id.clone())
+        });
+        if let Some(existing_connection) = existing_connection.as_deref() {
+            if existing_connection != envelope.connection_id {
+                return Err(TransportError::IdentityConflict);
+            }
+            if index
+                .get(existing_connection)
+                .into_iter()
+                .flatten()
+                .any(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == envelope.envelope_sha256
+                        && candidate.task_controller_envelope.is_some()
+                })
+            {
+                return Ok(());
+            }
+        }
+        let queued = index
+            .values()
+            .flatten()
+            .filter(|candidate| candidate.task_controller_envelope.is_some())
+            .count();
+        if queued >= MAX_QUEUED_LOCAL_READS {
+            let mut evicted = false;
+            for refs in index.values_mut() {
+                if let Some(position) = refs.iter().position(|candidate| {
+                    candidate.task_controller_envelope.is_some()
+                        && !candidate.task_controller_attempt.is_live()
+                }) {
+                    refs.remove(position);
+                    evicted = true;
+                    break;
+                }
+            }
+            if !evicted {
+                return Err(TransportError::Backpressure);
+            }
+        }
+        let task_controller_attempt = LocalReadAttemptState {
+            enqueue_salt: LOCAL_READ_ENQUEUE_SALT.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            ..LocalReadAttemptState::default()
+        };
+        let refs = index.entry(envelope.connection_id.clone()).or_default();
+        if let Some(candidate) = refs.iter_mut().find(|candidate| {
+            candidate.operation_id == operation_id
+                && candidate.request_digest == envelope.envelope_sha256
+        }) {
+            candidate.task_controller_envelope = Some(envelope.clone());
+            candidate.task_controller_tool = Some(tool.clone());
+            candidate.task_controller_attempt = task_controller_attempt;
+        } else {
+            refs.push(HostRequestOperationRef {
+                operation_id,
+                request_digest: envelope.envelope_sha256.clone(),
+                local_read_envelope: None,
+                local_read_tool: None,
+                local_read_attempt: LocalReadAttemptState::default(),
+                campaign_packet_envelope: None,
+                campaign_packet_tool: None,
+                campaign_packet_attempt: LocalReadAttemptState::default(),
+                task_controller_envelope: Some(envelope.clone()),
+                task_controller_tool: Some(tool.clone()),
+                task_controller_attempt,
             });
         }
         Ok(())
@@ -1140,6 +1397,169 @@ impl KernelComposition {
                     &candidate.local_read_attempt,
                 )?;
                 return Ok(Some((envelope.clone(), tool.clone(), attempt)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Claims the next admitted campaign packet from its independent queue.
+    /// The returned capability is never consumable by the evidence-query leg.
+    pub(crate) fn claim_campaign_packet_pair(
+        &self,
+        session: &Session,
+    ) -> Result<
+        Option<(
+            HostRequestEnvelope,
+            serde_json::Value,
+            eliot_protocol::LocalReadAttempt,
+        )>,
+        TransportError,
+    > {
+        let _transition = self.agent_bridge_transition_read()?;
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let mut index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let now = unix_ms();
+        for refs in index.values_mut() {
+            for candidate in refs.iter_mut() {
+                let (Some(envelope), Some(tool)) = (
+                    candidate.campaign_packet_envelope.as_ref(),
+                    candidate.campaign_packet_tool.as_ref(),
+                ) else {
+                    continue;
+                };
+                if activation_deadline_expired(now, envelope.identity.deadline_unix_ms)
+                    || envelope.identity.capability != "eliot.packet"
+                {
+                    continue;
+                }
+                campaign_packet_admission(envelope, tool)?;
+                if !candidate.campaign_packet_attempt.is_owned_by(session) {
+                    let generation = candidate
+                        .campaign_packet_attempt
+                        .generation
+                        .checked_add(1)
+                        .ok_or(TransportError::SessionFenced)?;
+                    candidate.campaign_packet_attempt = LocalReadAttemptState {
+                        attempt_id: self.mint_local_read_attempt_id(
+                            &candidate.operation_id,
+                            candidate.campaign_packet_attempt.enqueue_salt,
+                            generation,
+                        ),
+                        generation,
+                        enqueue_salt: candidate.campaign_packet_attempt.enqueue_salt,
+                        owner_connection_id: session.connection_id.clone(),
+                        owner_launch_nonce: session.launch_nonce.clone(),
+                        owner_session_epoch: session.session_epoch,
+                    };
+                }
+                let attempt = self.local_read_attempt_capability(
+                    envelope,
+                    &candidate.operation_id,
+                    &candidate.campaign_packet_attempt,
+                )?;
+                return Ok(Some((envelope.clone(), tool.clone(), attempt)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Claims the next admitted Task Controller invocation under the same
+    /// governed attempt ownership used by local reads. The owner-native
+    /// invocation is returned only with its exact admitted envelope/tool pair
+    /// and a Kernel-minted attempt capability.
+    pub(crate) fn claim_task_controller_pair(
+        &self,
+        session: &Session,
+    ) -> Result<
+        Option<(
+            HostRequestEnvelope,
+            serde_json::Value,
+            TaskControllerInvocation,
+            TaskControllerAttempt,
+        )>,
+        TransportError,
+    > {
+        let _transition = self.agent_bridge_transition_read()?;
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let mut index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let now = unix_ms();
+        for refs in index.values_mut() {
+            for candidate in refs.iter_mut() {
+                let (Some(envelope), Some(tool)) = (
+                    candidate.task_controller_envelope.as_ref(),
+                    candidate.task_controller_tool.as_ref(),
+                ) else {
+                    continue;
+                };
+                if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
+                    continue;
+                }
+                let invocation = task_controller_admission(envelope, tool)?;
+                if !candidate.task_controller_attempt.is_owned_by(session) {
+                    let generation = candidate
+                        .task_controller_attempt
+                        .generation
+                        .checked_add(1)
+                        .ok_or(TransportError::SessionFenced)?;
+                    candidate.task_controller_attempt = LocalReadAttemptState {
+                        attempt_id: self.mint_local_read_attempt_id(
+                            &candidate.operation_id,
+                            candidate.task_controller_attempt.enqueue_salt,
+                            generation,
+                        ),
+                        generation,
+                        enqueue_salt: candidate.task_controller_attempt.enqueue_salt,
+                        owner_connection_id: session.connection_id.clone(),
+                        owner_launch_nonce: session.launch_nonce.clone(),
+                        owner_session_epoch: session.session_epoch,
+                    };
+                }
+                let task_id = envelope
+                    .identity
+                    .task_id
+                    .as_deref()
+                    .and_then(|value| value.parse().ok())
+                    .ok_or(TransportError::SessionFenced)?;
+                let scope_id = envelope
+                    .identity
+                    .work_scope_id
+                    .as_deref()
+                    .ok_or(TransportError::SessionFenced)?;
+                let session_id = envelope
+                    .identity
+                    .session_id
+                    .as_deref()
+                    .ok_or(TransportError::SessionFenced)?;
+                let attempt = TaskControllerAttempt {
+                    wire_id: eliot_protocol::TASK_CONTROLLER_ATTEMPT_WIRE_ID.to_owned(),
+                    wire_version: eliot_protocol::TASK_CONTROLLER_ATTEMPT_WIRE_VERSION,
+                    operation_id: candidate.operation_id.clone(),
+                    attempt_id: candidate.task_controller_attempt.attempt_id.clone(),
+                    fencing_generation: candidate.task_controller_attempt.generation,
+                    session_id: session_id.to_owned(),
+                    authority_epoch: envelope.state_fence.authority_epoch.clone(),
+                    scope_id: scope_id.to_owned(),
+                    expires_at_unix_ms: envelope.identity.deadline_unix_ms,
+                    use_budget: 1,
+                    task_id,
+                    state_fence: envelope.state_fence.clone(),
+                };
+                attempt
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                return Ok(Some((envelope.clone(), tool.clone(), invocation, attempt)));
             }
         }
         Ok(None)
@@ -1264,6 +1684,33 @@ impl KernelComposition {
             .filter(LocalReadAttemptState::is_live))
     }
 
+    /// Loads the live campaign-packet attempt without exposing query state.
+    pub(crate) fn live_campaign_packet_attempt(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+    ) -> Result<Option<LocalReadAttemptState>, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(index
+            .values()
+            .flatten()
+            .find(|candidate| {
+                candidate.operation_id == operation_id
+                    && candidate.request_digest == request_digest
+                    && candidate.campaign_packet_envelope.is_some()
+            })
+            .map(|candidate| candidate.campaign_packet_attempt.clone())
+            .filter(LocalReadAttemptState::is_live))
+    }
+
     /// Retires one queued local-read pair without failing.
     ///
     /// Called after a result is persisted (submit and sync legs) so later
@@ -1289,6 +1736,26 @@ impl KernelComposition {
                 !(candidate.operation_id == operation_id
                     && candidate.request_digest == request_digest
                     && candidate.local_read_envelope.is_some())
+            });
+        }
+    }
+
+    /// Retires one queued campaign packet without touching the query queue.
+    pub(crate) fn retire_campaign_packet_pair(&self, operation_id: &str, request_digest: &str) {
+        let Ok(_transition) = self.agent_bridge_transition_read() else {
+            return;
+        };
+        let Ok(_admission_owner) = self.agent_activation_pending.lock() else {
+            return;
+        };
+        let Ok(mut index) = self.host_request_connection_index.lock() else {
+            return;
+        };
+        for refs in index.values_mut() {
+            refs.retain(|candidate| {
+                !(candidate.operation_id == operation_id
+                    && candidate.request_digest == request_digest
+                    && candidate.campaign_packet_envelope.is_some())
             });
         }
     }
@@ -1477,6 +1944,157 @@ impl KernelComposition {
         // pair so no later claim or submit can reuse this generation.
         self.retire_local_read_pair_under_transition(&body.operation_id, &body.request_sha256);
         Ok(LocalReadSubmitDisposition::Persisted(Box::new(persisted)))
+    }
+    /// Submits the result of one claimed Task Controller invocation. The
+    /// attempt, task, scope, authority and State Fence joins are checked
+    /// against the same live queue record before the result reaches ORS.
+    pub(crate) fn submit_task_controller_result(
+        &self,
+        session: &Session,
+        body: &TaskControllerResultBody,
+    ) -> Result<LocalReadSubmitDisposition, TransportError> {
+        body.validate().map_err(|_| TransportError::SessionFenced)?;
+        let _transition = self.agent_bridge_transition_read()?;
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let operation_id = OperationIdentity::new(body.operation_id.clone())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let stored = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation_id, &body.request_sha256)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        if stored.operation_id.as_str() != body.operation_id
+            || stored.request_digest != body.request_sha256
+            || stored.capability_ref.as_str() != "eliot.task-controller"
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if stored.state == HostRequestState::ResultReceived
+            && stored.result_digest.as_deref() == Some(body.result_digest.as_str())
+            && stored.result_response.as_ref() == Some(&body.response)
+        {
+            return Ok(LocalReadSubmitDisposition::Persisted(Box::new(stored)));
+        }
+        if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
+            return Err(TransportError::Timeout);
+        }
+        let queued = {
+            let index = self
+                .host_request_connection_index
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            index
+                .values()
+                .flatten()
+                .find(|candidate| {
+                    candidate.operation_id == body.operation_id
+                        && candidate.request_digest == body.request_sha256
+                        && candidate.task_controller_envelope.is_some()
+                })
+                .map(|candidate| {
+                    (
+                        candidate.task_controller_envelope.clone(),
+                        candidate.task_controller_attempt.clone(),
+                    )
+                })
+        };
+        let (envelope, state) = queued.ok_or(TransportError::UnknownRequest)?;
+        let envelope = envelope.ok_or(TransportError::UnknownRequest)?;
+        if !state.is_owned_by(session) {
+            return Ok(LocalReadSubmitDisposition::StaleAttempt(
+                StaleLocalReadObservation {
+                    operation_id: body.operation_id.clone(),
+                    request_digest: body.request_sha256.clone(),
+                    presented_attempt_id: Some(body.attempt.attempt_id.clone()),
+                    presented_generation: Some(body.attempt.fencing_generation),
+                    current_generation: Some(state.generation),
+                    reason: StaleLocalReadReason::OwnerMismatch,
+                },
+            ));
+        }
+        if body.attempt.operation_id != body.operation_id
+            || body.attempt.attempt_id != state.attempt_id
+            || body.attempt.fencing_generation != state.generation
+            || body.attempt.task_id.as_str()
+                != envelope
+                    .identity
+                    .task_id
+                    .as_deref()
+                    .ok_or(TransportError::SessionFenced)?
+            || body.attempt.scope_id
+                != envelope
+                    .identity
+                    .work_scope_id
+                    .as_deref()
+                    .ok_or(TransportError::SessionFenced)?
+            || body.attempt.session_id
+                != envelope
+                    .identity
+                    .session_id
+                    .as_deref()
+                    .ok_or(TransportError::SessionFenced)?
+            || body.attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
+            || body.attempt.state_fence != envelope.state_fence
+            || !body
+                .attempt
+                .authority_epoch
+                .is_same_authority(&envelope.state_fence.authority_epoch)
+        {
+            return Ok(LocalReadSubmitDisposition::StaleAttempt(
+                StaleLocalReadObservation {
+                    operation_id: body.operation_id.clone(),
+                    request_digest: body.request_sha256.clone(),
+                    presented_attempt_id: Some(body.attempt.attempt_id.clone()),
+                    presented_generation: Some(body.attempt.fencing_generation),
+                    current_generation: Some(state.generation),
+                    reason: StaleLocalReadReason::Superseded,
+                },
+            ));
+        }
+        if !session
+            .authority_epoch
+            .is_same_authority(&envelope.state_fence.authority_epoch)
+            || session.module_generation.state_fence != envelope.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let persisted = self
+            .generation_gateway
+            .ors
+            .persist_host_request_result(
+                &operation_id,
+                &body.request_sha256,
+                &body.result_digest,
+                &body.response,
+            )
+            .map_err(|error| match error {
+                OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
+                _ => TransportError::SessionFenced,
+            })?
+            .ok_or(TransportError::UnknownRequest)?;
+        self.retire_task_controller_pair_under_transition(&body.operation_id, &body.request_sha256);
+        Ok(LocalReadSubmitDisposition::Persisted(Box::new(persisted)))
+    }
+
+    fn retire_task_controller_pair_under_transition(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+    ) {
+        let Ok(mut index) = self.host_request_connection_index.lock() else {
+            return;
+        };
+        for refs in index.values_mut() {
+            refs.retain(|candidate| {
+                !(candidate.operation_id == operation_id
+                    && candidate.request_digest == request_digest
+                    && candidate.task_controller_envelope.is_some())
+            });
+        }
     }
 }
 
@@ -1864,9 +2482,7 @@ pub(crate) fn host_request_tool_from_payload(
 /// when present, else the admitted `session_id` — never an MCP argument),
 /// `subject` is the exact `subject:<exact-subject>` selector (never free
 /// text, never blank), `max_records` is the explicit catalogue bound, and
-/// `intent_mode` is the presented `snake_case` query mode. `eliot.packet` is
-/// not a query and yields no selectors; the packet path keeps its
-/// admission-only behaviour untouched.
+/// `intent_mode` is the presented `snake_case` query mode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LocalReadSelectors {
     pub(crate) scope_id: ScopeId,
@@ -1875,18 +2491,83 @@ pub(crate) struct LocalReadSelectors {
     pub(crate) intent_mode: String,
 }
 
-/// Derives the closed local-read selectors from one linked envelope+tool pair.
+/// The two local-read shapes admitted by the authenticated daemon poller.
 ///
-/// Returns `Ok(None)` for `eliot.packet` (non-goal: the packet path keeps its
-/// admission-only behaviour and never reaches the read leg). Fails closed as
-/// `SessionFenced` for any other tool name, for a capability mismatch, for a
-/// `CurrentPosition` intent (which never admits `GetEvidencePack`), for a
-/// present `exact_resource_uri` (exact expansion uses the resource path, not
-/// a query), for a non-exact `subject:` selector, and for a missing or blank
-/// trusted scope. Mirrors the `plan_evidence_pack_query` rules field-for-field
-/// without taking an MCP edge; linkage (capability + payload digest) must
-/// already be proven by the caller through [`HostRequestInvokeReadPayload`].
-/// Pure: deriving selectors performs no store IO.
+/// `eliot.query` is the bounded evidence query. `eliot.packet` is a distinct
+/// task-bound campaign compilation request; it must be queued and claimed just
+/// like a query, but it is never converted into an evidence-pack selector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LocalReadAdmission {
+    /// A bounded evidence query.
+    Query(LocalReadSelectors),
+    /// A task-bound campaign packet with its trusted scope, task, and exact
+    /// task revision admitted before it can enter the queue.
+    CampaignPacket {
+        scope_id: ScopeId,
+        task_id: String,
+        task_revision: u64,
+    },
+}
+
+const MAX_CAMPAIGN_PACKET_MATERIALS: usize = 256;
+const MAX_CAMPAIGN_PACKET_SELECTOR_BYTES: usize = 4096;
+
+/// Validates the closed Task Controller invoke-read pair before it enters the
+/// Kernel-owned queue. The owner-native task payload remains opaque here; the
+/// daemon decodes it only after claiming the exact fenced attempt.
+fn task_controller_admission(
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> Result<TaskControllerInvocation, TransportError> {
+    let object = tool.as_object().ok_or(TransportError::SessionFenced)?;
+    if object.get("name").and_then(serde_json::Value::as_str) != Some("eliot.task-controller")
+        || envelope.identity.capability != "eliot.task-controller"
+        || envelope.identity.payload_schema_id != "eliot.task-controller.invoke.v1"
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let arguments = object
+        .get("arguments")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)?;
+    let invocation: TaskControllerInvocation =
+        serde_json::from_value(arguments).map_err(|_| TransportError::SessionFenced)?;
+    invocation
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    if invocation.task_id.as_str()
+        != envelope
+            .identity
+            .task_id
+            .as_deref()
+            .ok_or(TransportError::SessionFenced)?
+        || invocation.work_scope_id
+            != envelope
+                .identity
+                .work_scope_id
+                .as_deref()
+                .ok_or(TransportError::SessionFenced)?
+        || envelope.state_fence.task_revision.is_none()
+        || envelope.identity.session_id.is_none()
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(invocation)
+}
+
+fn check_task_controller_admission(
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> Result<(), TransportError> {
+    task_controller_admission(envelope, tool).map(|_| ())
+}
+
+/// Derives the closed query selectors from one linked envelope+tool pair.
+///
+/// This compatibility helper remains query-only: a packet is deliberately not
+/// represented as a query. The production admission gate below uses
+/// [`local_read_admission_from_tool`] so packets receive their own queue
+/// marker instead of disappearing behind `Ok(None)`.
 pub(crate) fn local_read_selectors_from_tool(
     envelope: &HostRequestEnvelope,
     tool: &serde_json::Value,
@@ -1930,6 +2611,16 @@ pub(crate) fn local_read_selectors_from_tool(
         .map(str::trim)
         .filter(|subject| !subject.is_empty() && !subject.chars().any(char::is_control))
         .ok_or(TransportError::SessionFenced)?;
+    let scope_id = trusted_local_read_scope(envelope)?;
+    Ok(Some(LocalReadSelectors {
+        scope_id,
+        subject: subject.to_owned(),
+        max_records: EVIDENCE_PACK_MAX_RECORDS,
+        intent_mode: mode.to_owned(),
+    }))
+}
+
+fn trusted_local_read_scope(envelope: &HostRequestEnvelope) -> Result<ScopeId, TransportError> {
     let scope_text = envelope
         .identity
         .work_scope_id
@@ -1943,26 +2634,84 @@ pub(crate) fn local_read_selectors_from_tool(
                 .filter(|scope| !scope.trim().is_empty())
         })
         .ok_or(TransportError::SessionFenced)?;
-    let scope_id = ScopeId::new(scope_text).map_err(|_| TransportError::SessionFenced)?;
-    Ok(Some(LocalReadSelectors {
-        scope_id,
-        subject: subject.to_owned(),
-        max_records: EVIDENCE_PACK_MAX_RECORDS,
-        intent_mode: mode.to_owned(),
-    }))
+    ScopeId::new(scope_text).map_err(|_| TransportError::SessionFenced)
 }
 
-/// Validates one local-read admission before any store read (no IO).
-///
-/// Runs the exact invoke-read linkage gate ([`HostRequestInvokeReadPayload`])
-/// plus the closed selector derivation, so a changed payload digest, a forged
-/// descriptor or capability, or a malformed selector is rejected before the
-/// caller performs any Gateway IO. Pure: validation performs no IO by
-/// construction, which is the rejection-before-reading proof.
-pub(crate) fn check_local_read_admission(
+fn campaign_packet_admission(
     envelope: &HostRequestEnvelope,
     tool: &serde_json::Value,
-) -> Result<Option<LocalReadSelectors>, TransportError> {
+) -> Result<LocalReadAdmission, TransportError> {
+    let object = tool.as_object().ok_or(TransportError::SessionFenced)?;
+    if object.get("name").and_then(serde_json::Value::as_str) != Some("eliot.packet")
+        || envelope.identity.capability != "eliot.packet"
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let arguments = object
+        .get("arguments")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(TransportError::SessionFenced)?;
+    if arguments.len() > 2
+        || arguments
+            .keys()
+            .any(|key| !matches!(key.as_str(), "packet_ref" | "material_refs"))
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    if let Some(packet_ref) = arguments.get("packet_ref")
+        && (!packet_ref.is_string()
+            || packet_ref.as_str().is_some_and(|value| {
+                value.trim().is_empty() || value.len() > MAX_CAMPAIGN_PACKET_SELECTOR_BYTES
+            }))
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    if let Some(materials) = arguments.get("material_refs") {
+        let materials = materials.as_array().ok_or(TransportError::SessionFenced)?;
+        if materials.len() > MAX_CAMPAIGN_PACKET_MATERIALS
+            || materials.iter().any(|value| {
+                value.as_str().is_none_or(|value| {
+                    value.trim().is_empty()
+                        || value.len() > MAX_CAMPAIGN_PACKET_SELECTOR_BYTES
+                        || value.chars().any(char::is_control)
+                })
+            })
+        {
+            return Err(TransportError::SessionFenced);
+        }
+    }
+    let task_id = envelope
+        .identity
+        .task_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))
+        .ok_or(TransportError::SessionFenced)?
+        .to_owned();
+    let task_revision = envelope
+        .state_fence
+        .task_revision
+        .ok_or(TransportError::SessionFenced)?
+        .value();
+    let scope_text = envelope
+        .identity
+        .work_scope_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))
+        .ok_or(TransportError::SessionFenced)?;
+    let scope_id = ScopeId::new(scope_text).map_err(|_| TransportError::SessionFenced)?;
+    Ok(LocalReadAdmission::CampaignPacket {
+        scope_id,
+        task_id,
+        task_revision,
+    })
+}
+
+/// Derives the authenticated local-read admission, preserving packet as a
+/// first-class admitted shape rather than an absent selector set.
+pub(crate) fn local_read_admission_from_tool(
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> Result<LocalReadAdmission, TransportError> {
     HostRequestInvokeReadPayload {
         wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
         wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
@@ -1971,7 +2720,27 @@ pub(crate) fn check_local_read_admission(
     }
     .validate()
     .map_err(|_| TransportError::SessionFenced)?;
-    local_read_selectors_from_tool(envelope, tool)
+    let name = tool
+        .as_object()
+        .and_then(|object| object.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(TransportError::SessionFenced)?;
+    match name {
+        "eliot.packet" => campaign_packet_admission(envelope, tool),
+        "eliot.query" => local_read_selectors_from_tool(envelope, tool)
+            .map_err(|_| TransportError::SessionFenced)?
+            .map(LocalReadAdmission::Query)
+            .ok_or(TransportError::SessionFenced),
+        _ => Err(TransportError::SessionFenced),
+    }
+}
+
+/// Validates one local-read admission before any store read (no IO).
+pub(crate) fn check_local_read_admission(
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> Result<LocalReadAdmission, TransportError> {
+    local_read_admission_from_tool(envelope, tool)
 }
 
 /// Serves an exact replay of a resulted operation without re-dispatch (no IO).
@@ -2347,15 +3116,19 @@ mod invoke_read_tool_tests {
     }
 
     #[test]
-    fn local_read_packet_yields_no_selectors_and_keeps_admission_path() {
+    fn local_read_packet_is_a_distinct_queue_shape() {
         let tool = packet_tool();
         let envelope = test_envelope("eliot.packet", &tool_digest(&tool));
         assert_eq!(
             local_read_selectors_from_tool(&envelope, &tool)
                 .expect("packet must not fail selector derivation"),
             None,
-            "packet stays on the admission-only leg and never reaches the read"
+            "packet is not represented as an evidence-query selector"
         );
+        assert!(matches!(
+            check_local_read_admission(&envelope, &tool).expect("packet linkage must validate"),
+            LocalReadAdmission::CampaignPacket { .. }
+        ));
     }
 
     #[test]
@@ -2424,12 +3197,10 @@ mod invoke_read_tool_tests {
     fn check_local_read_admission_rejects_forgery_without_io() {
         let tool = query_tool();
         let envelope = test_envelope("eliot.query", &tool_digest(&tool));
-        assert!(
-            check_local_read_admission(&envelope, &tool)
-                .expect("admitted query must validate")
-                .is_some(),
-            "the admitted query carries selectors"
-        );
+        assert!(matches!(
+            check_local_read_admission(&envelope, &tool).expect("admitted query must validate"),
+            LocalReadAdmission::Query(_)
+        ));
 
         // A changed payload under the same envelope digest is rejected before
         // any read: the digest no longer binds the presented bytes.
@@ -2449,15 +3220,14 @@ mod invoke_read_tool_tests {
             "capability mismatch must be rejected before reading"
         );
 
-        // Packet passes linkage and yields no selectors: admission-only leg.
+        // Packet passes linkage as its own queue shape.
         let packet = packet_tool();
         let packet_envelope = test_envelope("eliot.packet", &tool_digest(&packet));
-        assert_eq!(
+        assert!(matches!(
             check_local_read_admission(&packet_envelope, &packet)
                 .expect("packet linkage must validate"),
-            None,
-            "packet keeps the admission-only path"
-        );
+            LocalReadAdmission::CampaignPacket { .. }
+        ));
     }
 
     #[test]

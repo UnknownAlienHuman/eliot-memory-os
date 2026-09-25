@@ -38,7 +38,16 @@ use std::sync::atomic::Ordering;
 
 mod activation_projection;
 pub mod agent_fabric;
+pub mod campaign_context_owner;
+pub mod campaign_evaluation_owner;
+pub mod campaign_owner_matrix;
 pub mod campaign_packet;
+pub mod campaign_task_controller;
+
+pub use campaign_context_owner::build_context_owner_publications;
+pub use campaign_evaluation_owner::build_product_evaluation_publications;
+pub use campaign_owner_matrix::assemble_campaign_owner_publications;
+pub use campaign_task_controller::serve_task_controller_claim;
 pub mod canonical_config_precedence;
 mod capability_admission;
 mod capability_evidence_wiring;
@@ -116,7 +125,9 @@ pub use capability_outcome::{
 };
 pub use daemon_config::DaemonConfig;
 pub(crate) use daemon_kernel_client::kernel_port_error;
-pub use daemon_kernel_client::{DaemonKernelClient, LocalReadSubmitOutcome, OwnerSessionFacts};
+pub use daemon_kernel_client::{
+    DaemonKernelClient, LocalReadSubmitOutcome, OwnerSessionFacts, TaskControllerSubmitOutcome,
+};
 #[cfg(test)]
 pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
 #[cfg(all(test, windows))]

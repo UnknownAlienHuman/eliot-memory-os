@@ -27,8 +27,8 @@ use eliot_protocol::{
 use eliotd::testd_terminal_completion::TestdOwnerDrainOutcome;
 use eliotd::{
     ActivationClaim, DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus,
-    LocalReadSubmitOutcome, PROTOCOL_VERSION, SERVICE_NAME, forward_admitted_local_read,
-    terminal_for_invalid_ticket,
+    LocalReadSubmitOutcome, PROTOCOL_VERSION, SERVICE_NAME, TaskControllerSubmitOutcome,
+    forward_admitted_local_read, terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -646,6 +646,7 @@ impl LoopCadence {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_loop(
     kernel: Arc<DaemonKernelClient>,
     composition: SharedComposition,
@@ -660,6 +661,10 @@ async fn run_loop(
     // off until the next tick, while a claimed pair forwards through the
     // Kernel `local_read` leg and submits its result body before idling.
     let mut local_read_flight = LocalReadFlight::Idle;
+    // Task Controller claims ride the same bounded cadence. The owner path is
+    // real and independent: one authenticated claim, one Governor transition,
+    // and one fenced result submit per tick.
+    let mut task_controller_flight = TaskControllerFlight::Idle;
     // #2100: O1 owner-feed trigger state. The runtime retains one trigger
     // across passes so an unchanged provider performs no IO, while a
     // revision advance or a recovery re-presentation republishes through the
@@ -682,7 +687,10 @@ async fn run_loop(
                 signal.map_err(|error| format!("daemon shutdown signal: {error}"))?;
                 let exit = drain_activation_on_shutdown(&mut flight).await?;
                 drain_local_read_on_shutdown(&mut local_read_flight).await?;
-                drain_testd_owner_on_shutdown(&mut testd_owner_flight).await?;
+                drain_task_controller_on_shutdown(&mut task_controller_flight).await?;
+
+
+                 drain_testd_owner_on_shutdown(&mut testd_owner_flight).await?;
                 return Ok(exit);
             }
             _ = cadence.activation_poll.tick() => {
@@ -690,6 +698,14 @@ async fn run_loop(
                 // gate: it must start even while an activation is in flight,
                 // so its gate is checked before the activation early-continue.
                 maybe_start_local_read_poll(&kernel, &composition, &mut local_read_flight);
+                // Task Controller uses a separate queue and attempt type;
+                // start it on the same cadence without sharing the local-read
+                // completion branch.
+                maybe_start_task_controller_poll(
+                    &kernel,
+                    &composition,
+                    &mut task_controller_flight,
+                );
                 // The TestD owner drain rides the same tick under its own
                 // gate for the same reason: terminal evidence must publish
                 // while activations are in flight.
@@ -761,6 +777,13 @@ async fn run_loop(
             local_read_completion = next_local_read_completion(&mut local_read_flight) => {
                 settle_local_read_completion(local_read_completion, &mut local_read_flight)?;
             }
+            task_controller_completion =
+                next_task_controller_completion(&mut task_controller_flight) => {
+                    settle_task_controller_completion(
+                        task_controller_completion,
+                        &mut task_controller_flight,
+                    )?;
+                }
             testd_owner_completion = next_testd_owner_completion(&mut testd_owner_flight) => {
                 settle_testd_owner_completion(testd_owner_completion, &mut testd_owner_flight)?;
             }
@@ -1081,6 +1104,142 @@ async fn drain_local_read_on_shutdown(flight: &mut LocalReadFlight) -> Result<Ru
     };
     match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
         Ok(LocalReadCompletion::Settled(Err(error))) => Err(error),
+        _ => Ok(RunLoopExit::Shutdown),
+    }
+}
+
+/// Outcome of one production Task Controller poll step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskControllerPollOutcome {
+    /// No queued invocation; back off until the next tick.
+    IdleBackoff,
+    /// The result body was committed or exact-replayed.
+    Accepted,
+    /// The fenced attempt expired before its result committed.
+    Expired,
+    /// The attempt was replaced/revoked and was quarantined.
+    StaleAttempt,
+}
+
+/// Completion of one in-flight Task Controller step.
+enum TaskControllerCompletion {
+    Settled(Result<TaskControllerPollOutcome, String>),
+}
+
+struct TaskControllerFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = TaskControllerCompletion>>>,
+}
+
+/// Sole owner of Task Controller poll state in the runtime loop.
+enum TaskControllerFlight {
+    Idle,
+    InFlight(TaskControllerFlightState),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskControllerTickDecision {
+    StartPoll,
+    SkipInFlight,
+}
+
+fn decide_task_controller_tick(flight: &TaskControllerFlight) -> TaskControllerTickDecision {
+    match flight {
+        TaskControllerFlight::Idle => TaskControllerTickDecision::StartPoll,
+        TaskControllerFlight::InFlight(_) => TaskControllerTickDecision::SkipInFlight,
+    }
+}
+
+fn start_task_controller_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
+) -> Pin<Box<dyn std::future::Future<Output = TaskControllerCompletion>>> {
+    let kernel_clone = Arc::clone(kernel);
+    Box::pin(async move {
+        TaskControllerCompletion::Settled(
+            Box::pin(run_task_controller_poll(&kernel_clone, composition)).await,
+        )
+    })
+}
+
+fn maybe_start_task_controller_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    flight: &mut TaskControllerFlight,
+) {
+    if decide_task_controller_tick(flight) == TaskControllerTickDecision::StartPoll {
+        *flight = TaskControllerFlight::InFlight(TaskControllerFlightState {
+            future: start_task_controller_poll(kernel, Arc::clone(composition)),
+        });
+    }
+}
+
+async fn next_task_controller_completion(
+    flight: &mut TaskControllerFlight,
+) -> TaskControllerCompletion {
+    match flight {
+        TaskControllerFlight::Idle => std::future::pending::<TaskControllerCompletion>().await,
+        TaskControllerFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+fn settle_task_controller_completion(
+    completion: TaskControllerCompletion,
+    flight: &mut TaskControllerFlight,
+) -> Result<(), String> {
+    match completion {
+        TaskControllerCompletion::Settled(Ok(_)) => {
+            *flight = TaskControllerFlight::Idle;
+            Ok(())
+        }
+        TaskControllerCompletion::Settled(Err(error)) => Err(error),
+    }
+}
+
+async fn run_task_controller_poll(
+    kernel: &DaemonKernelClient,
+    composition: SharedComposition,
+) -> Result<TaskControllerPollOutcome, String> {
+    let _span = tracing::info_span!("eliotd.task_controller_poll").entered();
+    let claimed = kernel
+        .claim_task_controller_pair_async()
+        .await
+        .map_err(|error| format!("Kernel Task Controller pair claim: {error}"))?;
+    let Some(claimed) = claimed else {
+        return Ok(TaskControllerPollOutcome::IdleBackoff);
+    };
+    let guard = composition.lock().await;
+    let body = Box::pin(eliotd::serve_task_controller_claim(&guard, claimed))
+        .await
+        .map_err(|error| format!("daemon Task Controller dispatch: {error}"))?;
+    drop(guard);
+    match kernel.submit_task_controller_result_async(&body).await {
+        Ok(TaskControllerSubmitOutcome::Accepted) => Ok(TaskControllerPollOutcome::Accepted),
+        Ok(TaskControllerSubmitOutcome::Expired) => Ok(TaskControllerPollOutcome::Expired),
+        Ok(TaskControllerSubmitOutcome::StaleAttempt) => {
+            Ok(TaskControllerPollOutcome::StaleAttempt)
+        }
+        Err(first_error) => match kernel.submit_task_controller_result_async(&body).await {
+            Ok(TaskControllerSubmitOutcome::Accepted) => Ok(TaskControllerPollOutcome::Accepted),
+            Ok(TaskControllerSubmitOutcome::Expired) => Ok(TaskControllerPollOutcome::Expired),
+            Ok(TaskControllerSubmitOutcome::StaleAttempt) => {
+                Ok(TaskControllerPollOutcome::StaleAttempt)
+            }
+            Err(second_error) => Err(format!(
+                "Kernel Task Controller result submit: {first_error}; retry: {second_error}"
+            )),
+        },
+    }
+}
+
+async fn drain_task_controller_on_shutdown(
+    flight: &mut TaskControllerFlight,
+) -> Result<RunLoopExit, String> {
+    let previous = std::mem::replace(flight, TaskControllerFlight::Idle);
+    let TaskControllerFlight::InFlight(state) = previous else {
+        return Ok(RunLoopExit::Shutdown);
+    };
+    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
+        Ok(TaskControllerCompletion::Settled(Err(error))) => Err(error),
         _ => Ok(RunLoopExit::Shutdown),
     }
 }

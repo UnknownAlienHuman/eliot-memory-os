@@ -33,7 +33,7 @@
 
 use eliot_governor::{
     GovernorTaskLifecycle, KernelTransitionPort, TaskCommand, TaskCommandContext,
-    TaskLifecycleError, TaskProposal, TaskRecord,
+    TaskControllerCampaignSources, TaskLifecycleError, TaskProposal, TaskRecord,
 };
 use eliot_learning_contracts::LearningStateViewRecipe;
 
@@ -92,7 +92,109 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingTaskLifecycle<'_, P> {
             .await
     }
 
-    /// Forwards one guarded task command to the Governor canonical path and
+    /// Forwards a task proposal carrying the complete owner-role publication
+    /// matrix through the authenticated Task Controller transition.
+    pub async fn propose_task_with_complete_campaign_sources(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: eliot_contracts::OperationId,
+        proposal: TaskProposal,
+        recipe: LearningStateViewRecipe,
+        owner_publications: Vec<eliot_store_api::CampaignSourcePublication>,
+    ) -> Result<eliot_store_api::WriteReceipt, TaskLifecycleError> {
+        self.inner
+            .propose_task_with_complete_campaign_sources(
+                identity,
+                operation_id,
+                proposal,
+                recipe,
+                owner_publications,
+            )
+            .await
+    }
+
+    /// Forwards a guarded task command carrying the complete owner-role
+    /// publication matrix through the authenticated Task Controller transition.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_task_with_complete_campaign_sources(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: eliot_contracts::OperationId,
+        task_id: eliot_contracts::TaskId,
+        context: TaskCommandContext,
+        command: TaskCommand,
+        recipe: LearningStateViewRecipe,
+        owner_publications: Vec<eliot_store_api::CampaignSourcePublication>,
+    ) -> Result<eliot_store_api::WriteReceipt, TaskLifecycleError> {
+        self.inner
+            .apply_task_with_complete_campaign_sources(
+                identity,
+                operation_id,
+                task_id,
+                context,
+                command,
+                recipe,
+                owner_publications,
+            )
+            .await
+    }
+
+    /// Forwards a complete owner-material proposal to the Governor owner. The
+    /// builder runs only after the Task Controller has produced its native
+    /// objective/plan/acceptance/open-items rows.
+    pub async fn propose_task_with_complete_campaign_owner_materials<F>(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: eliot_contracts::OperationId,
+        proposal: TaskProposal,
+        recipe: LearningStateViewRecipe,
+        owner_builder: F,
+    ) -> Result<eliot_store_api::WriteReceipt, TaskLifecycleError>
+    where
+        F: FnOnce(
+            &TaskControllerCampaignSources,
+        ) -> Result<Vec<eliot_store_api::CampaignSourcePublication>, String>,
+    {
+        self.inner
+            .propose_task_with_complete_campaign_owner_materials(
+                identity,
+                operation_id,
+                proposal,
+                recipe,
+                owner_builder,
+            )
+            .await
+    }
+
+    /// Forwards a complete owner-material task command to the Governor owner.
+    pub async fn apply_task_with_complete_campaign_owner_materials<F>(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: eliot_contracts::OperationId,
+        task_id: eliot_contracts::TaskId,
+        context: TaskCommandContext,
+        command: TaskCommand,
+        recipe: LearningStateViewRecipe,
+        owner_builder: F,
+    ) -> Result<eliot_store_api::WriteReceipt, TaskLifecycleError>
+    where
+        F: FnOnce(
+            &TaskControllerCampaignSources,
+        ) -> Result<Vec<eliot_store_api::CampaignSourcePublication>, String>,
+    {
+        self.inner
+            .apply_task_with_complete_campaign_owner_materials(
+                identity,
+                operation_id,
+                task_id,
+                context,
+                command,
+                recipe,
+                owner_builder,
+            )
+            .await
+    }
+
     /// returns only the exact issued receipt.
     pub async fn apply_task(
         &self,

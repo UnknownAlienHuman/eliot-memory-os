@@ -2243,7 +2243,6 @@ impl RedbRecoveryStore {
             let mut pending = write.open_table(CAMPAIGN_SOURCE_PENDING).map_err(storage)?;
             for publication in publications {
                 let key = campaign_source_key(&publication.record)?;
-                let expected = publication.expected_head.as_ref();
                 let current = heads
                     .get(key.as_str())
                     .map_err(storage)?
@@ -2255,46 +2254,85 @@ impl RedbRecoveryStore {
                     .map(|value| decode::<CampaignSourceReservation>(value.value()))
                     .transpose()?;
 
-                if current.as_ref() == Some(&publication.next_head()) {
-                    // Exact replay after the canonical receipt and source
-                    // head were both committed.
-                    let row_key =
-                        campaign_source_record_key(&key, &publication.record.content_digest);
-                    let records = write.open_table(CAMPAIGN_SOURCE_RECORDS).map_err(storage)?;
-                    let same_record = records
-                        .get(row_key.as_str())
-                        .map_err(storage)?
-                        .map(|value| decode::<eliot_store_api::CampaignSourceRecord>(value.value()))
-                        .transpose()?
-                        .is_some_and(|record| record == publication.record);
-                    drop(records);
-                    if same_record {
-                        continue;
+                match &publication.state {
+                    eliot_store_api::CampaignSourcePublicationState::CurrentReference {
+                        current_head,
+                    } => {
+                        if pending_row.is_some() || current.as_ref() != Some(current_head) {
+                            return Err(campaign_source_identity_conflict(&key));
+                        }
+                        let row_key =
+                            campaign_source_record_key(&key, &publication.record.content_digest);
+                        let records = write.open_table(CAMPAIGN_SOURCE_RECORDS).map_err(storage)?;
+                        let same_record = records
+                            .get(row_key.as_str())
+                            .map_err(storage)?
+                            .map(|value| {
+                                decode::<eliot_store_api::CampaignSourceRecord>(value.value())
+                            })
+                            .transpose()?
+                            .is_some_and(|record| record == publication.record);
+                        if !same_record {
+                            return Err(campaign_source_identity_conflict(&key));
+                        }
                     }
-                    return Err(campaign_source_identity_conflict(&key));
-                }
+                    eliot_store_api::CampaignSourcePublicationState::NewRevision { .. } => {
+                        let expected = publication.state.expected_head();
+                        if current.as_ref() == Some(&publication.next_head()) {
+                            // Exact replay after the canonical receipt and
+                            // source head were both committed.
+                            let row_key = campaign_source_record_key(
+                                &key,
+                                &publication.record.content_digest,
+                            );
+                            let records =
+                                write.open_table(CAMPAIGN_SOURCE_RECORDS).map_err(storage)?;
+                            let same_record = records
+                                .get(row_key.as_str())
+                                .map_err(storage)?
+                                .map(|value| {
+                                    decode::<eliot_store_api::CampaignSourceRecord>(value.value())
+                                })
+                                .transpose()?
+                                .is_some_and(|record| record == publication.record);
+                            if !same_record {
+                                return Err(campaign_source_identity_conflict(&key));
+                            }
+                            if let Some(existing) = pending_row {
+                                if existing.operation_id != operation_text
+                                    || existing.request_digest != request_digest
+                                    || existing.publication != *publication
+                                {
+                                    return Err(campaign_source_identity_conflict(&key));
+                                }
+                                pending.remove(key.as_str()).map_err(storage)?;
+                            }
+                            continue;
+                        }
 
-                if let Some(existing) = pending_row {
-                    if existing.operation_id == operation_text
-                        && existing.request_digest == request_digest
-                        && existing.publication == *publication
-                    {
-                        continue;
+                        if let Some(existing) = pending_row {
+                            if existing.operation_id == operation_text
+                                && existing.request_digest == request_digest
+                                && existing.publication == *publication
+                            {
+                                continue;
+                            }
+                            return Err(campaign_source_identity_conflict(&key));
+                        }
+                        if current.as_ref() != expected {
+                            return Err(campaign_source_identity_conflict(&key));
+                        }
+                        let reservation = CampaignSourceReservation {
+                            operation_id: operation_text.clone(),
+                            request_digest: request_digest.to_owned(),
+                            publication: publication.clone(),
+                        };
+                        let payload = encode(&reservation)?;
+                        pending
+                            .insert(key.as_str(), payload.as_str())
+                            .map_err(storage)?;
                     }
-                    return Err(campaign_source_identity_conflict(&key));
                 }
-                if current.as_ref() != expected {
-                    return Err(campaign_source_identity_conflict(&key));
-                }
-                let reservation = CampaignSourceReservation {
-                    operation_id: operation_text.clone(),
-                    request_digest: request_digest.to_owned(),
-                    publication: publication.clone(),
-                };
-                let payload = encode(&reservation)?;
-                pending
-                    .insert(key.as_str(), payload.as_str())
-                    .map_err(storage)?;
             }
         }
         write.commit().map_err(storage)
@@ -2324,8 +2362,17 @@ impl RedbRecoveryStore {
             publication
                 .validate()
                 .map_err(|error| OrsError::Contract(error.to_string()))?;
-            if publication.record.recorded_state_fence != receipt.state_fence {
-                return Err(OrsError::FenceMismatch);
+            match &publication.state {
+                eliot_store_api::CampaignSourcePublicationState::NewRevision { .. } => {
+                    if publication.record.recorded_state_fence != receipt.state_fence {
+                        return Err(OrsError::FenceMismatch);
+                    }
+                }
+                eliot_store_api::CampaignSourcePublicationState::CurrentReference { .. } => {
+                    if publication.read_receipt.read_state_fence != receipt.state_fence {
+                        return Err(OrsError::FenceMismatch);
+                    }
+                }
             }
         }
 
@@ -2358,48 +2405,67 @@ impl RedbRecoveryStore {
                     .map(|value| decode::<CampaignSourceReservation>(value.value()))
                     .transpose()?;
 
-                if current_head.as_ref() == Some(&publication.next_head())
-                    && stored_record.as_ref() == Some(&publication.record)
-                {
-                    // An exact replay after a complete source commit is
-                    // idempotent even though the reservation has been cleared.
-                    if let Some(existing) = reservation {
-                        if existing.operation_id != operation_text
-                            || existing.request_digest != request_digest
-                            || existing.publication != *publication
+                match &publication.state {
+                    eliot_store_api::CampaignSourcePublicationState::CurrentReference {
+                        current_head: reference_head,
+                    } => {
+                        if reservation.is_some()
+                            || current_head.as_ref() != Some(reference_head)
+                            || stored_record.as_ref() != Some(&publication.record)
                         {
                             return Err(campaign_source_identity_conflict(&key));
                         }
+                        // A current reference is an observation only. The
+                        // exact head and immutable row are already durable;
+                        // neither table is advanced or rewritten here.
+                        continue;
+                    }
+                    eliot_store_api::CampaignSourcePublicationState::NewRevision { .. } => {
+                        if current_head.as_ref() == Some(&publication.next_head())
+                            && stored_record.as_ref() == Some(&publication.record)
+                        {
+                            // An exact replay after a complete source commit is
+                            // idempotent even though the reservation has been
+                            // cleared.
+                            if let Some(existing) = reservation {
+                                if existing.operation_id != operation_text
+                                    || existing.request_digest != request_digest
+                                    || existing.publication != *publication
+                                {
+                                    return Err(campaign_source_identity_conflict(&key));
+                                }
+                                pending.remove(key.as_str()).map_err(storage)?;
+                            }
+                            continue;
+                        }
+                        let Some(reservation) = reservation else {
+                            return Err(campaign_source_identity_conflict(&key));
+                        };
+                        if reservation.operation_id != operation_text
+                            || reservation.request_digest != request_digest
+                            || reservation.publication != *publication
+                            || current_head.as_ref() != publication.state.expected_head()
+                        {
+                            return Err(campaign_source_identity_conflict(&key));
+                        }
+                        if let Some(existing) = stored_record {
+                            if existing != publication.record {
+                                return Err(campaign_source_identity_conflict(&key));
+                            }
+                        } else {
+                            let payload = encode(&publication.record)?;
+                            records
+                                .insert(row_key.as_str(), payload.as_str())
+                                .map_err(storage)?;
+                        }
+                        let head = publication.next_head();
+                        let payload = encode(&head)?;
+                        heads
+                            .insert(key.as_str(), payload.as_str())
+                            .map_err(storage)?;
                         pending.remove(key.as_str()).map_err(storage)?;
                     }
-                    continue;
                 }
-                let Some(reservation) = reservation else {
-                    return Err(campaign_source_identity_conflict(&key));
-                };
-                if reservation.operation_id != operation_text
-                    || reservation.request_digest != request_digest
-                    || reservation.publication != *publication
-                    || current_head.as_ref() != publication.expected_head.as_ref()
-                {
-                    return Err(campaign_source_identity_conflict(&key));
-                }
-                if let Some(existing) = stored_record {
-                    if existing != publication.record {
-                        return Err(campaign_source_identity_conflict(&key));
-                    }
-                } else {
-                    let payload = encode(&publication.record)?;
-                    records
-                        .insert(row_key.as_str(), payload.as_str())
-                        .map_err(storage)?;
-                }
-                let head = publication.next_head();
-                let payload = encode(&head)?;
-                heads
-                    .insert(key.as_str(), payload.as_str())
-                    .map_err(storage)?;
-                pending.remove(key.as_str()).map_err(storage)?;
             }
         }
         write.commit().map_err(storage)
@@ -2457,6 +2523,7 @@ impl RedbRecoveryStore {
                 status: eliot_store_api::CampaignSourceReadStatus::Missing,
                 source: None,
                 current_head: None,
+                read_receipt: None,
                 read_state_fence: read_state_fence.clone(),
             });
         };
@@ -2497,6 +2564,26 @@ impl RedbRecoveryStore {
                 .validate()
                 .map_err(|error| OrsError::Contract(error.to_string()))?;
         }
+        let head_row_key = campaign_source_record_key(&key, &head.content_digest);
+        let head_record = records
+            .get(head_row_key.as_str())
+            .map_err(storage)?
+            .map(|value| decode::<eliot_store_api::CampaignSourceRecord>(value.value()))
+            .transpose()?
+            .ok_or(OrsError::IntegrityProblem {
+                record_type: "campaign_source_record",
+                reason: "current head has no matching immutable source row".to_owned(),
+            })?;
+        head_record
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let read_receipt = source
+            .as_ref()
+            .map(|record| {
+                eliot_store_api::CampaignOwnerReadReceipt::from_record(record, read_state_fence)
+            })
+            .transpose()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
         let matches_head = source.as_ref().is_some_and(|record| {
             record.revision == head.revision && record.content_digest == head.content_digest
         });
@@ -2508,6 +2595,7 @@ impl RedbRecoveryStore {
                 status: eliot_store_api::CampaignSourceReadStatus::Current,
                 source,
                 current_head: Some(head),
+                read_receipt,
                 read_state_fence: read_state_fence.clone(),
             }
         } else {
@@ -2515,6 +2603,7 @@ impl RedbRecoveryStore {
                 status: eliot_store_api::CampaignSourceReadStatus::Stale,
                 source,
                 current_head: Some(head),
+                read_receipt,
                 read_state_fence: read_state_fence.clone(),
             }
         };

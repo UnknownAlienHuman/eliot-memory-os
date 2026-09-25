@@ -15,8 +15,9 @@
 //! Production edges out of this module:
 //! [`forward_admitted_local_read`] forwards one admitted `eliot.query` pair
 //! to the Kernel `local_read` leg over the retained authenticated session
-//! and returns the persisted result body; [`serve_admitted_local_read`]
-//! serves one admitted pair through the local twin
+//! and returns the persisted result body. `eliot.packet` follows the same
+//! claim/result lifecycle but is served by the production campaign compiler;
+//! [`serve_admitted_local_read`] remains the query-only local twin
 //! ([`KernelContextReadClient::execute_local_read`] over
 //! [`LocalReadPort::evidence_query`]) and returns the exact evidence record.
 //!
@@ -41,10 +42,12 @@ use super::{DaemonComposition, DaemonKernelClient, KernelContextReadClient};
 /// [`DaemonKernelClient::local_read_async`], travels as the `"local_read"`
 /// operation with the Kernel-issued attempt capability, and the persisted
 /// result body behind the admitted receipt+record returns carrying that same
-/// attempt for the submit leg. Kernel remains the admission, read, and
-/// persistence authority; this function performs no admission decision and no
-/// consistency algorithm. A wrong fence or malformed pair fails closed before
-/// any transport; a packet admission carries no result body by design.
+/// attempt for the submit leg. Kernel remains the admission and persistence
+/// authority; this function performs no admission decision and no consistency
+/// algorithm. A wrong fence or malformed pair fails closed before any
+/// transport. A packet is dispatched by the campaign poller after its exact
+/// owner-read and Context-compiler work, then uses this same result-submit
+/// contract.
 pub async fn forward_admitted_local_read(
     kernel: &DaemonKernelClient,
     envelope: HostRequestEnvelope,
@@ -61,9 +64,9 @@ pub async fn forward_admitted_local_read(
 /// the caller-observed admitted fence, and the closed selectors serve exactly
 /// one bounded [`LocalReadPort::evidence_query`] whose answer must echo the
 /// evidence operation and the admitted fence. Returns the exact evidence
-/// record, never a bare admission. `eliot.packet` stays admission-only
-/// (`Unavailable`, MGR04 #19); a wrong fence or a substituted answer fails
-/// closed, never `Ok`-empty.
+/// record, never a bare admission. `eliot.packet` is dispatched by the
+/// production campaign compiler rather than this query-only twin; a wrong
+/// fence or substituted answer fails closed, never `Ok`-empty.
 ///
 /// The port and the fence stay per-call parameters (rather than retained
 /// state) so the composition retains no client and no thread.

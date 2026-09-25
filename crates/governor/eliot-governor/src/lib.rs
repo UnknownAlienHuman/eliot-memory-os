@@ -33,6 +33,7 @@
 #![forbid(unsafe_code)]
 
 mod activation_outcome;
+mod campaign_source_publishers;
 mod campaign_task_sources;
 mod canonical_projections;
 mod capability_evidence;
@@ -71,7 +72,15 @@ mod task_lifecycle;
 mod wasm_resolution;
 
 pub use activation_outcome::*;
-pub use campaign_task_sources::TaskControllerCampaignSourceHeads;
+pub use campaign_source_publishers::{
+    CampaignOwnerSourceInput, CampaignOwnerSourceRegistration, CampaignSourcePublicationBundle,
+    CampaignSourcePublisherError, assemble_campaign_owner_matrix, assemble_task_owner_matrix,
+    campaign_owner_source_registry, validate_campaign_source_role_matrix,
+};
+pub use campaign_task_sources::{
+    TaskControllerCampaignSourceHeads, TaskControllerCampaignSources,
+    build_task_controller_campaign_sources,
+};
 pub use canonical_projections::{
     GOVERNOR_PROJECTIONS_SCHEMA_VERSION, GovernorAffordanceProjection,
     GovernorContinuityProjection, GovernorProjectionError, GovernorProjectionSet,

@@ -28,7 +28,6 @@ eliot-evidence.workspace = true
 eliot-finish.workspace = true
 eliot-integration-coverage.workspace = true
 eliot-kernel-core.workspace = true
-eliot-learning-contracts.workspace = true
 eliot-maintenance.workspace = true
 eliot-mcp.workspace = true
 eliot-module-registry.workspace = true
@@ -47,6 +46,7 @@ eliot-task.workspace = true
 eliot-testd-core.workspace = true
 eliot-instrument-api.workspace = true
 eliot-learning-contracts.workspace = true
+eliot-reactive-context-plan = { path = "../../smart/eliot-reactive-context-plan", version = "0.1.0" }
 eliot-learning-delta.workspace = true
 eliot-learning-activation-assessment.workspace = true
 eliot-verifier = { path = "../../instrument/eliot-verifier", version = "0.1.0" }

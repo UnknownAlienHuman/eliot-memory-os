@@ -318,7 +318,28 @@ impl KernelTransitionPort for DaemonKernelClient {
                 CampaignSourceRole::TaskPlan,
             )
             .await?;
-            Ok(TaskControllerCampaignSourceHeads { objective, plan })
+            let acceptance = read_task_controller_source_head(
+                self,
+                &task_id,
+                &scope_id,
+                &state_fence,
+                CampaignSourceRole::TaskAcceptance,
+            )
+            .await?;
+            let open_items = read_task_controller_source_head(
+                self,
+                &task_id,
+                &scope_id,
+                &state_fence,
+                CampaignSourceRole::TaskOpenItems,
+            )
+            .await?;
+            Ok(TaskControllerCampaignSourceHeads {
+                objective,
+                plan,
+                acceptance,
+                open_items,
+            })
         })
     }
 }

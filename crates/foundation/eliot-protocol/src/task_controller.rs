@@ -92,6 +92,24 @@ pub enum TaskControllerAction {
     Apply,
 }
 
+/// Owner-native material bundle used only for a complete campaign-owner
+/// transition. The protocol keeps each owner body opaque; the daemon decodes
+/// it at the owning boundary and rejects missing, detached, or unbound values.
+/// An absent bundle selects the ordinary recipe-bearing Task Controller path.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskControllerCampaignOwnerMaterials {
+    /// Exact prior Context delivery snapshot selected by the owner route.
+    pub prior_delivery: Value,
+    /// Exact product-evaluation publication bundle emitted by its owner.
+    pub evaluation: Value,
+    /// Current owner heads observed immediately before publication. A missing
+    /// entry is an authenticated absence observation, never a guessed head.
+    pub source_heads: Vec<Value>,
+    /// Remaining owner-issued source inputs for the closed role denominator.
+    pub remaining_owner_inputs: Vec<Value>,
+}
+
 /// Authenticated, closed-shape Task Controller invocation.
 ///
 /// Domain objects remain JSON at the protocol layer to avoid a dependency from
@@ -125,6 +143,11 @@ pub struct TaskControllerInvocation {
     /// Optional selector for the persisted prior delivery snapshot. This is a
     /// lookup selector only and is never evidence or source authority.
     pub prior_delivery_selector: Option<Value>,
+    /// Optional complete owner-material bundle. When present, the daemon must
+    /// assemble and validate every declared owner role before committing the
+    /// Task Controller transition; it cannot infer any missing owner row.
+    #[serde(default)]
+    pub campaign_owner_materials: Option<TaskControllerCampaignOwnerMaterials>,
 }
 
 impl TaskControllerInvocation {
@@ -166,6 +189,40 @@ impl TaskControllerInvocation {
                 selector,
                 "task_controller_invocation.prior_delivery_selector",
             )?;
+        }
+        if let Some(materials) = &self.campaign_owner_materials {
+            structured_object(
+                &materials.prior_delivery,
+                "task_controller_invocation.campaign_owner_materials.prior_delivery",
+            )?;
+            structured_object(
+                &materials.evaluation,
+                "task_controller_invocation.campaign_owner_materials.evaluation",
+            )?;
+            if materials.source_heads.len() > 26 {
+                return Err(ProtocolError::InvalidField {
+                    field: "task_controller_invocation.campaign_owner_materials.source_heads",
+                    reason: "exceeds the closed owner-role denominator",
+                });
+            }
+            for head in &materials.source_heads {
+                structured_object(
+                    head,
+                    "task_controller_invocation.campaign_owner_materials.source_heads",
+                )?;
+            }
+            if materials.remaining_owner_inputs.len() > 26 {
+                return Err(ProtocolError::InvalidField {
+                    field: "task_controller_invocation.campaign_owner_materials.remaining_owner_inputs",
+                    reason: "exceeds the closed owner-role denominator",
+                });
+            }
+            for input in &materials.remaining_owner_inputs {
+                structured_object(
+                    input,
+                    "task_controller_invocation.campaign_owner_materials.remaining_owner_inputs",
+                )?;
+            }
         }
         Ok(())
     }

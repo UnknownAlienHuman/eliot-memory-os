@@ -388,7 +388,7 @@ async fn resolve_compile_and_bind_result(
             );
         }
     };
-    let history_plan_set = match build_history_plan_set(&resolved.current_records) {
+    let history_plan_set = match build_history_plan_set(&recipe, &resolved.current_records) {
         Ok(history) => history,
         Err(_) => {
             return campaign_packet_result_body(
@@ -740,6 +740,29 @@ async fn resolve_compile_and_bind_result(
         );
     }
 
+    // Re-run the Context owner's publication validators at the consumption
+    // edge. The packet then consumes the exact compiled result through the
+    // downstream delivery adapter; neither step can substitute a transcript or
+    // a detached Context row.
+    if crate::campaign_context_owner::validate_context_owner_bodies(
+        &context_recipe_body,
+        prior.as_ref().map(|_| &prior_delivery),
+        &binding.state_fence,
+    )
+    .is_err()
+    {
+        return campaign_packet_result_body(
+            envelope,
+            attempt,
+            context_blocked_response(
+                publication,
+                CampaignPacketGapCode::ContextRecipeUnavailable,
+                Some(CampaignSourceRole::ContextRecipe),
+                &resolved.resolutions,
+                prior.is_some() && !prior_is_current,
+            ),
+        );
+    }
     let compiled = match eliot_context::ContextCompiler::compile_with_campaign_learning_state(
         eliot_context::CampaignLearningStateCompileInput {
             recipe_body: &context_recipe_body,
@@ -767,6 +790,25 @@ async fn resolve_compile_and_bind_result(
             );
         }
     };
+    if crate::campaign_context_owner::consume_compiled_context(
+        &compiled,
+        &publication.view.view_id,
+        &publication.view.canonical_digest,
+    )
+    .is_err()
+    {
+        return campaign_packet_result_body(
+            envelope,
+            attempt,
+            context_blocked_response(
+                publication,
+                CampaignPacketGapCode::ContextCompilationRejected,
+                None,
+                &resolved.resolutions,
+                prior.is_some() && !prior_is_current,
+            ),
+        );
+    }
     campaign_packet_result_body(
         envelope,
         attempt,
@@ -1081,20 +1123,23 @@ fn collect_positions(resolved: &ResolvedCampaignSources) -> Vec<CampaignPosition
 }
 
 fn build_history_plan_set(
+    recipe: &LearningStateViewRecipe,
     current_records: &[CampaignSourceRecord],
 ) -> Result<ValidatedHistoryPlans, String> {
-    let records = current_records
-        .iter()
-        .flat_map(|source| source.history_plans.iter().cloned())
-        .collect::<Vec<_>>();
+    let mut records = Vec::new();
+    for source in current_records {
+        for record in &source.history_plans {
+            record
+                .validate_for_source(recipe.campaign_id.as_str(), &source.owner_id)
+                .map_err(|_| CampaignPacketError::OwnerReadUnavailable.to_string())?;
+            records.push(record.clone());
+        }
+    }
     if records.is_empty() {
         return Err(CampaignPacketError::OwnerReadUnavailable.to_string());
     }
     let mut plans = Vec::with_capacity(records.len());
     for record in &records {
-        record
-            .validate()
-            .map_err(|_| CampaignPacketError::OwnerReadUnavailable.to_string())?;
         let plan: RetrievalPlan = serde_json::from_value(record.plan.clone())
             .map_err(|_| CampaignPacketError::OwnerReadUnavailable.to_string())?;
         plan.validate()

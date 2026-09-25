@@ -855,7 +855,7 @@ static COMMIT_EXPERIENCE_PARAMETERS: [ParameterDeclaration; 6] = [
 /// `expected_revision` as its decimal string (`"1"` on propose, the current
 /// task revision on apply, mirroring how `AppendAuditEvent` carries
 /// `expected_revision`), and the admitted `actor_ref`.
-static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 8] = [
+static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 9] = [
     ParameterDeclaration {
         name: "task_id",
         shape: ParameterShape::Subject,
@@ -894,6 +894,11 @@ static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 8] = [
     ParameterDeclaration {
         name: "campaign_source_publications_json",
         shape: ParameterShape::CampaignSourcePublications,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "campaign_source_matrix_complete",
+        shape: ParameterShape::Subject,
         required: false,
     },
 ];
@@ -1225,7 +1230,11 @@ pub fn verify_declaration_holds_no_payload_encoding(
 ) -> Result<(), StoreError> {
     let structured = match declaration.shape {
         ParameterShape::OperationId | ParameterShape::Subject => false,
-        ParameterShape::EpistemicRevision | ParameterShape::NotificationState => true,
+        ParameterShape::EpistemicRevision
+        | ParameterShape::NotificationState
+        | ParameterShape::CampaignSourceLookup
+        | ParameterShape::CampaignSourcePublications
+        | ParameterShape::CampaignViewLookup => true,
     };
     if structured && CONTROL_FIELD_DENYLIST.contains(&declaration.name) {
         return Err(StoreError::InvalidField {

@@ -55,6 +55,7 @@ eliot-observation-contracts.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-process.workspace = true
+eliot-product-evaluation = { path = "../../crates/instrument/eliot-product-evaluation", version = "0.1.0" }
 eliot-protocol.workspace = true
 eliot-reactive-context-plan = { path = "../../crates/smart/eliot-reactive-context-plan", version = "0.1.0" }
 eliot-read = { path = "../../crates/governor/eliot-read", version = "0.1.0" }

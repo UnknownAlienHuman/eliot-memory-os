@@ -33,9 +33,11 @@
 //! The local-read serving arm ([`KernelContextReadClient::execute_local_read`])
 //! twins that gate shape for an admitted envelope+tool pair: the closed
 //! `eliot.query` selectors serve exactly one bounded
-//! [`LocalReadPort::evidence_query`](eliot_read::LocalReadPort::evidence_query),
-//! while `eliot.packet` stays admission-only (`Unavailable`, MGR04 #19) and a
-//! wrong fence fails closed before any read. The port and the admitted fence
+//! [`LocalReadPort::evidence_query`](eliot_read::LocalReadPort::evidence_query).
+//! `eliot.packet` is dispatched by the production campaign-packet poller after
+//! its own owner reads and Context compilation; this query-only port refuses
+//! to reinterpret a packet as evidence. A wrong fence fails closed before any
+//! read. The port and the admitted fence
 //! stay per-call parameters, so the composition retains no client and no
 //! thread; the `local_read` forwarding transport
 //! (`DaemonKernelClient::local_read_async`) is called through the
@@ -442,9 +444,10 @@ impl KernelContextReadClient {
     /// Checks the local-read execute capability before any read is served:
     /// the pair must prove its closed linkage, name the admitted
     /// `eliot.query` capability, and carry the closed evidence selectors.
-    /// `eliot.packet` is admission-only and fails closed as
-    /// [`StoreError::Unavailable`] (MGR04 #19 owns storage activation); any
-    /// other tool fails closed as [`StoreError::UnknownOperation`], mirroring
+    /// `eliot.packet` is outside this query-only twin and fails closed as
+    /// [`StoreError::Unavailable`]; the authenticated campaign poller owns
+    /// packet dispatch. Any other tool fails closed as
+    /// [`StoreError::UnknownOperation`], mirroring
     /// [`check_execute_capability`](Self::check_execute_capability).
     fn check_local_read_capability(
         envelope: &HostRequestEnvelope,
@@ -543,8 +546,10 @@ impl KernelContextReadClient {
     /// envelope fence must equal the caller-observed admitted fence, and the
     /// closed selectors serve exactly one bounded `evidence_query` whose
     /// answer must echo the evidence operation and the admitted fence.
-    /// `eliot.packet` stays admission-only (`Unavailable`); a wrong fence or
-    /// a substituted answer fails closed, never `Ok`-empty.
+    /// `eliot.packet` is intentionally not served by this query-only port;
+    /// the authenticated daemon poller dispatches it through the production
+    /// campaign compiler. A wrong fence or a substituted answer fails closed,
+    /// never `Ok`-empty.
     ///
     /// The port and the fence stay per-call parameters (rather than retained
     /// state) so the composition retains no client and no thread: callers

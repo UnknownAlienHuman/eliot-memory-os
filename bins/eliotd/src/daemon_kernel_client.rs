@@ -13,9 +13,12 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use eliot_contracts::{ClockReading, OperationId, ProductId, RequestId, RequestMetadata, SourceId};
+use eliot_contracts::{
+    ClockReading, OperationId, ProductId, RequestId, RequestMetadata, SessionId, SourceId,
+};
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
+use eliot_learning_contracts::LearningStateViewRecipe;
 use eliot_protocol::{
     AgentActivationResolutionResult, AgentActivationResultAck, AgentActivationResultReconcile,
     AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind,
@@ -155,6 +158,60 @@ pub enum TaskControllerSubmitOutcome {
     StaleAttempt,
 }
 
+fn derive_task_controller_request_identity(
+    invocation: &TaskControllerInvocation,
+    envelope: &HostRequestEnvelope,
+) -> Result<RequestIdentity, String> {
+    let recipe: LearningStateViewRecipe =
+        serde_json::from_value(invocation.learning_state_view_recipe.clone())
+            .map_err(|error| format!("Task Controller learning recipe does not decode: {error}"))?;
+    recipe
+        .validate()
+        .map_err(|error| format!("Task Controller learning recipe is invalid: {error}"))?;
+    if recipe.binding.task_id != invocation.task_id
+        || recipe.binding.scope.as_str()
+            != envelope
+                .identity
+                .work_scope_id
+                .as_deref()
+                .unwrap_or_default()
+        || recipe.binding.state_fence != envelope.state_fence
+        || recipe.binding.request_id.as_str() != envelope.identity.request_id.as_str()
+    {
+        return Err(
+            "Task Controller invocation is not bound to the admitted recipe/envelope".to_owned(),
+        );
+    }
+    let session_id = envelope
+        .identity
+        .session_id
+        .clone()
+        .map(|value| SessionId::new(value).map_err(|error| error.to_string()))
+        .transpose()?;
+    let metadata = RequestMetadata {
+        request_id: recipe.binding.request_id.clone(),
+        session_id,
+        task_id: Some(recipe.binding.task_id.clone()),
+        product_id: recipe.binding.product_id.clone(),
+        source_id: recipe.binding.source.owner.clone(),
+        state_fence: envelope.state_fence.clone(),
+        clock: ClockReading::default(),
+    };
+    let identity = RequestIdentity {
+        request: RequestBinding {
+            metadata,
+            state_fence: envelope.state_fence.clone(),
+        },
+        idempotency_key: envelope.identity.idempotency_key.clone(),
+        deadline_unix_ms: envelope.identity.deadline_unix_ms,
+        cancellation_id: envelope.identity.cancellation_id.clone(),
+    };
+    identity
+        .validate()
+        .map_err(|error| format!("derived Task Controller identity is invalid: {error}"))?;
+    Ok(identity)
+}
+
 /// Parses one unwrapped Task Controller poll answer into its exact admitted
 /// invocation and Kernel-issued attempt.
 pub fn parse_task_controller_claimed_pair(
@@ -185,8 +242,11 @@ pub fn parse_task_controller_claimed_pair(
         .validate()
         .map_err(|error| format!("Kernel Task Controller envelope is invalid: {error}"))?;
     let tool = decode("tool")?;
-    let request_identity: RequestIdentity = serde_json::from_value(decode("identity")?)
-        .map_err(|error| format!("Kernel Task Controller identity does not decode: {error}"))?;
+    let request_identity: RequestIdentity = match pair.get("identity") {
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|error| format!("Kernel Task Controller identity does not decode: {error}"))?,
+        None => derive_task_controller_request_identity(&invocation, &envelope)?,
+    };
     request_identity
         .validate()
         .map_err(|error| format!("Kernel Task Controller identity is invalid: {error}"))?;
@@ -1174,7 +1234,7 @@ impl DaemonKernelClient {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| {
                 KernelPortError::Contract(
-                    "Kernel local read admission carries no result digest; packet admissions stay admission-only"
+                    "Kernel local read admission carries no result digest; the campaign packet poller must submit its compiled result"
                         .to_owned(),
                 )
             })?;
@@ -1184,7 +1244,7 @@ impl DaemonKernelClient {
             .cloned()
             .ok_or_else(|| {
                 KernelPortError::Contract(
-                    "Kernel local read admission carries no result body; packet admissions stay admission-only"
+                    "Kernel local read admission carries no result body; the campaign packet poller must submit its compiled result"
                         .to_owned(),
                 )
             })?;
@@ -1872,10 +1932,11 @@ mod tests {
             "a wrong fence must fail closed as FenceMismatch, got {fenced:?}"
         );
 
-        // Packet pairs stay admission-only: Unavailable, never a read.
+        // The query-only twin refuses packets; the production campaign poller
+        // owns packet claim, owner reads, compilation, and result submit.
         let packet = packet_tool();
         let packet_envelope = test_envelope("eliot.packet", &fence, &tool_digest(&packet)?)?;
-        let admitted_only = runtime.block_on(KernelContextReadClient::execute_local_read(
+        let query_twin_result = runtime.block_on(KernelContextReadClient::execute_local_read(
             &service,
             &fence,
             &packet_envelope,
@@ -1883,10 +1944,10 @@ mod tests {
         ));
         assert!(
             matches!(
-                admitted_only,
+                query_twin_result,
                 Err(ReadError::Store(StoreReadFailure::Unavailable))
             ),
-            "packet must stay admission-only as Unavailable, got {admitted_only:?}"
+            "the query-only twin must refuse a packet, got {query_twin_result:?}"
         );
 
         // The production forwarding bridge fails closed before transport: a

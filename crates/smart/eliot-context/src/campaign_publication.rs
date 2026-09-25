@@ -117,6 +117,31 @@ impl ContextSourcePublication {
         &self.recorded_state_fence
     }
 
+    /// Render the native owner record identity for a closed store envelope.
+    #[must_use]
+    pub fn record_id_text(&self) -> String {
+        match &self.record_id {
+            CampaignOwnerRecordId::Decision(value) => value.as_str().to_owned(),
+            CampaignOwnerRecordId::Resource(value) => value.clone(),
+            CampaignOwnerRecordId::Task(value) => value.as_str().to_owned(),
+            CampaignOwnerRecordId::Contract(value) => value.as_str().to_owned(),
+            CampaignOwnerRecordId::Artifact(value) => value.as_str().to_owned(),
+        }
+    }
+
+    /// Render the native owner revision for a closed store envelope.
+    #[must_use]
+    pub fn revision_text(&self) -> String {
+        match &self.revision {
+            CampaignOwnerRevision::Task(value) => value.value().to_string(),
+            CampaignOwnerRevision::Counter(value) => value.to_string(),
+            CampaignOwnerRevision::AuthorityEpoch(value) => value.value().to_string(),
+            CampaignOwnerRevision::Policy(value) => value.value().to_string(),
+            CampaignOwnerRevision::ResourceGeneration(value) => value.value().to_string(),
+            CampaignOwnerRevision::ResourceSnapshot(value) => value.clone(),
+        }
+    }
+
     /// Closed typed source document for the role.
     #[must_use]
     pub const fn document(&self) -> &ContextSourceDocument {
