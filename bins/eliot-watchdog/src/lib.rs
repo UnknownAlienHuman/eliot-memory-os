@@ -12,7 +12,6 @@ use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-#[cfg(test)]
 use std::sync::Arc;
 use std::sync::Mutex;
 #[cfg(test)]
@@ -88,7 +87,16 @@ use watchdog_publication_readback::{
     verify_against_durable_current,
 };
 pub use watchdog_spool::export_driver::{
-    WatchdogEntryView, WatchdogExportSink, export_once, watchdog_entry_views, watchog_entry_views,
+    WatchdogEntryView, WatchdogExportSink, WatchdogIntentAcknowledgement,
+    WatchdogIntentReconciliation, WatchdogIntentSink, export_once, reconcile_watchdog_intents,
+    watchdog_entry_views, watchog_entry_views,
+};
+pub(crate) use watchdog_spool::intent::{
+    GovernorIntentOutcome, GovernorUnavailability, IntentLineage, WatchdogIntentSubmission,
+    governor_unavailable_observation_digest,
+};
+pub use watchdog_spool::intent::{
+    IntentSubmissionDisposition, PendingWatchdogIntent, WatchdogIntentClass,
 };
 pub use watchdog_spool::{
     CaptureFenceParams, SpoolAppendOutcome, SpoolCoverageDenominator, SpoolFenceEntryKind,
@@ -310,6 +318,14 @@ pub struct IndependentKernelSensor {
     /// Watchdog generation bound at construction, from the retained binding's
     /// selected manifest in production or explicit in tests.
     watchdog_generation: u64,
+    /// The Watchdog's own authority epoch lineage, from the retained binding's
+    /// selected manifest. It is observation lineage for a later reconciliation,
+    /// never a claim about the Kernel's current epoch.
+    epoch_lineage: eliot_contracts::EpochLineageId,
+    /// The supervision lease identity last accepted by this sensor, retained so a
+    /// later fenced-Kernel reconciliation can name the exact lease the Kernel
+    /// holds. `None` until a lease has been verified at least once.
+    supervision_lease_id: Mutex<Option<String>>,
 }
 
 impl IndependentKernelSensor {
@@ -336,6 +352,13 @@ impl IndependentKernelSensor {
             .runtime_launch
             .authority_generation
             .value();
+        let epoch_lineage = binding
+            .selected_manifest
+            .runtime_launch
+            .authority_state_fence
+            .authority_epoch
+            .lineage_id
+            .clone();
         let watchdog = Watchdog::new(
             eliot_watchdog_core::WatchdogConfig::default(),
             Epoch(watchdog_epoch),
@@ -347,6 +370,8 @@ impl IndependentKernelSensor {
             _runtime_binding: Some(binding),
             installation_id,
             watchdog_generation,
+            epoch_lineage,
+            supervision_lease_id: Mutex::new(None),
         })
     }
 
@@ -373,12 +398,21 @@ impl IndependentKernelSensor {
             .runtime_launch
             .authority_generation
             .value();
+        let epoch_lineage = binding
+            .selected_manifest
+            .runtime_launch
+            .authority_state_fence
+            .authority_epoch
+            .lineage_id
+            .clone();
         Ok(Self {
             watchdog: Mutex::new(None),
             spool,
             _runtime_binding: Some(binding),
             installation_id,
             watchdog_generation,
+            epoch_lineage,
+            supervision_lease_id: Mutex::new(None),
         })
     }
 
@@ -590,12 +624,20 @@ impl IndependentKernelSensor {
             Epoch(watchdog_epoch),
         )
         .map_err(|_| SpoolError::InvalidLease("watchdog epoch is invalid".to_owned()))?;
+        // The test contour supplies the same fixed lineage shape the production
+        // binding carries, so the reconciliation projection is exercised through
+        // the identical field path.
+        let epoch_lineage =
+            eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
         Ok(Self {
             watchdog: Mutex::new(Some(watchdog)),
             spool,
             _runtime_binding: None,
             installation_id: installation_id.to_owned(),
             watchdog_generation,
+            epoch_lineage,
+            supervision_lease_id: Mutex::new(None),
         })
     }
 
@@ -633,6 +675,232 @@ impl IndependentKernelSensor {
         self.spool.readback()
     }
 
+    /// Counts one genuinely observed admission-path rejection against the
+    /// Watchdog-owned deterministic escalation rule.
+    ///
+    /// This is the production minter for the Governor-unavailability proof: the
+    /// `error` is the real failure the Watchdog's own admission path observed,
+    /// and [`GovernorUnavailability::from_admission_error`] accepts only the
+    /// exact lease rejections that demonstrate a Governor admission failure.
+    /// Retention pressure, host-identity observations, and spool I/O failures
+    /// are not Governor unavailability and are never counted, so a busy spool
+    /// can never escalate the system. The only write is the Watchdog-owned
+    /// `watchdog.redb` append: no ORS, canonical, or `HostStateJournal` write is
+    /// reachable from this path.
+    ///
+    /// Non-fatal by construction: a spool or rule failure is itself only an
+    /// observation problem, so the supervision tick never fails because of it.
+    pub fn observe_admission_unavailable(&self, error: &SpoolError) {
+        let Ok(proof) = GovernorUnavailability::from_admission_error(error) else {
+            return;
+        };
+        self.count_governor_unavailability(proof, GOVERNOR_UNAVAILABLE_ADMISSION_SOURCE);
+    }
+
+    /// Counts one genuinely observed kernel supervision rejection against the
+    /// Watchdog-owned deterministic escalation rule.
+    ///
+    /// The counterpart minter for the supervision leg: only the kernel lease
+    /// rejections that demonstrate a Governor admission failure are counted,
+    /// and the original [`KernelWatchdogError`] is never altered here.
+    pub fn observe_supervision_unavailable(&self, error: &KernelWatchdogError) {
+        let Ok(proof) = GovernorUnavailability::from_kernel_error(error) else {
+            return;
+        };
+        self.count_governor_unavailability(proof, GOVERNOR_UNAVAILABLE_SUPERVISION_SOURCE);
+    }
+
+    /// Closes an open escalation episode after a live Governor admission.
+    ///
+    /// A live admission is the only recovery signal the rule accepts. Spooled
+    /// intents are untouched here: they stay retained until the fenced Kernel
+    /// route acknowledges them.
+    pub fn observe_governor_recovered(&self) {
+        let Ok(observed_at_ms) = current_unix_ms().map(|value| value.max(1)) else {
+            return;
+        };
+        match self.spool.observe_governor_recovery(observed_at_ms) {
+            Ok(true) => tracing::debug!(
+                event = "watchdog.intent_episode_closed",
+                observation = "reconciled",
+                "live Governor admission closed an open watchdog intent episode"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::debug!(
+                event = "watchdog.intent_episode_close_failed",
+                observation = "fenced",
+                detail = error.to_string().as_str(),
+                "watchdog could not close the intent episode; no escalation was skipped"
+            ),
+        }
+    }
+
+    /// Returns the supervision lease identity this sensor last verified, or
+    /// `None` when no lease has been admitted yet.
+    ///
+    /// A fenced-Kernel reconciliation names this lease so the Kernel resolves it
+    /// against its own retained supervision authority. A gap-only sensor that
+    /// never verified a lease reports `None` and therefore cannot submit.
+    pub fn verified_supervision_lease_id(&self) -> Option<String> {
+        self.supervision_lease_id
+            .lock()
+            .ok()
+            .and_then(|retained| retained.clone())
+    }
+
+    /// Returns the bounded oldest window of retained Watchdog intents that have
+    /// no submit-once receipt, with each exact original record and the digests
+    /// the fenced Kernel route binds. Read-only: nothing is submitted, reserved,
+    /// or removed, and an empty window means every retained intent already holds
+    /// a durable submit-once receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retained spool or its receipt ledger fails
+    /// validation.
+    pub fn pending_watchdog_intents(&self) -> Result<Vec<PendingWatchdogIntent>, SpoolError> {
+        self.spool.pending_watchdog_intents(
+            crate::watchdog_spool::intent::INTENT_RECONCILIATION_MAX_SUBMISSIONS,
+            &self.epoch_lineage,
+        )
+    }
+
+    /// Persists the durable submit-once receipt for one reconciled intent.
+    ///
+    /// This is the exactly-once boundary of fenced-Kernel reconciliation: the
+    /// first acknowledgement writes the receipt, and every later attempt for
+    /// the same retained sequence observes the existing receipt instead of
+    /// submitting again. The receipt is Watchdog-owned durable state, so the
+    /// entry stays inside this crate: only
+    /// [`reconcile_watchdog_intents`](crate::reconcile_watchdog_intents), which
+    /// builds the receipt from a real fenced acknowledgement, may write it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the receipt is not canonical, an existing receipt
+    /// for the same sequence disagrees, or the ledger cannot be written.
+    pub(crate) fn record_intent_submission(
+        &self,
+        submission: &WatchdogIntentSubmission,
+    ) -> Result<IntentSubmissionDisposition, SpoolError> {
+        self.spool.record_intent_submission(submission)
+    }
+
+    /// Applies one proven Governor-unavailability observation to the durable
+    /// deterministic rule and reports the resolved outcome.
+    fn count_governor_unavailability(&self, proof: GovernorUnavailability, source: &str) {
+        let Ok(observed_at_ms) = current_unix_ms().map(|value| value.max(1)) else {
+            return;
+        };
+        let reason = proof.reason();
+        let digest = governor_unavailable_observation_digest(
+            &self.installation_id,
+            self.watchdog_generation,
+            source,
+            reason,
+            observed_at_ms,
+        );
+        // A gap-only sensor has no established supervision epoch, so it has no
+        // fenced lineage for a later reconciliation to bind against. It still
+        // records the observation as a gap, but it mints no intent: an intent
+        // whose lineage can never be admitted would be a retained record with no
+        // fenced path home.
+        let Some(epoch) = self.established_watchdog_epoch() else {
+            tracing::debug!(
+                event = "watchdog.intent_epoch_unestablished",
+                observation = "unavailable",
+                "watchdog has no established supervision epoch; the observation stays a gap, not an intent"
+            );
+            return;
+        };
+        let lineage = match IntentLineage::new(
+            self.installation_id.clone(),
+            self.watchdog_generation,
+            epoch,
+        ) {
+            Ok(lineage) => lineage,
+            Err(error) => {
+                tracing::debug!(
+                    event = "watchdog.intent_lineage_unusable",
+                    observation = "fenced",
+                    detail = error.to_string().as_str(),
+                    "watchdog could not bind intent lineage; no intent was spooled"
+                );
+                return;
+            }
+        };
+        let outcome =
+            match self
+                .spool
+                .observe_governor_unavailability(proof, digest, lineage, observed_at_ms)
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::debug!(
+                        event = "watchdog.intent_spool_failed",
+                        observation = "fenced",
+                        detail = error.to_string().as_str(),
+                        "watchdog could not spool an intent; the observation stays an observation"
+                    );
+                    return;
+                }
+            };
+        match outcome {
+            GovernorIntentOutcome::Counting { consecutive } => {
+                tracing::debug!(
+                    event = "watchdog.intent_observed",
+                    observation = "counted",
+                    consecutive = consecutive,
+                    "watchdog counted one Governor-unavailable observation"
+                );
+            }
+            GovernorIntentOutcome::ProblemIntent(reference) => {
+                tracing::warn!(
+                    event = "watchdog.problem_intent_spooled",
+                    observation = "spooled",
+                    sequence = reference.sequence,
+                    "watchdog spooled a problem_intent in its own store for Governor reconciliation"
+                );
+            }
+            GovernorIntentOutcome::IncidentIntent(reference) => {
+                tracing::warn!(
+                    event = "watchdog.incident_intent_spooled",
+                    observation = "spooled",
+                    sequence = reference.sequence,
+                    "watchdog spooled an incident_intent in its own store for Governor reconciliation"
+                );
+            }
+        }
+    }
+
+    /// Returns the established nonzero supervision epoch, or `None` for a
+    /// gap-only sensor that has never established one.
+    fn established_watchdog_epoch(&self) -> Option<u64> {
+        self.watchdog
+            .lock()
+            .ok()
+            .and_then(|watchdog| watchdog.as_ref().map(|value| value.epoch().0))
+            .filter(|epoch| *epoch != 0)
+    }
+
+    /// Records the exact outcome of one supervision leg against the escalation
+    /// rule, then returns the leg result unchanged.
+    ///
+    /// A live accepted heartbeat closes any open escalation episode; a rejected
+    /// lease is counted against it. The supervision contract is untouched: the
+    /// original outcome is returned verbatim, so no intent path can turn a
+    /// supervision failure into a success or vice versa.
+    fn observe_supervision_outcome(
+        &self,
+        outcome: Result<(), KernelWatchdogError>,
+    ) -> Result<(), KernelWatchdogError> {
+        match &outcome {
+            Ok(()) => self.observe_governor_recovered(),
+            Err(error) => self.observe_supervision_unavailable(error),
+        }
+        outcome
+    }
+
     fn record_heartbeat(
         &self,
         lease: &VerifiedSupervisionLease,
@@ -665,6 +933,15 @@ impl IndependentKernelSensor {
         let digest = lease
             .payload_digest()
             .map_err(|_| KernelWatchdogError::LeaseInvalid)?;
+        // Retain the verified lease identity so a later fenced-Kernel
+        // reconciliation names the exact lease the Kernel holds. Only a fully
+        // verified lease reaches this point, so a gap-only sensor never
+        // publishes one.
+        if let Ok(mut retained) = self.supervision_lease_id.lock()
+            && retained.as_deref() != Some(lease.lease().lease_id.as_str())
+        {
+            *retained = Some(lease.lease().lease_id.clone());
+        }
         match self
             .spool
             .append(
@@ -711,7 +988,7 @@ impl KernelWatchdogPort for IndependentKernelSensor {
         &'a self,
         lease: &'a VerifiedSupervisionLease,
     ) -> Pin<Box<dyn Future<Output = Result<(), KernelWatchdogError>> + Send + 'a>> {
-        Box::pin(async move { self.record_heartbeat(lease) })
+        Box::pin(async move { self.observe_supervision_outcome(self.record_heartbeat(lease)) })
     }
 
     fn report_gap<'a>(
@@ -723,6 +1000,67 @@ impl KernelWatchdogPort for IndependentKernelSensor {
 
     fn installation_identity(&self) -> Option<&str> {
         Some(self.installation_id.as_str())
+    }
+}
+
+/// Closed observation-source label for an admission-reload rejection.
+///
+/// The label is part of the bounded evidence digest, so it distinguishes the
+/// admission leg from the supervision leg without carrying any semantic
+/// meaning. It is a closed constant, never caller-supplied prose.
+const GOVERNOR_UNAVAILABLE_ADMISSION_SOURCE: &str = "admission-reload";
+/// Closed observation-source label for a kernel supervision rejection.
+const GOVERNOR_UNAVAILABLE_SUPERVISION_SOURCE: &str = "supervision-lease";
+
+/// Production admission source that also drives the Watchdog-owned
+/// deterministic intent rule.
+///
+/// This is the production seam between the real Governor/admission path and the
+/// Watchdog-owned `watchdog.redb` spool. It owns no authority of its own: it
+/// delegates every admission decision to the wrapped source and returns that
+/// result verbatim. On a genuinely observed admission rejection it mints the
+/// Governor-unavailability proof from the real [`SpoolError`] and counts it
+/// against the durable rule, whose only write is a spool append. On a live
+/// admission it closes any open escalation episode.
+///
+/// The alternative production seam is the supervision leg inside
+/// [`IndependentKernelSensor`], which counts genuine kernel lease rejections.
+pub struct GovernorIntentAdmissionSource {
+    inner: Arc<dyn WatchdogAdmissionSource>,
+    sensor: Arc<IndependentKernelSensor>,
+}
+
+impl GovernorIntentAdmissionSource {
+    /// Wraps one real admission source with the Watchdog-owned intent rule.
+    #[must_use]
+    pub fn new(
+        inner: Arc<dyn WatchdogAdmissionSource>,
+        sensor: Arc<IndependentKernelSensor>,
+    ) -> Self {
+        Self { inner, sensor }
+    }
+}
+
+impl WatchdogAdmissionSource for GovernorIntentAdmissionSource {
+    fn reload(&self) -> Result<VerifiedWatchdogAdmission, SpoolError> {
+        match self.inner.reload() {
+            Ok(admission) => {
+                self.sensor.observe_governor_recovered();
+                Ok(admission)
+            }
+            Err(error) => {
+                self.sensor.observe_admission_unavailable(&error);
+                Err(error)
+            }
+        }
+    }
+
+    fn approved_host_image(&self) -> Option<PathBuf> {
+        self.inner.approved_host_image()
+    }
+
+    fn approved_host_registration(&self) -> Option<ApprovedHostRegistration> {
+        self.inner.approved_host_registration()
     }
 }
 

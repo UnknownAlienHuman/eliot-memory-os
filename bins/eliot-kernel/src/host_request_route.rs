@@ -27,6 +27,17 @@
 //!   bridge activation path, and only for a `Resolved` disposition.
 //! - Payloads travel by digest only and are never parsed here; capability
 //!   membership is enforced by the admission gate, never interpreted.
+//! - The one exception is the closed Watchdog intent route
+//!   (`WATCHDOG_INTENT_SUBMIT_OPERATION`): it decodes its own typed
+//!   `WatchdogSpoolIntentBatchPayload` because the Watchdog's original
+//!   restricted record must be *retained verbatim* for forensic linkage, not
+//!   reduced to a digest. That is still typed decoding of a named contract, and
+//!   it is a separate closed entry rather than a relaxation of the envelope
+//!   rule: a Watchdog intent is a parentless observation submission, so it can
+//!   neither ride nor widen the host-request envelope. Admitting it records a
+//!   durable *pending intent projection* under a derived reconciliation key and
+//!   never performs the canonical Problem/Incident transition, which stays the
+//!   Governor's.
 //! - Raw `Frame` cancellation is never handled here. Cancellation arrives only
 //!   as a typed `Cancellation` envelope that stages its own durable record
 //!   and advances its exact parent operation.
@@ -55,6 +66,7 @@ use eliot_protocol::{
     AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding, HOST_REQUEST_INVOKE_READ_WIRE_ID,
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestAdmissionReceipt, HostRequestEnvelope,
     HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
+    WatchdogIntentKind, WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission,
     host_request_operation_id,
 };
 use eliot_store_api::{EVIDENCE_PACK_MAX_RECORDS, ScopeId};
@@ -107,6 +119,21 @@ pub(crate) fn is_host_request_operation(operation: &str) -> bool {
             | AGENT_HOST_REQUEST_REHYDRATE_OPERATION
             | AGENT_HOST_REQUEST_INVOKE_READ_OPERATION
     )
+}
+
+/// Returns whether the operation string selects the fenced Watchdog intent
+/// route.
+///
+/// The intent route is deliberately **not** part of
+/// [`is_host_request_operation`]: a Watchdog intent has no parent operation, and
+/// every host-request kind that could carry it (`Status` and `Reconciliation`)
+/// requires one exact previously admitted parent by contract. Folding it into
+/// that predicate would either break the envelope contract or grant the
+/// Watchdog a parent operation it does not own. It is a separate closed entry
+/// with its own payload, envelope validation, and named mutation, reachable
+/// from the front door through [`is_watchdog_intent_operation`].
+pub(crate) fn is_watchdog_intent_operation(operation: &str) -> bool {
+    operation == WATCHDOG_INTENT_SUBMIT_OPERATION
 }
 
 /// Connection-scoped reference to one staged host-request operation.
@@ -347,6 +374,212 @@ impl KernelComposition {
 
         self.note_host_request_operation_under_transition(envelope)?;
         Ok((admission_receipt, admitted))
+    }
+
+    /// Admits one Watchdog spool intent batch through the fenced named Kernel
+    /// intent mutation, exactly once per retained spool record.
+    ///
+    /// This is the Kernel half of the I8.1 reconciliation path. It records a
+    /// **pending intent projection** and nothing else: each submitted
+    /// `problem_intent` / `incident_intent` becomes one durable ORS
+    /// `Reconciliation` host-request record whose durable identity is the
+    /// derived reconciliation key, so the first submission wins and every later
+    /// submission of the same spool record replays to that same record instead
+    /// of creating a second projection. Changed bytes under the same key are an
+    /// identity conflict, not a second intent.
+    ///
+    /// The distinction the issue requires is preserved by construction: the
+    /// Kernel stops at the durable `Admitted` state and never writes a result
+    /// body, so the projection stays a *watchdog intent awaiting a Governor
+    /// decision*. Advancing it past `Admitted` is the Governor's leg, not this
+    /// entry's. The canonical Problem/Incident transition, the Current Epistemic
+    /// Position, task state, and every other semantic decision stay owned by the
+    /// Governor consuming this record. The Watchdog gains no canonical,
+    /// ORS-authoring, or `HostStateJournal` authority from this entry: it submits
+    /// an observation through a named Kernel mutation, exactly as I1.8 requires.
+    ///
+    /// The original Watchdog record travels verbatim inside each submission and
+    /// is retained by the Watchdog spool, so the Kernel projection and the
+    /// Governor's later decision both stay forensically linked to it.
+    ///
+    /// The entry and its projection stay inside this crate on purpose: the
+    /// Watchdog reaches the mutation only through the admitted frame front door
+    /// in [`Self::dispatch_watchdog_intent_frame`], and the projections it
+    /// returns are rendered into that frame's typed answer, so no caller outside
+    /// the Kernel can name or hold one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::SessionFenced`] when the payload, envelope
+    /// joins, fence, session, or service state are unusable, and
+    /// [`TransportError::IdentityConflict`] when a submission replays under a
+    /// key already bound to different bytes.
+    pub(crate) fn admit_watchdog_intent_batch(
+        &self,
+        session: &Session,
+        payload: &WatchdogSpoolIntentBatchPayload,
+    ) -> Result<Vec<WatchdogIntentProjection>, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        payload
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let now = unix_ms();
+        if self
+            .service_state()
+            .map_err(|_| TransportError::SessionFenced)?
+            != KernelServiceState::Ready
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        if !session.accepts(&session.authority_epoch, session.session_epoch) {
+            return Err(TransportError::SessionFenced);
+        }
+        // The submission must ride the *current* supervision lease the Kernel
+        // itself retains, not merely a live transport session: a front-door
+        // session proves who is connected, while only the retained supervision
+        // lease proves which Watchdog generation and epoch are currently
+        // admitted. A stale generation, a superseded epoch, or a lease the
+        // Kernel does not hold therefore fences here and can never stage a
+        // record.
+        let admitted_generation = self.admitted_watchdog_generation(payload)?;
+        // The mechanical envelope joins run before any durable write, so a
+        // forged or stale window never stages a record.
+        validate_watchdog_spool_batch_envelope(
+            payload.predecessor_sequence,
+            payload.first_sequence,
+            payload.last_sequence,
+            payload.high_water_sequence,
+            payload.watchdog_generation,
+            payload.watchdog_epoch,
+            &payload.installation_id,
+            &payload.sink_id,
+            &payload.route,
+            admitted_generation,
+            payload.watchdog_epoch,
+            &session.connection_id,
+            &session.connection_id,
+            payload.created_at_ms,
+            payload.expires_at_ms,
+            now,
+            false,
+            payload.intents.len(),
+            payload.batch_digest.len() as u64,
+        )?;
+        let mut projections = Vec::with_capacity(payload.intents.len());
+        for intent in &payload.intents {
+            projections.push(self.stage_watchdog_intent_projection(payload, intent)?);
+        }
+        Ok(projections)
+    }
+
+    /// Resolves the Watchdog generation the Kernel currently admits, from the
+    /// retained supervision lease the batch names.
+    ///
+    /// The submitted `watchdog_generation` and `watchdog_epoch` must equal the
+    /// activation generation and Watchdog epoch of the durable lease record the
+    /// Kernel holds, and the named installation must match it exactly. A
+    /// missing authority, an unknown lease, a non-current record, a different
+    /// installation, or any divergence fences closed before a durable write, so
+    /// a stale Watchdog generation can never stage a pending intent.
+    fn admitted_watchdog_generation(
+        &self,
+        payload: &WatchdogSpoolIntentBatchPayload,
+    ) -> Result<u64, TransportError> {
+        let authority = self
+            .supervision_lease_authority
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let snapshot = authority
+            .current_snapshot(&payload.supervision_lease_id)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::SessionFenced)?;
+        let binding = &snapshot.record.binding;
+        if binding.installation_id.as_str() != payload.installation_id
+            || binding.watchdog_epoch.value() != payload.watchdog_epoch
+            || binding.activation_generation.value() != payload.watchdog_generation
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(payload.watchdog_generation)
+    }
+
+    /// Stages the durable pending-intent projection for one submitted intent.
+    ///
+    /// The durable identity is the derived reconciliation key, so
+    /// `stage_host_request` first-writer-wins semantics give exactly-once
+    /// admission per spool record: an exact replay returns the stored record
+    /// unchanged, and changed bytes under the same key fail as
+    /// `HostRequestIdentityConflict`.
+    fn stage_watchdog_intent_projection(
+        &self,
+        payload: &WatchdogSpoolIntentBatchPayload,
+        intent: &WatchdogSpoolIntentSubmission,
+    ) -> Result<WatchdogIntentProjection, TransportError> {
+        let operation_id = OperationIdentity::new(format!(
+            "{WATCHDOG_INTENT_OPERATION_ID_PREFIX}{}",
+            intent.idempotency_key
+        ))
+        .map_err(|_| TransportError::SessionFenced)?;
+        let record = watchdog_intent_projection_record(payload, intent, &operation_id)?;
+        let stored = self
+            .generation_gateway
+            .ors
+            .stage_host_request(&record)
+            .map_err(|error| match error {
+                OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
+                _ => TransportError::SessionFenced,
+            })?;
+        // A still-`Requested` row is one this call must advance; an
+        // already-advanced row is an exact replay, which is reported honestly
+        // instead of being re-advanced. This is the Kernel-side half of
+        // exactly-once: the durable record exists once per derived key, and
+        // the answer tells the Watchdog which case it observed.
+        let admitted_now = stored.state == HostRequestState::Requested;
+        let admitted = if admitted_now {
+            self.generation_gateway
+                .ors
+                .advance_host_request(
+                    &operation_id,
+                    &record.request_digest,
+                    HostRequestState::Admitted,
+                    None,
+                )
+                .map_err(|error| match error {
+                    OrsError::HostRequestIdentityConflict { .. } => {
+                        TransportError::IdentityConflict
+                    }
+                    _ => TransportError::SessionFenced,
+                })?
+                .ok_or(TransportError::SessionFenced)?
+        } else {
+            stored
+        };
+        // `stage_host_request` already compared the complete binding
+        // (`same_binding`, which excludes only ORS-owned state/result/order) and
+        // returned `HostRequestIdentityConflict` on any divergence, so reaching
+        // here proves the stored row is this submission's own record.
+        //
+        // A pending intent projection carries no result body: the canonical
+        // Problem/Incident decision is the Governor's, and this Kernel entry
+        // must never imply one by writing a result for a record it only
+        // admitted.
+        if admitted.result_digest.is_some() {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(WatchdogIntentProjection {
+            sequence: intent.sequence,
+            idempotency_key: intent.idempotency_key.clone(),
+            intent_kind: intent.intent_kind,
+            record_digest: intent.record_digest.clone(),
+            payload_digest: intent.payload_digest.clone(),
+            operation_id: admitted.operation_id.as_str().to_owned(),
+            state: admitted.state,
+            admitted_now,
+        })
     }
 
     /// Admits one typed cancellation envelope for its exact parent operation.
@@ -1747,6 +1980,86 @@ impl KernelComposition {
         Ok(KernelFrameAction::Reply(reply))
     }
 
+    /// Dispatches one fenced Watchdog intent batch from the admitted front door.
+    ///
+    /// The caller ([`crate::KernelComposition::dispatch_frame`]) has already run
+    /// the closed gateway gates; those joins are re-checked here so a direct
+    /// caller cannot bypass them. The frame must ride the same connection as
+    /// the presenting admitted Session, and the correlation identity must be
+    /// present. The typed batch decode, the mechanical envelope validation, and
+    /// the durable named intent mutation live in
+    /// [`Self::admit_watchdog_intent_batch`]. This entry creates no Session,
+    /// grants no capability beyond the one observation submission the batch
+    /// already presents, mints no canonical truth, and never produces a Problem
+    /// or Incident decision.
+    pub(crate) fn dispatch_watchdog_intent_frame(
+        &self,
+        session: &Session,
+        frame: &Frame,
+    ) -> Result<KernelFrameAction, TransportError> {
+        if self
+            .service_state()
+            .map_err(|_| TransportError::SessionFenced)?
+            != KernelServiceState::Ready
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let request_id = frame
+            .request_id
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        let identity = frame
+            .request_identity
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        if !session
+            .module_generation
+            .state_fence
+            .is_compatible_with(&identity.request.state_fence)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if frame.connection_id != session.connection_id {
+            return Err(TransportError::SessionFenced);
+        }
+        let payload = match &frame.payload {
+            ProtocolPayload::Json(payload) => payload.clone(),
+            _ => return Err(TransportError::SessionFenced),
+        };
+        let operation = payload
+            .get("operation")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        if !is_watchdog_intent_operation(operation) {
+            return Err(TransportError::SessionFenced);
+        }
+        // The typed batch is bounded before decode: an oversized frame never
+        // reaches the parser or any durable write.
+        let batch_bytes = payload
+            .get("intent_batch")
+            .ok_or(TransportError::SessionFenced)
+            .and_then(|batch| {
+                eliot_contracts::canonical_json_bytes(batch)
+                    .map_err(|_| TransportError::SessionFenced)
+            })?;
+        if batch_bytes.len() > MAX_WATCHDOG_INTENT_BATCH_BYTES {
+            return Err(TransportError::SessionFenced);
+        }
+        let batch = watchdog_intent_batch_from_payload(&payload)?;
+        let projections = self.admit_watchdog_intent_batch(session, &batch)?;
+        let value = watchdog_intent_batch_response(&projections, &batch.sink_id);
+        let mut reply = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+        reply.request_id = Some(request_id);
+        reply
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(KernelFrameAction::Reply(reply))
+    }
+
     /// Returns a snapshot of the retained admitted bridge transport Session.
     ///
     /// The front-door post-activation loop drives every host-request frame
@@ -1773,6 +2086,162 @@ impl KernelComposition {
         }
         state.session.clone().ok_or(TransportError::SessionFenced)
     }
+}
+
+/// Opaque durable-operation prefix of one Watchdog intent projection.
+///
+/// The durable identity is the prefix plus the derived reconciliation key, so
+/// the prefix itself is never a semantic decision: it names only "a pending
+/// Watchdog intent awaiting Governor reconciliation".
+const WATCHDOG_INTENT_OPERATION_ID_PREFIX: &str = "watchdog-intent:";
+
+/// Exact capability the Watchdog's fenced intent route is admitted under.
+///
+/// The Watchdog is admitted for this one observation-submission capability and
+/// nothing else. It is not a canonical-write, task, Architecture, completion, or
+/// budget capability, and no other capability membership is granted by this
+/// entry.
+const WATCHDOG_INTENT_CAPABILITY: &str = "eliot.watchdog.intent.submit";
+
+/// One durable pending-intent projection produced by the named Kernel mutation.
+///
+/// `operation_id` and `state` are the durable ORS facts; `admitted_now`
+/// distinguishes a first admission from an exact replay, which is what lets the
+/// caller answer the Watchdog's submit-once contract honestly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WatchdogIntentProjection {
+    pub(crate) sequence: u64,
+    pub(crate) idempotency_key: String,
+    pub(crate) intent_kind: WatchdogIntentKind,
+    pub(crate) record_digest: String,
+    pub(crate) payload_digest: String,
+    pub(crate) operation_id: String,
+    pub(crate) state: HostRequestState,
+    pub(crate) admitted_now: bool,
+}
+
+/// Decodes the exact typed Watchdog spool intent batch from a frame payload.
+///
+/// The payload must carry the closed operation string plus the full typed
+/// batch; the batch shape, its own canonical digest, and every covered intent
+/// (including the derived reconciliation key and the retained record bytes) are
+/// re-validated here, so this is typed dispatch rather than generic JSON
+/// routing.
+pub(crate) fn watchdog_intent_batch_from_payload(
+    payload: &serde_json::Value,
+) -> Result<WatchdogSpoolIntentBatchPayload, TransportError> {
+    let batch_value = payload
+        .get("intent_batch")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)?;
+    let batch: WatchdogSpoolIntentBatchPayload =
+        serde_json::from_value(batch_value).map_err(|_| TransportError::SessionFenced)?;
+    batch
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    if batch.route != WATCHDOG_SPOOL_BATCH_ROUTE {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(batch)
+}
+
+/// Typed answer for one admitted Watchdog intent batch.
+///
+/// The response carries the durable projection per submitted spool record plus
+/// the reconciliation key the Kernel derived, and nothing else. In particular
+/// it carries no Problem/Incident state, no Current Epistemic Position, and no
+/// task, Architecture, completion, or budget decision: those remain the
+/// Governor's, and the durable record behind this projection is a
+/// non-canonical pending intent.
+pub(crate) fn watchdog_intent_batch_response(
+    projections: &[WatchdogIntentProjection],
+    sink_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "known",
+        "value": {
+            "accepted": true,
+            "sink_id": sink_id,
+            "intents": projections
+                .iter()
+                .map(|projection| serde_json::json!({
+                    "sequence": projection.sequence,
+                    "idempotency_key": projection.idempotency_key,
+                    "intent_kind": projection.intent_kind.as_str(),
+                    "record_digest": projection.record_digest,
+                    "payload_digest": projection.payload_digest,
+                    "operation_id": projection.operation_id,
+                    "state": projection.state,
+                    "admitted_now": projection.admitted_now,
+                }))
+                .collect::<Vec<_>>(),
+        },
+        "recovery": null,
+    })
+}
+
+/// Builds the durable pending-intent record for one submitted Watchdog intent.
+///
+/// The record is a `Reconciliation` host request: an observation-only durable
+/// row keyed by the derived reconciliation key, carrying the original Watchdog
+/// evidence digest and the retained record digest and nothing more. It has no
+/// field in which a canonical semantic decision could be expressed, and the
+/// `Reconciliation` kind forbids a fresh result body, so the canonical
+/// Problem/Incident transition cannot be smuggled through this path.
+///
+/// The recorded `fence_digest`, `authority_epoch`, and `generation` are derived
+/// from the *Watchdog's own* submitted lineage, not from the presenting Kernel
+/// fence. That fence is still checked mechanically at admission, so a stale
+/// submission is still fenced; keeping it out of the durable binding is what
+/// lets an exactly-once replay survive an epoch rotation, because
+/// `stage_host_request` compares the whole binding and a Kernel-side fence
+/// change would otherwise turn a legitimate retry into an identity conflict and
+/// a second projection.
+fn watchdog_intent_projection_record(
+    payload: &WatchdogSpoolIntentBatchPayload,
+    intent: &WatchdogSpoolIntentSubmission,
+    operation_id: &OperationIdentity,
+) -> Result<HostRequestRecord, TransportError> {
+    let label =
+        |value: &str| OpaqueLabel::new(value.to_owned()).map_err(|_| TransportError::SessionFenced);
+    let epoch_lineage = eliot_contracts::EpochLineageId::new(&intent.lineage_epoch_id)
+        .map_err(|_| TransportError::SessionFenced)?;
+    let epoch_sequence =
+        std::num::NonZeroU64::new(intent.lineage_epoch).ok_or(TransportError::SessionFenced)?;
+    let authority_epoch = eliot_contracts::EpochId::new(epoch_lineage, epoch_sequence)
+        .map_err(|_| TransportError::SessionFenced)?;
+    let resource_generation = eliot_contracts::ResourceGeneration::new(intent.lineage_generation)
+        .map_err(|_| TransportError::SessionFenced)?;
+    let submitted_fence = eliot_contracts::StateFence::new(authority_epoch, resource_generation);
+    Ok(HostRequestRecord {
+        contract_version: ORS_CONTRACT_VERSION,
+        operation_id: operation_id.clone(),
+        kind: OrsHostRequestKind::Reconciliation,
+        // The request identity is the derived reconciliation key: one spool
+        // record, one durable request identity, forever.
+        request_id: label(&intent.idempotency_key)?,
+        idempotency_key: label(&intent.idempotency_key)?,
+        cancellation_id: label(&format!(
+            "{WATCHDOG_INTENT_OPERATION_ID_PREFIX}{}:cancel",
+            intent.idempotency_key
+        ))?,
+        parent_operation_id: None,
+        request_digest: intent.record_digest.clone(),
+        payload_digest: intent.payload_digest.clone(),
+        connection_ref: label(&payload.sink_id)?,
+        session_ref: None,
+        task_ref: None,
+        scope_ref: None,
+        capability_ref: label(WATCHDOG_INTENT_CAPABILITY)?,
+        fence_digest: sha256_json(&submitted_fence).map_err(|_| TransportError::SessionFenced)?,
+        authority_epoch: submitted_fence.authority_epoch.clone(),
+        generation: intent.lineage_generation,
+        deadline_unix_ms: payload.expires_at_ms,
+        state: HostRequestState::Requested,
+        result_digest: None,
+        result_response: None,
+        commit_order: 0,
+    })
 }
 
 /// Decodes the exact typed envelope from a host-request frame payload.
@@ -2021,14 +2490,29 @@ pub(crate) fn host_request_rehydrated_response(record: &HostRequestRecord) -> se
     })
 }
 
-/// Expected route identity for one Watchdog spool export batch.
+/// Closed EBP route identity for one Watchdog spool intent batch.
 ///
-/// The EBP `payload_type`/`message_type` binding for
-/// `watchdog-spool-batch-v1` is deferred (protocol file out of scope; see PR
-/// residual). Until it lands, this closed route string is the mechanical
-/// route check below; no new payload type is created here.
-#[cfg(test)]
-pub(crate) const WATCHDOG_SPOOL_BATCH_ROUTE: &str = "watchdog-spool-batch-v1";
+/// The route string is owned once by the protocol crate
+/// ([`WATCHDOG_SPOOL_BATCH_ROUTE`]) and re-exported here, so the Kernel gate
+/// and the Watchdog submission cannot drift into two route vocabularies.
+pub use eliot_protocol::WATCHDOG_SPOOL_BATCH_ROUTE;
+
+/// Closed frame operation carrying one Watchdog spool intent batch through the
+/// front-door gateway.
+///
+/// It joins the same admitted host-request list as the other closed entries:
+/// the operation string only selects this entry, and the payload must still
+/// present the exact typed [`WatchdogSpoolIntentBatchPayload`] for validation.
+pub(crate) const WATCHDOG_INTENT_SUBMIT_OPERATION: &str = "watchdog_intent_submit";
+
+/// Bounded frame size of one Watchdog spool intent batch.
+///
+/// One batch carries at most
+/// `eliot_protocol::MAX_WATCHDOG_SPOOL_INTENT_SUBMISSIONS` submissions, each
+/// with at most `eliot_protocol::MAX_WATCHDOG_INTENT_EVIDENCE_REFS` evidence
+/// references plus its retained record. The ceiling keeps the whole batch under
+/// the transport frame limit without depending on the caller's declaration.
+const MAX_WATCHDOG_INTENT_BATCH_BYTES: usize = 512 * 1024;
 
 /// Validates one Watchdog spool batch envelope mechanically.
 ///
@@ -2046,10 +2530,9 @@ pub(crate) const WATCHDOG_SPOOL_BATCH_ROUTE: &str = "watchdog-spool-batch-v1";
 /// `SessionFenced`; a changed predecessor binding under the same identity is
 /// `IdentityConflict`; an elapsed acknowledgement deadline is `Timeout`. No
 /// error prose drives routing.
-#[cfg(test)]
 #[allow(
     clippy::too_many_arguments,
-    reason = "the mechanical envelope joins stay explicit until the EBP payload_type lands"
+    reason = "the mechanical envelope joins stay explicit so each fence is visible at the call site"
 )]
 pub(crate) fn validate_watchdog_spool_batch_envelope(
     predecessor_acknowledged: u64,

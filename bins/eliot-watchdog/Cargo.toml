@@ -22,6 +22,7 @@ eliot-notify-core.workspace = true
 eliot-ors.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
+eliot-protocol.workspace = true
 eliot-receipts.workspace = true
 eliot-watchdog-core.workspace = true
 eliot-windows-ipc.workspace = true

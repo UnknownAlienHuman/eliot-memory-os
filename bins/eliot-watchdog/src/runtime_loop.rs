@@ -25,9 +25,10 @@ use eliot_platform_windows::ServiceBootstrapArguments;
 #[cfg(windows)]
 use eliot_platform_windows::WindowsPlatform;
 use eliot_watchdog::{
-    FileWatchdogAdmission, HeartbeatTransport, INSTALLATION_REGISTRY_FILE_NAME,
-    IndependentKernelSensor, LiveHostObservationSource, SERVICE_NAME, WatchdogAdmissionSource,
-    WatchdogComposition, WatchdogConfig, WatchdogReadiness, inspect_approved_host_registration,
+    FileWatchdogAdmission, GovernorIntentAdmissionSource, HeartbeatTransport,
+    INSTALLATION_REGISTRY_FILE_NAME, IndependentKernelSensor, LiveHostObservationSource,
+    SERVICE_NAME, WatchdogAdmissionSource, WatchdogComposition, WatchdogConfig, WatchdogReadiness,
+    inspect_approved_host_registration,
 };
 
 #[cfg(windows)]
@@ -95,7 +96,21 @@ pub(super) fn run_watchdog(
     };
     let binding = admission_source.runtime_binding();
     inspect_approved_host_registration(&binding).map_err(|error| error.to_string())?;
-    let initial_admission = admission_source.reload().ok();
+    let initial_admission = match admission_source.reload() {
+        Ok(admission) => Some(admission),
+        Err(error) => {
+            // A real admission-path failure observed before the sensor exists
+            // is still evidence: a gap-only sensor opens below and starts
+            // counting the deterministic rule on its first supervision tick.
+            tracing::info!(
+                event = "watchdog.initial_admission_unavailable",
+                observation = "unavailable",
+                detail = error.to_string().as_str(),
+                "initial durable admission is unavailable; starting a gap-only sensor"
+            );
+            None
+        }
+    };
     let sensor = Arc::new(
         match initial_admission {
             Some(admission) => IndependentKernelSensor::open_runtime_binding(
@@ -106,6 +121,17 @@ pub(super) fn run_watchdog(
         }
         .map_err(|error| error.to_string())?,
     );
+    // I8.1: the deterministic intent rule is driven by the real admission
+    // path, not by a private Watchdog policy loop. The decorator delegates
+    // every admission decision unchanged and returns its result verbatim; it
+    // only counts genuine Governor-unavailability proofs and closes an open
+    // escalation episode on a live admission. Its sole write is a
+    // `watchdog.redb` append: no ORS, canonical, or HostStateJournal write is
+    // reachable from this seam.
+    let admission_source = Arc::new(GovernorIntentAdmissionSource::new(
+        admission_source,
+        sensor.clone(),
+    ));
     let composition = WatchdogComposition::start_with_shutdown_and_host_and_heartbeat(
         WatchdogConfig::default(),
         admission_source,
