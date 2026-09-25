@@ -78,6 +78,40 @@ pub(crate) mod table {
     /// Immutable agent-feedback row per handle + owner revision
     /// (issue #223). Same create-only rule as the bank rows.
     pub(crate) const EXPERIENCE_FEEDBACK: &str = "experience_feedback";
+
+    /// Every physical table this single owner declares, in declaration order.
+    ///
+    /// This is the closed denominator a consumer checks for exact 1:1
+    /// coverage. It adds no name: every entry is the same const declared
+    /// above, so physical-name ownership stays in this one place (A2.3 /
+    /// ARCH-MOD-03) and a consumer can name the denominator instead of
+    /// counting its own list. A table added above without a disposition is
+    /// then a machine-checked incompleteness rather than a silent omission.
+    pub(crate) const ALL_TABLES: [&str; 23] = [
+        SCHEMA_META,
+        WRITE_RECEIPT,
+        REVISION_HEAD,
+        ORDERING_HEAD,
+        CANONICAL_EVENT,
+        PROJECTION_RECORD,
+        RELATION_RECORD,
+        OUTBOX_EVENT,
+        CANONICAL_FENCE,
+        RECOVERY_OWNER,
+        RECOVERY_JOB,
+        ERASURE_INTENT,
+        ERASURE_OUTCOME,
+        NOTIFICATION_RECORD,
+        REACTIVE_SESSION,
+        RESOURCE_SNAPSHOT,
+        AUTOMATION_REVISION,
+        AUTOMATION_CURRENT,
+        AUTOMATION_INVOCATION,
+        AUTOMATION_FAILURE,
+        AUTOMATION_LAST_FAILURE,
+        EXPERIENCE_BANK,
+        EXPERIENCE_FEEDBACK,
+    ];
 }
 
 /// Record key of the single canonical fence/sequence row.

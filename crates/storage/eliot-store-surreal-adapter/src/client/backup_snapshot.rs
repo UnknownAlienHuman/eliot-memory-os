@@ -1,19 +1,22 @@
 //! Fixed coherent-snapshot operation registration for the `SurrealDB` seam.
 //!
 //! Only the four closed `snapshot.*` operations below may execute. Caller text
-//! never becomes a statement: every operation maps to one pinned `&'static str`
-//! composed once from the single-owner consts in [`crate::schema`] and
+//! never becomes a statement: every operation maps to one fixed `&'static str`
+//! built from the single-owner consts in [`crate::schema`] and
 //! [`crate::backup_snapshot`], and a snapshot statement carries no bindings at
 //! all, so no caller value can reach the provider. Connection endpoints and
 //! credentials never cross this seam; they remain inside adapter
 //! configuration.
 //!
-//! Both pinned batches are one `BEGIN TRANSACTION;` … `COMMIT TRANSACTION;`
-//! sequence. This is the only coherent boundary available in this crate:
-//! [`crate::client::session`] issues only the `version`, `signin`, `use` and
-//! `query` RPC methods, so there is no `let`/cursor RPC and an open
-//! cross-RPC transaction cannot exist. The shape is the one already proven
-//! twice in this crate — `schema::READ_GENESIS_SCHEMA_AND_STATE` and
+//! Both batches are one `BEGIN TRANSACTION;` … `COMMIT TRANSACTION;` sequence.
+//! This is the only coherent boundary reachable through this crate's client
+//! seam: [`crate::client::session`] issues only the `version`, `signin`, `use`
+//! and `query` RPC methods, so this seam has no way to hold a transaction open
+//! across RPC calls. (The provider protocol does expose `begin`/`commit`/
+//! `cancel`; reaching them would mean extending `client/session.rs`, which is
+//! outside this leaf's mutable scope. Do not read the sentence above as a
+//! claim that the provider lacks them.) The batch shape is the one already
+//! proven twice in this crate — `schema::READ_GENESIS_SCHEMA_AND_STATE` and
 //! `apply::read_boundary::READ_VALIDATION_SNAPSHOT`.
 //!
 //! I5.1 keeps the bridge inside "validates protocol and schema generation;
@@ -72,7 +75,7 @@ pub(crate) const SNAPSHOT_OPERATIONS: &[&str] = &[
     SNAPSHOT_PAGE_OPERATION,
 ];
 
-/// Transaction delimiter that opens every pinned snapshot batch.
+/// Transaction delimiter that opens every snapshot batch.
 ///
 /// Referenced, never redefined, so the single owner in [`crate::schema`]
 /// keeps both delimiters (A2.3 / ARCH-MOD-03).
@@ -80,7 +83,7 @@ pub(crate) fn begin_transaction_prefix() -> &'static str {
     TX_BEGIN
 }
 
-/// Transaction delimiter that closes every pinned snapshot batch.
+/// Transaction delimiter that closes every snapshot batch.
 pub(crate) fn commit_transaction_suffix() -> &'static str {
     TX_COMMIT
 }
@@ -88,9 +91,21 @@ pub(crate) fn commit_transaction_suffix() -> &'static str {
 /// Interns one adapter-owned statement once and returns the same
 /// `&'static str` for the process lifetime.
 ///
-/// `concat!` accepts literals only, so the composed text cannot be a `const`
-/// item: the bytes are built once from the single-owner consts and reused, so
-/// the statement stays pinned and reproducible across calls.
+/// The composed text is *not* a `const` item, and this is a deliberate,
+/// stated mechanism rather than an accident:
+///
+/// * `concat!` accepts literals only. It cannot interpolate
+///   `crate::schema::table::*`, so the only way to express these batches as
+///   one `concat!` would be to restate every physical table name in this
+///   module — a second owner for names A2.3 reserves to
+///   [`crate::schema`], and exactly the duplication the module doc forbids.
+/// * Therefore the bytes are assembled at first use from the single-owner
+///   consts and stored in a [`OnceLock`].
+///
+/// The result is still a process-stable `&'static str`, so callers hold the
+/// same pointer for the process lifetime and the statement text is
+/// reproducible. What it is *not* is decided at compile time; nothing here
+/// should claim otherwise.
 fn intern(cell: &'static OnceLock<Box<str>>, build: impl FnOnce() -> String) -> &'static str {
     cell.get_or_init(|| build().into_boxed_str()).as_ref()
 }
@@ -139,7 +154,7 @@ fn members_batch() -> String {
     sql
 }
 
-/// Pinned capture-point statement shared by the three point operations.
+/// Interned capture-point statement shared by the three point operations.
 ///
 /// The three labels stay distinct so the provider error and the pool read lane
 /// can attribute an outcome to the exact call, while the read itself is one
@@ -149,7 +164,7 @@ fn point_statement() -> &'static str {
     intern(&STATEMENT, point_batch)
 }
 
-/// Pinned canonical-member statement for [`SNAPSHOT_MEMBERS_OPERATION`].
+/// Interned canonical-member statement for [`SNAPSHOT_MEMBERS_OPERATION`].
 fn members_statement() -> &'static str {
     static STATEMENT: OnceLock<Box<str>> = OnceLock::new();
     intern(&STATEMENT, members_batch)
@@ -174,11 +189,11 @@ pub(crate) fn validate_snapshot_operation(name: &str) -> Result<(), AdapterError
     }
 }
 
-/// Maps a closed snapshot operation to its pinned fixed statement.
+/// Maps a closed snapshot operation to its fixed interned statement.
 ///
-/// Each arm returns a `&'static str` composed only from single-owner consts.
-/// Unknown operations fail with the same redacted static label used by
-/// [`validate_snapshot_operation`].
+/// Each arm returns a process-stable `&'static str` assembled only from
+/// single-owner consts. Unknown operations fail with the same redacted static
+/// label used by [`validate_snapshot_operation`].
 pub(crate) fn fixed_snapshot_statement(operation: &str) -> Result<&'static str, AdapterError> {
     if operation == SNAPSHOT_MEMBERS_OPERATION {
         Ok(members_statement())

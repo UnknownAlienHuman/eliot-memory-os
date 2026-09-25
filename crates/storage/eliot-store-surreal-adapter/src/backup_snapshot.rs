@@ -1,40 +1,51 @@
 //! Coherent bounded snapshot capture over the `SurrealDB` bridge (issue #951).
 //!
 //! The denominator is read from the provider, never taken from the caller.
-//! [`begin_snapshot`] runs the pinned member batch in one
+//! [`begin_snapshot`] runs the fixed member batch in one
 //! `BEGIN TRANSACTION;` … `COMMIT TRANSACTION;` sequence, binds the point that
 //! batch observed (schema generation, canonical fence, both allocated
-//! sequences) after the readiness/generation/fence/source-identity gate,
-//! reconciles the caller's declared denominator against the observed set as a
-//! claim to be verified, and freezes the served set, totals, bounds and expiry.
-//! [`read_snapshot_page`] and [`end_snapshot`] re-verify the whole point on
-//! every call, before and after the provider await.
+//! sequences) after the principal/readiness/generation/fence/source-identity
+//! gate, reconciles the caller's declared denominator and scope against the
+//! observed set as claims to be verified, and freezes the served set, totals,
+//! bounds and expiry. [`read_snapshot_page`] and [`end_snapshot`] re-verify the
+//! whole point on every call, before and after the provider await.
+//!
+//! The scope half is derived from the same observation: the exported projection
+//! is the `revision_head`/`ordering_head` values the provider returned at the
+//! bound point, reconciled against the request and bound into the owner-issued
+//! consistency point by digest. A claim the provider contradicts is refused; a
+//! head it has no row for, or has outside the request, is exact per-key scope
+//! evidence. See [`observed_scope_projection`] for the record-level limit this
+//! honest projection does not claim to cover.
 //!
 //! One release discipline: [`CaptureRelease`] releases exactly the capture-owned
 //! entry on every exit path of a page or end call, including a future dropped
 //! while the provider await is in flight. The registry map is never cleared
 //! wholesale. A capture that stopped being servable — window closed, point
-//! moved, page bound reached, set exhausted — records its exact partial
-//! evidence with [`mark_interruption`] and keeps its entry, so
+//! moved, page bound reached, set exhausted, provider read failed — records its
+//! exact partial evidence with [`mark_interruption`] and keeps its entry, so
 //! [`end_snapshot`] issues a real `Partial`/`Expired` receipt carrying the
 //! exact served counts instead of deleting the only record of what was served.
+//! A recorded interruption is terminal for serving, but never for closing.
 //!
 //! Reads only: this module never acquires `adapter.write_lock`, issues no
 //! DDL/migration, performs no restore, and defines no archive format. Every
-//! provider statement is a fixed adapter-owned `&'static str` composed from the
-//! single-owner consts in [`crate::schema`]; no snapshot statement carries a
-//! binding, so no caller value can reach the provider, and errors/receipts carry
-//! digests and static text, never provider payload or credentials.
+//! provider statement is a fixed adapter-owned `&'static str` assembled at
+//! first use from the single-owner consts in [`crate::schema`] (see
+//! `client::backup_snapshot::intern` for why it is not a `const`); no snapshot
+//! statement carries a binding, so no caller value can reach the provider, and
+//! errors/receipts carry digests and static text, never provider payload or
+//! credentials.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
 
 use eliot_store_api::{
     BlobResidency, BlobResidencyDomain, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_MEMBERS,
-    MAX_SNAPSHOT_PAGE_MEMBERS, MAX_SNAPSHOT_PAGES, RequestMeta, SnapshotBeginRequest,
-    SnapshotCompleteness, SnapshotCursor, SnapshotDenominator, SnapshotEndReceipt, SnapshotHandle,
-    SnapshotMember, SnapshotMemberType, SnapshotPage, StateFence, StoreError, canonical_json_bytes,
-    sha256_hex,
+    MAX_SNAPSHOT_PAGE_MEMBERS, MAX_SNAPSHOT_PAGES, OrderingHead, RequestMeta, RevisionHead,
+    SnapshotBeginRequest, SnapshotCompleteness, SnapshotCursor, SnapshotDenominator,
+    SnapshotEndReceipt, SnapshotHandle, SnapshotMember, SnapshotMemberType, SnapshotPage,
+    StateFence, StoreError, canonical_json_bytes, sha256_hex,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -54,6 +65,9 @@ const SNAPSHOT_PAGE_CHUNK: u64 = MAX_SNAPSHOT_PAGE_MEMBERS as u64;
 
 /// Static error field for a canonical source class composition defect.
 const SNAPSHOT_CLASS_FIELD: &str = "snapshot.classes";
+
+/// Static error field for an observed scope-projection defect.
+const SCOPE_PROJECTION_FIELD: &str = "snapshot.scope_projection";
 
 /// Enumeration revision bound into every end receipt.
 ///
@@ -130,11 +144,69 @@ const SNAPSHOT_CONSISTENCY_POINT_VERSION: &str = "eliot.snapshot.consistency-poi
 /// Builds the versioned, domain-separated owner-issued consistency point.
 ///
 /// The token binds the encoding version, the capability that owns the capture
-/// as its domain separator, and the exact begin-request digest.
-fn consistency_point(snapshot_digest: &str) -> String {
+/// as its domain separator, the exact begin-request digest, and the digest of
+/// the scope projection *observed* at the bound point. The caller cannot mint
+/// any of these: the request digest and the observed projection are the only
+/// two inputs, and the second is read from the provider, not from the request.
+fn consistency_point(snapshot_digest: &str, scope_projection_digest: &str) -> String {
     format!(
-        "{SNAPSHOT_CONSISTENCY_POINT_VERSION}:{SNAPSHOT_CONSISTENCY_POINT_DOMAIN}:{snapshot_digest}"
+        "{SNAPSHOT_CONSISTENCY_POINT_VERSION}:{SNAPSHOT_CONSISTENCY_POINT_DOMAIN}:{snapshot_digest}:{scope_projection_digest}"
     )
+}
+
+/// Static error field for the capture principal check.
+const SNAPSHOT_PRINCIPAL_FIELD: &str = "snapshot.principal";
+
+/// Binds the one principal a capture can act as and proves the caller cannot
+/// select another one.
+///
+/// `eliot_store_api::RequestMeta` carries no principal field
+/// (`request_id`/`session_id`/`task_id`/`product_id`/`source_id`/
+/// `state_fence`/`clock`), and `SnapshotBeginRequest` carries none either, so
+/// there is no caller-supplied principal in this capture path to compare. The
+/// acting principal is therefore exactly one value:
+/// `SurrealAdapterConfig::username`, the value
+/// `client::session::authenticate_provider` signs in with once per session
+/// (`client/session.rs`) and the only principal the single provider owner ever
+/// authenticates. This function states that explicitly instead of leaving it
+/// implied, and fails closed with the named typed error
+/// [`SNAPSHOT_PRINCIPAL_FIELD`] when the invariant does not hold.
+///
+/// Two properties are checked, both observable from inside this crate:
+///
+/// 1. the configured principal is an admissible single token, so a capture can
+///    never open under a blank or control-bearing principal;
+/// 2. the pinned statement for the requested operation carries no `$`
+///    binding placeholder. `run_pinned_snapshot_query` always sends an empty
+///    binding map, so a statement that did carry a placeholder would have
+///    nothing to fill it with — this is the only channel through which a
+///    caller value, and therefore a caller-chosen principal, could reach the
+///    provider at this seam, so it is checked rather than assumed.
+///
+/// The missing contract is real and is not invented here: `RequestMeta` has no
+/// principal field, so "schema/generation/fence/principal mismatch rejected"
+/// can only be satisfied for the first three. A caller-selected principal
+/// needs an `eliot-store-api` contract owner outside this leaf.
+fn bind_capture_principal(
+    adapter: &SurrealStoreAdapter,
+    operation: &'static str,
+) -> Result<(), StoreError> {
+    let principal = adapter.config.username.as_str();
+    if principal.is_empty() || principal.chars().any(char::is_control) {
+        return Err(StoreError::InvalidField {
+            field: SNAPSHOT_PRINCIPAL_FIELD,
+            reason: "acting principal is not the adapter's single authenticated principal",
+        });
+    }
+    let statement = crate::client::fixed_snapshot_statement(operation)
+        .map_err(AdapterError::into_store_error)?;
+    if statement.contains('$') {
+        return Err(StoreError::InvalidField {
+            field: SNAPSHOT_PRINCIPAL_FIELD,
+            reason: "pinned snapshot statement is not bound-free and could admit a caller principal",
+        });
+    }
+    Ok(())
 }
 
 /// Versioned canonical encoding of the member identity and ordering shape.
@@ -220,19 +292,22 @@ pub(crate) enum CanonicalSourceClass {
     ///
     /// `SurrealAdapterConfig::validate` pins
     /// `expected_schema_generation == GENERATION_V2`, and `SCHEMA_DDL_V2`
-    /// (`schema.rs`) defines exactly the eleven tables below the
-    /// [`CanonicalSourceClass::CapturePoint`] rows plus the nine
-    /// [`CanonicalSourceClass::Member`] rows. Every remaining table is added by
-    /// an additive delta DDL that no admitted migration path reaches: the
-    /// erasure delta is `#[allow(dead_code)]` (`schema.rs`
-    /// `MIGRATION_ID_V2_TO_V3`) and the notification/resource/automation/
-    /// experience deltas are the same shape. Reading an undefined table inside
-    /// one `BEGIN … COMMIT` batch aborts the whole transaction (see the
-    /// recorded provider observations in `apply/read_boundary.rs`), so
-    /// including these rows would make every capture fail on an admitted
-    /// store. Each therefore has exactly one disposition — declared, not
-    /// captured — instead of being silently omitted or reported as an
-    /// undeclared exclusion.
+    /// (`schema.rs`) defines exactly the eleven tables this enumeration reads:
+    /// the two [`CanonicalSourceClass::CapturePoint`] rows plus the nine
+    /// [`CanonicalSourceClass::Member`] rows. The twelve classes below are not
+    /// among them: the erasure, notification, reactive-session, resource,
+    /// automation and experience families are defined by the superseded
+    /// first-generation baseline and by additive deltas the admitted
+    /// generation never reaches, and `automation_failure` /
+    /// `automation_last_failure` are in no baseline DDL at all. Reading a table
+    /// the admitted generation does not define inside one `BEGIN … COMMIT`
+    /// batch aborts the whole transaction (see the recorded provider
+    /// observations in `apply/read_boundary.rs`), so capturing these rows would
+    /// make every capture fail on an admitted store. Each therefore has exactly
+    /// one disposition — declared, not captured — instead of being silently
+    /// omitted or reported as an undeclared exclusion, and
+    /// `verify_canonical_source_classes` proves that 1:1 against the single
+    /// owner's own table list.
     OutsideAdmittedGeneration {
         /// Physical table name owned by [`crate::schema`].
         table: &'static str,
@@ -412,14 +487,24 @@ fn captured_member_classes() -> impl Iterator<Item = &'static MemberClass> {
         })
 }
 
-/// Reports whether the admitted baseline generations define `table` exactly.
+/// Reports whether the admitted generation defines `table` exactly.
 ///
-/// Both single-owner baselines are consulted so a v1 store is never read as
-/// missing a table the v2 baseline added. The marker carries the trailing
-/// space, so `relation_record_extra` can never satisfy `relation_record`.
-fn defines_admitted_table(table: &str) -> bool {
+/// The admitted generation is exactly `GENERATION_V2`, and only its baseline
+/// DDL is evidence of what a capture may read: `SurrealAdapterConfig::validate`
+/// pins `expected_schema_generation` to `GENERATION_V2` and `begin_snapshot`
+/// re-checks the observed generation against that same pinned value, so a
+/// capture never runs against another generation. The superseded v1 baseline is
+/// deliberately *not* consulted here even though it is a strict superset of the
+/// v2 table set: it defines `erasure_intent`, `erasure_outcome`,
+/// `notification_record`, `reactive_session`, `resource_snapshot`, the three
+/// captured automation tables, `experience_bank` and `experience_feedback`, so
+/// OR-ing it in would make every one of those declared classes read as
+/// admitted and the census would refuse every capture before any provider I/O.
+/// The marker carries the trailing space, so `relation_record_extra` can never
+/// satisfy `relation_record`.
+fn admitted_generation_defines(table: &str) -> bool {
     let marker = format!("DEFINE TABLE {table} ");
-    crate::schema::SCHEMA_DDL_V2.contains(&marker) || crate::schema::SCHEMA_DDL.contains(&marker)
+    crate::schema::SCHEMA_DDL_V2.contains(&marker)
 }
 
 /// Walks every declared canonical source class and proves its one disposition.
@@ -430,12 +515,22 @@ fn defines_admitted_table(table: &str) -> bool {
 /// whose pinned read does not name its own table would bind the wrong point.
 /// Both are composition defects, not caller input, so both are refused before
 /// any provider I/O instead of being absorbed into a later error.
+///
+/// The census denominator is [`crate::schema::table::ALL_TABLES`], not this
+/// enumeration. The previous guard incremented a counter once per loop
+/// iteration and compared it against the enumeration's own length, so it
+/// always held: adding a new `schema::table` const would have produced an
+/// incomplete census with no error. Coverage is now checked in both
+/// directions against the single owner's own list — every owner table has
+/// exactly one disposition, and every disposition names an owner table — so a
+/// table that is added, renamed, duplicated or dropped is a typed refusal
+/// before any provider I/O.
 fn verify_canonical_source_classes() -> Result<(), StoreError> {
-    let mut verified = 0_usize;
+    let mut disposed: BTreeSet<&'static str> = BTreeSet::new();
     for class in CANONICAL_SOURCE_CLASSES {
-        match class {
+        let table = match class {
             CanonicalSourceClass::Member(member) => {
-                if !defines_admitted_table(member.table) {
+                if !admitted_generation_defines(member.table) {
                     return Err(StoreError::InvalidField {
                         field: SNAPSHOT_CLASS_FIELD,
                         reason: "captured class is not defined by the admitted generation",
@@ -453,13 +548,14 @@ fn verify_canonical_source_classes() -> Result<(), StoreError> {
                     });
                 }
                 if let Some(reference) = &member.reference
-                    && !defines_admitted_table(reference.target_table)
+                    && !admitted_generation_defines(reference.target_table)
                 {
                     return Err(StoreError::InvalidField {
                         field: SNAPSHOT_CLASS_FIELD,
                         reason: "reference target is not defined by the admitted generation",
                     });
                 }
+                member.table
             }
             CanonicalSourceClass::CapturePoint { table, statement } => {
                 if !statement.contains(*table) {
@@ -468,25 +564,52 @@ fn verify_canonical_source_classes() -> Result<(), StoreError> {
                         reason: "capture point read does not name its own table",
                     });
                 }
+                *table
             }
             CanonicalSourceClass::OutsideAdmittedGeneration { table } => {
-                if defines_admitted_table(table) {
+                if admitted_generation_defines(table) {
                     return Err(StoreError::InvalidField {
                         field: SNAPSHOT_CLASS_FIELD,
                         reason: "declared class is defined by the admitted generation",
                     });
                 }
+                *table
             }
+        };
+        // Exactly one disposition per single-owner table: a second disposition
+        // for the same table would silently drop one of them from the census.
+        if !disposed.insert(table) {
+            return Err(StoreError::InvalidField {
+                field: SNAPSHOT_CLASS_FIELD,
+                reason: "canonical source class has more than one disposition",
+            });
         }
-        verified += 1;
+        // ... and every disposition must name a table the single owner really
+        // declares, so a stale or invented physical name cannot be captured.
+        if !crate::schema::table::ALL_TABLES.contains(&table) {
+            return Err(StoreError::InvalidField {
+                field: SNAPSHOT_CLASS_FIELD,
+                reason: "disposition names a table the single owner does not declare",
+            });
+        }
     }
-    // Every declared class carries exactly one disposition, so the walk always
-    // covers the whole enumeration; the guard keeps that a checked property
-    // rather than an assumption.
-    if verified != CANONICAL_SOURCE_CLASSES.len() {
+    // Every table the single owner declares is covered by a disposition, so a
+    // newly declared class cannot join the census incomplete.
+    for table in crate::schema::table::ALL_TABLES {
+        if !disposed.contains(table) {
+            return Err(StoreError::InvalidField {
+                field: SNAPSHOT_CLASS_FIELD,
+                reason: "canonical source class has no disposition",
+            });
+        }
+    }
+    // The census is exactly 1:1 with the owner's table count. Together with the
+    // two directions above this also proves the owner list itself has no
+    // duplicate name, which a per-iteration counter never could.
+    if disposed.len() != crate::schema::table::ALL_TABLES.len() {
         return Err(StoreError::InvalidField {
             field: SNAPSHOT_CLASS_FIELD,
-            reason: "canonical source class enumeration is not total",
+            reason: "canonical source class census is not one-to-one with the single owner",
         });
     }
     Ok(())
@@ -644,13 +767,26 @@ fn parse_capture_point(
 /// [`StoreError::InvalidField`] naming a static field and reason, so no caller
 /// text crosses the boundary.
 ///
-/// `source.generation` is bound to the resource generation inside the
-/// owner-issued state fence that the same request carries and that the store
-/// has just verified live. That is the only honest binding available: this
-/// adapter owns no live resource-generation counter (`SurrealAdapterConfig`
-/// holds `SchemaGeneration`, a migration version *string*, not a counter), so
-/// the claim is anchored to the verified fence rather than compared against an
-/// invented provider counter.
+/// The generation claim is bound in two separately named steps, because they
+/// prove different things:
+///
+/// * the `StateFenceMismatch` comparison below compares the caller's fence to
+///   the fence the store just read live. That is an observation of provider
+///   state;
+/// * [`check_request_generation_coherence`] compares two *caller-supplied*
+///   fields of one request to each other. It is a request-internal coherence
+///   check, and this module deliberately does not present it as a provider
+///   observation. It is kept because the two checks together bind the claimed
+///   generation transitively to the live-verified fence, and removing it would
+///   let a request carry a generation unrelated to the fence it claims.
+///
+/// The gap this leaves is real and is not papered over: no owner-issued live
+/// resource-generation counter exists to observe. `SurrealAdapterConfig` holds
+/// `SchemaGeneration`, a migration version *string* pinned to `GENERATION_V2`
+/// (`config.rs`), not a counter, and the store API carries no such field on
+/// `SnapshotSourceIdentity`'s provider side. Binding a claimed generation to
+/// an independently observed provider counter needs a contract owner outside
+/// this leaf.
 fn bind_source_identity(
     adapter: &SurrealStoreAdapter,
     point: &CapturePoint,
@@ -676,14 +812,27 @@ fn bind_source_identity(
             reason: "source is not the observed schema generation",
         });
     }
+    if request.scope.state_fence != point.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    check_request_generation_coherence(request)
+}
+
+/// Refuses a request whose claimed source generation disagrees with the
+/// generation inside the state fence the very same request carries.
+///
+/// This is a request-internal coherence check over two caller-supplied fields.
+/// It is *not* an observation of live provider state and is not named as one:
+/// see the [`bind_source_identity`] contract note for the full split and for
+/// the owner-issued resource-generation counter this adapter does not have.
+/// It runs after the live fence comparison, so the fence it reads is already
+/// proven equal to the fence the store just observed.
+fn check_request_generation_coherence(request: &SnapshotBeginRequest) -> Result<(), StoreError> {
     if request.source.generation != request.scope.state_fence.resource_generation {
         return Err(StoreError::InvalidField {
             field: "snapshot.generation",
-            reason: "source generation must match the bound state fence generation",
+            reason: "source generation must match the request's own state fence generation",
         });
-    }
-    if request.scope.state_fence != point.state_fence {
-        return Err(StoreError::FenceMismatch);
     }
     Ok(())
 }
@@ -696,6 +845,8 @@ struct Enumeration {
     evidence: EnumerationEvidence,
     /// Members in versioned logical order.
     members: Vec<SnapshotMember>,
+    /// The scope projection observed at the same point.
+    scope: ObservedScopeProjection,
 }
 
 /// Proof that the canonical enumeration actually ran over every admitted
@@ -878,6 +1029,7 @@ fn member_for_row(
 /// so ordering never depends on incidental provider row order (I5.27).
 async fn enumerate_canonical_members(
     adapter: &SurrealStoreAdapter,
+    request: &SnapshotBeginRequest,
 ) -> Result<Enumeration, StoreError> {
     let (point, class_rows) = read_enumeration(adapter).await?;
     let rows_by_key = observed_row_keys(&class_rows)?;
@@ -894,6 +1046,10 @@ async fn enumerate_canonical_members(
         .map(|(_, _, member)| member)
         .collect::<Vec<_>>();
     validate_reference_closure(&members)?;
+    // The scope projection is derived from the same observation as the
+    // denominator, so the exported projection and the served members describe
+    // exactly one point.
+    let scope = observed_scope_projection(&class_rows, &point, request)?;
     let evidence = EnumerationEvidence {
         classes_read: class_rows.len(),
         members_read: members.len(),
@@ -902,6 +1058,7 @@ async fn enumerate_canonical_members(
         point,
         evidence,
         members,
+        scope,
     })
 }
 
@@ -997,6 +1154,330 @@ fn validate_reference_closure(members: &[SnapshotMember]) -> Result<(), StoreErr
     Ok(())
 }
 
+/// Versioned canonical encoding of the observed scope projection.
+///
+/// I5.27: the projection is a digest-bound owner record, so a reader can tell
+/// which encoding produced it and cannot confuse a scope export with a full
+/// capture.
+const SCOPE_PROJECTION_VERSION: &str = "eliot.snapshot.scope-projection.v1";
+
+/// Row field carrying one head record's own typed body.
+const HEAD_BODY_FIELD: &str = "body";
+
+/// The scope projection observed at the bound point, exported as its canonical
+/// digest.
+///
+/// Required implementation: "for the requested full or scope projection" and
+/// "Scope-export exclusion needs exact scope evidence, not a broad omitted
+/// table". This is the scope half of the capture: it is derived from the
+/// `revision_head` / `ordering_head` rows the member batch *observed* at the
+/// bound point, never from `request.scope` alone, and the caller's claim is
+/// reconciled against it. A claim the provider contradicts is a typed refusal
+/// (see [`reconcile_scope_projection`]); a head the provider simply has no row
+/// for, or has for a key outside the request, is recorded as exact per-key
+/// scope evidence in the exported digest rather than as a broad table
+/// exclusion.
+///
+/// Honest limit, not papered over: the admitted generation's canonical tables
+/// (`schema.rs` `SCHEMA_DDL_V2`) carry no uniform `scope_id` column, so this
+/// projection covers the scope-defining head records. It does *not* filter the
+/// canonical record set to the requested scope, because no physical column
+/// supports that filter. Record-level scope export needs a schema owner
+/// outside this leaf.
+struct ObservedScopeProjection {
+    /// Canonical digest of the observed heads and the exact per-key boundary.
+    digest: String,
+}
+
+/// The two head classes' observed rows, split by the single owner's table names.
+struct ObservedHeadRows<'rows> {
+    /// Every observed `revision_head` row.
+    revisions: Vec<&'rows Map<String, Value>>,
+    /// Every observed `ordering_head` row.
+    orderings: Vec<&'rows Map<String, Value>>,
+}
+
+/// Splits the observed member rows into the two head classes, by the physical
+/// table the single owner declares. Classes that are not heads are skipped, so
+/// a new member class cannot be mistaken for a head.
+fn observed_head_rows(class_rows: &[Vec<Map<String, Value>>]) -> ObservedHeadRows<'_> {
+    let mut revisions = Vec::new();
+    let mut orderings = Vec::new();
+    for (class, rows) in captured_member_classes().zip(class_rows) {
+        let target = if class.table == crate::schema::table::REVISION_HEAD {
+            &mut revisions
+        } else if class.table == crate::schema::table::ORDERING_HEAD {
+            &mut orderings
+        } else {
+            continue;
+        };
+        target.extend(rows);
+    }
+    ObservedHeadRows {
+        revisions,
+        orderings,
+    }
+}
+
+/// Decodes one observed head row's own typed body.
+///
+/// The body is what the canonical write path stored
+/// (`apply/atomic_write.rs` binds `{"revision_key": …, "body": <RevisionHead>}`
+/// and `{"ordering_scope": …, "body": <OrderingHead>}`), so the head is read
+/// from the row the provider returned rather than re-derived from the index
+/// column.
+fn head_body<T: serde::de::DeserializeOwned>(row: &Map<String, Value>) -> Result<T, StoreError> {
+    let body = row.get(HEAD_BODY_FIELD).ok_or(StoreError::InvalidField {
+        field: SCOPE_PROJECTION_FIELD,
+        reason: "observed head row does not carry its typed body",
+    })?;
+    serde_json::from_value(body.clone()).map_err(snapshot_serialization_error)
+}
+
+/// Reads one observed `revision_head` row and proves it belongs to this point.
+///
+/// The physical index column is cross-checked against the head's own key, and
+/// the head's fence against the fence the store just observed: a head written
+/// under another fence is not evidence about this point.
+fn observed_revision_head(
+    row: &Map<String, Value>,
+    point: &CapturePoint,
+) -> Result<RevisionHead, StoreError> {
+    let head: RevisionHead = head_body(row)?;
+    head.validate()?;
+    if head.state_fence != point.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    let index_key =
+        row.get("revision_key")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: SCOPE_PROJECTION_FIELD,
+                reason: "observed revision row does not carry its index key",
+            })?;
+    if index_key != head.key.as_str() {
+        return Err(StoreError::IdentityConflict);
+    }
+    Ok(head)
+}
+
+/// Reads one observed `ordering_head` row and proves it belongs to this point.
+fn observed_ordering_head(
+    row: &Map<String, Value>,
+    point: &CapturePoint,
+) -> Result<OrderingHead, StoreError> {
+    let head: OrderingHead = head_body(row)?;
+    head.validate()?;
+    if head.state_fence != point.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    let index_scope =
+        row.get("ordering_scope")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: SCOPE_PROJECTION_FIELD,
+                reason: "observed ordering row does not carry its index scope",
+            })?;
+    if index_scope != head.scope.as_str() {
+        return Err(StoreError::IdentityConflict);
+    }
+    Ok(head)
+}
+
+/// Reconciles the caller's claimed scope against the observed projection.
+///
+/// A *conflict* is an observed head the request contradicts: the request names
+/// the key, the provider has the key, and the revision/sequence or the fence
+/// disagrees. That is a typed refusal, never a silently narrowed projection.
+///
+/// A head the provider has no row for is not a conflict: the per-key absence is
+/// exact scope evidence, and the exported projection simply does not contain
+/// that key. This is what keeps a capture of a store that has never written a
+/// head legal, which `SnapshotBeginRequest::validate` otherwise could not
+/// express, because it requires a non-empty `scope.revision_heads` on every
+/// request.
+fn reconcile_scope_projection(
+    observed_revisions: &[RevisionHead],
+    observed_orderings: &[OrderingHead],
+    request: &SnapshotBeginRequest,
+) -> Result<(), StoreError> {
+    let by_key: BTreeMap<&str, &RevisionHead> = observed_revisions
+        .iter()
+        .map(|head| (head.key.as_str(), head))
+        .collect();
+    for claimed in &request.scope.revision_heads {
+        if let Some(observed) = by_key.get(claimed.key.as_str())
+            && *observed != claimed
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+    }
+    let by_scope: BTreeMap<&str, &OrderingHead> = observed_orderings
+        .iter()
+        .map(|head| (head.scope.as_str(), head))
+        .collect();
+    for claimed in &request.scope.ordering_heads {
+        if let Some(observed) = by_scope.get(claimed.scope.as_str())
+            && *observed != claimed
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+    }
+    Ok(())
+}
+
+/// Builds the canonical scope-projection document.
+///
+/// The document states the exported projection (`revision_heads`,
+/// `ordering_heads` are the *observed* values for the requested keys) plus the
+/// exact per-key boundary: which requested keys the provider has no row for,
+/// and which observed keys lie outside the request. That is what makes a
+/// scope-export exclusion exact rather than a broad omitted table.
+///
+/// Every list is ordered by its own store-owned key, so the digest never
+/// depends on incidental provider row order (I5.27).
+fn scope_projection_document(
+    request: &SnapshotBeginRequest,
+    observed_revisions: &[RevisionHead],
+    observed_orderings: &[OrderingHead],
+) -> Map<String, Value> {
+    let claimed_revisions: BTreeSet<&str> = request
+        .scope
+        .revision_heads
+        .iter()
+        .map(|head| head.key.as_str())
+        .collect();
+    let claimed_orderings: BTreeSet<&str> = request
+        .scope
+        .ordering_heads
+        .iter()
+        .map(|head| head.scope.as_str())
+        .collect();
+    let revision_keys: BTreeSet<&str> = observed_revisions
+        .iter()
+        .map(|head| head.key.as_str())
+        .collect();
+    let ordering_scopes: BTreeSet<&str> = observed_orderings
+        .iter()
+        .map(|head| head.scope.as_str())
+        .collect();
+    let keys_absent_from = |keys: &BTreeSet<&str>, present: &BTreeSet<&str>| -> Value {
+        Value::Array(
+            keys.iter()
+                .filter(|key| !present.contains(**key))
+                .map(|key| Value::String((*key).to_owned()))
+                .collect(),
+        )
+    };
+    Map::from_iter([
+        (
+            "version".to_owned(),
+            Value::String(SCOPE_PROJECTION_VERSION.to_owned()),
+        ),
+        (
+            "scope_id".to_owned(),
+            Value::String(request.scope.scope_id.as_str().to_owned()),
+        ),
+        (
+            "revision_heads".to_owned(),
+            Value::Array(
+                observed_revisions
+                    .iter()
+                    .filter(|head| claimed_revisions.contains(head.key.as_str()))
+                    .map(|head| {
+                        Value::Array(vec![
+                            Value::String(head.key.as_str().to_owned()),
+                            Value::from(head.revision),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "ordering_heads".to_owned(),
+            Value::Array(
+                observed_orderings
+                    .iter()
+                    .filter(|head| claimed_orderings.contains(head.scope.as_str()))
+                    .map(|head| {
+                        Value::Array(vec![
+                            Value::String(head.scope.as_str().to_owned()),
+                            Value::from(head.sequence),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "unobserved_revision_keys".to_owned(),
+            keys_absent_from(&claimed_revisions, &revision_keys),
+        ),
+        (
+            "unobserved_ordering_scopes".to_owned(),
+            keys_absent_from(&claimed_orderings, &ordering_scopes),
+        ),
+        (
+            "out_of_scope_revision_keys".to_owned(),
+            keys_absent_from(&revision_keys, &claimed_revisions),
+        ),
+        (
+            "out_of_scope_ordering_scopes".to_owned(),
+            keys_absent_from(&ordering_scopes, &claimed_orderings),
+        ),
+    ])
+}
+
+/// Refuses two observed heads for the same key.
+///
+/// The admitted DDL declares a unique index per head key, so a duplicate means
+/// the observation is not faithful and no projection may be exported from it.
+fn ensure_unique_head_keys(
+    observed_revisions: &[RevisionHead],
+    observed_orderings: &[OrderingHead],
+) -> Result<(), StoreError> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for key in observed_revisions
+        .iter()
+        .map(|head| head.key.as_str())
+        .chain(observed_orderings.iter().map(|head| head.scope.as_str()))
+    {
+        if !seen.insert(key) {
+            return Err(StoreError::Duplicate {
+                field: SCOPE_PROJECTION_FIELD,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Digests the observed scope projection and its exact per-key boundary.
+fn observed_scope_projection(
+    class_rows: &[Vec<Map<String, Value>>],
+    point: &CapturePoint,
+    request: &SnapshotBeginRequest,
+) -> Result<ObservedScopeProjection, StoreError> {
+    let heads = observed_head_rows(class_rows);
+    let mut observed_revisions = heads
+        .revisions
+        .iter()
+        .map(|row| observed_revision_head(row, point))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut observed_orderings = heads
+        .orderings
+        .iter()
+        .map(|row| observed_ordering_head(row, point))
+        .collect::<Result<Vec<_>, _>>()?;
+    // Logical order, never incidental provider row order (I5.27).
+    observed_revisions.sort_by(|left, right| left.key.as_str().cmp(right.key.as_str()));
+    observed_orderings.sort_by(|left, right| left.scope.as_str().cmp(right.scope.as_str()));
+    ensure_unique_head_keys(&observed_revisions, &observed_orderings)?;
+    reconcile_scope_projection(&observed_revisions, &observed_orderings, request)?;
+    let document = scope_projection_document(request, &observed_revisions, &observed_orderings);
+    let digest =
+        sha256_hex(&canonical_json_bytes(&document).map_err(snapshot_serialization_error)?);
+    Ok(ObservedScopeProjection { digest })
+}
+
 /// Reconciles the caller's claimed denominator against the observed member set.
 ///
 /// The claimed denominator is evidence, not truth: a missing, extra, duplicated
@@ -1068,6 +1549,9 @@ const INTERRUPTION_POINT_MOVED: &str = "bound consistency point moved";
 const INTERRUPTION_PAGE_BOUND: &str = "served page bound exceeded";
 /// The observed member set has no further page to serve.
 const INTERRUPTION_CAPTURE_EXHAUSTED: &str = "no further page is available";
+/// A provider read of the bound point failed, so the capture cannot say the
+/// point still holds. Bounded static text: no provider prose, no payload.
+const INTERRUPTION_PROVIDER_FAILED: &str = "bound point read failed";
 
 /// Records the exact partial evidence on the capture-owned entry.
 ///
@@ -1087,6 +1571,26 @@ fn mark_interruption(
             bytes_served: state.bytes_served,
         });
     }
+}
+
+/// Records the interruption a provider failure leaves behind, then keeps the
+/// entry.
+///
+/// A transport or RPC failure is not evidence that the capture served nothing:
+/// the pages already handed out are exact partial evidence an operator must be
+/// able to see, and `end_snapshot` still owes the caller a receipt carrying
+/// them. The guard therefore stays *armed* across the provider await — a
+/// future dropped mid-await still releases the capture-owned entry through
+/// `Drop`, which is the only observable cancellation in this crate — and this
+/// helper disarms it only on the failure path, after the frozen counters have
+/// been recorded. The reason is bounded static text, so no provider message
+/// crosses the boundary. A poisoned registry lock still retains the entry:
+/// keeping the evidence is the safe direction when it cannot be annotated.
+fn retain_with_interruption(guard: &mut CaptureRelease, digest: &str) {
+    if let Ok(mut states) = registry().lock() {
+        mark_interruption(&mut states, digest, INTERRUPTION_PROVIDER_FAILED);
+    }
+    guard.retain();
 }
 
 /// Releases exactly the capture-owned entry on every exit path of a page or end
@@ -1235,11 +1739,14 @@ pub(crate) async fn begin_snapshot(
     if ctx.state_fence != request.scope.state_fence {
         return Err(StoreError::FenceMismatch);
     }
+    // The acting principal is named, not assumed, before any protected read.
+    bind_capture_principal(adapter, SNAPSHOT_BEGIN_OPERATION)?;
     verify_canonical_source_classes()?;
-    // The denominator is read from the provider, in one coherent transaction
-    // with the point it claims, and the claimed denominator is reconciled
-    // against it. The caller never supplies the served set.
-    let enumeration = enumerate_canonical_members(adapter).await?;
+    // The denominator and the scope projection are read from the provider, in one
+    // coherent transaction with the point they claim, and the caller's claims are
+    // reconciled against what was observed. The caller never supplies the served
+    // set.
+    let enumeration = enumerate_canonical_members(adapter, &request).await?;
     let point = enumeration.point;
     if point.schema_generation != adapter.config.expected_schema_generation.as_str() {
         return Err(StoreError::Unavailable);
@@ -1247,6 +1754,7 @@ pub(crate) async fn begin_snapshot(
     bind_source_identity(adapter, &point, &request)?;
     let ordered_members = enumeration.members;
     let evidence = enumeration.evidence;
+    let scope_digest = enumeration.scope.digest;
     reconcile_denominator(&ordered_members, &request.denominator)?;
     // An empty observed set is only a bindable denominator when the
     // enumeration actually read every admitted canonical class and found
@@ -1281,7 +1789,10 @@ pub(crate) async fn begin_snapshot(
     }
 
     let handle = SnapshotHandle {
-        consistency_point: consistency_point(&snapshot_digest),
+        // The owner-issued point binds the caller's claim *and* the scope
+        // projection read back from the provider, so a reader of the handle can
+        // tell which projection was actually exported.
+        consistency_point: consistency_point(&snapshot_digest, &scope_digest),
         snapshot_digest: snapshot_digest.clone(),
         operation_id: request.operation.operation_id.clone(),
         idempotency_key: request.operation.idempotency_key.clone(),
@@ -1436,6 +1947,14 @@ fn prepare_page(
         mark_interruption(states, digest, INTERRUPTION_WINDOW_CLOSED);
         return Err(StoreError::Unavailable);
     }
+    if state.interruption.is_some() {
+        // A recorded interruption is terminal: the capture can no longer claim
+        // the bound point still holds, and the frozen counters the interruption
+        // carries are the receipt's counts. Serving another page would move
+        // those counters past the recorded ones, so the entry is kept exactly
+        // as it is and `end_snapshot` issues the partial receipt.
+        return Err(StoreError::Unavailable);
+    }
     if ctx.state_fence != state.begin.scope.state_fence {
         return Err(StoreError::FenceMismatch);
     }
@@ -1465,13 +1984,19 @@ fn finish_page(
     guard: &mut CaptureRelease,
 ) -> Result<SnapshotPage, StoreError> {
     let mut states = lock_registry()?;
-    let (moved, retired) = {
+    let (moved, retired, interrupted) = {
         let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
         (
             observed != &state.point,
             capture_is_retired(state, crate::write_execution::current_time_ms()),
+            state.interruption.is_some(),
         )
     };
+    if interrupted {
+        // The capture was already interrupted between the pre-await validation
+        // and this observation; the recorded evidence stands.
+        return Err(StoreError::Unavailable);
+    }
     if moved {
         // The source moved under the bound point: never mix a newer point, and
         // keep the exact partial evidence for the closing receipt.
@@ -1506,6 +2031,9 @@ pub(crate) async fn read_snapshot_page(
             reason: "cursor does not belong to this snapshot handle",
         });
     }
+    // The same single-principal invariant is proved on the continuation, not
+    // only at begin: a page is protected data too.
+    bind_capture_principal(adapter, SNAPSHOT_PAGE_OPERATION)?;
     let digest = handle.snapshot_digest.clone();
     {
         let mut states = lock_registry()?;
@@ -1517,11 +2045,19 @@ pub(crate) async fn read_snapshot_page(
             crate::write_execution::current_time_ms(),
         )?;
     }
-    // No registry lock is held across this provider await (I5.7). The guard
-    // releases exactly the capture-owned entry on every exit path of this call,
-    // including a future dropped while the await is in flight.
+    // No registry lock is held across this provider await (I5.7). The guard is
+    // armed across it, so a future dropped while the await is in flight still
+    // releases exactly the capture-owned entry; only a provider failure that
+    // actually returns disarms it, and only after recording the exact partial
+    // evidence the pages already served left behind.
     let mut guard = CaptureRelease::arm(digest.clone());
-    let observed = observe_capture_point(adapter, SNAPSHOT_PAGE_OPERATION).await?;
+    let observed = match observe_capture_point(adapter, SNAPSHOT_PAGE_OPERATION).await {
+        Ok(point) => point,
+        Err(error) => {
+            retain_with_interruption(&mut guard, &digest);
+            return Err(error);
+        }
+    };
     finish_page(&digest, &observed, handle, cursor, &mut guard)
 }
 
@@ -1575,6 +2111,9 @@ pub(crate) async fn end_snapshot(
 ) -> Result<SnapshotEndReceipt, StoreError> {
     ctx.validate().map_err(StoreError::Foundation)?;
     handle.validate()?;
+    // The closing receipt is owner-issued evidence about protected data, so the
+    // same single-principal invariant is proved before it can be issued.
+    bind_capture_principal(adapter, SNAPSHOT_END_OPERATION)?;
     let digest = handle.snapshot_digest.clone();
     let retired = {
         let mut states = lock_registry()?;
@@ -1594,8 +2133,20 @@ pub(crate) async fn end_snapshot(
         None
     } else {
         let mut guard = CaptureRelease::arm(digest.clone());
-        let observed = observe_capture_point(adapter, SNAPSHOT_END_OPERATION).await?;
-        guard.retain();
+        let observed = match observe_capture_point(adapter, SNAPSHOT_END_OPERATION).await {
+            Ok(point) => {
+                guard.retain();
+                point
+            }
+            Err(error) => {
+                // The end read failed, so no receipt can claim the point held
+                // across this close. The capture-owned entry is still the only
+                // record of what was served, so it is kept with its exact
+                // partial evidence and the caller may retry `end_snapshot`.
+                retain_with_interruption(&mut guard, &digest);
+                return Err(error);
+            }
+        };
         Some(observed)
     };
     close_capture(&digest, observed.as_ref(), handle)
