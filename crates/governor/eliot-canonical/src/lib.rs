@@ -1320,4 +1320,100 @@ mod tests {
                 .expect("shared hash recomputes")
         );
     }
+
+    /// Issue #63 A2 cross-crate golden manifest: neutral single-manifest
+    /// values admitting the chain envelope's class and ceiling, so the
+    /// digest is code-derived identically in every crate.
+    fn golden_chain_manifest() -> eliot_store_api::NamedOperationManifest {
+        eliot_store_api::NamedOperationManifest::new(
+            "governor-golden-chain-63",
+            eliot_store_api::CONTRACT_VERSION,
+            vec![TransitionClass::CaptureCandidate],
+            EffectClass::Candidate,
+            1024,
+            1024,
+            1000,
+        )
+        .expect("chain manifest builds")
+    }
+
+    /// Issue #63 A2 cross-crate golden envelope: fixed Governor admission
+    /// inputs whose prepared transition `eliot-store-memory` commits
+    /// verbatim, so Governor, store-api and the memory store bind one
+    /// digest.
+    fn golden_chain_envelope(fence: &StateFence) -> CanonicalWriteEnvelope {
+        CanonicalWriteEnvelope {
+            operation_id: OperationId::new("op-golden-chain-63").expect("operation id"),
+            request: RequestMetadata {
+                request_id: eliot_contracts::RequestId::new("request-golden-chain-63")
+                    .expect("request id"),
+                session_id: None,
+                task_id: None,
+                product_id: eliot_contracts::ProductId::new("product-golden-chain")
+                    .expect("product id"),
+                source_id: eliot_contracts::SourceId::new("source-golden-chain")
+                    .expect("source id"),
+                state_fence: fence.clone(),
+                clock: eliot_contracts::ClockReading {
+                    valid_time_ms: Some(1),
+                    known_time_ms: Some(1),
+                    transaction_sequence: None,
+                    monotonic_ns: Some(1),
+                },
+            },
+            idempotency_key: "idem-golden-chain-63".to_owned(),
+            scope_id: ScopeId::new("scope-golden-chain-63").expect("scope"),
+            task_id: None,
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: "c".repeat(64),
+            operation_manifest_digest: golden_chain_manifest().digest.clone(),
+            semantic_commands: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: BTreeMap::from([(
+                    "subject".to_owned(),
+                    serde_json::json!("observation-golden-chain-63"),
+                )]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: vec![EventId::new("event-golden-chain-1").expect("event id")],
+                projection_kinds: vec!["projection-golden-chain-1".to_owned()],
+                relation_kinds: vec!["relation-golden-chain-1".to_owned()],
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: vec!["approval-golden-chain-1".to_owned()],
+            expected_revision_heads: vec![RevisionHeadExpectation {
+                key: RevisionKey::new("revision-golden-chain-a").expect("key"),
+                expected_revision: 1,
+                state_fence: fence.clone(),
+            }],
+            expected_ordering_heads: vec![OrderingHeadExpectation {
+                scope: OrderingScopeId::new("scope-golden-chain-63").expect("ordering scope"),
+                expected_sequence: 1,
+                state_fence: fence.clone(),
+            }],
+        }
+    }
+
+    /// Pinned digest of [`golden_chain_envelope`], derived by running the
+    /// shared hash over those fixed inputs (not hand-written):
+    /// `eliot-store-api` and `eliot-store-memory` assert the same literal.
+    const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str =
+        "32d9235499c0e63f72509808c0b1439cd7e879c754fbc1bc5e965bb6af4d6a36";
+
+    #[test]
+    fn golden_chain_envelope_hash_matches_the_pinned_cross_crate_digest() {
+        let fence = test_fence();
+        let envelope = golden_chain_envelope(&fence);
+        let hash = envelope
+            .canonical_request_hash()
+            .expect("chain hash computes");
+        assert_eq!(hash, ISSUE_63_GOLDEN_CHAIN_DIGEST);
+        // prepare() carries the same Governor-admitted claim downstream.
+        let transition = envelope.prepare().expect("chain envelope prepares");
+        assert_eq!(
+            transition.identity.canonical_request_hash,
+            ISSUE_63_GOLDEN_CHAIN_DIGEST
+        );
+    }
 }
