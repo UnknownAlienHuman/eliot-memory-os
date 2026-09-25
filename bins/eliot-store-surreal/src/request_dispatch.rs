@@ -17,6 +17,7 @@ use eliot_protocol::dreamer_job::DurableJobRequest;
 use eliot_protocol::dreamer_job::DurableJobResponse;
 use eliot_store_api::CanonicalStoreClient;
 use eliot_store_api::MAX_STORE_FAILURE_REFERENCE_LEN;
+use eliot_store_api::NamedReadRequest;
 use eliot_store_api::RequestMeta;
 use eliot_store_api::StoreBackupOperation;
 use eliot_store_api::StoreBackupRequest;
@@ -124,11 +125,14 @@ pub(crate) fn map_composition_error(
     }
 }
 
-fn failure_context_for_fence(
-    state_fence: eliot_contracts::StateFence,
-) -> StoreFailureIdentityContext {
+fn failure_context_for_named_read(request: &NamedReadRequest) -> StoreFailureIdentityContext {
+    // The EBP client admits this exact operation-kind identity for every
+    // named read. Bind failures must echo it (or its SHA-256 digest), not an
+    // independent request digest, or the client correctly rejects them as an
+    // identity conflict before it can preserve StoreError::Unavailable.
     StoreFailureIdentityContext {
-        state_fence_ref_or_exact_safe_projection: Some(state_fence),
+        idempotency_key_ref_or_digest: Some("store-named-read".to_owned()),
+        state_fence_ref_or_exact_safe_projection: Some(request.state_fence.clone()),
         ..StoreFailureIdentityContext::default()
     }
 }
@@ -337,6 +341,14 @@ pub(crate) async fn dispatch_dreamer_job(
     }
 }
 
+async fn dispatch_named_request(store: &StoreComposition, request: NamedReadRequest) -> Response {
+    let context = failure_context_for_named_read(&request);
+    match store.named(request).await {
+        Ok(response) => Response::Named { response },
+        Err(error) => map_store_error(error, context),
+    }
+}
+
 #[allow(async_fn_in_trait)]
 pub trait StoreDispatchBackend: Send + Sync {
     async fn dispatch_request(&self, request: Request) -> Response;
@@ -357,13 +369,7 @@ impl StoreDispatchBackend for StoreComposition {
                 Ok(receipt) => Response::Readiness { receipt },
                 Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),
             },
-            Request::Named { request } => {
-                let context = failure_context_for_fence(request.state_fence.clone());
-                match self.named(request).await {
-                    Ok(response) => Response::Named { response },
-                    Err(error) => map_store_error(error, context),
-                }
-            }
+            Request::Named { request } => dispatch_named_request(self, request).await,
             Request::Apply {
                 context,
                 transition,
