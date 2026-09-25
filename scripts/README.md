@@ -135,13 +135,66 @@ be promoted to live multi-agent/runtime proof.
 | `build-eliot-windows-x64-release.ps1` | Build declared Windows x64 release inputs and an unsigned bundle | Build/staging only |
 | `finalize-eliot-windows-x64-release.ps1` | Sign/finalize and independently read back declared release artifacts | Release-artifact evidence only |
 | `write-operator-build-receipt.ps1` | Write the commit-bound Eliot.Operator build receipt consumed by `build-eliot-windows-x64-release.ps1` (#2391) | Operator build-input evidence only |
-| `install-pipeline.ps1` | Root-controller install pipeline executing materialization and installation apply | Installation orchestration only |
+| `install-pipeline.ps1` | Root-controller install pipeline with an optional step-0 developer reset, then materialization and installation apply | Installation orchestration only |
 | `invoke-eliot-windows-x64-production.ps1` | Execute the manifest-bound production invocation/installation flow | Live acceptance remains issue #11 |
-| `reset-developer-install.ps1` | Reset developer installation state across services, processes, directories, and credentials | Developer machine reset only |
+| `reset-developer-install.ps1` | Return a developer machine to the "not installed" state for the `system_service` profile (issue #1375) | Developer machine reset only; not a product uninstall |
 
 Read `docs/release/WINDOWS_X64_RELEASE.md` before use. The canonical operator
 surface is `eliot.exe`; scripts do not create a parallel CLI or direct
 storage/process authority.
+
+### Developer reset (`install-pipeline.ps1 -Reset`, #1375)
+
+`install-pipeline.ps1 -Reset` runs `reset-developer-install.ps1` as step 0 and
+then exits 0, so the next normal install starts from a machine that is not
+installed. `install-pipeline.ps1 -Reset -Install` resets and then continues into
+step 4 and step 5. Both accept `-WhatIf`, which prints the exact same artifact
+list and mutates nothing. The reset targets the same root the pipeline installs
+into (`-Anchor`, default `C:\ProgramData`).
+
+```powershell
+# What the reset would find, without touching anything
+.\scripts\install-pipeline.ps1 -Reset -WhatIf
+
+# Return the machine to "not installed"
+.\scripts\install-pipeline.ps1 -Reset
+```
+
+The reset removes exactly these machine-level artifacts, each read out of current
+installation source rather than guessed:
+
+| Artifact | Owner evidence | Action |
+|---|---|---|
+| `EliotHost`, `EliotWatchdog` services | `crates/foundation/eliot-runtime-contracts/src/installation_activation.rs::InstallationScmRole::service_name`, `bins/eliot-watchdog/src/lib.rs::SERVICE_NAME` | `sc.exe stop`, `sc.exe delete`, then wait until `sc.exe query` reports the service absent |
+| EliotHost-to-EliotWatchdog service-object control grant | `crates/kernel/eliot-installation/src/scm_approval.rs` | Removed with the SCM service object by `sc.exe delete`; no separate ACL step exists |
+| Any process whose image is under `<Anchor>\Eliot` | staged roles in `crates/kernel/eliot-installation/src/package_planner.rs::REQUIRED_PACKAGE_ROLES` and `bins/eliot/src/source_bundle_materializer.rs::REQUIRED_ROLES` | Terminated, selected by image path so no process outside the installation root is targeted |
+| `<Anchor>\Eliot` installation root | `crates/kernel/eliot-installation/src/package_planner.rs` (`staging_root` must equal `profile_anchor_root\Eliot\packages`), `scripts/invoke-eliot-windows-x64-production.ps1::New-ProductionMaterializeContract` | Moved aside to `Eliot-reset-<UTC timestamp>`, never recursively deleted, so prior state stays inspectable |
+| Credential Manager targets `eliot/installer-root/v1/*` | `crates/kernel/eliot-installation/src/transaction.rs::InstallationSecretReference::validate` | `cmdkey /delete` |
+
+Deliberately never touched, with the reason:
+
+- `%LOCALAPPDATA%\Eliot` — the owner's live legacy ELIOT data, not part of the
+  `system_service` installation root.
+- `eliot/store/v1/*` credentials — the legacy Store target namespace
+  (`crates/kernel/eliot-installation/src/credential_provision.rs::validate_store_credential_target`).
+- Windows registry — no installation code path creates a registry key. Services
+  exist only as SCM objects (`crates/kernel/eliot-platform-windows/src/lib.rs::CreateServiceW`,
+  `::ChangeServiceConfig2W`) and are removed by `sc.exe delete`; the only registry
+  reads in the install path are the read-only Windows SDK kit-root lookups in
+  `scripts/build-eliot-windows-x64-release.ps1`.
+- Protected directories and file DACLs — they are created on paths inside the
+  installation root and travel with the moved directory.
+- Named pipes and the `EliotHost` Event Log source — kernel objects that vanish
+  with the process, and `crates/kernel/eliot-platform-windows/src/event_log.rs::report_local_event`
+  never registers an Event Log source.
+
+The reset is idempotent: on a clean machine it finds nothing, prints
+`RESET: nothing to reset (machine is clean)` and exits 0. If any artifact could
+not be returned to the absent state, that artifact is reported and the reset exits
+non-zero, so a partial reset is never mistaken for a clean machine. This is a
+developer-machine reset only. It is not the product uninstall lifecycle (I3.13)
+and it is not install rollback machinery for a broken first install (#1325 / T10,
+deferred to the production phase by owner decision 2026-09-14).
 
 ## Integration packaging and probes
 
