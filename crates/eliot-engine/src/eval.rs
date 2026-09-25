@@ -6,17 +6,18 @@ use eliot_types::{
     EvalComparisonVerdict, EvalComponentCoverage, EvalCoverageMatrix, EvalCoverageStatus,
     EvalCriterion, EvalDatasetManifest, EvalDatasetManifestId, EvalFamily, EvalFamilyCoverage,
     EvalFamilyDelta, EvalFamilyThreshold, EvalFamilyTrend, EvalFixtureChecksum,
-    EvalFixtureStabilityReport, EvalGateDecision, EvalGateDecisionKind, EvalMeasurementKind,
-    EvalMeasurementResult, EvalMeasurementSpec, EvalRegressionGateProfile, EvalRegressionSeverity,
-    EvalRiskCoverage, EvalRun, EvalRunId, EvalRunProfile, EvalRunStatus, EvalSuite, EvalSuiteId,
-    EvalTrendDirection, EvalTrendReport, EvalVerdict, EvalVerdictId, EvalVerdictStatus,
-    ExperimentalMetaPolicyCandidate, ExperimentalMetaPolicyPayload, ExperimentalMetaPolicyState,
-    HarnessExperimentRecord, HarnessExperimentRecordId, LifecycleStatus, MetaCandidateChangeClass,
-    MetaExperimentDecision, MetaIsolationFence, MetaIsolationRejectionRecord,
-    MetaPolicyAuthorization, MetaPolicyExecutionAction, MetaPolicyExecutionReceipt, ProjectId,
-    ReplayCaseStatus, ReplayRun, ReplayRunStatus, ReplaySetRole, ReplayThresholdPolicyV1,
-    SealedReplaySetRecord, SemanticCommand, TaintClass, TaskId, ToolObservationRecordCommand,
-    Visibility, WriteId, WriteReceiptRef,
+    EvalFixtureStabilityReport, EvalGateDecision, EvalGateDecisionKind,
+    EvalIntegrityFingerprintSet, EvalMeasurementKind, EvalMeasurementResult, EvalMeasurementSpec,
+    EvalRegressionGateProfile, EvalRegressionSeverity, EvalRiskCoverage, EvalRun, EvalRunId,
+    EvalRunProfile, EvalRunStatus, EvalSuite, EvalSuiteId, EvalTrendDirection, EvalTrendReport,
+    EvalVerdict, EvalVerdictId, EvalVerdictStatus, ExperimentalMetaPolicyCandidate,
+    ExperimentalMetaPolicyPayload, ExperimentalMetaPolicyState, HarnessExperimentRecord,
+    HarnessExperimentRecordId, LifecycleStatus, MetaCandidateChangeClass, MetaExperimentDecision,
+    MetaIsolationFence, MetaIsolationRejectionRecord, MetaPolicyAuthorization,
+    MetaPolicyExecutionAction, MetaPolicyExecutionReceipt, ProjectId, ReplayCaseStatus, ReplayRun,
+    ReplayRunStatus, ReplaySetRole, ReplayThresholdPolicyV1, SealedReplaySetRecord,
+    SemanticCommand, TaintClass, TaskId, ToolObservationRecordCommand, Visibility, WriteId,
+    WriteReceiptRef,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -901,6 +902,40 @@ pub struct EvalMeasurementService;
 const NOT_YET_IMPLEMENTED_OBSERVATION_PREFIX: &str = "not yet implemented:";
 const STRUCTURAL_ONLY_PROOF_CEILING: &str = "STRUCTURAL_ONLY";
 
+/// Current evaluator identity fingerprints (issue #1922 stale-marking basis).
+///
+/// Single source for the identity strings the receipt builder records:
+/// the builder and [`current_eval_fingerprints`] both read these
+/// constants, so any future identity change automatically stale-marks
+/// previously recorded fingerprint sets through
+/// [`EvalIntegrityFingerprintSet::is_stale_against`] instead of silently
+/// comparing across identities. `EVALUATOR_PATH` is compiler-provided
+/// (`module_path!`), so a module move re-identifies automatically;
+/// descriptive strings below it name review-verified behavior, not
+/// observed runtime effects.
+const HARNESS_FINGERPRINT: &str = "eliot-engine-eval-case-schema";
+const EVALUATOR_PATH: &str = concat!(module_path!(), "::EvalMeasurementService");
+const ENVIRONMENT_FINGERPRINT: &str = "not-captured:structural-evaluator-process";
+const ACTUAL_ROUTE: &str = concat!(module_path!(), "::evaluate_case");
+const REQUESTED_ROUTE: &str = "runtime artifact/effect observation";
+const ACCEPTANCE_RELATION: &str = "required criterion matches a measurement result";
+const ORACLE_OWNER: &str = concat!(module_path!(), "::EvalMeasurementService");
+
+/// Capture the current evaluator identity as a comparable set.
+/// Pure snapshot of the constants above; performs no observation and
+/// grants no validity.
+pub fn current_eval_fingerprints() -> EvalIntegrityFingerprintSet {
+    EvalIntegrityFingerprintSet {
+        harness_fingerprint: HARNESS_FINGERPRINT.to_owned(),
+        evaluator_fingerprint: EVALUATOR_PATH.to_owned(),
+        environment_fingerprint: ENVIRONMENT_FINGERPRINT.to_owned(),
+        actual_route: ACTUAL_ROUTE.to_owned(),
+        requested_route: REQUESTED_ROUTE.to_owned(),
+        acceptance_relation: ACCEPTANCE_RELATION.to_owned(),
+        oracle_owner: ORACLE_OWNER.to_owned(),
+    }
+}
+
 impl EvalMeasurementService {
     pub fn evaluate_case(case: &EvalCase) -> EvalCaseResult {
         let measurements = case
@@ -956,6 +991,7 @@ impl EvalMeasurementService {
             produced_refs: vec![format!("eval:{}:report", family_slug(case.family))],
             errors,
             duration_ms: 0,
+            integrity_fingerprints: Some(current_eval_fingerprints()),
         }
     }
 
@@ -1003,17 +1039,20 @@ impl EvalMeasurementService {
                 checksum_text(&receipt_binding)
             ),
             property: case.description.clone(),
-            product_identity: "eliot-memory-os/eliot-engine-eval".to_owned(),
-            oracle_owner: "eliot-engine::EvalMeasurementService".to_owned(),
-            acceptance_relation: "required criterion matches a measurement result".to_owned(),
+            product_identity: format!(
+                "eliot-memory-os/eliot-engine-eval:product:{}",
+                case.project_id
+            ),
+            oracle_owner: ORACLE_OWNER.to_owned(),
+            acceptance_relation: ACCEPTANCE_RELATION.to_owned(),
             task_subset: vec![case.eval_case_id.to_string()],
             sampling_procedure: "single declared case; no runtime sampling or replicate unit"
                 .to_owned(),
             model_fingerprint: "not-applicable:no-model-invocation".to_owned(),
-            harness_fingerprint: "eliot-engine-eval-case-schema".to_owned(),
+            harness_fingerprint: HARNESS_FINGERPRINT.to_owned(),
             tools_fingerprint: "not-applicable:no-runtime-tools".to_owned(),
-            evaluator_fingerprint: "eliot-engine::EvalMeasurementService".to_owned(),
-            environment_fingerprint: "not-captured:structural-evaluator-process".to_owned(),
+            evaluator_fingerprint: EVALUATOR_PATH.to_owned(),
+            environment_fingerprint: ENVIRONMENT_FINGERPRINT.to_owned(),
             budget_fingerprint: format!(
                 "declared:max_runtime_ms={};max_input_tokens={};max_output_tokens={};max_tool_calls={}",
                 case.budget.max_runtime_ms,
@@ -1077,8 +1116,8 @@ impl EvalMeasurementService {
             false_fail_evidence: vec![
                 "not measured: no known-valid/known-invalid runtime set".to_owned(),
             ],
-            actual_route: "eliot-engine::EvalMeasurementService::evaluate_case".to_owned(),
-            requested_route: "runtime artifact/effect observation".to_owned(),
+            actual_route: ACTUAL_ROUTE.to_owned(),
+            requested_route: REQUESTED_ROUTE.to_owned(),
             resource_fingerprint: "not-captured:no runtime execution".to_owned(),
             oracle_dependencies: vec![
                 "case-declared expectations".to_owned(),
@@ -1104,6 +1143,29 @@ impl EvalMeasurementService {
     }
 
     pub fn measure(_case: &EvalCase, spec: &EvalMeasurementSpec) -> EvalMeasurementResult {
+        // Structural self-check with a real observation (issue #1922):
+        // MustBlockAction carries the action under test in
+        // `expected_ref` (see the `block()` fixture constructor) and the
+        // runner owns the production block gate, so the measurement
+        // observes the gate's actual decision instead of matching a
+        // declaration. Every other kind lacks a reachable runtime input
+        // (no artifact, registry, or suite/manifest in scope) and stays
+        // honestly NotYetImplemented; the integrity gate below keeps the
+        // case NYI regardless until measured validity exists.
+        if spec.kind == EvalMeasurementKind::MustBlockAction
+            && let Some(action) = spec.expected_ref.as_deref()
+        {
+            let blocked = EvalRunnerService::mutation_attempt_blocked(action);
+            return EvalMeasurementResult {
+                measurement_id: spec.measurement_id.clone(),
+                passed: blocked,
+                observed: format!(
+                    "structural self-check: runner gate {} action {action:?}",
+                    if blocked { "blocked" } else { "permitted" },
+                ),
+                evidence_refs: Vec::new(),
+            };
+        }
         let (passed, observed, evidence_refs) = match spec.kind {
             EvalMeasurementKind::MustIncludeEvidence
             | EvalMeasurementKind::MustExcludeEvidence
@@ -1320,6 +1382,22 @@ impl EvalBaselineService {
         git_commit: &str,
         approved_by: &str,
     ) -> EvalBaseline {
+        // Retain the run's evaluator identity only on unanimous observation
+        // (issue #1922): `Some` exactly when every case result carries one
+        // identical retained set. Empty, mixed, or partially unretained runs
+        // yield `None` (unknown provenance), which comparison treats as
+        // non-evidence. No inference across differing identities.
+        let mut retained = run
+            .case_results
+            .iter()
+            .filter_map(|result| result.integrity_fingerprints.as_ref());
+        let first = retained.next();
+        let integrity_fingerprints = match first {
+            Some(set) if !run.case_results.is_empty() && retained.all(|other| other == set) => {
+                Some(set.clone())
+            }
+            _ => None,
+        };
         EvalBaseline {
             baseline_id: format!("eval-baseline-{}", WriteId::new_v7()),
             suite_id: suite.eval_suite_id.to_string(),
@@ -1330,6 +1408,7 @@ impl EvalBaselineService {
             overall_status: verdict.status,
             approved_at: OffsetDateTime::now_utc(),
             approved_by: approved_by.to_owned(),
+            integrity_fingerprints,
         }
     }
 }
@@ -1380,7 +1459,30 @@ impl EvalComparisonService {
             })
             .map(|result| result.eval_case_id.to_string())
             .collect::<Vec<_>>();
-        let verdict = comparison_verdict(&family_deltas, candidate_run.status);
+        let verdict = {
+            // Automatic stale invalidation (issue #1922): a candidate run
+            // whose retained fingerprint sets predate current evaluator
+            // identity — or predate retention entirely (unknown
+            // provenance is non-evidence per contract) — cannot support a
+            // fresh comparison verdict, so the comparison is Inconclusive
+            // and gates block it unless they allow inconclusive. Fresh
+            // runs always carry current fingerprints and flow unchanged;
+            // the baseline side's unanimously retained set is not yet
+            // compared here, so baseline-side staleness remains a
+            // documented future interface.
+            let current = current_eval_fingerprints();
+            let stale_inputs = candidate_run.case_results.iter().any(|result| {
+                match &result.integrity_fingerprints {
+                    None => true,
+                    Some(recorded) => recorded.is_stale_against(&current),
+                }
+            });
+            if stale_inputs {
+                EvalComparisonVerdict::Inconclusive
+            } else {
+                comparison_verdict(&family_deltas, candidate_run.status)
+            }
+        };
         EvalCandidateComparison {
             comparison_id: format!("eval-comparison-{}", WriteId::new_v7()),
             suite_id: suite.eval_suite_id.to_string(),

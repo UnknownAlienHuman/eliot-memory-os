@@ -170,6 +170,27 @@ pub enum EvalRunStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+<<<<pub struct EvalIntegrityFingerprintSet {
+    pub harness_fingerprint: String,
+    pub evaluator_fingerprint: String,
+    pub environment_fingerprint: String,
+    pub actual_route: String,
+    pub requested_route: String,
+    pub acceptance_relation: String,
+    pub oracle_owner: String,
+}
+
+impl EvalIntegrityFingerprintSet {
+    /// True when any recorded fingerprint differs from current identity.
+    /// Exact string equality; no normalization, no partial credit. A
+    /// mismatch means the recorded result predates current evaluator
+    /// identity and must be treated as stale, never as fresh evidence.
+    pub fn is_stale_against(&self, current: &Self) -> bool {
+        self != current
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvalCaseResult {
     pub result_id: String,
@@ -180,6 +201,13 @@ pub struct EvalCaseResult {
     pub produced_refs: Vec<String>,
     pub errors: Vec<String>,
     pub duration_ms: u64,
+    /// Integrity fingerprints recorded when this result was produced.
+    /// `None` for results predating fingerprint retention: unknown, never
+    /// a freshness claim and never stale-proven. Compared against current
+    /// evaluator identity by consumers to mark stale results; retention
+    /// alone never grants measured validity.
+    #[serde(default)]
+    pub integrity_fingerprints: Option<EvalIntegrityFingerprintSet>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -557,6 +585,13 @@ pub struct EvalBaseline {
     #[serde(with = "time::serde::rfc3339")]
     pub approved_at: OffsetDateTime,
     pub approved_by: String,
+    /// Retained evaluator identity for the run this baseline approves, when
+    /// every contributing case result carries one identical set. `None`
+    /// means unknown provenance (pre-retention baselines, empty or mixed
+    /// runs) and is non-evidence downstream. Additive optional field per
+    /// I5.22: old payloads parse with `None`; no existing field changes.
+    #[serde(default)]
+    pub integrity_fingerprints: Option<EvalIntegrityFingerprintSet>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
