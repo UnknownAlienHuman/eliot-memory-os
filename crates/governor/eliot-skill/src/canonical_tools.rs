@@ -50,8 +50,8 @@
 use std::collections::BTreeMap;
 
 use eliot_skills::{
-    MaterializationPorts, MaterializationScope, MissingVerificationProvider, ReadinessClaims,
-    SkillPackage,
+    MaterializationPorts, MaterializationScope, MissingVerificationProvider,
+    PortableSkillPackageCandidate, ReadinessClaims, SkillPackage,
 };
 
 use super::{SkillError, install_package};
@@ -282,6 +282,46 @@ pub fn sealed_materialization_check(
     }
 }
 ///
+/// Cross-checks provider availability names against the live tool source.
+///
+/// The sealed observation mirror proves the provider marked every required
+/// tool and capability available at its exact version, but the claims
+/// themselves arrive from the injector lane. This predicate binds the name
+/// dimension to current owner state: every available observation must
+/// resolve through the caller-supplied tool-owner view (in production the
+/// version-bound projection over the live canonical source), so a claim for
+/// a tool the registry never admitted fails closed here instead of flowing
+/// to receipt issuance. Availability truth itself stays with the sealed
+/// owner ports and is never inferred from membership; unknown or
+/// unavailable observations fail in the mirror, never here.
+pub fn readiness_names_known_to_source(
+    readiness: &ReadinessClaims,
+    tools: &dyn KnownTools,
+) -> Result<(), SkillError> {
+    use eliot_skills::Availability;
+
+    fn known(
+        tools: &dyn KnownTools,
+        observations: &[eliot_skills::VersionedObservation],
+    ) -> Result<(), SkillError> {
+        for observation in observations {
+            if !matches!(observation.availability, Availability::Available { .. }) {
+                continue;
+            }
+            if !tools.knows_tool(&observation.name) {
+                return Err(SkillError::InvalidField {
+                    field: "readiness.observation.name",
+                    reason: "an available observation names a tool the owner does not admit",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    known(tools, &readiness.tools)?;
+    known(tools, &readiness.capabilities)?;
+    Ok(())
+}
 /// Installs one canonical package source under the versioned canonical view.
 ///
 /// Fails closed unless the source binds exactly the definition version the
@@ -290,11 +330,19 @@ pub fn sealed_materialization_check(
 /// change on the tool-owner side therefore blocks installation until the
 /// composition re-admits — the invalidation half of the frozen consumer rule
 /// ("any profile-version edit invalidates dependents before Material reuse")
-/// applied at the install boundary. On agreement, projects and inserts
-/// through [`install_package`] with the [`VersionBoundTools`] projection, so
-/// install, delivery, and activation all share one versioned membership.
+/// applied at the install boundary. On agreement, binds the presented
+/// materialization to its exact accepted candidate and then projects and
+/// inserts through [`install_package`] with the [`VersionBoundTools`]
+/// projection, so install, delivery, and activation all share one versioned
+/// membership.
+// The install boundary carries every owner term explicitly (catalogue,
+// candidate, package, inputs, context, source, aliases, admitted version)
+// so no authority term hides inside a bundle; the arity lint is allowed for
+// this boundary function.
+#[allow(clippy::too_many_arguments)]
 pub fn install_package_versioned(
     catalogue: &mut SkillCatalogue,
+    candidate: &PortableSkillPackageCandidate,
     package: &SkillPackage,
     inputs: &MaterializationInputs,
     context: &CatalogueInstallContext,
@@ -315,7 +363,7 @@ pub fn install_package_versioned(
         });
     }
     let tools = VersionBoundTools::new(source, aliases);
-    install_package(catalogue, package, inputs, context, &tools)
+    install_package(catalogue, candidate, package, inputs, context, &tools)
 }
 
 #[cfg(test)]
@@ -324,10 +372,9 @@ mod tests {
     use super::*;
     use eliot_skills::{
         AdvisoryRuleClaim, Availability, AvailabilityField, CapabilityVersion, ConflictState,
-        DeliveryProjection, DependencyMaterial, DistractorState, FreshnessState, HostLimits,
-        HostProfile, LifecycleProposal, QuarantineState, SkillBehavior, SkillCounters,
-        SkillInteractionProjection, SkillState, ToolDefinitionMaterial, VersionedObservation,
-        VersionedRequirement,
+        DeliveryProjection, DependencyMaterial, DistractorState, FreshnessState, LifecycleProposal,
+        QuarantineState, SkillBehavior, SkillCounters, SkillInteractionProjection, SkillState,
+        ToolDefinitionMaterial, VersionedObservation, VersionedRequirement,
     };
 
     /// Boundary double implementing the OWNED port. It is test scaffolding,
@@ -405,6 +452,14 @@ mod tests {
     }
 
     fn fixture_package() -> (SkillPackage, MaterializationInputs) {
+        // Behavior and host are the accepted candidate's own: the mapper
+        // derives them from the definition and target below, so the binding
+        // the versioned install path enforces holds by construction here.
+        // The stamped install candidate comes from `fixture_candidate`.
+        let candidate = crate::install::candidate_fixture::candidate_for(
+            candidate_definition(),
+            candidate_target(),
+        );
         let material = inputs();
         let package = SkillPackage {
             registration: eliot_skills::RegistrationIdentity::new(
@@ -414,24 +469,8 @@ mod tests {
             )
             .expect("valid test registration"),
             digests: eliot_skills::PackageDigests::derive(&material).expect("valid test inputs"),
-            host: HostProfile {
-                host: "codex".to_owned(),
-                profile: "default".to_owned(),
-                required_tools: vec![VersionedRequirement {
-                    name: "eliot.state".to_owned(),
-                    version: "2.5.1".to_owned(),
-                }],
-                required_capabilities: vec![VersionedRequirement {
-                    name: "eliot.query".to_owned(),
-                    version: "7".to_owned(),
-                }],
-                limits: HostLimits {
-                    max_description_chars: 500,
-                    max_actions: 1,
-                    max_expansion_handles: 2,
-                },
-            },
-            behavior: behavior(),
+            host: candidate.host.clone(),
+            behavior: candidate.behavior.clone(),
             counters: SkillCounters::default(),
             state: SkillState {
                 freshness: FreshnessState::Current,
@@ -448,6 +487,63 @@ mod tests {
             .validate(&material)
             .expect("fixture package validates");
         (package, material)
+    }
+
+    /// Mirrors [`behavior`] as the accepted procedure definition the
+    /// versioned-install fixtures bind against.
+    fn candidate_definition() -> eliot_skills::ProcedureDefinition {
+        eliot_skills::ProcedureDefinition {
+            name: "orientation skill".to_owned(),
+            purpose: "orient before acting".to_owned(),
+            trigger: "when orientation is required load this skill".to_owned(),
+            action: "run eliot.query".to_owned(),
+            applies_when: vec!["the task needs orientation".to_owned()],
+            where_not_apply: vec!["the host is unsupported".to_owned()],
+            required_inputs: vec!["the exact task".to_owned()],
+            ordered_steps: vec!["run eliot.query".to_owned()],
+            expected_outputs: vec!["orientation".to_owned()],
+            stop_conditions: vec!["stop on stale material".to_owned()],
+            required_writebacks: vec!["NONE".to_owned()],
+            escalation: "report PLAN_GAP".to_owned(),
+            challenge: "show exact conflicting identities".to_owned(),
+            rollback_or_recovery: "restore the prior revision".to_owned(),
+            required_tools: vec![VersionedRequirement {
+                name: "eliot.state".to_owned(),
+                version: "2.5.1".to_owned(),
+            }],
+            required_capabilities: vec![VersionedRequirement {
+                name: "eliot.query".to_owned(),
+                version: "7".to_owned(),
+            }],
+        }
+    }
+
+    fn candidate_target() -> eliot_skills::TargetProfile {
+        eliot_skills::TargetProfile {
+            target_id: "candidate-target".to_owned(),
+            host: "codex".to_owned(),
+            profile: "default".to_owned(),
+            fingerprint: "2".repeat(64),
+            available_tools: vec![VersionedRequirement {
+                name: "eliot.state".to_owned(),
+                version: "2.5.1".to_owned(),
+            }],
+            available_capabilities: vec![VersionedRequirement {
+                name: "eliot.query".to_owned(),
+                version: "7".to_owned(),
+            }],
+        }
+    }
+
+    fn fixture_candidate() -> eliot_skills::PortableSkillPackageCandidate {
+        // The producer stamps the exact materialized digests: the versioned
+        // install path never sees an unstamped candidate.
+        let (package, material) = fixture_package();
+        let raw = crate::install::candidate_fixture::candidate_for(
+            candidate_definition(),
+            candidate_target(),
+        );
+        crate::stamp_materialization_digests(&raw, &package, &material).expect("fixture stamps")
     }
 
     fn context() -> CatalogueInstallContext {
@@ -552,6 +648,7 @@ mod tests {
         let mut catalogue = SkillCatalogue::default();
         let installed = install_package_versioned(
             &mut catalogue,
+            &fixture_candidate(),
             &package,
             &material,
             &context(),
@@ -566,11 +663,13 @@ mod tests {
     #[test]
     fn versioned_install_refuses_drifted_and_blank_admissions() {
         let (package, material) = fixture_package();
+        let candidate = fixture_candidate();
         let stale = source("9.9.9");
         let aliases = ToolAliasTable::new();
         let mut catalogue = SkillCatalogue::default();
         let refused = install_package_versioned(
             &mut catalogue,
+            &candidate,
             &package,
             &material,
             &context(),
@@ -587,6 +686,7 @@ mod tests {
         let current = source("1.2.0");
         let blank = install_package_versioned(
             &mut catalogue,
+            &candidate,
             &package,
             &material,
             &context(),
@@ -605,6 +705,7 @@ mod tests {
     #[test]
     fn versioned_install_refuses_tools_absent_from_the_source() {
         let (package, material) = fixture_package();
+        let candidate = fixture_candidate();
         let empty = ProofSource {
             version: "1.2.0".to_owned(),
             known: Vec::new(),
@@ -613,6 +714,7 @@ mod tests {
         let mut catalogue = SkillCatalogue::default();
         let refused = install_package_versioned(
             &mut catalogue,
+            &candidate,
             &package,
             &material,
             &context(),

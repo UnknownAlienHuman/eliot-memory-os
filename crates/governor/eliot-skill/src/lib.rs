@@ -27,23 +27,32 @@ pub use catalogue::*;
 pub mod canonical_tools;
 pub use canonical_tools::{
     CanonicalToolSource, ToolAliasTable, VersionBoundTools, install_package_versioned,
-    readiness_available_for_package, sealed_materialization_check,
+    readiness_available_for_package, readiness_names_known_to_source, sealed_materialization_check,
 };
 pub mod install;
-pub use install::{CatalogueInstallContext, install_package, project_package_to_entry};
+pub use install::{
+    CatalogueInstallContext, check_lifecycle_standing, install_package, project_package_to_entry,
+    stamp_materialization_digests, validate_candidate_materialization,
+};
 
 /// Canonical package-source types consumed at the installation boundary.
 ///
 /// Re-exported so the composition owner calls
-/// [`install_package`] without taking a second surface dependency; the types
-/// stay canonical (no duplicates, no bridges).
+/// [`install_package`] and drives the accepted-candidate chain without taking
+/// a second surface dependency; the types stay canonical (no duplicates, no
+/// bridges). This includes the governed-procedure projection surface the
+/// daemon rehydrates before install.
 pub use eliot_skills::{
     AdvisoryRuleClaim, Availability, AvailabilityField, CapabilityVersion, ConflictState,
-    DeliveryProjection, DependencyMaterial, DistractorState, FreshnessState, HostLimits,
-    HostProfile, LifecycleProposal, MaterializationInputs, MaterializationScope, PackageDigests,
-    QuarantineState, ReadinessClaims, RegistrationIdentity, SkillBehavior, SkillCounters,
-    SkillInteractionProjection, SkillPackage, SkillState, ToolDefinitionMaterial, UnavailableCode,
-    VersionedObservation, VersionedRequirement,
+    DeliveryProjection, DependencyMaterial, DistractorState, FreshnessState,
+    GOVERNED_PROCEDURE_PROJECTION_SCHEMA_VERSION, GovernedProcedureProjection, HostLimits,
+    HostProfile, InertAsset, LifecycleProposal, MaterializationInputs, MaterializationScope,
+    PackageDigests, PortableSkillPackageCandidate, ProcedureDefinition, ProcedureEvidence,
+    ProcedureState, ProcedureVerifier, QuarantineState, ReadinessClaims, ReceiptClaim,
+    RegistrationIdentity, SafetyPrivacyDisclosure, SkillBehavior, SkillCounters,
+    SkillInteractionProjection, SkillPackage, SkillState, TargetProfile, ToolDefinitionMaterial,
+    UnavailableCode, VersionedObservation, VersionedRequirement,
+    project_governed_procedure_to_portable_skill_candidates,
 };
 
 pub const CONTRACT_NAME: &str = "eliot.governor.skill";
