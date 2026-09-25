@@ -968,13 +968,14 @@ async fn dispatch_tool_with_recall_scope(
             // request below takes ownership of `input.scope`.
             let receipt_scope = input.scope.clone().unwrap_or_default();
             let requested_limit = input.limit;
+            let lifecycle_audit = input.lifecycle_audit;
             let response = ReadService::new(state.store.clone())
                 .recall_l0(&RecallL0Request {
                     project_id: parse_project_id(&input.project_id)?,
                     query: input.query,
                     consistency: ReadConsistencyMode::Latest,
                     at_least_revision: None,
-                    lifecycle_audit: input.lifecycle_audit,
+                    lifecycle_audit,
                     task_id: context.bound_task_id,
                     task_class_cues: input.task_class_cues,
                     scope_refs: input.scope.into_iter().collect(),
@@ -985,11 +986,24 @@ async fn dispatch_tool_with_recall_scope(
             // has been bounded to the handles that can actually be delivered.
             // Retrieval coverage is captured before that output bound; a
             // caller-requested limit is not a claim that the corpus scan was
-            // incomplete. This L0 owner has no authoritative corpus-cardinality
-            // or conflict-blocking observation, so both remain unavailable and
-            // the typed derivation fails closed to INCOMPLETE_COVERAGE rather
-            // than manufacturing false observations.
-            let coverage_complete = !response.truncation.truncated;
+            // incomplete.
+            let corpus_scan_truncated = response.truncation.truncated;
+            let coverage_complete = !corpus_scan_truncated;
+            // Corpus cardinality, observed rather than assumed. The
+            // lifecycle-audit route is the only route that scans the
+            // project's complete recall candidate set with no query filter,
+            // so it is the only route where this owner holds authoritative
+            // cardinality evidence: an untruncated scan that considered zero
+            // candidates proves the corpus holds no records, and any
+            // considered candidate proves it is not empty. The default route
+            // loads query-matched candidates only, so an empty result set
+            // there is evidence of no match and not of an empty corpus; that
+            // observation stays unavailable instead of being coerced.
+            let corpus_empty = if lifecycle_audit && !corpus_scan_truncated {
+                Some(response.rank_trace.candidates_considered == 0)
+            } else {
+                None
+            };
             // Opaque read-fence token for the retained legacy facade. The
             // canonical current State Fence remains an owner-supplied residual;
             // this token is not presented as a new authority source.
@@ -1000,12 +1014,20 @@ async fn dispatch_tool_with_recall_scope(
             );
             let response =
                 bound_recall_response_for_agent(response, requested_limit, expected_recall_handles);
+            // Conflict state stays unavailable: `RecallL0Response` carries no
+            // corpus-level conflict observation. The store's per-record
+            // contradiction signal is consumed as a ranking penalty at the
+            // store ranking boundary and is never projected onto the response,
+            // so this owner cannot observe whether conflicting evidence blocked
+            // admission. The typed derivation therefore keeps failing closed to
+            // INCOMPLETE_COVERAGE for that missing fact instead of manufacturing
+            // a false observation from a path that never inspected conflict.
             let verdict =
                 eliot_types::ServerRecallVerdict::issue_for_l0_response_with_observations(
                     &response,
                     &receipt_scope,
                     &state_fence,
-                    None,
+                    corpus_empty,
                     coverage_complete,
                     None,
                 )
