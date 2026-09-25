@@ -30,9 +30,7 @@ use eliotd::startup_capability_bindings::{
     DeclaredStartupCapability, RetainedStartupBinding, StartupBindingDisposition,
     StartupCapabilityBindings,
 };
-use eliotd::startup_readiness::{
-    CapabilityRefresh, CapabilityRefreshOutcome, StartupReadinessProjection, StartupRefreshReason,
-};
+use eliotd::startup_readiness::StartupReadinessProjection;
 use eliotd::testd_terminal_completion::{
     TestdOwnerDrainOutcome, ack_testd_owner_terminal_completion,
     bind_testd_owner_verifier_dispatch, emit_testd_owner_drain_skip,
@@ -477,45 +475,28 @@ pub(super) fn run() -> Result<(), String> {
     // how many optional descriptors are present. `DaemonStatus` keeps its exact
     // wire shape.
     let composition_status = composition.status();
-    let core_readiness = startup_readiness.core_readiness_prerequisites_satisfied();
-    let degraded_capabilities = startup_readiness.degraded_capabilities();
-    let capability_degraded = !degraded_capabilities.is_empty();
-    let ready = composition_status.ready && core_readiness.is_satisfied();
-    let degraded = composition_status.degraded
-        || !core_readiness.is_satisfied()
-        || capability_degraded
-        || capability_summary.has_restrictions();
-    // The composition's own health ladder is preserved exactly: a stopped or
-    // stale composition still reports that, and a ready generation is only
-    // reported healthy when no optional capability is degraded.
-    let health = if composition_status.health == "stopped"
-        || composition_status.health == "stale"
-        || (ready && !capability_degraded)
-    {
-        composition_status.health.clone()
-    } else {
-        "degraded".to_owned()
-    };
+    // #2560: core control readiness is the composition's own owner state plus
+    // the mandatory capability set; optional availability is a separate, visible
+    // fact. A ready generation with a degraded optional capability reports ready
+    // with degraded health and the exact per-slot reason, while a missing owner
+    // session, a stale view or unresolved recovery still withholds ready and
+    // effects however many optional descriptors are present. `DaemonStatus` keeps
+    // its exact wire shape.
+    let readiness = eliotd::startup_readiness::evaluate_startup_readiness(
+        &startup_readiness,
+        &composition_status,
+        capability_summary.has_restrictions(),
+    );
+    // #2560: the same evaluation that produced the ready/degraded record reaches
+    // diagnostics, so stdout, diagnostics and dispatch cannot disagree.
+    eliotd::startup_readiness::emit_startup_readiness_record(&startup_readiness, &readiness);
     let status = DaemonStatus {
-        ready,
-        degraded,
-        health,
+        ready: readiness.ready,
+        degraded: readiness.degraded,
+        health: readiness.health,
         ..composition_status
     };
-    let _ = eliotd::diagnostics::emit_daemon_readiness(ready, degraded);
-    // #2560: the same evaluation that produced the ready/degraded record above
-    // reaches diagnostics, so stdout, diagnostics and dispatch cannot disagree.
-    // Every declared slot is shown with its mandatory flag, its exact retained
-    // binding or exact reason, its current availability and any prior failure.
-    tracing::info!(
-        target: "eliotd::diagnostics",
-        event = "eliotd.startup_readiness",
-        core_ready = ready,
-        core_satisfied = core_readiness.is_satisfied(),
-        capability_degraded,
-        slots_accounted = startup_readiness.all_slots_accounted_for().is_accounted(),
-        readiness = %startup_readiness.report(),
-    );
+    let _ = eliotd::diagnostics::emit_daemon_readiness(status.ready, status.degraded);
     write_json(&ready_message(&status))?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1092,7 +1073,7 @@ async fn run_loop(
                 )?;
             }
             local_read_completion = next_local_read_completion(&mut local_read_flight) => {
-                settle_local_read_completion(
+                settle_local_read_completion_updating_readiness(
                     local_read_completion,
                     &mut local_read_flight,
                     &mut startup_readiness,
@@ -1343,6 +1324,7 @@ async fn run_health_heartbeat_tick(
     // supervision submit below uses, so the `idle` gate stays consistent with
     // what this tick actually did.
     let activation_in_flight = matches!(flight, ActivationFlight::InFlight(_));
+    let readiness_verdict;
     {
         let guard = composition.lock().await;
         // #2560: re-read the composition's own owner facts once per heartbeat.
@@ -1352,6 +1334,11 @@ async fn run_health_heartbeat_tick(
         // generation/epoch, so a proof admitted at an earlier generation reads
         // as unavailable instead of staying usable because it was retained.
         startup_readiness.observe_owner(&guard);
+        readiness_verdict = eliotd::startup_readiness::evaluate_startup_readiness(
+            startup_readiness,
+            &guard.status(),
+            false,
+        );
         note_maintenance_trigger_at(
             &guard,
             MaintenanceTriggerOrigin::AdmittedObservation,
@@ -1367,13 +1354,11 @@ async fn run_health_heartbeat_tick(
     // prerequisite is missing or an optional capability is degraded. A fully
     // healthy generation stays quiet rather than re-recording itself every
     // heartbeat: this is a change report, not a poll of every optional provider.
-    let core_readiness = startup_readiness.core_readiness_prerequisites_satisfied();
-    if !core_readiness.is_satisfied() || !startup_readiness.degraded_capabilities().is_empty() {
+    if !readiness_verdict.core_satisfied() || readiness_verdict.capability_degraded {
         tracing::info!(
             target: "eliotd::diagnostics",
             event = "eliotd.startup_readiness_heartbeat",
-            core_satisfied = core_readiness.is_satisfied(),
-            slots_accounted = startup_readiness.all_slots_accounted_for().is_accounted(),
+            core_satisfied = readiness_verdict.core_satisfied(),
             readiness = %startup_readiness.report(),
         );
     }
@@ -1598,9 +1583,11 @@ async fn drain_flights_on_shutdown(
                 }
             }
             local_read_completion = next_local_read_completion(local_read_flight) => {
+                // #2560: the bounded shutdown drain owns no readiness state, so
+                // a capability-refused pair still settles here exactly like any
+                // other. The loop's projection is untouched by this path.
                 settle_local_read_completion(local_read_completion, local_read_flight)?;
-            }
-            testd_owner_completion = next_testd_owner_completion(testd_owner_flight) => {
+            }            testd_owner_completion = next_testd_owner_completion(testd_owner_flight) => {
                 settle_testd_owner_completion(testd_owner_completion, testd_owner_flight)?;
             }
             owner_feed_trigger = next_owner_feed_completion(owner_feed_flight) => {
@@ -1796,13 +1783,9 @@ async fn next_local_read_completion(flight: &mut LocalReadFlight) -> LocalReadCo
 fn settle_local_read_completion(
     completion: LocalReadCompletion,
     flight: &mut LocalReadFlight,
-    startup_readiness: &mut StartupReadinessProjection,
 ) -> Result<(), String> {
     match completion {
         LocalReadCompletion::Settled(Ok(step)) => {
-            // #2560: take the projection back, so any demand-driven
-            // re-evaluation the step performed becomes the loop's state.
-            *startup_readiness = step.readiness;
             // The poll outcome itself stays what it always was — a settle
             // signal, not a decision — but it is named rather than dropped, so
             // a capability refusal is distinguishable from an ordinary accept
@@ -1811,13 +1794,31 @@ fn settle_local_read_completion(
                 target: "eliotd::diagnostics",
                 event = "eliotd.local_read_settled",
                 outcome = local_read_outcome_name(&step.outcome),
-                readiness = %startup_readiness.report(),
+                readiness = %step.readiness.report(),
             );
             *flight = LocalReadFlight::Idle;
             Ok(())
         }
         LocalReadCompletion::Settled(Err(error)) => Err(error),
     }
+}
+
+/// Settles one completed local-read poll step and takes the readiness snapshot
+/// the step borrowed back into the run loop's single authoritative projection.
+///
+/// Same settle contract as [`settle_local_read_completion`]; the only difference
+/// is that a demand-driven capability re-evaluation the step performed becomes
+/// the loop's state instead of being dropped with the step.
+fn settle_local_read_completion_updating_readiness(
+    completion: LocalReadCompletion,
+    flight: &mut LocalReadFlight,
+    startup_readiness: &mut StartupReadinessProjection,
+) -> Result<(), String> {
+    let LocalReadCompletion::Settled(Ok(step)) = &completion else {
+        return settle_local_read_completion(completion, flight);
+    };
+    *startup_readiness = step.readiness.clone();
+    settle_local_read_completion(completion, flight)
 }
 
 /// Names one settled local-read poll outcome for the loop's own record.
@@ -1927,73 +1928,28 @@ async fn run_local_read_poll(
 /// Re-evaluates the Skill startup capabilities this demand names, and returns
 /// the exact refusal when one of them is still unavailable afterwards (#2560).
 ///
-/// This is the demand-driven half of the updateable projection: an admitted
-/// Skill request is the real event that makes one slot worth reevaluating, so
-/// only that slot is touched. It re-runs the owning attach — the same
-/// `attach_skill_tool_source` the startup path used, which proves the live
-/// canonical tools-owner edge and installs, issues and displays nothing — and
-/// files the owner's own outcome through
-/// [`StartupReadinessProjection::reevaluate_capability`]. Nothing here launches
-/// a model or a worker, and a slot that is already available is never
-/// re-evaluated, so the step performs no work on the healthy path.
+/// Thin seam over [`eliotd::startup_readiness::reevaluate_demanded_capability`]:
+/// the real owner attach is supplied here because this is the module that owns
+/// it, and the readiness module stays IO-free.
 fn skill_capability_refusal(startup_readiness: &mut StartupReadinessProjection) -> Option<String> {
-    let required = [
+    eliotd::startup_readiness::reevaluate_demanded_capability(
+        startup_readiness,
         DeclaredStartupCapability::SkillToolSource,
-        DeclaredStartupCapability::SkillToolBasis,
-    ];
-    let missing = startup_readiness
-        .capabilities_available_for_operation(&required)
-        .into_iter()
-        .find(|availability| !availability.is_available())?;
-    let capability = missing.capability();
-    if capability == DeclaredStartupCapability::SkillToolSource {
-        // The one slot this demand can actually re-evaluate: re-run the real
-        // owner attach and file exactly what it returned.
-        let observed = attach_skill_tool_source().map(|admitted_definition_version| {
-            RetainedStartupBinding::SkillToolSource {
-                admitted_definition_version,
-            }
-        });
-        let reason = observed.as_ref().err().cloned();
-        let outcome = startup_readiness.reevaluate_capability(CapabilityRefresh {
-            capability,
-            reason: StartupRefreshReason::CapabilityDemanded,
-            observed,
-        });
-        if matches!(outcome, CapabilityRefreshOutcome::Rebound { .. }) {
-            return skill_capability_refusal_after_rebind(startup_readiness, &required);
-        }
-        return Some(format!(
-            "startup capability {} is unavailable: {}",
-            capability.as_str(),
-            reason.unwrap_or_else(|| "owner attach did not bind".to_owned())
-        ));
-    }
-    Some(format!(
-        "startup capability {} is unavailable: {}",
-        capability.as_str(),
-        missing.refusal_reason().unwrap_or("no owner evidence")
-    ))
-}
-
-/// Re-reads the operation's availability once after a successful rebind.
-///
-/// The rebind above restored exactly one slot, so a second refusal here can
-/// only be the other slot of the same operation. Kept as its own function so
-/// the recursive call is a single reviewed edge rather than a loop.
-fn skill_capability_refusal_after_rebind(
-    startup_readiness: &StartupReadinessProjection,
-    required: &[DeclaredStartupCapability],
-) -> Option<String> {
-    let missing = startup_readiness
-        .capabilities_available_for_operation(required)
-        .into_iter()
-        .find(|availability| !availability.is_available())?;
-    Some(format!(
-        "startup capability {} is unavailable: {}",
-        missing.capability().as_str(),
-        missing.refusal_reason().unwrap_or("no owner evidence")
-    ))
+        || {
+            attach_skill_tool_source().map(|admitted_definition_version| {
+                RetainedStartupBinding::SkillToolSource {
+                    admitted_definition_version,
+                }
+            })
+        },
+    );
+    eliotd::startup_readiness::refuse_unavailable_capabilities(
+        startup_readiness,
+        &[
+            DeclaredStartupCapability::SkillToolSource,
+            DeclaredStartupCapability::SkillToolBasis,
+        ],
+    )
 }
 
 /// Submits one forwarded local-read result body, retrying once with the

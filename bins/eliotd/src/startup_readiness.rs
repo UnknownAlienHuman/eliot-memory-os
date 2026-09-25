@@ -702,6 +702,157 @@ impl StartupReadinessProjection {
     }
 }
 
+/// The readiness verdict one generation reports, in the exact terms
+/// `DaemonStatus` publishes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartupReadinessVerdict {
+    /// Whether this generation may report core control readiness.
+    pub ready: bool,
+    /// Whether normal admission is closed while the process stays observable.
+    pub degraded: bool,
+    /// The bounded health label. `DaemonStatus`'s own wire shape is unchanged.
+    pub health: String,
+    /// The core prerequisite verdict, with every unmet precondition named.
+    pub core: CoreReadiness,
+    /// Whether at least one optional capability is degraded.
+    pub capability_degraded: bool,
+}
+
+impl StartupReadinessVerdict {
+    /// Whether the mandatory core prerequisites hold.
+    #[must_use]
+    pub const fn core_satisfied(&self) -> bool {
+        self.core.is_satisfied()
+    }
+}
+
+/// Computes the reported readiness for one generation from actual owner state.
+///
+/// Core readiness is the composition's own readiness combined with the
+/// mandatory prerequisite verdict; optional availability never withholds it,
+/// only degrades it. A withheld core verdict is always also a degraded generation, so a
+/// process is never reported as healthy while refusing governed work. The
+/// composition's own health ladder is preserved exactly: a stopped or stale
+/// composition still reports that, and only a ready generation with no degraded
+/// optional capability is reported healthy.
+#[must_use]
+pub fn evaluate_startup_readiness(
+    projection: &StartupReadinessProjection,
+    composition_status: &crate::DaemonStatus,
+    capability_model_restricted: bool,
+) -> StartupReadinessVerdict {
+    let core = projection.core_readiness_prerequisites_satisfied();
+    let capability_degraded = !projection.degraded_capabilities().is_empty();
+    let ready = composition_status.ready && core.is_satisfied();
+    let degraded = composition_status.degraded
+        || !core.is_satisfied()
+        || capability_degraded
+        || capability_model_restricted;
+    let health = if composition_status.health == "stopped"
+        || composition_status.health == "stale"
+        || (ready && !capability_degraded)
+    {
+        composition_status.health.clone()
+    } else {
+        "degraded".to_owned()
+    };
+    StartupReadinessVerdict {
+        ready,
+        degraded,
+        health,
+        core,
+        capability_degraded,
+    }
+}
+
+/// Emits the bounded per-slot readiness record on the existing diagnostics sink.
+///
+/// The same evaluation that produced the published readiness reaches diagnostics
+/// here, so stdout, diagnostics and dispatch cannot disagree about which
+/// capability is degraded or why. Every declared slot is shown with its
+/// mandatory flag, its exact retained binding or exact reason, its current
+/// availability and any prior failure. No new transport, registry or service.
+pub fn emit_startup_readiness_record(
+    projection: &StartupReadinessProjection,
+    verdict: &StartupReadinessVerdict,
+) {
+    tracing::info!(
+        target: "eliotd::diagnostics",
+        event = "eliotd.startup_readiness",
+        core_ready = verdict.ready,
+        core_satisfied = verdict.core_satisfied(),
+        capability_degraded = verdict.capability_degraded,
+        slots_accounted = projection.all_slots_accounted_for().is_accounted(),
+        readiness = %projection.report(),
+    );
+}
+
+/// Re-evaluates exactly one declared capability from evidence an admitted
+/// demand produced, and reports what the reevaluation changed.
+///
+/// This is the demand-driven refresh an operation triggers: the operation names
+/// the capability it actually needs, the owning caller supplies the re-run of
+/// that capability's real attach, and the owner's own outcome is filed here.
+/// Only the named slot is touched, so a demand never sweeps every optional
+/// provider and never blocks on one it does not use.
+///
+/// `reattach` is called **only** when the slot is currently unavailable, so the
+/// healthy path performs no work at all and an available capability is never
+/// re-proved for an operation that already has it. This function performs no IO
+/// itself: the attach belongs to the owner, which is why it arrives as a closure
+/// rather than being called from here.
+pub fn reevaluate_demanded_capability<F>(
+    projection: &mut StartupReadinessProjection,
+    capability: DeclaredStartupCapability,
+    reattach: F,
+) -> CapabilityRefreshOutcome
+where
+    F: FnOnce() -> Result<RetainedStartupBinding, String>,
+{
+    if projection
+        .capability_available_for_operation(capability)
+        .is_available()
+    {
+        return CapabilityRefreshOutcome::Rebound {
+            previously_bound: true,
+        };
+    }
+    projection.reevaluate_capability(CapabilityRefresh {
+        capability,
+        reason: StartupRefreshReason::CapabilityDemanded,
+        observed: reattach(),
+    })
+}
+
+/// Returns the exact capability-specific refusal when any capability one
+/// operation names is still unavailable, and `None` when the operation may
+/// proceed.
+///
+/// This is the seam a dispatch path refuses on. It names the one missing
+/// capability with the owner's own fail-closed reason, so a dependent request is
+/// refused specifically and unrelated admitted requests keep running. An empty
+/// required set is a caller bug rather than a permit: it refuses.
+#[must_use]
+pub fn refuse_unavailable_capabilities(
+    projection: &StartupReadinessProjection,
+    required: &[DeclaredStartupCapability],
+) -> Option<String> {
+    if required.is_empty() {
+        return Some(
+            "operation named no startup capability to check, so it cannot be admitted".to_owned(),
+        );
+    }
+    let missing = projection
+        .capabilities_available_for_operation(required)
+        .into_iter()
+        .find(|availability| !availability.is_available())?;
+    Some(format!(
+        "startup capability {} is unavailable: {}",
+        missing.capability().as_str(),
+        missing.refusal_reason().unwrap_or("no owner evidence")
+    ))
+}
+
 /// Whether a declared slot's retained proof carries owner generation identity.
 ///
 /// The three that do are the two Dreamer route contexts and the agent-fabric
