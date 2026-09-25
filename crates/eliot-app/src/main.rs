@@ -2122,6 +2122,10 @@ async fn dispatch_command(
                 force,
             } => commands::run_daemon_init_default(config, &source_config, force),
             DaemonCommand::Run { instance } => {
+                // #1858 step 1': `daemon run` is the retained shared runtime for
+                // the hosts that have not cut over (codex/opencode/claude-desktop
+                // per #1719). The front-door gate intentionally does not cover it;
+                // refusing here would break those retained paths.
                 commands::run_daemon(
                     config,
                     selected_instance(instance, implicit_instance).as_deref(),
@@ -2439,7 +2443,12 @@ async fn dispatch_command(
         Command::Logs { command } => dispatch_logs_command(config, command),
         Command::Adapter { command } => dispatch_adapter_command(config, command).await,
         Command::Verifier { command } => dispatch_verifier_command(config, command).await,
-        Command::Hook { command } => dispatch_hook_command(config, command),
+        Command::Hook { command } => {
+            // #1858 step 1': hook arms are the retained plugin-lifecycle path.
+            // The front-door gate intentionally does not apply here; hook cutover
+            // is owned by #1719/#13. See front_door_cutover disposition docs.
+            dispatch_hook_command(config, command)
+        }
         Command::Mcp {
             command:
                 McpCommand::Stdio {

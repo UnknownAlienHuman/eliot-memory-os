@@ -27,6 +27,17 @@
 //! (disposition recorded in the release manifest by
 //! `scripts/build-eliot-windows-x64-release.ps1`).
 //!
+//! Explicit per-entrypoint disposition (FRONT DOOR step 1', owner scope):
+//! - `mcp stdio --host claude` with the flag set: refused here with
+//!   [`LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER`] plus the canonical-route receipt.
+//! - `mcp stdio --host codex|opencode|claude-desktop` (any flag value):
+//!   retained legacy path, owned by #1719 until each host's cutover.
+//! - `hook <event>` arms: retained plugin-lifecycle path, gate intentionally
+//!   not applied; hook cutover is owned by #1719/#13, not this module.
+//! - `daemon run`: retained shared runtime serving the not-yet-cut-over
+//!   hosts; refusing it here would break those retained paths, so the gate
+//!   intentionally does not cover it (see #1719).
+//!
 //! Wire receipt compatibility: the rejection object shape (`status`, `code`,
 //! `detail`, `canonical_route`, `completed`) and the canonical-route text
 //! match `bins/eliot/src/main.rs::write_legacy_governor_cutover_rejection`
