@@ -4907,6 +4907,14 @@ mod tests {
         assert_eq!(receipt.canonical_request_hash, recomputed);
         let before = store.snapshot()?;
         // Tamper one load-bearing byte (subject) while keeping the old claim.
+        // Ordering note (issue #63 vs #18): `apply_transaction` runs the
+        // structural/plan validation before the canonical recompute, so a
+        // tamper inside `named_operations` reports the mutation-plan digest
+        // here while a tamper outside plan coverage reports the canonical
+        // digest. Both cover the tampered bytes with the same typed kind,
+        // and the issue acceptance requires exactly that kind ("fails ...
+        // with a typed digest mismatch"), never a specific digest value —
+        // so either value satisfies the contract.
         let mut tampered = exact.clone();
         tampered.named_operations[0]
             .parameters
@@ -4915,14 +4923,28 @@ mod tests {
             .apply_transaction(&ctx, tampered, &[], &[])
             .expect_err("tampered bytes must fail");
         assert!(
-            matches!(
-                &err,
-                StoreError::TransitionDigestMismatch { expected, observed }
-                    if expected == &recomputed
-                        && observed
-                            != &recomputed
-            ),
+            matches!(&err, StoreError::TransitionDigestMismatch { .. }),
             "tamper must be TRANSITION_DIGEST_MISMATCH, got {err:?}"
+        );
+        assert_eq!(before, store.snapshot()?);
+        // Canonical-only tamper (outside mutation-plan coverage): a changed
+        // request id keeps every stored plan digest valid, so the plan
+        // checks pass and the canonical recompute reports expected == the
+        // original claim. This pins the canonical leg with a digest-value
+        // assertion.
+        let mut tampered_ctx = ctx.clone();
+        tampered_ctx.request_id =
+            RequestId::new("request-tampered").map_err(StoreError::Foundation)?;
+        let ctx_err = store
+            .apply_transaction(&tampered_ctx, exact.clone(), &[], &[])
+            .expect_err("tampered context must fail");
+        assert!(
+            matches!(
+                &ctx_err,
+                StoreError::TransitionDigestMismatch { expected, observed }
+                    if expected == &recomputed && observed != &recomputed
+            ),
+            "context tamper must report the canonical digest, got {ctx_err:?}"
         );
         assert_eq!(before, store.snapshot()?);
         // Same-key-different-bytes with a correctly recomputed claim for the
@@ -4934,6 +4956,10 @@ mod tests {
         forked.named_operations[0]
             .parameters
             .insert("subject".to_owned(), json!("forked"));
+        // Rebind the plan digests for the new bytes: the fork must be fully
+        // self-consistent (plan + canonical) so the idempotency collision —
+        // not a stale plan claim — decides the outcome.
+        eliot_store_api::bind_issue18_digests(&mut forked)?;
         let forked_view = CanonicalRequestView::from_apply(&ctx, &forked, &[], &[]);
         forked.identity.canonical_request_hash = canonical_request_hash(&forked_view)?;
         // Force the idempotency-key collision while keeping the fork's own
@@ -4967,6 +4993,124 @@ mod tests {
         let before = store.snapshot()?;
         let replay = store.apply_transaction(&ctx, prepared, &[], &[])?;
         assert_eq!(first, replay);
+        assert_eq!(before, store.snapshot()?);
+        Ok(())
+    }
+
+    /// Issue #63 A2 cross-crate golden manifest: the same neutral
+    /// single-manifest values `eliot-canonical` uses for the chain
+    /// envelope, so the manifest digest is code-derived identically.
+    fn golden_chain_manifest() -> Result<eliot_store_api::NamedOperationManifest, StoreError> {
+        eliot_store_api::NamedOperationManifest::new(
+            "governor-golden-chain-63",
+            eliot_store_api::CONTRACT_VERSION,
+            vec![TransitionClass::CaptureCandidate],
+            EffectClass::Candidate,
+            1_024,
+            1_024,
+            1_000,
+        )
+    }
+
+    /// Pinned digest of the Governor chain envelope, asserted independently
+    /// by `eliot-canonical` (see its `golden_chain_envelope` test).
+    const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str =
+        "32d9235499c0e63f72509808c0b1439cd7e879c754fbc1bc5e965bb6af4d6a36";
+
+    #[test]
+    fn governor_envelope_store_view_and_receipt_share_one_golden_digest() -> Result<(), StoreError>
+    {
+        // Issue #63 A2: Governor envelope (eliot-canonical) → shared view
+        // and hash (eliot-store-api) → memory commit receipt. All three
+        // bind the pinned digest; the exact replay is byte-identical.
+        use eliot_canonical::CanonicalWriteEnvelope;
+        use eliot_store_api::{
+            EventId, NamedMutationOperation, NamedMutationRequest, OrderingHeadExpectation,
+            RevisionHeadExpectation,
+        };
+
+        fn canonical_error(error: eliot_canonical::CanonicalError) -> StoreError {
+            StoreError::Serialization(error.to_string())
+        }
+
+        let state_fence = fence();
+        let manifest = golden_chain_manifest()?;
+        let envelope = CanonicalWriteEnvelope {
+            operation_id: eliot_contracts::OperationId::new("op-golden-chain-63")
+                .map_err(StoreError::Foundation)?,
+            request: RequestMeta {
+                request_id: RequestId::new("request-golden-chain-63")
+                    .map_err(StoreError::Foundation)?,
+                session_id: None,
+                task_id: None,
+                product_id: ProductId::new("product-golden-chain")
+                    .map_err(StoreError::Foundation)?,
+                source_id: SourceId::new("source-golden-chain").map_err(StoreError::Foundation)?,
+                state_fence: state_fence.clone(),
+                clock: ClockReading {
+                    valid_time_ms: Some(1),
+                    known_time_ms: Some(1),
+                    transaction_sequence: None,
+                    monotonic_ns: Some(1),
+                },
+            },
+            idempotency_key: "idem-golden-chain-63".to_owned(),
+            scope_id: ScopeId::new("scope-golden-chain-63")?,
+            task_id: None,
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: "c".repeat(64),
+            operation_manifest_digest: manifest.digest.clone(),
+            semantic_commands: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: BTreeMap::from([(
+                    "subject".to_owned(),
+                    json!("observation-golden-chain-63"),
+                )]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: vec![EventId::new("event-golden-chain-1")?],
+                projection_kinds: vec!["projection-golden-chain-1".to_owned()],
+                relation_kinds: vec!["relation-golden-chain-1".to_owned()],
+            },
+            security: eliot_store_api::SecurityContext::default(),
+            required_proof_and_approval_refs: vec!["approval-golden-chain-1".to_owned()],
+            expected_revision_heads: vec![RevisionHeadExpectation {
+                key: RevisionKey::new("revision-golden-chain-a")?,
+                expected_revision: 1,
+                state_fence: state_fence.clone(),
+            }],
+            expected_ordering_heads: vec![OrderingHeadExpectation {
+                scope: OrderingScopeId::new("scope-golden-chain-63")?,
+                expected_sequence: 1,
+                state_fence: state_fence.clone(),
+            }],
+        };
+        // Governor side binds the pinned digest through the shared function.
+        let governor_hash = envelope.canonical_request_hash().map_err(canonical_error)?;
+        assert_eq!(governor_hash, ISSUE_63_GOLDEN_CHAIN_DIGEST);
+        let transition = envelope.prepare().map_err(canonical_error)?;
+        assert_eq!(
+            transition.identity.canonical_request_hash,
+            ISSUE_63_GOLDEN_CHAIN_DIGEST
+        );
+        // Store-api side recomputes the same digest from the transported
+        // apply values.
+        let ctx = envelope.request.clone();
+        let revision_heads = envelope.expected_revision_heads.clone();
+        let ordering_heads = envelope.expected_ordering_heads.clone();
+        let view =
+            CanonicalRequestView::from_apply(&ctx, &transition, &revision_heads, &ordering_heads);
+        assert_eq!(canonical_request_hash(&view)?, ISSUE_63_GOLDEN_CHAIN_DIGEST);
+        // Memory side commits and binds the same digest, then replays it.
+        let store = store()?;
+        store.register_manifest(manifest)?;
+        let receipt =
+            store.apply_transaction(&ctx, transition.clone(), &revision_heads, &ordering_heads)?;
+        assert_eq!(receipt.canonical_request_hash, ISSUE_63_GOLDEN_CHAIN_DIGEST);
+        let before = store.snapshot()?;
+        let replay = store.apply_transaction(&ctx, transition, &revision_heads, &ordering_heads)?;
+        assert_eq!(receipt, replay);
         assert_eq!(before, store.snapshot()?);
         Ok(())
     }
