@@ -66,6 +66,7 @@ impl AdapterCapability {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterAuthorityProfile {
     pub allowed_projects: Vec<ProjectId>,
     pub allowed_roles: Vec<AgentRole>,
@@ -76,6 +77,7 @@ pub struct AdapterAuthorityProfile {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterLimits {
     pub timeout_ms: u64,
     pub max_payload_bytes: usize,
@@ -97,6 +99,7 @@ impl Default for AdapterLimits {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessExecutionPolicy {
     pub process_spawn_allowed: bool,
     pub allowed_executables: Vec<String>,
@@ -105,6 +108,7 @@ pub struct ProcessExecutionPolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilityManifest {
     pub adapter_id: String,
     pub name: String,
@@ -119,6 +123,7 @@ pub struct CapabilityManifest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterContext {
     pub project_id: ProjectId,
     pub task_id: TaskId,
@@ -137,6 +142,7 @@ pub struct AdapterContext {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterRequest {
     pub request_id: String,
     pub adapter_id: String,
@@ -158,6 +164,7 @@ pub enum AdapterResultStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterError {
     pub code: String,
     pub message: String,
@@ -165,6 +172,7 @@ pub struct AdapterError {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterResult {
     pub result_id: String,
     pub request_id: String,
@@ -181,6 +189,7 @@ pub struct AdapterResult {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterObservation {
     pub observation_id: String,
     pub adapter_id: String,
@@ -213,6 +222,7 @@ pub enum AdapterState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterHealth {
     pub adapter_id: String,
     pub name: String,

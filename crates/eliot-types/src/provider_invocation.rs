@@ -101,6 +101,7 @@ pub enum ProviderRouteReadinessVerdict {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderInvocationTransition {
     pub transition_id: String,
     pub from: Option<ProviderInvocationState>,
@@ -111,6 +112,7 @@ pub struct ProviderInvocationTransition {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderInvocationAttempt {
     pub invocation_attempt_id: String,
     pub provider: String,
@@ -416,6 +418,7 @@ fn hash_optional_u64(hasher: &mut blake3::Hasher, value: Option<u64>) {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderTimeoutProfile {
     profile_id: String,
     provider: String,
@@ -485,6 +488,7 @@ impl ProviderTimeoutProfile {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderInvocationOutcome {
     pub outcome_id: String,
     pub invocation_attempt_ref: String,
@@ -503,6 +507,7 @@ pub struct ProviderInvocationOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderIdentityCheck {
     pub field: String,
     pub expected: Option<String>,
@@ -512,6 +517,7 @@ pub struct ProviderIdentityCheck {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderReconciliationRecord {
     pub reconciliation_id: String,
     pub invocation_attempt_ref: String,
@@ -533,6 +539,7 @@ pub struct ProviderReconciliationRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalResultCompletenessReceipt {
     pub completeness_receipt_id: String,
     pub invocation_attempt_ref: String,
@@ -548,6 +555,7 @@ pub struct ExternalResultCompletenessReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderFailureIncident {
     pub incident_id: String,
     pub source_phase: String,
@@ -569,6 +577,7 @@ pub struct ProviderFailureIncident {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderRouteReadinessGate {
     pub readiness_gate_id: String,
     pub provider: String,

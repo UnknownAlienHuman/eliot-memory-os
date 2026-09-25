@@ -49,6 +49,7 @@ pub struct OperationAuthorityOpenRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperationAuthorityOpenReceipt {
     pub operation_id: String,
     pub purpose: ExternalAgentPurpose,
@@ -94,6 +95,7 @@ pub struct OperationAuthorityCloseRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperationAuthorityCloseReceipt {
     pub operation_id: String,
     pub purpose: ExternalAgentPurpose,
