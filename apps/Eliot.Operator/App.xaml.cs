@@ -26,6 +26,10 @@ public partial class App : Application
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
         WriteStartupDiagnostic("launch:begin");
+        // Bounded redacted record of the wire adapter this process pinned:
+        // schema, contract hash, single consumer, proof ceiling and removal
+        // condition. No endpoint, nonce, credential or payload.
+        WriteAdapterDiagnostic(LegacyOperatorAdapter.Describe());
         try
         {
             _window = new MainWindow();
@@ -45,31 +49,47 @@ public partial class App : Application
         WriteStartupDiagnostic("application-unhandled", args.Exception);
     }
 
-    private static void WriteStartupDiagnostic(string stage, Exception? exception = null)
+    private static void WriteAdapterDiagnostic(string description)
     {
         try
         {
-            var directory = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "Eliot",
-                "logs");
-            Directory.CreateDirectory(directory);
-            var path = Path.Combine(directory, "operator-startup.log");
-            // Bounded redacted record: stage, exception type, and HRESULT
-            // only. Messages, stack traces, pipe names, nonces, endpoints,
-            // credentials, and command/query bodies never enter the log.
-            var record = OperatorDiagnostics.FormatStartupRecord(
-                stage, exception?.GetType().FullName, exception?.HResult);
-            var info = new FileInfo(path);
-            if (info.Exists && OperatorDiagnostics.ShouldRotate(info.Length))
-            {
-                File.Delete(path);
-            }
-            File.AppendAllText(path, $"{record}{Environment.NewLine}");
+            AppendStartupRecord(OperatorDiagnostics.FormatAdapterRecord(description));
         }
         catch
         {
             // Startup diagnostics must never mask the original WinUI failure.
         }
+    }
+
+    private static void WriteStartupDiagnostic(string stage, Exception? exception = null)
+    {
+        try
+        {
+            // Bounded redacted record: stage, exception type, and HRESULT
+            // only. Messages, stack traces, pipe names, nonces, endpoints,
+            // credentials, and command/query bodies never enter the log.
+            AppendStartupRecord(OperatorDiagnostics.FormatStartupRecord(
+                stage, exception?.GetType().FullName, exception?.HResult));
+        }
+        catch
+        {
+            // Startup diagnostics must never mask the original WinUI failure.
+        }
+    }
+
+    private static void AppendStartupRecord(string record)
+    {
+        var directory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Eliot",
+            "logs");
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, "operator-startup.log");
+        var info = new FileInfo(path);
+        if (info.Exists && OperatorDiagnostics.ShouldRotate(info.Length))
+        {
+            File.Delete(path);
+        }
+        File.AppendAllText(path, $"{record}{Environment.NewLine}");
     }
 }

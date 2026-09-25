@@ -12,23 +12,26 @@ namespace Eliot.Operator.Services;
 /// Governor serves a current-owner route on this pipe (see
 /// [`LegacyOperatorAdapter.ExpiryRemoval`]).
 ///
-/// Handoff/reconnect rule: the one-shot broker endpoint is consumed once. A
-/// lost pipe never loops on the consumed value and never infers continuity
-/// from PID, pipe name, or cached state. Pipe loss during a mutation becomes
-/// the typed unknown-outcome fault carrying the same operation identity for
-/// reconciliation; pipe loss with no replacement handoff becomes the typed
-/// restart-required disposition.
+/// Handoff/reconnect rule: the broker handoff is single-use. It is bound to the
+/// exact installation, user SID/logon Session, broker registration epoch,
+/// Operator artifact fingerprint, Operator process generation, endpoint
+/// generation, role/capability set and the owner's expiry, and it is consumed
+/// before the connection is opened. A lost pipe invalidates it permanently:
+/// the next attempt returns the typed restart-required disposition and never
+/// re-presents the consumed nonce, the cached endpoint, the PID, the user or
+/// the pipe name. Pipe loss during a mutation becomes the typed
+/// unknown-outcome fault carrying the same operation identity for
+/// reconciliation.
 public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGovernorClient, IAsyncDisposable
 {
-    private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web)
-    {
-        // Explicit, never wider than the framework default.
-        MaxDepth = 64
-    };
+    // One closed profile for every surface: unknown members are refused rather
+    // than ignored, depth is bounded, and the raw line is bounded before the
+    // typed object is allocated.
+    private static readonly JsonSerializerOptions Json = OperatorJson.Reader;
     private NamedPipeClientStream? _pipe;
     private StreamReader? _reader;
     private StreamWriter? _writer;
-    private OperatorEndpoint? _endpoint;
+    private OperatorHandoff? _handoff;
     private long _requestId;
     private readonly SemaphoreSlim _requestGate = new(1, 1);
     private readonly StringBuilder _readAhead = new();
@@ -37,12 +40,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     {
         var contract = await CallToolAsync<OperatorContractResponse>(
             LegacyOperatorAdapter.ToolContract, new { }, "read:contract", cancellationToken);
-        if (contract.SchemaVersion != OperatorProtocol.SchemaVersion
-            || contract.IpcProtocolVersion != OperatorProtocol.IpcProtocolVersion
-            || contract.ProtocolHash != OperatorProtocol.PinnedContractHash)
-        {
-            throw new InvalidOperationException("Governor operator contract differs from the client-pinned version/hash");
-        }
+        RequireCurrentContract(contract);
         return await CallToolAsync<OperatorSnapshot>(
             LegacyOperatorAdapter.ToolSnapshot,
             new { project_id = projectId, task_id = taskId },
@@ -86,8 +84,13 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         OperatorQueryRequest request,
         CancellationToken cancellationToken = default)
     {
+        RequireBoundedPageRequest(request);
         await ValidateContractAsync(cancellationToken);
-        return await CallToolAsync<OperatorProjectionPage>(LegacyOperatorAdapter.ToolQuery, request, "read:query", cancellationToken);
+        var page = await CallToolAsync<OperatorProjectionPage>(
+            LegacyOperatorAdapter.ToolQuery, request, "read:query", cancellationToken);
+        // Retained containers are bounded before the page is handed to the UI.
+        OperatorProjectionGuard.ValidatePage(page);
+        return page;
     }
 
     private async Task ValidateContractAsync(CancellationToken cancellationToken)
@@ -97,11 +100,40 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             new { },
             "read:contract",
             cancellationToken);
-        if (contract.SchemaVersion != OperatorProtocol.SchemaVersion
+        RequireCurrentContract(contract);
+    }
+
+    private static void RequireCurrentContract(OperatorContractResponse contract)
+    {
+        // The client pins the compatibility adapter's own schema and contract
+        // hash, not a bare protocol constant, so an owner change cannot be
+        // absorbed silently by this one admitted consumer.
+        if (contract.SchemaVersion != LegacyOperatorAdapter.SchemaVersion
             || contract.IpcProtocolVersion != OperatorProtocol.IpcProtocolVersion
-            || contract.ProtocolHash != OperatorProtocol.PinnedContractHash)
+            || contract.ProtocolHash != LegacyOperatorAdapter.ContractHash)
         {
-            throw new InvalidOperationException("Governor operator contract differs from the client-pinned version/hash");
+            throw new OperatorProtocolException("contract", "version_or_hash_mismatch");
+        }
+    }
+
+    /// The page request is bounded locally: an unbounded page size or cursor
+    /// never leaves the UI.
+    private static void RequireBoundedPageRequest(OperatorQueryRequest request)
+    {
+        if (request.PageSize is < OperatorProtocol.MinPageSize or > OperatorProtocol.MaxPageSize)
+        {
+            throw new OperatorProtocolException("query_request", "page_size_cap");
+        }
+        RequireBoundedCursor(request.Cursor, "query_request");
+        RequireBoundedCursor(request.SelectedRef, "query_request");
+    }
+
+    private static void RequireBoundedCursor(string? cursor, string shapeName)
+    {
+        if (cursor is null) return;
+        if (cursor.Length > OperatorProtocol.MaxCursorChars || cursor.Any(char.IsControl))
+        {
+            throw new OperatorProtocolException(shapeName, "cursor_cap");
         }
     }
 
@@ -121,6 +153,12 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
 
     private async Task<T> CallToolAsync<T>(string tool, object arguments, string operationScope, CancellationToken cancellationToken)
     {
+        if (!LegacyOperatorAdapter.IsAdmittedTool(tool))
+        {
+            // The compatibility adapter admits exactly its four pinned tools
+            // plus the typed owner route. Anything else is refused before use.
+            throw new OperatorProtocolException("tool", "unadmitted_tool");
+        }
         await _requestGate.WaitAsync(cancellationToken);
         try
         {
@@ -142,29 +180,10 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             {
                 throw;
             }
-            catch (RuntimeDiscoveryException error)
+            catch (Exception error)
             {
-                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
-            }
-            catch (UnauthorizedAccessException error)
-            {
-                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
-            }
-            catch (IOException error)
-            {
-                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
-            }
-            catch (OperatorProtocolException error)
-            {
-                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
-            }
-            catch (JsonException error)
-            {
-                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
-            }
-            catch (InvalidOperationException error)
-            {
-                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+                throw new OperatorUnknownOutcomeException(
+                    operationScope, tool, OperatorFaultReason.ForException(error));
             }
             var requestId = Interlocked.Increment(ref _requestId);
             try
@@ -182,61 +201,41 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
                     // A JSON-RPC error carries no owner-bound terminal receipt;
                     // the request may already have reached the mutation owner.
                     throw new OperatorUnknownOutcomeException(
-                        operationScope, tool, "owner returned an unbound JSON-RPC error");
+                        operationScope, tool, OperatorFaultReason.OwnerErrorUnbound);
                 }
                 if (response.Result is null)
                 {
                     throw new OperatorUnknownOutcomeException(
-                        operationScope, tool, "owner returned no result");
+                        operationScope, tool, OperatorFaultReason.OwnerResultAbsent);
                 }
                 try
                 {
                     return response.Result.StructuredContent.Deserialize<T>(Json)
                         ?? throw new OperatorUnknownOutcomeException(
-                            operationScope, tool, "owner answer was empty and unproven");
+                            operationScope, tool, OperatorFaultReason.OwnerResultUnreadable);
                 }
-                catch (JsonException error)
+                catch (JsonException)
                 {
                     // The owner answered but the bytes prove nothing: the same
                     // operation must be reconciled, on the live connection.
-                    throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+                    throw new OperatorUnknownOutcomeException(
+                        operationScope, tool, OperatorFaultReason.OwnerResultUnreadable);
                 }
             }
             catch (OperatorUnknownOutcomeException)
             {
-                await DisconnectAsync();
+                await DisconnectAsync(OperatorHandoffInvalidation.PipeLost);
                 throw;
             }
-            catch (OperationCanceledException error)
+            catch (OperationCanceledException)
             {
-                await DisconnectAsync();
-                throw new OperatorUnknownOutcomeException(
-                    operationScope, tool, $"request cancelled after send: {error.Message}");
+                await DisconnectAsync(OperatorHandoffInvalidation.PipeLost);
+                throw new OperatorUnknownOutcomeException(operationScope, tool, OperatorFaultReason.RequestTimeout);
             }
-            catch (IOException error)
+            catch (Exception error)
             {
-                await DisconnectAsync();
-                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
-            }
-            catch (OperatorProtocolException error)
-            {
-                await DisconnectAsync();
-                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
-            }
-            catch (JsonException error)
-            {
-                await DisconnectAsync();
-                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
-            }
-            catch (NotSupportedException error)
-            {
-                await DisconnectAsync();
-                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
-            }
-            catch (InvalidOperationException error)
-            {
-                await DisconnectAsync();
-                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+                await DisconnectAsync(OperatorHandoffInvalidation.PipeLost);
+                throw new OperatorUnknownOutcomeException(operationScope, tool, OperatorFaultReason.ForException(error));
             }
         }
         finally
@@ -245,37 +244,72 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         }
     }
 
+    /// Opens the single authenticated connection bound to one consumed handoff.
+    ///
+    /// The handoff is validated against the exact current process identity and
+    /// consumed before the pipe is opened, so a failed connect can never
+    /// present the same nonce twice. The effective connect deadline is the
+    /// handoff's own remaining lifetime: a handoff that cannot be consumed in
+    /// time is refused rather than burned.
     private async Task EnsureConnectedAsync(CancellationToken cancellationToken)
     {
-        if (_pipe?.IsConnected == true && _endpoint is not null)
+        // A live connection is reusable; the handoff that authenticated it is
+        // not. Single use binds connection establishment, not request handling.
+        if (_pipe?.IsConnected == true)
         {
             return;
         }
-        OperatorEndpoint activeRuntime;
+        OperatorHandoff handoff;
         try
         {
-            activeRuntime = await discovery.DiscoverAsync(cancellationToken);
+            handoff = await discovery.DiscoverAsync(cancellationToken);
+            handoff.RequireBindingTo(OperatorProcessIdentityProvider.Current, DateTimeOffset.UtcNow);
         }
-        catch (RuntimeDiscoveryException error) when (error.Code == "endpoint_missing")
+        catch (OperatorHandoffRefusedException)
         {
-            throw new OperatorRestartRequiredException(
-                "one-shot broker handoff is consumed and no replacement handoff is available in-process");
+            await DisconnectAsync(OperatorHandoffInvalidation.ReconnectRequired);
+            throw;
+        }
+        catch (RuntimeDiscoveryException)
+        {
+            await DisconnectAsync(OperatorHandoffInvalidation.ReconnectRequired);
+            throw new OperatorRestartRequiredException(OperatorHandoff.ReacquisitionRequirement);
+        }
+        catch (OperatorProcessIdentityException)
+        {
+            await DisconnectAsync(OperatorHandoffInvalidation.ReconnectRequired);
+            throw new OperatorRestartRequiredException(OperatorFaultReason.ProcessIdentityUnproven);
         }
         if (_pipe is not null)
         {
-            await DisconnectAsync();
+            await DisconnectAsync(OperatorHandoffInvalidation.ReconnectRequired);
         }
-        _endpoint = activeRuntime;
-        var pipeName = _endpoint.PipeName.Replace(@"\\.\pipe\", string.Empty, StringComparison.OrdinalIgnoreCase);
+        _handoff = handoff;
+
+        var remaining = handoff.RemainingLifetime(DateTimeOffset.UtcNow);
+        if (remaining <= TimeSpan.Zero)
+        {
+            handoff.Invalidate(OperatorHandoffInvalidation.Expired);
+            throw new OperatorRestartRequiredException(OperatorHandoff.ReacquisitionRequirement);
+        }
+        var connectBudget = remaining < TimeSpan.FromSeconds(OperatorProtocol.ConnectTimeoutSeconds)
+            ? remaining
+            : TimeSpan.FromSeconds(OperatorProtocol.ConnectTimeoutSeconds);
+        var pipeName = handoff.Endpoint.PipeName.Replace(@"\\.\pipe\", string.Empty, StringComparison.OrdinalIgnoreCase);
+        // Single use: the nonce is spent now, not after a successful connect.
+        handoff.Consume(DateTimeOffset.UtcNow);
         _pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
         try
         {
-            await _pipe.ConnectAsync(TimeSpan.FromSeconds(OperatorProtocol.ConnectTimeoutSeconds), cancellationToken);
+            using var connectWindow = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            connectWindow.CancelAfter(connectBudget);
+            await _pipe.ConnectAsync(connectWindow.Token);
         }
         catch (Exception error) when (error is IOException or TimeoutException or OperationCanceledException)
         {
-            await DisconnectAsync();
-            throw new OperatorRestartRequiredException($"Governor pipe is unreachable: {error.GetType().Name}");
+            await DisconnectAsync(OperatorHandoffInvalidation.PipeLost);
+            throw new OperatorRestartRequiredException(
+                $"{OperatorFaultReason.ConnectionRefused} at broker registration generation {handoff.BrokerRegistrationEpoch}");
         }
         _reader = new StreamReader(_pipe, Encoding.UTF8, false, 4096, leaveOpen: true);
         _writer = new StreamWriter(_pipe, new UTF8Encoding(false), 4096, leaveOpen: true) { AutoFlush = true };
@@ -285,9 +319,9 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             {
                 kind = "eliot_ipc_handshake",
                 protocol_version = OperatorProtocol.IpcProtocolVersion,
-                broker_epoch = _endpoint.BrokerEpoch,
-                interactive_session_id = _endpoint.InteractiveSessionId,
-                handoff_nonce = _endpoint.HandoffNonce,
+                broker_epoch = handoff.Endpoint.BrokerEpoch,
+                interactive_session_id = handoff.Endpoint.InteractiveSessionId,
+                handoff_nonce = handoff.Endpoint.HandoffNonce,
                 client_nonce = Guid.NewGuid().ToString("N"),
                 profile = "human_operator",
                 requested_session_id = (string?)null
@@ -306,7 +340,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
                 || accepted.ValueKind != JsonValueKind.True && accepted.ValueKind != JsonValueKind.False
                 || !accepted.GetBoolean())
             {
-                throw new UnauthorizedAccessException("Governor rejected the operator handshake");
+                throw new UnauthorizedAccessException(OperatorFaultReason.HandshakeRefused);
             }
             var initializeId = Interlocked.Increment(ref _requestId);
             var initialize = await RequestAsync<JsonRpcResponse<JsonElement>>(new
@@ -325,42 +359,51 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             ValidateJsonRpcResponse(initialize, initializeId);
             if (initialize.Error is not null || initialize.Result.ValueKind == JsonValueKind.Undefined)
             {
-                throw new UnauthorizedAccessException("Governor rejected operator initialization");
+                throw new UnauthorizedAccessException(OperatorFaultReason.HandshakeRefused);
             }
         }
         catch (OperatorRestartRequiredException)
         {
-            await DisconnectAsync();
+            await DisconnectAsync(OperatorHandoffInvalidation.PipeLost);
             throw;
         }
         catch (OperationCanceledException)
         {
-            await DisconnectAsync();
+            await DisconnectAsync(OperatorHandoffInvalidation.PipeLost);
             throw;
         }
         catch (UnauthorizedAccessException)
         {
-            await DisconnectAsync();
+            await DisconnectAsync(OperatorHandoffInvalidation.PipeLost);
             throw;
         }
         catch (Exception error) when (error is IOException or OperatorProtocolException or InvalidOperationException or JsonException)
         {
-            await DisconnectAsync();
-            throw new OperatorRestartRequiredException($"operator handshake failed closed: {error.GetType().Name}");
+            await DisconnectAsync(OperatorHandoffInvalidation.PipeLost);
+            throw new OperatorRestartRequiredException(
+                $"{OperatorFaultReason.HandshakeShapeRefused} at broker registration generation {handoff.BrokerRegistrationEpoch}");
         }
     }
 
+    /// Writes one framed request and reads one framed answer. The absolute
+    /// per-request ceiling applies even when the caller supplies no
+    /// cancellation token, so a silent owner cannot hold a request open.
     private async Task<T> RequestAsync<T>(object request, CancellationToken cancellationToken)
     {
+        using var requestWindow = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        requestWindow.CancelAfter(TimeSpan.FromSeconds(OperatorProtocol.RequestTimeoutSeconds));
         try
         {
             await _writer!.WriteLineAsync(JsonSerializer.Serialize(request, Json));
-            var response = await ReadBoundedLineAsync(cancellationToken)
+            var response = await ReadBoundedLineAsync(requestWindow.Token)
                 ?? throw new IOException("Governor closed the named pipe");
             if (Encoding.UTF8.GetByteCount(response) > OperatorProtocol.MaxDecodedBytes)
             {
                 throw new OperatorProtocolException("response", "body_cap");
             }
+            // Independent member/depth/token/string/item caps and duplicate-key
+            // rejection run on the raw line before the typed object exists.
+            OperatorResponseGuard.ValidateFramedResponse(response, "response");
             return JsonSerializer.Deserialize<T>(response, Json)
                 ?? throw new InvalidOperationException("Governor returned an unreadable response");
         }
@@ -440,16 +483,21 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         }
     }
 
-    private async Task DisconnectAsync()
+    /// Drops the connection and permanently invalidates the handoff it used.
+    /// The nonce, the endpoint and the pipe name are released together: nothing
+    /// here can authenticate a later connection.
+    private async Task DisconnectAsync(OperatorHandoffInvalidation invalidation)
     {
         var writer = _writer;
         var reader = _reader;
         var pipe = _pipe;
+        var handoff = _handoff;
         _writer = null;
         _reader = null;
         _pipe = null;
-        _endpoint = null;
+        _handoff = null;
         _readAhead.Clear();
+        handoff?.Invalidate(invalidation);
         try
         {
             if (writer is not null) await writer.DisposeAsync();
@@ -471,7 +519,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         await _requestGate.WaitAsync();
         try
         {
-            await DisconnectAsync();
+            await DisconnectAsync(OperatorHandoffInvalidation.ReconnectRequired);
         }
         finally
         {

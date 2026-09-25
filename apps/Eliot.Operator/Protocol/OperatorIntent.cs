@@ -71,9 +71,20 @@ public static class OperatorIntentContract
     }
 }
 
+/// Which owner route a retained operation belongs to. A pending entry is
+/// reconciled on its own route under its own identity; a retained entry can
+/// never be replayed through the other route.
+public enum OperatorMutationRoute
+{
+    OperatorCommand = 0,
+    UserAutomation
+}
+
 /// Durable phases of one UI-issued operation. `UnknownReconciling` means the
 /// request may have executed: the same identity must be reconciled, never
-/// resubmitted as a new mutation.
+/// resubmitted as a new mutation. `PossiblyExecuted` is a transport loss after
+/// the request was written; `StaleFence` is an owner-bound rejection proving
+/// the mutation was not admitted. All seven states stay distinct.
 public enum OperatorOperationPhase
 {
     Created,
@@ -90,8 +101,9 @@ public enum OperatorOperationPhase
 /// revision/fence input, and phase until a terminal receipt.
 public sealed record OperatorPendingOperation(
     string OperationId,
+    OperatorMutationRoute Route,
     string EnvelopeJson,
-    ulong ExpectedRevision,
+    ulong? ExpectedRevision,
     string CommandName,
     OperatorOperationPhase Phase,
     DateTimeOffset CreatedAtUtc)
@@ -135,4 +147,27 @@ public static class LegacyOperatorAdapter
     public const string ExpiryRemoval =
         "Remove when the Governor serves a current-owner ControlBoard/OperatorIntent route " +
         "on the UI pipe or the #1189 retirement owner lands; no new tool or command shape may be added.";
+
+    /// The exact closed set of routes this adapter may issue. A tool outside
+    /// the set is refused before it is written to the pipe, so the adapter
+    /// cannot gain a fifth tool, a second command shape or a wider capability
+    /// by accident.
+    private static readonly string[] AdmittedTools =
+    [
+        ToolContract,
+        ToolSnapshot,
+        ToolQuery,
+        ToolCommand,
+        UserAutomationContract.Route
+    ];
+
+    public static bool IsAdmittedTool(string? tool) =>
+        tool is not null && AdmittedTools.Contains(tool, StringComparer.Ordinal);
+
+    /// Bounded redacted description of this adapter's boundary. It carries the
+    /// pinned identity, the single consumer, the proof ceiling and the removal
+    /// condition; it carries no endpoint, nonce, credential or payload.
+    public static string Describe() =>
+        $"legacy adapter schema={SchemaVersion} hash={ContractHash} consumer={Consumer} " +
+        $"tools={AdmittedTools.Length} proof_ceiling={ProofCeiling} removal={ExpiryRemoval}";
 }
