@@ -1050,6 +1050,16 @@ pub fn derive_finish_decision(
         .iter()
         .map(String::as_str)
         .collect();
+    // Issue #325 W3: `executed_current` is the gate's explicit pass-and-exact
+    // outcome check. The canonical owner (`produce_finish_evidence`) records
+    // every terminal run in `executed_verifier_run_refs` but stale-marks each
+    // run that is not executed, passing, and exactly fresh
+    // (`certifies_completion`: job, receipt, and run `Succeeded`, outcome
+    // `Pass`, coverage `CompleteForScope`, `Exact*` freshness, unchanged
+    // source, complete artifacts). Only refs surviving this difference are
+    // proven executed/passing/current evidence; set membership in `executed`
+    // alone never suffices below.
+    let executed_current: BTreeSet<&str> = executed.difference(&stale).copied().collect();
     let mut verifier_gap = false;
     let mut artifact_gap = false;
     let mut all_satisfied = true;
@@ -1071,7 +1081,7 @@ pub fn derive_finish_decision(
         }
     }
     for verifier in &draft.verifier_run_refs {
-        if !executed.contains(verifier.as_str()) || stale.contains(verifier.as_str()) {
+        if !executed_current.contains(verifier.as_str()) {
             verifier_gap = true;
             missing.push(format!("verifier:{verifier}"));
         }
@@ -1084,9 +1094,7 @@ pub fn derive_finish_decision(
         coverage.push(format!("{}={}", item.item_id, item.satisfied));
         for verifier in &item.verifier_run_refs {
             bindings.push(verifier.clone());
-            if item.requires_verifier
-                && (!executed.contains(verifier.as_str()) || stale.contains(verifier.as_str()))
-            {
+            if item.requires_verifier && !executed_current.contains(verifier.as_str()) {
                 verifier_gap = true;
                 missing.push(format!("verifier:{verifier}"));
             }
@@ -1102,9 +1110,28 @@ pub fn derive_finish_decision(
     unresolved.extend(draft.remaining_unknowns_declared_by_caller.iter().cloned());
     unresolved.sort();
     unresolved.dedup();
+    // Issue #325 W3: every verifier-bound obligation must be proven by
+    // executed, passing, current evidence — a `satisfied` flag alone never
+    // carries a verifier-bound item to `VerifiedComplete`. Items without a
+    // verifier requirement keep their upstream disposition.
+    let verifier_items_proven = evidence
+        .acceptance
+        .iter()
+        .filter(|item| item.requires_verifier)
+        .all(|item| {
+            !item.verifier_run_refs.is_empty()
+                && item
+                    .verifier_run_refs
+                    .iter()
+                    .all(|verifier| executed_current.contains(verifier.as_str()))
+        });
     let outcome = match draft.requested_outcome {
         RequestedFinishOutcome::CompleteCandidate
-            if all_satisfied && !verifier_gap && !artifact_gap && unresolved.is_empty() =>
+            if all_satisfied
+                && verifier_items_proven
+                && !verifier_gap
+                && !artifact_gap
+                && unresolved.is_empty() =>
         {
             FinishDecisionOutcome::VerifiedComplete
         }

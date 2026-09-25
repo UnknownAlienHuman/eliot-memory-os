@@ -881,6 +881,25 @@ pub struct CanonicalVerifierPlanBinding {
     pub input_artifacts: Vec<ArtifactId>,
     /// Required test ids selected by the canonical plan owner.
     pub required_test_ids: BTreeSet<String>,
+    /// Full `TaskContract` acceptance denominator bound by the canonical plan
+    /// owner (issue #325 P1, I7.9).
+    ///
+    /// The finish path enumerates exactly this set before joining executed
+    /// verifier evidence. The selected `required_test_ids` inventory alone is
+    /// never the acceptance denominator: an obligation omitted from the test
+    /// list must still surface as an uncovered acceptance row rather than
+    /// vanishing from the gate.
+    pub required_acceptance_item_ids: BTreeSet<String>,
+    /// Explicit join from each acceptance item to the nextest test ids that
+    /// establish it (issue #325 P1).
+    ///
+    /// Many-to-many mappings are supported without equating test ids with
+    /// acceptance ids. An item with no entry is unmapped and the verifier
+    /// path reports it uncovered; an entry with an empty test set declares a
+    /// non-test obligation that executed verifier runs alone cannot satisfy.
+    /// Neither form ever shrinks the task denominator to the selected test
+    /// list.
+    pub acceptance_verifier_map: BTreeMap<String, BTreeSet<String>>,
     /// Registered evaluator identity and version used for this plan.
     pub evaluator: ContractId,
     pub evaluator_version: ContractVersion,
@@ -952,6 +971,11 @@ impl CanonicalVerifierPlanBinding {
                 "canonical verifier plan has no required test ids".to_owned(),
             ));
         }
+        // I7.9 / issue #325 P1: the plan must bind the full TaskContract
+        // acceptance denominator, not just the selected test inventory. An
+        // empty denominator would let the finish path shrink the task to the
+        // test list, so admission fails closed here.
+        self.validate_acceptance_denominator()?;
         if self.input_artifacts.is_empty()
             || self
                 .input_artifacts
@@ -962,22 +986,63 @@ impl CanonicalVerifierPlanBinding {
                 "canonical verifier plan has no exact input artifact binding".to_owned(),
             ));
         }
-        let config_hash = verifier_invocation_config_digest(
-            &self.instrument,
-            self.kind,
-            &self.profile,
-            &self.target,
-            &self.arguments,
-            &self.declared_scope,
-            &self.input_artifacts,
-            &self.required_test_ids,
-            &self.evaluator,
-            self.evaluator_version,
-        )?;
+        let config_hash = verifier_invocation_config_digest(&VerifierInvocationConfig {
+            instrument: &self.instrument,
+            kind: self.kind,
+            profile: &self.profile,
+            target: &self.target,
+            arguments: &self.arguments,
+            declared_scope: &self.declared_scope,
+            input_artifacts: &self.input_artifacts,
+            required_test_ids: &self.required_test_ids,
+            required_acceptance_item_ids: &self.required_acceptance_item_ids,
+            acceptance_verifier_map: &self.acceptance_verifier_map,
+            evaluator: &self.evaluator,
+            evaluator_version: self.evaluator_version,
+        })?;
         if self.planned.verifier_config_hash != config_hash {
             return Err(CompositionError::Recovery(
                 "canonical verifier plan config hash does not bind its invocation shape".to_owned(),
             ));
+        }
+        Ok(())
+    }
+
+    /// Validates the plan-bound `TaskContract` acceptance denominator and its
+    /// explicit join to the selected test inventory (issue #325 P1, I7.9).
+    fn validate_acceptance_denominator(&self) -> Result<(), CompositionError> {
+        if self.required_acceptance_item_ids.is_empty()
+            || self
+                .required_acceptance_item_ids
+                .iter()
+                .any(|item_id| item_id.trim().is_empty() || item_id.chars().any(char::is_control))
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan has no required acceptance item ids".to_owned(),
+            ));
+        }
+        for (item_id, test_ids) in &self.acceptance_verifier_map {
+            if !self.required_acceptance_item_ids.contains(item_id) {
+                return Err(CompositionError::Recovery(
+                    "canonical verifier plan maps an unknown acceptance item".to_owned(),
+                ));
+            }
+            if item_id.trim().is_empty() || item_id.chars().any(char::is_control) {
+                return Err(CompositionError::Recovery(
+                    "canonical verifier plan has an invalid acceptance item id".to_owned(),
+                ));
+            }
+            for test_id in test_ids {
+                if test_id.trim().is_empty()
+                    || test_id.chars().any(char::is_control)
+                    || !self.required_test_ids.contains(test_id)
+                {
+                    return Err(CompositionError::Recovery(
+                        "canonical verifier plan maps an acceptance item outside its required test set"
+                            .to_owned(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -998,6 +1063,13 @@ pub struct CanonicalVerifierInvocationBinding {
     pub declared_scope: String,
     pub input_artifacts: Vec<ArtifactId>,
     pub required_test_ids: BTreeSet<String>,
+    /// `TaskContract` acceptance denominator observed with the admitted
+    /// invocation; copied from the canonical plan so a persisted fact keeps
+    /// the exact denominator its acceptance join used.
+    pub required_acceptance_item_ids: BTreeSet<String>,
+    /// Acceptance-to-test join observed with the admitted invocation; copied
+    /// from the canonical plan for the same reason.
+    pub acceptance_verifier_map: BTreeMap<String, BTreeSet<String>>,
     pub evaluator: ContractId,
     pub evaluator_version: ContractVersion,
     pub config_hash: String,
@@ -1011,18 +1083,20 @@ impl CanonicalVerifierInvocationBinding {
         invocation.validate().map_err(|error| {
             verifier_fact_error(format!("TestD invocation validation failed: {error}"))
         })?;
-        let config_hash = verifier_invocation_config_digest(
-            &invocation.instrument,
-            invocation.kind,
-            &invocation.profile,
-            &invocation.target,
-            &invocation.arguments,
-            &invocation.declared_scope,
-            &invocation.input_artifacts,
-            &plan.required_test_ids,
-            &plan.evaluator,
-            plan.evaluator_version,
-        )?;
+        let config_hash = verifier_invocation_config_digest(&VerifierInvocationConfig {
+            instrument: &invocation.instrument,
+            kind: invocation.kind,
+            profile: &invocation.profile,
+            target: &invocation.target,
+            arguments: &invocation.arguments,
+            declared_scope: &invocation.declared_scope,
+            input_artifacts: &invocation.input_artifacts,
+            required_test_ids: &plan.required_test_ids,
+            required_acceptance_item_ids: &plan.required_acceptance_item_ids,
+            acceptance_verifier_map: &plan.acceptance_verifier_map,
+            evaluator: &plan.evaluator,
+            evaluator_version: plan.evaluator_version,
+        })?;
         Ok(Self {
             instrument: invocation.instrument.clone(),
             kind: invocation.kind,
@@ -1032,6 +1106,8 @@ impl CanonicalVerifierInvocationBinding {
             declared_scope: invocation.declared_scope.clone(),
             input_artifacts: invocation.input_artifacts.clone(),
             required_test_ids: plan.required_test_ids.clone(),
+            required_acceptance_item_ids: plan.required_acceptance_item_ids.clone(),
+            acceptance_verifier_map: plan.acceptance_verifier_map.clone(),
             evaluator: plan.evaluator.clone(),
             evaluator_version: plan.evaluator_version,
             config_hash,
@@ -1047,6 +1123,7 @@ impl CanonicalVerifierInvocationBinding {
             || self.declared_scope.trim().is_empty()
             || self.input_artifacts.is_empty()
             || self.required_test_ids.is_empty()
+            || self.required_acceptance_item_ids.is_empty()
             || self.config_hash.len() != 64
             || self
                 .config_hash
@@ -1065,23 +1142,43 @@ impl CanonicalVerifierInvocationBinding {
                 .required_test_ids
                 .iter()
                 .any(|test_id| test_id.trim().is_empty() || test_id.chars().any(char::is_control))
+            || self
+                .required_acceptance_item_ids
+                .iter()
+                .any(|item_id| item_id.trim().is_empty() || item_id.chars().any(char::is_control))
+            || self.acceptance_verifier_map.keys().any(|item_id| {
+                item_id.trim().is_empty()
+                    || item_id.chars().any(char::is_control)
+                    || !self.required_acceptance_item_ids.contains(item_id)
+            })
+            || self
+                .acceptance_verifier_map
+                .values()
+                .flat_map(BTreeSet::iter)
+                .any(|test_id| {
+                    test_id.trim().is_empty()
+                        || test_id.chars().any(char::is_control)
+                        || !self.required_test_ids.contains(test_id)
+                })
         {
             return Err(verifier_fact_error(
                 "observed verifier invocation binding has invalid text",
             ));
         }
-        let recomputed = verifier_invocation_config_digest(
-            &self.instrument,
-            self.kind,
-            &self.profile,
-            &self.target,
-            &self.arguments,
-            &self.declared_scope,
-            &self.input_artifacts,
-            &self.required_test_ids,
-            &self.evaluator,
-            self.evaluator_version,
-        )?;
+        let recomputed = verifier_invocation_config_digest(&VerifierInvocationConfig {
+            instrument: &self.instrument,
+            kind: self.kind,
+            profile: &self.profile,
+            target: &self.target,
+            arguments: &self.arguments,
+            declared_scope: &self.declared_scope,
+            input_artifacts: &self.input_artifacts,
+            required_test_ids: &self.required_test_ids,
+            required_acceptance_item_ids: &self.required_acceptance_item_ids,
+            acceptance_verifier_map: &self.acceptance_verifier_map,
+            evaluator: &self.evaluator,
+            evaluator_version: self.evaluator_version,
+        })?;
         if recomputed != self.config_hash {
             return Err(verifier_fact_error(
                 "observed verifier invocation config hash is not exact",
@@ -1091,17 +1188,29 @@ impl CanonicalVerifierInvocationBinding {
     }
 }
 
-fn verifier_invocation_config_digest(
-    instrument: &ContractId,
+/// Exact verifier invocation shape bound by the canonical plan owner into
+/// `verifier_config_hash`.
+///
+/// Issue #325 P1: the `TaskContract` acceptance denominator and its explicit
+/// test join are part of the hashed shape, so a stale hash can never attest
+/// a substituted denominator.
+struct VerifierInvocationConfig<'a> {
+    instrument: &'a ContractId,
     kind: InstrumentKind,
-    profile: &str,
-    target: &str,
-    arguments: &[String],
-    declared_scope: &str,
-    input_artifacts: &[ArtifactId],
-    required_test_ids: &BTreeSet<String>,
-    evaluator: &ContractId,
+    profile: &'a str,
+    target: &'a str,
+    arguments: &'a [String],
+    declared_scope: &'a str,
+    input_artifacts: &'a [ArtifactId],
+    required_test_ids: &'a BTreeSet<String>,
+    required_acceptance_item_ids: &'a BTreeSet<String>,
+    acceptance_verifier_map: &'a BTreeMap<String, BTreeSet<String>>,
+    evaluator: &'a ContractId,
     evaluator_version: ContractVersion,
+}
+
+fn verifier_invocation_config_digest(
+    config: &VerifierInvocationConfig<'_>,
 ) -> Result<String, CompositionError> {
     #[derive(Serialize)]
     struct Config<'a> {
@@ -1113,20 +1222,24 @@ fn verifier_invocation_config_digest(
         declared_scope: &'a str,
         input_artifacts: &'a [ArtifactId],
         required_test_ids: &'a BTreeSet<String>,
+        required_acceptance_item_ids: &'a BTreeSet<String>,
+        acceptance_verifier_map: &'a BTreeMap<String, BTreeSet<String>>,
         evaluator: &'a ContractId,
         evaluator_version: ContractVersion,
     }
     let bytes = canonical_json_bytes(&Config {
-        instrument,
-        kind,
-        profile,
-        target,
-        arguments,
-        declared_scope,
-        input_artifacts,
-        required_test_ids,
-        evaluator,
-        evaluator_version,
+        instrument: config.instrument,
+        kind: config.kind,
+        profile: config.profile,
+        target: config.target,
+        arguments: config.arguments,
+        declared_scope: config.declared_scope,
+        input_artifacts: config.input_artifacts,
+        required_test_ids: config.required_test_ids,
+        required_acceptance_item_ids: config.required_acceptance_item_ids,
+        acceptance_verifier_map: config.acceptance_verifier_map,
+        evaluator: config.evaluator,
+        evaluator_version: config.evaluator_version,
     })
     .map_err(|error| {
         CompositionError::Recovery(format!("verifier config canonicalization failed: {error}"))
@@ -1372,14 +1485,7 @@ impl CanonicalVerifierExecutionFact {
         receipt: &VerificationReceipt,
         run: VerificationRun,
     ) -> Result<Self, CompositionError> {
-        receipt.validate(job).map_err(|error| {
-            verifier_fact_error(format!("TestD receipt validation failed: {error}"))
-        })?;
-        if !job.state.is_terminal() {
-            return Err(verifier_fact_error(
-                "TestD verifier fact requires a terminal job",
-            ));
-        }
+        check_testd_receipt_terminal(job, receipt)?;
         let receipt_binding = receipt.binding();
         if job.receipt.as_ref() != Some(&receipt_binding)
             || job.verification_receipt.as_ref() != Some(receipt)
@@ -1388,149 +1494,13 @@ impl CanonicalVerifierExecutionFact {
                 "TestD verifier receipt is not the durably retained job receipt",
             ));
         }
-        if job.execution != Some(receipt.execution)
-            || job.invocation.request.state_fence != *state_fence
-            || receipt.authority_epoch != state_fence.authority_epoch
-            || receipt.generation != state_fence.resource_generation.value()
-        {
-            return Err(verifier_fact_error(
-                "TestD receipt does not bind to the current canonical fence",
-            ));
-        }
-        if plan.task_id != *task_id || task_revision == 0 {
-            return Err(verifier_fact_error(
-                "verifier fact task or plan binding is invalid",
-            ));
-        }
-        plan.validate()?;
-        let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
-            verifier_fact_error(
-                "canonical plan has no verifier profile/config/scope/artifact binding",
-            )
-        })?;
-        if job.invocation.request.task_id.as_ref() != Some(task_id) {
-            return Err(verifier_fact_error(
-                "TestD verifier request is not bound to the canonical plan",
-            ));
-        }
-        let invocation =
-            CanonicalVerifierInvocationBinding::from_invocation(&job.invocation, verifier_plan)?;
-        if invocation.instrument != verifier_plan.instrument
-            || invocation.kind != verifier_plan.kind
-            || invocation.profile != verifier_plan.profile
-            || invocation.target != verifier_plan.target
-            || invocation.arguments != verifier_plan.arguments
-            || invocation.declared_scope != verifier_plan.declared_scope
-            || invocation.input_artifacts != verifier_plan.input_artifacts
-            || invocation.required_test_ids != verifier_plan.required_test_ids
-            || invocation.evaluator != verifier_plan.evaluator
-            || invocation.evaluator_version != verifier_plan.evaluator_version
-            || invocation.config_hash != verifier_plan.planned.verifier_config_hash
-        {
-            return Err(verifier_fact_error(
-                "observed TestD invocation is not the exact canonical plan request",
-            ));
-        }
-        run.validate().map_err(|error| {
-            verifier_fact_error(format!("VerificationRun validation failed: {error}"))
-        })?;
-        if !run.execution.is_terminal()
-            || run.state_fence != *state_fence
-            || run.invocation_id.as_str() != job.invocation.request.request_id.as_str()
-            || run.invocation_id.as_str() != receipt.invocation_id
-            || run.execution != receipt.execution
-        {
-            return Err(verifier_fact_error(
-                "VerificationRun is not the terminal TestD execution outcome",
-            ));
-        }
-        let evidence_refs: Vec<_> = run
-            .raw_evidence
-            .iter()
-            .cloned()
-            .chain(
-                run.evidence
-                    .iter()
-                    .map(|evidence| evidence.evidence_id.clone()),
-            )
-            .collect();
-        let terminal_binding = TerminalVerifierBinding {
-            planned: verifier_plan.planned.clone(),
-            evidence: VerifierEvidenceRef {
-                run_id: run.run_id.clone(),
-                verifier_id: run.verifier.clone(),
-                scope: run.scope.clone(),
-                execution: run.execution,
-                outcome: run.outcome,
-                proof_ceiling: verifier_plan.planned.proof_ceiling,
-                evidence_refs,
-            },
-        };
-        terminal_binding.validate().map_err(|error| {
-            verifier_fact_error(format!("terminal verifier binding invalid: {error}"))
-        })?;
-        if terminal_binding.evidence.run_id != run.run_id
-            || terminal_binding.evidence.verifier_id != run.verifier
-            || terminal_binding.evidence.scope != run.scope
-            || terminal_binding.evidence.execution != run.execution
-            || terminal_binding.evidence.outcome != run.outcome
-        {
-            return Err(verifier_fact_error(
-                "terminal verifier binding does not match the executed run",
-            ));
-        }
-        if terminal_binding.planned.verifier_id != verifier_plan.planned.verifier_id
-            || terminal_binding.planned.scope != verifier_plan.declared_scope
-            || terminal_binding.planned.verifier_config_hash
-                != verifier_plan.planned.verifier_config_hash
-            || terminal_binding.planned.contract_revision != verifier_plan.planned.contract_revision
-            || run.verifier != verifier_plan.evaluator
-            || run.scope != job.invocation.declared_scope
-        {
-            return Err(verifier_fact_error(
-                "terminal verifier configuration is not the canonical requested profile/revision",
-            ));
-        }
+        check_testd_receipt_fence(job, receipt, state_fence)?;
+        let verifier_plan = admitted_testd_verifier_plan(plan, task_id, task_revision, job)?;
+        let invocation = matched_testd_invocation(&job.invocation, verifier_plan)?;
+        let terminal_binding =
+            checked_testd_terminal_binding(&run, state_fence, job, receipt, verifier_plan)?;
 
-        let raw_handles: BTreeSet<String> = receipt
-            .raw_artifacts
-            .iter()
-            .map(|artifact| artifact.handle.clone())
-            .collect();
-        let run_raw_handles: BTreeSet<String> =
-            run.raw_evidence.iter().map(ToString::to_string).collect();
-        if !run_raw_handles.is_subset(&raw_handles) {
-            return Err(verifier_fact_error(
-                "VerificationRun raw evidence is outside the TestD receipt",
-            ));
-        }
-        for evidence in &run.evidence {
-            if !raw_handles.contains(evidence.raw_artifact_id.as_str()) {
-                return Err(verifier_fact_error(
-                    "normalized verifier evidence is outside the TestD receipt",
-                ));
-            }
-        }
-        let run_artifacts: BTreeSet<String> = run
-            .raw_evidence
-            .iter()
-            .map(ToString::to_string)
-            .chain(
-                run.evidence
-                    .iter()
-                    .map(|evidence| evidence.evidence_id.to_string()),
-            )
-            .collect();
-        if terminal_binding
-            .evidence
-            .evidence_refs
-            .iter()
-            .any(|reference| !run_artifacts.contains(reference.as_str()))
-        {
-            return Err(verifier_fact_error(
-                "terminal verifier evidence references an unbound artifact",
-            ));
-        }
+        check_testd_artifact_lineage(receipt, &run, &terminal_binding)?;
 
         let receipt_sha256 =
             eliot_testd_core::verification_receipt_sha256(receipt).map_err(|error| {
@@ -1584,196 +1554,11 @@ impl CanonicalVerifierExecutionFact {
 
     /// Validates the persisted fact without consulting a caller or provider.
     pub fn validate(&self, expected_fence: &StateFence) -> Result<(), CompositionError> {
-        if &self.state_fence != expected_fence
-            || self.task_id.trim().is_empty()
-            || self.task_id.chars().any(char::is_control)
-            || self.job_id.trim().is_empty()
-            || self.job_id.chars().any(char::is_control)
-            || self.task_revision == 0
-        {
-            return Err(verifier_fact_error(
-                "canonical verifier fact has an invalid task, job, or fence",
-            ));
-        }
-        self.state_fence
-            .validate()
-            .map_err(|error| verifier_fact_error(error.to_string()))?;
-        self.plan.validate()?;
-        if self.plan.task_id.as_str() != self.task_id {
-            return Err(verifier_fact_error(
-                "canonical verifier fact plan is task-mismatched",
-            ));
-        }
-        let verifier_plan = self.plan.verifier.as_ref().ok_or_else(|| {
-            verifier_fact_error("persisted verifier fact has no canonical verifier plan binding")
-        })?;
-        self.invocation.validate()?;
-        if self.invocation.instrument != verifier_plan.instrument
-            || self.invocation.kind != verifier_plan.kind
-            || self.invocation.profile != verifier_plan.profile
-            || self.invocation.target != verifier_plan.target
-            || self.invocation.arguments != verifier_plan.arguments
-            || self.invocation.declared_scope != verifier_plan.declared_scope
-            || self.invocation.input_artifacts != verifier_plan.input_artifacts
-            || self.invocation.required_test_ids != verifier_plan.required_test_ids
-            || self.invocation.evaluator != verifier_plan.evaluator
-            || self.invocation.evaluator_version != verifier_plan.evaluator_version
-            || self.invocation.config_hash != verifier_plan.planned.verifier_config_hash
-        {
-            return Err(verifier_fact_error(
-                "persisted verifier invocation does not match canonical plan config",
-            ));
-        }
-        if self.input_artifact_bindings.is_empty()
-            || self.input_artifact_bindings != verifier_plan.input_artifacts
-        {
-            return Err(verifier_fact_error(
-                "persisted verifier input artifacts are not the canonical plan artifacts",
-            ));
-        }
-        self.verification_run.validate().map_err(|error| {
-            verifier_fact_error(format!("persisted VerificationRun is invalid: {error}"))
-        })?;
-        if !self.verification_run.execution.is_terminal()
-            || self.verification_run.state_fence != *expected_fence
-        {
-            return Err(verifier_fact_error(
-                "persisted verifier run is not terminal or is stale",
-            ));
-        }
-        self.terminal_binding.validate().map_err(|error| {
-            verifier_fact_error(format!("persisted terminal binding is invalid: {error}"))
-        })?;
-        if self.terminal_binding.evidence.run_id != self.verification_run.run_id
-            || self.terminal_binding.evidence.verifier_id != self.verification_run.verifier
-            || self.terminal_binding.evidence.scope != self.verification_run.scope
-            || self.terminal_binding.evidence.execution != self.verification_run.execution
-            || self.terminal_binding.evidence.outcome != self.verification_run.outcome
-        {
-            return Err(verifier_fact_error(
-                "persisted terminal binding does not match the run",
-            ));
-        }
-        validate_canonical_receipt_binding(&self.receipt, &self.state_fence)?;
-        match &self.source_observation {
-            Some(observation) => observation.validate(&self.receipt.source_root)?,
-            None if self.receipt.execution == ExecutionStatus::Succeeded => {
-                return Err(verifier_fact_error(
-                    "successful verifier fact lacks an observed source identity",
-                ));
-            }
-            None => {}
-        }
-        if self.receipt.job_id != self.job_id
-            || self.receipt.invocation_id != self.verification_run.invocation_id.as_str()
-            || self.receipt.execution != self.verification_run.execution
-        {
-            return Err(verifier_fact_error(
-                "persisted receipt binding does not match the run",
-            ));
-        }
-        if self.verification_run.verifier != verifier_plan.evaluator
-            || self.verification_run.scope != self.invocation.declared_scope
-            || self.verification_run.invocation_id.as_str() != self.receipt.invocation_id
-        {
-            return Err(verifier_fact_error(
-                "persisted verifier run is not bound to the admitted evaluator invocation",
-            ));
-        }
-        let mut handles = BTreeSet::new();
-        for artifact in &self.raw_artifact_bindings {
-            if artifact.handle.trim().is_empty()
-                || artifact.content_type.trim().is_empty()
-                || artifact.handle.chars().any(char::is_control)
-                || artifact.content_type.chars().any(char::is_control)
-                || artifact.sha256.len() != 64
-                || artifact
-                    .sha256
-                    .bytes()
-                    .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-                || !handles.insert(artifact.handle.clone())
-            {
-                return Err(verifier_fact_error(
-                    "persisted verifier artifact binding is invalid or duplicated",
-                ));
-            }
-        }
-        let run_artifacts: BTreeSet<String> = self
-            .verification_run
-            .raw_evidence
-            .iter()
-            .map(ToString::to_string)
-            .chain(
-                self.verification_run
-                    .evidence
-                    .iter()
-                    .map(|evidence| evidence.evidence_id.to_string()),
-            )
-            .collect();
-        if self
-            .verification_run
-            .raw_evidence
-            .iter()
-            .any(|reference| !handles.contains(reference.as_str()))
-            || self
-                .verification_run
-                .evidence
-                .iter()
-                .any(|evidence| !handles.contains(evidence.raw_artifact_id.as_str()))
-            || self
-                .terminal_binding
-                .evidence
-                .evidence_refs
-                .iter()
-                .any(|reference| !run_artifacts.contains(reference.as_str()))
-        {
-            return Err(verifier_fact_error(
-                "persisted verifier artifact lineage is not exact",
-            ));
-        }
-        for evidence in &self.verification_run.evidence {
-            let Some(raw_handles) = evidence.value.get("raw_artifact_handles") else {
-                continue;
-            };
-            let raw_handles = raw_handles.as_array().ok_or_else(|| {
-                verifier_fact_error("normalized evidence raw_artifact_handles is not an array")
-            })?;
-            let mut seen_raw_handles = BTreeSet::new();
-            for raw_handle in raw_handles {
-                let raw_handle = raw_handle.as_str().ok_or_else(|| {
-                    verifier_fact_error(
-                        "normalized evidence raw_artifact_handles contains a non-string value",
-                    )
-                })?;
-                if !handles.contains(raw_handle) || !seen_raw_handles.insert(raw_handle) {
-                    return Err(verifier_fact_error(
-                        "normalized evidence names an unbound or duplicate raw artifact",
-                    ));
-                }
-            }
-        }
-        if !matches!(
-            self.job_state.as_str(),
-            "succeeded" | "failed" | "cancelled" | "quarantined"
-        ) {
-            return Err(verifier_fact_error(
-                "persisted verifier fact does not identify a terminal TestD job",
-            ));
-        }
-        if self.effect_reference_bindings.len() != 1
-            || self.effect_reference_bindings.iter().any(|effect| {
-                effect.validate(&self.task_id, expected_fence).is_err()
-                    || effect.receipt_sha256 != self.receipt.receipt_sha256
-                    || effect.job_id != self.receipt.job_id
-                    || effect.operation_id != self.receipt.operation_id
-                    || effect.process_tree_id != self.receipt.process_tree_id
-                    || effect.execution != self.receipt.execution
-            })
-        {
-            return Err(verifier_fact_error(
-                "persisted verifier fact does not join its exact TestD effect receipt",
-            ));
-        }
+        let verifier_plan = checked_fact_identity_and_plan(self, expected_fence)?;
+        check_fact_invocation_matches_plan(self, verifier_plan)?;
+        check_fact_run_and_receipt(self, expected_fence, verifier_plan)?;
+        check_fact_artifact_lineage(self)?;
+        check_fact_terminal_effect_join(self, expected_fence)?;
         Ok(())
     }
 
@@ -1815,9 +1600,455 @@ impl CanonicalVerifierExecutionFact {
     }
 }
 
+/// Rejects a receipt that fails owner validation or a non-terminal job.
+fn check_testd_receipt_terminal(
+    job: &TestJob,
+    receipt: &VerificationReceipt,
+) -> Result<(), CompositionError> {
+    receipt.validate(job).map_err(|error| {
+        verifier_fact_error(format!("TestD receipt validation failed: {error}"))
+    })?;
+    if !job.state.is_terminal() {
+        return Err(verifier_fact_error(
+            "TestD verifier fact requires a terminal job",
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects a receipt that does not bind the current canonical fence.
+fn check_testd_receipt_fence(
+    job: &TestJob,
+    receipt: &VerificationReceipt,
+    state_fence: &StateFence,
+) -> Result<(), CompositionError> {
+    if job.execution != Some(receipt.execution)
+        || job.invocation.request.state_fence != *state_fence
+        || receipt.authority_epoch != state_fence.authority_epoch
+        || receipt.generation != state_fence.resource_generation.value()
+    {
+        return Err(verifier_fact_error(
+            "TestD receipt does not bind to the current canonical fence",
+        ));
+    }
+    Ok(())
+}
+
+/// Admits the canonical verifier plan for one task revision and binds the
+/// `TestD` request to it. Returns the borrowed verifier plan binding.
+fn admitted_testd_verifier_plan<'a>(
+    plan: &'a CanonicalPlanBinding,
+    task_id: &TaskId,
+    task_revision: u64,
+    job: &TestJob,
+) -> Result<&'a CanonicalVerifierPlanBinding, CompositionError> {
+    if plan.task_id != *task_id || task_revision == 0 {
+        return Err(verifier_fact_error(
+            "verifier fact task or plan binding is invalid",
+        ));
+    }
+    plan.validate()?;
+    let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
+        verifier_fact_error("canonical plan has no verifier profile/config/scope/artifact binding")
+    })?;
+    if job.invocation.request.task_id.as_ref() != Some(task_id) {
+        return Err(verifier_fact_error(
+            "TestD verifier request is not bound to the canonical plan",
+        ));
+    }
+    Ok(verifier_plan)
+}
+
+/// Whether the observed invocation equals the exact canonical plan request,
+/// including the plan-bound `TaskContract` acceptance denominator and its
+/// explicit test join (issue #325 P1, I7.9).
+fn verifier_invocation_matches_plan(
+    invocation: &CanonicalVerifierInvocationBinding,
+    verifier_plan: &CanonicalVerifierPlanBinding,
+) -> bool {
+    invocation.instrument == verifier_plan.instrument
+        && invocation.kind == verifier_plan.kind
+        && invocation.profile == verifier_plan.profile
+        && invocation.target == verifier_plan.target
+        && invocation.arguments == verifier_plan.arguments
+        && invocation.declared_scope == verifier_plan.declared_scope
+        && invocation.input_artifacts == verifier_plan.input_artifacts
+        && invocation.required_test_ids == verifier_plan.required_test_ids
+        && invocation.required_acceptance_item_ids == verifier_plan.required_acceptance_item_ids
+        && invocation.acceptance_verifier_map == verifier_plan.acceptance_verifier_map
+        && invocation.evaluator == verifier_plan.evaluator
+        && invocation.evaluator_version == verifier_plan.evaluator_version
+        && invocation.config_hash == verifier_plan.planned.verifier_config_hash
+}
+
+/// Rebuilds the observed invocation binding and requires it to equal the
+/// exact canonical plan request.
+fn matched_testd_invocation(
+    job_invocation: &InstrumentInvocation,
+    verifier_plan: &CanonicalVerifierPlanBinding,
+) -> Result<CanonicalVerifierInvocationBinding, CompositionError> {
+    let invocation =
+        CanonicalVerifierInvocationBinding::from_invocation(job_invocation, verifier_plan)?;
+    if !verifier_invocation_matches_plan(&invocation, verifier_plan) {
+        return Err(verifier_fact_error(
+            "observed TestD invocation is not the exact canonical plan request",
+        ));
+    }
+    Ok(invocation)
+}
+
+/// Validates the terminal execution outcome and builds its canonical binding.
+fn checked_testd_terminal_binding(
+    run: &VerificationRun,
+    state_fence: &StateFence,
+    job: &TestJob,
+    receipt: &VerificationReceipt,
+    verifier_plan: &CanonicalVerifierPlanBinding,
+) -> Result<TerminalVerifierBinding, CompositionError> {
+    run.validate().map_err(|error| {
+        verifier_fact_error(format!("VerificationRun validation failed: {error}"))
+    })?;
+    if !run.execution.is_terminal()
+        || run.state_fence != *state_fence
+        || run.invocation_id.as_str() != job.invocation.request.request_id.as_str()
+        || run.invocation_id.as_str() != receipt.invocation_id
+        || run.execution != receipt.execution
+    {
+        return Err(verifier_fact_error(
+            "VerificationRun is not the terminal TestD execution outcome",
+        ));
+    }
+    let evidence_refs: Vec<_> = run
+        .raw_evidence
+        .iter()
+        .cloned()
+        .chain(
+            run.evidence
+                .iter()
+                .map(|evidence| evidence.evidence_id.clone()),
+        )
+        .collect();
+    let terminal_binding = TerminalVerifierBinding {
+        planned: verifier_plan.planned.clone(),
+        evidence: VerifierEvidenceRef {
+            run_id: run.run_id.clone(),
+            verifier_id: run.verifier.clone(),
+            scope: run.scope.clone(),
+            execution: run.execution,
+            outcome: run.outcome,
+            proof_ceiling: verifier_plan.planned.proof_ceiling,
+            evidence_refs,
+        },
+    };
+    terminal_binding.validate().map_err(|error| {
+        verifier_fact_error(format!("terminal verifier binding invalid: {error}"))
+    })?;
+    if terminal_binding.evidence.run_id != run.run_id
+        || terminal_binding.evidence.verifier_id != run.verifier
+        || terminal_binding.evidence.scope != run.scope
+        || terminal_binding.evidence.execution != run.execution
+        || terminal_binding.evidence.outcome != run.outcome
+    {
+        return Err(verifier_fact_error(
+            "terminal verifier binding does not match the executed run",
+        ));
+    }
+    if terminal_binding.planned.verifier_id != verifier_plan.planned.verifier_id
+        || terminal_binding.planned.scope != verifier_plan.declared_scope
+        || terminal_binding.planned.verifier_config_hash
+            != verifier_plan.planned.verifier_config_hash
+        || terminal_binding.planned.contract_revision != verifier_plan.planned.contract_revision
+        || run.verifier != verifier_plan.evaluator
+        || run.scope != job.invocation.declared_scope
+    {
+        return Err(verifier_fact_error(
+            "terminal verifier configuration is not the canonical requested profile/revision",
+        ));
+    }
+    Ok(terminal_binding)
+}
+
+/// Requires the run's raw and normalized evidence to stay inside the `TestD`
+/// receipt lineage bound by the terminal binding.
+fn check_testd_artifact_lineage(
+    receipt: &VerificationReceipt,
+    run: &VerificationRun,
+    terminal_binding: &TerminalVerifierBinding,
+) -> Result<(), CompositionError> {
+    let raw_handles: BTreeSet<String> = receipt
+        .raw_artifacts
+        .iter()
+        .map(|artifact| artifact.handle.clone())
+        .collect();
+    let run_raw_handles: BTreeSet<String> =
+        run.raw_evidence.iter().map(ToString::to_string).collect();
+    if !run_raw_handles.is_subset(&raw_handles) {
+        return Err(verifier_fact_error(
+            "VerificationRun raw evidence is outside the TestD receipt",
+        ));
+    }
+    for evidence in &run.evidence {
+        if !raw_handles.contains(evidence.raw_artifact_id.as_str()) {
+            return Err(verifier_fact_error(
+                "normalized verifier evidence is outside the TestD receipt",
+            ));
+        }
+    }
+    let run_artifacts: BTreeSet<String> = run
+        .raw_evidence
+        .iter()
+        .map(ToString::to_string)
+        .chain(
+            run.evidence
+                .iter()
+                .map(|evidence| evidence.evidence_id.to_string()),
+        )
+        .collect();
+    if terminal_binding
+        .evidence
+        .evidence_refs
+        .iter()
+        .any(|reference| !run_artifacts.contains(reference.as_str()))
+    {
+        return Err(verifier_fact_error(
+            "terminal verifier evidence references an unbound artifact",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates fact identity, fence, plan admission, and the observed
+/// invocation shape. Returns the borrowed verifier plan binding.
+fn checked_fact_identity_and_plan<'a>(
+    fact: &'a CanonicalVerifierExecutionFact,
+    expected_fence: &StateFence,
+) -> Result<&'a CanonicalVerifierPlanBinding, CompositionError> {
+    if &fact.state_fence != expected_fence
+        || fact.task_id.trim().is_empty()
+        || fact.task_id.chars().any(char::is_control)
+        || fact.job_id.trim().is_empty()
+        || fact.job_id.chars().any(char::is_control)
+        || fact.task_revision == 0
+    {
+        return Err(verifier_fact_error(
+            "canonical verifier fact has an invalid task, job, or fence",
+        ));
+    }
+    fact.state_fence
+        .validate()
+        .map_err(|error| verifier_fact_error(error.to_string()))?;
+    fact.plan.validate()?;
+    if fact.plan.task_id.as_str() != fact.task_id {
+        return Err(verifier_fact_error(
+            "canonical verifier fact plan is task-mismatched",
+        ));
+    }
+    let verifier_plan = fact.plan.verifier.as_ref().ok_or_else(|| {
+        verifier_fact_error("persisted verifier fact has no canonical verifier plan binding")
+    })?;
+    fact.invocation.validate()?;
+    Ok(verifier_plan)
+}
+
+/// Requires the persisted invocation to equal the canonical plan config,
+/// including the acceptance denominator and test join (issue #325 P1, I7.9).
+fn check_fact_invocation_matches_plan(
+    fact: &CanonicalVerifierExecutionFact,
+    verifier_plan: &CanonicalVerifierPlanBinding,
+) -> Result<(), CompositionError> {
+    if !verifier_invocation_matches_plan(&fact.invocation, verifier_plan) {
+        return Err(verifier_fact_error(
+            "persisted verifier invocation does not match canonical plan config",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates input artifacts, the terminal run, its binding, and the exact
+/// `TestD` receipt/source join.
+fn check_fact_run_and_receipt(
+    fact: &CanonicalVerifierExecutionFact,
+    expected_fence: &StateFence,
+    verifier_plan: &CanonicalVerifierPlanBinding,
+) -> Result<(), CompositionError> {
+    if fact.input_artifact_bindings.is_empty()
+        || fact.input_artifact_bindings != verifier_plan.input_artifacts
+    {
+        return Err(verifier_fact_error(
+            "persisted verifier input artifacts are not the canonical plan artifacts",
+        ));
+    }
+    fact.verification_run.validate().map_err(|error| {
+        verifier_fact_error(format!("persisted VerificationRun is invalid: {error}"))
+    })?;
+    if !fact.verification_run.execution.is_terminal()
+        || fact.verification_run.state_fence != *expected_fence
+    {
+        return Err(verifier_fact_error(
+            "persisted verifier run is not terminal or is stale",
+        ));
+    }
+    fact.terminal_binding.validate().map_err(|error| {
+        verifier_fact_error(format!("persisted terminal binding is invalid: {error}"))
+    })?;
+    if fact.terminal_binding.evidence.run_id != fact.verification_run.run_id
+        || fact.terminal_binding.evidence.verifier_id != fact.verification_run.verifier
+        || fact.terminal_binding.evidence.scope != fact.verification_run.scope
+        || fact.terminal_binding.evidence.execution != fact.verification_run.execution
+        || fact.terminal_binding.evidence.outcome != fact.verification_run.outcome
+    {
+        return Err(verifier_fact_error(
+            "persisted terminal binding does not match the run",
+        ));
+    }
+    validate_canonical_receipt_binding(&fact.receipt, &fact.state_fence)?;
+    match &fact.source_observation {
+        Some(observation) => observation.validate(&fact.receipt.source_root)?,
+        None if fact.receipt.execution == ExecutionStatus::Succeeded => {
+            return Err(verifier_fact_error(
+                "successful verifier fact lacks an observed source identity",
+            ));
+        }
+        None => {}
+    }
+    if fact.receipt.job_id != fact.job_id
+        || fact.receipt.invocation_id != fact.verification_run.invocation_id.as_str()
+        || fact.receipt.execution != fact.verification_run.execution
+    {
+        return Err(verifier_fact_error(
+            "persisted receipt binding does not match the run",
+        ));
+    }
+    if fact.verification_run.verifier != verifier_plan.evaluator
+        || fact.verification_run.scope != fact.invocation.declared_scope
+        || fact.verification_run.invocation_id.as_str() != fact.receipt.invocation_id
+    {
+        return Err(verifier_fact_error(
+            "persisted verifier run is not bound to the admitted evaluator invocation",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates raw artifact bindings and the exact artifact lineage join.
+fn check_fact_artifact_lineage(
+    fact: &CanonicalVerifierExecutionFact,
+) -> Result<(), CompositionError> {
+    let mut handles = BTreeSet::new();
+    for artifact in &fact.raw_artifact_bindings {
+        if artifact.handle.trim().is_empty()
+            || artifact.content_type.trim().is_empty()
+            || artifact.handle.chars().any(char::is_control)
+            || artifact.content_type.chars().any(char::is_control)
+            || artifact.sha256.len() != 64
+            || artifact
+                .sha256
+                .bytes()
+                .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            || !handles.insert(artifact.handle.clone())
+        {
+            return Err(verifier_fact_error(
+                "persisted verifier artifact binding is invalid or duplicated",
+            ));
+        }
+    }
+    let run_artifacts: BTreeSet<String> = fact
+        .verification_run
+        .raw_evidence
+        .iter()
+        .map(ToString::to_string)
+        .chain(
+            fact.verification_run
+                .evidence
+                .iter()
+                .map(|evidence| evidence.evidence_id.to_string()),
+        )
+        .collect();
+    if fact
+        .verification_run
+        .raw_evidence
+        .iter()
+        .any(|reference| !handles.contains(reference.as_str()))
+        || fact
+            .verification_run
+            .evidence
+            .iter()
+            .any(|evidence| !handles.contains(evidence.raw_artifact_id.as_str()))
+        || fact
+            .terminal_binding
+            .evidence
+            .evidence_refs
+            .iter()
+            .any(|reference| !run_artifacts.contains(reference.as_str()))
+    {
+        return Err(verifier_fact_error(
+            "persisted verifier artifact lineage is not exact",
+        ));
+    }
+    for evidence in &fact.verification_run.evidence {
+        let Some(raw_handles) = evidence.value.get("raw_artifact_handles") else {
+            continue;
+        };
+        let raw_handles = raw_handles.as_array().ok_or_else(|| {
+            verifier_fact_error("normalized evidence raw_artifact_handles is not an array")
+        })?;
+        let mut seen_raw_handles = BTreeSet::new();
+        for raw_handle in raw_handles {
+            let raw_handle = raw_handle.as_str().ok_or_else(|| {
+                verifier_fact_error(
+                    "normalized evidence raw_artifact_handles contains a non-string value",
+                )
+            })?;
+            if !handles.contains(raw_handle) || !seen_raw_handles.insert(raw_handle) {
+                return Err(verifier_fact_error(
+                    "normalized evidence names an unbound or duplicate raw artifact",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Requires a terminal job state and the exact single `TestD` effect receipt
+/// join.
+fn check_fact_terminal_effect_join(
+    fact: &CanonicalVerifierExecutionFact,
+    expected_fence: &StateFence,
+) -> Result<(), CompositionError> {
+    if !matches!(
+        fact.job_state.as_str(),
+        "succeeded" | "failed" | "cancelled" | "quarantined"
+    ) {
+        return Err(verifier_fact_error(
+            "persisted verifier fact does not identify a terminal TestD job",
+        ));
+    }
+    if fact.effect_reference_bindings.len() != 1
+        || fact.effect_reference_bindings.iter().any(|effect| {
+            effect.validate(&fact.task_id, expected_fence).is_err()
+                || effect.receipt_sha256 != fact.receipt.receipt_sha256
+                || effect.job_id != fact.receipt.job_id
+                || effect.operation_id != fact.receipt.operation_id
+                || effect.process_tree_id != fact.receipt.process_tree_id
+                || effect.execution != fact.receipt.execution
+        })
+    {
+        return Err(verifier_fact_error(
+            "persisted verifier fact does not join its exact TestD effect receipt",
+        ));
+    }
+    Ok(())
+}
+
 /// Rebuilds acceptance dispositions from the terminal verifier evidence and
 /// canonical plan. Persisted `satisfied` flags are never an independent
 /// source of acceptance truth.
+///
+/// I7.9 / issue #325 P1: the denominator is the plan-bound `TaskContract`
+/// acceptance set (`required_acceptance_item_ids`), never the selected
+/// `required_test_ids` inventory. Every required item is enumerated before
+/// any verifier evidence is joined; unmapped items stay uncovered and can
+/// never yield `VERIFIED_COMPLETE` downstream.
 pub(crate) fn acceptance_coverage_from_verifier_fact(
     fact: &CanonicalVerifierExecutionFact,
 ) -> Result<Vec<AcceptanceCoverage>, CompositionError> {
@@ -1831,38 +2062,64 @@ pub(crate) fn acceptance_coverage_from_verifier_fact(
             | EvidenceFreshness::ExactCommit
             | EvidenceFreshness::ExactQuiescedWorktree
     );
-    let mut acceptance = Vec::with_capacity(verifier_plan.required_test_ids.len());
-    for item_id in &verifier_plan.required_test_ids {
-        let item_events = fact
-            .verification_run
-            .evidence
-            .iter()
-            .filter(|event| {
-                event
-                    .value
-                    .get("nextest_test_id")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(item_id.as_str())
-            })
-            .collect::<Vec<_>>();
+    let mut acceptance = Vec::with_capacity(verifier_plan.required_acceptance_item_ids.len());
+    for item_id in &verifier_plan.required_acceptance_item_ids {
+        // Explicit acceptance-to-test join owned by the canonical plan. A
+        // missing entry is an unmapped obligation; an empty test set declares
+        // a non-test obligation that executed verifier runs alone cannot
+        // satisfy. Neither form shrinks the denominator to the test list.
+        let mapped = verifier_plan
+            .acceptance_verifier_map
+            .get(item_id)
+            .cloned()
+            .unwrap_or_default();
         let mut evidence_refs = BTreeSet::new();
-        for event in &item_events {
-            evidence_refs.insert(event.evidence_id.to_string());
-            evidence_refs.insert(event.raw_artifact_id.to_string());
-            if let Some(handles) = event
-                .value
-                .get("raw_artifact_handles")
-                .and_then(serde_json::Value::as_array)
-            {
-                evidence_refs.extend(
-                    handles
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .map(str::to_owned),
-                );
+        let mut mapped_events = 0_usize;
+        let mut all_mapped_observed = true;
+        let mut all_pass = true;
+        for test_id in &mapped {
+            let test_events = fact
+                .verification_run
+                .evidence
+                .iter()
+                .filter(|event| {
+                    event
+                        .value
+                        .get("nextest_test_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(test_id.as_str())
+                })
+                .collect::<Vec<_>>();
+            if test_events.is_empty() {
+                all_mapped_observed = false;
+            }
+            for event in test_events {
+                mapped_events += 1;
+                evidence_refs.insert(event.evidence_id.to_string());
+                evidence_refs.insert(event.raw_artifact_id.to_string());
+                if let Some(handles) = event
+                    .value
+                    .get("raw_artifact_handles")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    evidence_refs.extend(
+                        handles
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                    );
+                }
+                if event
+                    .value
+                    .get("nextest_status")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("PASS")
+                {
+                    all_pass = false;
+                }
             }
         }
-        if item_events.is_empty() {
+        if mapped_events == 0 {
             // Keep the negative item disposition tied to the actual raw run
             // artifacts inspected; never mint a placeholder item receipt.
             evidence_refs.extend(
@@ -1872,26 +2129,30 @@ pub(crate) fn acceptance_coverage_from_verifier_fact(
                     .map(ToString::to_string),
             );
         }
-        let satisfied = run_is_current
-            && !item_events.is_empty()
-            && item_events.iter().all(|event| {
-                event
-                    .value
-                    .get("nextest_status")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("PASS")
-            });
-        let verifier_run_refs = if item_events.is_empty() {
+        // An item is satisfied only for a current run where every bound test
+        // executed and every bound execution passed. Failed, stale,
+        // not-executed, simulated (non-productive, hence non-certifying and
+        // stale-marked upstream), unmapped, and non-test obligations stay
+        // uncovered here and fail closed in `derive_finish_decision`.
+        let satisfied = run_is_current && !mapped.is_empty() && all_mapped_observed && all_pass;
+        let verifier_run_refs = if mapped_events == 0 {
             Vec::new()
         } else {
             vec![run_ref.clone()]
         };
+        // Only an explicit empty mapping declares a non-test obligation that
+        // does not require a verifier run. A missing mapping stays a
+        // verifier gap so absent coverage fails closed downstream.
+        let requires_verifier = !matches!(
+            verifier_plan.acceptance_verifier_map.get(item_id),
+            Some(tests) if tests.is_empty()
+        );
         acceptance.push(AcceptanceCoverage {
             item_id: item_id.clone(),
             satisfied,
             evidence_refs: evidence_refs.into_iter().collect(),
             verifier_run_refs,
-            requires_verifier: true,
+            requires_verifier,
         });
     }
     Ok(acceptance)
