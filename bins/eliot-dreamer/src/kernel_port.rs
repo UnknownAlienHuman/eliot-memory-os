@@ -70,11 +70,11 @@ use eliot_process::{
 };
 use eliot_process_executor::DispatchValidationPort;
 use eliot_protocol::RequestIdentity;
+use eliot_protocol::dreamer_job::JobState as ProtocolJobState;
 use eliot_protocol::dreamer_job::{
     DurableJobError, DurableJobRequest, DurableJobResponse, DurableRequestIdentity, JobOperation,
     JobRole,
 };
-use eliot_protocol::dreamer_job::JobState as ProtocolJobState;
 
 /// Stable session module identity of the one-shot Dreamer worker.
 ///
@@ -243,7 +243,9 @@ pub(crate) enum KernelPortError {
     #[error("dreamer dispatch material violates the closed contract: {0}")]
     InvalidMaterial(String),
     /// The presented epoch disagrees with the live authority epoch.
-    #[error("dreamer dispatch material epoch is foreign or stale: presented {presented}, live {live}")]
+    #[error(
+        "dreamer dispatch material epoch is foreign or stale: presented {presented}, live {live}"
+    )]
     StaleEpoch {
         /// Presented epoch value.
         presented: String,
@@ -317,9 +319,7 @@ pub(crate) fn live_epoch_from_health(
     health: &serde_json::Value,
 ) -> Result<EpochId, KernelPortError> {
     let epoch_value = health.get("authority_epoch").ok_or_else(|| {
-        KernelPortError::Contract(
-            "kernel health reply carries no live authority epoch".to_owned(),
-        )
+        KernelPortError::Contract("kernel health reply carries no live authority epoch".to_owned())
     })?;
     serde_json::from_value(epoch_value.clone()).map_err(|_| {
         KernelPortError::Contract(
@@ -451,7 +451,12 @@ fn validate_envelope(
         .validate_for_launch(
             &envelope.job_id,
             &envelope.attempt_id,
-            envelope.admitted_curation.request.binding.request_id.as_str(),
+            envelope
+                .admitted_curation
+                .request
+                .binding
+                .request_id
+                .as_str(),
             envelope.admitted_curation.admission.operation_id.as_str(),
             &envelope.grant.idempotency_key,
             &envelope.scope_id,
@@ -633,9 +638,7 @@ impl DreamerDispatchAuthority {
         let permit = self
             .authority
             .lock()
-            .map_err(|_| {
-                KernelPortError::Contract("dreamer authority lock poisoned".to_owned())
-            })?
+            .map_err(|_| KernelPortError::Contract("dreamer authority lock poisoned".to_owned()))?
             .issue(intent, issuance)
             .map_err(&invalid)?;
         let context = DispatchValidationContext::new(
@@ -654,9 +657,8 @@ impl DreamerDispatchAuthority {
         *self
             .context
             .lock()
-            .map_err(|_| {
-                KernelPortError::Contract("dreamer context lock poisoned".to_owned())
-            })? = Some(context);
+            .map_err(|_| KernelPortError::Contract("dreamer context lock poisoned".to_owned()))? =
+            Some(context);
         ProcessRequest::new(intent.clone(), permit).map_err(invalid)
     }
 }
@@ -1004,9 +1006,8 @@ fn lease_exact_request(
     operation_id: &str,
     now_unix_ms: u64,
 ) -> Result<DurableJobRequest, KernelPortError> {
-    let contract = |error: DurableJobError| {
-        KernelPortError::Contract(truncate_detail(&error.to_string()))
-    };
+    let contract =
+        |error: DurableJobError| KernelPortError::Contract(truncate_detail(&error.to_string()));
     let fence_json = serde_json::to_value(&material.fence)
         .map_err(|error| KernelPortError::Contract(truncate_detail(&error.to_string())))?;
     let operation_value = serde_json::json!({
@@ -1072,9 +1073,8 @@ fn start_request(
     operation_id: &str,
     now_unix_ms: u64,
 ) -> Result<DurableJobRequest, KernelPortError> {
-    let contract = |error: DurableJobError| {
-        KernelPortError::Contract(truncate_detail(&error.to_string()))
-    };
+    let contract =
+        |error: DurableJobError| KernelPortError::Contract(truncate_detail(&error.to_string()));
     let fence_json = serde_json::to_value(&material.fence)
         .map_err(|error| KernelPortError::Contract(truncate_detail(&error.to_string())))?;
     let operation = JobOperation::Start {
@@ -1129,9 +1129,8 @@ fn status_request(
     operation_id: &str,
     now_unix_ms: u64,
 ) -> Result<DurableJobRequest, KernelPortError> {
-    let contract = |error: DurableJobError| {
-        KernelPortError::Contract(truncate_detail(&error.to_string()))
-    };
+    let contract =
+        |error: DurableJobError| KernelPortError::Contract(truncate_detail(&error.to_string()));
     let fence_json = serde_json::to_value(&material.fence)
         .map_err(|error| KernelPortError::Contract(truncate_detail(&error.to_string())))?;
     let operation_value = serde_json::json!({
@@ -1194,17 +1193,14 @@ fn dreamer_payload(
     let now_i64 = i64::try_from(now_unix_ms)
         .map_err(|_| KernelPortError::Contract("dreamer clock is out of range".to_owned()))?;
     let context = RequestMetadata {
-        request_id: RequestId::new(context_id).map_err(|error| {
-            KernelPortError::Contract(truncate_detail(&error.to_string()))
-        })?,
+        request_id: RequestId::new(context_id)
+            .map_err(|error| KernelPortError::Contract(truncate_detail(&error.to_string())))?,
         session_id: None,
         task_id: None,
-        product_id: ProductId::new(CLAIM_PRODUCT_ID).map_err(|error| {
-            KernelPortError::Contract(truncate_detail(&error.to_string()))
-        })?,
-        source_id: SourceId::new(CLAIM_SOURCE_ID).map_err(|error| {
-            KernelPortError::Contract(truncate_detail(&error.to_string()))
-        })?,
+        product_id: ProductId::new(CLAIM_PRODUCT_ID)
+            .map_err(|error| KernelPortError::Contract(truncate_detail(&error.to_string())))?,
+        source_id: SourceId::new(CLAIM_SOURCE_ID)
+            .map_err(|error| KernelPortError::Contract(truncate_detail(&error.to_string())))?,
         state_fence: fence,
         clock: ClockReading {
             valid_time_ms: Some(now_i64),
@@ -1314,11 +1310,7 @@ pub(crate) fn status_once<T: ClaimTransport>(
     let now_unix_ms = unix_ms()?;
     let request = status_request(material, &operation_id, now_unix_ms)?;
     transport.bind_identity(&material.fence, &operation_id)?;
-    let payload = dreamer_payload(
-        &request,
-        &format!("{operation_id}-ctx"),
-        now_unix_ms,
-    )?;
+    let payload = dreamer_payload(&request, &format!("{operation_id}-ctx"), now_unix_ms)?;
     let reply = transport.transact(DREAMER_JOB_WIRE_ID, payload)?;
     checked_response(reply, &request)
 }
@@ -1333,7 +1325,8 @@ mod tests {
 
     fn test_epoch(sequence: u64) -> Result<EpochId, String> {
         let lineage = EpochLineageId::new(TEST_LINEAGE).map_err(|error| error.to_string())?;
-        let sequence = NonZeroU64::new(sequence).ok_or_else(|| "test sequence is zero".to_owned())?;
+        let sequence =
+            NonZeroU64::new(sequence).ok_or_else(|| "test sequence is zero".to_owned())?;
         EpochId::new(lineage, sequence).map_err(|error| error.to_string())
     }
 
@@ -1412,17 +1405,16 @@ mod tests {
             }
         }
 
-        fn submitted_request(
-            payload: &serde_json::Value,
-        ) -> Result<DurableJobRequest, String> {
+        fn submitted_request(payload: &serde_json::Value) -> Result<DurableJobRequest, String> {
             if payload.get("operation").and_then(serde_json::Value::as_str)
                 != Some(DREAMER_JOB_WIRE_ID)
             {
                 return Err("fake transport admits only the dreamer job wire".to_owned());
             }
-            let request_value = payload.get("request").cloned().ok_or_else(|| {
-                "fake transport payload carries no typed request".to_owned()
-            })?;
+            let request_value = payload
+                .get("request")
+                .cloned()
+                .ok_or_else(|| "fake transport payload carries no typed request".to_owned())?;
             let request: DurableJobRequest =
                 serde_json::from_value(request_value).map_err(|error| error.to_string())?;
             request.validate().map_err(|error| error.to_string())?;
@@ -1461,10 +1453,12 @@ mod tests {
             }))
         }
 
-        fn lease_projection(&self, request: &DurableJobRequest) -> Result<serde_json::Value, String> {
-            let fence_json =
-                serde_json::to_value(&request.request_identity.operation.state_fence)
-                    .map_err(|error| error.to_string())?;
+        fn lease_projection(
+            &self,
+            request: &DurableJobRequest,
+        ) -> Result<serde_json::Value, String> {
+            let fence_json = serde_json::to_value(&request.request_identity.operation.state_fence)
+                .map_err(|error| error.to_string())?;
             Ok(serde_json::json!({
                 "job_id": "dreamer-job-1",
                 "attempt_id": "dreamer-attempt-1",
@@ -1504,11 +1498,11 @@ mod tests {
             let JobOperation::Start { lease, .. } = &request.operation else {
                 return Err("fake transport start requires the claimed lease".to_owned());
             };
-            let lease_json =
-                serde_json::to_value(lease).map_err(|error| error.to_string())?;
+            let lease_json = serde_json::to_value(lease).map_err(|error| error.to_string())?;
             let mut response = Self::lease_json(request, &lease_json)?;
             response["state"] = serde_json::Value::String("RUNNING".to_owned());
-            response["receipt_id"] = serde_json::Value::String("dreamer-receipt-start01".to_owned());
+            response["receipt_id"] =
+                serde_json::Value::String("dreamer-receipt-start01".to_owned());
             Ok(response)
         }
     }
@@ -1538,15 +1532,21 @@ mod tests {
             let kind_name = kind.as_str().to_owned();
             if kind == eliot_protocol::dreamer_job::JobOperationKind::LeaseExact {
                 if self.calls.iter().any(|call| call == "LEASE_EXACT") {
-                    return Err(denied("fake transport refuses a second worker claim".to_owned()));
+                    return Err(denied(
+                        "fake transport refuses a second worker claim".to_owned(),
+                    ));
                 }
             } else if kind == eliot_protocol::dreamer_job::JobOperationKind::Start {
                 if !self.calls.iter().any(|call| call == "LEASE_EXACT") {
-                    return Err(denied("fake transport refuses Start before LeaseExact".to_owned()));
+                    return Err(denied(
+                        "fake transport refuses Start before LeaseExact".to_owned(),
+                    ));
                 }
             } else if kind == eliot_protocol::dreamer_job::JobOperationKind::Status {
                 if !self.calls.iter().any(|call| call == "START_JOB") {
-                    return Err(denied("fake transport refuses Status before Start".to_owned()));
+                    return Err(denied(
+                        "fake transport refuses Status before Start".to_owned(),
+                    ));
                 }
             } else {
                 return Err(denied(
@@ -1580,12 +1580,14 @@ mod tests {
         if path.exists() {
             return Err("validated presentation must be consumed once".to_owned());
         }
-        if material.job_id != "dreamer-job-1" || material.nonce != "dreamer-dispatch-abcdef0123456789" {
+        if material.job_id != "dreamer-job-1"
+            || material.nonce != "dreamer-dispatch-abcdef0123456789"
+        {
             return Err("validated material must carry the staged identities".to_owned());
         }
         let (executable, directory) = claim_executable_for_test()?;
-        let permit = derive_permit(&material, &executable, &directory)
-            .map_err(|error| error.to_string())?;
+        let permit =
+            derive_permit(&material, &executable, &directory).map_err(|error| error.to_string())?;
         permit.validate().map_err(|error| error.to_string())?;
         let now_unix_ms = unix_ms().map_err(|error| error.to_string())?;
         let mut transport = FakeClaimTransport::fresh(now_unix_ms);
@@ -1599,12 +1601,17 @@ mod tests {
         if started.state != ProtocolJobState::Running {
             return Err("claim must project the running job".to_owned());
         }
-        if read_material_from(&path, &live).map_err(|error| error.to_string())?.is_some() {
+        if read_material_from(&path, &live)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
             return Err("consumed presentation must not replay".to_owned());
         }
         match claim_once(&material, &mut transport) {
             Err(KernelPortError::Transport(_)) => Ok(()),
-            Err(error) => Err(format!("second claim must fence at the transport, got {error}")),
+            Err(error) => Err(format!(
+                "second claim must fence at the transport, got {error}"
+            )),
             Ok(_) => Err("second claim must never start a second worker".to_owned()),
         }
     }
@@ -1643,17 +1650,20 @@ mod tests {
             return Err("status must bind the exact claimed job identity".to_owned());
         }
         if observed.disposition.is_some() {
-            return Err("status is a pure observation and must carry no mutation disposition".to_owned());
+            return Err(
+                "status is a pure observation and must carry no mutation disposition".to_owned(),
+            );
         }
-        let replayed =
-            status_once(&material, &mut transport).map_err(|error| error.to_string())?;
+        let replayed = status_once(&material, &mut transport).map_err(|error| error.to_string())?;
         if replayed.revision != observed.revision || replayed.state != observed.state {
             return Err("exact status replay must return the same checkpoint identity".to_owned());
         }
         let mut unclaimed = FakeClaimTransport::fresh(now_unix_ms);
         match status_once(&material, &mut unclaimed) {
             Err(KernelPortError::Transport(_)) => Ok(()),
-            Err(error) => Err(format!("status before start must fence at the transport, got {error}")),
+            Err(error) => Err(format!(
+                "status before start must fence at the transport, got {error}"
+            )),
             Ok(_) => Err("status before start must never observe an unclaimed job".to_owned()),
         }
     }
@@ -1679,7 +1689,9 @@ mod tests {
         }
         for kind in [JobOperationKind::Submit, JobOperationKind::RequestCancel] {
             if JobRole::Worker.permits(kind) {
-                return Err(format!("worker role must never originate {kind} from the child"));
+                return Err(format!(
+                    "worker role must never originate {kind} from the child"
+                ));
             }
         }
         Ok(())
@@ -1734,15 +1746,43 @@ mod tests {
     /// claim gating.
     fn denial_cases() -> Vec<DenialCase> {
         vec![
-            ("widened wire rejected by the closed shape", corrupt_widened_wire, "Malformed"),
-            ("blank job refused before epoch checks", corrupt_blank_job, "InvalidMaterial"),
-            ("zero revision refused", corrupt_zero_revision, "InvalidMaterial"),
-            ("stale generation refused", corrupt_generation_mismatch, "StaleGeneration"),
+            (
+                "widened wire rejected by the closed shape",
+                corrupt_widened_wire,
+                "Malformed",
+            ),
+            (
+                "blank job refused before epoch checks",
+                corrupt_blank_job,
+                "InvalidMaterial",
+            ),
+            (
+                "zero revision refused",
+                corrupt_zero_revision,
+                "InvalidMaterial",
+            ),
+            (
+                "stale generation refused",
+                corrupt_generation_mismatch,
+                "StaleGeneration",
+            ),
             ("foreign epoch refused", corrupt_foreign_epoch, "StaleEpoch"),
             ("malformed nonce refused", corrupt_bad_nonce, "BadNonce"),
-            ("tampered grant digest refused", corrupt_bad_grant_digest, "BadGrant"),
-            ("foreign grant epoch refused", corrupt_foreign_grant_epoch, "BadGrant"),
-            ("grant generation mismatch refused", corrupt_grant_generation, "BadGrant"),
+            (
+                "tampered grant digest refused",
+                corrupt_bad_grant_digest,
+                "BadGrant",
+            ),
+            (
+                "foreign grant epoch refused",
+                corrupt_foreign_grant_epoch,
+                "BadGrant",
+            ),
+            (
+                "grant generation mismatch refused",
+                corrupt_grant_generation,
+                "BadGrant",
+            ),
             ("zero grant expiry refused", corrupt_zero_expiry, "BadGrant"),
         ]
     }
@@ -1797,9 +1837,17 @@ mod tests {
         let foreign_outcome = read_material_from(&foreign_path, &presented);
         let _ = fs::remove_file(&foreign_path);
         match foreign_outcome {
-            Ok(Some(_)) => {},
-            Ok(None) => return Err("foreign-epoch bytes must validate under the presented epoch".to_owned()),
-            Err(error) => return Err(format!("foreign-epoch bytes must be well-formed, got {error}")),
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(
+                    "foreign-epoch bytes must validate under the presented epoch".to_owned(),
+                );
+            }
+            Err(error) => {
+                return Err(format!(
+                    "foreign-epoch bytes must be well-formed, got {error}"
+                ));
+            }
         }
         let bound = usize::try_from(DREAMER_MATERIAL_LIMIT_BYTES)
             .map_err(|_| "material bound exceeds the test address space".to_owned())?;
@@ -1810,7 +1858,9 @@ mod tests {
         let _ = fs::remove_file(&big_path);
         match big_outcome {
             Err(KernelPortError::TooLarge { .. }) => Ok(()),
-            Err(error) => Err(format!("oversize presentation must deny TooLarge, got {error}")),
+            Err(error) => Err(format!(
+                "oversize presentation must deny TooLarge, got {error}"
+            )),
             Ok(_) => Err("oversize presentation must refuse".to_owned()),
         }
     }

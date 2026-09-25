@@ -171,15 +171,15 @@ pub use rival::{
 };
 pub use screen::{ScreenBinding, ScreenEligibility, ScreenReference, ScreenState};
 pub use self_query::{
-    AcceptedSourceProjection, AcceptedSourceRef, ArchitectureAnchor, ArchitectureAnchorClass, ArchitectureApplicability,
-    ArchitectureApplicabilityBasis, ArchitectureApplicabilityState, ArchitectureBriefCandidate,
-    ArchitectureBriefDisposition, ArchitectureBriefGap, ArchitectureBriefGapClass,
-    ArchitectureBriefGapState, ArchitectureBriefOmission, ArchitectureBriefSection,
-    ArchitectureBriefSectionKind, ArchitectureBriefStatement, ArchitectureDependencyDenominator,
-    ArchitectureDependencyKind, ArchitectureDependencyMember, ArchitectureSourceSnapshot,
-    ArchitectureSourceStatus, ArchitectureStatementModality, AttemptBinding, NormativePairBinding,
-    SelfQueryContractError, SelfQueryInput, SelfQueryOutputProfile, SelfQueryPolicy,
-    SelfQueryProfile,
+    AcceptedSourceProjection, AcceptedSourceRef, ArchitectureAnchor, ArchitectureAnchorClass,
+    ArchitectureApplicability, ArchitectureApplicabilityBasis, ArchitectureApplicabilityState,
+    ArchitectureBriefCandidate, ArchitectureBriefDisposition, ArchitectureBriefGap,
+    ArchitectureBriefGapClass, ArchitectureBriefGapState, ArchitectureBriefOmission,
+    ArchitectureBriefSection, ArchitectureBriefSectionKind, ArchitectureBriefStatement,
+    ArchitectureDependencyDenominator, ArchitectureDependencyKind, ArchitectureDependencyMember,
+    ArchitectureSourceSnapshot, ArchitectureSourceStatus, ArchitectureStatementModality,
+    AttemptBinding, NormativePairBinding, SelfQueryContractError, SelfQueryInput,
+    SelfQueryOutputProfile, SelfQueryPolicy, SelfQueryProfile,
 };
 pub use validation::{
     DreamDraftValidationError, GroundingValidationInput, STRUCTURED_VALIDATION_SCHEMA_VERSION,

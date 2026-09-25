@@ -78,6 +78,39 @@ pub struct CurationProductPulse {
     pub screen_result: Option<CurationScreenResult>,
 }
 
+/// Projects the exact identities omitted by the frozen sample, retaining the
+/// category so a partial projection cannot be mistaken for a complete one.
+pub(crate) fn sample_omission_ids(sample: &CycleSample) -> Vec<String> {
+    let mut omissions = Vec::new();
+    omissions.extend(
+        sample
+            .omitted_pending
+            .iter()
+            .map(|identity| format!("cycle_sample:omitted_pending:{}", identity.as_str())),
+    );
+    omissions.extend(
+        sample
+            .omitted_proposed
+            .iter()
+            .map(|identity| format!("cycle_sample:omitted_proposed:{}", identity.as_str())),
+    );
+    omissions.extend(
+        sample
+            .omitted_outcomes
+            .iter()
+            .map(|identity| format!("cycle_sample:omitted_outcomes:{}", identity.as_str())),
+    );
+    omissions.extend(
+        sample
+            .frontier
+            .iter()
+            .map(|identity| format!("cycle_sample:frontier:{identity}")),
+    );
+    omissions.sort();
+    omissions.dedup();
+    omissions
+}
+
 impl CurationProductPulse {
     /// Projects the native screen result and frozen cycle digests into the
     /// public Product Pulse shape.  The caller supplies the carrier's
@@ -91,33 +124,7 @@ impl CurationProductPulse {
         sample: &CycleSample,
         plan: &CyclePlan,
     ) -> Self {
-        let mut sample_omissions = Vec::new();
-        sample_omissions.extend(
-            sample
-                .omitted_pending
-                .iter()
-                .map(|identity| format!("cycle_sample:omitted_pending:{}", identity.as_str())),
-        );
-        sample_omissions.extend(
-            sample
-                .omitted_proposed
-                .iter()
-                .map(|identity| format!("cycle_sample:omitted_proposed:{}", identity.as_str())),
-        );
-        sample_omissions.extend(
-            sample
-                .omitted_outcomes
-                .iter()
-                .map(|identity| format!("cycle_sample:omitted_outcomes:{}", identity.as_str())),
-        );
-        sample_omissions.extend(
-            sample
-                .frontier
-                .iter()
-                .map(|identity| format!("cycle_sample:frontier:{identity}")),
-        );
-        sample_omissions.sort();
-        sample_omissions.dedup();
+        let sample_omissions = sample_omission_ids(sample);
 
         let mut all_omissions = omissions.to_vec();
         all_omissions.extend(sample_omissions.iter().cloned());

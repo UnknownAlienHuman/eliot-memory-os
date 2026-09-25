@@ -11,9 +11,9 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use eliot_contracts::{StateFence, fences_match_exact};
 #[cfg(test)]
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+use eliot_contracts::{StateFence, fences_match_exact};
 #[cfg(test)]
 use std::num::NonZeroU64;
 
@@ -235,7 +235,11 @@ impl DreamJobInput {
         admission.validate()?;
         let deadline_matches = admission
             .deadline_ms
-            .and_then(|deadline| u64::try_from(self.deadline_ms).ok().map(|value| value == deadline))
+            .and_then(|deadline| {
+                u64::try_from(self.deadline_ms)
+                    .ok()
+                    .map(|value| value == deadline)
+            })
             .unwrap_or(false);
         if self.job_class != admission.job_class
             || self.requester != admission.requester.principal
@@ -653,8 +657,8 @@ mod tests {
             wire.strip_suffix('}').expect("object json"),
             "}"
         );
-        let err =
-            serde_json::from_str::<DreamJobAdmission>(&with_extra).expect_err("extra key must fail");
+        let err = serde_json::from_str::<DreamJobAdmission>(&with_extra)
+            .expect_err("extra key must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("unknown field"),

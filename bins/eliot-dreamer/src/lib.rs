@@ -6,8 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_contracts::{StateFence, fences_match_exact};
-use eliot_dreamer_contracts::{ContractViolation, ScreenBinding};
 use eliot_dreamer_contracts::registry::{CurationHandlerRegistry, canonical_registry};
+use eliot_dreamer_contracts::{ContractViolation, ScreenBinding};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState as ProtocolJobState};
 use serde::{Deserialize, Serialize};
 
@@ -201,6 +201,10 @@ impl AuthenticatedKernelJobPort {
     /// the handshake from the material epoch — performing no health probe, no
     /// permit derivation, and no `LeaseExact`/`Start` transact.
     #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "retained as the closed no-Kernel test seam for protected-material admission regressions"
+    )]
     pub(crate) fn for_test(
         material: kernel_port::ValidatedDreamerMaterial,
         admission: KernelJobAdmission,
@@ -281,13 +285,11 @@ impl AuthenticatedKernelJobPort {
         admission: &KernelJobAdmission,
         job: &DreamJobInput,
     ) -> Result<CurationSourceCarrier, DreamerError> {
-        let material = self
-            .material
-            .admitted_curation
-            .as_ref()
-            .ok_or(DreamerError::KernelAdmissionRequired(
+        let material = self.material.admitted_curation.as_ref().ok_or(
+            DreamerError::KernelAdmissionRequired(
                 "protected launch omitted owner-admitted Curation material".to_owned(),
-            ))?;
+            ),
+        )?;
         CurationSourceCarrier::from_admitted(material, admission, job)
     }
 
@@ -334,7 +336,12 @@ fn claim_admission(
             "protected launch omitted owner-admitted semantic material".to_owned(),
         )
     })?;
-    let request_id = owner_material.request.binding.request_id.as_str().to_owned();
+    let request_id = owner_material
+        .request
+        .binding
+        .request_id
+        .as_str()
+        .to_owned();
     Ok(KernelJobAdmission {
         job_id: material.job_id.clone(),
         attempt_id: material.attempt_id.clone(),
@@ -471,13 +478,9 @@ fn run_admitted_pipeline(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
     curation_carrier: Option<dispatch_stage::CurationExecutionCarrier<'_>>,
-    owner_binding: Option<ScreenBinding>,
+    owner_binding: Option<&ScreenBinding>,
 ) -> Result<DreamResult, DreamerError> {
-    let screen = curation_screen_stage::resolve_screen_inputs(
-        admission,
-        job,
-        owner_binding.as_ref(),
-    )?;
+    let screen = curation_screen_stage::resolve_screen_inputs(admission, job, owner_binding)?;
     if job.job_class == JobClass::Curation {
         let curation_screen_stage::ScreenDecision::Screened { binding, .. } = screen else {
             return Err(DreamerError::InvalidAdmission(
@@ -497,14 +500,7 @@ fn run_admitted_pipeline(
     let validation_input =
         admitted_material::validation_input_for(admission, job, grounded, Some(0))?;
     let validated = validation_stage::validate_admitted_draft(&validation_input)?;
-    dispatch_stage::dispatch_admitted(
-        admission,
-        job,
-        None,
-        None,
-        job.job_class,
-        Some(&validated),
-    )
+    dispatch_stage::dispatch_admitted(admission, job, None, None, job.job_class, Some(&validated))
 }
 
 impl KernelJobPort for AuthenticatedKernelJobPort {
@@ -555,11 +551,8 @@ impl KernelJobPort for AuthenticatedKernelJobPort {
                     "protected launch omitted owner-admitted Curation material".to_owned(),
                 ))?
                 .screen_binding;
-            let screen = curation_screen_stage::resolve_screen_inputs(
-                admission,
-                job,
-                Some(owner_binding),
-            )?;
+            let screen =
+                curation_screen_stage::resolve_screen_inputs(admission, job, Some(owner_binding))?;
             let curation_screen_stage::ScreenDecision::Screened { binding, .. } = screen else {
                 return Err(DreamerError::InvalidAdmission(
                     "admitted curation dispatch requires owner-resolved screen binding",

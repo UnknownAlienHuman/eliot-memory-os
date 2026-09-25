@@ -2214,6 +2214,7 @@ dependencies = [
 name = "eliot-kernel"
 version = "0.1.0"
 dependencies = [
+ "eliot-agent-contracts",
  "eliot-authority",
  "eliot-backup",
  "eliot-contracts",
@@ -2222,6 +2223,7 @@ dependencies = [
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-kernel-service",
+ "eliot-memory-curation-contracts",
  "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",

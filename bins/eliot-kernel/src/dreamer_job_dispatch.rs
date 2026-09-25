@@ -517,7 +517,8 @@ mod dreamer_job_dispatch_tests {
     use crate::dispatch_launch::dreamer_dispatch_launch::{
         DREAMER_MODULE_ID, DreamerChildBinding, DreamerLaunchKeys, DreamerLeaseExpectation,
         DreamerMaterialError, DreamerReconcileOutcome, dreamer_launch_permits_lease,
-        parse_dreamer_material_bytes, release_dreamer_launch, validate_dreamer_material,
+        parse_dreamer_material_bytes, release_dreamer_launch, test_admitted_curation_material,
+        validate_dreamer_material,
     };
     use crate::dispatch_launch::{
         DreamerLaunchMaterial, PreparedDreamerLaunch, launch_admitted_dreamer_attempt,
@@ -1793,12 +1794,28 @@ mod dreamer_job_dispatch_tests {
         let executable = child_dir.join("eliot-dreamer.exe");
         let executable_sha256 = crate::sha256_hex(b"eliot-dreamer-installed-package-bytes");
         let now_nanos = super::super::unix_ms().saturating_mul(1_000_000).max(1);
+        let admitted_curation = test_admitted_curation_material(
+            &job_id,
+            &attempt_id,
+            &scope_id,
+            queued
+                .request_identity
+                .request
+                .request
+                .metadata
+                .request_id
+                .as_str(),
+            queued.request_identity.operation.operation_id.as_str(),
+            queued.request_identity.operation.idempotency_key.as_str(),
+            &fence,
+        );
         let material = DreamerLaunchMaterial {
             keys: DreamerLaunchKeys {
                 job_id: &job_id,
                 attempt_id: &attempt_id,
             },
             queued: &queued,
+            admitted_curation: &admitted_curation,
             child: DreamerChildBinding {
                 executable: &executable,
                 executable_sha256: &executable_sha256,
@@ -2025,12 +2042,39 @@ mod dreamer_job_dispatch_tests {
             .await
             .expect("resubmit projects");
         let queued_again = reply_response(&reply);
+        let job_id_again = queued_again.job_id.as_str().to_owned();
+        let attempt_id_again = queued_again.attempt_id.as_str().to_owned();
+        let scope_id_again = queued_again.scope.scope_id.as_str().to_owned();
+        let admitted_curation_again = test_admitted_curation_material(
+            &job_id_again,
+            &attempt_id_again,
+            &scope_id_again,
+            queued_again
+                .request_identity
+                .request
+                .request
+                .metadata
+                .request_id
+                .as_str(),
+            queued_again
+                .request_identity
+                .operation
+                .operation_id
+                .as_str(),
+            queued_again
+                .request_identity
+                .operation
+                .idempotency_key
+                .as_str(),
+            &queued_again.scope.state_fence,
+        );
         let material_again = DreamerLaunchMaterial {
             keys: DreamerLaunchKeys {
-                job_id: &job_id,
-                attempt_id: &attempt_id,
+                job_id: &job_id_again,
+                attempt_id: &attempt_id_again,
             },
             queued: &queued_again,
+            admitted_curation: &admitted_curation_again,
             child: DreamerChildBinding {
                 executable: &executable,
                 executable_sha256: &executable_sha256,

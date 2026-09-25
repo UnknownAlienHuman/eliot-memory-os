@@ -14,7 +14,9 @@
 //! returns at dispatch with zero screen work, and a failed screen never
 //! reaches the bundle stage.
 
+use crate::controller::verify_admitted_binding;
 use eliot_contracts::{ArtifactId, OperationId, RequestId, canonical_json_bytes, sha256_hex};
+use eliot_dreamer_contracts::DreamJobAdmission;
 use eliot_dreamer_contracts::{
     AdmittedCurationMaterial, ContractViolation, JobClass, ScreenBinding,
 };
@@ -23,21 +25,20 @@ use eliot_dreamer_cycle::{
     DreamerCycleState, ExpectedArtifact, PendingRequest, PhasePolicyRule, RequestKind,
     SampleLimits, plan_cycle, sample_cycle,
 };
-use eliot_memory_curation_contracts::{CurationScreenRequest, CurationScreenResult, SourceSnapshot};
+use eliot_memory_curation_contracts::{
+    CurationScreenRequest, CurationScreenResult, SourceSnapshot,
+};
 use eliot_memory_curation_screen::{CurationScreenError, screen_memory_curation};
 use eliot_receipts::{EffectClass, ProofCeiling, ReceiptKind};
-use crate::controller::verify_admitted_binding;
-use eliot_dreamer_contracts::DreamJobAdmission;
 
 use crate::{DreamJobInput, DreamerError, KernelJobAdmission};
 
 /// Minimal admitted screen inputs for one job.
 ///
-/// Carries only the admitted job class: the closed [`ScreenBinding`] itself is
-/// derived deterministically from the admitted pair in
-/// [`screen_binding_for`] (never fetched, never synthesized from unadmitted
-/// material), and the owner validation runs exactly once through
-/// [`screen_admitted_targets`].
+/// Carries only the admitted job class. For Curation, the exact owner-issued
+/// [`ScreenBinding`] arrives through the protected admitted material and is
+/// validated once through [`screen_admitted_targets`]; this seam never derives
+/// or defaults a binding from semantic handles.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ScreenInputs {
     /// Admitted job class carried for dispatch context.
@@ -81,21 +82,18 @@ pub(crate) fn screen_binding_for(
     if job.job_class != JobClass::Curation {
         return Ok(None);
     }
-    Ok(Some(
-        owner_binding.cloned().ok_or(DreamerError::InvalidAdmission(
-            "admitted curation requires owner-resolved screen binding",
-        ))?,
-    ))
+    Ok(Some(owner_binding.cloned().ok_or(
+        DreamerError::InvalidAdmission("admitted curation requires owner-resolved screen binding"),
+    )?))
 }
 
 /// Resolves the A-20 screen decision for one admitted job.
 ///
 /// Fails closed: any invalid/stale admission or identity mismatch refuses here
 /// with zero owner-screen calls. Non-Curation classes pass through with no
-/// screen work. Curation jobs derive the closed binding from the admitted
-/// pair and run the real owner screen exactly once through the production
-/// entry; an empty admitted handle set refuses fail-closed instead of
-/// screening nothing.
+/// screen work. Curation jobs require the exact owner binding carried by the
+/// protected admitted material and run the real owner screen exactly once
+/// through the production entry; no local binding is ever synthesized.
 pub(crate) fn resolve_screen_inputs(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
@@ -189,9 +187,7 @@ impl CurationSourceCarrier {
                 &claim.scope_id,
                 &claim.state_fence,
             )
-            .map_err(|_| {
-                DreamerError::InvalidAdmission("owner-admitted Curation material")
-            })?;
+            .map_err(|_| DreamerError::InvalidAdmission("owner-admitted Curation material"))?;
         if &material.job != job {
             return Err(DreamerError::InvalidAdmission(
                 "semantic job differs from owner-admitted Curation material",
@@ -206,9 +202,7 @@ impl CurationSourceCarrier {
             omissions: material.omissions.clone(),
             source_manifest_digest: material
                 .source_manifest_digest()
-                .map_err(|_| {
-                    DreamerError::InvalidAdmission("Curation source manifest digest")
-                })?,
+                .map_err(|_| DreamerError::InvalidAdmission("Curation source manifest digest"))?,
         })
     }
 }
@@ -262,9 +256,11 @@ fn carrier_screen_binding(
         .map_err(|_| DreamerError::InvalidAdmission("owner A-20 screen binding"))?;
     job.validate_against(&carrier.admission)
         .map_err(|_| DreamerError::InvalidAdmission("owner Curation job admission"))?;
-    if carrier.admission.operation_id != admission.request_id
+    if carrier.request.binding.request_id.as_str() != admission.request_id
+        || carrier.request.binding.operation_id.as_str() != carrier.admission.operation_id
         || carrier.admission.idempotency_key != admission.idempotency_key
         || carrier.admission.scope_id != admission.scope_id
+        || carrier.screen_binding.request_id.as_str() != admission.request_id
         || carrier.screen_binding.scope_id != admission.scope_id
         || carrier.screen_binding.task_id != carrier.admission.task_id
         || !eliot_contracts::fences_match_exact(

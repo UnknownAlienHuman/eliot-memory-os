@@ -43,6 +43,7 @@
 //! A-31 leaf remains available only behind its explicit Governor/test
 //! execution carrier.
 
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_dreamer_candidate_validation::{
     CandidateValidationOutcome, DreamDraftValidationError, validate_grounded_dream_draft_at,
 };
@@ -676,6 +677,26 @@ pub(crate) fn dispatch_screened_curation(route: NativeCurationRoute) -> DreamRes
     for omission in &omissions {
         push_unique(&mut provenance, omission.clone());
     }
+    for identity in crate::product_pulse::sample_omission_ids(&sample) {
+        push_unique(&mut provenance, format!("cycle-sample-omission:{identity}"));
+    }
+    push_unique(
+        &mut provenance,
+        format!(
+            "native-route:{}",
+            screen.request.binding.request_id.as_str()
+        ),
+    );
+    if let Ok(binding_bytes) = canonical_json_bytes(&screen_binding) {
+        push_unique(
+            &mut provenance,
+            format!("screen-binding-digest:{}", sha256_hex(&binding_bytes)),
+        );
+    }
+    push_unique(
+        &mut provenance,
+        format!("source-manifest:{source_manifest_digest}"),
+    );
     push_unique(
         &mut provenance,
         format!("cycle-sample:{}", sample.coverage_digest),
@@ -1259,19 +1280,6 @@ pub(crate) mod curation_test_support {
                 owner_revision: binding.owner_revision,
             })
             .collect())
-    }
-
-    /// Builds the fixture batch bound to one screen without assembling ports:
-    /// delegates to the private harness builder so the digest/pin/seal logic
-    /// lives in exactly one place and is never duplicated by hand. Test
-    /// carrier sources reuse this for the presented screen, admission, and
-    /// job, then wrap it in ports around their own handler.
-    pub(crate) fn test_batch_for(
-        screen: &ScreenBinding,
-        admission: &KernelJobAdmission,
-        job: &DreamJobInput,
-    ) -> Result<ValidatedCurationBatch, DreamerError> {
-        harness_batch(screen, admission, job)
     }
 
     /// Builds one bound fixture call over a single target, mirroring the

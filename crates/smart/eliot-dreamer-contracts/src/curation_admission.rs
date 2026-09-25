@@ -87,10 +87,16 @@ impl AdmittedCurationMaterial {
     }
 
     /// Validates the complete intrinsic and cross-object owner closure.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the owner closure validator keeps intrinsic, cross-object, fence, target, protection, omission, and manifest checks together"
+    )]
     pub fn validate(&self) -> Result<(), ContractViolation> {
         self.admission.validate()?;
         self.job.validate_against(&self.admission)?;
-        if self.admission.job_class != JobClass::Curation || self.job.job_class != JobClass::Curation {
+        if self.admission.job_class != JobClass::Curation
+            || self.job.job_class != JobClass::Curation
+        {
             return Err(ContractViolation::BindingMismatch {
                 field: "curation.job_class",
                 reason: "admitted Curation material requires the Curation class".to_owned(),
@@ -124,22 +130,25 @@ impl AdmittedCurationMaterial {
 
         let policy_revision = self.source.identity.state_fence.policy_revision;
         if policy_revision != Some(self.request.profile.policy_revision) {
-            return Err(ContractViolation::ImplicitDefault("state_fence.policy_revision"));
+            return Err(ContractViolation::ImplicitDefault(
+                "state_fence.policy_revision",
+            ));
         }
-        if !fences_match_exact(&self.source.identity.state_fence, &self.admission.state_fence)
-            || !fences_match_exact(
-                &self.request.binding.state_fence,
-                &self.admission.state_fence,
-            )
-            || !fences_match_exact(
-                &self.screen_binding.state_fence,
-                &self.admission.state_fence,
-            )
-        {
+        if !fences_match_exact(
+            &self.source.identity.state_fence,
+            &self.admission.state_fence,
+        ) || !fences_match_exact(
+            &self.request.binding.state_fence,
+            &self.admission.state_fence,
+        ) || !fences_match_exact(
+            &self.screen_binding.state_fence,
+            &self.admission.state_fence,
+        ) {
             return Err(ContractViolation::BindingMismatch {
                 field: "curation.state_fence",
-                reason: "source, native request, A-20 binding, and admission must use one exact fence"
-                    .to_owned(),
+                reason:
+                    "source, native request, A-20 binding, and admission must use one exact fence"
+                        .to_owned(),
             });
         }
 
@@ -150,7 +159,7 @@ impl AdmittedCurationMaterial {
             .binding
             .task_id
             .as_ref()
-            .map(|task| task.as_str());
+            .map(eliot_contracts::TaskId::as_str);
         if request_scope != self.admission.scope_id.as_str()
             || source_scope != self.admission.scope_id.as_str()
             || self.screen_binding.scope_id != self.admission.scope_id
@@ -164,8 +173,9 @@ impl AdmittedCurationMaterial {
         {
             return Err(ContractViolation::BindingMismatch {
                 field: "curation.owner_binding",
-                reason: "A-20 binding differs from the native request, source, task, scope, or profile"
-                    .to_owned(),
+                reason:
+                    "A-20 binding differs from the native request, source, task, scope, or profile"
+                        .to_owned(),
             });
         }
 
@@ -200,6 +210,10 @@ impl AdmittedCurationMaterial {
 
     /// Revalidates this owner material against the exact protected-launch
     /// identity reconstructed by the child after its Kernel claim.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the protected launch revalidation must compare each independent job, request, operation, scope, idempotency, and fence binding"
+    )]
     pub fn validate_for_launch(
         &self,
         job_id: &str,
@@ -238,12 +252,12 @@ impl AdmittedCurationMaterial {
         let mut evidence_ids = BTreeSet::new();
         let mut by_member = BTreeMap::<MemberId, BTreeSet<_>>::new();
         for evidence in &self.protection_evidence {
-            evidence
-                .validate(&self.source.identity)
-                .map_err(|error| ContractViolation::BindingMismatch {
+            evidence.validate(&self.source.identity).map_err(|error| {
+                ContractViolation::BindingMismatch {
                     field: "curation.protection_evidence",
                     reason: error.to_string(),
-                })?;
+                }
+            })?;
             if !evidence_ids.insert(evidence.evidence_id.clone()) {
                 return Err(ContractViolation::BindingMismatch {
                     field: "curation.protection_evidence",
@@ -256,7 +270,10 @@ impl AdmittedCurationMaterial {
                 .insert(evidence.class);
         }
         for target in &self.request.partition.changed_targets {
-            if !by_member.get(target).is_some_and(|classes| !classes.is_empty()) {
+            if by_member
+                .get(target)
+                .is_none_or(std::collections::BTreeSet::is_empty)
+            {
                 return Err(ContractViolation::MissingField(
                     "curation.protection_evidence.changed_target",
                 ));
@@ -266,7 +283,11 @@ impl AdmittedCurationMaterial {
     }
 
     fn validate_omissions(&self) -> Result<(), ContractViolation> {
-        check_vec_bound(self.omissions.len(), MAX_CURATION_OMISSIONS, "curation.omissions")?;
+        check_vec_bound(
+            self.omissions.len(),
+            MAX_CURATION_OMISSIONS,
+            "curation.omissions",
+        )?;
         let mut seen = BTreeSet::new();
         for omission in &self.omissions {
             check_text(omission, "curation.omissions", MAX_CURATION_OMISSION_TEXT)?;
@@ -300,16 +321,11 @@ impl AdmittedCurationMaterial {
             || self.source.availability != SourceAvailability::Available
             || self.source.page.has_more
             || !self.source.page.frontier.is_empty()
-            || self
-                .request
-                .partition
-                .changed_targets
-                .iter()
-                .any(|target| {
-                    required
-                        .iter()
-                        .any(|class| !evidence_resolves(target, *class))
-                });
+            || self.request.partition.changed_targets.iter().any(|target| {
+                required
+                    .iter()
+                    .any(|class| !evidence_resolves(target, *class))
+            });
         if incomplete && self.omissions.is_empty() {
             return Err(ContractViolation::MissingField("curation.omissions"));
         }

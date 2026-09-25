@@ -4556,8 +4556,18 @@ pub fn prepare_dreamer_launch(
                 .metadata
                 .request_id
                 .as_str(),
-            material.queued.request_identity.operation.operation_id.as_str(),
-            &material.admitted_curation.admission.idempotency_key,
+            material
+                .queued
+                .request_identity
+                .operation
+                .operation_id
+                .as_str(),
+            material
+                .queued
+                .request_identity
+                .operation
+                .idempotency_key
+                .as_str(),
             material.queued.scope.scope_id.as_str(),
             &material.queued.scope.state_fence,
         )

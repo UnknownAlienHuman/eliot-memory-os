@@ -46,7 +46,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+eliot-agent-contracts = { path = "../../crates/agent/eliot-agent-contracts", version = "0.1.0" }
 eliot-ipc = { workspace = true, features = ["test-support"] }
+eliot-memory-curation-contracts = { path = "../../crates/smart/eliot-memory-curation-contracts", version = "0.1.0" }
 eliot-kernel-service = { workspace = true, features = ["test-support"] }
 eliot-ors = { workspace = true, features = ["test-support"] }
 eliot-platform-windows = { workspace = true, features = ["test-support"] }

@@ -1321,12 +1321,8 @@ fn plan_reprojects_accepted_and_unknown_reconciliation_requests() {
         );
         let step = step_dreamer_cycle(&current, &[observed], &policy).unwrap();
         assert_eq!(step.disposition, StepDisposition::ReconciliationRequired);
-        let sample = sample_cycle(
-            &step.next_state,
-            &policy,
-            &SampleLimits { max_sampled: 1 },
-        )
-        .unwrap();
+        let sample =
+            sample_cycle(&step.next_state, &policy, &SampleLimits { max_sampled: 1 }).unwrap();
         let plan = plan_cycle(&sample, &step.next_state, &policy, None).unwrap();
         assert_eq!(plan.requests.len(), 1);
         assert_eq!(plan.requests[0].operation_id, request.operation_id);
@@ -1339,8 +1335,133 @@ fn plan_reprojects_accepted_and_unknown_reconciliation_requests() {
             plan.requests[0].reason,
             "reconcile the same operation; do not issue a replacement retry"
         );
-        assert_eq!(plan.experiments[0].kind, ExperimentKind::ReconciliationProbe);
+        assert_eq!(
+            plan.experiments[0].kind,
+            ExperimentKind::ReconciliationProbe
+        );
     }
+}
+
+#[test]
+fn plan_validation_rejects_rehashed_request_field_substitution_and_duplicates() {
+    let fence = fence();
+    let policy = policy(&fence, "bundle_validation");
+    let request = pending(&policy);
+    let state = state(&policy, request.clone());
+    let sample = sample_cycle(&state, &policy, &SampleLimits { max_sampled: 1 }).unwrap();
+    let plan = plan_cycle(&sample, &state, &policy, None).unwrap();
+    assert!(plan.validate(&sample, &state, &policy).is_ok());
+
+    macro_rules! assert_rehashed_mutation_rejected {
+        ($label:literal, $mutate:expr) => {{
+            let mut changed = plan.clone();
+            $mutate(&mut changed);
+            changed.plan_digest = changed.computed_digest().unwrap();
+            assert!(
+                changed.validate(&sample, &state, &policy).is_err(),
+                "rehashed {} substitution must fail validation",
+                $label
+            );
+        }};
+    }
+
+    assert_rehashed_mutation_rejected!(
+        "request_id",
+        |candidate: &mut eliot_dreamer_cycle::CyclePlan| {
+            candidate.requests[0].request_id = RequestId::new("request-mutated").unwrap();
+        }
+    );
+    assert_rehashed_mutation_rejected!(
+        "operation_id",
+        |candidate: &mut eliot_dreamer_cycle::CyclePlan| {
+            candidate.requests[0].operation_id = OperationId::new("operation-mutated").unwrap();
+        }
+    );
+    assert_rehashed_mutation_rejected!(
+        "attempt_id",
+        |candidate: &mut eliot_dreamer_cycle::CyclePlan| {
+            candidate.requests[0].attempt_id = AgentAttemptId::new("attempt-mutated").unwrap();
+        }
+    );
+    assert_rehashed_mutation_rejected!(
+        "owner",
+        |candidate: &mut eliot_dreamer_cycle::CyclePlan| {
+            candidate.requests[0].owner = "owner-mutated".to_owned();
+        }
+    );
+    assert_rehashed_mutation_rejected!("kind", |candidate: &mut eliot_dreamer_cycle::CyclePlan| {
+        candidate.requests[0].kind = RequestKind::CurationScreen;
+    });
+    assert_rehashed_mutation_rejected!(
+        "phase",
+        |candidate: &mut eliot_dreamer_cycle::CyclePlan| {
+            candidate.requests[0].phase = CyclePhase::Screened;
+        }
+    );
+    assert_rehashed_mutation_rejected!(
+        "payload_digest",
+        |candidate: &mut eliot_dreamer_cycle::CyclePlan| {
+            candidate.requests[0].payload_digest = DIGEST_B.to_owned();
+        }
+    );
+    assert_rehashed_mutation_rejected!(
+        "task_id",
+        |candidate: &mut eliot_dreamer_cycle::CyclePlan| {
+            candidate.requests[0].task_id = "task-mutated".to_owned();
+        }
+    );
+    assert_rehashed_mutation_rejected!(
+        "scope_id",
+        |candidate: &mut eliot_dreamer_cycle::CyclePlan| {
+            candidate.requests[0].scope_id = "scope-mutated".to_owned();
+        }
+    );
+    assert_rehashed_mutation_rejected!(
+        "state_fence",
+        |candidate: &mut eliot_dreamer_cycle::CyclePlan| {
+            candidate.requests[0].state_fence.resource_generation =
+                ResourceGeneration::new(2).unwrap();
+        }
+    );
+    assert_rehashed_mutation_rejected!(
+        "predecessor",
+        |candidate: &mut eliot_dreamer_cycle::CyclePlan| {
+            candidate.requests[0].predecessor_receipt_id =
+                Some(eliot_contracts::ReceiptId::new("receipt-mutated").unwrap());
+        }
+    );
+
+    let mut duplicate = plan.clone();
+    duplicate.requests.push(duplicate.requests[0].clone());
+    duplicate.plan_digest = duplicate.computed_digest().unwrap();
+    assert!(duplicate.validate(&sample, &state, &policy).is_err());
+
+    let blocked_outcome = outcome(
+        &request,
+        receipt(
+            &request,
+            generic_for(&request, OutcomeDisposition::Rejected),
+            None,
+        ),
+        OutcomeDisposition::Rejected,
+        false,
+    );
+    let blocked = step_dreamer_cycle(&state, &[blocked_outcome], &policy).unwrap();
+    let blocked_sample = sample_cycle(
+        &blocked.next_state,
+        &policy,
+        &SampleLimits { max_sampled: 1 },
+    )
+    .unwrap();
+    let mut blocked_plan = plan_cycle(&blocked_sample, &blocked.next_state, &policy, None).unwrap();
+    assert!(blocked_plan.requests.is_empty());
+    blocked_plan.requests = plan.requests;
+    blocked_plan.plan_digest = blocked_plan.computed_digest().unwrap();
+    assert!(
+        blocked_plan
+            .validate(&blocked_sample, &blocked.next_state, &policy)
+            .is_err()
+    );
 }
 
 // WORK_UNIT_CASE: 806/9

@@ -117,7 +117,8 @@ fn project_pending_request(
     {
         request.predecessor_receipt_id = Some(outcome.receipt.identity.receipt_id.clone());
         request.kind = RequestKind::EffectReconciliation;
-        request.reason = "reconcile the same operation; do not issue a replacement retry".to_owned();
+        "reconcile the same operation; do not issue a replacement retry"
+            .clone_into(&mut request.reason);
     }
     request
 }

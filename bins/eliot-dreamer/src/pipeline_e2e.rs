@@ -211,3 +211,35 @@ fn curation_without_owner_material_refuses_before_generic_stages() {
     ));
 }
 
+#[test]
+fn protected_claim_without_owner_material_never_synthesizes_identity() {
+    let epoch = test_epoch(1);
+    let fence = StateFence::new(epoch.clone(), ResourceGeneration::genesis());
+    let material = crate::kernel_port::ValidatedDreamerMaterial {
+        job_id: "job-missing-owner-material".to_owned(),
+        attempt_id: "attempt-missing-owner-material".to_owned(),
+        revision: 1,
+        scope_id: SCOPE_E2E.to_owned(),
+        fence: fence.clone(),
+        admitted_curation: None,
+        epoch: epoch.clone(),
+        generation: 1,
+        nonce: "dreamer-dispatch-test-nonce".to_owned(),
+        grant: crate::kernel_port::DispatchGrant {
+            grant_digest: "ab".repeat(32),
+            authority_epoch: epoch,
+            fence_generation: 1,
+            fence_nonce: "dreamer-dispatch-fence-test".to_owned(),
+            idempotency_key: "missing-owner-material-idem".to_owned(),
+            expires_at: u64::MAX,
+        },
+    };
+    let Err(error) = crate::claim_admission(&material) else {
+        panic!("missing owner material must not synthesize a claim admission");
+    };
+    assert!(matches!(
+        error,
+        DreamerError::KernelAdmissionRequired(reason)
+            if reason == "protected launch omitted owner-admitted semantic material"
+    ));
+}

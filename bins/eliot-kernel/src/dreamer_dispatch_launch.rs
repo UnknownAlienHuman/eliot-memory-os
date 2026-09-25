@@ -685,7 +685,12 @@ pub(crate) fn validate_dreamer_material(
         .validate_for_launch(
             &envelope.job_id,
             &envelope.attempt_id,
-            envelope.admitted_curation.request.binding.request_id.as_str(),
+            envelope
+                .admitted_curation
+                .request
+                .binding
+                .request_id
+                .as_str(),
             envelope.admitted_curation.admission.operation_id.as_str(),
             &envelope.grant.idempotency_key,
             &envelope.scope_id,
@@ -941,9 +946,10 @@ pub(crate) fn test_admitted_curation_material(
         ArtifactId, OperationId, PolicyRevision, ProductId, RequestId, SourceId, TaskId,
         TaskRevision,
     };
+    use eliot_dreamer_contracts::job::{DREAM_JOB_SCHEMA_VERSION, PRIVACY_LOCAL_ONLY};
     use eliot_dreamer_contracts::{
-        BudgetLimits, DREAM_JOB_SCHEMA_VERSION, DreamJobAdmission, DreamJobInput, JobClass,
-        PRIVACY_LOCAL_ONLY, Requester, RequesterOrigin, ScreenBinding, ScreenState,
+        BudgetLimits, DreamJobAdmission, DreamJobInput, JobClass, Requester, RequesterOrigin,
+        ScreenBinding, ScreenState,
     };
     use eliot_memory_curation_contracts::{
         CurationScreenRequest, DenominatorCoverage, DisclosureCeiling, FindingClass,
@@ -964,10 +970,8 @@ pub(crate) fn test_admitted_curation_material(
     let source_identity = SourceIdentity {
         product_id: ProductId::new("eliot").expect("product identity"),
         source_id: SourceId::new("canonical-memory").expect("source identity"),
-        snapshot_id: eliot_memory_curation_contracts::SnapshotId::new(format!(
-            "snapshot-{job_id}"
-        ))
-        .expect("snapshot identity"),
+        snapshot_id: eliot_memory_curation_contracts::SnapshotId::new(format!("snapshot-{job_id}"))
+            .expect("snapshot identity"),
         query: QueryIdentity {
             query_id: eliot_memory_curation_contracts::QueryId::new(format!("query-{job_id}"))
                 .expect("query identity"),
@@ -1015,9 +1019,7 @@ pub(crate) fn test_admitted_curation_material(
             rule_id: rule_id.clone(),
             finding_class: FindingClass::ProtectionGap,
             precedence: 1,
-            required_protection: std::collections::BTreeSet::from([
-                ProtectionClass::CurrentTruth,
-            ]),
+            required_protection: std::collections::BTreeSet::from([ProtectionClass::CurrentTruth]),
         }],
         requested_findings: std::collections::BTreeSet::from([FindingClass::ProtectionGap]),
         precedence: vec![rule_id],
@@ -1142,7 +1144,7 @@ pub(crate) fn test_admitted_curation_material(
         digest: eliot_memory_curation_contracts::Digest::new(&"16".repeat(32))
             .expect("evidence digest"),
     };
-    let mut material = AdmittedCurationMaterial {
+    let material = AdmittedCurationMaterial {
         admission,
         job,
         screen_binding,
@@ -1150,10 +1152,10 @@ pub(crate) fn test_admitted_curation_material(
         source,
         protection_evidence: vec![evidence],
         omissions: vec![format!("owner-omission:{job_id}")],
-        source_manifest_digest: String::new(),
     };
-    material.bind_frozen_manifest().expect("fixture manifest binds");
     material
+        .bind_frozen_manifest()
+        .expect("fixture manifest binds")
 }
 
 /// Bounds third-party error detail carried into deny lines.
@@ -1331,6 +1333,35 @@ mod dreamer_dispatch_launch_tests {
         let mut bad_grant = envelope.clone();
         bad_grant.grant.authority_epoch = test_epoch(9);
         assert!(validate_dreamer_material(&bad_grant, &live_epoch).is_err());
+    }
+
+    #[test]
+    fn owner_material_rejects_policy_fence_and_binding_drift() {
+        let envelope = test_envelope("job-material-drift-01");
+        let live_epoch = test_epoch(1);
+
+        let mut policy_drift = envelope.clone();
+        policy_drift
+            .admitted_curation
+            .request
+            .profile
+            .policy_revision =
+            eliot_contracts::PolicyRevision::new(2).expect("different policy revision");
+        assert!(validate_dreamer_material(&policy_drift, &live_epoch).is_err());
+
+        let mut fence_drift = envelope.clone();
+        fence_drift
+            .admitted_curation
+            .source
+            .identity
+            .state_fence
+            .resource_generation =
+            eliot_contracts::ResourceGeneration::new(2).expect("different generation");
+        assert!(validate_dreamer_material(&fence_drift, &live_epoch).is_err());
+
+        let mut binding_drift = envelope;
+        binding_drift.admitted_curation.screen_binding.item_digest = "ff".repeat(32);
+        assert!(validate_dreamer_material(&binding_drift, &live_epoch).is_err());
     }
 
     #[test]
