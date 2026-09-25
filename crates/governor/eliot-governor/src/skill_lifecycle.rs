@@ -298,6 +298,8 @@ fn action_str(action: eliot_skill::LifecycleAction) -> &'static str {
         eliot_skill::LifecycleAction::Archive => "archive",
         eliot_skill::LifecycleAction::Quarantine => "quarantine",
         eliot_skill::LifecycleAction::Restore => "restore",
+        eliot_skill::LifecycleAction::Rollback => "rollback",
+        eliot_skill::LifecycleAction::Expiry => "expiry",
     }
 }
 

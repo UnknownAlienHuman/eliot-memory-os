@@ -23,7 +23,7 @@
 use eliot_skill::{
     ActivatedSkillDisplay, CatalogueInstallContext, HotsetDeliveryAck, HotsetDeliveryReceipt,
     MaterializationInputs, MaterializationScope, PortableSkillPackageCandidate, ReadinessClaims,
-    SkillPackage,
+    SkillExecutionEvidence, SkillHarnessActivationReceipt, SkillPackage,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -51,6 +51,24 @@ pub const SKILL_INJECT_TOOL: &str = "skill.inject";
 /// Host-request capability and tool name carrying Skill display requests.
 /// Same non-MCP status as [`SKILL_INJECT_TOOL`].
 pub const SKILL_DISPLAY_TOOL: &str = "skill.display";
+/// Host-request capability and tool name carrying Skill harness activation
+/// receipts (issue #1191).
+///
+/// Same non-MCP status as [`SKILL_INJECT_TOOL`]: it names the
+/// session-admitted capability for per-attempt activation evidence on the
+/// host-request invoke-read leg, where the Kernel linkage rule (tool name
+/// equals envelope capability, digest-bound bytes) applies unchanged. The
+/// daemon folds the carried receipt into its attempt summary; the receipt
+/// producer is the harness that observed the attempt.
+pub const SKILL_ACTIVATE_TOOL: &str = "skill.activate";
+/// Host-request capability and tool name carrying Skill execution evidence
+/// (issue #1191).
+///
+/// Same non-MCP status as [`SKILL_INJECT_TOOL`]: it names the
+/// session-admitted capability for step/artifact/verifier/outcome evidence on
+/// the host-request invoke-read leg. The daemon reconciles unknown effects
+/// before retry; the evidence producer is the harness that ran the steps.
+pub const SKILL_EXECUTE_TOOL: &str = "skill.execute";
 
 /// Skill tool kinds routable on the host-request channel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,18 +77,24 @@ pub enum SkillToolKind {
     Inject,
     /// Display request (`skill.display`).
     Display,
+    /// Harness activation receipt ingest (`skill.activate`).
+    Activate,
+    /// Execution evidence ingest (`skill.execute`).
+    Execute,
 }
 
 /// Routes one tool name to its Skill kind, if any.
 ///
 /// Pure name match owned here so every lane (bridge submit path, daemon
-/// dispatch, Kernel admission) resolves the same two names from one
+/// dispatch, Kernel admission) resolves the same four names from one
 /// definition. Unknown names yield `None` and stay on their existing path.
 #[must_use]
 pub fn skill_tool_kind(name: &str) -> Option<SkillToolKind> {
     match name {
         SKILL_INJECT_TOOL => Some(SkillToolKind::Inject),
         SKILL_DISPLAY_TOOL => Some(SkillToolKind::Display),
+        SKILL_ACTIVATE_TOOL => Some(SkillToolKind::Activate),
+        SKILL_EXECUTE_TOOL => Some(SkillToolKind::Execute),
         _ => None,
     }
 }
@@ -369,6 +393,23 @@ pub enum SkillResultOutcome {
     /// would otherwise push the envelope over the large-variant size lint.
     /// `Box` is serde-transparent, so the wire shape is unchanged.
     Display(Box<ActivatedSkillDisplay>),
+    /// Activation receipt folded: the per-attempt stage summary derived from
+    /// the exact presented harness receipt. Delivered, retrieved, activated,
+    /// adhered and useful stay distinct; a packet-included but never
+    /// activated Skill is never marked successful.
+    Attempt(eliot_skill::AttemptLifecycleSummary),
+    /// Execution evidence reconciled: exact presented outcome counts with the
+    /// still-uncertain remainder. Retry is permitted only when
+    /// `uncertain_pending` is zero; uncertain effects block retry until
+    /// reconciled by exact evidence.
+    Evidence {
+        /// Presented executions with a fully observed outcome.
+        observed: u64,
+        /// Presented executions with a known failed outcome.
+        failed: u64,
+        /// Presented executions whose effects are still unknown.
+        uncertain_pending: u64,
+    },
     /// The pair was understood but refused: stable code plus detail.
     Refused {
         /// Stable refusal code (`FENCE_MISMATCH`, `INVALID_FIELD:<field>`,
@@ -393,6 +434,35 @@ impl SkillResultEnvelope {
         Self {
             contract_version: SKILL_TRANSPORT_VERSION,
             outcome: SkillResultOutcome::Display(Box::new(display)),
+        }
+    }
+
+    /// Builds an attempt-summary outcome from one validated harness receipt.
+    ///
+    /// The summary keeps delivered, retrieved, activated, adhered and useful
+    /// distinct; absent adherence evidence stays unassessed or unknown, never
+    /// compliance, and usefulness additionally requires verifier-backed
+    /// outcome refs — never installation, retrieval, repetition or agreement.
+    pub fn attempt(summary: eliot_skill::AttemptLifecycleSummary) -> Self {
+        Self {
+            contract_version: SKILL_TRANSPORT_VERSION,
+            outcome: SkillResultOutcome::Attempt(summary),
+        }
+    }
+
+    /// Builds an evidence-reconciliation outcome from one validated ingest.
+    ///
+    /// Carries the exact presented outcome counts. A non-zero
+    /// `uncertain_pending` means retry stays blocked until those executions
+    /// are reconciled by exact evidence.
+    pub fn evidence(observed: u64, failed: u64, uncertain_pending: u64) -> Self {
+        Self {
+            contract_version: SKILL_TRANSPORT_VERSION,
+            outcome: SkillResultOutcome::Evidence {
+                observed,
+                failed,
+                uncertain_pending,
+            },
         }
     }
 
@@ -449,11 +519,136 @@ impl SkillResultEnvelope {
     }
 }
 
-/// Activated display projection carried back across the wire.
+/// Maximum execution evidence records per ingest (issue #1191). Evidence
+/// frames stay in the hot-response profile: larger windows arrive as
+/// successive bounded ingests, never as giant inline frames.
 ///
-/// The display boundary returns this typed view; validation stays with the
-/// [`ActivatedSkillDisplay`](eliot_skill::ActivatedSkillDisplay) owner and is
-/// re-checked by receivers.
+/// The activated display projection itself is owned by
+/// [`ActivatedSkillDisplay`](eliot_skill::ActivatedSkillDisplay); validation
+/// stays with that owner and is re-checked by receivers.
+pub const MAX_EXECUTION_RECORDS: usize = 256;
+
+/// Harness activation receipt ingest as wire bytes (issue #1191).
+///
+/// Carries one per-attempt [`SkillHarnessActivationReceipt`](eliot_skill::SkillHarnessActivationReceipt)
+/// binding eligibility, packet position, retrieval, delivery, observable
+/// activation and adherence for one Skill revision. Decode verifies the exact
+/// receipt shape from the bytes; the daemon folds the receipt into its
+/// attempt summary (delivered/retrieved/activated/adhered/useful stay
+/// distinct) and carries the summary back in the result envelope. The
+/// producer is the harness that observed the attempt — this module mints no
+/// activation claim, it only contracts the carriage.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillActivationPayload {
+    /// Payload contract revision (must be [`SKILL_TRANSPORT_VERSION`]).
+    pub contract_version: u32,
+    /// The observed per-attempt activation receipt.
+    pub receipt: SkillHarnessActivationReceipt,
+}
+
+impl SkillActivationPayload {
+    /// Encodes a validated activation ingest within the carry bound.
+    pub fn encode(&self) -> Result<Vec<u8>, SkillTransportError> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| SkillTransportError::Shape(error.to_string()))?;
+        check_bound(bytes.len(), MAX_CARRY_BYTES)?;
+        Ok(bytes)
+    }
+
+    /// Decodes and validates one activation ingest within the carry bound.
+    pub fn decode(bytes: &[u8]) -> Result<Self, SkillTransportError> {
+        check_bound(bytes.len(), MAX_CARRY_BYTES)?;
+        let payload: Self = serde_json::from_slice(bytes)
+            .map_err(|error| SkillTransportError::Shape(error.to_string()))?;
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    fn validate(&self) -> Result<(), SkillTransportError> {
+        check_version(self.contract_version)?;
+        self.receipt
+            .validate()
+            .map_err(|error| SkillTransportError::Shape(format!("activate.receipt: {error}")))?;
+        Ok(())
+    }
+}
+
+/// Execution evidence ingest as wire bytes (issue #1191).
+///
+/// Carries step/artifact/verifier/outcome evidence bound to one Skill
+/// revision and package digest. Decode verifies the skill binding plus every
+/// record shape from the bytes; the daemon reconciles unknown effects before
+/// retry (uncertain executions block retry until superseded by exact
+/// evidence) and carries the reconciliation counts back in the result
+/// envelope. Absent records prove nothing: only presented evidence folds.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillExecutionPayload {
+    /// Payload contract revision (must be [`SKILL_TRANSPORT_VERSION`]).
+    pub contract_version: u32,
+    /// Skill identity the evidence is bound to.
+    pub skill_id: String,
+    /// Skill revision the evidence was observed at.
+    pub skill_revision: String,
+    /// Package digest the evidence was observed at.
+    pub package_digest: String,
+    /// Presented step/artifact/verifier/outcome records.
+    pub executions: Vec<SkillExecutionEvidence>,
+}
+
+impl SkillExecutionPayload {
+    /// Encodes a validated evidence ingest within the carry bound.
+    pub fn encode(&self) -> Result<Vec<u8>, SkillTransportError> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| SkillTransportError::Shape(error.to_string()))?;
+        check_bound(bytes.len(), MAX_CARRY_BYTES)?;
+        Ok(bytes)
+    }
+
+    /// Decodes and validates one evidence ingest within the carry bound.
+    pub fn decode(bytes: &[u8]) -> Result<Self, SkillTransportError> {
+        check_bound(bytes.len(), MAX_CARRY_BYTES)?;
+        let payload: Self = serde_json::from_slice(bytes)
+            .map_err(|error| SkillTransportError::Shape(error.to_string()))?;
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    fn validate(&self) -> Result<(), SkillTransportError> {
+        check_version(self.contract_version)?;
+        bounded_text(&self.skill_id, "execute.skill_id")?;
+        bounded_text(&self.skill_revision, "execute.skill_revision")?;
+        if self.package_digest.len() != 64
+            || self
+                .package_digest
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+        {
+            return Err(SkillTransportError::Shape(
+                "execute.package_digest: must be lowercase SHA-256 hex".to_owned(),
+            ));
+        }
+        if self.executions.is_empty() {
+            return Err(SkillTransportError::Shape(
+                "execute.executions: at least one presented record is required".to_owned(),
+            ));
+        }
+        if self.executions.len() > MAX_EXECUTION_RECORDS {
+            return Err(SkillTransportError::Shape(
+                "execute.executions: window exceeds the bounded ingest".to_owned(),
+            ));
+        }
+        for execution in &self.executions {
+            execution.validate().map_err(|error| {
+                SkillTransportError::Shape(format!("execute.executions: {error}"))
+            })?;
+        }
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]

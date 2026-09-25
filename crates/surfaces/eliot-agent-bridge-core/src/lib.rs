@@ -37,10 +37,11 @@ pub use resources::{
 };
 mod skill_transport;
 pub use skill_transport::{
-    MAX_CARRY_BYTES, MAX_INTAKE_BYTES, SKILL_DISPLAY_TOOL, SKILL_INJECT_TOOL,
-    SKILL_TRANSPORT_CONTRACT_ID, SKILL_TRANSPORT_VERSION, SkillAckPayload, SkillDisplayPayload,
-    SkillIntakePayload, SkillResultEnvelope, SkillResultOutcome, SkillToolKind,
-    SkillTransportError, skill_tool_kind,
+    MAX_CARRY_BYTES, MAX_EXECUTION_RECORDS, MAX_INTAKE_BYTES, SKILL_ACTIVATE_TOOL,
+    SKILL_DISPLAY_TOOL, SKILL_EXECUTE_TOOL, SKILL_INJECT_TOOL, SKILL_TRANSPORT_CONTRACT_ID,
+    SKILL_TRANSPORT_VERSION, SkillAckPayload, SkillActivationPayload, SkillDisplayPayload,
+    SkillExecutionPayload, SkillIntakePayload, SkillResultEnvelope, SkillResultOutcome,
+    SkillToolKind, SkillTransportError, skill_tool_kind,
 };
 mod route_tokens;
 pub use route_tokens::{

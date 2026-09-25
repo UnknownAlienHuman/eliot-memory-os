@@ -7,7 +7,10 @@
 //! Intake pairs decode to the wire intake, resolve canonical procedure
 //! acceptance over the authenticated Kernel route, and drive install→receipt
 //! only for owner-accepted material (issue #1191); display pairs decode to
-//! the wire display request and drive ack→display.
+//! the wire display request and drive ack→display; activation pairs decode to
+//! the wire harness receipt and fold it into the per-attempt stage summary
+//! (issue #1191); execution pairs decode to the wire evidence ingest and
+//! reconcile unknown effects before retry (issue #1191).
 //! Every claimed pair settles through a result body — including refusals,
 //! which persist as typed refusal outcomes — so no skill pair can poison the
 //! poller into a crash loop. Only transport and submit-leg failures fail the
@@ -115,6 +118,8 @@ async fn drive_accepted_skill_request(
     match kind {
         SkillToolKind::Inject => drive_accepted_inject(composition, kernel, &arguments).await,
         SkillToolKind::Display => drive_display(composition, &arguments),
+        SkillToolKind::Activate => drive_activation(&arguments),
+        SkillToolKind::Execute => drive_execution_evidence(&arguments),
     }
 }
 
@@ -229,6 +234,78 @@ fn bind_accepted_intake(
         });
     }
     Ok(())
+}
+
+/// Drives one decoded harness activation receipt into its attempt summary.
+///
+/// The wire receipt is validated on decode (eligibility↔retrieval,
+/// delivery↔retrieval, activation↔delivery, adherence↔activation bindings);
+/// the fold keeps delivered, retrieved, activated, adhered and useful
+/// distinct, so a packet-included but never activated Skill is never marked
+/// successful and usefulness still requires verifier-backed outcome refs.
+/// Material-use gating (stale/quarantine standing) stays at the install and
+/// display boundaries against the live registry — this ingest reports stages,
+/// it never admits Material use.
+fn drive_activation(arguments: &Value) -> SkillResultEnvelope {
+    let payload = match canonical_json_bytes(&arguments)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| {
+            eliot_agent_bridge_core::SkillActivationPayload::decode(&bytes)
+                .map_err(|error| error.to_string())
+        }) {
+        Ok(payload) => payload,
+        Err(detail) => {
+            return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(format!(
+                "activation arguments fail their shape: {detail}"
+            )));
+        }
+    };
+    SkillResultEnvelope::attempt(eliot_skill::derive_attempt_summary(&payload.receipt))
+}
+
+/// Drives one decoded execution-evidence ingest through unknown-effects
+/// reconciliation.
+///
+/// Every presented record is validated (observed executions require exact
+/// step refs; causal credit stays denied) and folded by outcome. A clean
+/// window carries its exact counts back; any still-uncertain execution
+/// refuses retry with the pending refs named, so unknown effects are
+/// reconciled by exact evidence before the next attempt. Absent records
+/// prove nothing — only presented evidence folds, and uninstrumented
+/// executions stay unknown instead of proving success.
+fn drive_execution_evidence(arguments: &Value) -> SkillResultEnvelope {
+    let payload = match canonical_json_bytes(&arguments)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| {
+            eliot_agent_bridge_core::SkillExecutionPayload::decode(&bytes)
+                .map_err(|error| error.to_string())
+        }) {
+        Ok(payload) => payload,
+        Err(detail) => {
+            return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(format!(
+                "execution arguments fail their shape: {detail}"
+            )));
+        }
+    };
+    match eliot_skill::reconcile_unknown_effects(&payload.executions) {
+        Ok(verdict) => {
+            if verdict.retry_permitted() {
+                SkillResultEnvelope::evidence(verdict.observed, verdict.failed, 0)
+            } else {
+                SkillResultEnvelope {
+                    contract_version: eliot_agent_bridge_core::SKILL_TRANSPORT_VERSION,
+                    outcome: eliot_agent_bridge_core::SkillResultOutcome::Refused {
+                        code: "UNCERTAIN_EFFECTS".to_owned(),
+                        detail: format!(
+                            "{} execution(s) have unknown effects; reconcile with exact evidence before retry",
+                            verdict.uncertain_pending_refs.len()
+                        ),
+                    },
+                }
+            }
+        }
+        Err(error) => SkillResultEnvelope::refused(&error),
+    }
 }
 
 fn drive_display(composition: &DaemonComposition, arguments: &Value) -> SkillResultEnvelope {

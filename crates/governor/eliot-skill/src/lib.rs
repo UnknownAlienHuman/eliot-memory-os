@@ -61,11 +61,13 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 pub mod activation;
 
 pub use activation::{
-    AdherenceCheckpoints, AttemptLifecycleSummary, InstructionConflict, LifecycleEvidence,
-    OrderingBasis, SkillActivationStatus, SkillAdherenceStatus, SkillDeliveryStatus,
-    SkillHarnessActivationReceipt, SkillRetrievalStatus, apply_dependency_staleness,
-    changed_dependency_names, derive_attempt_summary, derive_lifecycle_view,
-    detect_dependency_staleness, material_use_allowed, record_instruction_conflict,
+    AdherenceCheckpoints, AttemptLifecycleSummary, ExecutionFold, InstructionConflict,
+    LifecycleEvidence, OrderingBasis, SkillActivationStatus, SkillAdherenceStatus,
+    SkillDeliveryStatus, SkillHarnessActivationReceipt, SkillRetrievalStatus,
+    UnknownEffectsVerdict, apply_dependency_staleness, changed_dependency_names,
+    derive_attempt_summary, derive_lifecycle_view, detect_dependency_staleness,
+    fold_execution_evidence, material_use_allowed, reconcile_unknown_effects,
+    record_instruction_conflict,
 };
 
 pub(crate) fn text(value: &str, field: &'static str) -> Result<(), SkillError> {
@@ -247,6 +249,17 @@ pub enum LifecycleAction {
     Archive,
     Quarantine,
     Restore,
+    /// Exact governed rollback to a previously receipted revision. Reversible
+    /// by construction: promotion requires the review plus rollback binding
+    /// ([`LifecycleReview`]), and the canonical commit path serializes the
+    /// name into the closed `ApplyLifecyclePolicy` row like every other
+    /// reversible action (issue #1191).
+    Rollback,
+    /// Governed expiry of a superseded or stale revision. Reversible by
+    /// construction under the same review plus rollback binding: expiry
+    /// retires the revision from Material use without destroying the
+    /// evidence the restore path replays (issue #1191).
+    Expiry,
 }
 
 impl LifecycleAction {
