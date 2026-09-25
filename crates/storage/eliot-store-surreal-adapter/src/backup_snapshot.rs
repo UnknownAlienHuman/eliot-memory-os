@@ -16,17 +16,18 @@
 //! and errors/receipts carry digests and static text, never provider payload
 //! or credentials.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
 
 use eliot_store_api::{
-    MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_MEMBERS, MAX_SNAPSHOT_PAGE_MEMBERS, MAX_SNAPSHOT_PAGES,
-    RequestMeta, SnapshotBeginRequest, SnapshotCompleteness, SnapshotCursor, SnapshotEndReceipt,
-    SnapshotHandle, SnapshotMember, SnapshotPage, StateFence, StoreError, canonical_json_bytes,
+    BlobResidency, BlobResidencyDomain, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_MEMBERS,
+    MAX_SNAPSHOT_PAGE_MEMBERS, MAX_SNAPSHOT_PAGES, RequestMeta, SnapshotBeginRequest,
+    SnapshotCompleteness, SnapshotCursor, SnapshotDenominator, SnapshotEndReceipt, SnapshotHandle,
+    SnapshotMember, SnapshotMemberType, SnapshotPage, StateFence, StoreError, canonical_json_bytes,
     sha256_hex,
 };
 use serde::Deserialize;
-use serde_json::Map;
+use serde_json::{Map, Value};
 
 use crate::SurrealStoreAdapter;
 use crate::error::AdapterError;
@@ -51,6 +52,16 @@ const SNAPSHOT_CLASS_FIELD: &str = "snapshot.classes";
 /// evidence of a later or earlier enumeration shape.
 const SNAPSHOT_VALIDATION_REVISION: u64 = 1;
 
+/// Bounded static text for a canonical serialization failure inside this
+/// module. A provider or serde message never crosses the boundary (I5.1: the
+/// bridge "returns receipts and exact errors").
+const SNAPSHOT_SERIALIZATION_REASON: &str = "canonical snapshot serialization failed";
+
+/// Maps a canonical serialization failure to bounded static text.
+fn snapshot_serialization_error(_error: serde_json::Error) -> StoreError {
+    StoreError::Serialization(SNAPSHOT_SERIALIZATION_REASON.to_owned())
+}
+
 /// Domain separator for the owner-issued consistency point.
 ///
 /// I5.27 binds canonical identity over a domain separator, so a capture handle
@@ -58,6 +69,66 @@ const SNAPSHOT_VALIDATION_REVISION: u64 = 1;
 /// the public capability this fixed registry implements, owned by
 /// `eliot-store-api` and surfaced by the registry.
 const SNAPSHOT_CONSISTENCY_POINT_DOMAIN: &str = crate::client::snapshot_capability();
+
+/// Versioned canonical encoding of the member identity and ordering shape.
+///
+/// I5.27: "Canonical encoding is deterministic and versioned; fields affecting
+/// authority, scope, ordering, privacy or effect cannot be omitted/defaulted
+/// silently." A member identity is therefore `<version>:<class token>:<versioned
+/// residency domain>:<digest of the row's own key fields>` — never a derived
+/// `Debug` rendering and never a caller string.
+const MEMBER_ID_VERSION: &str = "eliot.snapshot.member.v1";
+
+/// Versioned canonical token for one blob-residency domain.
+///
+/// I5.2 and `crates/storage/AGENTS.md`: "deduplication never crosses
+/// privacy/retention/erasure domains by digest alone". The domain token, not a
+/// derived rendering, is what orders and identifies members, so equal bytes in
+/// two domains never collapse onto one identity.
+const fn domain_key(domain: BlobResidencyDomain) -> &'static str {
+    match domain {
+        BlobResidencyDomain::InlineCanonical => "inline-canonical.v1",
+        BlobResidencyDomain::ContentBlob => "content-blob.v1",
+        BlobResidencyDomain::ExternalReference => "external-reference.v1",
+    }
+}
+
+/// How one captured class points at another captured class.
+///
+/// A typed edge is only a `SnapshotMemberType::Reference` member when its
+/// target is resolvable inside the same observed capture; an unresolvable edge
+/// is refused, never reported as an omitted table.
+pub(crate) struct MemberReference {
+    /// Row field naming the target record's key.
+    key_field: &'static str,
+    /// Physical table of the target class, owned by [`crate::schema`].
+    target_table: &'static str,
+}
+
+/// The captured shape of one admitted canonical source class.
+///
+/// The residency domain comes from the physical origin of the row, never from
+/// its content: an inline canonical row is `InlineCanonical`, a row carrying
+/// verbatim captured bytes is `ContentBlob`, and a typed edge row is
+/// `ExternalReference`.
+pub(crate) struct MemberClass {
+    /// Versioned canonical class token.
+    token: &'static str,
+    /// Physical table name owned by [`crate::schema`].
+    table: &'static str,
+    /// Member type this class contributes.
+    member_type: SnapshotMemberType,
+    /// Residency domain implied by the physical origin of the class.
+    domain: BlobResidencyDomain,
+    /// Row key fields that name this record, read from the row itself.
+    key_fields: &'static [&'static str],
+    /// Store-owned content-digest column carried forward as the member
+    /// residency digest. Never recomputed here: this crate is not a
+    /// Blob-root owner, so no residency digest can be re-derived.
+    digest_field: Option<&'static str>,
+    /// The typed edge this class contributes, when it is a reference.
+    reference: Option<MemberReference>,
+}
 
 /// One declared canonical source class and its single disposition in a capture.
 ///
@@ -69,10 +140,7 @@ const SNAPSHOT_CONSISTENCY_POINT_DOMAIN: &str = crate::client::snapshot_capabili
 /// and no migration.
 pub(crate) enum CanonicalSourceClass {
     /// Read in the one member transaction and captured as a snapshot member.
-    Member {
-        /// Physical table name owned by [`crate::schema`].
-        table: &'static str,
-    },
+    Member(MemberClass),
     /// Read as the capture point itself; never a member.
     CapturePoint {
         /// Physical table name owned by [`crate::schema`].
@@ -105,38 +173,108 @@ pub(crate) enum CanonicalSourceClass {
 }
 
 /// Every canonical source class the single owner declares, in canonical order.
+///
+/// A13.7: "A backup includes canonical state, referenced immutable artifacts,
+/// policy and configuration snapshots, required pending operational state,
+/// purge ledger, Architecture revision digest, manifest, and checksums." This
+/// enumeration is the bounded-surreal-adapter's share of that list: the nine
+/// admitted canonical tables, the two point singletons, and the twelve classes
+/// the admitted generation does not define.
 pub(crate) const CANONICAL_SOURCE_CLASSES: &[CanonicalSourceClass] = &[
     CanonicalSourceClass::CapturePoint {
         table: crate::schema::table::SCHEMA_META,
         statement: crate::schema::READ_SCHEMA_META,
     },
-    CanonicalSourceClass::Member {
+    CanonicalSourceClass::Member(MemberClass {
+        token: "write-receipt",
         table: crate::schema::table::WRITE_RECEIPT,
-    },
-    CanonicalSourceClass::Member {
+        member_type: SnapshotMemberType::Record,
+        domain: BlobResidencyDomain::InlineCanonical,
+        key_fields: &["operation_id"],
+        digest_field: None,
+        reference: None,
+    }),
+    CanonicalSourceClass::Member(MemberClass {
+        token: "revision-head",
         table: crate::schema::table::REVISION_HEAD,
-    },
-    CanonicalSourceClass::Member {
+        member_type: SnapshotMemberType::Record,
+        domain: BlobResidencyDomain::InlineCanonical,
+        key_fields: &["revision_key"],
+        digest_field: None,
+        reference: None,
+    }),
+    CanonicalSourceClass::Member(MemberClass {
+        token: "ordering-head",
         table: crate::schema::table::ORDERING_HEAD,
-    },
-    CanonicalSourceClass::Member {
+        member_type: SnapshotMemberType::Record,
+        domain: BlobResidencyDomain::InlineCanonical,
+        key_fields: &["ordering_scope"],
+        digest_field: None,
+        reference: None,
+    }),
+    CanonicalSourceClass::Member(MemberClass {
+        token: "canonical-event",
         table: crate::schema::table::CANONICAL_EVENT,
-    },
-    CanonicalSourceClass::Member {
+        member_type: SnapshotMemberType::Record,
+        domain: BlobResidencyDomain::InlineCanonical,
+        key_fields: &["event_id"],
+        digest_field: None,
+        reference: None,
+    }),
+    CanonicalSourceClass::Member(MemberClass {
+        token: "projection-record",
         table: crate::schema::table::PROJECTION_RECORD,
-    },
-    CanonicalSourceClass::Member {
+        member_type: SnapshotMemberType::Record,
+        domain: BlobResidencyDomain::InlineCanonical,
+        key_fields: &["publication_id"],
+        digest_field: None,
+        reference: None,
+    }),
+    // A typed relation row is an edge into another canonical record: the edge
+    // carries no inline payload of its own and its target is named by the
+    // immutable commit that created it.
+    CanonicalSourceClass::Member(MemberClass {
+        token: "relation-record",
         table: crate::schema::table::RELATION_RECORD,
-    },
-    CanonicalSourceClass::Member {
+        member_type: SnapshotMemberType::Reference,
+        domain: BlobResidencyDomain::ExternalReference,
+        key_fields: &["relation_id"],
+        digest_field: None,
+        reference: Some(MemberReference {
+            key_field: "operation_id",
+            target_table: crate::schema::table::WRITE_RECEIPT,
+        }),
+    }),
+    CanonicalSourceClass::Member(MemberClass {
+        token: "outbox-event",
         table: crate::schema::table::OUTBOX_EVENT,
-    },
-    CanonicalSourceClass::Member {
+        member_type: SnapshotMemberType::Record,
+        domain: BlobResidencyDomain::InlineCanonical,
+        key_fields: &["outbox_id"],
+        digest_field: None,
+        reference: None,
+    }),
+    // The operational-recovery rows hold an opaque locator or immutable
+    // payload bytes plus the store-owned value digest, so the digest is
+    // carried forward rather than recomputed.
+    CanonicalSourceClass::Member(MemberClass {
+        token: "recovery-owner",
         table: crate::schema::table::RECOVERY_OWNER,
-    },
-    CanonicalSourceClass::Member {
+        member_type: SnapshotMemberType::Record,
+        domain: BlobResidencyDomain::InlineCanonical,
+        key_fields: &["namespace", "key"],
+        digest_field: Some("value_digest"),
+        reference: None,
+    }),
+    CanonicalSourceClass::Member(MemberClass {
+        token: "recovery-job",
         table: crate::schema::table::RECOVERY_JOB,
-    },
+        member_type: SnapshotMemberType::Record,
+        domain: BlobResidencyDomain::InlineCanonical,
+        key_fields: &["namespace", "key"],
+        digest_field: Some("value_digest"),
+        reference: None,
+    }),
     CanonicalSourceClass::CapturePoint {
         table: crate::schema::table::CANONICAL_FENCE,
         statement: crate::schema::READ_FENCE,
@@ -186,17 +324,22 @@ pub(crate) fn capture_point_statements() -> impl Iterator<Item = &'static str> {
         .iter()
         .filter_map(|class| match class {
             CanonicalSourceClass::CapturePoint { statement, .. } => Some(*statement),
-            CanonicalSourceClass::Member { .. }
+            CanonicalSourceClass::Member(_)
             | CanonicalSourceClass::OutsideAdmittedGeneration { .. } => None,
         })
 }
 
 /// The physical tables the pinned member batch reads, in order.
 pub(crate) fn captured_member_tables() -> impl Iterator<Item = &'static str> {
+    captured_member_classes().map(|member| member.table)
+}
+
+/// The captured classes, in the exact order the pinned member batch reads them.
+fn captured_member_classes() -> impl Iterator<Item = &'static MemberClass> {
     CANONICAL_SOURCE_CLASSES
         .iter()
         .filter_map(|class| match class {
-            CanonicalSourceClass::Member { table } => Some(*table),
+            CanonicalSourceClass::Member(member) => Some(member),
             CanonicalSourceClass::CapturePoint { .. }
             | CanonicalSourceClass::OutsideAdmittedGeneration { .. } => None,
         })
@@ -224,11 +367,30 @@ fn verify_canonical_source_classes() -> Result<(), StoreError> {
     let mut verified = 0_usize;
     for class in CANONICAL_SOURCE_CLASSES {
         match class {
-            CanonicalSourceClass::Member { table } => {
-                if !defines_admitted_table(table) {
+            CanonicalSourceClass::Member(member) => {
+                if !defines_admitted_table(member.table) {
                     return Err(StoreError::InvalidField {
                         field: SNAPSHOT_CLASS_FIELD,
                         reason: "captured class is not defined by the admitted generation",
+                    });
+                }
+                // A typed edge is a `Reference` member exactly when it declares
+                // a resolvable target inside the admitted generation, so a
+                // member type can never disagree with its reference shape.
+                if member.reference.is_some()
+                    != (member.member_type == SnapshotMemberType::Reference)
+                {
+                    return Err(StoreError::InvalidField {
+                        field: SNAPSHOT_CLASS_FIELD,
+                        reason: "reference class and member type disagree",
+                    });
+                }
+                if let Some(reference) = &member.reference
+                    && !defines_admitted_table(reference.target_table)
+                {
+                    return Err(StoreError::InvalidField {
+                        field: SNAPSHOT_CLASS_FIELD,
+                        reason: "reference target is not defined by the admitted generation",
                     });
                 }
             }
@@ -472,6 +634,369 @@ fn bind_source_identity(
     Ok(())
 }
 
+/// One observed canonical enumeration at a single bound point.
+struct Enumeration {
+    /// The point the members were observed at, from the same transaction.
+    point: CapturePoint,
+    /// Proof that the canonical enumeration actually ran.
+    evidence: EnumerationEvidence,
+    /// Members in versioned logical order.
+    members: Vec<SnapshotMember>,
+}
+
+/// Proof that the canonical enumeration actually ran over every admitted
+/// canonical class.
+#[derive(Clone, Copy)]
+struct EnumerationEvidence {
+    /// Admitted canonical classes the pinned member batch returned.
+    classes_read: usize,
+    /// Canonical rows the pinned member batch returned across those classes.
+    members_read: usize,
+}
+
+impl EnumerationEvidence {
+    /// Reports whether this observation is an authoritative known-zero
+    /// denominator.
+    ///
+    /// A13.7 and `SnapshotValidationReceipt::validate`: a known-zero count
+    /// requires a complete authoritative denominator. Here that means the pinned
+    /// member batch read every admitted canonical class and every one of them
+    /// returned zero rows — never "nothing was found" inferred from a
+    /// denominator the caller declared empty.
+    fn is_authoritative_zero(self) -> bool {
+        self.members_read == 0 && self.classes_read == captured_member_classes().count()
+    }
+}
+
+/// Runs the pinned member batch and returns the point plus every class's rows.
+///
+/// The point is re-read inside the same transaction as the members, so the
+/// denominator this binds is observed at exactly the fence the capture claims.
+/// Result offsets are fixed: 0 is the retained `BEGIN TRANSACTION` result, 1 the
+/// schema generation, 2 the canonical fence, then one whole-record array per
+/// captured class in declaration order.
+async fn read_enumeration(
+    adapter: &SurrealStoreAdapter,
+) -> Result<(CapturePoint, Vec<Vec<Map<String, Value>>>), StoreError> {
+    let statement =
+        crate::client::fixed_snapshot_statement(crate::client::SNAPSHOT_MEMBERS_OPERATION)
+            .map_err(AdapterError::into_store_error)?;
+    crate::client::validate_snapshot_operation(crate::client::SNAPSHOT_MEMBERS_OPERATION)
+        .map_err(AdapterError::into_store_error)?;
+    let transport = crate::apply::client(adapter)
+        .await
+        .map_err(AdapterError::into_store_error)?;
+    crate::apply::ensure_ready(adapter, transport)
+        .await
+        .map_err(AdapterError::into_store_error)?;
+    let mut response = crate::client::query(
+        transport,
+        &adapter.config,
+        crate::client::SNAPSHOT_MEMBERS_OPERATION,
+        statement,
+        Map::new(),
+    )
+    .await
+    .map_err(AdapterError::into_store_error)?;
+    let errors = response.take_errors();
+    if !errors.is_empty() {
+        if errors
+            .iter()
+            .all(|error| crate::client::is_absent_table(error))
+        {
+            return Err(StoreError::Unavailable);
+        }
+        return Err(StoreError::MissingReceiptEnvelope);
+    }
+    let meta: Option<PointSchemaMeta> = response.take(1).map_err(AdapterError::into_store_error)?;
+    let fence: Option<PointFence> = response.take(2).map_err(AdapterError::into_store_error)?;
+    let point = parse_capture_point(meta, fence)?;
+    let mut rows = Vec::new();
+    for offset in 0..captured_member_classes().count() {
+        let offset = offset + 3;
+        let class_rows: Vec<Map<String, Value>> = response
+            .take(offset)
+            .map_err(AdapterError::into_store_error)?;
+        rows.push(class_rows);
+    }
+    Ok((point, rows))
+}
+
+/// Digest of the exact canonical bytes of one observed row.
+fn row_content_digest(row: &Map<String, Value>) -> Result<String, StoreError> {
+    let bytes = canonical_json_bytes(row).map_err(snapshot_serialization_error)?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// The versioned, domain-qualified member identity of one observed row.
+///
+/// The digest covers only the row's own key fields, so identity is stable under
+/// unrelated column changes while still being constructed from the row rather
+/// than from any caller string.
+fn row_member_id(class: &MemberClass, row: &Map<String, Value>) -> Result<String, StoreError> {
+    let mut key = Map::new();
+    for field in class.key_fields {
+        let value = row.get(*field).ok_or(StoreError::InvalidField {
+            field: "snapshot.member_id",
+            reason: "captured row does not carry its declared key field",
+        })?;
+        if !value.is_string() {
+            return Err(StoreError::InvalidField {
+                field: "snapshot.member_id",
+                reason: "captured row key field is not store-owned text",
+            });
+        }
+        key.insert((*field).to_owned(), value.clone());
+    }
+    let key_digest = sha256_hex(&canonical_json_bytes(&key).map_err(snapshot_serialization_error)?);
+    Ok(format!(
+        "{MEMBER_ID_VERSION}:{}:{}:{key_digest}",
+        class.token,
+        domain_key(class.domain),
+    ))
+}
+
+/// The joined key of one observed row under its own class.
+fn row_joined_key(class: &MemberClass, row: &Map<String, Value>) -> Result<String, StoreError> {
+    let mut parts = Vec::with_capacity(class.key_fields.len());
+    for field in class.key_fields {
+        parts.push(
+            row.get(*field)
+                .and_then(Value::as_str)
+                .ok_or(StoreError::InvalidField {
+                    field: "snapshot.member_id",
+                    reason: "captured row does not carry its declared key field",
+                })?,
+        );
+    }
+    Ok(parts.join("\u{1f}"))
+}
+
+/// The store-owned content digest carried forward as the residency digest.
+///
+/// A13.7 and `crates/storage/AGENTS.md`: a Blob residency digest cannot be
+/// re-derived here (this crate is not a Blob-root owner), so the store's own
+/// digest column is carried forward opaquely and the digest of the exact
+/// captured canonical bytes is the fallback. The residency *domain* — never the
+/// digest — is what keeps same-content-different-domain members distinct.
+fn row_residency_digest(
+    class: &MemberClass,
+    row: &Map<String, Value>,
+    content_digest: &str,
+) -> String {
+    class
+        .digest_field
+        .and_then(|field| row.get(field))
+        .and_then(Value::as_str)
+        .filter(|value| is_lowercase_sha256(value))
+        .unwrap_or(content_digest)
+        .to_owned()
+}
+
+/// Reports whether `value` is a lowercase hexadecimal SHA-256 digest.
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Maps one observed row of one captured class to its snapshot member.
+fn member_for_row(
+    class: &MemberClass,
+    row: &Map<String, Value>,
+) -> Result<SnapshotMember, StoreError> {
+    let content_digest = row_content_digest(row)?;
+    let member_id = row_member_id(class, row)?;
+    let residency_digest = row_residency_digest(class, row, &content_digest);
+    let bytes = canonical_json_bytes(row).map_err(snapshot_serialization_error)?;
+    let byte_count = u64::try_from(bytes.len())
+        .map_err(|_| StoreError::PayloadTooLarge)?
+        .max(1);
+    Ok(SnapshotMember {
+        member_id,
+        member_type: class.member_type,
+        content_digest,
+        residency: BlobResidency {
+            domain: class.domain,
+            residency_digest,
+            byte_count,
+        },
+        reference_digest: None,
+    })
+}
+
+/// Enumerates every admitted canonical source class at one bound point.
+///
+/// This is the provider-read denominator: the caller's declared denominator is
+/// a claim checked against this set, never the source of the counts, the page
+/// count or the served ordering. Members are returned in versioned logical
+/// order — class token, then versioned residency domain, then member identity —
+/// so ordering never depends on incidental provider row order (I5.27).
+async fn enumerate_canonical_members(
+    adapter: &SurrealStoreAdapter,
+) -> Result<Enumeration, StoreError> {
+    let (point, class_rows) = read_enumeration(adapter).await?;
+    let rows_by_key = observed_row_keys(&class_rows);
+    let mut members = resolve_member_references(&class_rows, &rows_by_key)?;
+    members.sort_by(|left, right| {
+        (left.0, left.1, left.2.member_id.as_str()).cmp(&(
+            right.0,
+            right.1,
+            right.2.member_id.as_str(),
+        ))
+    });
+    let members = members
+        .into_iter()
+        .map(|(_, _, member)| member)
+        .collect::<Vec<_>>();
+    validate_reference_closure(&members)?;
+    let evidence = EnumerationEvidence {
+        classes_read: class_rows.len(),
+        members_read: members.len(),
+    };
+    Ok(Enumeration {
+        point,
+        evidence,
+        members,
+    })
+}
+
+/// Indexes every observed row by its own class table and joined key.
+fn observed_row_keys(
+    class_rows: &[Vec<Map<String, Value>>],
+) -> BTreeMap<(&'static str, String), String> {
+    let mut keys = BTreeMap::new();
+    for (class, rows) in captured_member_classes().zip(class_rows) {
+        for row in rows {
+            if let Ok(joined) = row_joined_key(class, row) {
+                keys.insert(
+                    (class.table, joined),
+                    row_content_digest(row).unwrap_or_default(),
+                );
+            }
+        }
+    }
+    keys
+}
+
+/// Builds every member and resolves each typed edge against the observed set.
+///
+/// An edge whose target is absent from the observed capture is refused with an
+/// exact typed failure. A13.7 / ARCH-RES-03: recovery cannot resurrect invalid
+/// state, so a dangling edge is never reported as a broad "omitted table"
+/// exclusion.
+fn resolve_member_references(
+    class_rows: &[Vec<Map<String, Value>>],
+    rows_by_key: &BTreeMap<(&'static str, String), String>,
+) -> Result<Vec<(&'static str, &'static str, SnapshotMember)>, StoreError> {
+    let mut members = Vec::new();
+    for (class, rows) in captured_member_classes().zip(class_rows) {
+        for row in rows {
+            let member = member_for_row(class, row)?;
+            let reference = match &class.reference {
+                None => None,
+                Some(reference) => {
+                    let target_key = row
+                        .get(reference.key_field)
+                        .and_then(Value::as_str)
+                        .ok_or(StoreError::InvalidField {
+                            field: "snapshot.reference_digest",
+                            reason: "typed edge does not name its target key",
+                        })?
+                        .to_owned();
+                    let digest = rows_by_key
+                        .get(&(reference.target_table, target_key))
+                        .ok_or(StoreError::InvalidField {
+                            field: "snapshot.reference_digest",
+                            reason: "typed edge target is not in the observed capture",
+                        })?;
+                    Some(digest.clone())
+                }
+            };
+            let mut member = member;
+            member.reference_digest = reference;
+            member.validate()?;
+            members.push((class.token, domain_key(class.domain), member));
+        }
+    }
+    Ok(members)
+}
+
+/// Validates the canonical reference closure of one observed member set.
+///
+/// The snapshot analogue of `crate::backup_restore::validate_reference_closure`:
+/// every `SnapshotMemberType::Reference` member must name the exact
+/// `content_digest` of another member in the same capture. This is an
+/// independent re-proof over a different observation than the enumeration used
+/// (the key index), so a member set that lost its target still fails closed.
+fn validate_reference_closure(members: &[SnapshotMember]) -> Result<(), StoreError> {
+    let present: BTreeSet<&str> = members
+        .iter()
+        .map(|member| member.content_digest.as_str())
+        .collect();
+    for member in members {
+        if member.member_type != SnapshotMemberType::Reference {
+            continue;
+        }
+        let Some(reference) = member.reference_digest.as_deref() else {
+            return Err(StoreError::InvalidField {
+                field: "snapshot.reference_digest",
+                reason: "reference member requires a reference digest",
+            });
+        };
+        if !present.contains(reference) || reference == member.content_digest {
+            return Err(StoreError::IdentityConflict);
+        }
+    }
+    Ok(())
+}
+
+/// Reconciles the caller's claimed denominator against the observed member set.
+///
+/// The claimed denominator is evidence, not truth: a missing, extra, duplicated
+/// or conflicting member refuses the capture instead of being absorbed into the
+/// served accounting.
+fn reconcile_denominator(
+    observed: &[SnapshotMember],
+    claimed: &SnapshotDenominator,
+) -> Result<(), StoreError> {
+    let mut by_id: BTreeMap<&str, &SnapshotMember> = BTreeMap::new();
+    for member in observed {
+        if by_id.insert(member.member_id.as_str(), member).is_some() {
+            return Err(StoreError::Duplicate {
+                field: "snapshot.members",
+            });
+        }
+    }
+    for claim in &claimed.members {
+        match by_id.get(claim.member_id.as_str()) {
+            None => {
+                return Err(StoreError::InvalidField {
+                    field: "snapshot.members",
+                    reason: "claimed member is absent from the observed capture",
+                });
+            }
+            Some(member) if *member == claim => {}
+            Some(_) => return Err(StoreError::IdentityConflict),
+        }
+    }
+    let claimed_ids: BTreeSet<&str> = claimed
+        .members
+        .iter()
+        .map(|member| member.member_id.as_str())
+        .collect();
+    for member in observed {
+        if !claimed_ids.contains(member.member_id.as_str()) {
+            return Err(StoreError::InvalidField {
+                field: "snapshot.members",
+                reason: "observed member is absent from the claimed denominator",
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Removes exactly the capture-owned entry. The map itself is never cleared.
 fn release_owned(states: &mut HashMap<String, SnapshotState>, digest: &str) {
     states.remove(digest);
@@ -489,15 +1014,28 @@ pub(crate) async fn begin_snapshot(
         return Err(StoreError::FenceMismatch);
     }
     verify_canonical_source_classes()?;
-    let point = observe_capture_point(adapter, SNAPSHOT_BEGIN_OPERATION).await?;
+    // The denominator is read from the provider, in one coherent transaction
+    // with the point it claims, and the claimed denominator is reconciled
+    // against it. The caller never supplies the served set.
+    let enumeration = enumerate_canonical_members(adapter).await?;
+    let point = enumeration.point;
     if point.schema_generation != adapter.config.expected_schema_generation.as_str() {
         return Err(StoreError::Unavailable);
     }
     bind_source_identity(adapter, &point, &request)?;
+    let ordered_members = enumeration.members;
+    reconcile_denominator(&ordered_members, &request.denominator)?;
+    // An empty observed set is only a bindable denominator when the
+    // enumeration actually read every admitted canonical class and found
+    // nothing. A declared-empty denominator with no provider evidence is not a
+    // zero-member capture; it is refused.
+    if ordered_members.is_empty() && !enumeration.evidence.is_authoritative_zero() {
+        return Err(StoreError::Empty {
+            field: "snapshot.members",
+        });
+    }
 
     let snapshot_digest = request.compute_digest()?;
-    let mut ordered_members = request.denominator.members.clone();
-    ordered_members.sort_by_key(SnapshotMember::logical_identity);
 
     let member_count = ordered_members.len() as u64;
     if member_count > request.bounds.max_members || member_count > MAX_SNAPSHOT_MEMBERS as u64 {
