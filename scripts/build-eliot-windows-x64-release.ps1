@@ -213,7 +213,10 @@ function Get-RuntimeArtifactPlan([object]$Metadata) {
 # launch flag is ELIOT_CLAUDE_FRONT_DOOR (absent/legacy = today's
 # `eliot-governor.exe mcp stdio --host claude --instance default`;
 # agent-bridge = the staged `eliot-agent-bridge.exe` with its
-# `--profile/--transport/--client-declaration` argv). The bundle switch
+# `mcp --profile/--transport/--client-declaration` argv. The leading `mcp`
+# token is the explicit checked MCP entrypoint contract owned by #2562: it
+# selects the MCP JSON-RPC front door, while the tokenless argv keeps serving
+# the private `op` stdio clients unchanged. The bundle switch
 # -ClaudeCodeFrontDoor provisions the selected command: legacy stages
 # today's set unchanged, agent-bridge additionally builds and stages the
 # bridge so the flagged command always exists in the bundle. No new
@@ -2419,7 +2422,7 @@ $plan = [ordered]@{
         legacy_argv = @('mcp', 'stdio', '--host', 'claude', '--instance', 'default')
         bridge_command = 'eliot-agent-bridge.exe'
         bridge_build = 'cargo --frozen -p eliot-agent-bridge --bin eliot-agent-bridge'
-        bridge_argv = @('--profile', 'SPINE_FUNCTIONAL', '--transport', 'stdio', '--client-declaration', '<installation-absolute>/agent-bridge/client-declaration-v2.json')
+        bridge_argv = @('mcp', '--profile', 'SPINE_FUNCTIONAL', '--transport', 'stdio', '--client-declaration', '<installation-absolute>/agent-bridge/client-declaration-v2.json')
         bridge_path = [string]$frontDoorBridgePlan.path
         bridge_provisioned = [bool]$frontDoorBridgePlan.provisioned
         other_hosts = 'legacy-unchanged (codex/opencode/claude-desktop keep eliot-governor MCP entries)'
