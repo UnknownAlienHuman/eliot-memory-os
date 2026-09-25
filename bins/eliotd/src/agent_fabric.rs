@@ -631,7 +631,14 @@ pub struct VerifiedProviderMaterial {
 }
 
 /// Builds the sealed admission capability from authenticated Kernel claim
-/// material (issue #1108, production composition caller for W4/A1/A2).
+/// material (issue #1108).
+///
+/// Crate-internal: the only cross-crate construction path is
+/// [`DaemonComposition::agent_fabric_verified_capability`](crate::DaemonComposition::agent_fabric_verified_capability),
+/// which unconditionally overwrites the caller-supplied session halves
+/// (live fence, session binding) with the live authenticated session
+/// values before calling this builder. External callers therefore cannot
+/// bypass the session-half overwrite with coherent caller-built halves.
 ///
 /// Wiring plus coherence: forwards the daemon-resolved
 /// [`VerifiedProviderMaterial`] halves into the presented/owner capability
@@ -647,7 +654,7 @@ pub struct VerifiedProviderMaterial {
 ///
 /// Returns the coordinator owner rejection unchanged (shape, coherence, or
 /// stale/revoked binding).
-pub fn build_admitted_provider_capability(
+pub(crate) fn build_admitted_provider_capability(
     material: VerifiedProviderMaterial,
 ) -> Result<AdmittedProviderCapability, FabricError> {
     let presented = PresentedClaimMaterial::new(
@@ -2906,6 +2913,12 @@ impl AgentFabric {
     /// Restores the fabric on freshly resolved owner material in one call
     /// (issue #1108, verified restore for A8).
     ///
+    /// Crate-internal: the only cross-crate restore path is
+    /// [`DaemonComposition::agent_fabric_restore_verified`](crate::DaemonComposition::agent_fabric_restore_verified),
+    /// which re-resolves the session halves over the live authenticated
+    /// session before calling this restore. External callers therefore
+    /// cannot restore effecting readiness with caller-held halves alone.
+    ///
     /// Builds a fresh capability from `material` — the daemon's per-restore
     /// resolution over its authenticated session (fresh live fence, current
     /// Governor expectation, validated session binding) — then restores
@@ -2918,7 +2931,7 @@ impl AgentFabric {
     ///
     /// Returns the capability construction rejection, the coordinator owner
     /// restore rejection, or a stale-config conflict unchanged.
-    pub fn restore_verified(
+    pub(crate) fn restore_verified(
         snapshot: FabricSnapshot,
         config: CoordinatorConfig,
         ports: FabricPorts,

@@ -329,7 +329,9 @@ fn verify_accepts_durable_row_bound_to_exact_attempt_and_operation() {
         .expect("context");
     // Presented proof material mirrors the durable row exactly; the owner
     // verifies currentness (live epoch agreement, no revocation) and the
-    // presented route/capacity revision binding.
+    // presented route/capacity revision binding against the
+    // Governor-observed currentness, which this proof supplies equal to the
+    // presented revisions.
     context
         .verify(
             ProviderProofKind::Admission,
@@ -340,6 +342,8 @@ fn verify_accepts_durable_row_bound_to_exact_attempt_and_operation() {
             &"c".repeat(64),
             &binding_digest,
             &"8".repeat(64),
+            "route-rev-t904-7",
+            "capacity-rev-t904-3",
             "route-rev-t904-7",
             "capacity-rev-t904-3",
         )
@@ -374,6 +378,8 @@ fn verify_rejects_foreign_attempt_under_known_claim() {
         &"c".repeat(64),
         &binding_digest,
         &"8".repeat(64),
+        "route-rev-t904-7",
+        "capacity-rev-t904-3",
         "route-rev-t904-7",
         "capacity-rev-t904-3",
     );
@@ -424,6 +430,8 @@ fn verify_rejects_stale_epoch_row() {
         &"c".repeat(64),
         &binding_digest,
         &"8".repeat(64),
+        "route-rev-t904-7",
+        "capacity-rev-t904-3",
         "route-rev-t904-7",
         "capacity-rev-t904-3",
     );
