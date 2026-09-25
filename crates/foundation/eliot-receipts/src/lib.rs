@@ -852,6 +852,7 @@ impl GrantClosureReceipt {
             canonical.validate()?;
         }
         Ok(())
+    }
 }
 
 /// Principal, session and scope identity one authority activation or
@@ -859,7 +860,7 @@ impl GrantClosureReceipt {
 ///
 /// `AuthorityBinding` is a compact transport/projection form: it pins the
 /// authority owner, epoch, state fence, effect ceiling and proof ceiling, and
-/// deliberately carries no semantic session or WorkScope identity. That is
+/// deliberately carries no semantic session or `WorkScope` identity. That is
 /// correct for a receipt and insufficient for a request that *mutates*
 /// authority state: without the holder subject, a Kernel authority owner
 /// cannot tell a cross-principal, cross-session or cross-scope presentation
