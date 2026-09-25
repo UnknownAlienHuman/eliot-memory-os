@@ -76,6 +76,11 @@ proof ceilings:
    content-addressed canonical receipt. Proof ceiling:
    `DEPENDENCY_ADMISSION_AND_ADVISORY_EVIDENCE_CANDIDATE`.
 
+Both profiles also prove root `Cargo.lock` freshness with `cargo metadata
+--locked --offline --no-deps`, validate the optional per-dependency
+`platforms` scope, and fail exceptions whose exact package/version drifted
+from every observed lock.
+
 The Review profile's final cargo-deny gate delegates to this verifier profile.
 It uses the configured version-and-digest-pinned Windows executable through
 the verifier's private-copy runner. The verifier may locate a candidate via
@@ -117,7 +122,9 @@ canonical manifest at `config/dependency-policy.toml`:
 
 Every direct third-party dependency must record a current consumer, capability
 owner, justification, enabled features, public-contract exposure boundary, and
-removal/rollback plan.
+removal/rollback plan. An entry may narrow `platforms` to a non-empty list of
+target triples; absence means all configured targets for the entry ecosystem.
+A malformed scope is an explicit incomplete state.
 
 The verifier constructs the receipt denominator from observed source inputs and
 lock data, then reconciles direct roots against the policy inventory in both
@@ -215,3 +222,27 @@ artifact. A failed cleanup is reported as a harness failure. The receipt binds:
 - advisory database snapshot timestamp and source;
 - evaluated targets and feature profiles;
 - structured exceptions and verification findings.
+
+## Run and release artifacts
+
+When `--sbom-out`, `--license-report-out` or `--advisory-report-out` is
+supplied, the verifier derives the matching bounded JSON artifact from the
+executed receipt and writes it only to the caller-selected path. `just
+dependency-policy-artifacts` runs the offline profile into fixed filenames
+under `.eliot/dependency-policy-artifacts/` (overwritten per run); release
+staging passes its own paths. Artifacts are never committed: Git tracks only
+policy and exact lock/input manifests.
+
+Every artifact copies the receipt profile, proof ceiling and status, binds
+the canonical receipt digest, and carries an explicit no-support stamp:
+dependency-policy evidence never creates runtime, semantic,
+release-acceptance or Product support. The SBOM enumerates observed locked
+components across Rust, NuGet, Python, unlocked Node imports and external
+executables, joined to inventory dispositions for direct roots. The license
+report binds the `deny.toml` allowlist and digest, the executed licenses
+gate verdict and external executable licenses; per-crate license facts are
+explicitly not enumerated from summary-level scanner evidence. The advisory
+report binds the Rust advisory snapshot (current-advisories only; offline
+reports `not_assessed`), scanner policy findings, exception state and
+SurrealDB OSV evidence, and states that no advisory feed is configured for
+NuGet/Python/Node.

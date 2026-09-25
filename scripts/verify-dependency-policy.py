@@ -1342,6 +1342,41 @@ def check_direct_inventory_reconciliation(
     return findings
 
 
+def check_inventory_platform_scope(manifest_data: dict) -> list[Finding]:
+    """Validate the optional per-dependency platform scope (issue #1229 A2).
+
+    Every direct dependency carries feature scope in ``features``; ``platforms``
+    optionally narrows the target triples the entry covers. Absence means all
+    configured targets for the entry ecosystem. A malformed scope is an
+    explicit incomplete state, never a silent all-targets claim.
+    """
+
+    findings: list[Finding] = []
+    inventory = manifest_data.get("direct_dependencies", {})
+    if not isinstance(inventory, dict):
+        return findings
+    for name in sorted(inventory, key=str):
+        entry = inventory[name]
+        if not isinstance(entry, dict) or "platforms" not in entry:
+            continue
+        platforms = entry["platforms"]
+        if (
+            not isinstance(platforms, list)
+            or not platforms
+            or any(not isinstance(item, str) or not item.strip() for item in platforms)
+        ):
+            findings.append(
+                Finding(
+                    "DEP-003",
+                    "config/dependency-policy.toml",
+                    1,
+                    f"dependency '{name}' declares an invalid 'platforms' scope: "
+                    "must be a non-empty list of target triples",
+                )
+            )
+    return findings
+
+
 def check_workspace_dependency_dispositions(
     manifest_data: dict, dependency_edges: list[dict]
 ) -> list[Finding]:
@@ -1483,6 +1518,113 @@ def check_exceptions(manifest_data: dict, now_dt: datetime | None = None) -> lis
                     Finding("DEP-010", "config/dependency-policy.toml", 1, f"invalid expires_at format '{exp_str}': {e}")
                 )
 
+    return findings
+
+
+def _locked_exception_identities(ecosystem_denominator: dict | None) -> list[tuple[str, str, str]]:
+    """Collect (ecosystem, normalized name, version) identities from lock denominators."""
+
+    identities: list[tuple[str, str, str]] = []
+    if not isinstance(ecosystem_denominator, dict):
+        return identities
+    rust = ecosystem_denominator.get("rust", {})
+    if isinstance(rust, dict):
+        for package in rust.get("locked_packages", []) if isinstance(rust.get("locked_packages"), list) else []:
+            if not isinstance(package, dict):
+                continue
+            name = package.get("name")
+            version = package.get("version")
+            if isinstance(name, str) and name and isinstance(version, str) and version:
+                identities.append(("rust", _normalize_ecosystem_package_name("rust", name), version))
+    nuget = ecosystem_denominator.get("nuget", {})
+    if isinstance(nuget, dict):
+        for package in nuget.get("locked_packages", []) if isinstance(nuget.get("locked_packages"), list) else []:
+            if not isinstance(package, dict):
+                continue
+            name = package.get("name")
+            version = package.get("version")
+            if isinstance(name, str) and name and isinstance(version, str) and version:
+                identities.append(("nuget", _normalize_ecosystem_package_name("nuget", name), version))
+    python = ecosystem_denominator.get("python", {})
+    if isinstance(python, dict):
+        for package in python.get("locked_packages", []) if isinstance(python.get("locked_packages"), list) else []:
+            if not isinstance(package, dict):
+                continue
+            version = package.get("version")
+            normalized = package.get("normalized_name")
+            if not isinstance(normalized, str) or not normalized:
+                raw_name = package.get("name")
+                normalized = (
+                    _normalize_ecosystem_package_name("python", raw_name)
+                    if isinstance(raw_name, str) and raw_name
+                    else ""
+                )
+            if normalized and isinstance(version, str) and version:
+                identities.append(("python", normalized, version))
+    return identities
+
+
+def check_exception_lock_drift(
+    manifest_data: dict, ecosystem_denominator: dict | None
+) -> list[Finding]:
+    """Fail exceptions whose exact package/version drifted from every lock (issue #1229 A6).
+
+    Shape and expiry stay in :func:`check_exceptions`; this join requires each
+    well-formed exception to name a package/version pair present in at least one
+    observed lock denominator. A renamed, removed or re-versioned package makes
+    the exception stale, never silently portable.
+    """
+
+    findings: list[Finding] = []
+    exceptions = manifest_data.get("exceptions", [])
+    if not isinstance(exceptions, list):
+        return findings
+    locked = _locked_exception_identities(ecosystem_denominator)
+    for exc_entry in exceptions:
+        if not isinstance(exc_entry, dict):
+            continue
+        package = exc_entry.get("package")
+        version = exc_entry.get("version")
+        advisory = exc_entry.get("advisory", "unknown")
+        if not isinstance(package, str) or not package or not isinstance(version, str) or not version:
+            continue
+        if not locked:
+            findings.append(
+                Finding(
+                    "DEP-010",
+                    "config/dependency-policy.toml",
+                    1,
+                    f"exception for package '{package}' advisory '{advisory}' cannot be bound: "
+                    "no locked package identities were established",
+                )
+            )
+            continue
+        candidates = [
+            (ecosystem, locked_version)
+            for ecosystem, normalized, locked_version in locked
+            if normalized == _normalize_ecosystem_package_name(ecosystem, package)
+        ]
+        if not candidates:
+            findings.append(
+                Finding(
+                    "DEP-010",
+                    "config/dependency-policy.toml",
+                    1,
+                    f"exception for package '{package}' advisory '{advisory}' matches no locked "
+                    "package identity (stale exception)",
+                )
+            )
+        elif all(locked_version != version for _, locked_version in candidates):
+            observed = sorted({f"{ecosystem}:{locked_version}" for ecosystem, locked_version in candidates})
+            findings.append(
+                Finding(
+                    "DEP-010",
+                    "config/dependency-policy.toml",
+                    1,
+                    f"exception for package '{package}' advisory '{advisory}' drifted from version "
+                    f"'{version}': locked versions are {', '.join(observed)}",
+                )
+            )
     return findings
 
 
@@ -1794,6 +1936,103 @@ def collect_all_rust_locked_packages(
         )
     identities.sort(key=lambda item: (item["name"], item["version"], item["source"] or ""))
     return findings, identities
+
+
+def check_rust_lock_drift(root: Path, rust_policy: dict | None) -> tuple[list[Finding], dict]:
+    """Prove the root Cargo.lock still resolves the scanned manifests (issue #1229 A5).
+
+    Runs ``cargo metadata --locked --offline --no-deps`` at the repository root:
+    exit 0 binds lock freshness for this run, while drift, resolution errors or
+    a missing toolchain yield explicit incomplete evidence. The ``--offline``
+    flag keeps both profiles independent of network access.
+    """
+
+    findings: list[Finding] = []
+    policy = rust_policy if isinstance(rust_policy, dict) else {}
+    lockfile = policy.get("lockfile", "Cargo.lock")
+    evidence: dict = {
+        "command": ["cargo", "metadata", "--locked", "--offline", "--no-deps", "--format-version", "1"],
+        "lockfile": lockfile if isinstance(lockfile, str) else None,
+        "status": "not_established",
+    }
+    if (
+        not isinstance(lockfile, str)
+        or not lockfile.strip()
+        or Path(lockfile).is_absolute()
+        or ".." in Path(lockfile).parts
+    ):
+        findings.append(
+            Finding(
+                IDENTITY_BINDING_FINDING,
+                "config/dependency-policy.toml",
+                1,
+                "Rust lockfile path is invalid for lock drift evidence",
+            )
+        )
+        return findings, evidence
+    relative_lock = lockfile.replace("\\", "/")
+    if not (root / lockfile).is_file():
+        findings.append(
+            Finding(
+                IDENTITY_BINDING_FINDING,
+                relative_lock,
+                0,
+                "Cargo.lock is missing; root lock drift cannot be established",
+            )
+        )
+        return findings, evidence
+    try:
+        proc = subprocess.run(
+            [*evidence["command"]],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except FileNotFoundError:
+        findings.append(
+            Finding(
+                IDENTITY_BINDING_FINDING,
+                relative_lock,
+                1,
+                "cargo is unavailable; root Cargo.lock drift cannot be established",
+            )
+        )
+        evidence["status"] = "unknown_tool_missing"
+        return findings, evidence
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        findings.append(
+            Finding(
+                IDENTITY_BINDING_FINDING,
+                relative_lock,
+                1,
+                f"root lock drift probe failed before a verdict: {exc}",
+            )
+        )
+        evidence["status"] = "unknown_probe_failed"
+        return findings, evidence
+    evidence["exit_code"] = proc.returncode
+    if proc.returncode != 0:
+        marker_text = (proc.stderr or "").lower()
+        drift_markers = ("needs to be updated", "requires update", "out of date", "--locked")
+        drifted = any(marker in marker_text for marker in drift_markers)
+        detail = " ".join((proc.stderr or proc.stdout or "").split())
+        if len(detail) > 300:
+            detail = detail[:300] + "..."
+        findings.append(
+            Finding(
+                IDENTITY_BINDING_FINDING,
+                relative_lock,
+                1,
+                f"root Cargo.lock {'drifted from its manifests' if drifted else 'failed locked resolution'}: {detail or 'no diagnostic'}",
+            )
+        )
+        evidence["status"] = "drift" if drifted else "resolution_error"
+        return findings, evidence
+    evidence["status"] = "verified"
+    evidence["metadata_digest"] = hashlib.sha256((proc.stdout or "").encode("utf-8")).hexdigest()
+    return findings, evidence
 
 def _validated_node_input(
     root: Path,
@@ -3340,6 +3579,8 @@ def _validate_patched_candidate(
     tag_path, tag_payload, tag_data = _parse_external_json(
         root, candidate.get("source_tag_ref_path"), "SurrealDB patched candidate tag evidence", findings
     )
+    if not isinstance(tag_data, dict):
+        tag_data = {}
     tag_object = tag_data.get("object", {}) if isinstance(tag_data, dict) else {}
     if not isinstance(tag_object, dict) or tag_data.get("ref") != f"refs/tags/{candidate.get('source_tag')}" or tag_object.get("type") != "commit" or tag_object.get("sha") != candidate.get("source_commit"):
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "saved candidate tag evidence does not bind source_commit"))
@@ -4896,6 +5137,380 @@ def run_cargo_deny(
     return findings, status, {**summary, "_execution": execution}
 
 
+_NO_SUPPORT_CLAIM = (
+    "none: dependency-policy evidence only; "
+    "no runtime, semantic, release-acceptance or Product support"
+)
+
+_SCANNER_POLICY_FINDING_CODES = ("DEP-004", "DEP-005", "DEP-006")
+
+
+def _artifact_envelope(artifact: str, schema: str, receipt: dict) -> dict:
+    """Stamp a run artifact with the receipt identity it derives from."""
+
+    canonical = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {
+        "schema": schema,
+        "artifact": artifact,
+        "profile": receipt.get("profile"),
+        "proof_ceiling": receipt.get("proof_ceiling"),
+        "status": receipt.get("status"),
+        "source_sha": receipt.get("source_sha"),
+        "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "receipt_digest": hashlib.sha256(canonical).hexdigest(),
+        "support_claim": _NO_SUPPORT_CLAIM,
+    }
+
+
+def _inventory_disposition(inventory: dict, ecosystem: str, name: str) -> dict | None:
+    """Join a locked identity to its direct-dependency inventory disposition."""
+
+    if not isinstance(inventory, dict) or not isinstance(name, str):
+        return None
+    wanted = _normalize_ecosystem_package_name(ecosystem, name)
+    for declared, entry in inventory.items():
+        if not isinstance(declared, str) or not isinstance(entry, dict):
+            continue
+        if entry.get("ecosystem") != ecosystem:
+            continue
+        if _normalize_ecosystem_package_name(ecosystem, declared) != wanted:
+            continue
+        return {
+            "consumer": entry.get("consumer"),
+            "owner": entry.get("owner"),
+            "reason": entry.get("reason"),
+            "features": entry.get("features"),
+            "platforms": entry.get("platforms"),
+            "platform_scope": entry.get("platforms") if "platforms" in entry else "all_configured_targets",
+            "public_exposure": entry.get("public_exposure"),
+            "removal_plan": entry.get("removal_plan"),
+        }
+    return None
+
+
+def build_sbom_artifact(receipt: dict, manifest_data: dict) -> dict:
+    """Build the SBOM run artifact from receipt denominator evidence (issue #1229 W7).
+
+    The artifact enumerates observed locked components across Rust, NuGet,
+    Python, Node imports and external executables, joined to inventory
+    dispositions for direct roots. It is written only to a caller-selected
+    path, never committed, and carries the originating receipt digest.
+    """
+
+    receipt = receipt if isinstance(receipt, dict) else {}
+    manifest_data = manifest_data if isinstance(manifest_data, dict) else {}
+    denominator = receipt.get("ecosystem_denominator", {})
+    denominator = denominator if isinstance(denominator, dict) else {}
+    inventory = manifest_data.get("direct_dependencies", {})
+    inventory = inventory if isinstance(inventory, dict) else {}
+    components: list[dict] = []
+
+    rust = denominator.get("rust", {})
+    if isinstance(rust, dict):
+        direct_names = set(rust.get("direct_dependencies", [])) if isinstance(rust.get("direct_dependencies"), list) else set()
+        locked = rust.get("locked_packages", []) if isinstance(rust.get("locked_packages"), list) else []
+        for package in locked:
+            if not isinstance(package, dict):
+                continue
+            name = package.get("name")
+            direct = isinstance(name, str) and name in direct_names
+            components.append(
+                {
+                    "ecosystem": "rust",
+                    "name": name,
+                    "version": package.get("version"),
+                    "source": package.get("source"),
+                    "integrity": {"algorithm": "sha256", "digest": package.get("checksum")},
+                    "direct": direct,
+                    "lock_dependencies": package.get("dependencies", []),
+                    "disposition": _inventory_disposition(inventory, "rust", name) if direct else None,
+                }
+            )
+
+    nuget = denominator.get("nuget", {})
+    if isinstance(nuget, dict):
+        locked = nuget.get("locked_packages", []) if isinstance(nuget.get("locked_packages"), list) else []
+        for package in locked:
+            if not isinstance(package, dict):
+                continue
+            name = package.get("name")
+            direct = package.get("type") == "direct"
+            components.append(
+                {
+                    "ecosystem": "nuget",
+                    "name": name,
+                    "version": package.get("version"),
+                    "target_framework": package.get("target_framework"),
+                    "source": "nuget-lock",
+                    "integrity": {"algorithm": "sha512-base64", "digest": package.get("content_hash_sha512")},
+                    "direct": direct,
+                    "lock_dependencies": package.get("dependencies", []),
+                    "disposition": _inventory_disposition(inventory, "nuget", name) if direct else None,
+                }
+            )
+
+    python = denominator.get("python", {})
+    if isinstance(python, dict):
+        locked = python.get("locked_packages", []) if isinstance(python.get("locked_packages"), list) else []
+        for package in locked:
+            if not isinstance(package, dict):
+                continue
+            name = package.get("name")
+            direct = package.get("direct") is True
+            components.append(
+                {
+                    "ecosystem": "python",
+                    "name": name,
+                    "version": package.get("version"),
+                    "source": "hash-locked-requirements",
+                    "integrity": {"algorithm": "sha256", "digest": package.get("hashes", [])},
+                    "direct": direct,
+                    "disposition": _inventory_disposition(inventory, "python", name) if direct else None,
+                }
+            )
+
+    node = denominator.get("node", {})
+    if isinstance(node, dict):
+        imports = node.get("external_imports", []) if isinstance(node.get("external_imports"), list) else []
+        for record in imports:
+            if not isinstance(record, dict):
+                continue
+            components.append(
+                {
+                    "ecosystem": "node",
+                    "name": record.get("package"),
+                    "specifier": record.get("specifier"),
+                    "source": record.get("source"),
+                    "version": None,
+                    "integrity": None,
+                    "direct": True,
+                    "lock_status": record.get("status", "unlocked"),
+                    "disposition": _inventory_disposition(inventory, "node", record.get("package")),
+                }
+            )
+
+    externals = manifest_data.get("external_executables", {})
+    if isinstance(externals, dict):
+        for key, entry in sorted(externals.items(), key=lambda item: str(item[0])):
+            if not isinstance(entry, dict):
+                continue
+            components.append(
+                {
+                    "ecosystem": "external-executable",
+                    "name": entry.get("name", key),
+                    "version": entry.get("version"),
+                    "source": entry.get("release_asset"),
+                    "catalog": entry.get("catalog"),
+                    "integrity": {"algorithm": "sha256", "digest": entry.get("sha256")},
+                    "license": entry.get("license"),
+                    "direct": True,
+                    "disposition": {
+                        "consumer": entry.get("consumer"),
+                        "owner": entry.get("owner"),
+                        "trust_model": entry.get("trust_model"),
+                        "removal_boundary": entry.get("removal_boundary"),
+                        "advisory_ids": entry.get("advisory_findings", []),
+                    },
+                }
+            )
+
+    components.sort(
+        key=lambda item: (
+            str(item.get("ecosystem", "")),
+            str(item.get("name", "")),
+            str(item.get("version") or ""),
+            str(item.get("target_framework") or ""),
+        )
+    )
+    by_ecosystem: dict[str, int] = {}
+    for component in components:
+        key = str(component.get("ecosystem", "unknown"))
+        by_ecosystem[key] = by_ecosystem.get(key, 0) + 1
+    artifact = _artifact_envelope("sbom", "eliot.dependency-policy-sbom.v1", receipt)
+    artifact.update(
+        {
+            "denominator_status": denominator.get("status"),
+            "component_count": len(components),
+            "component_count_by_ecosystem": by_ecosystem,
+            "components": components,
+            "coverage": (
+                "observed locked components plus inventory-joined direct roots; "
+                "transitive Rust/NuGet packages carry no per-package disposition; "
+                "unlocked Node imports are recorded as unlocked, not as admitted packages"
+            ),
+        }
+    )
+    return artifact
+
+
+def build_license_report_artifact(
+    receipt: dict,
+    manifest_data: dict,
+    deny_license_allow: list[str] | None,
+) -> dict:
+    """Build the license run artifact from policy and scanner evidence (issue #1229 W7)."""
+
+    receipt = receipt if isinstance(receipt, dict) else {}
+    manifest_data = manifest_data if isinstance(manifest_data, dict) else {}
+    input_digests = receipt.get("input_digests", {})
+    input_digests = input_digests if isinstance(input_digests, dict) else {}
+    scanner_summary = receipt.get("scanner_summary", {})
+    scanner_summary = scanner_summary if isinstance(scanner_summary, dict) else {}
+    scanner_execution = receipt.get("scanner_execution", {})
+    scanner_execution = scanner_execution if isinstance(scanner_execution, dict) else {}
+    receipt_findings = receipt.get("findings", [])
+    receipt_findings = receipt_findings if isinstance(receipt_findings, list) else []
+    policy_findings = [
+        finding
+        for finding in receipt_findings
+        if isinstance(finding, dict) and finding.get("code") in _SCANNER_POLICY_FINDING_CODES
+    ]
+    licenses_summary = scanner_summary.get("licenses")
+    if not isinstance(licenses_summary, dict) or not isinstance(licenses_summary.get("errors"), int):
+        license_status = "not_established"
+        license_reason = "no cargo-deny licenses summary is bound to this receipt"
+    elif licenses_summary.get("errors", 0) > 0 or policy_findings:
+        license_status = "findings"
+        license_reason = "scanner policy findings are recorded verbatim below"
+    else:
+        license_status = "no_policy_findings"
+        license_reason = "executed licenses gate reported no errors"
+    externals = manifest_data.get("external_executables", {})
+    externals = externals if isinstance(externals, dict) else {}
+    artifact = _artifact_envelope("license-report", "eliot.dependency-policy-licenses.v1", receipt)
+    artifact.update(
+        {
+            "license_status": license_status,
+            "license_reason": license_reason,
+            "policy": {
+                "path": "deny.toml",
+                "digest": input_digests.get("deny.toml"),
+                "allow": deny_license_allow,
+                "status": "bound" if isinstance(deny_license_allow, list) else "not_established",
+            },
+            "scanner": {
+                "executed_checks": scanner_execution.get("checks"),
+                "licenses_summary": licenses_summary,
+            },
+            "scanner_policy_findings": policy_findings,
+            "external_executable_licenses": [
+                {"name": entry.get("name", key), "version": entry.get("version"), "license": entry.get("license")}
+                for key, entry in sorted(externals.items(), key=lambda item: str(item[0]))
+                if isinstance(entry, dict)
+            ],
+            "per_package_licenses": {
+                "status": "not_enumerated",
+                "reason": (
+                    "cargo-deny evidence is summary-level; per-crate license facts are not "
+                    "collected. The executed licenses gate verdict plus the allowlist above "
+                    "is the authoritative license evidence."
+                ),
+            },
+        }
+    )
+    return artifact
+
+
+def build_advisory_report_artifact(receipt: dict, manifest_data: dict) -> dict:
+    """Build the advisory run artifact from snapshot and exception evidence (issue #1229 W7)."""
+
+    receipt = receipt if isinstance(receipt, dict) else {}
+    manifest_data = manifest_data if isinstance(manifest_data, dict) else {}
+    scanner_summary = receipt.get("scanner_summary", {})
+    scanner_summary = scanner_summary if isinstance(scanner_summary, dict) else {}
+    scanner_execution = receipt.get("scanner_execution", {})
+    scanner_execution = scanner_execution if isinstance(scanner_execution, dict) else {}
+    receipt_findings = receipt.get("findings", [])
+    receipt_findings = receipt_findings if isinstance(receipt_findings, list) else []
+    policy_findings = [
+        finding
+        for finding in receipt_findings
+        if isinstance(finding, dict) and finding.get("code") in _SCANNER_POLICY_FINDING_CODES
+    ]
+    exception_findings = [
+        finding
+        for finding in receipt_findings
+        if isinstance(finding, dict) and finding.get("code") == "DEP-010"
+    ]
+    snapshot = receipt.get("advisory_snapshot")
+    if not isinstance(snapshot, dict):
+        snapshot = {
+            "status": "not_assessed",
+            "reason": "offline-source profile executes no advisory check and claims no current coverage",
+        }
+    externals = manifest_data.get("external_executables", {})
+    externals = externals if isinstance(externals, dict) else {}
+    surreal = externals.get("surrealdb")
+    surreal = surreal if isinstance(surreal, dict) else {}
+    external_evidence = receipt.get("external_executable_evidence", {})
+    external_evidence = external_evidence if isinstance(external_evidence, dict) else {}
+    artifact = _artifact_envelope("advisory-report", "eliot.dependency-policy-advisories.v1", receipt)
+    artifact.update(
+        {
+            "rust_advisory_snapshot": snapshot,
+            "scanner": {
+                "executed_checks": scanner_execution.get("checks"),
+                "advisories_summary": scanner_summary.get("advisories"),
+            },
+            "scanner_policy_findings": policy_findings,
+            "exceptions": manifest_data.get("exceptions", []),
+            "exceptions_digest": receipt.get("exceptions_digest"),
+            "exception_findings": exception_findings,
+            "exception_policy": "exact package/version/advisory scope, owned, expiring; drift and expiry fail",
+            "external_surrealdb": {
+                "package": surreal.get("advisory_package"),
+                "ecosystem": surreal.get("advisory_ecosystem"),
+                "scope": surreal.get("advisory_scope"),
+                "version": surreal.get("version"),
+                "status": surreal.get("advisory_status"),
+                "ids": surreal.get("advisory_findings", []),
+                "checked_at": surreal.get("advisory_checked_at"),
+                "query_sha256": surreal.get("advisory_query_sha256"),
+                "response_digest": surreal.get("advisory_response_digest"),
+                "distributed_binary_applicability": surreal.get("distributed_binary_applicability"),
+                "evidence": external_evidence.get("surrealdb"),
+            },
+            "other_ecosystem_advisories": {
+                "nuget": "not_configured",
+                "python": "not_configured",
+                "node": "not_configured",
+                "reason": (
+                    "no advisory feed is configured for NuGet/Python/Node; "
+                    "absence of findings there is not vulnerability evidence"
+                ),
+            },
+        }
+    )
+    return artifact
+
+
+def _read_deny_license_allowlist(root: Path) -> tuple[list[str] | None, str]:
+    """Read the deny.toml license allowlist for the license artifact (bounded, offline)."""
+
+    deny_path = root / "deny.toml"
+    try:
+        deny_data = tomllib.loads(deny_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        return None, f"deny.toml license allowlist is not readable: {exc}"
+    licenses = deny_data.get("licenses", {}) if isinstance(deny_data, dict) else {}
+    allow = licenses.get("allow") if isinstance(licenses, dict) else None
+    if not isinstance(allow, list) or any(not isinstance(item, str) for item in allow):
+        return None, "deny.toml [licenses].allow is missing or malformed"
+    return allow, "bound"
+
+
+def _write_json_artifact(path_value: str, payload: dict, label: str) -> str:
+    """Write one bounded run artifact to its caller-selected path."""
+
+    out_path = Path(path_value)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(payload, indent=2) + "\n"
+    out_path.write_text(text, encoding="utf-8")
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    print(f"DEPENDENCY_POLICY_{label}_ARTIFACT: path={out_path} sha256={digest}")
+    return digest
+
+
 def build_receipt(
     root: Path,
     profile: str,
@@ -5110,6 +5725,7 @@ def _collect_ecosystem_denominator(
     direct_rust_identity: dict[str, list[dict]],
     rust_source_findings: list[Finding] | None = None,
     rust_dependency_edges: list[dict] | None = None,
+    rust_lock_drift_evidence: dict | None = None,
 ) -> tuple[list[Finding], dict]:
     findings: list[Finding] = []
     ecosystems = manifest_data.get("ecosystems", {})
@@ -5186,6 +5802,11 @@ def _collect_ecosystem_denominator(
         ],
         "workspace_dependency_dispositions": manifest_data.get(
             "workspace_dependency_dispositions", []
+        ),
+        "lock_drift": (
+            rust_lock_drift_evidence
+            if isinstance(rust_lock_drift_evidence, dict)
+            else {"status": "not_established"}
         ),
         "manifest": rust_policy.get("manifest", "Cargo.toml"),
         "lockfile": rust_policy.get("lockfile", "Cargo.lock"),
@@ -5331,6 +5952,8 @@ def verify_all(root: Path, profile: str) -> tuple[list[Finding], str, dict, dict
     all_findings.extend(resolver_findings)
     inv_findings = check_cargo_inventory(manifest_data, direct_deps)
     all_findings.extend(inv_findings)
+    scope_findings = check_inventory_platform_scope(manifest_data)
+    all_findings.extend(scope_findings)
 
     ecosystems = manifest_data.get("ecosystems", {})
     rust_policy = ecosystems.get("rust", {}) if isinstance(ecosystems, dict) else {}
@@ -5347,6 +5970,7 @@ def verify_all(root: Path, profile: str) -> tuple[list[Finding], str, dict, dict
         root, root_workspace_direct_deps, rust_policy.get("lockfile")
     )
     all_findings.extend(identity_findings)
+    drift_findings, lock_drift_evidence = check_rust_lock_drift(root, rust_policy)
 
     # 3. Check exceptions
     exc_findings = check_exceptions(manifest_data)
@@ -5358,10 +5982,12 @@ def verify_all(root: Path, profile: str) -> tuple[list[Finding], str, dict, dict
         manifest_data,
         direct_deps,
         direct_dependency_identity,
-        [*d_findings, *resolver_findings, *inv_findings, *identity_findings],
+        [*d_findings, *resolver_findings, *inv_findings, *identity_findings, *drift_findings],
         rust_dependency_edges=rust_dependency_edges,
+        rust_lock_drift_evidence=lock_drift_evidence,
     )
     all_findings.extend(denominator_findings)
+    all_findings.extend(check_exception_lock_drift(manifest_data, ecosystem_denominator))
 
     # 7. Check external executables and retain the exact observation for the receipt.
     ext_findings, external_evidence = _collect_external_evidence(root, manifest_data)
@@ -5487,7 +6113,14 @@ def run_self_tests() -> int:
             "<Project><PropertyGroup><RestorePackagesWithLockFile>true</RestorePackagesWithLockFile></PropertyGroup></Project>",
             encoding="utf-8",
         )
-        findings = check_nuget_ecosystem(root)
+        findings = check_nuget_ecosystem(
+            root,
+            {
+                "project": "apps/Eliot.Operator/Eliot.Operator.csproj",
+                "lockfile": "apps/Eliot.Operator/packages.lock.json",
+                "target_framework": "net10.0-windows10.0.19041",
+            },
+        )
         if not any(f.code == "DEP-007" and "missing" in f.detail for f in findings):
             print("SELF_TEST_FAILURE: expected DEP-007 for missing nuget packages.lock.json", file=sys.stderr)
             return 1
@@ -5524,7 +6157,114 @@ def run_self_tests() -> int:
         print("SELF_TEST_FAILURE: expected advisory_snapshot in current-advisories receipt", file=sys.stderr)
         return 1
 
-    print("DEPENDENCY_POLICY_SELF_TEST: PASS (8/8 cases verified)")
+    # Case 9: missing patched-candidate tag evidence yields findings, never a crash
+    with tempfile.TemporaryDirectory() as tmp:
+        s_root = Path(tmp)
+        s_candidate_dir = ".eliot/dependency-policy/surrealdb/v3.2.0"
+        s_candidate = {
+            "status": "project_local_artifact_required",
+            "name": "surreal.exe",
+            "version": "3.2.0",
+            "architecture": "windows-x64",
+            "pe_machine": "8664",
+            "sha256": "9382a851a54df09aaf39c74c0b010a14b09f2565651f620e83c21dc1f1bca8d3",
+            "release_source": "https://github.com/surrealdb/surrealdb/releases/tag/v3.2.0",
+            "release_asset": "https://github.com/surrealdb/surrealdb/releases/download/v3.2.0/surreal-v3.2.0.windows-amd64.exe",
+            "source_tag": "v3.2.0",
+            "source_commit": "5bebfcdcfa9166131618f768dfe0c0e6fb486f4f",
+            "build_target": "x86_64-pc-windows-msvc",
+            "build_features": ["default", "storage-tikv", "jwks", "ml"],
+            "build_command": "cargo build --no-default-features --features default --features storage-tikv,jwks,ml --locked --target x86_64-pc-windows-msvc",
+            "provisioning": "project_local_provisioner",
+            "installation_approval": "not-issued",
+            "artifact_path": f"{s_candidate_dir}/surreal-v3.2.0.windows-amd64.exe",
+            "artifact_size": 114430464,
+            "source_archive_path": f"{s_candidate_dir}/surrealdb-v3.2.0.tar.gz",
+            "source_archive_sha256": "669f077b43c8a2910a2e0091d2cf2f4082e3279d4f6d2d3fbba0e5e30a0f15f6",
+            "source_paths": ["surrealdb/server/src/ntw/api.rs"],
+            "source_tag_ref_path": f"{s_candidate_dir}/github-tag-v3.2.0.json",
+            "release_metadata_path": f"{s_candidate_dir}/github-release-v3.2.0.json",
+            "advisory_query_path": f"{s_candidate_dir}/osv-query.json",
+            "advisory_response_path": f"{s_candidate_dir}/osv-response.json",
+            "advisory_package": "surrealdb",
+            "advisory_ecosystem": "crates.io",
+            "advisory_scope": "rust-crate",
+            "advisory_max_age_hours": 24,
+        }
+        s_surreal = {
+            "name": "surreal.exe",
+            "version": "3.1.4",
+            "advisory_query_path": ".eliot/dependency-policy/surrealdb/v3.1.4/osv-query.json",
+            "advisory_response_path": ".eliot/dependency-policy/surrealdb/v3.1.4/osv-response.json",
+            "patched_candidate": s_candidate,
+        }
+        tag_findings: list[Finding] = []
+        candidate_evidence = _validate_patched_candidate(s_root, s_surreal, {}, {}, tag_findings)
+        if not any(f.code == "DEP-009" and "tag evidence" in f.detail for f in tag_findings):
+            print("SELF_TEST_FAILURE: expected DEP-009 for missing candidate tag evidence", file=sys.stderr)
+            return 1
+        if candidate_evidence.get("tag_ref", {}).get("status") != "findings":
+            print("SELF_TEST_FAILURE: expected findings tag_ref without tag evidence", file=sys.stderr)
+            return 1
+
+    # Case 10: platform scope shape
+    scoped_manifest = {"direct_dependencies": {"scoped": {"ecosystem": "rust", "platforms": ["x86_64-pc-windows-msvc"]}}}
+    if check_inventory_platform_scope(scoped_manifest):
+        print("SELF_TEST_FAILURE: valid platforms scope must pass", file=sys.stderr)
+        return 1
+    unscoped_manifest = {"direct_dependencies": {"bad": {"ecosystem": "rust", "platforms": "x86_64-pc-windows-msvc"}}}
+    if not any(f.code == "DEP-003" and "platforms" in f.detail for f in check_inventory_platform_scope(unscoped_manifest)):
+        print("SELF_TEST_FAILURE: expected DEP-003 for malformed platforms scope", file=sys.stderr)
+        return 1
+
+    # Case 11: exception package/version drift against locked identities
+    drift_denominator = {
+        "rust": {"locked_packages": [{"name": "serde", "version": "1.0.228"}]},
+        "nuget": {"locked_packages": []},
+        "python": {"locked_packages": [{"name": "jsonschema", "normalized_name": "jsonschema", "version": "4.25.1"}]},
+    }
+    drifted = {"exceptions": [{"package": "serde", "version": "9.9.9", "advisory": "RUSTSEC-2026-0001"}]}
+    if not any(f.code == "DEP-010" and "drifted" in f.detail for f in check_exception_lock_drift(drifted, drift_denominator)):
+        print("SELF_TEST_FAILURE: expected DEP-010 for drifted exception version", file=sys.stderr)
+        return 1
+    bound = {"exceptions": [{"package": "serde", "version": "1.0.228", "advisory": "RUSTSEC-2026-0001"}]}
+    if check_exception_lock_drift(bound, drift_denominator):
+        print("SELF_TEST_FAILURE: bound exception version must pass drift check", file=sys.stderr)
+        return 1
+    stale = {"exceptions": [{"package": "gone-crate", "version": "1.0.0", "advisory": "RUSTSEC-2026-0001"}]}
+    if not any(f.code == "DEP-010" and "no locked package identity" in f.detail for f in check_exception_lock_drift(stale, drift_denominator)):
+        print("SELF_TEST_FAILURE: expected DEP-010 for stale exception package", file=sys.stderr)
+        return 1
+
+    # Case 12: run artifacts derive from the receipt without crashing on partial evidence
+    artifact_receipt = build_receipt(Path("."), "offline-source", STATUS_PASS, [], manifest_fixture, {"bans": {"errors": 0}}, 1)
+    sbom = build_sbom_artifact(artifact_receipt, manifest_fixture)
+    if sbom.get("schema") != "eliot.dependency-policy-sbom.v1" or "components" not in sbom:
+        print("SELF_TEST_FAILURE: expected SBOM artifact envelope", file=sys.stderr)
+        return 1
+    licenses_report = build_license_report_artifact(artifact_receipt, manifest_fixture, ["MIT"])
+    if licenses_report.get("license_status") != "not_established":
+        print("SELF_TEST_FAILURE: expected not_established license status without a licenses summary", file=sys.stderr)
+        return 1
+    advisory_report = build_advisory_report_artifact(artifact_receipt, manifest_fixture)
+    rust_snapshot = advisory_report.get("rust_advisory_snapshot", {})
+    if rust_snapshot.get("status") != "not_assessed":
+        print("SELF_TEST_FAILURE: expected not_assessed offline advisory snapshot", file=sys.stderr)
+        return 1
+    if not all("no runtime" in str(report.get("support_claim", "")) for report in (sbom, licenses_report, advisory_report)):
+        print("SELF_TEST_FAILURE: expected explicit no-support stamp on run artifacts", file=sys.stderr)
+        return 1
+
+    # Case 13: lock drift probe rejects an escaping lockfile path without running cargo
+    with tempfile.TemporaryDirectory() as tmp:
+        drift_probe_findings, drift_probe_evidence = check_rust_lock_drift(Path(tmp), {"lockfile": "../escape/Cargo.lock"})
+        if drift_probe_evidence.get("status") != "not_established" or not any(
+            f.code == IDENTITY_BINDING_FINDING for f in drift_probe_findings
+        ):
+            print("SELF_TEST_FAILURE: expected DEP-014 for invalid lock drift path", file=sys.stderr)
+            return 1
+
+    print("DEPENDENCY_POLICY_SELF_TEST: PASS (13/13 cases verified)")
     return 0
 
 
@@ -5539,6 +6279,9 @@ def main() -> int:
     )
     parser.add_argument("--json-out", help="Write findings to JSON output file")
     parser.add_argument("--receipt-out", help="Write canonical receipt to JSON output file")
+    parser.add_argument("--sbom-out", help="Write SBOM run artifact to JSON output file")
+    parser.add_argument("--license-report-out", help="Write license run artifact to JSON output file")
+    parser.add_argument("--advisory-report-out", help="Write advisory run artifact to JSON output file")
     parser.add_argument("--selected-release-policy-receipt-out", help="Build a non-runtime receipt for the exact locked release candidate")
     parser.add_argument("--selected-artifact-path", help="Repository-relative artifact path selected by the release consumer")
     parser.add_argument("--selected-artifact-sha256", help="SHA-256 selected by the release consumer")
@@ -5587,7 +6330,7 @@ def main() -> int:
             and receipt["candidate_advisory_status"] == "no_known_vulnerabilities"
         ) else 1
 
-    findings, status, receipt, _, _ = verify_all(root, args.profile)
+    findings, status, receipt, manifest_data, _ = verify_all(root, args.profile)
 
     if args.json_out:
         out_p = Path(args.json_out)
@@ -5606,6 +6349,26 @@ def main() -> int:
         rec_p = Path(args.receipt_out)
         rec_p.parent.mkdir(parents=True, exist_ok=True)
         rec_p.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+
+    try:
+        if args.sbom_out:
+            _write_json_artifact(args.sbom_out, build_sbom_artifact(receipt, manifest_data), "SBOM")
+        if args.license_report_out:
+            deny_allow, _ = _read_deny_license_allowlist(root)
+            _write_json_artifact(
+                args.license_report_out,
+                build_license_report_artifact(receipt, manifest_data, deny_allow),
+                "LICENSE_REPORT",
+            )
+        if args.advisory_report_out:
+            _write_json_artifact(
+                args.advisory_report_out,
+                build_advisory_report_artifact(receipt, manifest_data),
+                "ADVISORY_REPORT",
+            )
+    except OSError as exc:
+        print(f"DEPENDENCY_POLICY_ARTIFACT_WRITE_FAILURE: {exc}", file=sys.stderr)
+        return 1
 
     print(f"VERIFY_DEPENDENCY_POLICY: {status} (profile={args.profile}, findings={len(findings)})")
     for f in findings:
