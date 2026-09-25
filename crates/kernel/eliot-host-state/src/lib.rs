@@ -36,17 +36,17 @@ pub use journal::{
 };
 pub use legacy::{LegacyHostStateImporter, LegacyHostStateSnapshot};
 pub use model::{
-    ActivationState, AppliedOperation, CleanMarker, DependencyLifecycleBudget, DependencyRecord,
-    DependencyResourceBudget, DependencyState, DrainCommitRecord, DrainRecord, DrainState,
-    EliotActivationRecord, EpochEvidence, EpochRetirementRecord, FailureRecoveryDirective,
-    HostInstallationEpoch, HostKernelStoreLineage, HostObservationRecord, HostState,
-    HostStateRecord, IdempotencyIdentity, ImmutableProcessManifest, JournalManifest,
-    KernelJobBinding, KernelReadinessObservationRecord, KernelRecord, LifecycleTimestamps,
-    NonceState, OneTimeNonceState, PriorKernelDisposition, PriorKernelSource,
-    ReadinessApprovedContour, ReadinessEvidence, RecordFence, RecoveryLineageEvidence,
-    RecoveryLineageReason, ServiceSafetyClass, StoreRebindRecord, StoreRebindState,
-    WakeCancellationBatchEntry, WakeCancellationBatchRecord, WakeDisposition, WakeRecord,
-    host_owner_epoch_digest,
+    ActivationState, AppliedOperation, CleanMarker, CutoverIntentRecord, CutoverIntentState,
+    DependencyLifecycleBudget, DependencyRecord, DependencyResourceBudget, DependencyState,
+    DrainCommitRecord, DrainRecord, DrainState, EliotActivationRecord, EpochEvidence,
+    EpochRetirementRecord, FailureRecoveryDirective, HostInstallationEpoch, HostKernelStoreLineage,
+    HostObservationRecord, HostState, HostStateRecord, IdempotencyIdentity,
+    ImmutableProcessManifest, JournalManifest, KernelJobBinding, KernelReadinessObservationRecord,
+    KernelRecord, LifecycleTimestamps, NonceState, OneTimeNonceState, PriorKernelDisposition,
+    PriorKernelSource, ReadinessApprovedContour, ReadinessEvidence, RecordFence,
+    RecoveryLineageEvidence, RecoveryLineageReason, ServiceSafetyClass, StoreRebindRecord,
+    StoreRebindState, WakeCancellationBatchEntry, WakeCancellationBatchRecord, WakeDisposition,
+    WakeRecord, host_owner_epoch_digest,
 };
 pub use reactive_context::{
     DEFAULT_REACTIVE_CONTEXT_MAX_ATTEMPT_ITEMS, DEFAULT_REACTIVE_CONTEXT_MAX_BYTES,

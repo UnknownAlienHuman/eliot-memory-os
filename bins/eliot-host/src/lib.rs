@@ -4023,7 +4023,7 @@ pub enum BackupDispatchTarget {
 impl HostComposition {
     /// Opens one short-lived installation-registry handle below the retained
     /// Host root (#1339, A13.9). The caller drops it after one CAS or load.
-    fn open_registry_store(&self) -> Result<RedbInstallationRegistry, HostError> {
+    pub(crate) fn open_registry_store(&self) -> Result<RedbInstallationRegistry, HostError> {
         #[cfg(test)]
         if let Some(path) = self.test_registry_file.as_ref() {
             return RedbInstallationRegistry::open_test_support(path)
@@ -4378,21 +4378,113 @@ impl HostComposition {
         // Bounded reconciliation closed by a real owner readback under the
         // same operation identity. The journal retirement receipt is
         // genuinely absent here: retirement is a separate explicitly
-        // authorized step, so the registry flip alone is the observed proof.
+        // authorized step, so the registry flip alone is the observed proof
+        // and the honest disposition is `RetirementPending`.
         let readback = self
             .open_registry_store()?
             .load()
             .map_err(|error| CutoverError::Registry(error.to_string()))?;
         let reconciled = reconcile_cutover_outcome(
             &committed.operation,
+            true,
+            self.journal
+                .snapshot()
+                .map_err(|error| {
+                    CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string()))
+                })?
+                .pending_cutover
+                .as_ref(),
             readback.active_generation(),
             &validated.request.target_generation,
             None,
         );
-        if reconciled.disposition != CutoverDisposition::Committed {
+        if reconciled.disposition != CutoverDisposition::RetirementPending {
             return Ok((reconciled, barrier));
         }
         Ok((committed, barrier))
+    }
+
+    /// Exact admitted cutover disposition for one operation, read from the
+    /// real owners after a lost response, a crash between the registry and
+    /// the journal, or a cancellation.
+    ///
+    /// [#962](crate::backup_cutover) or the public command surface. It owns no
+    /// algorithm. It re-reads the Host journal's own durable cutover
+    /// projection and the installation registry's active generation and
+    /// projects them through
+    /// [`crate::backup_cutover::reconcile_cutover_outcome`], so the returned
+    /// disposition is the exact requested/validated/prepared/committed/
+    /// reconciled/retirement-pending/failed/unknown state of the operation
+    /// rather than a local assumption. The optional `retirement_receipt` is the
+    /// actual journal `AppendReceipt` read back for this operation identity.
+    /// No cutover effect is performed here and nothing is retried.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError`] when the durable Host journal or the installation
+    /// registry cannot be read. A failed read is an error, never a
+    /// disposition: reporting a state the owners did not prove is exactly the
+    /// local assumption this method exists to remove.
+    #[cfg(windows)]
+    pub fn backup_dispatch_cutover_disposition(
+        &self,
+        request: &crate::backup_cutover::CutoverRequest,
+        validated: bool,
+        retirement_receipt: Option<&eliot_host_state::AppendReceipt>,
+    ) -> Result<crate::backup_cutover::CutoverOutcome, HostError> {
+        crate::backup_cutover::read_cutover_disposition(
+            self,
+            request,
+            validated,
+            retirement_receipt,
+        )
+    }
+
+    /// Executes the separately authorized prior-generation retirement that
+    /// completes one committed cutover.
+    ///
+    /// This is the second admitted cutover port, and it is the only caller of
+    /// [`crate::backup_cutover::retire_prior_generation`]. Retirement is never
+    /// automatic cleanup: the caller must present the
+    /// [`GenerationRetirementBarrier`] returned by
+    /// [`Self::backup_dispatch_cutover`] for the same operation, the exact
+    /// prior [`eliot_host_state::HostInstallationEpoch`] still retained by the
+    /// journal, and an explicit non-empty retirement authorization. Only then
+    /// is the durable `EpochRetirement` record appended. The source
+    /// installation is retained until this record commits, and source data
+    /// destruction stays a separate explicitly authorized action.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CutoverError`](crate::backup_cutover::CutoverError) when the
+    /// operation does not resolve to the cutover dispatch target, the
+    /// authorization is empty, the prior epoch is not a retained epoch of this
+    /// installation, or the journal owner refuses the retirement record.
+    #[cfg(windows)]
+    pub fn backup_dispatch_cutover_retire(
+        &self,
+        operation: eliot_protocol::backup::BackupOperationKind,
+        request: &crate::backup_cutover::CutoverRequest,
+        evidence: &crate::backup_cutover::IsolatedRecoveryEvidence,
+        barrier: &GenerationRetirementBarrier,
+        prior_host: &eliot_host_state::HostInstallationEpoch,
+        retirement_authorization: &PlatformHandle,
+    ) -> Result<crate::backup_cutover::CutoverOutcome, crate::backup_cutover::CutoverError> {
+        use crate::backup_cutover::{CutoverError, retire_authorized_generation};
+        if Self::backup_dispatch_target(operation) != Some(BackupDispatchTarget::Cutover) {
+            return Err(CutoverError::NotSeparatelyAdmitted(format!(
+                "backup operation {operation:?} is not the admitted cutover dispatch"
+            )));
+        }
+        Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
+        retire_authorized_generation(
+            self,
+            request,
+            evidence,
+            barrier,
+            prior_host,
+            retirement_authorization,
+        )
     }
 
     /// Opens the durable Host contour for one installation identity and

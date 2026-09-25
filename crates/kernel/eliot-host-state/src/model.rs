@@ -1578,6 +1578,123 @@ impl EpochRetirementRecord {
     }
 }
 
+/// Durable pre-effect intent and terminal disposition of one separately
+/// authorized installation cutover (#961).
+///
+/// The Host journal is the durable owner of the cutover operation, so the
+/// intent is appended BEFORE the installation-registry activation CAS: within
+/// the Host epoch performing the cutover, a lost response, a crash between the
+/// registry and the journal, or a terminal refusal can therefore never leave an
+/// activation without a durable record of the operation that produced it.
+///
+/// Scope, stated precisely: like every other Host journal record, this one
+/// lives in the log of the Host epoch that wrote it. A restart re-bases the
+/// journal into a new epoch, so a cutover that spans an epoch boundary is
+/// reconciled from the registry owner readback instead — the bounded `Unknown`
+/// state the issue already requires — and is never asserted committed from a
+/// record this projection no longer holds.
+///
+/// This is the same intent/terminal seam the Store-rebind record already uses —
+/// one record type per Host-owned effect, never a shared catch-all.
+///
+/// Every state is a fresh append for the same cutover operation, installation
+/// and canonical request digest, under a per-disposition journal mutation
+/// identity; the reducer keeps the newest disposition, refuses a foreign
+/// operation, and refuses any move out of a terminal state. The
+/// `target_build_digest` / `target_config_digest` / `user_broker_ref` bindings
+/// are the exact identities the admitted request carried, so the durable
+/// record — not a console-presented value — is what a later reconciliation
+/// re-reads.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CutoverIntentRecord {
+    pub fence: RecordFence,
+    /// Journal mutation identity. One per disposition of this cutover
+    /// (`<cutover operation>:<state>`), because the journal keys
+    /// `applied_operations` on this identity: reusing one identity for the
+    /// intent and its terminal record would be a checksum conflict, not a
+    /// second mutation. A retry of the *same* disposition reuses the identity
+    /// and therefore replays byte-identically.
+    pub operation: IdempotencyIdentity,
+    /// Destination installation this cutover activates. Carried so the exact
+    /// replay identity is self-contained in the durable record and a
+    /// reconciliation never has to take it from a console-presented request.
+    pub installation: PlatformHandle,
+    /// Exact cutover operation identity issued for the destination
+    /// installation.
+    pub cutover_operation: PlatformHandle,
+    /// Canonical cutover request digest (the idempotency key of the operation
+    /// itself, distinct from the journal mutation identity above).
+    pub request_digest: PlatformHandle,
+    /// Exact active predecessor generation observed when the intent was
+    /// committed.
+    pub expected_predecessor: PlatformHandle,
+    /// Exact approved target generation this cutover activates.
+    pub target_generation: PlatformHandle,
+    /// Owner-approved target build digest bound by the admitted request.
+    pub target_build_digest: PlatformHandle,
+    /// Owner-approved target configuration digest bound by the admitted
+    /// request.
+    pub target_config_digest: PlatformHandle,
+    /// Owner-issued `UserBroker` identity for the destination generation.
+    pub user_broker_ref: PlatformHandle,
+    /// Bounded owner-receipt evidence bound to this intent. Digests only.
+    pub intent_evidence_refs: Vec<PlatformHandle>,
+    /// Exact disposition reached for this operation.
+    pub state: CutoverIntentState,
+}
+
+impl CutoverIntentRecord {
+    fn validate(&self) -> Result<(), JournalError> {
+        self.fence.validate()?;
+        self.operation.validate()?;
+        handle(&self.installation, "cutover_intent.installation")?;
+        handle(&self.cutover_operation, "cutover_intent.cutover_operation")?;
+        handle(&self.request_digest, "cutover_intent.request_digest")?;
+        handle(
+            &self.expected_predecessor,
+            "cutover_intent.expected_predecessor",
+        )?;
+        handle(&self.target_generation, "cutover_intent.target_generation")?;
+        if self.expected_predecessor == self.target_generation {
+            return Err(JournalError::Invalid(
+                "cutover intent target must differ from the expected predecessor".into(),
+            ));
+        }
+        handle(
+            &self.target_build_digest,
+            "cutover_intent.target_build_digest",
+        )?;
+        handle(
+            &self.target_config_digest,
+            "cutover_intent.target_config_digest",
+        )?;
+        handle(&self.user_broker_ref, "cutover_intent.user_broker_ref")?;
+        handles(
+            &self.intent_evidence_refs,
+            "cutover_intent.intent_evidence_refs",
+            true,
+        )
+    }
+}
+
+/// Disposition of one durable cutover intent.
+///
+/// `Pending` is the pre-effect state and the only non-terminal one: the
+/// activation CAS may only run after it is durable. `Committed` and `Failed`
+/// are terminal and are appended after the CAS attempt, so an operator can
+/// always read which of the two happened for the exact operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CutoverIntentState {
+    /// Durable intent committed; no activation effect applied yet.
+    Pending,
+    /// The registry activation CAS committed for this exact operation.
+    Committed,
+    /// Terminal refusal: no installation changed for this operation.
+    Failed,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StoreRebindState {
@@ -1744,6 +1861,8 @@ pub enum HostStateRecord {
     EpochRetirement(EpochRetirementRecord),
     StoreRebind(StoreRebindRecord),
     ReactiveContext(ReactiveContextRecord),
+    /// Durable cutover intent/terminal record (#961).
+    CutoverIntent(CutoverIntentRecord),
 }
 
 impl HostStateRecord {
@@ -1762,6 +1881,7 @@ impl HostStateRecord {
             Self::EpochRetirement(value) => value.validate(),
             Self::StoreRebind(value) => value.validate(),
             Self::ReactiveContext(value) => validate_record_for_journal(value),
+            Self::CutoverIntent(value) => value.validate(),
         }
     }
 
@@ -1788,6 +1908,7 @@ impl HostStateRecord {
             Self::EpochRetirement(value) => &value.fence,
             Self::StoreRebind(value) => &value.fence,
             Self::ReactiveContext(value) => &value.fence,
+            Self::CutoverIntent(value) => &value.fence,
         }
     }
 
@@ -1806,6 +1927,7 @@ impl HostStateRecord {
             Self::EpochRetirement(value) => &value.operation,
             Self::StoreRebind(value) => &value.operation,
             Self::ReactiveContext(value) => &value.operation,
+            Self::CutoverIntent(value) => &value.operation,
         }
     }
 }
@@ -1855,6 +1977,12 @@ pub struct HostState {
     /// Durable reactive-Context queue projection owned by this journal.
     #[serde(default)]
     pub reactive_context: Option<ReactiveContextQueueState>,
+    /// Durable cutover intent/terminal projection owned by this journal.
+    ///
+    /// `None` means no cutover intent is outstanding. Reconciliation re-reads
+    /// this projection instead of assuming an activation from local state.
+    #[serde(default)]
+    pub pending_cutover: Option<CutoverIntentRecord>,
     pub clean_marker: Option<CleanMarker>,
     pub retained_epochs: Vec<EpochEvidence>,
     pub retired_epochs: Vec<HostInstallationEpoch>,
@@ -1880,6 +2008,7 @@ impl HostState {
             readiness_observations: Vec::new(),
             store_rebinds: Vec::new(),
             reactive_context: Some(ReactiveContextQueueState::default()),
+            pending_cutover: None,
             clean_marker: None,
             retained_epochs,
             retired_epochs: Vec::new(),
