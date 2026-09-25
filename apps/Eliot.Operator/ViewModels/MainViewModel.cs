@@ -375,32 +375,78 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
     }
 
-    /// Reconciles a retained typed UserAutomation effect. The retry-stable
-    /// identity is re-derived from the exact retained operation bytes and must
-    /// equal the retained identity; a mismatch refuses the send instead of
-    /// creating a second logical mutation.
+    /// Reconciles a retained typed UserAutomation effect under its ORIGINAL
+    /// identity.
+    ///
+    /// The retained bytes are authoritative and are never rewritten. The
+    /// recorded identity is the one the bytes already carry and is never
+    /// re-derived: today's serializer no longer produces the bytes that were
+    /// hashed when the key was minted, so re-deriving would rename a pending
+    /// request instead of retrying it. A mismatch between the retained
+    /// metadata and the retained request is refused, not repaired.
+    ///
+    /// A retained envelope written by the superseded generation also encodes
+    /// the local read/effect classifier, which the closed owner contract
+    /// refuses. Resending those bytes would be refused; re-encoding them
+    /// without the classifier under the retained key would be a DIFFERENT
+    /// request commitment. Neither is allowed, so the record is preserved
+    /// visibly and execution is withheld for its actual owner to resolve.
     private async Task ReconcileUserAutomationAsync(OperatorPendingOperation pending)
     {
-        using var document = JsonDocument.Parse(pending.EnvelopeJson);
-        var request = document.RootElement.Deserialize<UserAutomationOperatorRequest>(OperatorJson.Reader);
-        if (request is null)
+        UserAutomationRetainedRequest retained;
+        try
         {
-            await SubmitUserAutomationAsync(null, pending.CommandName, isReconcile: true);
+            retained = UserAutomationRetainedRequest.Read(pending.EnvelopeJson);
+        }
+        catch (Exception error) when (error is JsonException or InvalidOperationException)
+        {
+            WithholdUserAutomation(pending, $"the retained typed request is not a closed UserAutomation envelope ({error.Message});");
             return;
         }
-        request.Validate();
-        var derived = UserAutomationOperatorRequest.DeriveIdempotencyKey(request.Operation);
-        if (!string.Equals(derived, pending.OperationId, StringComparison.Ordinal))
+
+        if (!string.Equals(retained.Request.IdempotencyKey, pending.OperationId, StringComparison.Ordinal)
+            || pending.ExpectedRevision is not null)
         {
-            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
-            RefreshPendingState();
-            SetBanner(
-                "Unknown outcome — reconcile, do not resubmit",
-                $"{pending.CommandName}: the retained typed request no longer derives its own identity; it stays reconciling and is not resent.",
-                OperatorBannerSeverity.Warning);
+            WithholdUserAutomation(pending, "the retained typed request does not bind to its own recorded operation identity;");
             return;
         }
-        await SubmitUserAutomationAsync(request.Operation, pending.CommandName, isReconcile: true);
+
+        if (retained.CarriesSupersededLocalClassifier)
+        {
+            WithholdUserAutomation(pending, "the retained request was encoded by the superseded local serializer and carries the local effect classifier, which the closed UserAutomation owner contract does not accept; it is neither resent nor re-encoded under its own identity;");
+            return;
+        }
+
+        try
+        {
+            retained.Request.Validate();
+        }
+        catch (InvalidOperationException error)
+        {
+            WithholdUserAutomation(pending, $"the retained typed request is no longer valid ({error.Message});");
+            return;
+        }
+
+        await TransmitUserAutomationAsync(retained.Request, pending, pending.CommandName);
+    }
+
+    /// Keeps an incompatible retained record visible and reconciling. The
+    /// journal is never emptied and no unrelated pending item is removed to
+    /// unblock a button: a fresh strict-decoder refusal, a missing local field
+    /// or a failed reconnection does not establish the outcome of the earlier
+    /// attempt, so only the actual owner of that attempt may resolve this
+    /// record. A genuinely new corrected operation needs the existing explicit
+    /// new-operation decision once that uncertainty is resolved; nothing here
+    /// makes that decision automatically.
+    private void WithholdUserAutomation(OperatorPendingOperation pending, string reason)
+    {
+        ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+        RefreshPendingState();
+        SetBanner(
+            "Withheld — retained request is not recoverable from this build",
+            $"{pending.CommandName}: {reason} The record stays reconciling under {pending.OperationId}; "
+            + "nothing was sent and no pending item was removed. Issue a new operation explicitly once this record is resolved.",
+            OperatorBannerSeverity.Warning);
     }
 
     public async Task RunCommandAsync(string command)
@@ -443,41 +489,29 @@ public sealed class MainViewModel : INotifyPropertyChanged
             SetBanner("UserAutomation command not sent", error.Message, OperatorBannerSeverity.Warning);
             return;
         }
-        await SubmitUserAutomationAsync(operation, UserAutomationOperation, isReconcile: false);
+        await SubmitUserAutomationAsync(operation, UserAutomationOperation);
     }
 
-    /// Sends one retained typed UserAutomation operation.
+    /// Sends one new closed UserAutomation operator operation.
     ///
     /// A read executes immediately inside existing authority and retains
-    /// nothing. An effect mints one retry-stable identity from the exact
-    /// canonical operation bytes, journals it BEFORE the first send, and keeps
-    /// it until a terminal owner receipt, so a lost response reconciles the
-    /// same typed operation instead of creating a second logical mutation.
-    private async Task SubmitUserAutomationAsync(
-        UserAutomationOperation? operation,
-        string action,
-        bool isReconcile)
+    /// nothing. An effect mints ONE retry-stable identity from the exact
+    /// canonical operation bytes, journals the very request that is then
+    /// transmitted, and keeps it until a terminal owner receipt, so a lost
+    /// response reconciles the same typed operation instead of creating a
+    /// second logical mutation.
+    private async Task SubmitUserAutomationAsync(UserAutomationOperation operation, string action)
     {
         IsBusy = true;
         NotifyCounts();
-        if (operation is null)
-        {
-            SetBanner(
-                "Command not sent",
-                "The retained typed request could not be decoded; the operation stays reconciling.",
-                OperatorBannerSeverity.Warning);
-            IsBusy = false;
-            NotifyCounts();
-            return;
-        }
         operation.Validate();
 
-        if (!operation.IsEffect)
+        if (!operation.IsEffect())
         {
             try
             {
                 var read = await _client.UserAutomationAsync(
-                    operation,
+                    UserAutomationOperatorRequest.Create(operation),
                     _requestCancellation?.Token ?? CancellationToken.None);
                 ShowUserAutomationResult(action, read);
             }
@@ -493,7 +527,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             return;
         }
 
-        if (!isReconcile && _pendingJournalUnavailable)
+        if (_pendingJournalUnavailable)
         {
             SetBanner(
                 "Command not sent",
@@ -504,6 +538,9 @@ public sealed class MainViewModel : INotifyPropertyChanged
             return;
         }
 
+        // One prepared request. The same object is journaled and transmitted,
+        // so the retained identity and the wire identity cannot diverge and
+        // the key is minted exactly once.
         var request = UserAutomationOperatorRequest.Create(operation);
         request.Validate();
         var pending = new OperatorPendingOperation(
@@ -514,27 +551,37 @@ public sealed class MainViewModel : INotifyPropertyChanged
             action,
             OperatorOperationPhase.Submitted,
             DateTimeOffset.UtcNow);
-        if (!isReconcile)
+        _pendingOperations.Add(pending);
+        if (!TryPersistPendingState())
         {
-            _pendingOperations.Add(pending);
-            if (!TryPersistPendingState())
-            {
-                _pendingOperations.RemoveAll(entry => entry.OperationId == pending.OperationId);
-                RefreshPendingState();
-                SetBanner(
-                    "Command not sent",
-                    "The pending typed operation could not be durably journaled; no owner request was sent.",
-                    OperatorBannerSeverity.Error);
-                IsBusy = false;
-                NotifyCounts();
-                return;
-            }
+            _pendingOperations.RemoveAll(entry => entry.OperationId == pending.OperationId);
             RefreshPendingState();
+            SetBanner(
+                "Command not sent",
+                "The pending typed operation could not be durably journaled; no owner request was sent.",
+                OperatorBannerSeverity.Error);
+            IsBusy = false;
+            NotifyCounts();
+            return;
         }
+        RefreshPendingState();
+        await TransmitUserAutomationAsync(request, pending, action);
+    }
+
+    /// Transmits one prepared typed UserAutomation request under the identity it
+    /// already carries. A first send journals that same request; recovery
+    /// resends the retained one unchanged. No identity is minted or renamed
+    /// here, and no outcome short of an owner-bound terminal disposition may
+    /// compact the record.
+    private async Task TransmitUserAutomationAsync(
+        UserAutomationOperatorRequest request,
+        OperatorPendingOperation pending,
+        string action)
+    {
         try
         {
             var answer = await _client.UserAutomationAsync(
-                operation,
+                request,
                 _requestCancellation?.Token ?? CancellationToken.None);
             ShowUserAutomationResult(action, answer);
             // The owner answered. This route reports admission, not a canonical

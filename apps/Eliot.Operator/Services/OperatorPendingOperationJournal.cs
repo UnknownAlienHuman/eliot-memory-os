@@ -449,12 +449,19 @@ public sealed class OperatorPendingOperationJournal : IDisposable
                         }
                         break;
                     case OperatorMutationRoute.UserAutomation:
-                        var automation = document.RootElement.Deserialize<UserAutomationOperatorRequest>(Json)
-                            ?? throw new InvalidOperationException("request is empty");
-                        automation.Validate();
-                        if (!string.Equals(automation.IdempotencyKey, operation.OperationId, StringComparison.Ordinal)
+                        // A retained envelope may predate the current closed wire
+                        // contract and carry the superseded local effect
+                        // classifier. The exact legacy-only reader understands
+                        // that one known member as non-authoritative recovery
+                        // metadata and still refuses every other unmapped
+                        // member. The retained bytes and identity are read, not
+                        // rewritten: an incompatible record stays in the
+                        // journal instead of emptying it or being dropped.
+                        var automation = UserAutomationRetainedRequest.Read(operation.EnvelopeJson);
+                        automation.Request.Validate();
+                        if (!string.Equals(automation.Request.IdempotencyKey, operation.OperationId, StringComparison.Ordinal)
                             || operation.ExpectedRevision is not null
-                            || !automation.Operation.IsEffect)
+                            || !automation.Request.Operation.IsEffect())
                         {
                             throw new InvalidOperationException("journal metadata does not bind the typed request");
                         }
