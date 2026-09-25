@@ -2052,7 +2052,6 @@ impl GrantActivationPort {
                             durable_record: hydration.durable_record.clone(),
                         },
                     );
-                    continue;
                 }
                 OperationalPhase::Fenced if is_revoked => {
                     candidate.grants.insert(
