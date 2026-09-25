@@ -9,6 +9,7 @@ mod config;
 mod delegation_runtime;
 mod disposition;
 mod dogfood;
+mod front_door_cutover;
 mod host_runtime;
 mod mcp_stdio;
 mod named_pipe_ipc;
@@ -2449,6 +2450,23 @@ async fn dispatch_command(
                     instance,
                 },
         } => {
+            // #1858 (I19.5, I19.10): once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge
+            // selects the new stack, the retired `claude` host edge refuses
+            // with a stable cutover code plus the canonical-route receipt.
+            // The refusal precedes ensure_daemon_ready, so a cut-over
+            // invocation never auto-launches the daemon, starts a store, or
+            // constructs a ControlWal/WriterActor. Remaining hosts proceed on
+            // the retained legacy path while their cutover is pending.
+            if let Err(detail) = front_door_cutover::gate_legacy_entrypoint(
+                "eliot-governor mcp stdio",
+                host.as_deref(),
+            ) {
+                front_door_cutover::write_cutover_rejection(
+                    front_door_cutover::LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER,
+                    &detail,
+                );
+                return Err(anyhow::anyhow!(detail));
+            }
             mcp_stdio::run(
                 config,
                 &profile,

@@ -1547,6 +1547,8 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
         generation = $SourceCommit
         proof_ceiling = 'unsigned-build-evidence (retirement scope is Part B after #1189)'
         gate = '#1189-legacy-retirement (GATED: retained explicitly, never by repository presence)'
+        entrypoint_disposition = 'retained-legacy-entrypoint (#1858: eliot-governor mcp stdio --host claude refuses with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge selects the new stack; daemon run and the remaining legacy hosts codex/opencode/claude-desktop stay on this binary until their cutover)'
+        cutover_behavior = 'refuse-with-code on the retired claude host edge (no daemon auto-launch, no store start, no ControlWal/WriterActor); retained path for the remaining legacy hosts'
     }
     if ($FrontDoorBridge) {
         $entries += [ordered]@{
@@ -2748,6 +2750,24 @@ try {
             bridge_provisioned = [bool]$frontDoorBridgeStaged
             bridge_sha256 = if ($frontDoorBridgeStaged) { [string]$frontDoorBridgeStaged.sha256 } else { $null }
             bridge_bytes = if ($frontDoorBridgeStaged) { [int64]$frontDoorBridgeStaged.bytes } else { $null }
+            legacy_entrypoint_disposition = @(
+                [ordered]@{
+                    entrypoint = 'eliot-governor.exe mcp stdio --host claude --instance default'
+                    behavior = 'refuse-with-code LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge selects the new stack; legacy path otherwise'
+                    canonical_route = 'eliot setup through the Kernel canonical configuration surface (Host-managed StoreLaunchConfig bound to the installation manifest; Governor operates only as outbound-only eliotd polling Kernel; typed policy resolves only through eliotd::canonical_config_precedence)'
+                }
+                [ordered]@{
+                    entrypoint = 'eliot-governor.exe daemon run'
+                    behavior = 'retained for the remaining legacy hosts (codex/opencode/claude-desktop); refuses nothing until their cutover'
+                    canonical_route = 'same canonical route once the owning host cutover flag selects the new stack'
+                }
+                [ordered]@{
+                    entrypoint = 'eliot.exe setup/canary with a present legacy governor.toml, a running eliot-governor.exe, or an unknown OS observation'
+                    behavior = 'unconditional fail-closed refusal with LEGACY_GOVERNOR_CONFIG_RETIRED / LEGACY_GOVERNOR_PROCESS_RUNNING / LEGACY_GOVERNOR_OBSERVATION_UNKNOWN plus the canonical-route receipt'
+                    canonical_route = 'same canonical route as above'
+                }
+            )
+            observed_behavior = 'a cut-over claude host invocation returns a structured ERROR object with the stable cutover code and canonical_route and never auto-launches the daemon, starts a store, or constructs a ControlWal/WriterActor; no invocation creates an alternate writer'
         }
         operator_schema_version = $verifiedOperator.schema_version
         operator_protocol_version = $verifiedOperator.protocol_version
