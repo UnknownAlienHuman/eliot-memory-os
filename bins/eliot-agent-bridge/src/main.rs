@@ -2072,7 +2072,8 @@ mod tests {
                     "required_assurance":"evidence-provenance"
                 },
                 "query":"subject:evidence-alpha",
-                "exact_resource_uri": null
+                "exact_resource_uri": null,
+                "max_records":32
             }},
             "deadline_preference_ms":5000,
             "observed_context":{
@@ -3036,7 +3037,7 @@ mod tests {
         use eliot_contracts::{EpochId, EpochLineageId};
         use eliot_mcp::{
             HostInvocationPortOutcome, HostOperationHandle, KernelHostRequestPort, McpResponse,
-            ResponseKind,
+            ResponseKind, candidate_evidence_pack_recall_metadata,
         };
         use eliot_receipts::ProofCeiling;
         use std::num::NonZeroU64;
@@ -3106,6 +3107,7 @@ mod tests {
                 kind,
                 canonical_tool_name: "eliot.state".to_owned(),
                 recall_disposition: None,
+                recall_metadata: None,
                 content,
                 artifacts: Vec::new(),
                 proof_ceiling: ProofCeiling::Observation,
@@ -3290,55 +3292,56 @@ mod tests {
 
         /// Owning-operation answer served through the invoke-read leg.
         fn query_answer() -> McpResponse {
-            McpResponse {
-                request_id: "req-query-1".to_owned(),
-                idempotency_key: "idem-query-1".to_owned(),
-                canonical_request_sha256: DIGEST_A.to_owned(),
-                kind: ResponseKind::Projection,
-                canonical_tool_name: "eliot.query".to_owned(),
-                recall_disposition: serde_json::from_value(serde_json::json!(
-                    "INCOMPLETE_COVERAGE"
-                ))
-                .expect("fixture disposition must decode"),
-                content: serde_json::json!({
-                    "operation": "GetEvidencePack",
+            let content = serde_json::json!({
+                "operation": "GetEvidencePack",
+                "subject": "evidence-alpha",
+                "scope_id": "scope-delivery-1",
+                "evidence_pack": {
+                    "version": 1,
                     "subject": "evidence-alpha",
                     "scope_id": "scope-delivery-1",
-                    "evidence_pack": {
-                        "version": 1,
-                        "subject": "evidence-alpha",
-                        "scope_id": "scope-delivery-1",
-                        "records": [{
-                            "capture_index": 0,
-                            "operation": "CaptureObservation",
-                            "parameters": {"subject": "evidence-alpha"}
-                        }],
-                        "provenance": {
-                            "state_fence": {
-                                "authority_epoch": {
-                                    "lineage_id": TEST_LINEAGE,
-                                    "sequence": 2
-                                },
-                                "resource_generation": 5
-                            },
-                            "matched_total": 1,
-                            "returned": 1,
-                            "max_records": 32,
-                            "truncated": false
-                        }
-                    },
-                    "revision_heads": [{
-                        "key": "scope:scope-delivery-1",
-                        "revision": 1,
+                    "records": [{
+                        "capture_index": 0,
+                        "operation": "CaptureObservation",
+                        "parameters": {"subject": "evidence-alpha"}
+                    }],
+                    "provenance": {
                         "state_fence": {
                             "authority_epoch": {
                                 "lineage_id": TEST_LINEAGE,
                                 "sequence": 2
                             },
                             "resource_generation": 5
-                        }
-                    }]
-                }),
+                        },
+                        "matched_total": 1,
+                        "returned": 1,
+                        "max_records": 32,
+                        "truncated": false
+                    }
+                },
+                "revision_heads": [{
+                    "key": "scope:scope-delivery-1",
+                    "revision": 1,
+                    "state_fence": {
+                        "authority_epoch": {
+                            "lineage_id": TEST_LINEAGE,
+                            "sequence": 2
+                        },
+                        "resource_generation": 5
+                    }
+                }]
+            });
+            let recall_metadata = candidate_evidence_pack_recall_metadata(&content)
+                .expect("fixture recall metadata must build");
+            McpResponse {
+                request_id: "req-query-1".to_owned(),
+                idempotency_key: "idem-query-1".to_owned(),
+                canonical_request_sha256: DIGEST_A.to_owned(),
+                kind: ResponseKind::Projection,
+                canonical_tool_name: "eliot.query".to_owned(),
+                recall_disposition: Some(recall_metadata.disposition),
+                recall_metadata: Some(recall_metadata),
+                content,
                 artifacts: Vec::new(),
                 proof_ceiling: ProofCeiling::ScopedVerification,
                 resource: None,

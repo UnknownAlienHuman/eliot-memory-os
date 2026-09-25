@@ -1459,7 +1459,8 @@ mod tests {
                 "required_assurance":"evidence-provenance"
             },
             "query":"subject:evidence-alpha",
-            "exact_resource_uri": null
+            "exact_resource_uri": null,
+            "max_records":32
         }})
     }
 
@@ -1490,7 +1491,7 @@ mod tests {
                 capability: capability.to_owned(),
                 session_id: Some("kernel-session-1".to_owned()),
                 task_id: None,
-                work_scope_id: None,
+                work_scope_id: Some("work-scope-1".to_owned()),
                 payload_schema_id: "eliot.mcp.tool-request.v1".to_owned(),
                 payload_sha256: payload_sha256.to_owned(),
             },
@@ -1517,7 +1518,7 @@ mod tests {
             fencing_generation: generation,
             session_id: "kernel-session-1".to_owned(),
             authority_epoch: envelope.state_fence.authority_epoch.clone(),
-            scope_id: "kernel-session-1".to_owned(),
+            scope_id: "work-scope-1".to_owned(),
             facet_method: "eliot.query".to_owned(),
             expires_at_unix_ms: envelope.identity.deadline_unix_ms,
             use_budget: 1,

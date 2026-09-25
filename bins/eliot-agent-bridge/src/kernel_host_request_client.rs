@@ -28,9 +28,9 @@ use eliot_contracts::{
     canonical_json_bytes, sha256_hex,
 };
 use eliot_mcp::{
-    EVIDENCE_PACK_MAX_RECORDS, EvidencePackResponseExpectation, HostCancellationPortOutcome,
-    HostCancellationRequest, HostInvocationPortOutcome, HostInvocationRequest, HostOperationHandle,
-    KernelHostRequestPort, McpResponse, PortFailure, ToolRequest, classify_response_failure,
+    EvidencePackResponseExpectation, HostCancellationPortOutcome, HostCancellationRequest,
+    HostInvocationPortOutcome, HostInvocationRequest, HostOperationHandle, KernelHostRequestPort,
+    McpResponse, PortFailure, ToolRequest, classify_response_failure,
     requires_evidence_pack_response, validate_evidence_pack_response,
     validate_mcp_response_for_tool,
 };
@@ -1007,14 +1007,10 @@ fn decode_stored_response(
                 .work_scope_id
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
-                .or_else(|| {
-                    envelope
-                        .identity
-                        .session_id
-                        .as_deref()
-                        .filter(|value| !value.trim().is_empty())
-                })
-                .ok_or_else(|| invalid_result("admitted evidence scope is missing"))?;
+                .ok_or_else(|| invalid_result("admitted evidence WorkScope is missing"))?;
+            let max_records = input
+                .max_records
+                .ok_or_else(|| invalid_result("admitted evidence max_records is missing"))?;
             let expected_state_fence = serde_json::to_value(&envelope.state_fence)
                 .map_err(|_| invalid_result("admitted State Fence cannot be canonicalized"))?;
             validate_evidence_pack_response(
@@ -1025,7 +1021,7 @@ fn decode_stored_response(
                     canonical_request_sha256: expected_request_sha256,
                     subject: subject.to_owned(),
                     scope_id: scope_id.to_owned(),
-                    max_records: u64::from(EVIDENCE_PACK_MAX_RECORDS),
+                    max_records: u64::from(max_records),
                     state_fence: expected_state_fence,
                 },
             )
@@ -1949,7 +1945,8 @@ mod tests {
                     "required_assurance":"evidence-provenance"
                 },
                 "query":"subject:evidence-alpha",
-                "exact_resource_uri": null
+                "exact_resource_uri": null,
+                "max_records":32
             }}),
             serde_json::json!({"name":"eliot.packet","arguments":{
                 "packet_ref": null,

@@ -273,6 +273,11 @@ pub struct QueryInput {
     pub query: String,
     /// Immutable resource URI, when directly addressing a resource.
     pub exact_resource_uri: Option<String>,
+    /// Exact bounded record count for an evidence-pack selector. It is
+    /// required for the closed subject query and omitted for unrelated query
+    /// intents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_records: Option<u32>,
 }
 
 impl QueryInput {
@@ -282,7 +287,11 @@ impl QueryInput {
         optional_non_blank(
             self.exact_resource_uri.as_deref(),
             "query.exact_resource_uri",
-        )
+        )?;
+        if let Some(max_records) = self.max_records {
+            positive(u64::from(max_records), "query.max_records")?;
+        }
+        Ok(())
     }
 }
 

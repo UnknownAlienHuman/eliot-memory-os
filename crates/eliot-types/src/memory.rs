@@ -793,7 +793,7 @@ pub struct RecallL0Response {
     pub truncation: TruncationInfo,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CognitiveProjectionReadState {
     Published,
@@ -981,6 +981,102 @@ pub struct RecallDispositionInputs {
     pub conflicted: Option<bool>,
     /// Best admitted total score, when any handle was admitted.
     pub top_score: Option<i32>,
+}
+
+/// Explicit server observations used to derive a recall disposition.
+///
+/// `None` is an unavailable owner observation, not a negative observation. The
+/// optional-aware entrypoint below preserves that distinction for bounded
+/// response owners (such as an opaque candidate evidence pack) that cannot
+/// honestly manufacture corpus, admission, conflict, score, or coverage facts.
+/// Once all required observations are present, the same deterministic priority
+/// as [`derive_recall_disposition`] is used.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct RecallDispositionObservations {
+    /// Whether the owner authoritatively observed an empty corpus.
+    pub corpus_empty: Option<bool>,
+    /// Candidates considered before scope and lifecycle policy.
+    pub candidates_considered: Option<usize>,
+    /// Handles admitted to the visible response.
+    pub visible_count: Option<usize>,
+    /// Candidates suppressed by scope policy.
+    pub scope_suppressed_count: Option<usize>,
+    /// Projection freshness, when observed.
+    pub projection_state: Option<CognitiveProjectionReadState>,
+    /// Whether retrieval covered the relevant corpus without gaps.
+    pub coverage_complete: Option<bool>,
+    /// Whether the owner observed conflicting evidence.
+    pub conflicted: Option<bool>,
+    /// Best admitted score, when an admitted handle exists.
+    pub top_score: Option<i32>,
+}
+
+impl RecallDispositionObservations {
+    /// Returns the explicit unavailable-observation set used by an opaque
+    /// evidence-pack response. It is intentionally not a set of `false` or
+    /// zero defaults.
+    #[must_use]
+    pub const fn unavailable() -> Self {
+        Self {
+            corpus_empty: None,
+            candidates_considered: None,
+            visible_count: None,
+            scope_suppressed_count: None,
+            projection_state: None,
+            coverage_complete: None,
+            conflicted: None,
+            top_score: None,
+        }
+    }
+
+    /// Derives a closed disposition without coercing unavailable observations.
+    ///
+    /// A response that cannot observe all required owner facts remains
+    /// `INCOMPLETE_COVERAGE`. In particular, a non-zero candidate count never
+    /// becomes `ADMITTED_WEAK` without an authoritative admitted count and
+    /// score.
+    #[must_use]
+    pub const fn derive(&self) -> (RecallDisposition, &'static str) {
+        let (
+            Some(corpus_empty),
+            Some(candidates_considered),
+            Some(visible_count),
+            Some(scope_suppressed_count),
+            Some(projection_state),
+            Some(coverage_complete),
+            Some(conflicted),
+        ) = (
+            self.corpus_empty,
+            self.candidates_considered,
+            self.visible_count,
+            self.scope_suppressed_count,
+            self.projection_state,
+            self.coverage_complete,
+            self.conflicted,
+        )
+        else {
+            return (
+                RecallDisposition::IncompleteCoverage,
+                "required server observation unavailable",
+            );
+        };
+        if visible_count > 0 && self.top_score.is_none() {
+            return (
+                RecallDisposition::IncompleteCoverage,
+                "admitted count has no authoritative score observation",
+            );
+        }
+        derive_recall_disposition(&RecallDispositionInputs {
+            corpus_empty: Some(corpus_empty),
+            candidates_considered,
+            visible_count,
+            scope_suppressed_count,
+            projection_state,
+            coverage_complete,
+            conflicted: Some(conflicted),
+            top_score: self.top_score,
+        })
+    }
 }
 
 /// Derives the canonical [`RecallDisposition`] server-side.

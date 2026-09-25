@@ -335,6 +335,7 @@ impl AuthenticatedHostSession {
             },
             query: format!("subject:{subject}"),
             exact_resource_uri: None,
+            max_records: Some(max_records),
         };
         let plan = plan_evidence_pack_query(&input, scope_id, &max_records.to_string())
             .map_err(|error| error.to_string())?;
@@ -342,6 +343,9 @@ impl AuthenticatedHostSession {
             .map_err(|error| format!("evidence-pack projection is invalid: {error}"))?;
         let recall_disposition = projection.recall_disposition.ok_or_else(|| {
             "evidence-pack projection omitted its response-owner disposition".to_owned()
+        })?;
+        let recall_metadata = projection.recall_metadata.ok_or_else(|| {
+            "evidence-pack projection omitted its response-owner observation metadata".to_owned()
         })?;
         let mut content = projection.content;
         let content_object = content
@@ -372,6 +376,7 @@ impl AuthenticatedHostSession {
             kind: ResponseKind::Projection,
             canonical_tool_name: "eliot.query".to_owned(),
             recall_disposition: Some(recall_disposition),
+            recall_metadata: Some(recall_metadata),
             content,
             artifacts: Vec::new(),
             proof_ceiling: ProofCeiling::ScopedVerification,
@@ -460,6 +465,7 @@ pub fn validate_local_read_result_response(
         },
         query: format!("subject:{subject}"),
         exact_resource_uri: None,
+        max_records: Some(max_records),
     });
     let negative = classify_response_failure(&response)
         .map_err(|error| format!("typed local-read response is invalid: {error}"))?;
@@ -1223,15 +1229,13 @@ fn validate_exact_local_read_readback(
         .work_scope_id
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            envelope
-                .identity
-                .session_id
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-        })
         .ok_or_else(|| PortFailure::TransportBindingRejected {
-            reason: "stored exact evidence response has no admitted scope".to_owned(),
+            reason: "stored exact evidence response has no admitted WorkScope".to_owned(),
+        })?;
+    let max_records = input
+        .max_records
+        .ok_or_else(|| PortFailure::TransportBindingRejected {
+            reason: "stored exact evidence response has no admitted max_records".to_owned(),
         })?;
     let response_value =
         serde_json::to_value(response).map_err(|error| PortFailure::TransportBindingRejected {
@@ -1241,7 +1245,7 @@ fn validate_exact_local_read_readback(
         envelope,
         scope_id,
         subject,
-        EVIDENCE_PACK_MAX_RECORDS,
+        max_records,
         &response_value,
     )
     .map_err(|error| PortFailure::TransportBindingRejected {
@@ -1432,7 +1436,7 @@ fn is_lower_hex64(value: &str) -> bool {
 mod local_read_result_tests {
     use super::*;
     use eliot_contracts::{EpochLineageId, ResourceGeneration};
-    use eliot_mcp::EVIDENCE_PACK_PROJECTION_VERSION;
+    use eliot_mcp::{EVIDENCE_PACK_PROJECTION_VERSION, candidate_evidence_pack_recall_metadata};
     use serde_json::json;
     use std::num::NonZeroU64;
 
@@ -1451,7 +1455,8 @@ mod local_read_result_tests {
                 "required_assurance":"evidence-provenance"
             },
             "query":"subject:evidence-alpha",
-            "exact_resource_uri":null
+            "exact_resource_uri":null,
+            "max_records":32
         }},
         "deadline_preference_ms":5000,
         "observed_context":{
@@ -1491,7 +1496,7 @@ mod local_read_result_tests {
                 capability: "eliot.query".to_owned(),
                 session_id: Some("kernel-session-1".to_owned()),
                 task_id: None,
-                work_scope_id: None,
+                work_scope_id: Some("work-scope-1".to_owned()),
                 payload_schema_id: "eliot.mcp.tool-request.v1".to_owned(),
                 payload_sha256: payload_digest,
             },
@@ -1510,8 +1515,7 @@ mod local_read_result_tests {
             .identity
             .work_scope_id
             .as_deref()
-            .or(envelope.identity.session_id.as_deref())
-            .unwrap_or("kernel-session-1");
+            .expect("local-read envelope must carry a trusted WorkScope");
         let request_digest = sha256_hex(
             &canonical_json_bytes(&(
                 envelope.envelope_sha256.clone(),
@@ -1520,43 +1524,44 @@ mod local_read_result_tests {
             ))
             .expect("request tuple must canonicalize"),
         );
+        let content = json!({
+            "operation": "GetEvidencePack",
+            "subject": "evidence-alpha",
+            "scope_id": scope_id,
+            "evidence_pack": {
+                "version": EVIDENCE_PACK_PROJECTION_VERSION,
+                "subject": "evidence-alpha",
+                "scope_id": scope_id,
+                "records": [{
+                    "capture_index": 0,
+                    "operation": "CaptureObservation",
+                    "parameters": {"subject": "evidence-alpha"},
+                }],
+                "provenance": {
+                    "state_fence": envelope.state_fence.clone(),
+                    "matched_total": 1,
+                    "returned": 1,
+                    "max_records": EVIDENCE_PACK_MAX_RECORDS,
+                    "truncated": false,
+                },
+            },
+            "revision_heads": [{
+                "key": format!("scope:{scope_id}"),
+                "revision": 3,
+                "state_fence": envelope.state_fence.clone(),
+            }],
+        });
+        let recall_metadata = candidate_evidence_pack_recall_metadata(&content)
+            .expect("fixture recall metadata must build");
         McpResponse {
             request_id: envelope.identity.request_id.as_str().to_owned(),
             idempotency_key: envelope.identity.idempotency_key.clone(),
             canonical_request_sha256: request_digest,
             kind: ResponseKind::Projection,
             canonical_tool_name: "eliot.query".to_owned(),
-            recall_disposition: Some(
-                serde_json::from_value(json!("INCOMPLETE_COVERAGE"))
-                    .expect("fixture disposition must decode"),
-            ),
-            content: json!({
-                "operation": "GetEvidencePack",
-                "subject": "evidence-alpha",
-                "scope_id": scope_id,
-                "evidence_pack": {
-                    "version": EVIDENCE_PACK_PROJECTION_VERSION,
-                    "subject": "evidence-alpha",
-                    "scope_id": scope_id,
-                    "records": [{
-                        "capture_index": 0,
-                        "operation": "CaptureObservation",
-                        "parameters": {"subject": "evidence-alpha"},
-                    }],
-                    "provenance": {
-                        "state_fence": envelope.state_fence.clone(),
-                        "matched_total": 1,
-                        "returned": 1,
-                        "max_records": EVIDENCE_PACK_MAX_RECORDS,
-                        "truncated": false,
-                    },
-                },
-                "revision_heads": [{
-                    "key": format!("scope:{scope_id}"),
-                    "revision": 3,
-                    "state_fence": envelope.state_fence.clone(),
-                }],
-            }),
+            recall_disposition: Some(recall_metadata.disposition),
+            recall_metadata: Some(recall_metadata),
+            content,
             artifacts: Vec::new(),
             proof_ceiling: eliot_receipts::ProofCeiling::ScopedVerification,
             resource: None,
@@ -1723,7 +1728,8 @@ mod local_read_build_tests {
                 "required_assurance":"evidence-provenance"
             },
             "query":"subject:evidence-alpha",
-            "exact_resource_uri":null
+            "exact_resource_uri":null,
+            "max_records":32
         }},
         "deadline_preference_ms":5000,
         "observed_context":{
@@ -1766,7 +1772,7 @@ mod local_read_build_tests {
                 capability: "eliot.query".to_owned(),
                 session_id: Some("kernel-session-1".to_owned()),
                 task_id: None,
-                work_scope_id: None,
+                work_scope_id: Some("work-scope-1".to_owned()),
                 payload_schema_id: "eliot.mcp.tool-request.v1".to_owned(),
                 payload_sha256: payload_digest,
             },

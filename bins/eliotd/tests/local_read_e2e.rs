@@ -78,7 +78,8 @@ fn query_tool_with_mode(mode: &str) -> Value {
             "required_assurance":"evidence-provenance"
         },
         "query":"subject:evidence-alpha",
-        "exact_resource_uri": null
+        "exact_resource_uri": null,
+        "max_records":32
     }})
 }
 
@@ -109,7 +110,7 @@ fn test_envelope(
             capability: capability.to_owned(),
             session_id: Some("kernel-session-1".to_owned()),
             task_id: None,
-            work_scope_id: None,
+            work_scope_id: Some("work-scope-1".to_owned()),
             payload_schema_id: "eliot.mcp.tool-request.v1".to_owned(),
             payload_sha256: payload_sha256.to_owned(),
         },
@@ -319,7 +320,7 @@ fn result_body_for(envelope: &HostRequestEnvelope) -> TestResult<HostRequestResu
         "operation": "GetEvidencePack",
         "subject": "evidence-alpha",
         "evidence_pack": { "subject": "evidence-alpha" },
-        "revision_heads": [{ "key": "scope:kernel-session-1", "revision": 3 }],
+        "revision_heads": [{ "key": "scope:work-scope-1", "revision": 3 }],
     });
     let bytes = eliot_contracts::canonical_json_bytes(&response)
         .map_err(|error| format!("body must canonicalize: {error}"))?;
@@ -358,7 +359,7 @@ fn claimed_pair_submits_the_exact_bound_body() -> TestResult {
         fencing_generation: 1,
         session_id: "kernel-session-1".to_owned(),
         authority_epoch: fence.authority_epoch.clone(),
-        scope_id: "kernel-session-1".to_owned(),
+        scope_id: "work-scope-1".to_owned(),
         facet_method: "eliot.query".to_owned(),
         expires_at_unix_ms: envelope.identity.deadline_unix_ms,
         use_budget: 1,
@@ -448,7 +449,7 @@ fn claimed_pair_submits_the_exact_bound_body() -> TestResult {
         "a replay preserves the exact result digest"
     );
     let mut changed = body.response.clone();
-    changed["revision_heads"] = json!([{ "key": "scope:kernel-session-1", "revision": 4 }]);
+    changed["revision_heads"] = json!([{ "key": "scope:work-scope-1", "revision": 4 }]);
     let changed_bytes = eliot_contracts::canonical_json_bytes(&changed)
         .map_err(|error| format!("changed body must canonicalize: {error}"))?;
     assert_ne!(

@@ -40,7 +40,8 @@ fn query_tool() -> serde_json::Value {
             "required_assurance":"evidence-provenance"
         },
         "query":"subject:evidence-alpha",
-        "exact_resource_uri": null
+        "exact_resource_uri": null,
+        "max_records":"32"
     }})
 }
 
@@ -64,7 +65,7 @@ fn query_envelope(
             capability: "eliot.query".to_owned(),
             session_id: Some("kernel-session-1".to_owned()),
             task_id: None,
-            work_scope_id: None,
+            work_scope_id: Some("work-scope-1".to_owned()),
             payload_schema_id: "eliot.mcp.tool-request.v1".to_owned(),
             payload_sha256: tool_digest.to_owned(),
         },
@@ -116,14 +117,7 @@ fn evidence_response_for(envelope: &HostRequestEnvelope, revision: u32) -> serde
         .work_scope_id
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            envelope
-                .identity
-                .session_id
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .expect("local-read envelope must carry a trusted scope");
+        .expect("local-read envelope must carry a trusted WorkScope");
     let canonical_request_sha256 = eliot_contracts::sha256_hex(
         &eliot_contracts::canonical_json_bytes(&(
             envelope.envelope_sha256.clone(),
@@ -132,6 +126,66 @@ fn evidence_response_for(envelope: &HostRequestEnvelope, revision: u32) -> serde
         ))
         .expect("request tuple must canonicalize"),
     );
+    let content = serde_json::json!({
+        "operation": "GetEvidencePack",
+        "subject": "evidence-alpha",
+        "scope_id": scope_id,
+        "evidence_pack": {
+            "version": 1,
+            "subject": "evidence-alpha",
+            "scope_id": scope_id,
+            "records": [{
+                "capture_index": 0,
+                "operation": "CaptureObservation",
+                "parameters": {"subject": "evidence-alpha"}
+            }],
+            "provenance": {
+                "state_fence": envelope.state_fence,
+                "matched_total": 1,
+                "returned": 1,
+                "max_records": EVIDENCE_PACK_MAX_RECORDS,
+                "truncated": false
+            }
+        },
+        "revision_heads": [{
+            "key": format!("scope:{scope_id}"),
+            "revision": revision,
+            "state_fence": envelope.state_fence,
+        }]
+    });
+    let recall_metadata = serde_json::json!({
+        "disposition": "INCOMPLETE_COVERAGE",
+        "admission_observations": {
+            "corpus_empty": null,
+            "candidates_considered": null,
+            "visible_count": null,
+            "scope_suppressed_count": null,
+            "projection_state": null,
+            "coverage_complete": null,
+            "conflicted": null,
+            "top_score": null
+        },
+        "receipt": {
+            "scope_id": scope_id,
+            "state_fence": envelope.state_fence,
+            "source_revision": null,
+            "projection_revision": null,
+            "freshness": "UNAVAILABLE",
+            "matched_total": 1,
+            "returned": 1,
+            "visible_count": null,
+            "suppressed_count": null,
+            "reason": "required server observation unavailable; candidate-only evidence has no authoritative admission or ranking trace"
+        },
+        "rank_trace": {
+            "status": "UNAVAILABLE",
+            "handle": null,
+            "candidates_considered": null,
+            "candidates_returned": null,
+            "reason": "candidate-only evidence has no FusedRankTrace or equivalent"
+        },
+        "admitted_max_records": EVIDENCE_PACK_MAX_RECORDS
+    });
     serde_json::json!({
         "request_id": envelope.identity.request_id.as_str(),
         "idempotency_key": envelope.identity.idempotency_key,
@@ -139,33 +193,8 @@ fn evidence_response_for(envelope: &HostRequestEnvelope, revision: u32) -> serde
         "kind": "PROJECTION",
         "canonical_tool_name": "eliot.query",
         "recall_disposition": "INCOMPLETE_COVERAGE",
-        "content": {
-            "operation": "GetEvidencePack",
-            "subject": "evidence-alpha",
-            "scope_id": scope_id,
-            "evidence_pack": {
-                "version": 1,
-                "subject": "evidence-alpha",
-                "scope_id": scope_id,
-                "records": [{
-                    "capture_index": 0,
-                    "operation": "CaptureObservation",
-                    "parameters": {"subject": "evidence-alpha"}
-                }],
-                "provenance": {
-                    "state_fence": envelope.state_fence,
-                    "matched_total": 1,
-                    "returned": 1,
-                    "max_records": EVIDENCE_PACK_MAX_RECORDS,
-                    "truncated": false
-                }
-            },
-            "revision_heads": [{
-                "key": format!("scope:{scope_id}"),
-                "revision": revision,
-                "state_fence": envelope.state_fence,
-            }]
-        },
+        "recall_metadata": recall_metadata,
+        "content": content,
         "artifacts": [],
         "proof_ceiling": "SCOPED_VERIFICATION",
         "resource": null,

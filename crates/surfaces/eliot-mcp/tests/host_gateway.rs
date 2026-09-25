@@ -90,6 +90,7 @@ fn response(tool: &str) -> McpResponse {
         kind: ResponseKind::Projection,
         canonical_tool_name: tool.to_owned(),
         recall_disposition: None,
+        recall_metadata: None,
         content: json!({"projection": "current"}),
         artifacts: Vec::new(),
         proof_ceiling: ProofCeiling::Observation,

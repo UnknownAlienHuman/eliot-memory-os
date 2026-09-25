@@ -113,7 +113,7 @@ struct AdmittedConnection {
 /// captured by the one-shot activation exchange, so invocation envelopes bind
 /// an honest kernel-issued selector instead of host text or a minted
 /// identity. `activated_work_scope_id` carries the same activation-issued
-/// WorkScope into every host-request envelope. `replay_cache` makes exact host
+/// `WorkScope` into every host-request envelope. `replay_cache` makes exact host
 /// replays byte-identical (the
 /// kernel deduplicates by envelope digest) and turns a changed payload under
 /// a known correlation into a local `IdempotencyConflict` with no wire

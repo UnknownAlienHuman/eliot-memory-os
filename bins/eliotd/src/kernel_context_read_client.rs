@@ -411,30 +411,36 @@ impl KernelContextReadClient {
                 field: "operation.parameter",
                 reason: "query must be one exact subject selector",
             })?;
+        let max_records = arguments
+            .get("max_records")
+            .and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+            })
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value != 0 && *value <= EVIDENCE_PACK_MAX_RECORDS)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "local read requires an explicit bounded max_records selector",
+            })?;
         let scope_text = envelope
             .identity
             .work_scope_id
             .as_deref()
             .filter(|scope| !scope.trim().is_empty())
-            .or_else(|| {
-                envelope
-                    .identity
-                    .session_id
-                    .as_deref()
-                    .filter(|scope| !scope.trim().is_empty())
-            })
             .ok_or(StoreError::InvalidField {
                 field: "scope_id",
-                reason: "local read requires an exact trusted scope",
+                reason: "local read requires the exact trusted WorkScope",
             })?;
         let scope = ScopeId::new(scope_text).map_err(|_| StoreError::InvalidField {
             field: "scope_id",
-            reason: "local read requires an exact trusted scope",
+            reason: "local read requires the exact trusted WorkScope",
         })?;
         Ok(LocalReadSelectors {
             scope,
             subject: subject.to_owned(),
-            max_records: EVIDENCE_PACK_MAX_RECORDS,
+            max_records,
         })
     }
 

@@ -8,7 +8,7 @@ use eliot_source_assurance::{
     AdmissionOutcome, AssuranceFinding, OwnerSourceEvidence, SourceAssurance, SourceAssuranceError,
     canonical_digest,
 };
-use eliot_types::RecallDisposition;
+use eliot_types::{RecallDisposition, RecallDispositionObservations};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -17,8 +17,8 @@ use thiserror::Error;
 
 use crate::{
     ApplicationRequest, ContractViolation, LEGACY_FINISH_INPUT_REJECTED, McpProtocolVersion,
-    QueryInput, QueryIntent, QueryMode, ToolRequest, TypedRejection, decode_protected_request_bytes,
-    validate_proof_ceiling,
+    QueryInput, QueryIntent, QueryMode, ToolRequest, TypedRejection,
+    decode_protected_request_bytes, validate_proof_ceiling,
 };
 
 /// Default and optional local transport profiles. This is validation only.
@@ -182,6 +182,9 @@ pub struct ForwardedRequest {
     pub request: ApplicationRequest,
     /// SHA-256 over canonical serialized request bytes, including identity.
     pub canonical_request_sha256: String,
+    /// Exact evidence-record bound admitted by the query selector, when this
+    /// request is the closed subject evidence route.
+    pub evidence_max_records: Option<u32>,
     /// Trusted current operational binding resolved for this exact request.
     pub active_session_binding: ActiveSessionBinding,
     /// Owner-authenticated source evidence required by every semantic handoff.
@@ -294,6 +297,146 @@ pub const EVIDENCE_PACK_MAX_RECORDS: u32 = eliot_store_api::EVIDENCE_PACK_MAX_RE
 /// shape and does not carry semantic admission or disposition.
 pub const EVIDENCE_PACK_PROJECTION_VERSION: u32 = 1;
 
+/// Closed status for the rank-trace observation attached to an opaque
+/// evidence-pack response. The bounded v1 pack has candidate captures, not an
+/// admitted ranking, so this slice emits only the explicit unavailable state.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum EvidencePackRankTraceStatus {
+    /// No `FusedRankTrace` or equivalent was produced by the response owner.
+    Unavailable,
+}
+
+/// Bounded response-owner receipt for an opaque evidence pack.
+///
+/// This is intentionally not [`eliot_types::RecallReceipt`]: the v1 pack does
+/// not provide L0 source/projection revisions or an admitted-handle count. The
+/// unavailable fields remain `null`/absent rather than being fabricated.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidencePackRecallReceipt {
+    /// Exact trusted scope bound to the read.
+    pub scope_id: String,
+    /// Exact State Fence observed in the pack provenance.
+    pub state_fence: Value,
+    /// Source revision is unavailable on the candidate-only v1 contour.
+    pub source_revision: Option<String>,
+    /// Projection revision is unavailable on the candidate-only v1 contour.
+    pub projection_revision: Option<String>,
+    /// Projection freshness is explicitly unavailable, not inferred as fresh.
+    pub freshness: String,
+    /// Exact selector matches reported by the opaque pack.
+    pub matched_total: u64,
+    /// Exact bounded records returned by the opaque pack.
+    pub returned: u64,
+    /// Admitted visible-handle count is unavailable without an admission owner.
+    pub visible_count: Option<u64>,
+    /// Suppressed-handle count is unavailable without policy evaluation.
+    pub suppressed_count: Option<u64>,
+    /// Short response-owner reason for the bounded disposition.
+    pub reason: String,
+}
+
+/// Explicit rank-trace metadata for the candidate-only response contour.
+///
+/// The absence of a handle and counts is a first-class observation, not an
+/// invitation for the bridge or a model to invent a ranking.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidencePackRankTraceMetadata {
+    /// Availability of the rank trace.
+    pub status: EvidencePackRankTraceStatus,
+    /// Content-addressed rank-trace handle, when the owner produced one.
+    pub handle: Option<String>,
+    /// Number of ranked candidates, when ranking was actually performed.
+    pub candidates_considered: Option<u64>,
+    /// Number of ranked candidates returned, when ranking was actually performed.
+    pub candidates_returned: Option<u64>,
+    /// Why the rank trace is unavailable.
+    pub reason: String,
+}
+
+/// Response-owned disposition metadata for the bounded opaque evidence-pack
+/// route.
+///
+/// The metadata is a transport-safe, explicit unavailable-observation shape;
+/// it does not pretend to be a full L0 `ServerRecallVerdict`.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidencePackRecallMetadata {
+    /// Closed disposition derived from the explicit observations below.
+    pub disposition: RecallDisposition,
+    /// Canonical owner-observation inputs; `None` means unavailable.
+    pub admission_observations: RecallDispositionObservations,
+    /// Bounded receipt and reason for this exact read.
+    pub receipt: EvidencePackRecallReceipt,
+    /// Explicit rank-trace availability metadata.
+    pub rank_trace: EvidencePackRankTraceMetadata,
+    /// Exact record bound admitted by the response owner.
+    pub admitted_max_records: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct EvidencePackProjectionFacts {
+    scope_id: String,
+    state_fence: Value,
+    matched_total: u64,
+    returned: u64,
+    max_records: u64,
+}
+
+impl EvidencePackRecallMetadata {
+    fn for_candidate_pack(facts: &EvidencePackProjectionFacts) -> Self {
+        // This is the response owner's explicit observation decision. The
+        // opaque v1 pack has candidate captures but no authoritative corpus,
+        // admission, conflict, score, freshness, or ranking observation.
+        let admission_observations = RecallDispositionObservations::unavailable();
+        let (disposition, derived_reason) = admission_observations.derive();
+        let reason = format!(
+            "{derived_reason}; candidate-only evidence has no authoritative admission or ranking trace"
+        );
+        Self {
+            disposition,
+            admission_observations,
+            receipt: EvidencePackRecallReceipt {
+                scope_id: facts.scope_id.clone(),
+                state_fence: facts.state_fence.clone(),
+                source_revision: None,
+                projection_revision: None,
+                freshness: "UNAVAILABLE".to_owned(),
+                matched_total: facts.matched_total,
+                returned: facts.returned,
+                visible_count: None,
+                suppressed_count: None,
+                reason: reason.clone(),
+            },
+            rank_trace: EvidencePackRankTraceMetadata {
+                status: EvidencePackRankTraceStatus::Unavailable,
+                handle: None,
+                candidates_considered: None,
+                candidates_returned: None,
+                reason: "candidate-only evidence has no FusedRankTrace or equivalent".to_owned(),
+            },
+            admitted_max_records: facts.max_records,
+        }
+    }
+}
+
+/// Builds the explicit response-owner metadata for one validated opaque
+/// candidate evidence pack.
+///
+/// This is the only constructor for the bounded v1 contour. It records the
+/// selector/provenance facts it observed and marks semantic admission and
+/// ranking facts unavailable; it never treats record counts as admission.
+pub fn candidate_evidence_pack_recall_metadata(
+    content: &Value,
+) -> Result<EvidencePackRecallMetadata, BridgeError> {
+    let facts = parse_projected_evidence_pack("eliot.query", content)?.ok_or_else(|| {
+        BridgeError::Serialization("evidence-pack projection is missing".to_owned())
+    })?;
+    Ok(EvidencePackRecallMetadata::for_candidate_pack(&facts))
+}
+
 /// Closed T11.1 evidence-pack query plan derived from an explicit-intent
 /// `eliot.query`.
 ///
@@ -366,10 +509,19 @@ pub fn plan_evidence_pack_query(
     let bound: u32 = max_records.trim().parse().map_err(|_| {
         BridgeError::invalid("query.max_records", "must be a positive decimal bound")
     })?;
-    if bound == 0 {
+    if bound == 0 || bound > EVIDENCE_PACK_MAX_RECORDS {
         return Err(BridgeError::invalid(
             "query.max_records",
-            "must be a positive decimal bound",
+            "must be within the evidence-pack catalogue bound",
+        ));
+    }
+    if input
+        .max_records
+        .is_some_and(|input_bound| input_bound != bound)
+    {
+        return Err(BridgeError::invalid(
+            "query.max_records",
+            "typed selector and admitted bound must match",
         ));
     }
     let subject = input
@@ -424,11 +576,12 @@ pub fn project_evidence_pack_projection(
             "evidence_pack max_records does not match the admitted query".to_owned(),
         ));
     }
-    let recall_disposition = parse_projected_recall_disposition("eliot.query", &content)?;
+    let metadata = candidate_evidence_pack_recall_metadata(&content)?;
     Ok(PortProjection {
         kind: ProjectionKind::Projection,
         content,
-        recall_disposition,
+        recall_disposition: Some(metadata.disposition),
+        recall_metadata: Some(metadata),
         artifacts: Vec::new(),
         proof_ceiling: ProofCeiling::ScopedVerification,
         resource: None,
@@ -471,16 +624,20 @@ fn validate_projected_evidence_records(
     Ok(())
 }
 
-/// Parses and validates the response-owned disposition on an MCP projection.
+/// Parses and validates the opaque evidence-pack projection shape.
 ///
-/// The Store payload remains an opaque version-1 candidate-capture pack. This
-/// function validates that shape and derives the P1 result from what the
-/// response owner actually observed. Candidate count is not admission evidence,
-/// so the only honest result on this route is `INCOMPLETE_COVERAGE`.
-pub fn parse_projected_recall_disposition(
+/// This function is deliberately structural: it returns only selector,
+/// provenance, and State Fence facts. It does not author a disposition or
+/// invent admission observations. The response owner supplies those facts in
+/// [`EvidencePackRecallMetadata`] through the projection/response envelope.
+#[allow(
+    clippy::too_many_lines,
+    reason = "opaque evidence-pack parsing keeps shape, fence, selector, and count joins together"
+)]
+fn parse_projected_evidence_pack(
     canonical_tool_name: &str,
     content: &Value,
-) -> Result<Option<RecallDisposition>, BridgeError> {
+) -> Result<Option<EvidencePackProjectionFacts>, BridgeError> {
     let malformed = |reason: &str| BridgeError::Serialization(reason.to_owned());
     let operation = content.get("operation").and_then(Value::as_str);
     let Some(evidence_pack) = content.get("evidence_pack") else {
@@ -544,6 +701,10 @@ pub fn parse_projected_recall_disposition(
         .get("provenance")
         .and_then(Value::as_object)
         .ok_or_else(|| malformed("evidence_pack provenance must be an object"))?;
+    let state_fence = evidence_pack
+        .pointer("/provenance/state_fence")
+        .cloned()
+        .ok_or_else(|| malformed("evidence_pack provenance is missing its State Fence"))?;
     validate_projected_state_fence(evidence_pack)?;
     let matched_total = provenance
         .get("matched_total")
@@ -573,10 +734,56 @@ pub fn parse_projected_recall_disposition(
             "evidence_pack record and provenance counts are inconsistent",
         ));
     }
-    // Do not read a disposition from the Store payload, even if an older or
-    // substituted producer added one. The response owner has no admission,
-    // corpus, score, conflict, or selected-tier observation on this route.
-    Ok(Some(RecallDisposition::IncompleteCoverage))
+
+    Ok(Some(EvidencePackProjectionFacts {
+        scope_id: scope_id.to_owned(),
+        state_fence,
+        matched_total,
+        returned: returned_u64,
+        max_records,
+    }))
+}
+
+/// Parses the closed disposition for the bounded candidate-only owner contour.
+///
+/// This compatibility helper derives the metadata through the same explicit
+/// owner constructor used by [`project_evidence_pack_projection`]. Callers
+/// that validate an untrusted response must validate the carried metadata,
+/// not this helper alone.
+pub fn parse_projected_recall_disposition(
+    canonical_tool_name: &str,
+    content: &Value,
+) -> Result<Option<RecallDisposition>, BridgeError> {
+    Ok(parse_projected_evidence_pack(canonical_tool_name, content)?
+        .map(|facts| EvidencePackRecallMetadata::for_candidate_pack(&facts).disposition))
+}
+
+fn validate_projected_recall_metadata(
+    canonical_tool_name: &str,
+    content: &Value,
+    metadata: Option<&EvidencePackRecallMetadata>,
+) -> Result<Option<RecallDisposition>, BridgeError> {
+    let Some(facts) = parse_projected_evidence_pack(canonical_tool_name, content)? else {
+        if metadata.is_some() {
+            return Err(BridgeError::Serialization(
+                "unrelated response carries evidence-pack recall metadata".to_owned(),
+            ));
+        }
+        return Ok(None);
+    };
+    let metadata = metadata.ok_or_else(|| {
+        BridgeError::Serialization(
+            "evidence-pack response is missing its owner observation metadata".to_owned(),
+        )
+    })?;
+    let expected = EvidencePackRecallMetadata::for_candidate_pack(&facts);
+    if metadata != &expected {
+        return Err(BridgeError::Serialization(
+            "evidence-pack response metadata does not match the explicit owner observations"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(metadata.disposition))
 }
 
 fn validate_projected_state_fence(evidence_pack: &Value) -> Result<(), BridgeError> {
@@ -599,7 +806,6 @@ fn validate_projected_state_fence(evidence_pack: &Value) -> Result<(), BridgeErr
 
 fn validate_projected_revision_heads(
     content: &Value,
-    expected_scope_id: &str,
     expected_fence: &eliot_store_api::StateFence,
 ) -> Result<(), BridgeError> {
     let heads = content
@@ -610,9 +816,13 @@ fn validate_projected_revision_heads(
                 "evidence-pack response is missing its revision heads".to_owned(),
             )
         })?;
-    let scope_key = format!("scope:{expected_scope_id}");
+    // An empty head list is a valid Store observation. When heads are present,
+    // every supplied head remains an exact, uniquely keyed, same-fence
+    // observation; no synthetic scope head is required.
+    if heads.is_empty() {
+        return Ok(());
+    }
     let mut keys = BTreeSet::new();
-    let mut scope_heads = 0usize;
     for value in heads {
         let head: eliot_store_api::RevisionHead =
             serde_json::from_value(value.clone()).map_err(|error| {
@@ -623,25 +833,16 @@ fn validate_projected_revision_heads(
         head.validate().map_err(|error| {
             BridgeError::Serialization(format!("evidence-pack revision head is invalid: {error}"))
         })?;
+        if head.state_fence != *expected_fence {
+            return Err(BridgeError::Serialization(
+                "evidence-pack revision head State Fence does not match the request".to_owned(),
+            ));
+        }
         if !keys.insert(head.key.as_str().to_owned()) {
             return Err(BridgeError::Serialization(
                 "evidence-pack revision heads must have unique keys".to_owned(),
             ));
         }
-        if head.key.as_str() == scope_key {
-            scope_heads += 1;
-            if head.state_fence != *expected_fence {
-                return Err(BridgeError::Serialization(
-                    "evidence-pack scope revision head State Fence does not match the request"
-                        .to_owned(),
-                ));
-            }
-        }
-    }
-    if scope_heads != 1 {
-        return Err(BridgeError::Serialization(
-            "evidence-pack response must carry exactly one admitted scope revision head".to_owned(),
-        ));
     }
     Ok(())
 }
@@ -667,9 +868,9 @@ pub fn classify_response_failure(
     match response.kind {
         ResponseKind::Candidate | ResponseKind::Projection => Ok(None),
         ResponseKind::PlanGap => {
-            if response.recall_disposition.is_some() {
+            if response.recall_disposition.is_some() || response.recall_metadata.is_some() {
                 return Err(BridgeError::Serialization(
-                    "plan-gap response must not carry a recall disposition".to_owned(),
+                    "plan-gap response must not carry recall metadata".to_owned(),
                 ));
             }
             let content = response.content.as_object().ok_or_else(|| {
@@ -686,9 +887,9 @@ pub fn classify_response_failure(
             }))
         }
         ResponseKind::Unsupported => {
-            if response.recall_disposition.is_some() {
+            if response.recall_disposition.is_some() || response.recall_metadata.is_some() {
                 return Err(BridgeError::Serialization(
-                    "unsupported response must not carry a recall disposition".to_owned(),
+                    "unsupported response must not carry recall metadata".to_owned(),
                 ));
             }
             let content = response.content.as_object().ok_or_else(|| {
@@ -749,12 +950,35 @@ pub fn requires_evidence_pack_response(tool: &ToolRequest) -> bool {
         .is_some_and(|subject| !subject.is_empty() && !subject.chars().any(char::is_control))
 }
 
+fn validate_evidence_query_max_records(tool: &ToolRequest) -> Result<Option<u32>, BridgeError> {
+    if !requires_evidence_pack_response(tool) {
+        return Ok(None);
+    }
+    let ToolRequest::Query(input) = tool else {
+        return Ok(None);
+    };
+    let max_records = input.max_records.ok_or_else(|| {
+        BridgeError::invalid(
+            "query.max_records",
+            "exact subject evidence queries require an explicit positive decimal bound",
+        )
+    })?;
+    if max_records == 0 || max_records > EVIDENCE_PACK_MAX_RECORDS {
+        return Err(BridgeError::invalid(
+            "query.max_records",
+            "must be within the evidence-pack catalogue bound",
+        ));
+    }
+    Ok(Some(max_records))
+}
+
 fn validate_projection_content_for_tool(
     tool: &ToolRequest,
     content: &Value,
     disposition: Option<RecallDisposition>,
+    metadata: Option<&EvidencePackRecallMetadata>,
 ) -> Result<(), BridgeError> {
-    let parsed = parse_projected_recall_disposition(tool.canonical_name(), content)?;
+    let parsed = validate_projected_recall_metadata(tool.canonical_name(), content, metadata)?;
     if requires_evidence_pack_response(tool) {
         let subject = tool.query_subject().ok_or_else(|| {
             BridgeError::Serialization("exact evidence subject is missing".to_owned())
@@ -803,9 +1027,9 @@ pub fn validate_mcp_response_for_tool(
         response.kind,
         ResponseKind::PlanGap | ResponseKind::Unsupported
     ) {
-        if response.recall_disposition.is_some() {
+        if response.recall_disposition.is_some() || response.recall_metadata.is_some() {
             return Err(BridgeError::Serialization(
-                "negative response must not carry a recall disposition".to_owned(),
+                "negative response must not carry recall metadata".to_owned(),
             ));
         }
         if response.proof_ceiling != ProofCeiling::Observation
@@ -843,7 +1067,12 @@ pub fn validate_mcp_response_for_tool(
             ));
         }
     }
-    validate_projection_content_for_tool(tool, &response.content, response.recall_disposition)
+    validate_projection_content_for_tool(
+        tool,
+        &response.content,
+        response.recall_disposition,
+        response.recall_metadata.as_ref(),
+    )
 }
 
 /// Joins an exact evidence-pack projection to the direct MCP request.
@@ -870,6 +1099,11 @@ fn validate_direct_evidence_pack_response(
                 "request State Fence cannot be canonicalized: {error}"
             ))
         })?;
+    let admitted_max_records = request.evidence_max_records.ok_or_else(|| {
+        BridgeError::Serialization(
+            "direct evidence-pack request is missing its admitted max_records".to_owned(),
+        )
+    })?;
     validate_evidence_pack_response(
         response,
         &EvidencePackResponseExpectation {
@@ -883,18 +1117,15 @@ fn validate_direct_evidence_pack_response(
                 .scope
                 .expected_scope
                 .clone(),
-            max_records: u64::from(EVIDENCE_PACK_MAX_RECORDS),
+            max_records: u64::from(admitted_max_records),
             state_fence,
         },
     )
 }
 
-/// Validates an exact evidence-pack response and all request/fence joins that
-/// a response owner or replay boundary can know.
-pub fn validate_evidence_pack_response(
-    response: &McpResponse,
+fn validate_evidence_pack_expectation(
     expected: &EvidencePackResponseExpectation,
-) -> Result<(), BridgeError> {
+) -> Result<eliot_store_api::StateFence, BridgeError> {
     if expected.request_id.trim().is_empty()
         || expected.request_id.chars().any(char::is_control)
         || expected.idempotency_key.trim().is_empty()
@@ -916,6 +1147,20 @@ pub fn validate_evidence_pack_response(
     expected_fence.validate().map_err(|error| {
         BridgeError::Serialization(format!("expected evidence State Fence is invalid: {error}"))
     })?;
+    Ok(expected_fence)
+}
+
+/// Validates an exact evidence-pack response and all request/fence joins that
+/// a response owner or replay boundary can know.
+#[allow(
+    clippy::too_many_lines,
+    reason = "evidence-pack response validation keeps identity, fence, shape, and owner metadata joins together"
+)]
+pub fn validate_evidence_pack_response(
+    response: &McpResponse,
+    expected: &EvidencePackResponseExpectation,
+) -> Result<(), BridgeError> {
+    let expected_fence = validate_evidence_pack_expectation(expected)?;
     validate_mcp_response_for_tool(
         &ToolRequest::Query(QueryInput {
             intent: QueryIntent {
@@ -927,6 +1172,7 @@ pub fn validate_evidence_pack_response(
             },
             query: format!("subject:{}", expected.subject),
             exact_resource_uri: None,
+            max_records: u32::try_from(expected.max_records).ok(),
         }),
         response,
     )?;
@@ -985,12 +1231,37 @@ pub fn validate_evidence_pack_response(
             "evidence-pack response does not bind the admitted State Fence".to_owned(),
         ));
     }
-    validate_projected_revision_heads(
-        &response.content,
-        expected.scope_id.as_str(),
-        &expected_fence,
-    )?;
-    if response.recall_disposition != Some(RecallDisposition::IncompleteCoverage) {
+    validate_projected_revision_heads(&response.content, &expected_fence)?;
+    let metadata = response.recall_metadata.as_ref().ok_or_else(|| {
+        BridgeError::Serialization(
+            "evidence-pack response is missing its owner observation metadata".to_owned(),
+        )
+    })?;
+    if metadata.admitted_max_records != expected.max_records
+        || metadata.receipt.scope_id != expected.scope_id
+        || metadata.receipt.state_fence != expected.state_fence
+        || metadata.receipt.source_revision.is_some()
+        || metadata.receipt.projection_revision.is_some()
+        || metadata.receipt.freshness != "UNAVAILABLE"
+        || metadata.receipt.visible_count.is_some()
+        || metadata.receipt.suppressed_count.is_some()
+        || metadata.admission_observations != RecallDispositionObservations::unavailable()
+        || metadata.rank_trace.status != EvidencePackRankTraceStatus::Unavailable
+        || metadata.rank_trace.handle.is_some()
+        || metadata.rank_trace.candidates_considered.is_some()
+        || metadata.rank_trace.candidates_returned.is_some()
+        || metadata.receipt.reason.trim().is_empty()
+        || metadata.receipt.reason.chars().any(char::is_control)
+        || metadata.rank_trace.reason.trim().is_empty()
+        || metadata.rank_trace.reason.chars().any(char::is_control)
+    {
+        return Err(BridgeError::Serialization(
+            "evidence-pack response carries invalid or unavailable-observation metadata".to_owned(),
+        ));
+    }
+    if response.recall_disposition != Some(RecallDisposition::IncompleteCoverage)
+        || metadata.disposition != RecallDisposition::IncompleteCoverage
+    {
         return Err(BridgeError::Serialization(
             "candidate-only evidence must fail closed to INCOMPLETE_COVERAGE".to_owned(),
         ));
@@ -1176,6 +1447,7 @@ pub fn project_context_reconstruction_projection(
             "context_reconstruction": payload,
         }),
         recall_disposition: None,
+        recall_metadata: None,
         artifacts: Vec::new(),
         proof_ceiling: ProofCeiling::ScopedVerification,
         resource: None,
@@ -1205,6 +1477,10 @@ pub struct PortProjection {
     /// Other projections omit this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recall_disposition: Option<RecallDisposition>,
+    /// Explicit owner observations, receipt, and rank-trace availability for
+    /// an exact evidence-pack projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_metadata: Option<EvidencePackRecallMetadata>,
     /// Exact immutable artifacts referenced by the projection.
     #[serde(default)]
     pub artifacts: Vec<ArtifactBinding>,
@@ -1338,6 +1614,10 @@ pub struct McpResponse {
     /// Other projections and all negative responses omit this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recall_disposition: Option<RecallDisposition>,
+    /// Explicit owner observations, receipt, and rank-trace availability for
+    /// an exact evidence-pack response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_metadata: Option<EvidencePackRecallMetadata>,
     /// Structured bounded content or a resource pointer.
     pub content: Value,
     /// Immutable artifacts referenced by the content.
@@ -1442,6 +1722,7 @@ impl McpCore {
     ) -> Result<McpResponse, BridgeError> {
         transport.validate()?;
         validate_application_request(&request)?;
+        let evidence_max_records = validate_evidence_query_max_records(&request.tool)?;
         let correlation = RequestCorrelation {
             request_id: request
                 .identity
@@ -1501,6 +1782,7 @@ impl McpCore {
         let forwarded = ForwardedRequest {
             request,
             canonical_request_sha256: correlation.canonical_request_sha256.clone(),
+            evidence_max_records,
             active_session_binding,
             source_assurance,
         };
@@ -1522,8 +1804,10 @@ impl McpCore {
             &forwarded.request.tool,
             &projection.content,
             projection.recall_disposition,
+            projection.recall_metadata.as_ref(),
         )?;
         let recall_disposition = projection.recall_disposition;
+        let recall_metadata = projection.recall_metadata;
         let kind = match projection.kind {
             ProjectionKind::Candidate => ResponseKind::Candidate,
             ProjectionKind::Projection => ResponseKind::Projection,
@@ -1542,6 +1826,7 @@ impl McpCore {
             kind,
             canonical_tool_name,
             recall_disposition,
+            recall_metadata,
             content: projection.content,
             artifacts: projection.artifacts,
             proof_ceiling: projection.proof_ceiling,
@@ -1631,6 +1916,7 @@ fn negative_response(
         kind,
         canonical_tool_name: canonical_tool_name.to_owned(),
         recall_disposition: None,
+        recall_metadata: None,
         content,
         artifacts: Vec::new(),
         proof_ceiling: ProofCeiling::Observation,
@@ -2139,6 +2425,7 @@ pub fn replay_disposition(
         return ReplayDisposition::DifferentIdentity;
     }
     if original.canonical_request_sha256 != candidate.canonical_request_sha256
+        || original.evidence_max_records != candidate.evidence_max_records
         || original.request != candidate.request
     {
         return ReplayDisposition::Conflict(ReplayConflictKind::PayloadChanged);
@@ -2442,6 +2729,7 @@ mod evidence_pack_query_plan_tests {
             intent: verification_intent(mode),
             query: query.to_owned(),
             exact_resource_uri: None,
+            max_records: None,
         }
     }
 
@@ -2609,6 +2897,7 @@ mod context_reconstruction_query_plan_tests {
             intent: reconstruction_intent(mode),
             query: query.to_owned(),
             exact_resource_uri: None,
+            max_records: None,
         }
     }
 

@@ -3974,7 +3974,8 @@ mod local_read_dispatch_tests {
                 "required_assurance":"evidence-provenance"
             },
             "query":"subject:evidence-alpha",
-            "exact_resource_uri": null
+            "exact_resource_uri": null,
+            "max_records":"32"
         }})
     }
 
@@ -4005,7 +4006,7 @@ mod local_read_dispatch_tests {
                 capability: capability.to_owned(),
                 session_id: Some("kernel-session-1".to_owned()),
                 task_id: None,
-                work_scope_id: None,
+                work_scope_id: Some("work-scope-1".to_owned()),
                 payload_schema_id: "eliot.mcp.tool-request.v1".to_owned(),
                 payload_sha256: payload_sha256.to_owned(),
             },

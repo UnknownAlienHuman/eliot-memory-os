@@ -1177,44 +1177,34 @@ impl KernelComposition {
     ///
     /// Every field is re-derived from the exact admitted envelope plus the
     /// live record: work-item handle, attempt identity, fencing generation,
-    /// admitted session binding, authority epoch, trusted scope/facet method,
-    /// absolute expiry, and single-use budget. A pair without a derivable
-    /// trusted scope fails closed here and is skipped by the caller.
+    /// admitted session binding, authority epoch, trusted `WorkScope`/facet
+    /// method, absolute expiry, and single-use budget. Session and `WorkScope`
+    /// are independent required identities; neither substitutes for the other.
+    /// A pair without either trusted identity fails closed here.
     /// Re-derivation is deterministic, so equality with a presented capability
     /// proves every echoed field is exactly what the Kernel minted.
+    #[allow(
+        clippy::unused_self,
+        reason = "the method remains on the composition owner so capability derivation stays beside attempt construction"
+    )]
     pub(crate) fn local_read_attempt_capability(
         &self,
         envelope: &HostRequestEnvelope,
         operation_id: &str,
         state: &LocalReadAttemptState,
     ) -> Result<eliot_protocol::LocalReadAttempt, TransportError> {
-        let _ = self;
         let scope_text = envelope
             .identity
             .work_scope_id
             .as_deref()
             .filter(|scope| !scope.trim().is_empty())
-            .or_else(|| {
-                envelope
-                    .identity
-                    .session_id
-                    .as_deref()
-                    .filter(|scope| !scope.trim().is_empty())
-            })
             .ok_or(TransportError::SessionFenced)?;
         let session_text = envelope
             .identity
             .session_id
             .as_deref()
             .filter(|session| !session.trim().is_empty())
-            .or_else(|| {
-                envelope
-                    .identity
-                    .work_scope_id
-                    .as_deref()
-                    .filter(|scope| !scope.trim().is_empty())
-            })
-            .unwrap_or(&envelope.connection_id);
+            .ok_or(TransportError::SessionFenced)?;
         let attempt = LocalReadAttempt {
             wire_id: eliot_protocol::LOCAL_READ_ATTEMPT_WIRE_ID.to_owned(),
             wire_version: LocalReadAttempt::CONTRACT_VERSION,
@@ -1886,8 +1876,9 @@ pub(crate) fn host_request_tool_from_payload(
 
 /// Closed local-read selectors for one admitted `eliot.query` tool.
 ///
-/// `scope_id` is the trusted Kernel-issued scope (envelope `work_scope_id`
-/// when present, else the admitted `session_id` — never an MCP argument),
+/// `scope_id` is the trusted Kernel-issued `WorkScope` (envelope
+/// `work_scope_id` only — never an MCP argument and never a Session-ID
+/// fallback),
 /// `subject` is the exact `subject:<exact-subject>` selector (never free
 /// text, never blank), `max_records` is the explicit catalogue bound, and
 /// `intent_mode` is the presented `snake_case` query mode. `eliot.packet` is
@@ -2046,24 +2037,29 @@ pub(crate) fn local_read_selectors_from_tool(
         .map(str::trim)
         .filter(|subject| !subject.is_empty() && !subject.chars().any(char::is_control))
         .ok_or(TransportError::SessionFenced)?;
+    let max_records = arguments
+        .get("max_records")
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+        })
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or(TransportError::SessionFenced)?;
+    if max_records == 0 || max_records > EVIDENCE_PACK_MAX_RECORDS {
+        return Err(TransportError::SessionFenced);
+    }
     let scope_text = envelope
         .identity
         .work_scope_id
         .as_deref()
         .filter(|scope| !scope.trim().is_empty())
-        .or_else(|| {
-            envelope
-                .identity
-                .session_id
-                .as_deref()
-                .filter(|scope| !scope.trim().is_empty())
-        })
         .ok_or(TransportError::SessionFenced)?;
     let scope_id = ScopeId::new(scope_text).map_err(|_| TransportError::SessionFenced)?;
     Ok(Some(LocalReadSelectors {
         scope_id,
         subject: subject.to_owned(),
-        max_records: EVIDENCE_PACK_MAX_RECORDS,
+        max_records,
         intent_mode: mode.to_owned(),
     }))
 }
@@ -2414,7 +2410,7 @@ mod invoke_read_tool_tests {
                 capability: capability.to_owned(),
                 session_id: Some("kernel-session-1".to_owned()),
                 task_id: None,
-                work_scope_id: None,
+                work_scope_id: Some("work-scope-1".to_owned()),
                 payload_schema_id: "eliot.mcp.tool-request.v1".to_owned(),
                 payload_sha256: payload_sha256.to_owned(),
             },
@@ -2438,7 +2434,8 @@ mod invoke_read_tool_tests {
                 "required_assurance":"evidence-provenance"
             },
             "query":"subject:evidence-alpha",
-            "exact_resource_uri": null
+            "exact_resource_uri": null,
+            "max_records":"32"
         }})
     }
 
@@ -2495,7 +2492,7 @@ mod invoke_read_tool_tests {
             .expect("admitted query must yield selectors")
             .expect("eliot.query is a local read");
         assert_eq!(selectors.subject, "evidence-alpha");
-        assert_eq!(selectors.scope_id.as_str(), "kernel-session-1");
+        assert_eq!(selectors.scope_id.as_str(), "work-scope-1");
         assert_eq!(selectors.max_records, 32);
         assert_eq!(selectors.intent_mode, "verification");
     }
@@ -2645,6 +2642,66 @@ mod invoke_read_tool_tests {
             ))
             .expect("request tuple must canonicalize"),
         );
+        let content = serde_json::json!({
+            "operation": "GetEvidencePack",
+            "subject": "evidence-alpha",
+            "scope_id": "work-scope-1",
+            "evidence_pack": {
+                "version": 1,
+                "subject": "evidence-alpha",
+                "scope_id": "work-scope-1",
+                "records": [{
+                    "capture_index": 0,
+                    "operation": "CaptureObservation",
+                    "parameters": {"subject": "evidence-alpha"}
+                }],
+                "provenance": {
+                    "state_fence": envelope.state_fence,
+                    "matched_total": 1,
+                    "returned": 1,
+                    "max_records": EVIDENCE_PACK_MAX_RECORDS,
+                    "truncated": false
+                }
+            },
+            "revision_heads": [{
+                "key": "scope:work-scope-1",
+                "revision": 3,
+                "state_fence": envelope.state_fence,
+            }]
+        });
+        let recall_metadata = serde_json::json!({
+            "disposition": "INCOMPLETE_COVERAGE",
+            "admission_observations": {
+                "corpus_empty": null,
+                "candidates_considered": null,
+                "visible_count": null,
+                "scope_suppressed_count": null,
+                "projection_state": null,
+                "coverage_complete": null,
+                "conflicted": null,
+                "top_score": null
+            },
+            "receipt": {
+                "scope_id": "work-scope-1",
+                "state_fence": envelope.state_fence,
+                "source_revision": null,
+                "projection_revision": null,
+                "freshness": "UNAVAILABLE",
+                "matched_total": 1,
+                "returned": 1,
+                "visible_count": null,
+                "suppressed_count": null,
+                "reason": "required server observation unavailable; candidate-only evidence has no authoritative admission or ranking trace"
+            },
+            "rank_trace": {
+                "status": "UNAVAILABLE",
+                "handle": null,
+                "candidates_considered": null,
+                "candidates_returned": null,
+                "reason": "candidate-only evidence has no FusedRankTrace or equivalent"
+            },
+            "admitted_max_records": EVIDENCE_PACK_MAX_RECORDS
+        });
         let body = serde_json::json!({
             "request_id": envelope.identity.request_id.as_str(),
             "idempotency_key": envelope.identity.idempotency_key,
@@ -2652,33 +2709,8 @@ mod invoke_read_tool_tests {
             "kind": "PROJECTION",
             "canonical_tool_name": "eliot.query",
             "recall_disposition": "INCOMPLETE_COVERAGE",
-            "content": {
-                "operation": "GetEvidencePack",
-                "subject": "evidence-alpha",
-                "scope_id": "kernel-session-1",
-                "evidence_pack": {
-                    "version": 1,
-                    "subject": "evidence-alpha",
-                    "scope_id": "kernel-session-1",
-                    "records": [{
-                        "capture_index": 0,
-                        "operation": "CaptureObservation",
-                        "parameters": {"subject": "evidence-alpha"}
-                    }],
-                    "provenance": {
-                        "state_fence": envelope.state_fence,
-                        "matched_total": 1,
-                        "returned": 1,
-                        "max_records": EVIDENCE_PACK_MAX_RECORDS,
-                        "truncated": false
-                    }
-                },
-                "revision_heads": [{
-                    "key": "scope:kernel-session-1",
-                    "revision": 3,
-                    "state_fence": envelope.state_fence,
-                }]
-            },
+            "recall_metadata": recall_metadata,
+            "content": content,
             "artifacts": [],
             "proof_ceiling": "SCOPED_VERIFICATION",
             "resource": null,
