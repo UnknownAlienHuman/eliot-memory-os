@@ -82,6 +82,12 @@ pub enum DriveError {
         /// Stable stage name.
         stage: &'static str,
     },
+    /// The authenticated Kernel grant could not be resolved into a local
+    /// admitted port set. `code` is the stable grant-denial code.
+    Grant {
+        /// Stable grant-denial code.
+        code: &'static str,
+    },
 }
 
 impl std::fmt::Display for DriveError {
@@ -96,6 +102,7 @@ impl std::fmt::Display for DriveError {
                 write!(formatter, "DISPATCH_DRIVE_INVOCATION:{field}")
             }
             Self::Execution { stage } => write!(formatter, "DISPATCH_DRIVE_EXECUTION:{stage}"),
+            Self::Grant { code } => write!(formatter, "DISPATCH_DRIVE_GRANT:{code}"),
         }
     }
 }
