@@ -601,7 +601,7 @@ fn run_controller(args: &ControllerArgs) -> Result<(), String> {
                 .map_err(|error| format!("bridge wait: {error}"))?;
             let stdout = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
             let stderr = String::from_utf8(output.stderr).map_err(|error| error.to_string())?;
-            let expected = "{\"status\":\"error\",\"code\":\"BRIDGE_REQUEST_REJECTED\",\"detail\":\"activation denied by the trusted host provider: SEMANTIC_RESOLUTION_UNAVAILABLE\"}\n";
+            let expected = "{\"status\":\"error\",\"code\":\"ACTIVATION_FAILED\",\"detail\":\"activation denied: disposition=FAILED reason=UNKNOWN_OUTCOME directive=retry-requires-new-ticket operation=r13-denied-os-demand no-typed-result\"}\n";
             if stdout != expected || !stderr.is_empty() || !output.status.success() {
                 return Err("bridge output or exit status did not match exact denial".to_owned());
             }
@@ -1312,7 +1312,8 @@ fn run_worker(
             denial.disposition,
             eliot_protocol::AgentBridgeActivationDisposition::Denied {
                 reason_code:
-                    eliot_protocol::AgentBridgeActivationDenialCode::SemanticResolutionUnavailable
+                    eliot_protocol::AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+                detail: None,
             }
         ) {
             return Err(

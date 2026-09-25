@@ -3,13 +3,15 @@
 mod request_input;
 
 use eliot_agent_bridge::{
-    BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError, CurrentAssessment,
-    HotResourceView, InjectionReceipt, Profile, ScopeLevel, UnderstandingBootstrap,
+    AdmissionBasis, BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError,
+    CurrentAssessment, FiringEvidence, HotResourceView, InjectionReceipt, ItemDisposition,
+    NormalizedCue, Profile, ScopeLevel, UnderstandingBootstrap, UseOutcome,
     kernel_ports_with_declaration, parse_args, reactive_runtime_composition,
 };
 use eliot_agent_bridge_core::{
-    AttachRequest, BridgeError, ConnectionId, FencingToken, Generation, HostEventEnvelope,
-    ReconnectRequest, SessionId,
+    ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
+    ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachRequest, BridgeError, ConnectionId,
+    FencingToken, Generation, HostEventEnvelope, ReconnectRequest, SessionId,
 };
 use eliot_contracts::EpochId;
 #[cfg(test)]
@@ -130,6 +132,45 @@ enum Request {
     ForwardEvent {
         event: EventEnvelope,
     },
+    /// Admits one caller-supplied reactive-context injection for the live
+    /// session (I7.19 admit step over the live stdio intake).
+    ///
+    /// The caller supplies the normalized cue, exact firing evidence, bounded
+    /// relations, and admission basis; the bridge only records them against
+    /// the live attach session via [`BridgeRunner::admit_reactive_injection`].
+    /// `invalidations` names sources whose revision/risk condition changed and
+    /// is applied first via [`BridgeRunner::invalidate_reactive_source`], so
+    /// this single entry carries the invalidation-aware session dedup of the
+    /// settled-plan transport into the live flow.
+    ReactiveAdmit {
+        cue: NormalizedCue,
+        firing: FiringEvidence,
+        relations: Vec<String>,
+        admission: AdmissionBasis,
+        invalidations: Vec<String>,
+    },
+    /// Records a later observable use, influence, or outcome update for a
+    /// delivered item addressed by ledger identity (I7.19 use/outcome step).
+    ReactiveRecordUse {
+        item_id: String,
+        update: UseOutcome,
+    },
+    /// Records a later observable use, influence, or outcome update addressed
+    /// by the canonical observer memory handle
+    /// (`reactive-item-{seq}@{session}`).
+    ReactiveRecordUseByHandle {
+        memory_handle: String,
+        update: UseOutcome,
+    },
+    /// Records a durable resolved, waived, or superseded disposition for an
+    /// item; only a terminal disposition clears critical stickiness.
+    ReactiveRecordDisposition {
+        item_id: String,
+        disposition: ItemDisposition,
+    },
+    /// Exports the live ledger bytes for durable persistence by the Store
+    /// owner (I7.19 persist step; the attach-time restore already imports).
+    ReactiveSnapshot,
     ReconcileExternal {},
     Bootstrap {
         context: Option<BootstrapContext>,
@@ -224,6 +265,12 @@ enum Response {
         completion: HostCorrelationReceipt,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
+        /// Delivery/Injection Receipts issued by draining the live session's
+        /// pending reactive injections inside this response (I7.19
+        /// next-response delivery). Absent while nothing was pending, exactly
+        /// like [`Response::Forwarded`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reactive_receipts: Vec<InjectionReceipt>,
         /// Bounded hot-resource projection recorded for this delivery.
         ///
         /// Present only when the delivered result was snapshotted into the
@@ -245,6 +292,39 @@ enum Response {
         bootstrap: Option<UnderstandingBootstrap>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reactive_receipts: Vec<InjectionReceipt>,
+    },
+    /// Typed acknowledgement of one live reactive admission.
+    ///
+    /// Carries the minted ledger item identity plus how many delivered items
+    /// the entry invalidations reopened for re-admission. Deliberately
+    /// distinct from [`Response::Invocation`]: reusing the admitted/responded
+    /// shape would imply kernel admission, which the bridge never performs
+    /// here — the bridge only records owner-supplied admission decisions.
+    ReactiveAdmitted {
+        item_id: String,
+        invalidations_applied: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
+    },
+    /// Typed acknowledgement of one live reactive use/outcome or disposition
+    /// record, addressed by the resolved ledger item identity.
+    ReactiveRecorded {
+        item_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
+    },
+    /// Live durable export of the reactive delivery-record ledger for the
+    /// Store owner.
+    ///
+    /// `ledger_json` carries the exact bounded canonical bytes of
+    /// [`BridgeRunner::reactive_ledger_snapshot`]; `pending` counts the
+    /// live-session injections still awaiting delivery through a host hook or
+    /// next response.
+    ReactiveLedger {
+        ledger_json: String,
+        pending: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
     },
     Reconciled {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -605,6 +685,11 @@ fn main() {
                 let mut response =
                     handle_invocation(&host_gateway, &mut *host_request_port, &request);
                 record_invocation_delivery(&mut runner, &mut response);
+                drain_reactive_pending_into_invocation(
+                    &mut runner,
+                    request.correlation_id.as_str(),
+                    &mut response,
+                );
                 response
             }
             Ok(Request::Cancel { request }) => {
@@ -622,6 +707,32 @@ fn main() {
                 provider_failure |= provider_failed;
                 response
             }
+            Ok(Request::ReactiveAdmit {
+                cue,
+                firing,
+                relations,
+                admission,
+                invalidations,
+            }) => handle_reactive_admit(
+                &mut runner,
+                cue,
+                firing,
+                relations,
+                admission,
+                &invalidations,
+            ),
+            Ok(Request::ReactiveRecordUse { item_id, update }) => {
+                handle_reactive_record_use(&mut runner, &item_id, update)
+            }
+            Ok(Request::ReactiveRecordUseByHandle {
+                memory_handle,
+                update,
+            }) => handle_reactive_record_use_by_handle(&mut runner, &memory_handle, update),
+            Ok(Request::ReactiveRecordDisposition {
+                item_id,
+                disposition,
+            }) => handle_reactive_record_disposition(&mut runner, &item_id, disposition),
+            Ok(Request::ReactiveSnapshot) => handle_reactive_snapshot(&runner),
             Ok(Request::ReconcileExternal {}) => match runner.reconcile_external() {
                 Ok(_) => Response::Reconciled { bootstrap: None },
                 Err(error) => {
@@ -760,6 +871,9 @@ fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
         | Response::Invocation { bootstrap, .. }
         | Response::Cancellation { bootstrap, .. }
         | Response::Forwarded { bootstrap, .. }
+        | Response::ReactiveAdmitted { bootstrap, .. }
+        | Response::ReactiveRecorded { bootstrap, .. }
+        | Response::ReactiveLedger { bootstrap, .. }
         | Response::Reconciled { bootstrap }
         | Response::Stopped { bootstrap, .. } => bootstrap,
         Response::Bootstrap { .. } | Response::Error { .. } | Response::DryRun { .. } => {
@@ -808,6 +922,7 @@ fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
             completion,
             bootstrap: None,
             evidence: None,
+            reactive_receipts: Vec::new(),
         },
         Err(error) => host_gateway_error(&error),
     }
@@ -871,20 +986,25 @@ fn forward_stage(error: &BridgeError) -> &'static str {
 /// Shapes one forward-dispatch failure with staged typed recovery.
 ///
 /// Keeps the exact [`bridge_error`] code mapping and fail-closed behavior;
-/// only the detail is sharpened to name the failing stage, the durable
-/// owner (the Kernel observation route, which this bridge holds unadmitted),
-/// and the reconcile path. No ledger is built and no readiness is claimed:
-/// pending entries stay pending for explicit reconcile under their original
-/// identity.
+/// only the detail is sharpened to name the failing stage, the unadmitted
+/// event-delivery capability with its durable owner reference (the Kernel
+/// observation route, #77 req 4), and the pending-identity preservation.
+/// No ledger is built and no readiness is claimed: pending entries stay
+/// pending under their original identity, and no reconcile-then-retry loop
+/// is advertised because retry cannot succeed until the owner route admits
+/// this bridge.
 fn forward_dispatch_error(error: &BridgeError) -> (Response, bool) {
     let provider_failed = is_provider_failure(error);
     let response = match bridge_error(error) {
         Response::Error { code, detail } => Response::Error {
             code,
             detail: format!(
-                "forward {} stage: {detail}; durable owner: Kernel observation route (not admitted); \
-                reconcile pending entries under their original stream, event, and sequence identity \
-                with explicit reconcile, then retry the forward",
+                "forward {} stage: {detail}; event delivery unavailable: no admitted Kernel \
+                observation/ORS event route (front door admits activation and host-request \
+                envelopes only); owner: Kernel observation route (#77 req 4 allocates the \
+                event-delivery/reconciliation child there); pending entries stay pending \
+                under their original stream, event, and sequence identity; retry cannot \
+                succeed until that route is admitted",
                 forward_stage(error),
             ),
         },
@@ -959,6 +1079,146 @@ fn handle_forward_event(runner: &mut BridgeRunner, event: &EventEnvelope) -> (Re
             }
         }
         Err(error) => forward_dispatch_error(&error),
+    }
+}
+
+/// Delivers live-session pending reactive injections inside one successful
+/// invocation response (I7.19 next-response delivery).
+///
+/// Runs after the gateway returned, so `response` is the exact
+/// [`Response::Invocation`] frame that will reach the host: each pending item
+/// is delivered through `DeliveryPoint::NextBridgeResponse` named by the
+/// invocation correlation, issuing one Delivery/Injection Receipt per item on
+/// that response. Other responses are untouched. A drain failure keeps the
+/// gateway response exactly as shaped and reports on stderr: the items stay
+/// pending under their original identity for the next hook or response, so a
+/// receipt-stage failure never rewrites an already-admitted invocation.
+fn drain_reactive_pending_into_invocation(
+    runner: &mut BridgeRunner,
+    correlation_id: &str,
+    response: &mut Response,
+) {
+    if let Response::Invocation {
+        reactive_receipts, ..
+    } = response
+    {
+        debug_assert!(reactive_receipts.is_empty());
+        match runner.deliver_reactive_pending_via_response(correlation_id) {
+            Ok(receipts) => {
+                *reactive_receipts = receipts;
+            }
+            Err(error) => emit_error("REACTIVE_RECEIPT_REJECTED", &error.to_string()),
+        }
+    }
+}
+
+/// Admits one live reactive-context injection through the stdio intake.
+///
+/// Applies the caller-nominated source invalidations first (a changed
+/// source/revision/risk condition reopens delivered items for re-admission),
+/// then records the caller-supplied normalized cue, exact firing evidence,
+/// bounded relations, and admission basis against the live attach session.
+/// Every ledger rejection fails closed without touching the ledger; the live
+/// session binding is never read from caller text.
+fn handle_reactive_admit(
+    runner: &mut BridgeRunner,
+    cue: NormalizedCue,
+    firing: FiringEvidence,
+    relations: Vec<String>,
+    admission: AdmissionBasis,
+    invalidations: &[String],
+) -> Response {
+    let mut invalidations_applied = 0;
+    for source in invalidations {
+        invalidations_applied += runner.invalidate_reactive_source(source);
+    }
+    match runner.admit_reactive_injection(cue, Some(firing), relations, admission) {
+        Ok(item_id) => Response::ReactiveAdmitted {
+            item_id,
+            invalidations_applied,
+            bootstrap: None,
+        },
+        Err(error) => bridge_error(&error),
+    }
+}
+
+/// Records one live observable use, influence, or outcome update addressed by
+/// ledger item identity. Absence of evidence stays unknown by doing nothing:
+///
+/// [`UseOutcome::Unknown`] is rejected as the absence of an update, exactly
+/// like the ledger gate.
+fn handle_reactive_record_use(
+    runner: &mut BridgeRunner,
+    item_id: &str,
+    update: UseOutcome,
+) -> Response {
+    match runner.record_reactive_use(item_id, update) {
+        Ok(()) => Response::ReactiveRecorded {
+            item_id: item_id.to_owned(),
+            bootstrap: None,
+        },
+        Err(error) => bridge_error(&error),
+    }
+}
+
+/// Records one live observable use, influence, or outcome update addressed by
+/// the canonical observer memory handle. The handle session must equal the
+/// ledger session or nothing is recorded.
+fn handle_reactive_record_use_by_handle(
+    runner: &mut BridgeRunner,
+    memory_handle: &str,
+    update: UseOutcome,
+) -> Response {
+    match runner.record_reactive_use_by_handle(memory_handle, update) {
+        Ok(item_id) => Response::ReactiveRecorded {
+            item_id,
+            bootstrap: None,
+        },
+        Err(error) => bridge_error(&error),
+    }
+}
+
+/// Records one live durable disposition. Only a terminal disposition lands;
+/// open or self-superseding records fail closed with critical stickiness kept.
+fn handle_reactive_record_disposition(
+    runner: &mut BridgeRunner,
+    item_id: &str,
+    disposition: ItemDisposition,
+) -> Response {
+    match runner.record_reactive_disposition(item_id, disposition) {
+        Ok(()) => Response::ReactiveRecorded {
+            item_id: item_id.to_owned(),
+            bootstrap: None,
+        },
+        Err(error) => bridge_error(&error),
+    }
+}
+
+/// Exports the live reactive ledger for the Store owner.
+///
+/// Returns the exact bounded canonical bytes of
+/// [`BridgeRunner::reactive_ledger_snapshot`] as text plus the live-session
+/// pending count. Crash-safe persistence of these bytes is the Store owner's
+/// handoff; the bridge holds delivery records only for the life of this
+/// process. Non-UTF-8 snapshot bytes fail closed: they are never partially
+/// reported.
+///
+// Живая проводка I7.19: приём, выдача квитанций, учёт использования,
+// снятие залипания и выгрузка журнала идут через этот мост, а не через тесты.
+fn handle_reactive_snapshot(runner: &BridgeRunner) -> Response {
+    match runner.reactive_ledger_snapshot() {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(ledger_json) => Response::ReactiveLedger {
+                pending: runner.reactive_pending_count(),
+                ledger_json,
+                bootstrap: None,
+            },
+            Err(_) => Response::Error {
+                code: "REACTIVE_SNAPSHOT_REJECTED",
+                detail: "ledger snapshot is not valid UTF-8; nothing was exported".to_owned(),
+            },
+        },
+        Err(error) => bridge_error(&error),
     }
 }
 
@@ -1462,11 +1722,50 @@ fn bridge_error(error: &BridgeError) -> Response {
             code: "KERNEL_ACTIVATION_PORT_REJECTED",
             detail: "Kernel-owned HostActivationPort rejected or fenced the request".to_owned(),
         }
+    } else if let BridgeError::ActivationDenied(report) = error {
+        Response::Error {
+            code: activation_denial_host_code(report.disposition()),
+            detail: report.agent_detail(),
+        }
+    } else if let BridgeError::ActivationDeadlineExceeded {
+        operation,
+        deadline_unix_ms,
+    } = error
+    {
+        Response::Error {
+            code: "ACTIVATION_DEADLINE_EXCEEDED",
+            detail: format!(
+                "activation observed no terminal result before deadline {deadline_unix_ms} for operation {operation}; never a typed denial"
+            ),
+        }
+    } else if let BridgeError::ActivationUnknownOutcome { operation } = error {
+        Response::Error {
+            code: "ACTIVATION_UNKNOWN_OUTCOME",
+            detail: format!(
+                "activation outcome unknown for operation {operation}: transport ended with no terminal result before the deadline; never a typed denial, never authority"
+            ),
+        }
     } else {
         Response::Error {
             code: "BRIDGE_REQUEST_REJECTED",
             detail: error.to_string(),
         }
+    }
+}
+
+/// Maps an I7.20 activation denial disposition to its stable host-facing
+/// error code. The producer (`agent_disposition_for_denial`) is exhaustive
+/// over the four catalogue dispositions, so the fallback is unreachable by
+/// construction and exists only to keep the host code total.
+fn activation_denial_host_code(disposition: &str) -> &'static str {
+    if disposition == ACTIVATION_DISPOSITION_INVALID_REQUEST {
+        "ACTIVATION_INVALID_REQUEST"
+    } else if disposition == ACTIVATION_DISPOSITION_STALE_OR_CONFLICT {
+        "ACTIVATION_STALE_OR_CONFLICT"
+    } else if disposition == ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY {
+        "ACTIVATION_UNAVAILABLE_OR_CAPACITY"
+    } else {
+        "ACTIVATION_FAILED"
     }
 }
 
@@ -2400,6 +2699,13 @@ mod tests {
                         Request::DryRunCancel { .. } => "dry_run_cancel",
                         Request::ForwardHook { .. } => "forward_hook",
                         Request::ForwardEvent { .. } => "forward_event",
+                        Request::ReactiveAdmit { .. } => "reactive_admit",
+                        Request::ReactiveRecordUse { .. } => "reactive_record_use",
+                        Request::ReactiveRecordUseByHandle { .. } => {
+                            "reactive_record_use_by_handle"
+                        }
+                        Request::ReactiveRecordDisposition { .. } => "reactive_record_disposition",
+                        Request::ReactiveSnapshot => "reactive_snapshot",
                         Request::ReconcileExternal {} => "reconcile_external",
                         Request::Reconnect { .. } => "reconnect",
                         Request::Detach { .. } => "detach",

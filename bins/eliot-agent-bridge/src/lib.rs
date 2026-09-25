@@ -56,7 +56,6 @@ use kernel_activation_client::KernelHostActivationPort;
 #[cfg(test)]
 use kernel_activation_client::{
     activation_frame_for_request, build_neutral_activation_request, decode_activation_response,
-    denial_reason_code,
 };
 use kernel_host_request_client::{KernelHostRequestClient, ReplayCacheEntry};
 pub use memory_handle_join::{ResolvedMemoryHandle, parse_memory_handle};
@@ -148,12 +147,13 @@ type SharedTransport = Rc<RefCell<KernelTransportOwner>>;
 /// Durability, normalization, and application are owned by the Kernel
 /// observation route, which has not admitted this bridge — so no Kernel ORS
 /// durable record is staged, nothing is normalized, and nothing is applied.
-/// The replay/ack owner for an already-observed event is therefore the Kernel
-/// observation route, not this port: the exact recovery is to re-present the
-/// event via `ReconcileExternal` (or re-read status on the next admitted
-/// connection). Host-request submit/cancel/reconcile entries carry invocation
-/// intent and are not event delivery; never resubmit a refused event as a
-/// host request.
+/// The event-delivery capability is therefore exposed as unavailable with
+/// its owner/dependency reference (#77 req 4 allocates the bounded
+/// event-delivery/reconciliation child to the Kernel observation/ORS
+/// owner): neither `ReconcileExternal` (also unadmitted here) nor a retry
+/// can succeed until that route is admitted. Host-request
+/// submit/cancel/reconcile entries carry invocation intent and are not
+/// event delivery; never resubmit a refused event as a host request.
 struct KernelMcpForwardingPort;
 
 impl McpForwardingPort for KernelMcpForwardingPort {
@@ -164,9 +164,12 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     ) -> Result<(), ProviderFailure> {
         Err(ProviderFailure::new(
             "eliot-kernel-front-door",
-            "hook forwarding not admitted: receipt stands in the bridge journal, \
-             no Kernel durable record staged, nothing normalized or applied; \
-             re-present via ReconcileExternal",
+            "hook forwarding unavailable: no admitted Kernel observation/ORS event route \
+             (front door admits activation and host-request envelopes only); receipt stands \
+             in the bridge journal, no Kernel durable record staged, nothing normalized or \
+             applied; owner: Kernel observation route (#77 req 4 allocates the \
+             event-delivery/reconciliation child there); retry cannot succeed until that \
+             route is admitted; host-request submit is not event delivery",
         ))
     }
     fn forward_event(
@@ -176,9 +179,12 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     ) -> Result<EventPortOutcome, ProviderFailure> {
         Err(ProviderFailure::new(
             "eliot-kernel-front-door",
-            "event forwarding not admitted: receipt stands in the bridge journal, \
-             no Kernel ORS durable record staged, nothing normalized or applied; \
-             re-present via ReconcileExternal; host-request submit is not event delivery",
+            "event forwarding unavailable: no admitted Kernel observation/ORS event route \
+             (front door admits activation and host-request envelopes only); receipt stands \
+             in the bridge journal, no Kernel ORS durable record staged, nothing normalized \
+             or applied; owner: Kernel observation route (#77 req 4 allocates the \
+             event-delivery/reconciliation child there); retry cannot succeed until that \
+             route is admitted; host-request submit is not event delivery",
         ))
     }
     fn forward_gap(
@@ -188,8 +194,10 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     ) -> Result<(), ProviderFailure> {
         Err(ProviderFailure::new(
             "eliot-kernel-front-door",
-            "gap forwarding not admitted: no durable, normalized, or applied phase \
-             reached; re-present via ReconcileExternal",
+            "gap forwarding unavailable: no admitted Kernel observation/ORS event route, so \
+             no durable, normalized, or applied phase reached; owner: Kernel observation \
+             route (#77 req 4 allocates the event-delivery/reconciliation child there); \
+             retry cannot succeed until that route is admitted",
         ))
     }
     fn reconcile_external(
@@ -198,10 +206,12 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
         Err(ProviderFailure::new(
             "eliot-kernel-front-door",
-            "event-route reconciliation not admitted: durable idempotency and \
-             unknown-outcome belong to the Kernel ORS record; re-read status via \
-             the KernelHostRequestClient reconcile entry; host-request forwarding \
-             is not event delivery",
+            "event-route reconciliation unavailable: no admitted Kernel observation/ORS \
+             event route; durable idempotency and unknown-outcome belong to the Kernel ORS \
+             record once that route admits this bridge; owner: Kernel observation route \
+             (#77 req 4 allocates the event-delivery/reconciliation child there); the \
+             KernelHostRequestClient reconcile entry settles host-request operations only \
+             and is not event durability; host-request forwarding is not event delivery",
         ))
     }
 }
@@ -255,8 +265,10 @@ fn load_declaration(path: &Path) -> Result<LoadedAgentBridgeDeclaration, Runtime
 /// (`agent_host_request_reconcile`, `REACTIVE_RESTORE_OPERATION`) reuse it,
 /// so no second transport and no duplicated envelope state machine exist
 /// here. The forwarding face deliberately holds no transport: refused events
-/// are re-presented through `ReconcileExternal`, never by resubmitting them
-/// as host requests.
+/// expose the unadmitted event-delivery capability with its Kernel
+/// observation-route owner reference, never by resubmitting them
+/// as host requests and never through a reconcile-then-retry loop that
+/// cannot succeed until that route is admitted.
 pub fn kernel_ports_with_declaration(
     declaration_path: &Path,
 ) -> Result<KernelPorts, RuntimeBuildError> {
@@ -403,8 +415,9 @@ impl BridgeRunner {
         // (or later) ack, durable-observation cursors only on Normalized (or
         // later). The production forwarding face (`KernelMcpForwardingPort`)
         // fails closed, so no ack ever arrives here: no cursor advances, no
-        // outstanding delivery is recorded, and recovery stays on the
-        // ReconcileExternal / Kernel ORS reconcile path. The policy still
+        // outstanding delivery is recorded, and recovery awaits the admitted
+        // Kernel observation route (#77 req 4). `ReconcileExternal` stays
+        // fail-closed on this face until that route is admitted. The policy still
         // declares the honest requirement for any future admitted route.
         let cursor_policy = CursorPolicy::new(AckPhase::Durable, AckPhase::Normalized)
             .map_err(RuntimeBuildError::BridgeContract)?;
@@ -708,6 +721,14 @@ impl BridgeRunner {
     /// disclosure occurs here. Tokens rendered and route delivery stay unknowable at the
     /// bridge and are never estimated — completing a `ToolResultReceipt` remains the
     /// route owner's job (`project_tool_result_receipt`).
+    ///
+    /// Verify-before-handout (I7.18 explicit expansion): the full bytes behind
+    /// a hot handle are retrievable only through [`Self::expand_resource`].
+    /// The just-issued handle is expanded here, on the normal Invoke path,
+    /// and the expanded bytes must equal the published bytes before the view
+    /// reaches the response. A handle that does not resolve to the exact
+    /// bytes withholds the evidence slot (`None`) instead of emitting a
+    /// dangling reference; the gateway response itself is never rewritten.
     pub fn record_tool_result_delivery(
         &mut self,
         outcome: &HostInvocationOutcome,
@@ -723,7 +744,11 @@ impl BridgeRunner {
         if bytes.len() <= MAX_PREVIEW_BYTES {
             return None;
         }
-        self.core.publish_evidence(bytes).ok()
+        let view = self.core.publish_evidence(bytes.clone()).ok()?;
+        if self.expand_resource(view.handle()).ok()? != bytes {
+            return None;
+        }
+        Some(view)
     }
     /// Notes the owner-supplied bootstrap context for this session.
     ///
@@ -1339,6 +1364,7 @@ mod tests {
         let resp = AgentBridgeActivationResponse::denied(
             &req,
             eliot_protocol::AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+            None,
         )
         .unwrap();
         let resp_frame = Frame {
@@ -1402,6 +1428,7 @@ mod tests {
         let resp = AgentBridgeActivationResponse::denied(
             &req,
             eliot_protocol::AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+            None,
         )
         .unwrap();
         assert!(resp.validate_request(&req).is_ok());
@@ -1422,41 +1449,103 @@ mod tests {
             ConnectionId::new("conn-1").unwrap(),
         );
         let req = build_neutral_activation_request(&core_req, &receipt, "demand-1").unwrap();
-        let cases = [
+        // Each typed code round-trips together with its exact owner-issued
+        // detail: selection codes with distinct candidate sets, NOT_READY
+        // with its retry directive, STALE_FENCE with its observed fence, and
+        // FAILED_INTERNAL with its failure handle. The Kernel-owned
+        // no-result code travels detail-less.
+        let selection = |handles: &[&str]| {
+            eliot_protocol::AgentActivationResolutionDisposition::TaskSelectionRequired {
+                selection: eliot_protocol::AgentActivationSelectionDirective {
+                    candidate_handles: handles.iter().map(ToString::to_string).collect(),
+                    candidate_coverage: eliot_protocol::AgentActivationCandidateCoverage::Partial,
+                    recovery_handle: "recovery-1".to_owned(),
+                },
+            }
+        };
+        let cases: [(
+            AgentBridgeActivationDenialCode,
+            &str,
+            Option<eliot_protocol::AgentActivationResolutionDisposition>,
+        ); 7] = [
             (
                 AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
                 eliot_protocol::AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE,
+                None,
             ),
             (
                 AgentBridgeActivationDenialCode::TaskSelectionRequired,
                 eliot_protocol::AGENT_BRIDGE_TASK_SELECTION_REQUIRED,
+                Some(selection(&["task-candidate-1"])),
             ),
             (
                 AgentBridgeActivationDenialCode::ScopeSelectionRequired,
                 eliot_protocol::AGENT_BRIDGE_SCOPE_SELECTION_REQUIRED,
+                Some(
+                    eliot_protocol::AgentActivationResolutionDisposition::ScopeSelectionRequired {
+                        selection: eliot_protocol::AgentActivationSelectionDirective {
+                            candidate_handles: vec!["scope-candidate-1".to_owned()],
+                            candidate_coverage:
+                                eliot_protocol::AgentActivationCandidateCoverage::Partial,
+                            recovery_handle: "recovery-scope".to_owned(),
+                        },
+                    },
+                ),
             ),
             (
                 AgentBridgeActivationDenialCode::ScopeAmbiguous,
                 eliot_protocol::AGENT_BRIDGE_SCOPE_AMBIGUOUS,
+                Some(
+                    eliot_protocol::AgentActivationResolutionDisposition::ScopeAmbiguous {
+                        selection: eliot_protocol::AgentActivationSelectionDirective {
+                            candidate_handles: vec!["scope-a".to_owned(), "scope-b".to_owned()],
+                            candidate_coverage:
+                                eliot_protocol::AgentActivationCandidateCoverage::Complete,
+                            recovery_handle: "recovery-ambiguous".to_owned(),
+                        },
+                    },
+                ),
             ),
             (
                 AgentBridgeActivationDenialCode::NotReady,
                 eliot_protocol::AGENT_BRIDGE_NOT_READY,
+                Some(
+                    eliot_protocol::AgentActivationResolutionDisposition::NotReady {
+                        recovery_handle: "recovery-retry".to_owned(),
+                        retry: eliot_protocol::AgentActivationRetryDirective {
+                            dependency_ref: "dep-1".to_owned(),
+                            observed_dependency_revision: "rev-7".to_owned(),
+                            not_before_unix_ms: 1,
+                        },
+                    },
+                ),
             ),
             (
                 AgentBridgeActivationDenialCode::StaleFence,
                 eliot_protocol::AGENT_BRIDGE_STALE_FENCE,
+                Some(
+                    eliot_protocol::AgentActivationResolutionDisposition::StaleFence {
+                        recovery_handle: "recovery-fence".to_owned(),
+                        observed_state_fence: None,
+                    },
+                ),
             ),
             (
                 AgentBridgeActivationDenialCode::FailedInternal,
                 eliot_protocol::AGENT_BRIDGE_FAILED_INTERNAL,
+                Some(
+                    eliot_protocol::AgentActivationResolutionDisposition::FailedInternal {
+                        failure_handle: "failure-1".to_owned(),
+                    },
+                ),
             ),
         ];
         let mut seen = BTreeSet::new();
-        for (code, wire) in cases {
+        let total = cases.len();
+        for (code, wire, detail) in cases {
             assert!(seen.insert(wire), "denial reason strings must be distinct");
-            assert_eq!(denial_reason_code(code), wire);
-            let resp = AgentBridgeActivationResponse::denied(&req, code).unwrap();
+            assert_eq!(code.as_str(), wire);
+            let resp = AgentBridgeActivationResponse::denied(&req, code, detail).unwrap();
             assert!(resp.validate_request(&req).is_ok());
             let frame = Frame {
                 protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
@@ -1471,16 +1560,24 @@ mod tests {
             };
             let decoded = decode_activation_response(&frame, &req, &receipt).expect("decode");
             match decoded.disposition {
-                eliot_protocol::AgentBridgeActivationDisposition::Denied { reason_code } => {
+                eliot_protocol::AgentBridgeActivationDisposition::Denied {
+                    reason_code,
+                    detail,
+                } => {
                     assert_eq!(reason_code, code);
-                    assert_eq!(denial_reason_code(reason_code), wire);
+                    assert_eq!(reason_code.as_str(), wire);
+                    assert_eq!(
+                        detail.is_some(),
+                        code != AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+                        "typed denials keep their detail; the no-result denial keeps none"
+                    );
                 }
                 eliot_protocol::AgentBridgeActivationDisposition::Authenticated { .. } => {
                     panic!("denial response must not decode as authenticated");
                 }
             }
         }
-        assert_eq!(seen.len(), cases.len());
+        assert_eq!(seen.len(), total);
     }
 
     #[test]

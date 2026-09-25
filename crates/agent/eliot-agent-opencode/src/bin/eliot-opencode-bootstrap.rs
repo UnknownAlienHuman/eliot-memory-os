@@ -1,7 +1,8 @@
 use eliot_agent_api::{AdmittedRouteReceipt, AgentAttempt, ProviderExecutionBinding};
 use eliot_agent_opencode::{
-    AdmittedOpenCodeAttempt, BasicAuth, LoopbackEndpoint, ModelSelection, NoAuthorityRunResult,
-    OpenCodeClient, OpenCodeRunError, OpenCodeRunPolicy, ReadOnlyRunRequest, RunStatus,
+    AdmittedAttemptCandidate, AdmittedOpenCodeAttempt, BasicAuth, LoopbackEndpoint, ModelSelection,
+    NoAuthorityRunResult, OpenCodeClient, OpenCodeRunError, OpenCodeRunPolicy, ReadOnlyRunRequest,
+    RunStatus,
 };
 use eliot_contracts::{ResourceGeneration, StateFence};
 use secrecy::SecretString;
@@ -343,6 +344,8 @@ async fn run_admitted(args: AdmittedCliArgs) -> Result<(), CliError> {
     // verifies the full admission agreement (AdmittedOpenCodeAttempt::new
     // runs verify()), and run_admitted_read_only re-verifies, enforces the
     // plan-agent read-only ceiling, and returns a candidate-only seal.
+    let admitted_attempt_id = envelope.attempt.id.clone();
+    let admitted_route_digest = envelope.admission.self_digest.clone();
     let admitted = AdmittedOpenCodeAttempt::new(
         Some(envelope.admission),
         envelope.binding,
@@ -364,6 +367,21 @@ async fn run_admitted(args: AdmittedCliArgs) -> Result<(), CliError> {
     if outcome.candidate.status != RunStatus::Succeeded {
         return Err(CliError::Run(
             "OpenCode returned a non-successful admitted candidate; nothing was serialized"
+                .to_owned(),
+        ));
+    }
+    // The production boundary emits only the sealed candidate artifact:
+    // re-sealing the observed run must reproduce the identical seal, and the
+    // seal must link the admitted attempt and admission digest carried by
+    // this envelope. Anything else is refused, never printed.
+    let resealed = AdmittedAttemptCandidate::seal(&admitted, &outcome.run)
+        .map_err(|error| CliError::Run(sanitize_error(&error.to_string(), &password)))?;
+    if resealed != outcome.candidate
+        || outcome.candidate.attempt_id != admitted_attempt_id
+        || outcome.candidate.admitted_route_digest != admitted_route_digest
+    {
+        return Err(CliError::Run(
+            "OpenCode admitted seal does not match the admitted attempt; nothing was serialized"
                 .to_owned(),
         ));
     }
