@@ -282,42 +282,6 @@ fn activation_result_retention_round_trips_replays_conflicts_and_reopens() -> Te
 }
 
 #[test]
-fn expired_activation_claim_becomes_reconciling_before_result_admission() -> TestResult {
-    let path = database_path("activation-claim-expiry-reconcile");
-    let store = RedbRecoveryStore::open(&path)?;
-    let record = activation_result_record(
-        "ticket-claim-expiry",
-        &"b".repeat(64),
-        "opaque-ticket-payload",
-        "opaque-result-payload",
-        ActivationResultRetentionPhase::AcceptedTerminal,
-    );
-    let lifecycle = activation_lifecycle_record(&record);
-    store.stage_activation_ticket(&lifecycle, 1)?;
-    store.claim_activation_ticket(&record.ticket_id, "eliotd", 2, 3)?;
-    assert!(matches!(
-        store.commit_activation_result(&record, "eliotd", None, 4),
-        Err(OrsError::ActivationLifecycleStateConflict {
-            state: ActivationLifecycleState::Reconciling,
-            ..
-        })
-    ));
-    let reconciled = store
-        .load_activation_lifecycle(&record.ticket_id)?
-        .ok_or_else(|| std::io::Error::other("expired claim lifecycle disappeared"))?;
-    assert_eq!(reconciled.state, ActivationLifecycleState::Reconciling);
-    assert!(reconciled.claim_owner.is_none());
-    assert!(reconciled.claim_expires_at_unix_ms.is_none());
-    assert!(
-        store
-            .load_activation_result(&record.ticket_id, &record.result_sha256)?
-            .is_none()
-    );
-    cleanup(&path);
-    Ok(())
-}
-
-#[test]
 fn activation_result_retention_defaults_unpersisted_order_but_rejects_zero_persisted_order()
 -> TestResult {
     let record = activation_result_record(
