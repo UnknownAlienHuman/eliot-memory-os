@@ -8650,6 +8650,18 @@ where
             transaction.validate()?;
             self.store.compare_and_save(expected, &transaction)?;
         }
+        // Issue #1352: an effect whose intent is already committed keeps that
+        // exact intent here, so the `unreconciled` scan below still fails
+        // closed, but no longer destroys the operation identity. The scan
+        // reports the durable pending reference and leaves
+        // `IntentCommitted { attempt, intent_digest }` in place, so the
+        // unresolved effect stays reconcilable under its ORIGINAL operation by
+        // re-driving this transaction: `drive_effect_at` takes its
+        // `IntentCommitted` branch and issues `port.reconcile` for the
+        // reconstructed request. Rollback deliberately does not drive that
+        // drain itself — on an `Absent` readback `drive_effect_at` commits the
+        // next attempt and EXECUTES the external mutation, and a rollback path
+        // must never apply the effect it exists to unwind.
         let unreconciled = transaction
             .effect_progress
             .iter()
@@ -9123,6 +9135,20 @@ where
         })
     }
 
+    /// Records one unclassified observation against `index` and holds the
+    /// transaction at `RollbackRequired`.
+    ///
+    /// Issue #1352: an observation that could not be classified must not
+    /// destroy the identity of an operation that already committed its intent.
+    /// When [`has_exact_committed_intent`] proves the durable state still holds
+    /// the exact `IntentCommitted { attempt, intent_digest }` for this effect,
+    /// that intent is preserved — the new reference is recorded in
+    /// `pending_external_changes` and the transaction stays `RollbackRequired`
+    /// — so the unresolved cause remains reconcilable under its original
+    /// operation instead of becoming an unbound terminal state. A pre-intent
+    /// observation, or an intent this transaction can no longer reconstruct
+    /// exactly, keeps the existing terminal
+    /// [`InstallationEffectProgressState::Unknown`] disposition.
     fn persist_unknown(
         &mut self,
         mut transaction: InstallationTransaction,
@@ -9130,9 +9156,11 @@ where
         pending_ref: PlatformHandle,
     ) -> Result<InstallationStepOutcome, InstallationError> {
         let expected = TransactionVersion::of(&transaction)?;
-        transaction.effect_progress[index].state = InstallationEffectProgressState::Unknown {
-            pending_ref: pending_ref.clone(),
-        };
+        if !has_exact_committed_intent(&transaction, index) {
+            transaction.effect_progress[index].state = InstallationEffectProgressState::Unknown {
+                pending_ref: pending_ref.clone(),
+            };
+        }
         transaction.pending_external_changes = vec![pending_ref.clone()];
         transaction.stage = InstallationStage::RollbackRequired;
         increment_revision(&mut transaction)?;
@@ -9905,6 +9933,42 @@ fn effect_request(
     };
     request.validate()?;
     Ok(request)
+}
+
+/// Whether `index` still holds the exact committed intent of this transaction.
+///
+/// Issue #1352: an unclassified observation may keep the operation identity that
+/// already authorized the external object only while the durable transaction
+/// still reproduces that intent verbatim. The proof reuses the same
+/// [`effect_request`] reconstruction and the same normalized
+/// [`InstallationEffectRequest::intent_digest`] that admitted the intent, so a
+/// `Pending`/terminal state, a digest this transaction can no longer reproduce,
+/// or a request that can no longer be rebuilt at all report "not the original
+/// operation" instead of borrowing its identity. Nothing is synthesized here:
+/// the digest is recomputed from the reconstructed request or the check fails.
+fn has_exact_committed_intent(transaction: &InstallationTransaction, index: usize) -> bool {
+    let Some(progress) = transaction.effect_progress.get(index) else {
+        return false;
+    };
+    let InstallationEffectProgressState::IntentCommitted {
+        attempt,
+        intent_digest,
+    } = &progress.state
+    else {
+        return false;
+    };
+    let Ok(reconstructed) = effect_request(
+        transaction,
+        index,
+        *attempt,
+        InstallationEffectAction::Apply,
+        None,
+    ) else {
+        return false;
+    };
+    reconstructed
+        .intent_digest()
+        .is_ok_and(|digest| digest == *intent_digest)
 }
 
 const REDACTED_PROVIDER_REFERENCE_PENDING: &str = "pending:provider-reference-redacted";
