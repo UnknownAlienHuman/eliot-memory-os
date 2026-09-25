@@ -55,6 +55,18 @@
 //! [`StartupReadinessProjection::invalidate_for_replaced_generation`] and is
 //! driven by the existing owners, not by this module.
 //!
+//! # Late completions adopt deltas, never snapshots
+//!
+//! A local-read flight prepares its operation from an immutable snapshot but
+//! returns only what it actually observed: at most one [`LocalReadinessDelta`]
+//! bound to the exact slot, owner outcome, owner/fence identity and
+//! observation tokens captured for that work.
+//! [`StartupReadinessProjection::adopt_local_delta`] files it only while that
+//! basis is still current, through the existing single-slot reevaluation. A
+//! late or conflicting delta is refused without touching the loop's
+//! requirements, other slots or their history, while the flight's own
+//! read/submit outcome still settles exactly once.
+//!
 //! Architecture traceability: A2.3 (dependencies are required, optional, or
 //! advisory; failure of an optional Module reduces only the associated
 //! capability) and A13.8 (integrity evidence and visible degradation).
@@ -300,6 +312,82 @@ pub enum CapabilityRefreshOutcome {
     },
 }
 
+/// Explicit failure when the loop-local adoption token counter exhausts.
+///
+/// The counter never wraps into an old token: once `u64::MAX` is issued,
+/// every further mint fails with this instead of reusing a live basis. These
+/// tokens are local concurrency controls, not persisted proof and not a new
+/// authority epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalAdoptionTokenExhausted;
+
+impl std::fmt::Display for LocalAdoptionTokenExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("startup readiness adoption token counter exhausted; refusing to reuse a token")
+    }
+}
+
+impl std::error::Error for LocalAdoptionTokenExhausted {}
+
+/// One local-read flight's readiness observation, bound to the exact basis it
+/// was observed under (issue #2647).
+///
+/// A flight returns at most one of these, and only when its own attach or
+/// re-read actually produced an observation: empty claims and ordinary reads
+/// with no refresh carry none. The delta names its exact slot, the real owner
+/// outcome, the full owner/fence identity, and the owner/slot observation
+/// tokens captured for that work — the delta's whole dependency set, so
+/// adoption can prove it is still current without trusting a bare slot write
+/// or a scalar generation comparison.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalReadinessDelta {
+    refresh: CapabilityRefresh,
+    expected_owner: CoreOwnerState,
+    expected_owner_token: u64,
+    expected_slot_token: u64,
+}
+
+impl LocalReadinessDelta {
+    /// The declared slot this delta's observation belongs to.
+    #[must_use]
+    pub const fn capability(&self) -> DeclaredStartupCapability {
+        self.refresh.capability
+    }
+}
+
+/// How one local-read delta settled against the loop's current projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalDeltaAdoption {
+    /// The basis was current and the observation was filed through the
+    /// existing single-slot reevaluation, with its exact outcome.
+    Adopted {
+        /// What the single-slot reevaluation changed.
+        outcome: CapabilityRefreshOutcome,
+    },
+    /// The delta changed nothing: either an exact re-presentation of the last
+    /// adoption for this slot, or an observation whose filing is already in
+    /// place. No history rewrite, no new token, no refresh triggered.
+    Duplicate,
+    /// The delta's basis moved before settlement, so nothing was filed and
+    /// nothing was erased. Revalidation rides the existing heartbeat owner
+    /// observation and demand-driven refresh paths.
+    Stale {
+        /// Which half of the delta's dependency set moved.
+        conflict: LocalDeltaConflict,
+    },
+}
+
+/// Which half of a stale delta's dependency set moved before settlement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalDeltaConflict {
+    /// The owner context (observed fence/flag identity or its token) changed
+    /// after the delta's basis was captured.
+    OwnerContextChanged,
+    /// The delta's own slot was re-filed after the basis was captured,
+    /// including a change that later returned to equal flags.
+    SlotChanged,
+}
+
 /// One slot's current projection row.
 ///
 /// Feeds stdout, diagnostics and Kernel-facing reporting from the same
@@ -356,6 +444,19 @@ pub struct StartupReadinessProjection {
     bindings: StartupCapabilityBindings,
     requirements: CoreReadinessRequirements,
     prior_failures: [Option<String>; DeclaredStartupCapability::COUNT],
+    /// #2647: loop-local adoption control. `issued_tokens` is the monotonic
+    /// mint counter; `owner_token` marks the last real owner-context change;
+    /// `slot_tokens` marks each slot's last disposition/history change; and
+    /// `last_adopted` records each slot's most recent adopted delta plus the
+    /// slot token that adoption minted, so an exact re-presentation is an
+    /// idempotent duplicate rather than a second filing. Records are boxed so
+    /// seven of them stay pointer-sized. These detect conflicting projection
+    /// updates; they grant no capability, persist nothing, and never appear in
+    /// any report.
+    issued_tokens: u64,
+    owner_token: u64,
+    slot_tokens: [u64; DeclaredStartupCapability::COUNT],
+    last_adopted: [Option<Box<(LocalReadinessDelta, u64)>>; DeclaredStartupCapability::COUNT],
 }
 
 impl StartupReadinessProjection {
@@ -371,6 +472,10 @@ impl StartupReadinessProjection {
             bindings,
             requirements: CoreReadinessRequirements::derive(composition),
             prior_failures: std::array::from_fn(|_| None),
+            issued_tokens: 0,
+            owner_token: 0,
+            slot_tokens: [0; DeclaredStartupCapability::COUNT],
+            last_adopted: std::array::from_fn(|_| None),
         }
     }
 
@@ -380,8 +485,23 @@ impl StartupReadinessProjection {
     /// generation, epoch, readiness and view freshness, and re-checks retained
     /// generation-bound proofs against them. It performs no capability IO and
     /// never re-files a slot, so a slow optional attach cannot block it.
-    pub fn observe_owner(&mut self, composition: &DaemonComposition) {
-        self.requirements = CoreReadinessRequirements::derive(composition);
+    ///
+    /// #2647: an identical periodic observation retires nothing, so a
+    /// wall-clock tick alone never invalidates an in-flight delta's basis. A
+    /// real owner-context change — including one within the same generation
+    /// and change-away-then-back — mints a fresh owner token, which retires
+    /// every basis captured under the old context.
+    pub fn observe_owner(
+        &mut self,
+        composition: &DaemonComposition,
+    ) -> Result<(), LocalAdoptionTokenExhausted> {
+        let observed = CoreReadinessRequirements::derive(composition);
+        if observed.owner_state() == self.requirements.owner_state() {
+            return Ok(());
+        }
+        self.requirements = observed;
+        self.owner_token = self.mint_token()?;
+        Ok(())
     }
 
     /// Reevaluates exactly one slot from fresh owner evidence.
@@ -391,50 +511,117 @@ impl StartupReadinessProjection {
     /// recovering a slot never erases the failure it recovered from and a later
     /// failure is recorded rather than assumed away. There is no permanent
     /// startup-failure latch in either direction.
+    ///
+    /// #2647: only a real slot change mints a fresh slot token and retires
+    /// captured bases. Re-filing an identical disposition/history pair files
+    /// nothing new and retires nothing.
     pub fn reevaluate_capability(
         &mut self,
-        refresh: CapabilityRefresh,
-    ) -> CapabilityRefreshOutcome {
-        let CapabilityRefresh {
-            capability,
-            reason,
-            observed,
-        } = refresh;
+        refresh: &CapabilityRefresh,
+    ) -> Result<CapabilityRefreshOutcome, LocalAdoptionTokenExhausted> {
+        let capability = refresh.capability;
         let previously_bound = self.bindings.disposition(capability).is_bound();
+        let prior_before = self.prior_failures[capability.index()].clone();
         self.remember_prior_failure(capability);
-        let disposition = match observed {
-            // The owner reported a revocation, so a value travelling with it
-            // cannot rebind the slot: a withdrawal is not undone by whatever
-            // accompanied it. Fail closed with the exact reason rather than
-            // letting an invalidated capability read as available again.
-            Ok(_) if reason == StartupRefreshReason::OwnerInvalidated => {
-                StartupBindingDisposition::Unbound(format!(
-                    "owner invalidated the {} binding; an accompanying observation cannot rebind it",
-                    capability.as_str()
-                ))
+        let filed = disposition_for_refresh(refresh);
+        let misattributed = match &refresh.observed {
+            Ok(retained)
+                if refresh.reason != StartupRefreshReason::OwnerInvalidated
+                    && retained.declared_slot() != capability =>
+            {
+                Some(retained.declared_slot())
             }
-            Ok(retained) if retained.declared_slot() != capability => {
-                let retained_for = retained.declared_slot();
-                self.bindings.replace_disposition(
-                    capability,
-                    StartupBindingDisposition::Unbound(format!(
-                        "startup capability {} retains proof produced by the {} attach",
-                        capability.as_str(),
-                        retained_for.as_str()
-                    )),
-                );
-                return CapabilityRefreshOutcome::Misattributed { retained_for };
-            }
-            Ok(retained) => StartupBindingDisposition::Bound(Box::new(retained)),
-            Err(reason) => StartupBindingDisposition::Unbound(reason),
+            _ => None,
         };
-        let outcome = if matches!(disposition, StartupBindingDisposition::Bound(_)) {
+        let outcome = if let Some(retained_for) = misattributed {
+            CapabilityRefreshOutcome::Misattributed { retained_for }
+        } else if matches!(filed, StartupBindingDisposition::Bound(_)) {
             CapabilityRefreshOutcome::Rebound { previously_bound }
         } else {
             CapabilityRefreshOutcome::Unavailable { previously_bound }
         };
-        self.bindings.replace_disposition(capability, disposition);
-        outcome
+        let disposition_before = self.bindings.disposition(capability).clone();
+        self.bindings.replace_disposition(capability, filed);
+        let disposition_changed = self.bindings.disposition(capability) != &disposition_before;
+        let history_changed = self.prior_failures[capability.index()] != prior_before;
+        if disposition_changed || history_changed {
+            let minted = self.mint_token()?;
+            self.slot_tokens[capability.index()] = minted;
+        }
+        Ok(outcome)
+    }
+
+    /// Binds one flight's observation to the exact basis it was observed under.
+    ///
+    /// Pure: capturing a basis mints nothing and files nothing. The returned
+    /// delta carries the slot, the attach's real outcome, the full owner/fence
+    /// identity, and the owner/slot observation tokens read here, so
+    /// [`Self::adopt_local_delta`] can prove the observation is still current.
+    #[must_use]
+    pub fn prepare_local_delta(&self, refresh: CapabilityRefresh) -> LocalReadinessDelta {
+        let expected_slot_token = self.slot_tokens[refresh.capability.index()];
+        LocalReadinessDelta {
+            expected_owner: *self.requirements.owner_state(),
+            expected_owner_token: self.owner_token,
+            expected_slot_token,
+            refresh,
+        }
+    }
+
+    /// Adopts one flight's delta into the loop's projection iff its basis is
+    /// still current.
+    ///
+    /// Only the delta's own slot can change, and only through the existing
+    /// [`Self::reevaluate_capability`] filing: requirements, other slots and
+    /// their failure history are preserved. A conflicting owner-context or
+    /// slot change refuses adoption without touching anything; no revalidation
+    /// is queued here — the heartbeat owner observation and the next
+    /// demand-driven refresh re-observe through the existing paths, which
+    /// coalesces any number of late completions into that one revalidation.
+    /// An exact duplicate is idempotent: no history rewrite, no new token.
+    pub fn adopt_local_delta(
+        &mut self,
+        delta: &LocalReadinessDelta,
+    ) -> Result<LocalDeltaAdoption, LocalAdoptionTokenExhausted> {
+        let index = delta.refresh.capability.index();
+        // An exact re-presentation of the last adopted delta for this slot is
+        // a duplicate — but only while neither the owner context nor the slot
+        // moved since that adoption. Any intervening change falls through to
+        // the freshness checks below, so change-away-then-back still refuses.
+        if let Some(record) = &self.last_adopted[index] {
+            let (recorded, minted) = record.as_ref();
+            if recorded == delta
+                && *minted == self.slot_tokens[index]
+                && self.owner_token == delta.expected_owner_token
+            {
+                return Ok(LocalDeltaAdoption::Duplicate);
+            }
+        }
+        // Freshness over the delta's actual dependency set only: the owner
+        // context it was observed under and its own slot. Other slots never
+        // gate this adoption. Owner identity is compared whole — full
+        // fence/flag identity, not an ordering over scalar epochs.
+        if self.owner_token != delta.expected_owner_token
+            || self.requirements.owner_state() != &delta.expected_owner
+        {
+            return Ok(LocalDeltaAdoption::Stale {
+                conflict: LocalDeltaConflict::OwnerContextChanged,
+            });
+        }
+        if self.slot_tokens[index] != delta.expected_slot_token {
+            return Ok(LocalDeltaAdoption::Stale {
+                conflict: LocalDeltaConflict::SlotChanged,
+            });
+        }
+        // The basis is current and the filing is already in place: adopting
+        // would only rewrite history, so this is a duplicate, not a refresh.
+        let already_filed = disposition_for_refresh(&delta.refresh);
+        if self.bindings.disposition(delta.refresh.capability) == &already_filed {
+            return Ok(LocalDeltaAdoption::Duplicate);
+        }
+        let outcome = self.reevaluate_capability(&delta.refresh)?;
+        self.last_adopted[index] = Some(Box::new((delta.clone(), self.slot_tokens[index])));
+        Ok(LocalDeltaAdoption::Adopted { outcome })
     }
 
     /// Retires every retained *generation-scoped* binding because the owner
@@ -457,20 +644,33 @@ impl StartupReadinessProjection {
     /// anything, and each retired slot keeps its prior disposition as bounded
     /// history. A retired slot is re-evaluated on the next event that actually
     /// concerns it (see [`Self::reevaluate_capability`]).
-    pub fn retire_generation_scoped_bindings(&mut self, reason: &str) -> usize {
+    pub fn retire_generation_scoped_bindings(
+        &mut self,
+        reason: &str,
+    ) -> Result<usize, LocalAdoptionTokenExhausted> {
         let mut retired = 0_usize;
         for capability in DeclaredStartupCapability::ALL {
             if !is_generation_scoped(capability) {
                 continue;
             }
+            let disposition_before = self.bindings.disposition(capability).clone();
+            let prior_before = self.prior_failures[capability.index()].clone();
             self.remember_prior_failure(capability);
             self.bindings.replace_disposition(
                 capability,
                 StartupBindingDisposition::Unbound(reason.to_owned()),
             );
+            // #2647: retirement is a real invalidation only where it changed
+            // the slot; an already-retired slot keeps its basis valid.
+            let disposition_changed = self.bindings.disposition(capability) != &disposition_before;
+            let history_changed = self.prior_failures[capability.index()] != prior_before;
+            if disposition_changed || history_changed {
+                let minted = self.mint_token()?;
+                self.slot_tokens[capability.index()] = minted;
+            }
             retired += 1;
         }
-        retired
+        Ok(retired)
     }
 
     /// Returns the accounting verdict for the whole declared denominator.
@@ -700,6 +900,17 @@ impl StartupReadinessProjection {
             self.prior_failures[capability.index()] = Some(reason);
         }
     }
+
+    /// Mints one fresh adoption token. The counter never wraps: exhaustion is
+    /// an explicit error, never a silent return to an old token.
+    fn mint_token(&mut self) -> Result<u64, LocalAdoptionTokenExhausted> {
+        let minted = self
+            .issued_tokens
+            .checked_add(1)
+            .ok_or(LocalAdoptionTokenExhausted)?;
+        self.issued_tokens = minted;
+        Ok(minted)
+    }
 }
 
 /// The readiness verdict one generation reports, in the exact terms
@@ -805,7 +1016,7 @@ pub fn reevaluate_demanded_capability<F>(
     projection: &mut StartupReadinessProjection,
     capability: DeclaredStartupCapability,
     reattach: F,
-) -> CapabilityRefreshOutcome
+) -> Result<CapabilityRefreshOutcome, LocalAdoptionTokenExhausted>
 where
     F: FnOnce() -> Result<RetainedStartupBinding, String>,
 {
@@ -813,11 +1024,11 @@ where
         .capability_available_for_operation(capability)
         .is_available()
     {
-        return CapabilityRefreshOutcome::Rebound {
+        return Ok(CapabilityRefreshOutcome::Rebound {
             previously_bound: true,
-        };
+        });
     }
-    projection.reevaluate_capability(CapabilityRefresh {
+    projection.reevaluate_capability(&CapabilityRefresh {
         capability,
         reason: StartupRefreshReason::CapabilityDemanded,
         observed: reattach(),
@@ -851,6 +1062,35 @@ pub fn refuse_unavailable_capabilities(
         missing.capability().as_str(),
         missing.refusal_reason().unwrap_or("no owner evidence")
     ))
+}
+
+/// Computes the disposition one refresh would file, without filing it.
+///
+/// Single source of truth for [`StartupReadinessProjection::reevaluate_capability`]
+/// and the adoption duplicate check, so "already filed" can be tested without
+/// rewriting history.
+fn disposition_for_refresh(refresh: &CapabilityRefresh) -> StartupBindingDisposition {
+    match &refresh.observed {
+        // The owner reported a revocation, so a value travelling with it
+        // cannot rebind the slot: a withdrawal is not undone by whatever
+        // accompanied it. Fail closed with the exact reason rather than
+        // letting an invalidated capability read as available again.
+        Ok(_) if refresh.reason == StartupRefreshReason::OwnerInvalidated => {
+            StartupBindingDisposition::Unbound(format!(
+                "owner invalidated the {} binding; an accompanying observation cannot rebind it",
+                refresh.capability.as_str()
+            ))
+        }
+        Ok(retained) if retained.declared_slot() != refresh.capability => {
+            StartupBindingDisposition::Unbound(format!(
+                "startup capability {} retains proof produced by the {} attach",
+                refresh.capability.as_str(),
+                retained.declared_slot().as_str()
+            ))
+        }
+        Ok(retained) => StartupBindingDisposition::Bound(Box::new(retained.clone())),
+        Err(reason) => StartupBindingDisposition::Unbound(reason.clone()),
+    }
 }
 
 /// Whether a declared slot's retained proof carries owner generation identity.
