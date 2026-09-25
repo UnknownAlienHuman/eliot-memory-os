@@ -73,7 +73,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use eliot_backup::{
-    BackupBlob, BackupBundle, BackupError, BlobRestorationReceipt, CanonicalRecord,
+    BackupBlob, BackupBundle, BackupClass, BackupError, BlobRestorationReceipt, CanonicalRecord,
     CutoverAuthorization, DestinationRestoreAdapter, DestinationScope, OrsSnapshotFence,
     RestoreAppliedEffect, RestoreArchiveDisposition, RestoreArchiveDispositionKind, RestoreContext,
     RestoreEffectReceipt, RestoreEvidence, RestoreHistoricalAuthority, RestoreIntent,
@@ -84,7 +84,7 @@ use eliot_backup::{
 };
 use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreProvenance};
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
-use eliot_ors::RedbRecoveryStore;
+use eliot_ors::{MAX_JOURNAL_PAGE_ENTRIES, RedbRecoveryStore};
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::{RevocationHistoryPayload, WriteReceipt, parse_revocation_history_payload};
 use serde::Serialize;
@@ -538,6 +538,8 @@ impl KernelBackupRestore {
         ports: &RestorePorts<'_>,
         identity: &OrsRestoreBinding,
     ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
+        check_ors_journal_binding(bundle, &target, ports, identity)?;
+        check_ors_journal_budget(bundle)?;
         let mut journal = OrsRestoreJournal::production(
             std::sync::Arc::clone(ors),
             ports.kernel_fence,
@@ -1766,4 +1768,88 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
             },
         }
     }
+}
+
+/// Rejects a journal binding that names a different source, class or
+/// destination than the archive and target actually being restored (issue
+/// #960).
+///
+/// The ORS binding is what every journal row is keyed to, so a binding that
+/// disagrees with the archive would file this transaction's durable rows under
+/// another source's, another class's or another destination's stream while the
+/// effects land in this target. The comparison is exact equality against the
+/// archive's own declared identity, never a normalisation that could make two
+/// different values compare equal.
+fn check_ors_journal_binding(
+    bundle: &BackupBundle,
+    target: &RestoreContext,
+    ports: &RestorePorts<'_>,
+    identity: &OrsRestoreBinding,
+) -> Result<(), KernelRestoreError> {
+    if identity.source_archive_id != bundle.manifest.backup_id {
+        return Err(KernelRestoreError::OwnerEvidenceInvalid(
+            "restore journal source archive does not name this archive".to_owned(),
+        ));
+    }
+    if identity.destination_ref != target.target_id {
+        return Err(KernelRestoreError::OwnerEvidenceInvalid(
+            "restore journal destination does not name this target".to_owned(),
+        ));
+    }
+    // The writer that owns the durable rows must be the owner the admission
+    // already authenticated for this journal. Without this, an admission for
+    // one owner could file its durable rows under a different writer identity
+    // while the outcome still reports the admitted owner.
+    if identity.writer_id != ports.journal_admission.persistent_owner.owner_id {
+        return Err(KernelRestoreError::OwnerEvidenceInvalid(
+            "restore journal writer does not match the admitted journal owner".to_owned(),
+        ));
+    }
+    let declared = match bundle.manifest.class {
+        BackupClass::FullRecovery => eliot_ors::RestoreJournalArchiveClass::FullRecovery,
+        BackupClass::CanonicalOnlyDegraded => {
+            eliot_ors::RestoreJournalArchiveClass::CanonicalOnlyDegraded
+        }
+        BackupClass::ScopeExport => eliot_ors::RestoreJournalArchiveClass::ScopeExport,
+    };
+    if identity.archive_class != declared {
+        return Err(KernelRestoreError::OwnerEvidenceInvalid(
+            "restore journal archive class does not match the declared class".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses an archive whose restore cannot fit the durable journal before any
+/// effect runs (issue #960).
+///
+/// The single phase engine writes three journal records per phase (intent,
+/// receipt, advance) plus two genesis records, and the ORS owner caps one
+/// stream at its page ceiling. An archive past that ceiling would commit
+/// records until the owner refuses the next append, and because the oldest
+/// record is never resolved the stream can never be pruned, leaving a restore
+/// that is permanently unprogressable rather than merely refused. The
+/// denominator is computed from the archive's own member counts and checked
+/// against the same ceiling the owner enforces, so the limit refuses the
+/// archive up front instead of bricking it mid-run.
+fn check_ors_journal_budget(bundle: &BackupBundle) -> Result<(), KernelRestoreError> {
+    let members = bundle.blobs.len()
+        + bundle.canonical_events.len()
+        + bundle.receipts.len()
+        + bundle.projections.len()
+        + usize::from(bundle.ors_snapshot.is_some());
+    // Two fixed phases (prepare, purge) and three fixed tail phases (rebuild,
+    // verify, finalize), plus the conditional ORS suspension phase.
+    let phases = 5 + members;
+    let records = 2usize
+        .checked_add(phases.saturating_mul(3))
+        .ok_or_else(|| {
+            KernelRestoreError::ArchiveInvalid("restore journal budget overflowed".to_owned())
+        })?;
+    if records > MAX_JOURNAL_PAGE_ENTRIES {
+        return Err(KernelRestoreError::CapabilityMissing {
+            capability: "restore_journal_history_budget",
+        });
+    }
+    Ok(())
 }

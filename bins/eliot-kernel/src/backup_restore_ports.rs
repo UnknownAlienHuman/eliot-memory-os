@@ -67,7 +67,7 @@ use eliot_ors::{
     EpochIdentity, EpochLineage, JournalPredecessor, MAX_JOURNAL_PAGE_ENTRIES,
     MAX_JOURNAL_PAYLOAD_BYTES, MAX_JOURNAL_STREAM_KEY_BYTES, OpaqueLabel, OrsError,
     RESTORE_JOURNAL_RECORD_SCHEMA, RecoveryAccessClass, RecoveryEnvelopeContext,
-    RecoveryPayloadEnvelope, RedbRecoveryStore, RestoreJournalArchiveClass,
+    RecoveryPayloadEnvelope, RedbRecoveryStore, RestoreJournalArchiveClass, RestoreJournalEntry,
     RestoreJournalOperation, RestoreJournalResult, RestoreJournalStreamBinding, StateFenceSnapshot,
 };
 use eliot_platform::PlatformHandle;
@@ -608,6 +608,10 @@ pub struct OrsRestoreJournal {
     epoch: EpochIdentity,
     fence_snapshot: StateFenceSnapshot,
     sealed_root: PathBuf,
+    /// Canonical form of the payload root, resolved once at construction. A
+    /// lexical prefix check cannot see a link or junction planted inside the
+    /// root, so every read re-checks the resolved path against this value.
+    sealed_root_canonical: Option<PathBuf>,
     heads: BTreeMap<String, JournalPredecessor>,
 }
 
@@ -660,6 +664,9 @@ impl OrsRestoreJournal {
             writer_fence_digest: fence_snapshot.sha256.clone(),
             epoch,
             fence_snapshot,
+            // The root may not exist yet on a first restore; it is created by
+            // the first seal, and the canonical form is resolved then.
+            sealed_root_canonical: std::fs::canonicalize(&sealed_root).ok(),
             sealed_root,
             heads: BTreeMap::new(),
         })
@@ -700,50 +707,79 @@ impl OrsRestoreJournal {
     /// Reads the newest durably appended record and the durable head of one
     /// stream.
     ///
-    /// The head is **derived from the retained rows**, not from the
-    /// `load_restore_journal_readback` fence argument: the ORS owner only
-    /// installs that fence when a prune retired a phase slot, so a normal
-    /// stream that already holds rows still reports no fence. Trusting it as
-    /// "the head" would read a populated journal as empty and restart a
-    /// committed restore from revision zero.
+    /// An **unbound** stream is an exact new stream: the ORS owner reports it
+    /// as a missing binding, not as corruption, so it reads as empty and the
+    /// engine's genesis compare-and-swap can bind it. Reading it as an error
+    /// would strand every fresh transaction before its first append.
     ///
-    /// A pruned stream is refused outright. Its retained page is a suffix, not
-    /// a complete history, so its newest row is not provably the journal head
-    /// and resuming from it would re-drive phases that already completed.
-    /// Refusing keeps the ceiling honest: the member denominator and
-    /// complete-restore proof are #949's contract, not something this adapter
-    /// may assume.
+    /// The head is **derived from the retained rows** when nothing was pruned,
+    /// because the ORS owner installs `history_fence` only when a prune retired
+    /// a slot, so a populated unpruned stream still reports no fence. Once a
+    /// prune has run, the fence predecessor *is* the durable head and sits
+    /// beyond the retained suffix, so it is used verbatim.
+    ///
+    /// The newest record is the newest retained row in both cases. A prune
+    /// retires the oldest rows and keeps the newest, so a retained suffix still
+    /// carries the exact latest record and a resume reads the true journal
+    /// state rather than a truncated guess.
     fn read_state(
         &mut self,
         stream: &str,
     ) -> Result<(Option<RestoreJournalRecord>, Option<JournalPredecessor>), BackupError> {
+        let expected = self.binding.stream_binding("", &self.writer_fence_digest);
+        match self
+            .store
+            .load_restore_journal_binding(stream)
+            .map_err(ors_to_backup)?
+        {
+            // An unbound stream is an exact new stream: the ORS owner reports a
+            // missing binding as absent, not as corruption, so it reads as
+            // empty and the engine's genesis compare-and-swap can bind it.
+            None => return Ok((None, None)),
+            Some(existing) => {
+                // A stream already bound to another source, class, destination,
+                // writer, fence or transaction is refused on READ, not only on
+                // append. Checking it later would let the engine reconcile or
+                // apply a target effect under a foreign binding before the
+                // conflict surfaced.
+                if existing.transaction_id != expected.transaction_id
+                    || !matches_stream(&self.binding, &existing, &self.writer_fence_digest)
+                {
+                    return Err(BackupError::RestoreJournalMismatch);
+                }
+            }
+        }
         let (entries, fence_head) = self
             .store
             .load_restore_journal_readback(stream, MAX_JOURNAL_PAGE_ENTRIES)
             .map_err(ors_to_backup)?;
         let latest = entries.iter().max_by_key(|entry| entry.sequence);
-        if fence_head.is_some() {
-            return Err(BackupError::IntegrityMismatch {
-                subject: "restore journal retained suffix is not a complete history".to_owned(),
-            });
-        }
+        // The head is the newest RETAINED row, always. The readback fence
+        // argument is the prune boundary (the predecessor of the first retained
+        // row), not the head, so trusting it would submit a stale predecessor
+        // after any prune. A prune retires the oldest rows and leaves the head
+        // in place, so the newest retained row is the head in both cases.
         let Some(latest) = latest else {
+            if fence_head.is_some() {
+                return Err(BackupError::IntegrityMismatch {
+                    subject: "restore journal head has no retained record row".to_owned(),
+                });
+            }
             return Ok((None, None));
         };
         // The head digest is the owner's canonical digest of exactly this row,
         // so a row that does not hash to its own head is corruption rather
         // than a resume point.
-        let digest = sha256_hex(
-            serde_json::to_string(latest)
-                .map_err(|error| BackupError::Serialization(error.to_string()))?
-                .as_bytes(),
-        );
         let head = JournalPredecessor {
             sequence: latest.sequence,
-            digest,
+            digest: sha256_hex(
+                serde_json::to_string(latest)
+                    .map_err(|error| BackupError::Serialization(error.to_string()))?
+                    .as_bytes(),
+            ),
         };
         self.heads.insert(stream.to_owned(), head.clone());
-        let record = self.open_sealed(latest.payload.as_str())?;
+        let record = self.open_bound_sealed(latest)?;
         Ok((Some(record), Some(head)))
     }
 
@@ -775,47 +811,120 @@ impl OrsRestoreJournal {
         }
         let digest = sha256_hex(&bytes);
         let locator = format!("{}/{}", &digest[..2], digest);
-        let path = self.sealed_path(&locator)?;
-        if !path.is_file() {
-            let parent = path.parent().ok_or(BackupError::RestoreJournalCorrupt)?;
-            std::fs::create_dir_all(parent)
-                .map_err(|error| BackupError::Target(error.to_string()))?;
-            let mut temporary = path.clone();
-            temporary.set_extension("json.partial");
-            std::fs::write(&temporary, &bytes)
-                .map_err(|error| BackupError::Target(error.to_string()))?;
-            std::fs::rename(&temporary, &path)
-                .map_err(|error| BackupError::Target(error.to_string()))?;
-        }
         let length = u64::try_from(bytes.len()).map_err(|_| BackupError::IntegrityMismatch {
             subject: "restore journal payload length".to_owned(),
         })?;
+        let path = self.sealed_path(&locator)?;
+        // An existing target is never trusted on its path alone. Content
+        // addressing makes the name a claim, not a guarantee, so bytes already
+        // on disk are verified against the digest this record actually
+        // produced. Accepting a foreign body would let ORS commit a locator
+        // that every later read refuses.
+        if path.is_file() {
+            let existing =
+                std::fs::read(&path).map_err(|error| BackupError::Target(error.to_string()))?;
+            if sha256_hex(&existing) != digest {
+                return Err(BackupError::IntegrityMismatch {
+                    subject: "restore journal sealed payload address collision".to_owned(),
+                });
+            }
+            return Ok((locator, digest, length));
+        }
+        let parent = path.parent().ok_or(BackupError::RestoreJournalCorrupt)?;
+        std::fs::create_dir_all(parent).map_err(|error| BackupError::Target(error.to_string()))?;
+        let mut temporary = path.clone();
+        temporary.set_extension("json.partial");
+        // A stale partial from an interrupted write is replaced, never appended
+        // to, so a crash can never splice two bodies together.
+        if temporary.exists() {
+            std::fs::remove_file(&temporary)
+                .map_err(|error| BackupError::Target(error.to_string()))?;
+        }
+        std::fs::write(&temporary, &bytes)
+            .map_err(|error| BackupError::Target(error.to_string()))?;
+        // The body is made durable BEFORE the ORS row that names it is
+        // committed, and a failed sync is a refusal rather than a silent
+        // success: a recovered row must never point at a target that power
+        // loss could still remove.
+        std::fs::File::open(&temporary)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| BackupError::Target(error.to_string()))?;
+        std::fs::rename(&temporary, &path)
+            .map_err(|error| BackupError::Target(error.to_string()))?;
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| BackupError::Target(error.to_string()))?;
         Ok((locator, digest, length))
     }
 
     /// Resolves one locator inside the payload root, refusing any other shape.
+    ///
+    /// The shard must be two hex characters and the name a 64-hex digest, so a
+    /// `..` segment or any other traversal spelling is rejected before a path
+    /// is built. The resolved path is then re-checked against the root, so a
+    /// link or junction cannot move the read outside the payload area either.
     fn sealed_path(&self, locator: &str) -> Result<PathBuf, BackupError> {
         let mut parts = locator.split('/');
         let (Some(shard), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
             return Err(BackupError::RestoreJournalCorrupt);
         };
-        if shard.len() != 2 || name.len() != 64 || !is_hex64(name) {
+        if shard.len() != 2 || !shard.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BackupError::RestoreJournalCorrupt);
         }
-        Ok(self.sealed_root.join(shard).join(format!("{name}.json")))
+        if name.len() != 64 || !is_hex64(name) {
+            return Err(BackupError::RestoreJournalCorrupt);
+        }
+        let path = self.sealed_root.join(shard).join(format!("{name}.json"));
+        if path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+            || !path.starts_with(&self.sealed_root)
+        {
+            return Err(BackupError::RestoreJournalCorrupt);
+        }
+        Ok(path)
     }
 
-    /// Opens a sealed record body, verifying its exact length and digest.
-    fn open_sealed(&self, envelope_json: &str) -> Result<RestoreJournalRecord, BackupError> {
+    /// Opens the sealed record body of one persisted entry.
+    ///
+    /// Three independent things are proved before the bytes are parsed: the
+    /// entry's envelope, locator and digest agree with its own operation; the
+    /// resolved path is still inside the payload root once links are resolved;
+    /// and the body matches the declared length and SHA-256. The read is size
+    /// bounded first, so a committed locator cannot force an unbounded
+    /// allocation.
+    fn open_bound_sealed(
+        &self,
+        entry: &RestoreJournalEntry,
+    ) -> Result<RestoreJournalRecord, BackupError> {
+        check_entry_body_binding(entry)?;
         let envelope: RecoveryPayloadEnvelope =
-            serde_json::from_str(envelope_json).map_err(|_| BackupError::RestoreJournalCorrupt)?;
-        let eliot_ors::RecoveryPayload::ImmutableLocator { locator } = &envelope.payload else {
+            serde_json::from_str(&entry.payload).map_err(|_| BackupError::RestoreJournalCorrupt)?;
+        let RecoveryPayloadBinding { locator, .. } = read_payload_binding(&envelope)?;
+        let path = self.sealed_path(&locator)?;
+        let resolved =
+            std::fs::canonicalize(&path).map_err(|error| BackupError::Target(error.to_string()))?;
+        let root = self
+            .sealed_root_canonical
+            .as_ref()
+            .ok_or(BackupError::RestoreJournalCorrupt)?;
+        if !resolved.starts_with(root) {
             return Err(BackupError::RestoreJournalCorrupt);
-        };
-        let path = self.sealed_path(locator.as_str())?;
+        }
+        let length = resolved
+            .metadata()
+            .map_err(|error| BackupError::Target(error.to_string()))?
+            .len();
+        if length > MAX_JOURNAL_PAYLOAD_BYTES as u64 || length != envelope.payload_length {
+            return Err(BackupError::LimitExceeded {
+                field: "restore.journal_payload",
+                limit: MAX_JOURNAL_PAYLOAD_BYTES,
+            });
+        }
         let bytes = std::fs::read(&path).map_err(|error| BackupError::Target(error.to_string()))?;
-        let length = u64::try_from(bytes.len()).map_err(|_| BackupError::RestoreJournalCorrupt)?;
-        if length != envelope.payload_length || sha256_hex(&bytes) != envelope.payload_sha256 {
+        if u64::try_from(bytes.len()).ok() != Some(length)
+            || sha256_hex(&bytes) != envelope.payload_sha256
+        {
             return Err(BackupError::IntegrityMismatch {
                 subject: "restore journal sealed payload".to_owned(),
             });
@@ -969,7 +1078,14 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
             "restore_journal_binding" | "restore_journal_operation" => {
                 BackupError::RestoreJournalMismatch
             }
-            "restore_journal_entry" => BackupError::RestoreJournalCasConflict,
+            // ORS emits `restore_journal_entry` for a stale expected
+            // predecessor AND for malformed rows, sequence/key mismatch,
+            // duplicate slots, broken predecessor linkage and sequence
+            // exhaustion. Corruption is the far more likely cause, and
+            // `RestoreJournalCasConflict` reads as a retryable stale
+            // revision, so the unresolvable class wins: a corrupt journal
+            // must be refused, not retried.
+            "restore_journal_entry" => BackupError::RestoreJournalCorrupt,
             other => BackupError::IntegrityMismatch {
                 subject: format!("restore journal {other}: {reason}"),
             },
@@ -1040,6 +1156,78 @@ fn leak_free() -> &'static str {
     "must be a bounded opaque journal label"
 }
 
+/// Reports whether a persisted stream binding is exactly this adapter's own
+/// binding. The transaction is compared separately, because the adapter learns
+/// the transaction identity from the journaled record rather than owning it.
+fn matches_stream(
+    binding: &OrsRestoreBinding,
+    existing: &RestoreJournalStreamBinding,
+    writer_fence_digest: &str,
+) -> bool {
+    existing.source_archive_id == binding.source_archive_id
+        && existing.archive_class == binding.archive_class
+        && existing.destination_ref == binding.destination_ref
+        && existing.writer_id == binding.writer_id
+        && existing.writer_fence_digest == writer_fence_digest
+}
+
+/// Checks that a persisted entry and the record body it names agree.
+///
+/// The ORS owner checks the envelope against the operation's identity and
+/// writer fence, but it deliberately does not fetch a locator target, so
+/// nothing else proves that the locator the envelope names is the body the
+/// operation committed. This adapter re-derives both bindings from the entry
+/// it is about to trust, so a row whose envelope points at a different valid
+/// content-addressed body is refused rather than replayed.
+fn check_entry_body_binding(entry: &RestoreJournalEntry) -> Result<(), BackupError> {
+    let envelope: RecoveryPayloadEnvelope =
+        serde_json::from_str(&entry.payload).map_err(|_| BackupError::RestoreJournalCorrupt)?;
+    let RecoveryPayloadBinding {
+        locator,
+        payload_sha256,
+        payload_length,
+    } = read_payload_binding(&envelope)?;
+    if locator != entry.operation.payload_handle
+        || payload_sha256 != entry.payload_sha256
+        || payload_sha256 != entry.operation.body_digest
+    {
+        return Err(BackupError::RestoreJournalMismatch);
+    }
+    let expected =
+        u64::try_from(entry.payload.len()).map_err(|_| BackupError::RestoreJournalCorrupt)?;
+    if payload_length != expected {
+        return Err(BackupError::IntegrityMismatch {
+            subject: "restore journal envelope payload length".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// The three fields this adapter relies on from a sealed envelope.
+struct RecoveryPayloadBinding {
+    locator: String,
+    payload_sha256: String,
+    payload_length: u64,
+}
+
+/// Extracts the sealed-payload binding, refusing any other payload variant.
+///
+/// An `Encrypted` payload is refused rather than read: this adapter only ever
+/// writes the locator variant, so an encrypted row was not produced by it and
+/// must not be silently interpreted.
+fn read_payload_binding(
+    envelope: &RecoveryPayloadEnvelope,
+) -> Result<RecoveryPayloadBinding, BackupError> {
+    let eliot_ors::RecoveryPayload::ImmutableLocator { locator } = &envelope.payload else {
+        return Err(BackupError::RestoreJournalCorrupt);
+    };
+    Ok(RecoveryPayloadBinding {
+        locator: locator.as_str().to_owned(),
+        payload_sha256: envelope.payload_sha256.clone(),
+        payload_length: envelope.payload_length,
+    })
+}
+
 /// The ORS phase slot for one compare-and-swap: its exact revision plus its
 /// exact phase digest, so every CAS owns a distinct durable slot and an exact
 /// resume re-lands on the same one.
@@ -1107,10 +1295,19 @@ impl RestoreJournalPort for OrsRestoreJournal {
             }
             _ => {}
         }
-        // The engine only ever advances by one revision. Binding the exact
-        // advance keeps a rewritten record from being appended as if it were
-        // the next step of this transaction.
-        if next.revision != expected_revision.saturating_add(1) {
+        // The engine's genesis record is written at revision 0 with an expected
+        // revision of 0, so genesis is the one case where the next revision
+        // does NOT advance. Every later compare-and-swap advances by exactly
+        // one. The increment is checked, so a saturated `u64::MAX` cannot wrap a
+        // later append back to revision 0 and reverse the durable revision
+        // ordering.
+        let required_revision = match &current {
+            None => 0,
+            Some(_) => expected_revision
+                .checked_add(1)
+                .ok_or(BackupError::RestoreJournalCorrupt)?,
+        };
+        if next.revision != required_revision {
             return Err(BackupError::RestoreJournalMismatch);
         }
         self.ensure_bound(journal_key, &next.transaction.transaction_id)?;
