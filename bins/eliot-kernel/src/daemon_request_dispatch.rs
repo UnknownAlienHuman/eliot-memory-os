@@ -1157,6 +1157,11 @@ impl KernelComposition {
                     if payload.as_object().is_none_or(|object| object.len() != 1) {
                         return Err(TransportError::SessionFenced);
                     }
+                    self.admit_material_authority_for_fence(
+                        GovernanceProfile::full(),
+                        &session.module_generation.state_fence,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
                     self.claim_agent_activation_ticket().map(|ticket| {
                         serde_json::json!({
                             "status": "known",
@@ -1174,6 +1179,10 @@ impl KernelComposition {
             "agent_activation_submit" => {
                 #[cfg(windows)]
                 {
+                    // Result submission is a terminal observation/recovery
+                    // leg for an already-issued ticket. Its retained-result
+                    // and exact-replay checks remain authoritative even when
+                    // fresh material admission is unavailable.
                     // The closed submit operation carries exactly one resolver
                     // outcome in one of two result shapes: the production v2
                     // typed submit envelope carrying one
@@ -1410,6 +1419,11 @@ impl KernelComposition {
                 if !owner_bundle_agrees_with_session(&operation.bundle, session) {
                     return Err(TransportError::SessionFenced);
                 }
+                self.admit_material_authority_for_fence(
+                    GovernanceProfile::full(),
+                    &session.module_generation.state_fence,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
                 match self.recover_p07_owner(operation.bundle, operation.expected_revision) {
                     Ok(revision) => Ok(serde_json::json!({
                         "kind": "owner_bundle_receipt",
@@ -1441,6 +1455,11 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 p07_binding_agrees_with_session(&operation.binding, session)?;
+                self.admit_material_authority_for_fence(
+                    GovernanceProfile::full(),
+                    &session.module_generation.state_fence,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
                 let request = eliot_authority::GrantActivationRequest {
                     grant_id: eliot_authority::GrantId::new(operation.grant_id)
                         .map_err(|_| TransportError::SessionFenced)?,
@@ -1497,6 +1516,11 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 p07_binding_agrees_with_session(&operation.binding, session)?;
+                self.admit_material_authority_for_fence(
+                    GovernanceProfile::full(),
+                    &session.module_generation.state_fence,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
                 let request = eliot_authority::IntroductionActivationRequest {
                     introduction_id: eliot_authority::IntroductionId::new(
                         operation.introduction_id,
@@ -1720,6 +1744,10 @@ impl KernelComposition {
     /// retains progress (releasing the runtime lock) before this runs, so
     /// the bridge locks are taken after, matching the degraded/failed
     /// order.
+    ///
+    /// I1.5 (#1750): the expired generation remains fenced until a newly
+    /// admitted generation rebinds; a later `ProbeReady` or heartbeat cannot
+    /// revive it.
     #[cfg(windows)]
     fn revoke_supervision_expired_effect_admission(&self) -> Result<(), TransportError> {
         self.promote_agent_bridge_profile(None)?;
@@ -2011,6 +2039,11 @@ impl KernelComposition {
 
         match request {
             UserAutomationHostExecutionOperation::AdmitOccurrence { request } => {
+                self.admit_material_authority_for_fence(
+                    GovernanceProfile::full(),
+                    &session.module_generation.state_fence,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
                 match Box::pin(client.admit_occurrence(request)).await {
                     Ok(execution) => Ok(serde_json::json!({
                         "status": "known",
@@ -3145,6 +3178,11 @@ impl KernelComposition {
         if operation.request.state_fence != operation.context.state_fence {
             return Err(TransportError::SessionFenced);
         }
+        if let Some(rejection) =
+            self.material_write_admission_response(&operation.context.state_fence)
+        {
+            return Ok(rejection);
+        }
         let gateway = self.retained_store_gateway()?;
         match gateway
             .initialize_genesis(&operation.context, operation.request)
@@ -3252,10 +3290,18 @@ impl KernelComposition {
                 ));
             }
         }
-        if let Some(rejection) = self.normal_write_admission_response() {
+        let gateway = self.retained_store_gateway()?;
+        if let Some(replayed) = self
+            .replay_committed_apply_receipt(&gateway, &operation)
+            .await?
+        {
+            return Ok(replayed);
+        }
+        if let Some(rejection) =
+            self.material_write_admission_response(&operation.context.state_fence)
+        {
             return Ok(rejection);
         }
-        let gateway = self.retained_store_gateway()?;
         match gateway
             .apply(
                 &operation.context,
@@ -3268,6 +3314,47 @@ impl KernelComposition {
             Ok(receipt) => Ok(store_apply_response(&receipt)),
             Err(error) => Ok(Self::store_error_response_text("write_receipt", &error)),
         }
+    }
+
+    /// Resolves an already-committed `Apply` receipt for this exact operation
+    /// identity.
+    ///
+    /// A committed receipt is an exact, read-only replay result, so it is
+    /// resolved before the Material gate and response-loss recovery stays
+    /// reachable while degraded. The receipt must be the same terminal receipt
+    /// for the same operation: a different operation identity, idempotency
+    /// key, canonical request hash, State Fence, or a non-committed status is
+    /// an identity conflict and never a fresh write. An unreadable receipt
+    /// read is not a coverage observation either, so it yields `None` and
+    /// leaves the decision to the callers below.
+    #[cfg(windows)]
+    async fn replay_committed_apply_receipt(
+        &self,
+        gateway: &Arc<KernelStoreGateway>,
+        operation: &StoreApplyOperation,
+    ) -> Result<Option<serde_json::Value>, TransportError> {
+        let Ok(Some(receipt)) = gateway
+            .receipt(
+                &operation.context.state_fence,
+                operation.transition.identity.operation_id.clone(),
+            )
+            .await
+        else {
+            return Ok(None);
+        };
+        if receipt.operation_id != operation.transition.identity.operation_id
+            || receipt.idempotency_key != operation.transition.identity.idempotency_key
+            || receipt.canonical_request_hash
+                != operation.transition.identity.canonical_request_hash
+            || receipt.state_fence != operation.context.state_fence
+            || receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        receipt
+            .validate()
+            .map_err(|_| TransportError::IdentityConflict)?;
+        Ok(Some(store_apply_response(&receipt)))
     }
 
     #[cfg(not(windows))]
@@ -3835,6 +3922,11 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        self.admit_material_authority_for_fence(
+            GovernanceProfile::full(),
+            &session.module_generation.state_fence,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
         let host_executable_path = operation.host_executable_path.clone();
         let host_artifact_digest = operation.host_artifact_digest.clone();
         // Installation-observed host binding: absolute path, canonical image
@@ -3934,6 +4026,11 @@ impl KernelComposition {
         let operation: NotifyLaunchGrantOperation =
             serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
         validate_store_session_fence(session, &session.module_generation.state_fence)?;
+        self.admit_material_authority_for_fence(
+            GovernanceProfile::full(),
+            &session.module_generation.state_fence,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
         // Installer-observed launch artifact first: absolute path plus the
         // canonical image name (re-checked by the binder), then re-hash of
         // the real installed bytes against the presented digest.
@@ -4128,6 +4225,34 @@ impl KernelComposition {
                 "authority_ceiling": ceiling.as_str(),
             },
         }))
+    }
+
+    /// Store apply is the production Material/Critical admission boundary.
+    /// It keeps the existing helper seam used by the package-local gate proof,
+    /// but now requires the owner-backed current Watchdog observation before
+    /// the retained Store gateway can be entered.
+    ///
+    /// The answer uses the daemon's `error` wire variant. A refusal must be
+    /// decodable by the client: an unrecognised `status` would be surfaced as an
+    /// unknown transport outcome, which is exactly the ambiguity this
+    /// fail-closed path exists to avoid.
+    fn material_write_admission_response(&self, target: &StateFence) -> Option<serde_json::Value> {
+        self.admit_material_authority_for_fence(GovernanceProfile::full(), target)
+            .err()
+            .map(|_| {
+                serde_json::json!({
+                    "status": "error",
+                    "code": eliot_kernel_service::ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE,
+                    "reason": "independent Host-observed Watchdog coverage is not integrated; no Material/Critical effect was admitted",
+                    "value": {
+                        "kind": "material_authority",
+                        "code": eliot_kernel_service::ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE,
+                        "degraded_profile": "runtime-degraded-v3",
+                        "human_risk_path_required": true,
+                    },
+                    "recovery": null,
+                })
+            })
     }
 
     fn store_error_response_text(kind: &str, error: &str) -> serde_json::Value {

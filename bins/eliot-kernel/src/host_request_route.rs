@@ -53,8 +53,9 @@
 //! deadline is `Timeout`. No error prose drives routing.
 
 use super::{
-    Frame, FrameKind, KernelComposition, KernelFrameAction, MessageType, ProtocolPayload, Session,
-    TransportError, activation_deadline_expired, sha256_json, status_frame, unix_ms,
+    Frame, FrameKind, GovernanceProfile, KernelComposition, KernelFrameAction, MessageType,
+    ProtocolPayload, Session, TransportError, activation_deadline_expired, sha256_json,
+    status_frame, unix_ms,
 };
 use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_ors::{
@@ -298,6 +299,34 @@ impl KernelComposition {
             } else {
                 None
             };
+        let requested = requested_host_request_record(envelope)?;
+        let operation_id = OperationIdentity::new(host_request_operation_id(envelope))
+            .map_err(|_| TransportError::SessionFenced)?;
+        let existing = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation_id, &envelope.envelope_sha256)
+            .map_err(|_| TransportError::SessionFenced)?;
+        // Exact replay of an admitted or terminal operation remains an
+        // observation path. A fresh or still-Requested Invocation can still
+        // grant authority, so reject it before service admission and before
+        // any durable Requested row is written. Expired presentations are
+        // staged below without Material admission and closed in the same CAS
+        // path as the original late-delivery contract.
+        let needs_material_authority = matches!(
+            envelope.kind,
+            HostRequestKind::Activation | HostRequestKind::Invocation
+        ) && existing
+            .as_ref()
+            .is_none_or(|record| !record.state.is_terminal());
+        if !expired && needs_material_authority {
+            self.admit_material_authority_for_fence(
+                GovernanceProfile::full(),
+                &envelope.state_fence,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
+        }
+
         let admission_receipt = {
             let service = self
                 .service
@@ -307,10 +336,6 @@ impl KernelComposition {
                 .admit_host_request(envelope, &descriptor, &binding, resolution.as_ref())
                 .map_err(|_| TransportError::SessionFenced)?
         };
-
-        let requested = requested_host_request_record(envelope)?;
-        let operation_id = OperationIdentity::new(host_request_operation_id(envelope))
-            .map_err(|_| TransportError::SessionFenced)?;
         let stored = self
             .generation_gateway
             .ors
@@ -967,6 +992,7 @@ impl KernelComposition {
     /// operation; a result bound to another connection fails closed; a digest
     /// or fence mismatch is an identity conflict; a non-resolved disposition
     /// fails closed without yielding any binding.
+    #[cfg(test)]
     pub(super) fn host_request_activation_resolution(
         &self,
         envelope: &HostRequestEnvelope,
@@ -1204,6 +1230,7 @@ impl KernelComposition {
     /// digest already queued) is idempotent and never duplicates; when the
     /// bounded queue is full the oldest queued pair is evicted (daemon-leg
     /// memory only — the durable ORS record is untouched).
+    #[cfg(test)]
     pub(crate) fn enqueue_local_read_pair(
         &self,
         envelope: &HostRequestEnvelope,
@@ -1503,6 +1530,7 @@ impl KernelComposition {
     /// claims skip it. Like disconnect fencing, this never fails: every
     /// lock/store error is contained because retirement must hold even when
     /// the store is unavailable.
+    #[cfg(test)]
     pub(crate) fn retire_local_read_pair(&self, operation_id: &str, request_digest: &str) {
         let Ok(_transition) = self.agent_bridge_transition_read() else {
             return;

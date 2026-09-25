@@ -75,7 +75,7 @@ impl HostComposition {
     ) -> Result<HostPhaseBMaterialization, HostError> {
         // WORK_UNIT_CASE: 893/2 — Phase-B request observed before admission.
         phase_b_observe("host.phase-b-materialize requested");
-        self.ensure_admission_open()?;
+        self.ensure_material_admission_open_for_target(&manifest.generation, false)?;
         manifest
             .validate()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
@@ -841,10 +841,34 @@ impl HostComposition {
         active: &eliot_installation::ApprovedGeneration,
         recovery_kind: ActivePhaseBRebindRecoveryKind,
     ) -> Result<(), HostError> {
+        self.rebind_active_phase_b_with_options(active, recovery_kind, false)
+    }
+
+    pub(super) fn rebind_active_phase_b_on_open(
+        &mut self,
+        active: &eliot_installation::ApprovedGeneration,
+        recovery_kind: ActivePhaseBRebindRecoveryKind,
+    ) -> Result<(), HostError> {
+        self.rebind_active_phase_b_with_options(active, recovery_kind, true)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "open/restart rebind keeps admission, durable recovery, and exact publication contour together"
+    )]
+    fn rebind_active_phase_b_with_options(
+        &mut self,
+        active: &eliot_installation::ApprovedGeneration,
+        recovery_kind: ActivePhaseBRebindRecoveryKind,
+        allow_unrecorded_open_contour: bool,
+    ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 893/19 — Active rebind requested; replay-vs-commit
         // distinguished below.
         phase_b_observe("host.phase-b-rebind requested");
-        self.ensure_admission_open()?;
+        self.ensure_material_admission_open_for_target(
+            &active.manifest.generation,
+            allow_unrecorded_open_contour,
+        )?;
         let manifest = &active.manifest;
         let manifest_digest = phase_b_manifest_digest(manifest)?;
         if active
@@ -1258,6 +1282,18 @@ impl HostComposition {
         let agent_bridge_final = pending
             .and_then(|pending| pending.phase_b_receipt.as_ref())
             .and_then(|receipt| receipt.agent_bridge.clone());
+        // The public receipt digest is the durable, already-validated Phase-B
+        // receipt digest from the exact pending record. It must be carried
+        // through rehydration: the activation commit fence requires it, so
+        // dropping it here makes a crash after the Phase-B receipt CAS unable
+        // to resume. It is read back from the receipt, never recomputed from
+        // destination bytes.
+        let public_receipt_digest = pending.and_then(|pending| {
+            pending
+                .phase_b_receipt
+                .as_ref()
+                .map(|receipt| receipt.receipt_digest.clone())
+        });
         // WORK_UNIT_CASE: 893/5 — exact four-path readback replay; no
         // destination was published on this path.
         phase_b_observe("host.phase-b-rehydrate readback replay");
@@ -1279,7 +1315,7 @@ impl HostComposition {
             agent_bridge,
             agent_bridge_final,
             request_digest: Some(prepared.request_digest.clone()),
-            public_receipt_digest: None,
+            public_receipt_digest,
             file_identities: [
                 authority_identity,
                 config_identity,

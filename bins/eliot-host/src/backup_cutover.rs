@@ -746,7 +746,7 @@ pub fn execute_cutover(
     activation_id: &PlatformHandle,
     activation_generation: &EpochTransition,
 ) -> Result<(CutoverOutcome, GenerationRetirementBarrier), CutoverError> {
-    host.ensure_admission_open()?;
+    host.ensure_material_admission_open_for_target(&validated.request.target_generation, false)?;
     let store = super::open_registry_store_at(&host.registry_host_root)?;
     let fresh = store
         .load()
@@ -1270,7 +1270,7 @@ pub fn retire_prior_generation(
     prior_host: &HostInstallationEpoch,
     retirement_authorization: &PlatformHandle,
 ) -> Result<CutoverOutcome, CutoverError> {
-    host.ensure_admission_open()?;
+    host.ensure_material_admission_open_for_target(&validated.request.target_generation, false)?;
     if retirement_authorization.as_str().trim().is_empty() {
         return Err(CutoverError::AuthorityOrReadinessMissing);
     }

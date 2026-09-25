@@ -20,7 +20,7 @@ use eliot_process::{
 };
 
 use super::native_worker_lifecycle_route::{native_worker_json_str, native_worker_json_u64};
-use super::{KernelComposition, ProcessExecutionGateway, caller_binding};
+use super::{GovernanceProfile, KernelComposition, ProcessExecutionGateway, caller_binding};
 
 /// Operation port delegating to the gateway under one bound owner.
 ///
@@ -74,6 +74,33 @@ impl ProcessStarter for GatewayProcessStarter {
         let gateway = Arc::clone(&self.gateway);
         let owner = self.owner.clone();
         Box::pin(async move {
+            let target_generation = eliot_contracts::ResourceGeneration::new(
+                admission.state_fence().generation().get(),
+            )
+            .map_err(|error| {
+                eliot_process::ProcessExecutionError::Unavailable(error.to_string())
+            })?;
+            let target_fence = eliot_contracts::StateFence::new(
+                admission.state_fence().authority_epoch().clone(),
+                target_generation,
+            );
+            kernel
+                .admit_material_authority_for_fence(GovernanceProfile::full(), &target_fence)
+                .map_err(|error| {
+                    let detail = error.to_string();
+                    // Preserve the explicit coverage refusal as its own stable
+                    // category. Any other admission failure remains a bounded
+                    // `UNAVAILABLE` projection and is never relabelled as a
+                    // supervision observation that did not happen.
+                    if detail.contains(ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE) {
+                        eliot_process::ProcessExecutionError::Unavailable(format!(
+                            "{}: {detail}",
+                            ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE
+                        ))
+                    } else {
+                        eliot_process::ProcessExecutionError::Unavailable(detail)
+                    }
+                })?;
             let proof = kernel.retain_process_path_proof(&admission)?;
             gateway.start(&owner, admission, proof).await
         })

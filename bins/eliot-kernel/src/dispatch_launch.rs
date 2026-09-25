@@ -100,7 +100,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_service::{
     AuthenticatedDoctorSession, AuthenticatedTestdSession, ComposedDoctorFrontDoor,
     DoctorRecipeRegistry, DoctorRepairAdmission, DoctorRepairAttemptRequest, DoctorRepairResponse,
@@ -108,7 +108,8 @@ use eliot_kernel_service::{
     NativeWorkerClaimReceipt, NativeWorkerClaimRequest, NativeWorkerClaimResponse, TestdAdmission,
     TestdAdmissionAttemptRequest, TestdAdmissionEnvelope, TestdAdmissionResponse,
     advertise_doctor_repair, advertise_testd_admission_when_composed, handle_doctor_repair_attempt,
-    handle_testd_admission_attempt, reconcile_testd_admission,
+    handle_doctor_repair_cancellation, handle_testd_admission_attempt, handle_testd_cancellation,
+    reconcile_testd_admission,
 };
 use eliot_ors::{
     DoctorAttemptRecord, DoctorEffectRecord, DoctorLedgerError, DoctorRecoveryLedger,
@@ -609,6 +610,18 @@ pub(crate) trait DoctorLedgerPort: Send + Sync {
         request: &DoctorRepairAttemptRequest,
         now_unix_nanos: u64,
     ) -> Result<DoctorRepairResponse, KernelServiceError>;
+
+    /// Admits only the typed Doctor cancellation control entry.  This is kept
+    /// separate from effect admission so a transport control bit cannot admit
+    /// a submit-shaped request.
+    fn admit_cancellation(
+        &self,
+        registry: &DoctorRecipeRegistry,
+        service: &KernelService,
+        principal_ref: &str,
+        request: &DoctorRepairAttemptRequest,
+        now_unix_nanos: u64,
+    ) -> Result<DoctorRepairResponse, KernelServiceError>;
 }
 
 impl<L: DoctorRecoveryLedger> DoctorLedgerPort for L {
@@ -642,6 +655,26 @@ impl<L: DoctorRecoveryLedger> DoctorLedgerPort for L {
         debug_assert!(advertise_doctor_repair(&owner));
         let session = AuthenticatedDoctorSession::bind(service, owner.principal_ref())?;
         handle_doctor_repair_attempt(
+            self,
+            owner.registry(),
+            service,
+            &session,
+            request,
+            now_unix_nanos,
+        )
+    }
+
+    fn admit_cancellation(
+        &self,
+        registry: &DoctorRecipeRegistry,
+        service: &KernelService,
+        principal_ref: &str,
+        request: &DoctorRepairAttemptRequest,
+        now_unix_nanos: u64,
+    ) -> Result<DoctorRepairResponse, KernelServiceError> {
+        let owner = ComposedDoctorFrontDoor::compose(self, registry, principal_ref)?;
+        let session = AuthenticatedDoctorSession::bind(service, owner.principal_ref())?;
+        handle_doctor_repair_cancellation(
             self,
             owner.registry(),
             service,
@@ -1102,6 +1135,36 @@ pub(crate) fn admit_doctor_repair_attempt(
         .map_err(gate_error)
 }
 
+/// Admits only the typed Doctor cancellation control entry.  The transport
+/// control bit selects this function, while the owner still parses and
+/// verifies the closed cancellation envelope.
+pub(crate) fn admit_doctor_repair_cancellation(
+    service: &KernelService,
+    request: &DoctorRepairAttemptRequest,
+    now_unix_nanos: u64,
+) -> Result<DoctorRepairResponse, DispatchLaunchError> {
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("doctor front door"))?;
+    let doctor = contour
+        .doctor
+        .lock()
+        .map_err(|_| DispatchLaunchError::Gate("doctor front-door lock poisoned".to_owned()))?;
+    let state = doctor
+        .as_ref()
+        .ok_or(DispatchLaunchError::Uncomposed("doctor front door"))?;
+    state
+        .ledger
+        .admit_cancellation(
+            &state.registry,
+            service,
+            contour.principal_owner.as_str(),
+            request,
+            now_unix_nanos,
+        )
+        .map_err(gate_error)
+}
+
 /// Admits exactly one testd job through the composed principal owner and
 /// live service authority.
 ///
@@ -1122,6 +1185,20 @@ pub(crate) fn admit_testd_attempt(
     let session = AuthenticatedTestdSession::bind(service, contour.principal_owner.as_str())
         .map_err(gate_error)?;
     handle_testd_admission_attempt(service, &session, request, now_unix_nanos).map_err(gate_error)
+}
+
+/// Admits only the typed `TestD` cancellation control entry.
+pub(crate) fn admit_testd_cancellation(
+    service: &KernelService,
+    request: &TestdAdmissionAttemptRequest,
+    now_unix_nanos: u64,
+) -> Result<TestdAdmissionResponse, DispatchLaunchError> {
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("testd front door"))?;
+    let session = AuthenticatedTestdSession::bind(service, contour.principal_owner.as_str())
+        .map_err(gate_error)?;
+    handle_testd_cancellation(service, &session, request, now_unix_nanos).map_err(gate_error)
 }
 
 /// Returns the single Kernel-selected durable `TestD` owner database path.
@@ -2185,17 +2262,58 @@ pub fn prepare_doctor_launch(
     let contour = DISPATCH_CONTOUR
         .get()
         .ok_or(DispatchLaunchError::Uncomposed("doctor front door"))?;
+    let cancellation =
+        serde_json::from_str::<serde_json::Value>(&material.attempt.closed_request_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("cancellation")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(false);
+    // Lock discipline: the Kernel service mutex is NOT reentrant, and the
+    // material gate acquires it itself. So snapshot the live contour under the
+    // lock, release it, run the gate, then re-acquire and revalidate the exact
+    // contour before any typed admission. Never hold `kernel.service` across
+    // `admit_material_authority_for_fence`.
     let (authority_epoch, generation, response) = {
+        let (epoch, generation_value) = {
+            let service = kernel.service.lock().map_err(|_| {
+                DispatchLaunchError::Gate("kernel service lock poisoned".to_owned())
+            })?;
+            let generation_value = service
+                .activation_receipt()
+                .map_or(0, |receipt| receipt.generation.value());
+            (service.authority_epoch(), generation_value)
+        };
+        if !cancellation {
+            let target_generation = eliot_contracts::ResourceGeneration::new(generation_value)
+                .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+            let target_fence = StateFence::new(epoch.clone(), target_generation);
+            kernel
+                .admit_material_authority_for_fence(super::GovernanceProfile::full(), &target_fence)
+                .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+        }
         let service = kernel
             .service
             .lock()
             .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?;
-        let response = admit_doctor_repair_attempt(&service, material.attempt, now_unix_nanos)?;
-        let epoch = service.authority_epoch();
-        let generation = service
+        // The contour may have been fenced or replaced while the gate ran.
+        // Reject rather than admit a stale target.
+        let current_generation = service
             .activation_receipt()
             .map_or(0, |receipt| receipt.generation.value());
-        (epoch, generation, response)
+        if current_generation != generation_value || service.authority_epoch() != epoch {
+            return Err(DispatchLaunchError::Gate(
+                "Kernel contour changed during Doctor material admission".to_owned(),
+            ));
+        }
+        let response = if cancellation {
+            admit_doctor_repair_cancellation(&service, material.attempt, now_unix_nanos)?
+        } else {
+            admit_doctor_repair_attempt(&service, material.attempt, now_unix_nanos)?
+        };
+        (epoch, generation_value, response)
     };
     if generation == 0 {
         return Err(DispatchLaunchError::Gate(
@@ -2612,6 +2730,10 @@ async fn spawn_ready_child(
         return Err(DispatchLaunchError::ExecutorUnavailable);
     };
     let owner = launch_owner_binding(kind, inputs.authority_epoch, inputs.generation)?;
+    // Material/Critical process start: exact admission-derived target fence.
+    kernel
+        .admit_material_process_start(&admission)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let proof = kernel
         .retain_process_path_proof(&admission)
         .map_err(|error| DispatchLaunchError::Path(error.to_string()))?;

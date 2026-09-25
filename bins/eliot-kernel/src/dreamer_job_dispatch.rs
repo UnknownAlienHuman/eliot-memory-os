@@ -278,6 +278,15 @@ impl KernelComposition {
         Ok(())
     }
 
+    fn dreamer_operation_allows_degraded(operation: &JobOperation) -> bool {
+        matches!(
+            operation,
+            JobOperation::Status { .. }
+                | JobOperation::RequestCancel { .. }
+                | JobOperation::Reconcile { .. }
+        )
+    }
+
     /// Admits one decoded K2 envelope against the presenting session,
     /// routing to the requester arm or the bound-worker claim arm by the
     /// authenticated session module. Anything that is neither the `eliotd`
@@ -293,7 +302,25 @@ impl KernelComposition {
             Self::admit_dreamer_worker_lease(session, envelope)
         } else {
             self.admit_dreamer_caller(session, envelope)
+        }?;
+        if matches!(
+            &envelope.request.operation,
+            JobOperation::Submit { .. }
+                | JobOperation::LeaseNext { .. }
+                | JobOperation::LeaseExact { .. }
+                | JobOperation::Renew { .. }
+                | JobOperation::Start { .. }
+                | JobOperation::Resume { .. }
+                | JobOperation::BeginVerification { .. }
+                | JobOperation::Publish { .. }
+        ) {
+            self.admit_material_authority_for_fence(
+                GovernanceProfile::full(),
+                &envelope.context.state_fence,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
         }
+        Ok(())
     }
 
     /// Dispatches one Dreamer job frame from an admitted session.
@@ -317,13 +344,6 @@ impl KernelComposition {
         frame: &Frame,
     ) -> Result<KernelFrameAction, TransportError> {
         if frame.kind != FrameKind::Request || frame.message_type != MessageType::Execute {
-            return Err(TransportError::SessionFenced);
-        }
-        if self
-            .service_state()
-            .map_err(|_| TransportError::SessionFenced)?
-            != KernelServiceState::Ready
-        {
             return Err(TransportError::SessionFenced);
         }
         session
@@ -353,6 +373,15 @@ impl KernelComposition {
             _ => return Err(TransportError::SessionFenced),
         };
         let envelope = dreamer_envelope_from_payload(&payload)?;
+        let state = self
+            .service_state()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if state != KernelServiceState::Ready
+            && !(state == KernelServiceState::Degraded
+                && Self::dreamer_operation_allows_degraded(&envelope.request.operation))
+        {
+            return Err(TransportError::SessionFenced);
+        }
         self.admit_dreamer_envelope(session, &envelope)?;
         Ok(KernelFrameAction::Dreamer {
             request_id,
@@ -396,14 +425,16 @@ impl KernelComposition {
             .peer
             .validate()
             .map_err(|_| TransportError::PeerIdentityUnavailable)?;
-        if self
+        let envelope = dreamer_envelope_from_payload(&payload)?;
+        let state = self
             .service_state()
-            .map_err(|_| TransportError::SessionFenced)?
-            != KernelServiceState::Ready
+            .map_err(|_| TransportError::SessionFenced)?;
+        if state != KernelServiceState::Ready
+            && !(state == KernelServiceState::Degraded
+                && Self::dreamer_operation_allows_degraded(&envelope.request.operation))
         {
             return Err(TransportError::SessionFenced);
         }
-        let envelope = dreamer_envelope_from_payload(&payload)?;
         self.admit_dreamer_envelope(session, &envelope)?;
         #[cfg(windows)]
         {

@@ -26,12 +26,12 @@ use super::wasm_runtime_port_grant::{
 };
 use super::{
     ACTIVE_DAEMON_CALLER, DOCTOR_REPAIR_WIRE_ID, DoctorRepairAttemptRequest, Frame, FrameKind,
-    KernelComposition, KernelFrameAction, KernelServiceState, MessageType, PeerIdentity,
-    ProcessExecutionRequest, ProtocolPayload, Session, TESTD_ADMISSION_WIRE_ID,
+    GovernanceProfile, KernelComposition, KernelFrameAction, KernelServiceState, MessageType,
+    PeerIdentity, ProcessExecutionRequest, ProtocolPayload, Session, TESTD_ADMISSION_WIRE_ID,
     TestdAdmissionAttemptRequest, TransportError, caller_binding, probe_ready_state_admitted,
     route_doctor_repair, route_testd_admission, status_frame, unix_ms,
 };
-use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::{
     CapabilityReadiness, CompatibilityEnvelope, DurableCompatibilityState, HealthDimensionKind,
     KernelRuntimeHealthEvidence, NormativePairReceipt, ProcessHealthStatus, ProcessHealthVector,
@@ -346,82 +346,163 @@ impl KernelComposition {
         }
     }
 
-    /// Reads the current signed supervision lease when the Windows authority
-    /// is composed. Missing or stale supervision is represented as Unknown;
-    /// the worker capability explicitly requires this dimension, so it cannot
-    /// turn an absent watchdog proof into admission.
+    /// Independent Watchdog branch coverage for the current activation.
+    ///
+    /// The projection is a decision over the real branch state, not a
+    /// permanent refusal: a contour whose Watchdog branch verifies is
+    /// `Healthy`, and everything else stays `Unknown` so a supervised claim is
+    /// never projected from lease continuity alone.
     fn runtime_supervision_coverage(
         &self,
         candidate: &eliot_kernel_service::HostKernelCandidateBinding,
         generation: &eliot_runtime_contracts::ModuleGeneration,
     ) -> HealthDimension {
-        #[cfg(not(windows))]
+        if self
+            .verify_watchdog_supervision_branch(candidate, &generation.state_fence)
+            .is_ok()
         {
-            let _ = (candidate, generation);
-            return HealthDimension::Unknown;
-        }
-
-        #[cfg(windows)]
-        {
-            let Some(authority) = self.supervision_lease_authority.as_ref() else {
-                return HealthDimension::Unknown;
-            };
-            let lease_id = candidate
-                .supervision_incarnation
-                .supervision_lease_id
-                .as_str();
-            let Ok(Some(snapshot)) = authority.current_snapshot(lease_id) else {
-                return HealthDimension::Unknown;
-            };
-            if snapshot.validate().is_err()
-                || snapshot.record.lease_id.as_str() != lease_id
-                || snapshot.record.state != LeaseState::Active
-                || snapshot.record.projection != eliot_ors::SupervisionLeaseProjection::Active
-            {
-                return HealthDimension::Unknown;
-            }
-            let Ok(context) = snapshot.active_verification_context(
-                authority.trust_anchor().public_key_fingerprint(),
-                super::unix_ms(),
-            ) else {
-                return HealthDimension::Unknown;
-            };
-            if authority
-                .trust_anchor()
-                .verify(&snapshot.record.artifact, &context)
-                .is_err()
-            {
-                return HealthDimension::Unknown;
-            }
-            let binding = &snapshot.record.binding;
-            let Ok(expected_scope_ref) = candidate.supervision_incarnation.derived_scope_ref()
-            else {
-                return HealthDimension::Unknown;
-            };
-            if binding.scope_ref.as_str() != expected_scope_ref
-                || binding.observation_scope != candidate.supervision_incarnation.observation_scope
-                || binding.wake_policy != candidate.supervision_incarnation.wake_policy
-                || binding.installation_id.as_str() != candidate.installation_id.as_str()
-                || binding.host_epoch.value() != candidate.host_epoch.value()
-                || binding.activation_id.as_str() != candidate.activation_id.as_str()
-                || binding.activation_generation != generation.generation
-                || !binding
-                    .kernel_epoch
-                    .is_same_authority(&generation.state_fence.authority_epoch)
-                || binding.watchdog_epoch.value()
-                    != candidate.supervision_incarnation.watchdog_epoch.sequence
-                || binding.state_fence != generation.state_fence
-                || binding.generation_binding.target_id != generation.artifact_id.as_str()
-                || binding.generation_binding.target_generation != generation.generation
-                || binding.generation_binding.module_id != generation.module_id.as_str()
-                || binding.generation_binding.module_generation != generation.generation
-                || binding.generation_binding.process_generation != generation.generation
-                || binding.generation_binding.process_id.trim().is_empty()
-            {
-                return HealthDimension::Unknown;
-            }
             HealthDimension::Healthy
+        } else {
+            HealthDimension::Unknown
         }
+    }
+
+    /// Verifies the independent Watchdog branch for one exact target fence.
+    ///
+    /// I1.5/A8.1: ELIOT claims independent supervision only for a branch it can
+    /// currently verify. The conjunction is:
+    ///
+    /// 1. the revocable I1.11 supervision step, whose only producer is one
+    ///    Host-observed live SCM Watchdog incarnation bound to the presented
+    ///    candidate contour, and which a new activation contour revokes;
+    /// 2. a non-zero Watchdog epoch on this candidate's supervision
+    ///    incarnation;
+    /// 3. a signature-verified `Active` supervision lease inside its validity
+    ///    window under the Kernel trust anchor; and
+    /// 4. a two-sided exact join of that lease to this candidate and to the
+    ///    exact target fence being admitted.
+    ///
+    /// Any missing or mismatched fact refuses. An unexpired signed lease
+    /// alone, a health string, or `eliotd`'s self-reported `watchdog_covered`
+    /// boolean is never coverage.
+    #[cfg(windows)]
+    pub(crate) fn verify_watchdog_supervision_branch(
+        &self,
+        candidate: &eliot_kernel_service::HostKernelCandidateBinding,
+        target: &StateFence,
+    ) -> Result<(), &'static str> {
+        let supervision_verified = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| "startup gate lock is poisoned")?
+            .supervision_evidence_is_complete();
+        if !supervision_verified {
+            return Err("no Host-observed Watchdog branch for the current contour");
+        }
+        let incarnation = &candidate.supervision_incarnation;
+        if incarnation.watchdog_epoch.sequence == 0 {
+            return Err("supervision incarnation has no non-zero Watchdog epoch");
+        }
+        let authority = self
+            .supervision_lease_authority
+            .as_ref()
+            .ok_or("no Kernel supervision lease authority is composed")?;
+        let lease_id = incarnation.supervision_lease_id.as_str();
+        let snapshot = authority
+            .current_snapshot(lease_id)
+            .map_err(|_| "current supervision lease is unreadable")?
+            .ok_or("no current supervision lease for the observed Watchdog branch")?;
+        if snapshot.validate().is_err()
+            || snapshot.record.lease_id.as_str() != lease_id
+            || snapshot.record.state != LeaseState::Active
+            || snapshot.record.projection != eliot_ors::SupervisionLeaseProjection::Active
+        {
+            return Err("current supervision lease is not an active verified head");
+        }
+        let context = snapshot
+            .active_verification_context(
+                authority.trust_anchor().public_key_fingerprint(),
+                unix_ms(),
+            )
+            .map_err(|_| "current supervision lease is outside its verification window")?;
+        authority
+            .trust_anchor()
+            .verify(&snapshot.record.artifact, &context)
+            .map_err(|_| "current supervision lease signature is not trusted")?;
+        let expected_scope_ref = incarnation
+            .derived_scope_ref()
+            .map_err(|_| "supervision incarnation has no derivable scope ref")?;
+        let binding = &snapshot.record.binding;
+        if binding.scope_ref.as_str() != expected_scope_ref
+            || binding.observation_scope != incarnation.observation_scope
+            || binding.wake_policy != incarnation.wake_policy
+            || binding.installation_id.as_str() != incarnation.installation_id.as_str()
+            || binding.host_epoch.value() != incarnation.host_epoch.sequence
+            || binding.activation_id.as_str() != incarnation.activation_id.as_str()
+            || binding.activation_generation != target.resource_generation
+            || !binding
+                .kernel_epoch
+                .is_same_authority(&target.authority_epoch)
+            || binding.watchdog_epoch.value() != incarnation.watchdog_epoch.sequence
+            || binding.state_fence != *target
+            || binding.generation_binding.target_id != candidate.artifact_hash.as_str()
+            || binding.generation_binding.target_generation != target.resource_generation
+            || binding.generation_binding.module_generation != target.resource_generation
+            || binding.generation_binding.process_generation != target.resource_generation
+            || binding.generation_binding.process_id.trim().is_empty()
+        {
+            return Err(
+                "supervision lease does not join the observed Watchdog branch and target fence",
+            );
+        }
+        Ok(())
+    }
+
+    /// Non-Windows builds compose no supervision authority and expose no
+    /// independent Watchdog port (I1.7), so the branch can never verify there.
+    #[cfg(not(windows))]
+    pub(crate) fn verify_watchdog_supervision_branch(
+        &self,
+        _candidate: &eliot_kernel_service::HostKernelCandidateBinding,
+        _target: &StateFence,
+    ) -> Result<(), &'static str> {
+        Err("no independent Watchdog supervision port exists on this platform (I1.7)")
+    }
+
+    /// Matches a retained daemon observation to the current lease head for
+    /// lease-renewal continuity only. This is not independent Watchdog
+    /// coverage and cannot record startup step 11.
+    ///
+    /// A renewal observation is evaluated against the predecessor head and
+    /// remains valid as current coverage only when the Kernel-owned progress
+    /// record proves that this exact observation produced the immediately
+    /// following successor. The predecessor receipt alone is not enough: an
+    /// old observation could otherwise be replayed against a newer lease.
+    #[cfg(windows)]
+    pub(crate) fn progress_observation_matches_current_head(
+        observation: &eliot_runtime_contracts::DaemonProgressObservation,
+        snapshot: &eliot_ors::SupervisionLeaseSnapshot,
+        progress: &super::daemon_supervision::DaemonSupervisionProgressState,
+    ) -> bool {
+        if !observation.watchdog_covered
+            || observation.lease_id != snapshot.record.lease_id.as_str()
+            || progress.reconciliation_pending
+        {
+            return false;
+        }
+        if observation.lease_revision == snapshot.record.revision
+            && observation.predecessor_receipt_sha256 == snapshot.receipt.receipt_sha256
+        {
+            return true;
+        }
+        let Ok(observation_digest) = observation.digest() else {
+            return false;
+        };
+        observation.lease_revision.checked_add(1) == Some(snapshot.record.revision)
+            && snapshot.record.previous_receipt_sha256.as_deref()
+                == Some(observation.predecessor_receipt_sha256.as_str())
+            && progress.last_successor_revision == Some(snapshot.record.revision)
+            && progress.last_observation_sha256.as_deref() == Some(observation_digest.as_str())
     }
 
     /// Runs the currently admitted, deliberately closed semantic gateway.
@@ -576,13 +657,6 @@ impl KernelComposition {
                 // generation/binding validation, and persist-before-ack live
                 // in the route. Unknown or stale generations fence the
                 // session there and are never granted authority.
-                if self
-                    .service_state()
-                    .map_err(|_| TransportError::SessionFenced)?
-                    != KernelServiceState::Ready
-                {
-                    return Err(TransportError::SessionFenced);
-                }
                 session
                     .peer
                     .validate()
@@ -601,13 +675,6 @@ impl KernelComposition {
                 // admission (T9-02 gate revalidation + wire admit) and
                 // persist-before-ack live in the route. Stale bindings fence
                 // the session there and are never granted authority.
-                if self
-                    .service_state()
-                    .map_err(|_| TransportError::SessionFenced)?
-                    != KernelServiceState::Ready
-                {
-                    return Err(TransportError::SessionFenced);
-                }
                 session
                     .peer
                     .validate()
@@ -833,7 +900,25 @@ impl KernelComposition {
                     {
                         return Err(TransportError::SessionFenced);
                     }
-                    if self
+                    // Terminal completion is a recovery/observation leg, not a
+                    // new TestD execution: its owner already accepts
+                    // `Ready | Degraded` and re-verifies the retained launch and
+                    // terminal receipt. Route it on the same contour as
+                    // cancellation so degraded recovery stays reachable.
+                    // New-execution intake remains `Ready`-only.
+                    let terminal_recovery = native_operation
+                        == super::testd_terminal_completion_route::OPERATION
+                        || native_operation
+                            == super::testd_terminal_completion_route::OWNER_SUBMIT_OPERATION;
+                    if terminal_recovery {
+                        if !matches!(
+                            self.service_state()
+                                .map_err(|_| TransportError::SessionFenced)?,
+                            KernelServiceState::Ready | KernelServiceState::Degraded
+                        ) {
+                            return Err(TransportError::SessionFenced);
+                        }
+                    } else if self
                         .service_state()
                         .map_err(|_| TransportError::SessionFenced)?
                         != KernelServiceState::Ready
@@ -860,13 +945,6 @@ impl KernelComposition {
                 // granted protected input. No process is spawned on this
                 // path (worker handoff is T12-09).
                 if frame.kind != FrameKind::Request || frame.message_type != MessageType::Execute {
-                    return Err(TransportError::SessionFenced);
-                }
-                if self
-                    .service_state()
-                    .map_err(|_| TransportError::SessionFenced)?
-                    != KernelServiceState::Ready
-                {
                     return Err(TransportError::SessionFenced);
                 }
                 session
@@ -915,13 +993,17 @@ impl KernelComposition {
                 }
                 return dispatch_backup_frame(session, frame);
             }
-            if self
-                .service_state()
-                .map_err(|_| TransportError::SessionFenced)?
-                != KernelServiceState::Ready
-            {
-                return Err(TransportError::SessionFenced);
-            }
+            // I1.5 (#1750): the blanket `Ready` gate that used to sit here is
+            // replaced by per-route gates, each of which is at least as strict
+            // for the effects it admits. Backup, Doctor, `TestD`, Dreamer,
+            // daemon, and native-worker routes carry their own admission above
+            // or inside their owner; the generic process arm below admits
+            // `Start` only from `Ready` and keeps `Inspect`/`Cancel`/
+            // `Reconcile` — pure observations and terminal recovery — reachable
+            // from `Degraded`. A `Start` then passes
+            // `admit_material_authority_for_fence`, which additionally requires
+            // the current Ready, unfenced activation contour and the verified
+            // independent Watchdog branch.
             let request_id = frame
                 .request_id
                 .clone()
@@ -939,6 +1021,20 @@ impl KernelComposition {
             request
                 .validate()
                 .map_err(|_| TransportError::SessionFenced)?;
+            let state = self
+                .service_state()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if state != KernelServiceState::Ready
+                && !(state == KernelServiceState::Degraded
+                    && matches!(
+                        &request,
+                        ProcessExecutionRequest::Inspect { .. }
+                            | ProcessExecutionRequest::Cancel { .. }
+                            | ProcessExecutionRequest::Reconcile { .. }
+                    ))
+            {
+                return Err(TransportError::SessionFenced);
+            }
             let identity = frame
                 .request_identity
                 .as_ref()
@@ -1004,12 +1100,15 @@ fn is_daemon_operation(operation: &str) -> bool {
         operation,
         "snapshot"
             | "daemon_ready"
+            | "origin_challenge_issue"
+            | "origin_control_decide"
             | ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION
             | DAEMON_STARTUP_EVIDENCE_OPERATION
+            | super::daemon_request_dispatch::USER_AUTOMATION_RUNTIME_OPERATION
             | "health"
             | "daemon_degraded"
             | "daemon_fatal"
-            | "daemon_supervision_progress"
+            | super::daemon_request_dispatch::DAEMON_SUPERVISION_PROGRESS_OPERATION
             | "agent_activation_claim"
             | "agent_activation_submit"
             | "agent_activation_reconcile"
@@ -1024,10 +1123,18 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "publish_owner_bundle"
             | "query_owner_bundle"
             | "initialize_owner_revision"
+            // I1.5 (#1750): the Host request leg. These are the four admitted
+            // lifecycle legs of the Host request surface; the branch admits
+            // them here so the frame can reach the admitted dispatch.
+            | "agent_host_request_submit"
+            | "agent_host_request_cancel"
+            | "agent_host_request_reconcile"
+            | "agent_host_request_rehydrate"
             | "activate_grant"
             | "revoke_grant"
             | "activate_introduction"
             | "revoke_introduction"
+            | "publish_wasm_dispatch_bundle"
             // Issue #1780 W2: the Notify launch grant, the delivery gate that
             // proves the owner created or updated the canonical record before
             // a toast is launched. The marker is the one string the admitted
@@ -1105,7 +1212,7 @@ pub(crate) fn is_doctor_operation(operation: &str) -> bool {
     operation == DOCTOR_REPAIR_WIRE_ID
 }
 
-/// Returns whether the operation string selects one of the closed TestD
+/// Returns whether the operation string selects one of the closed `TestD`
 /// admission or terminal-completion routes. Each entry still validates its
 /// own exact wire id/version and typed payload.
 pub(crate) fn is_testd_operation(operation: &str) -> bool {
@@ -1200,6 +1307,7 @@ impl KernelComposition {
             request_id,
             operation: operation.to_owned(),
             payload,
+            control,
         })
     }
 
@@ -1240,9 +1348,25 @@ impl KernelComposition {
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<Frame, TransportError> {
+        self.execute_doctor_request_with_control(session, request_id, operation, payload, false)
+            .await
+    }
+
+    #[allow(
+        clippy::unused_async,
+        reason = "the front-door driver awaits this handler uniformly with the daemon/testd arms; spawning stays in the explicit async launch seam"
+    )]
+    pub async fn execute_doctor_request_with_control(
+        &self,
+        session: &Session,
+        request_id: super::RequestId,
+        operation: &str,
+        payload: serde_json::Value,
+        control: bool,
+    ) -> Result<Frame, TransportError> {
         observe_frame("kernel.frame_doctor_execute", "attempt");
         let result = self
-            .execute_doctor_request_inner(session, request_id, operation, &payload)
+            .execute_doctor_request_inner(session, request_id, operation, &payload, control)
             .await;
         match &result {
             Ok(_) => observe_frame("kernel.frame_doctor_execute", "success"),
@@ -1264,6 +1388,7 @@ impl KernelComposition {
         request_id: super::RequestId,
         operation: &str,
         payload: &serde_json::Value,
+        control: bool,
     ) -> Result<Frame, TransportError> {
         if !is_doctor_operation(operation) {
             return Err(TransportError::SessionFenced);
@@ -1292,11 +1417,27 @@ impl KernelComposition {
         if now_unix_nanos == 0 {
             return Err(TransportError::SessionFenced);
         }
-        // Admit through the composed contour: uncomposed contours,
-        // stale sessions, and mechanical gate failures fence here, while
-        // every typed answer (admitted, rejected, conflict) projects to a
-        // reply frame below.
-        let response = {
+        // A control frame reaches only the typed cancellation owner.  A
+        // submit-shaped request presented as control is rejected by that
+        // owner before any ledger admission; it cannot bypass the Material
+        // gate by changing the transport kind.
+        let response = if control {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            super::dispatch_launch::admit_doctor_repair_cancellation(
+                &service,
+                &request,
+                now_unix_nanos,
+            )
+            .map_err(|_| TransportError::SessionFenced)?
+        } else {
+            self.admit_material_authority_for_fence(
+                GovernanceProfile::full(),
+                &session.module_generation.state_fence,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
             let service = self
                 .service
                 .lock()
@@ -1459,6 +1600,7 @@ impl KernelComposition {
             identity: identity.clone(),
             operation: operation.to_owned(),
             payload,
+            control,
         })
     }
 
@@ -1500,9 +1642,25 @@ impl KernelComposition {
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<Frame, TransportError> {
+        self.execute_testd_request_with_control(session, request_id, operation, payload, false)
+            .await
+    }
+
+    #[allow(
+        clippy::unused_async,
+        reason = "the front-door driver awaits this handler uniformly with the daemon/doctor arms; spawning stays in the explicit async launch seam"
+    )]
+    pub async fn execute_testd_request_with_control(
+        &self,
+        session: &Session,
+        request_id: super::RequestId,
+        operation: &str,
+        payload: serde_json::Value,
+        control: bool,
+    ) -> Result<Frame, TransportError> {
         observe_frame("kernel.frame_testd_execute", "attempt");
         let result = self
-            .execute_testd_request_inner(session, request_id, operation, &payload)
+            .execute_testd_request_inner(session, request_id, operation, &payload, control)
             .await;
         match &result {
             Ok(_) => observe_frame("kernel.frame_testd_execute", "success"),
@@ -1524,6 +1682,7 @@ impl KernelComposition {
         request_id: super::RequestId,
         operation: &str,
         payload: &serde_json::Value,
+        control: bool,
     ) -> Result<Frame, TransportError> {
         if !is_testd_operation(operation) {
             return Err(TransportError::SessionFenced);
@@ -1551,6 +1710,24 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        let cancellation = serde_json::from_str::<serde_json::Value>(&request.closed_request_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("cancellation")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(false);
+        if control != cancellation {
+            return Err(TransportError::SessionFenced);
+        }
+        if !cancellation {
+            self.admit_material_authority_for_fence(
+                GovernanceProfile::full(),
+                &session.module_generation.state_fence,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
+        }
         let now_unix_nanos = unix_ms().saturating_mul(1_000_000);
         if now_unix_nanos == 0 {
             return Err(TransportError::SessionFenced);
@@ -1564,8 +1741,12 @@ impl KernelComposition {
                 .service
                 .lock()
                 .map_err(|_| TransportError::SessionFenced)?;
-            super::dispatch_launch::admit_testd_attempt(&service, &request, now_unix_nanos)
-                .map_err(|_| TransportError::SessionFenced)?
+            if cancellation {
+                super::dispatch_launch::admit_testd_cancellation(&service, &request, now_unix_nanos)
+            } else {
+                super::dispatch_launch::admit_testd_attempt(&service, &request, now_unix_nanos)
+            }
+            .map_err(|_| TransportError::SessionFenced)?
         };
         let mut reply = status_frame(
             session,
@@ -1582,9 +1763,13 @@ impl KernelComposition {
 }
 
 impl KernelComposition {
-    /// Rehydrates one TestD terminal notice through the existing authenticated
+    /// Rehydrates one `TestD` terminal notice through the existing authenticated
     /// worker session and retained launch owner. Pending is returned until the
-    /// daemon has persisted its committed Governor WriteReceipt.
+    /// daemon has persisted its committed Governor `WriteReceipt`.
+    #[allow(
+        clippy::unused_async,
+        reason = "the front-door driver awaits all terminal handlers uniformly; the terminal read itself is synchronous"
+    )]
     pub async fn execute_testd_terminal_completion(
         &self,
         session: &Session,
@@ -1671,6 +1856,11 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        self.admit_material_authority_for_fence(
+            GovernanceProfile::full(),
+            &identity.request.state_fence,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
         let request =
             super::testd_terminal_completion_route::owner_submit_request_from_payload(&payload)
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -1753,14 +1943,15 @@ impl KernelComposition {
         frame: &Frame,
     ) -> Result<KernelFrameAction, TransportError> {
         observe_frame("kernel.frame_wasm_grant_dispatch", "attempt");
+        // Material/Critical wasm grant. The fence check also proves the current
+        // Ready, unfenced, candidate-bound Kernel generation, so it subsumes a
+        // separate service-state read here.
+        self.admit_material_authority_for_fence(
+            GovernanceProfile::full(),
+            &session.module_generation.state_fence,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
         if frame.kind != FrameKind::Request || frame.message_type != MessageType::Execute {
-            return Err(TransportError::SessionFenced);
-        }
-        if self
-            .service_state()
-            .map_err(|_| TransportError::SessionFenced)?
-            != KernelServiceState::Ready
-        {
             return Err(TransportError::SessionFenced);
         }
         session

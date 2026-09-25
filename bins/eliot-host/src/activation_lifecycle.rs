@@ -773,6 +773,11 @@ fn lease_census_reason(error: &HostError) -> &'static str {
         | HostError::StoreNotLive { .. }
         | HostError::OwnerLeaseHeld
         | HostError::Stopped => "supervision-spool-unreadable",
+        // A refused independent-Watchdog proof means the supervision
+        // obligation cannot be established either, so the census stays
+        // `Unavailable` on the supervision leg and never reports `Idle`.
+        #[cfg(windows)]
+        HostError::WatchdogCoverageUnavailable(_) => "supervision-spool-unreadable",
         #[cfg(windows)]
         HostError::StoreRecoveryRequired(_) => "durable-state-unreadable",
     }

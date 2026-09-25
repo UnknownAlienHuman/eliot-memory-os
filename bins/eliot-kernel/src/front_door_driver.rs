@@ -293,6 +293,7 @@ async fn serve_connection(
                 request_id,
                 operation,
                 payload,
+                control,
             } => {
                 // P-07 Doctor repair intake: one bounded request/response
                 // through the closed P-07 handler
@@ -303,7 +304,9 @@ async fn serve_connection(
                 // fences them) and any handler failure fences the session
                 // instead of silently dropping the submit.
                 let reply = kernel
-                    .execute_doctor_request(&session, request_id, &operation, payload)
+                    .execute_doctor_request_with_control(
+                        &session, request_id, &operation, payload, control,
+                    )
                     .await?;
                 if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
                     session.fence();
@@ -315,6 +318,7 @@ async fn serve_connection(
                 identity,
                 operation,
                 payload,
+                control,
             } => {
                 // P-07 testd admission intake: one bounded request/response
                 // through the closed P-07 handler
@@ -338,7 +342,9 @@ async fn serve_connection(
                         .await?
                 } else {
                     kernel
-                        .execute_testd_request(&session, request_id, &operation, payload)
+                        .execute_testd_request_with_control(
+                            &session, request_id, &operation, payload, control,
+                        )
                         .await?
                 };
                 if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
