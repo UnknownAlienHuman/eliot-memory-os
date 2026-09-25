@@ -53,6 +53,7 @@ mod bootstrap_draft;
 mod controlboard_status;
 mod first_run_flow;
 mod plugin_preview;
+mod release_surface;
 mod scope_observe;
 mod source_bundle_materializer;
 mod update_installer;
@@ -72,6 +73,11 @@ const RESTART_REQUIRED_EXIT: i32 = 77;
 /// rehearsal was proven): backup existence is not recovery proof, so a
 /// process exit never stands in for it.
 const BACKUP_OWNER_ADMISSION_REQUIRED_EXIT: i32 = 78;
+/// Doctor observed installed-surface drift against the accepted immutable
+/// release manifest. Drift is data inside the report, but the command still
+/// terminates nonzero so a release gate cannot read a drifted installation as
+/// verified.
+const RELEASE_SURFACE_DRIFT_EXIT: i32 = 3;
 const INSTALLATION_INPUT_LIMIT: u64 = 16 * 1024 * 1024;
 const INSTALLATION_CONTRACT_VERSION: &str = "3.0.0";
 const INSTALLATION_SCOPE: &str = "bounded_all_effects_or_exact_rollback";
@@ -128,6 +134,11 @@ enum Command {
     Doctor {
         #[command(subcommand)]
         command: DoctorCommand,
+    },
+    /// Release-generation surfaces owned by the installation front door.
+    Release {
+        #[command(subcommand)]
+        command: ReleaseCommand,
     },
     /// Read the reconciled `ControlBoard` status projection (#1213).
     #[command(name = "controlboard")]
@@ -485,6 +496,111 @@ enum DoctorCommand {
         #[arg(long, value_parser = absolute_path)]
         observation: PathBuf,
     },
+    /// Compare the accepted immutable `ReleaseSurfaceManifest` with the
+    /// observed installation and report field-level `MATCH`, `MISSING`,
+    /// `MISMATCH`, `STALE`, or `UNKNOWN` (I19.8). Read-only: the accepted
+    /// manifest is never regenerated, repaired, or re-signed, and its bytes are
+    /// hashed before and after the comparison.
+    ReleaseSurface {
+        /// Absolute path to the accepted release-surface manifest.
+        #[arg(long, value_parser = absolute_path)]
+        manifest: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ReleaseCommand {
+    /// Generate and publish exactly one immutable `ReleaseSurfaceManifest` for
+    /// one installable release (I19.8).
+    ///
+    /// Run after `installation materialize-source-bundle` published the exact
+    /// Phase-A source bundle and before `installation apply` mutates the
+    /// machine. The manifest is published create-new and read-only; the
+    /// installer and runtime have no write path to it. Bind only
+    /// release-scoped, immutable Product Proof receipts and migration evidence
+    /// snapshots: a per-pulse receipt rotates and would later read as drift.
+    SurfaceManifest {
+        /// Absolute release source root. Its Git head and accepted normative
+        /// pair are the observed source and Architecture/Implementation
+        /// identities, so the tree must be the clean pinned release commit.
+        #[arg(long, value_parser = absolute_path)]
+        repo_root: PathBuf,
+        /// Absolute staged or finalized release bundle root.
+        #[arg(long, value_parser = absolute_path)]
+        release_bundle: PathBuf,
+        /// Absolute published Phase-A source bundle produced by
+        /// `installation materialize-source-bundle`.
+        #[arg(long, value_parser = absolute_path)]
+        phase_a_bundle: PathBuf,
+        /// Absolute Phase-A generation destination root the manifest binds as
+        /// the installed location of every published Phase-A role.
+        #[arg(long, value_parser = absolute_path)]
+        phase_a_install_root: PathBuf,
+        /// Absolute release payload destination root the manifest binds as the
+        /// installed location of every generated release artifact.
+        #[arg(long, value_parser = absolute_path)]
+        release_install_root: PathBuf,
+        /// Canonical relative package generation identity.
+        #[arg(long)]
+        generation: String,
+        /// Stable installation identity.
+        #[arg(long)]
+        installation: String,
+        /// Stable lineage identity.
+        #[arg(long)]
+        lineage_id: String,
+        /// Non-zero sequence within the lineage.
+        #[arg(long)]
+        sequence: u64,
+        /// Release receipt identity that authorized this generation.
+        #[arg(long)]
+        transaction_id: String,
+        /// Explicit installation profile.
+        #[arg(long, value_parser = parse_installation_profile)]
+        profile: InstallationProfile,
+        /// Exact recovery/rollback command retained by the release transaction.
+        #[arg(long)]
+        recovery_command: String,
+        /// Unix-seconds instant after which this manifest no longer describes
+        /// its release.
+        #[arg(long)]
+        expires_at_unix_seconds: i64,
+        /// Release-bundle-relative generated schema artifact; repeat for each.
+        #[arg(long = "generated-schema", value_name = "RELEASE_RELATIVE_PATH")]
+        generated_schemas: Vec<String>,
+        /// Release-bundle-relative generated plugin artifact; repeat for each.
+        #[arg(long = "generated-plugin", value_name = "RELEASE_RELATIVE_PATH")]
+        generated_plugins: Vec<String>,
+        /// Release-bundle-relative generated Skill artifact; repeat for each.
+        #[arg(long = "generated-skill", value_name = "RELEASE_RELATIVE_PATH")]
+        generated_skills: Vec<String>,
+        /// Release-bundle-relative generated hook artifact; repeat for each.
+        #[arg(long = "generated-hook", value_name = "RELEASE_RELATIVE_PATH")]
+        generated_hooks: Vec<String>,
+        /// Release-bundle-relative generated prompt artifact; repeat for each.
+        #[arg(long = "generated-prompt", value_name = "RELEASE_RELATIVE_PATH")]
+        generated_prompts: Vec<String>,
+        /// Repository-relative capability-cell registry artifact; repeat for
+        /// each.
+        #[arg(long = "capability-registry", value_name = "REPO_RELATIVE_PATH")]
+        capability_cell_registries: Vec<String>,
+        /// Absolute release-scoped Product Proof receipt; repeat for each.
+        #[arg(long = "product-proof", value_parser = absolute_path)]
+        product_proof_receipts: Vec<PathBuf>,
+        /// Absolute release-scoped migration evidence snapshot; repeat for each.
+        #[arg(long = "migration-evidence", value_parser = absolute_path)]
+        migration_evidence_snapshots: Vec<PathBuf>,
+        /// Absolute manifest this release rolls forward from.
+        #[arg(long, value_parser = absolute_path)]
+        supersedes: Option<PathBuf>,
+        /// Prior generation retained as the rollback target.
+        #[arg(long)]
+        prior_generation: Option<String>,
+        /// Absolute create-new manifest destination. It is published once and
+        /// is never overwritten.
+        #[arg(long, value_parser = absolute_path)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -631,6 +747,7 @@ fn run() -> Result<i32> {
         Command::Setup { command } => run_setup(command),
         Command::Plugin { command } => run_plugin(command),
         Command::Doctor { command } => run_doctor(command),
+        Command::Release { command } => run_release(command),
         Command::ControlBoard { command } => run_controlboard(command),
         Command::Backup { command } => backup_entry::run_backup(command),
         Command::Scope { command } => Ok(run_scope(command)),
@@ -786,6 +903,175 @@ fn run_doctor(command: DoctorCommand) -> Result<i32> {
                 }
                 Err(error) => {
                     write_installation_error("DOCTOR_INTEGRATION_INVALID", &error.to_string());
+                    Ok(INVALID_REQUEST_EXIT)
+                }
+            }
+        }
+        DoctorCommand::ReleaseSurface { manifest } => {
+            let observed_at = match release_surface::observed_unix_seconds() {
+                Ok(value) => value,
+                Err(error) => {
+                    write_installation_error("DOCTOR_RELEASE_SURFACE_INVALID", &error.to_string());
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+            };
+            // The comparison is read-only by construction: this front door
+            // decodes arguments and projects the report, and the gate never
+            // regenerates, repairs, or re-signs the accepted manifest.
+            match release_surface::verify_release_surface(&manifest, observed_at) {
+                Ok(report) => {
+                    let drift = report.drift_detected();
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    Ok(if drift { RELEASE_SURFACE_DRIFT_EXIT } else { 0 })
+                }
+                Err(error) => {
+                    write_installation_error("DOCTOR_RELEASE_SURFACE_INVALID", &error.to_string());
+                    Ok(INVALID_REQUEST_EXIT)
+                }
+            }
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one release-generation boundary keeps every observed input next to the field it binds"
+)]
+fn run_release(command: ReleaseCommand) -> Result<i32> {
+    match command {
+        ReleaseCommand::SurfaceManifest {
+            repo_root,
+            release_bundle,
+            phase_a_bundle,
+            phase_a_install_root,
+            release_install_root,
+            generation,
+            installation,
+            lineage_id,
+            sequence,
+            transaction_id,
+            profile,
+            recovery_command,
+            expires_at_unix_seconds,
+            generated_schemas,
+            generated_plugins,
+            generated_skills,
+            generated_hooks,
+            generated_prompts,
+            capability_cell_registries,
+            product_proof_receipts,
+            migration_evidence_snapshots,
+            supersedes,
+            prior_generation,
+            output,
+        } => {
+            let prior_generation = match prior_generation {
+                Some(value) => Some(cli_handle(value, "prior_generation")?),
+                None => None,
+            };
+            let input = release_surface::ReleaseSurfaceGenerateInput {
+                repo_root,
+                release_bundle,
+                phase_a_bundle,
+                phase_a_install_root,
+                release_install_root,
+                generation: cli_handle(generation, "generation")?,
+                installation: cli_handle(installation, "installation")?,
+                lineage_id: cli_handle(lineage_id, "lineage_id")?,
+                sequence,
+                transaction_id: cli_handle(transaction_id, "transaction_id")?,
+                profile,
+                recovery_command: cli_handle(recovery_command, "recovery_command")?,
+                expires_at_unix_seconds,
+                generated_schemas,
+                generated_plugins,
+                generated_skills,
+                generated_hooks,
+                generated_prompts,
+                capability_cell_registries,
+                product_proof_receipts,
+                migration_evidence_snapshots,
+                supersedes,
+                prior_generation,
+                output: output.clone(),
+            };
+            match release_surface::generate_release_surface_manifest(&input) {
+                Ok((manifest, bytes)) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "contract": release_surface::MANIFEST_WIRE_ID,
+                            "contract_version": release_surface::MANIFEST_SCHEMA_VERSION,
+                            "status": "RELEASE_SURFACE_MANIFEST_PUBLISHED",
+                            "manifest": output.display().to_string(),
+                            "manifest_bytes": bytes.len(),
+                            "manifest_sha256": format!("{:x}", Sha256::digest(&bytes)),
+                            "surface_digest": manifest.surface_digest,
+                            "release_id": manifest.release_id,
+                            "generation": manifest
+                                .product_and_source_identity
+                                .as_ref()
+                                .and_then(|identity| identity.generation.as_ref())
+                                .map(PlatformHandle::as_str),
+                            "source_commit": manifest
+                                .product_and_source_identity
+                                .as_ref()
+                                .and_then(|identity| identity.source_commit.clone()),
+                            "required_sections": release_surface::REQUIRED_SECTIONS,
+                            "bound": {
+                                "bundle_binaries": manifest
+                                    .executable_package_route_and_module_generation_digests
+                                    .as_ref()
+                                    .and_then(|value| value.bundle_binaries.as_ref())
+                                    .map_or(0, Vec::len),
+                                "phase_a_executables": manifest
+                                    .executable_package_route_and_module_generation_digests
+                                    .as_ref()
+                                    .and_then(|value| value.phase_a_executables.as_ref())
+                                    .map_or(0, Vec::len),
+                                "generated_schemas": manifest
+                                    .generated_schema_plugin_skill_hook_and_prompt_digests
+                                    .as_ref()
+                                    .and_then(|value| value.schemas.as_ref())
+                                    .map_or(0, Vec::len),
+                                "generated_plugins": manifest
+                                    .generated_schema_plugin_skill_hook_and_prompt_digests
+                                    .as_ref()
+                                    .and_then(|value| value.plugins.as_ref())
+                                    .map_or(0, Vec::len),
+                                "generated_skills": manifest
+                                    .generated_schema_plugin_skill_hook_and_prompt_digests
+                                    .as_ref()
+                                    .and_then(|value| value.skills.as_ref())
+                                    .map_or(0, Vec::len),
+                                "generated_hooks": manifest
+                                    .generated_schema_plugin_skill_hook_and_prompt_digests
+                                    .as_ref()
+                                    .and_then(|value| value.hooks.as_ref())
+                                    .map_or(0, Vec::len),
+                                "generated_prompts": manifest
+                                    .generated_schema_plugin_skill_hook_and_prompt_digests
+                                    .as_ref()
+                                    .and_then(|value| value.prompts.as_ref())
+                                    .map_or(0, Vec::len),
+                                "signing_identities": manifest
+                                    .release_receipt_and_signing_identity
+                                    .as_ref()
+                                    .and_then(|value| value.signing_identities.as_ref())
+                                    .map_or(0, Vec::len),
+                            },
+                            "immutability": "create_new_read_only_published_once",
+                            "verify_with": "eliot doctor release-surface --manifest <exact path>",
+                            "scope": INSTALLATION_SCOPE,
+                        }))?
+                    );
+                    Ok(0)
+                }
+                Err(error) => {
+                    write_installation_error(
+                        "RELEASE_SURFACE_MANIFEST_REJECTED",
+                        &error.to_string(),
+                    );
                     Ok(INVALID_REQUEST_EXIT)
                 }
             }
