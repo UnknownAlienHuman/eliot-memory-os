@@ -5,14 +5,41 @@
 //!
 //! This is the sole redb owner for the installation registry. It owns durable bytes and atomic CAS only; it does not mint canonical memory, Kernel authority, or Governor semantics, does not synthesize defaults, does not infer migration, and does not retry unowned operations. All production mutations are narrow transaction-bound operations with expected revision and exact typed approval. Validated projections are operational only.
 //!
-//! Handle lifetime: the installer holds this writer `Database` only for the
-//! bounded stage/load projection and releases it before any SCM start or
-//! convergence wait, and the Host holds no writer across its process lifetime
-//! (one short-lived open-use-drop per CAS/readback via
-//! `open_existing_at` + bounded `AlreadyOpen` retry, #1339). A held writer
-//! blocks the Watchdog approval reader (`inspect_existing_at`, a short-lived
-//! `ReadOnlyDatabase`); terminal reconcile re-opens short-lived handles via
-//! `open_existing_at`.
+//! Handle lifetime and owner model (A13.9:14, s37/#1339).
+//!
+//! redb 4.1.0 takes one exclusive OS file lock for `Database::create`/`open`
+//! and a shared lock for `ReadOnlyDatabase::open`, so exactly one writer may
+//! hold this file at a time, in or across processes. A13.9 therefore requires
+//! that no transaction, exclusive owner, or global lock is held during an
+//! unbounded wait. This crate discharges that with one owner model: **every
+//! handle is scoped to one bounded read or one bounded write, and the handle
+//! is dropped before any polling, SCM, convergence, or external effect wait.**
+//! redb cannot offer a shared reader/writer open or a snapshot model, so no
+//! long-lived registry owner is admitted.
+//!
+//! Complete inventory of the production opens, by lifetime and mode:
+//!
+//! | Owner | Symbol | Mode | Lifetime |
+//! |---|---|---|---|
+//! | installer staging | `open_at` | exclusive writer | bounded stage/load projection, dropped before the SCM start + convergence wait |
+//! | installer terminal reconcile | `reconcile_host_activation_terminal` → `inspect_existing_at` | shared reader | one bounded read of the committed terminal |
+//! | installer owner-aware rollback | `WindowsInstallationCoordinator::rollback_with_activation_owner` → `open_existing_at` | exclusive writer | one bounded abort phase, dropped before the transaction CAS and the external rollback effects |
+//! | Host CAS / readback | `eliot-host::open_registry_store_at` → `open_existing_at` | exclusive writer | one bounded CAS or load per call |
+//! | Watchdog polls | `inspect_existing_at` | shared reader | one bounded poll, 250ms/2s cadence |
+//!
+//! Two consequences are load-bearing. First, the Host is **not** a
+//! process-lifetime exclusive owner: `HostComposition` retains only the
+//! canonical `registry_host_root` plus a revision-keyed, rebuildable
+//! `ApprovedGenerationRegistry` projection and re-opens one short-lived handle
+//! per CAS/readback, so no Host writer survives a wait and the Watchdog
+//! reader is never starved by it. Second, because no side retains the writer,
+//! `DatabaseAlreadyOpen` between two short-lived sides is transient
+//! contention rather than a dead owner: the single typed retry helpers
+//! (`redb_state::{open_registry_reader_with_retry,
+//! open_registry_writer_with_retry, open_registry_writer_create_with_retry}`)
+//! retry only that variant with bounded backoff, so readers converge inside
+//! their readiness window and a writer retries then fails typed with its cause
+//! preserved. No retry extends or bypasses an approval or State Fence.
 
 use std::path::{Path, PathBuf};
 
@@ -226,11 +253,11 @@ impl RedbInstallationRegistry {
             ));
         }
         // A13.9 short-lived writer: bounded AlreadyOpen retry only
-        // (sole-owner contract above, lines 6-13). The installer drops this
-        // handle before any SCM start or convergence wait
-        // (bins/eliot/src/main.rs:2959), so contention with the Watchdog poll
-        // reader is transient; non-contention errors return immediately with
-        // their cause preserved.
+        // (the sole-owner contract in this module's owner-model table). The
+        // installer drops this handle before any SCM start or convergence wait
+        // (`bins/eliot/src/main.rs::drop(registry)`), so contention with the
+        // Watchdog poll reader is transient; non-contention errors return
+        // immediately with their cause preserved.
         let database = crate::redb_state::open_registry_writer_create_with_retry(file.path())?;
         file.verify_path_identity()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
@@ -276,12 +303,12 @@ impl RedbInstallationRegistry {
         }
         file.verify_path_identity()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        // A13.9 short-lived owner-aware rollback writer
-        // (`WindowsInstallationCoordinator::rollback_with_activation_owner`,
-        // `crates/kernel/eliot-installation/src/lib.rs:9344`): bounded
-        // AlreadyOpen retry only against live Watchdog poll readers; the
-        // handle is dropped before the transaction compare-and-save and the
-        // external rollback effects, and non-contention errors return
+        // A13.9 short-lived owner-aware rollback and Host CAS writer
+        // (`WindowsInstallationCoordinator::rollback_with_activation_owner`
+        // and `eliot-host::open_registry_store_at`): bounded AlreadyOpen retry
+        // only against live Watchdog poll readers; the handle is dropped after
+        // one abort phase / one CAS and before any transaction compare-and-save
+        // or external rollback effect, and non-contention errors return
         // immediately with cause preserved.
         let database = crate::redb_state::open_registry_writer_with_retry(file.path())?;
         file.verify_path_identity()

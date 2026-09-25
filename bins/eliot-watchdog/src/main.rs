@@ -14,6 +14,8 @@ mod runtime_loop;
 mod watchdog_service_status;
 
 use runtime_loop::run_watchdog;
+#[cfg(windows)]
+use runtime_loop::transient_lock_backoff;
 
 use eliot_platform_windows::ServiceBootstrapArguments;
 #[cfg(windows)]
@@ -391,22 +393,26 @@ fn validate_registered_process_bootstrap()
 /// registry-lock contention (s37/#1339). Each validation attempt already
 /// retries inside the single typed reader open
 /// (`inspect_existing_at`/`open_registry_reader_with_retry`); this outer
-/// loop only covers contention that outlasts that window. Six attempts sleep
-/// 250ms, 500ms, 1s, 2s, 2s capped between tries, and every retry
-/// re-publishes `SERVICE_START_PENDING` so the SCM start window stays armed.
-/// An SCM stop exits cleanly instead of polling.
+/// loop only covers contention that outlasts that window. Six attempts with
+/// the shared `runtime_loop::transient_lock_backoff` schedule (250ms, 500ms,
+/// 1s, 2s, 2s capped between tries), and every retry re-publishes
+/// `SERVICE_START_PENDING` so the SCM start window stays armed. An SCM stop
+/// exits cleanly instead of polling.
+///
+/// Six is the repository's existing bounded-contention budget for this exact
+/// redb file (the installer's terminal-reconcile writer open and the Host
+/// registry open), not a value chosen for this call site.
 #[cfg(windows)]
 const BOOTSTRAP_TRANSIENT_RETRY_ATTEMPTS: u32 = 6;
-#[cfg(windows)]
-const BOOTSTRAP_TRANSIENT_RETRY_BASE_MS: u64 = 250;
-#[cfg(windows)]
-const BOOTSTRAP_TRANSIENT_RETRY_MAX_MS: u64 = 2_000;
-/// SCM start-pending wait hint re-armed on every bootstrap retry, matching
-/// the initial `SERVICE_START_PENDING` publication above.
+/// SCM start-pending wait hint re-armed on every bootstrap retry. It repeats
+/// the initial `SERVICE_START_PENDING` publication above verbatim, so the
+/// readiness window is not shortened or extended by retrying.
 #[cfg(windows)]
 const BOOTSTRAP_RETRY_WAIT_HINT_MS: u32 = 10_000;
 /// Stop-poll slice while awaiting the next bootstrap retry, so an SCM stop
 /// during the wait is observed promptly instead of after a full backoff.
+/// This is a responsiveness bound only: it carries no approval, fence, or
+/// authority meaning and does not change any retry budget.
 #[cfg(windows)]
 const BOOTSTRAP_RETRY_STOP_POLL_MS: u64 = 50;
 
@@ -420,6 +426,11 @@ enum BootstrapValidationOutcome {
 
 /// Validates the captured process bootstrap, retrying only exact transient
 /// registry-lock contention with bounded stop-aware backoff.
+///
+/// Each attempt is a complete re-validation: the registry read and the
+/// read-only SCM inspection both run again from the immutable captured
+/// bootstrap, and nothing is cached between attempts, so a retry can neither
+/// widen nor extend an approval, a State Fence, or a revision check.
 ///
 /// Only the redb file-lock signal (`DatabaseAlreadyOpen`, probed by
 /// `FileWatchdogAdmission::is_transient_registry_lock` through the
@@ -439,6 +450,12 @@ fn validate_bootstrap_with_transient_retry(
         match validate_registered_process_bootstrap() {
             Ok(launch) => return BootstrapValidationOutcome::Validated(Box::new(launch)),
             Err(error) => {
+                // Re-check after the read: a stop published by
+                // `service_control` while this attempt held the registry must
+                // not be regressed back to `SERVICE_START_PENDING` below.
+                if stop_signal.load(Ordering::Acquire) {
+                    return BootstrapValidationOutcome::StopRequested;
+                }
                 let transient = eliot_watchdog::FileWatchdogAdmission::is_transient_registry_lock(
                     &error.to_string(),
                 );
@@ -461,10 +478,7 @@ fn validate_bootstrap_with_transient_retry(
                     attempt + 1,
                     BOOTSTRAP_RETRY_WAIT_HINT_MS,
                 );
-                let shift = (attempt - 1).min(3);
-                let backoff_ms = (BOOTSTRAP_TRANSIENT_RETRY_BASE_MS << shift)
-                    .min(BOOTSTRAP_TRANSIENT_RETRY_MAX_MS);
-                if sleep_until_stop(stop_signal, backoff_ms) {
+                if sleep_until_stop(stop_signal, transient_lock_backoff(attempt)) {
                     return BootstrapValidationOutcome::StopRequested;
                 }
             }
@@ -472,18 +486,18 @@ fn validate_bootstrap_with_transient_retry(
     }
 }
 
-/// Sleeps `millis` while an SCM stop is still absent, polling the stop
+/// Sleeps `backoff` while an SCM stop is still absent, polling the stop
 /// signal in bounded slices. Returns true when a stop was observed.
 #[cfg(windows)]
-fn sleep_until_stop(stop_signal: &AtomicBool, millis: u64) -> bool {
-    let mut waited = 0_u64;
-    while waited < millis {
+fn sleep_until_stop(stop_signal: &AtomicBool, backoff: Duration) -> bool {
+    let mut remaining = backoff;
+    while !remaining.is_zero() {
         if stop_signal.load(Ordering::Acquire) {
             return true;
         }
-        let slice = (millis - waited).min(BOOTSTRAP_RETRY_STOP_POLL_MS);
-        std::thread::sleep(Duration::from_millis(slice));
-        waited += slice;
+        let slice = remaining.min(Duration::from_millis(BOOTSTRAP_RETRY_STOP_POLL_MS));
+        std::thread::sleep(slice);
+        remaining -= slice;
     }
     stop_signal.load(Ordering::Acquire)
 }

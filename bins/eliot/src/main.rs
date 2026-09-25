@@ -3193,7 +3193,9 @@ fn run_installation_effect(
 /// durable activation intent.  The CLI only wires already-owned capabilities:
 /// the protected Host root bounds the registry opens while the
 /// installation-wide Host lease supplies the non-forgeable mutation proof.
-/// No caller-supplied approval, registry revision, or root path is accepted.
+/// No caller-supplied approval or registry revision is accepted, and the root
+/// is not caller-supplied either: it is read from the durable transaction's
+/// own candidate manifest, never from argv, environment, or a prompt.
 ///
 /// s37/#1339 ownership: the coordinator opens one short-lived registry writer
 /// per abort-phase touch (`open_existing_at` with the single typed bounded
