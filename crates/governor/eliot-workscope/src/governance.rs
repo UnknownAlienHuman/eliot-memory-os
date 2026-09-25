@@ -3,31 +3,56 @@
 //! Caller seam for the inputs that make scope/task admission meaningful:
 //!
 //! - who builds source candidates: the bootstrap-scanner/attach caller, only
-//!   from an authenticated root ([`GoverningSourceCandidate::from_authenticated_root`])
-//!   or from a read admitted by a valid [`DiscoveryReadLease`](super::DiscoveryReadLease)
+//!   from an authenticated resolution receipt
+//!   ([`GoverningSourceCandidate::from_authenticated_root`], which derives the
+//!   root identity from the receipt and binds the candidate scope/generation
+//!   to the authenticated selection) or from a read admitted by a valid
+//!   [`DiscoveryReadLease`](super::DiscoveryReadLease)
 //!   ([`GoverningSourceCandidate::from_discovery_lease`]). File names, recency,
-//!   locations and model summaries never produce candidates;
+//!   locations, model summaries, and bare caller-asserted identity strings
+//!   never produce candidates;
 //! - who promotes a candidate to `admitted`: an applicable authority/contract
-//!   ([`AuthorityBasis`]) attached as the candidate's claim, checked by
-//!   [`admit_governing_sources`]. Precedence between roles applies only when
-//!   the project declared it ([`PrecedenceDeclaration`]); there is no
-//!   hard-coded Architecture-over-Implementation default;
+//!   claim attached to the candidate and resolved against the admission
+//!   request by [`admit_governing_sources`]. A Human claim applies only when
+//!   it names the request's required owner; a delegation claim applies only
+//!   when the delegated task names a proven current binding carried by the
+//!   request; a contract claim applies only when the contract is listed as
+//!   proven by the request. Inapplicable claims fail the request with
+//!   [`WorkScopeError::TaskAuthorityDenied`](super::WorkScopeError::TaskAuthorityDenied)
+//!   instead of promoting. Precedence between roles applies only when the
+//!   project declared it with an applicable authority
+//!   ([`PrecedenceDeclaration`]); there is no hard-coded
+//!   Architecture-over-Implementation default, and a precedence-admitted
+//!   winner carries the declaration authority as its basis;
 //! - who consumes conflicts: [`admit_governing_sources`] returns a
 //!   [`SourceConflictSet`] with the required owner instead of selecting a
-//!   winner, and [`source_readiness`] (called by
+//!   winner. Same-handle digest divergence with no agreed applicable claim or
+//!   applicable declared precedence stays conflicted (there is no ordering
+//!   oracle to call it version drift), and every preserved quarantined,
+//!   provider-modified, or provider-conflicted record joins the conflict set
+//!   and the unresolved references, so [`source_readiness`] (called by
 //!   [`ColdStartController::compile`](super::ColdStartController)) fails
-//!   compilation for conflicted sets so no Material effect is eligible;
+//!   compilation for conflicted sets and no Material effect is eligible;
 //! - who submits tasks: [`TaskIntakeCandidate`] keeps origin provenance and
 //!   missing fields; promotion to a current binding requires the decision
-//!   owner or a delegated binding ([`TaskIntakeCandidate::promote`]), while
+//!   owner directly or a delegation proven by presenting the existing current
+//!   binding the delegation names ([`TaskIntakeCandidate::promote`]), while
 //!   [`TaskIntakeCandidate::admit_exploratory`] offers a bounded exploratory
 //!   binding that can never authorize Material effects. Missing task data is
 //!   answered with [`task_selection_required`], the `TASK_SELECTION_REQUIRED`
-//!   shape with a minimal valid intake example.
+//!   shape with a minimal valid intake example. The self-reported
+//!   `missing_fields` list is never trusted: completeness is recomputed from
+//!   the fields and a mismatch fails validation;
+//! - how long admission lasts: the fence and expiry live on
+//!   [`GoverningSourceAdmission`] together with the required owner, coverage,
+//!   and applied precedences; [`GoverningSourceAdmission::is_live`] (and the
+//!   [`GoverningSourceAdmission::require_live`] gate) is enforced by the
+//!   Governor admission entry before an admission is retained or consumed.
 
 use super::{
     DiscoveryRead, DiscoveryReadLease, GoverningSource, GoverningSourceRole, GoverningSourceSet,
-    SourceStatus, TaskBindingInput, WorkScopeError, counter, digest, text, unique,
+    ResolutionAuthentication, SourceStatus, TaskBindingInput, TaskBindingState, WorkScopeError,
+    WorkScopeResolutionReceipt, counter, digest, text, unique,
 };
 use eliot_contracts::{StateFence, sha256_hex};
 use eliot_security_contracts::{
@@ -88,9 +113,11 @@ impl AuthorityBasis {
 
 /// Project-declared precedence of one governing role over another for one scope.
 ///
-/// Precedence exists only when declared here. In particular there is no
-/// implicit Architecture-over-Implementation rule: that pair applies only
-/// when a declaration names it for the scope.
+/// Precedence exists only when declared here with an applicable authority.
+/// In particular there is no implicit Architecture-over-Implementation rule:
+/// that pair applies only when a declaration names it for the scope, and the
+/// declaration authority is what a precedence-admitted winner carries as its
+/// basis.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PrecedenceDeclaration {
@@ -98,17 +125,25 @@ pub struct PrecedenceDeclaration {
     pub higher: GoverningSourceRole,
     pub lower: GoverningSourceRole,
     pub declared_by: String,
+    pub authority: AuthorityBasis,
 }
 
 impl PrecedenceDeclaration {
     /// Validates the declaration without applying it to any candidate.
     ///
+    /// Validation never applies the declaration: admission additionally
+    /// requires the authority to be applicable to the request (the required
+    /// owner, a proven delegation, or a proven contract), and inapplicable
+    /// declarations resolve nothing.
+    ///
     /// # Errors
     ///
-    /// Returns an error when references are invalid or both roles are identical.
+    /// Returns an error when references are invalid, the authority is
+    /// invalid, or both roles are identical.
     pub fn validate(&self) -> Result<(), WorkScopeError> {
         text(&self.scope_ref, "precedence.scope_ref")?;
         text(&self.declared_by, "precedence.declared_by")?;
+        self.authority.validate()?;
         if self.higher == self.lower {
             return Err(WorkScopeError::DuplicateReference {
                 field: "precedence roles",
@@ -190,18 +225,36 @@ pub struct NewSourceCandidate {
 impl GoverningSourceCandidate {
     /// Builds a candidate observed at an authenticated root.
     ///
+    /// The caller presents the authenticated resolution receipt, never a bare
+    /// identity string: the receipt must validate with
+    /// [`ResolutionAuthentication::Authenticated`], the candidate scope and
+    /// generation must equal the authenticated selection, and the root
+    /// identity is derived from the receipt. Anything else fails closed
+    /// without producing a candidate.
+    ///
     /// # Errors
     ///
-    /// Returns an error when identity, digest, generation, assurance, domain
-    /// or claim evidence is invalid.
+    /// Returns an error when the receipt is not authenticated, names a
+    /// different scope or generation, or when digest, generation, assurance,
+    /// domain or claim evidence is invalid.
     pub fn from_authenticated_root(
         params: NewSourceCandidate,
-        root_identity: String,
+        receipt: &WorkScopeResolutionReceipt,
     ) -> Result<Self, WorkScopeError> {
-        text(&root_identity, "candidate.root_identity")?;
+        receipt.validate()?;
+        if receipt.authentication != ResolutionAuthentication::Authenticated {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        if params.applicable_scope_ref != receipt.selected.scope_ref
+            || params.applicable_generation != receipt.selected.generation
+        {
+            return Err(WorkScopeError::SourceSetMismatch);
+        }
         Self::build(
             params,
-            SourceCandidateOrigin::AuthenticatedRoot { root_identity },
+            SourceCandidateOrigin::AuthenticatedRoot {
+                root_identity: receipt.selected.root_identity.clone(),
+            },
         )
     }
 
@@ -357,7 +410,39 @@ pub enum SourceCoverage {
     ExplicitAbsence { reason_ref: String },
 }
 
+/// Proven contract the admission request may resolve contract claims against.
+///
+/// A contract claim is applicable only when the request carries the contract
+/// here with the resolver that proved it; the admission crate holds no
+/// contract registry, so existence is proven by the production caller that
+/// built the request from live governor state, never by the claimant.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProvenContract {
+    pub contract_ref: String,
+    pub proven_by_ref: String,
+}
+
+impl ProvenContract {
+    /// Validates the proven contract without granting anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a reference is blank or carries control characters.
+    pub fn validate(&self) -> Result<(), WorkScopeError> {
+        text(&self.contract_ref, "proven_contract.contract_ref")?;
+        text(&self.proven_by_ref, "proven_contract.proven_by_ref")
+    }
+}
+
 /// Input to [`admit_governing_sources`].
+///
+/// Delegation claims resolve against `proven_current_bindings`: a delegation
+/// is applicable only when it names the task of a current binding carried
+/// here (the production caller populates these from live governor task
+/// state). Contract claims resolve against `proven_contracts`. Human claims
+/// resolve against `required_owner_ref`. Claims that resolve against none of
+/// these fail the request; they never promote.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceAdmissionRequest {
     pub scope_ref: String,
@@ -365,9 +450,45 @@ pub struct SourceAdmissionRequest {
     pub candidates: Vec<GoverningSourceCandidate>,
     pub precedences: Vec<PrecedenceDeclaration>,
     pub required_owner_ref: String,
+    pub proven_current_bindings: Vec<TaskBindingState>,
+    pub proven_contracts: Vec<ProvenContract>,
     pub absence_reason_ref: Option<String>,
     pub state_fence: StateFence,
     pub expires_at: u64,
+}
+
+impl SourceAdmissionRequest {
+    /// Records one proven contract without granting anything.
+    ///
+    /// Lets callers that cannot name [`ProvenContract`] (it is not re-exported
+    /// past this module) still resolve contract claims from plain references.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a reference is blank, carries control characters,
+    /// or duplicates an already proven contract.
+    pub fn with_proven_contract(
+        mut self,
+        contract_ref: String,
+        proven_by_ref: String,
+    ) -> Result<Self, WorkScopeError> {
+        let proven = ProvenContract {
+            contract_ref,
+            proven_by_ref,
+        };
+        proven.validate()?;
+        if self
+            .proven_contracts
+            .iter()
+            .any(|existing| existing.contract_ref == proven.contract_ref)
+        {
+            return Err(WorkScopeError::DuplicateReference {
+                field: "proven_contract.contract_ref",
+            });
+        }
+        self.proven_contracts.push(proven);
+        Ok(self)
+    }
 }
 
 /// Outcome of [`admit_governing_sources`].
@@ -375,6 +496,9 @@ pub struct SourceAdmissionRequest {
 /// `admitted` holds only `admitted` records and is the sole input eligible
 /// for readiness; `preserved` keeps every non-admitted record under its
 /// honest status; `conflict` names the clash and the owner who must resolve it.
+/// `required_owner_ref` is the owner every Human claim resolved against, so
+/// the fence-carrying result always names its authority next to the fence and
+/// expiry instead of leaving them on a separate unreadable result.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GoverningSourceAdmission {
@@ -382,6 +506,7 @@ pub struct GoverningSourceAdmission {
     pub preserved: Vec<GoverningSource>,
     pub conflict: Option<SourceConflictSet>,
     pub coverage: SourceCoverage,
+    pub required_owner_ref: String,
     pub applied_precedences: Vec<PrecedenceDeclaration>,
     pub state_fence: StateFence,
     pub expires_at: u64,
@@ -392,6 +517,116 @@ impl GoverningSourceAdmission {
     #[must_use]
     pub fn is_live(&self, now: u64) -> bool {
         now <= self.expires_at
+    }
+
+    /// Fails closed when the admission fence is no longer live at `now`.
+    ///
+    /// Production callers enforce this before retaining or consuming an
+    /// admission, so an expired fence can never stay eligible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkScopeError::SourceSetMismatch`] when `now` is past
+    /// `expires_at`.
+    pub fn require_live(&self, now: u64) -> Result<(), WorkScopeError> {
+        if self.is_live(now) {
+            Ok(())
+        } else {
+            Err(WorkScopeError::SourceSetMismatch)
+        }
+    }
+
+    /// Fails closed when any admitted record lacks an authority basis.
+    ///
+    /// Admission constructs admitted records only through an applicable claim
+    /// or an applicable declared precedence, so this always holds; the gate
+    /// exists so production callers (and any future readiness check) fail
+    /// closed instead of trusting the invariant silently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkScopeError::TaskAuthorityDenied`] when an admitted record
+    /// carries no authority basis.
+    pub fn require_admitted_authority(&self) -> Result<(), WorkScopeError> {
+        if self
+            .admitted
+            .sources
+            .iter()
+            .all(|source| source.authority_basis.is_some())
+        {
+            Ok(())
+        } else {
+            Err(WorkScopeError::TaskAuthorityDenied)
+        }
+    }
+
+    /// Validates the admission shape without re-resolving any authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the required owner is invalid, the fence or
+    /// expiry is malformed, a declaration is malformed, or the conflict set
+    /// is malformed.
+    pub fn validate(&self) -> Result<(), WorkScopeError> {
+        text(&self.required_owner_ref, "admission.required_owner_ref")?;
+        counter(self.expires_at, "admission.expires_at")?;
+        self.state_fence
+            .validate()
+            .map_err(|_| WorkScopeError::InvalidStateFence)?;
+        for precedence in &self.applied_precedences {
+            precedence.validate()?;
+        }
+        if let Some(conflict) = &self.conflict {
+            conflict.validate()?;
+            if conflict.required_owner_ref != self.required_owner_ref {
+                return Err(WorkScopeError::SourceSetMismatch);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Borrowed admission scope used to resolve claim and declaration authority.
+///
+/// Built from the request before candidates move into triage, so resolution
+/// always judges applicability against the same request the caller signed.
+struct AdmissionContext<'a> {
+    scope_ref: &'a str,
+    required_owner_ref: &'a str,
+    precedences: &'a [PrecedenceDeclaration],
+    proven_current_bindings: &'a [TaskBindingState],
+    proven_contracts: &'a [ProvenContract],
+}
+
+/// Returns whether a claim is applicable to an admission request.
+///
+/// A Human claim applies only when it names the request's required owner; a
+/// delegation claim applies only when it names the task of a proven current
+/// binding carried by the request; a contract claim applies only when the
+/// request lists the contract as proven. Anything else promotes nothing.
+#[must_use]
+fn claim_is_applicable(claim: &AuthorityBasis, context: &AdmissionContext<'_>) -> bool {
+    match claim {
+        AuthorityBasis::HumanOwner { owner_ref } => {
+            owner_ref.as_str() == context.required_owner_ref
+        }
+        AuthorityBasis::DelegatedTaskBinding { task_ref, .. } => context
+            .proven_current_bindings
+            .iter()
+            .any(|binding| match binding {
+                TaskBindingState::CurrentTaskContract {
+                    task_ref: proven_ref,
+                    ..
+                } => proven_ref == task_ref,
+                TaskBindingState::None_
+                | TaskBindingState::Exploratory { .. }
+                | TaskBindingState::Ambiguous { .. }
+                | TaskBindingState::Stale { .. } => false,
+            }),
+        AuthorityBasis::ProjectContract { contract_ref } => context
+            .proven_contracts
+            .iter()
+            .any(|proven| &proven.contract_ref == contract_ref),
     }
 }
 
@@ -418,6 +653,35 @@ fn validate_admission_request(request: &SourceAdmissionRequest) -> Result<(), Wo
         precedence.validate()?;
         if precedence.scope_ref != request.scope_ref {
             return Err(WorkScopeError::SourceSetMismatch);
+        }
+    }
+    for proven in &request.proven_contracts {
+        proven.validate()?;
+    }
+    unique(
+        request
+            .proven_contracts
+            .iter()
+            .map(|proven| &proven.contract_ref),
+        "proven_contract.contract_ref",
+    )?;
+    for binding in &request.proven_current_bindings {
+        match binding {
+            TaskBindingState::CurrentTaskContract {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+            } => {
+                text(task_ref, "proven_binding.task_ref")?;
+                counter(*task_revision, "proven_binding.task_revision")?;
+                text(acceptance_digest, "proven_binding.acceptance_digest")?;
+            }
+            TaskBindingState::None_
+            | TaskBindingState::Exploratory { .. }
+            | TaskBindingState::Ambiguous { .. }
+            | TaskBindingState::Stale { .. } => {
+                return Err(WorkScopeError::SourceSetMismatch);
+            }
         }
     }
     for candidate in &request.candidates {
@@ -476,98 +740,117 @@ struct GroupResolution {
 
 /// Resolves one handle group without ever selecting a silent winner.
 ///
-/// One digest admits through its attached authority claim or stays a
-/// candidate. Several digests resolve only through a single agreed owner
-/// claim or one applicable project-declared precedence; disagreeing claims
-/// and undeclared clashes stay conflicted.
+/// One digest admits through its attached applicable authority claim or stays
+/// a candidate; the admitted record is deterministic (lowest role among the
+/// applicable-claimed candidates) instead of first-in-request-order. Several
+/// digests resolve only through a single agreed applicable owner claim or one
+/// applicable project-declared precedence, and the precedence winner carries
+/// the declaration authority as its basis; disagreeing claims, inapplicable
+/// claims, and undeclared clashes stay conflicted or fail the request. No
+/// branch selects a winner from filename, recency, location or model output.
+///
+/// # Errors
+///
+/// Returns [`WorkScopeError::TaskAuthorityDenied`] when any candidate carries
+/// a claim that is not applicable to the request.
 fn resolve_group(
     group: Vec<GoverningSourceCandidate>,
-    precedences: &[PrecedenceDeclaration],
-    scope_ref: &str,
-) -> GroupResolution {
-    let mut digests: BTreeSet<&str> = BTreeSet::new();
+    context: &AdmissionContext<'_>,
+) -> Result<GroupResolution, WorkScopeError> {
+    if group.is_empty() {
+        return Ok(GroupResolution {
+            admitted: Vec::new(),
+            preserved: Vec::new(),
+            conflicted: false,
+            applied: Vec::new(),
+        });
+    }
     for candidate in &group {
+        if let Some(claim) = &candidate.claim
+            && !claim_is_applicable(claim, context)
+        {
+            return Err(WorkScopeError::TaskAuthorityDenied);
+        }
+    }
+    let mut ordered = group;
+    ordered.sort_by(|left, right| {
+        left.role
+            .cmp(&right.role)
+            .then(left.digest.cmp(&right.digest))
+    });
+    let mut digests: BTreeSet<&str> = BTreeSet::new();
+    for candidate in &ordered {
         digests.insert(candidate.digest.as_str());
     }
     if digests.len() == 1 {
-        let only = group.into_iter().next();
-        let Some(candidate) = only else {
-            return GroupResolution {
-                admitted: Vec::new(),
-                preserved: Vec::new(),
-                conflicted: false,
-                applied: Vec::new(),
-            };
-        };
-        if candidate.claim.is_some() {
-            return GroupResolution {
-                admitted: vec![candidate.into_record(SourceStatus::Admitted)],
-                preserved: Vec::new(),
-                conflicted: false,
-                applied: Vec::new(),
-            };
+        let mut admitted = Vec::new();
+        let mut preserved = Vec::new();
+        for candidate in ordered {
+            if admitted.is_empty() && candidate.claim.is_some() {
+                admitted.push(candidate.into_record(SourceStatus::Admitted));
+            } else {
+                preserved.push(candidate.into_record(SourceStatus::Candidate));
+            }
         }
-        return GroupResolution {
-            admitted: Vec::new(),
-            preserved: vec![candidate.into_record(SourceStatus::Candidate)],
+        return Ok(GroupResolution {
+            admitted,
+            preserved,
             conflicted: false,
             applied: Vec::new(),
-        };
+        });
     }
     let mut claimed: BTreeSet<String> = BTreeSet::new();
-    for candidate in &group {
+    for candidate in &ordered {
         if candidate.claim.is_some() {
             claimed.insert(candidate.digest.clone());
         }
     }
     if claimed.len() > 1 {
-        return conflicted_group(group);
+        return Ok(conflicted_group(ordered));
     }
     if let Some(winner_digest) = claimed.iter().next().cloned() {
         let mut admitted = Vec::new();
         let mut preserved = Vec::new();
-        for candidate in group {
+        for candidate in ordered {
             if candidate.digest == winner_digest {
                 admitted.push(candidate.into_record(SourceStatus::Admitted));
             } else {
                 preserved.push(candidate.into_record(SourceStatus::Superseded));
             }
         }
-        return GroupResolution {
+        return Ok(GroupResolution {
             admitted,
             preserved,
             conflicted: false,
             applied: Vec::new(),
-        };
+        });
     }
-    if let Some(winner) = precedence_winner(&group, precedences, scope_ref) {
-        let winner_role = winner.role;
+    if let Some((winner, applied)) = precedence_winner(&ordered, context) {
         let winner_digest = winner.digest.clone();
-        let applied: Vec<PrecedenceDeclaration> = precedences
-            .iter()
-            .filter(|declaration| {
-                declaration.applies_to(scope_ref, winner_role, declaration.lower)
-                    || declaration.applies_to(scope_ref, declaration.higher, winner_role)
-            })
-            .cloned()
-            .collect();
+        let winner_authority = applied
+            .first()
+            .map(|declaration| declaration.authority.clone());
         let mut admitted = Vec::new();
         let mut preserved = Vec::new();
-        for candidate in group {
+        for candidate in ordered {
             if candidate.digest == winner_digest {
-                admitted.push(candidate.into_record(SourceStatus::Admitted));
+                let mut record = candidate.into_record(SourceStatus::Admitted);
+                if record.authority_basis.is_none() {
+                    record.authority_basis.clone_from(&winner_authority);
+                }
+                admitted.push(record);
             } else {
                 preserved.push(candidate.into_record(SourceStatus::Superseded));
             }
         }
-        return GroupResolution {
+        return Ok(GroupResolution {
             admitted,
             preserved,
             conflicted: false,
             applied,
-        };
+        });
     }
-    conflicted_group(group)
+    Ok(conflicted_group(ordered))
 }
 
 /// Preserves every member of an unresolvable group as conflicted.
@@ -585,19 +868,25 @@ fn conflicted_group(group: Vec<GoverningSourceCandidate>) -> GroupResolution {
 /// Admits governing sources from exact candidates without inferring authority.
 ///
 /// Candidates promote to `admitted` only through an attached applicable
-/// authority/contract claim. Incompatible documents (one handle, several
-/// digests) resolve only through a single agreed owner claim or an applicable
-/// project-declared precedence; disagreeing owner claims and undeclared
-/// clashes become a [`SourceConflictSet`] with the required owner, and every
-/// involved record is preserved as `conflicted`. Stale or quarantined
-/// evidence is preserved as `stale`/`conflicted` and never admitted. No
-/// branch selects a winner from filename, recency, location or model output.
+/// authority/contract claim resolved against the request (required owner,
+/// proven current bindings, proven contracts). Incompatible documents (one
+/// handle, several digests) resolve only through a single agreed applicable
+/// claim or an applicable project-declared precedence, and the precedence
+/// winner carries the declaration authority; disagreeing or inapplicable
+/// claims and undeclared clashes become a [`SourceConflictSet`] with the
+/// required owner (inapplicable claims fail the request outright), and every
+/// involved record is preserved as `conflicted`. Stale, quarantined, or
+/// provider-flagged evidence is preserved under its honest status and its
+/// handle joins the conflict set and the unresolved references, so readiness
+/// observes it instead of losing it in the preserved list. No branch selects
+/// a winner from filename, recency, location or model output.
 ///
 /// # Errors
 ///
-/// Returns an error when scope, generation, owner, fence, expiry, precedence
-/// or candidate evidence is malformed, when a candidate or precedence names a
-/// different scope/generation, or when no candidates exist without an explicit
+/// Returns an error when scope, generation, owner, fence, expiry, precedence,
+/// proven-binding, or candidate evidence is malformed, when a candidate or
+/// precedence names a different scope/generation, when a claim is not
+/// applicable to the request, or when no candidates exist without an explicit
 /// absence reason.
 pub fn admit_governing_sources(
     request: SourceAdmissionRequest,
@@ -620,24 +909,37 @@ pub fn admit_governing_sources(
             coverage: SourceCoverage::ExplicitAbsence {
                 reason_ref: reason.clone(),
             },
+            required_owner_ref: request.required_owner_ref.clone(),
             applied_precedences: Vec::new(),
             state_fence: request.state_fence,
             expires_at: request.expires_at,
         });
     }
 
+    let context = AdmissionContext {
+        scope_ref: &request.scope_ref,
+        required_owner_ref: &request.required_owner_ref,
+        precedences: &request.precedences,
+        proven_current_bindings: &request.proven_current_bindings,
+        proven_contracts: &request.proven_contracts,
+    };
     let (groups, mut preserved) = triage_candidates(request.candidates);
     let mut admitted: Vec<GoverningSource> = Vec::new();
     let mut conflicting: BTreeSet<String> = BTreeSet::new();
     let mut applied_precedences: Vec<PrecedenceDeclaration> = Vec::new();
     for (source_ref, group) in groups {
-        let resolution = resolve_group(group, &request.precedences, &request.scope_ref);
+        let resolution = resolve_group(group, &context)?;
         if resolution.conflicted {
             conflicting.insert(source_ref.clone());
         }
         admitted.extend(resolution.admitted);
         preserved.extend(resolution.preserved);
         applied_precedences.extend(resolution.applied);
+    }
+    for record in &preserved {
+        if record.status == SourceStatus::Conflicted {
+            conflicting.insert(record.source_ref.clone());
+        }
     }
 
     let conflicting_refs: Vec<String> = conflicting.into_iter().collect();
@@ -665,28 +967,38 @@ pub fn admit_governing_sources(
     if let Some(conflict) = &conflict {
         conflict.validate()?;
     }
-    Ok(GoverningSourceAdmission {
+    let admission = GoverningSourceAdmission {
         admitted: admitted_set,
         preserved,
         conflict,
         coverage,
+        required_owner_ref: request.required_owner_ref,
         applied_precedences,
         state_fence: request.state_fence,
         expires_at: request.expires_at,
-    })
+    };
+    admission.validate()?;
+    admission.require_admitted_authority()?;
+    Ok(admission)
 }
 
 /// Finds the winning digest through project-declared role precedence.
 ///
-/// Returns a winner only when the group spans at least two roles, one role
-/// beats every other declared comparison it takes part in, loses none, and
-/// carries exactly one digest. Within-role divergence and contradictory
-/// declarations never resolve silently.
+/// Returns a winner only when the group spans at least two roles, exactly one
+/// role beats-or-ties every declared comparison it takes part in through an
+/// applicable declaration authority, loses none, carries exactly one digest,
+/// and at least one applicable declaration names the winner as higher. The
+/// returned declarations are the applicable ones that order the winner above
+/// a present lower role, sorted for determinism. Within-role divergence,
+/// contradictory declarations, inapplicable declarations, and winner-less
+/// single-digest roles never resolve silently.
+///
+/// Only declarations whose authority is applicable to the request participate:
+/// a declaration anyone can utter with a bare name promotes nothing.
 fn precedence_winner(
     group: &[GoverningSourceCandidate],
-    precedences: &[PrecedenceDeclaration],
-    scope_ref: &str,
-) -> Option<GoverningSourceCandidate> {
+    context: &AdmissionContext<'_>,
+) -> Option<(GoverningSourceCandidate, Vec<PrecedenceDeclaration>)> {
     let mut roles: BTreeMap<GoverningSourceRole, BTreeSet<&str>> = BTreeMap::new();
     for candidate in group {
         roles
@@ -697,12 +1009,19 @@ fn precedence_winner(
     if roles.len() < 2 {
         return None;
     }
+    let applicable: Vec<&PrecedenceDeclaration> = context
+        .precedences
+        .iter()
+        .filter(|declaration| {
+            declaration.applies_to(context.scope_ref, declaration.higher, declaration.lower)
+                && claim_is_applicable(&declaration.authority, context)
+        })
+        .collect();
     let mut beaten: BTreeSet<GoverningSourceRole> = BTreeSet::new();
-    for declaration in precedences {
+    for declaration in &applicable {
         let higher = roles.get(&declaration.higher);
         let lower = roles.get(&declaration.lower);
         if let (Some(higher), Some(lower)) = (higher, lower)
-            && declaration.applies_to(scope_ref, declaration.higher, declaration.lower)
             && higher != lower
         {
             beaten.insert(declaration.lower);
@@ -716,10 +1035,28 @@ fn precedence_winner(
     if unbeaten.len() != 1 {
         return None;
     }
+    let winner_role = unbeaten[0];
+    let mut applied: Vec<PrecedenceDeclaration> = applicable
+        .into_iter()
+        .filter(|declaration| {
+            declaration.higher == winner_role && roles.contains_key(&declaration.lower)
+        })
+        .cloned()
+        .collect();
+    if applied.is_empty() {
+        return None;
+    }
+    applied.sort_by(|left, right| {
+        left.higher
+            .cmp(&right.higher)
+            .then(left.lower.cmp(&right.lower))
+            .then(left.declared_by.cmp(&right.declared_by))
+    });
     group
         .iter()
-        .find(|candidate| candidate.role == unbeaten[0])
+        .find(|candidate| candidate.role == winner_role)
         .cloned()
+        .map(|winner| (winner, applied))
 }
 
 /// Readiness of a governing-source set for scope-sensitive use.
@@ -890,34 +1227,127 @@ impl TaskIntakeCandidate {
         })
     }
 
+    /// Returns the missing goal, acceptance, owner, and scope fields computed
+    /// from the actual field values.
+    ///
+    /// This is the only completeness signal promotion trusts: the stored
+    /// `missing_fields` list is provenance metadata, never authority.
+    #[must_use]
+    pub fn computed_missing_fields(&self) -> Vec<String> {
+        let mut missing = Vec::new();
+        if self.goal.is_none() {
+            missing.push("goal".to_owned());
+        }
+        if self.acceptance_digest.is_none() {
+            missing.push("acceptance_digest".to_owned());
+        }
+        if self.decision_owner_ref.is_none() {
+            missing.push("decision_owner_ref".to_owned());
+        }
+        if self.proposed_scope_ref.is_none() {
+            missing.push("proposed_scope_ref".to_owned());
+        }
+        missing
+    }
+
     /// Returns whether goal, acceptance, owner and scope are all present.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.missing_fields.is_empty()
+        self.computed_missing_fields().is_empty()
+    }
+
+    /// Validates the intake candidate, including its self-reported missing list.
+    ///
+    /// A deserialized candidate whose stored `missing_fields` disagrees with
+    /// the recomputed list is tampered input and fails closed here, so forged
+    /// completeness can never bypass the owner gate through promotion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a supplied reference, digest, constraint, or the
+    /// stored missing-field list is malformed, duplicated, or inconsistent
+    /// with the actual fields.
+    pub fn validate(&self) -> Result<(), WorkScopeError> {
+        text(&self.intake_ref, "intake.intake_ref")?;
+        text(
+            &self.proposer_principal_ref,
+            "intake.proposer_principal_ref",
+        )?;
+        text(&self.proposer_session_ref, "intake.proposer_session_ref")?;
+        text(&self.route_ref, "intake.route_ref")?;
+        if let Some(goal) = &self.goal {
+            text(goal, "intake.goal")?;
+        }
+        if let Some(acceptance) = &self.acceptance_digest {
+            text(acceptance, "intake.acceptance_digest")?;
+        }
+        unique(self.constraints.iter(), "intake.constraints")?;
+        for constraint in &self.constraints {
+            text(constraint, "intake.constraints")?;
+        }
+        if let Some(scope) = &self.proposed_scope_ref {
+            text(scope, "intake.proposed_scope_ref")?;
+        }
+        unique(
+            self.proposed_source_digests.iter(),
+            "intake.proposed_source_digests",
+        )?;
+        for handle_digest in &self.proposed_source_digests {
+            digest(handle_digest, "intake.proposed_source_digests")?;
+        }
+        if let Some(owner) = &self.decision_owner_ref {
+            text(owner, "intake.decision_owner_ref")?;
+        }
+        if let Some(controller) = &self.task_controller_ref {
+            text(controller, "intake.task_controller_ref")?;
+        }
+        if self.missing_fields != self.computed_missing_fields() {
+            return Err(WorkScopeError::InvalidSourceEvidence);
+        }
+        Ok(())
     }
 
     /// Promotes the intake to a current-task binding input.
     ///
-    /// Only the matching Human decision owner or an existing delegated task
-    /// binding can promote; a project contract alone cannot, and
-    /// host-visible prompt text never authorizes itself. The admitting owner
-    /// assigns the task revision, so promotion invents no contract identity.
+    /// Only the matching Human decision owner promotes directly. A delegated
+    /// binding promotes only when the caller presents the existing current
+    /// binding the delegation names: `parent` must be the current task
+    /// contract whose task matches the delegation, which proves the binding
+    /// the delegation claims actually exists instead of trusting a nonblank
+    /// reference. A project contract alone cannot promote, and host-visible
+    /// prompt text never authorizes itself. The admitting owner assigns the
+    /// task revision, so promotion invents no contract identity. Completeness
+    /// is recomputed from the fields; a forged `missing_fields` list fails
+    /// validation before any authority check.
     ///
     /// # Errors
     ///
     /// Returns [`WorkScopeError::TaskAuthorityDenied`] when the basis is not
-    /// the decision owner or a delegated binding, and an error when the
-    /// intake is incomplete or the revision is zero.
+    /// the decision owner or a proven delegated binding, an error when the
+    /// intake is incomplete, tampered, or the revision is zero.
     pub fn promote(
         &self,
         basis: &AuthorityBasis,
+        parent: &TaskBindingState,
         task_revision: u64,
     ) -> Result<TaskBindingInput, WorkScopeError> {
+        self.validate()?;
         basis.validate()?;
         match basis {
             AuthorityBasis::HumanOwner { owner_ref }
                 if self.decision_owner_ref.as_deref() == Some(owner_ref.as_str()) => {}
-            AuthorityBasis::DelegatedTaskBinding { .. } => {}
+            AuthorityBasis::DelegatedTaskBinding { task_ref, .. } => {
+                let TaskBindingState::CurrentTaskContract {
+                    task_ref: parent_ref,
+                    ..
+                } = parent
+                else {
+                    return Err(WorkScopeError::TaskAuthorityDenied);
+                };
+                if parent_ref != task_ref {
+                    return Err(WorkScopeError::TaskAuthorityDenied);
+                }
+            }
             AuthorityBasis::HumanOwner { .. } | AuthorityBasis::ProjectContract { .. } => {
                 return Err(WorkScopeError::TaskAuthorityDenied);
             }
