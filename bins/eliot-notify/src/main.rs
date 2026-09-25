@@ -3,7 +3,9 @@
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-use eliot_notify::{NotificationComposition, PROTOCOL_VERSION, SERVICE_NAME};
+use eliot_notify::{
+    DeliveryOutcome, NotificationComposition, PROTOCOL_VERSION, SERVICE_NAME, UnsatisfiedObligation,
+};
 use eliot_notify_core::{
     NotificationEnvelope, NotificationStateReadRequest, NotifyError,
     SignedWatchdogFallbackEnvelope, UserAutomationFailureRequest, UserAutomationInvocation,
@@ -51,6 +53,17 @@ enum Response {
         service: &'static str,
         protocol: &'static str,
         observation: Box<eliot_notify_core::DeliveryObservation>,
+    },
+    /// Delivery lost its observed OS acceptance. I11.6:19: this degrades
+    /// delivery only — the payload carries the persisted Event Log / spool
+    /// obligation and the canonical obligation read back from its owner, and
+    /// `claimed_toast` is always false. Nothing here is a resolution.
+    Degraded {
+        service: &'static str,
+        protocol: &'static str,
+        code: &'static str,
+        detail: String,
+        obligation: Box<UnsatisfiedObligation>,
     },
     PreflightAdmitted {
         service: &'static str,
@@ -174,7 +187,7 @@ fn main() {
             Ok(mut composition) => dispatch_fallback(&mut composition, &envelope, &request),
             Err(error) => composition_error(error.to_string()),
         };
-        let provider_error = matches!(response, Response::Error { code, .. } if code == "NOTIFICATION_PROVIDER_REJECTED");
+        let provider_error = is_provider_rejection(&response);
         if !write_response(&response) {
             std::process::exit(PROVIDER_REJECTED_EXIT);
         }
@@ -240,7 +253,7 @@ fn main() {
             detail: error.to_string(),
         },
     };
-    let provider_error = matches!(response, Response::Error { code, .. } if code == "NOTIFICATION_PROVIDER_REJECTED");
+    let provider_error = is_provider_rejection(&response);
     if !write_response(&response) {
         std::process::exit(PROVIDER_REJECTED_EXIT);
     }
@@ -320,14 +333,7 @@ fn dispatch_deliver(
     envelope: &NotificationEnvelope,
     request: &NotificationRequest,
 ) -> Response {
-    match composition.deliver(envelope, request) {
-        Ok(observation) => Response::Delivered {
-            service: SERVICE_NAME,
-            protocol: PROTOCOL_VERSION,
-            observation: Box::new(observation),
-        },
-        Err(error) => notify_error(&error),
-    }
+    degraded_response(composition.deliver_with_obligation(envelope, request))
 }
 
 fn dispatch_user_automation_failure(
@@ -335,14 +341,7 @@ fn dispatch_user_automation_failure(
     failure: UserAutomationFailureRequest,
     request: &NotificationRequest,
 ) -> Response {
-    match composition.deliver_user_automation_failure(failure, request) {
-        Ok(observation) => Response::Delivered {
-            service: SERVICE_NAME,
-            protocol: PROTOCOL_VERSION,
-            observation: Box::new(observation),
-        },
-        Err(error) => notify_error(&error),
-    }
+    degraded_response(composition.deliver_user_automation_failure_with_obligation(failure, request))
 }
 
 fn dispatch_user_automation(
@@ -409,13 +408,67 @@ fn dispatch_fallback(
     envelope: &SignedWatchdogFallbackEnvelope,
     request: &NotificationRequest,
 ) -> Response {
-    match composition.deliver_watchdog_fallback(envelope, request) {
-        Ok(observation) => Response::Delivered {
-            service: SERVICE_NAME,
-            protocol: PROTOCOL_VERSION,
-            observation: Box::new(observation),
-        },
-        Err(error) => notify_error(&error),
+    degraded_response(composition.deliver_watchdog_fallback_with_obligation(envelope, request))
+}
+
+/// Projects one delivery outcome plus its durable obligation onto the wire.
+///
+/// `Some(obligation)` means the adapter returned no observed OS acceptance; the
+/// response then reports a delivery degradation carrying the persisted Event
+/// Log / spool record and the canonical obligation read back from its owner,
+/// never a resolution and never a claimed toast. The composition already
+/// persisted that obligation before handing the pair over, so this projection
+/// only decides what the caller is told.
+fn degraded_response(outcome: DeliveryOutcome) -> Response {
+    let DeliveryOutcome {
+        delivery,
+        obligation,
+    } = outcome;
+    let Some(obligation) = obligation else {
+        return match delivery {
+            Ok(observation) => Response::Delivered {
+                service: SERVICE_NAME,
+                protocol: PROTOCOL_VERSION,
+                observation: Box::new(observation),
+            },
+            Err(error) => notify_error(&error),
+        };
+    };
+    let (code, detail) = match delivery {
+        Ok(observation) => {
+            let confidence = &observation.confidence;
+            let delivered = &observation.delivered;
+            (
+                NOTIFICATION_DELIVERY_DEGRADED,
+                format!("delivery confidence {confidence:?}, delivered {delivered:?}"),
+            )
+        }
+        Err(error) => (notify_error_code(&error), error.to_string()),
+    };
+    Response::Degraded {
+        service: SERVICE_NAME,
+        protocol: PROTOCOL_VERSION,
+        code,
+        detail,
+        obligation: Box::new(obligation),
+    }
+}
+
+/// Stable code for one delivery that lost its observed OS acceptance while an
+/// obligation was still outstanding. It is a degradation, never a resolution.
+const NOTIFICATION_DELIVERY_DEGRADED: &str = "NOTIFICATION_DELIVERY_DEGRADED";
+
+/// Reports whether one response must exit with the provider-rejection code.
+///
+/// Both a plain rejection and a degradation carry the same code when the
+/// underlying cause was a plan gap, so recording a delivery obligation never
+/// changes the process's exit semantics for its caller.
+fn is_provider_rejection(response: &Response) -> bool {
+    match response {
+        Response::Error { code, .. } | Response::Degraded { code, .. } => {
+            *code == "NOTIFICATION_PROVIDER_REJECTED"
+        }
+        _ => false,
     }
 }
 
@@ -434,14 +487,21 @@ fn preflight_error(detail: String) -> Response {
 }
 
 fn notify_error(error: &NotifyError) -> Response {
-    let code = if matches!(error, NotifyError::PlanGap { .. }) {
+    Response::Error {
+        code: notify_error_code(error),
+        detail: error.to_string(),
+    }
+}
+
+/// Classifies one core failure onto its stable wire code. A plan gap is a
+/// provider rejection (non-zero exit); every other core failure is a rejected
+/// request. The same classification is reused by the degradation projection so
+/// an adapter loss never changes the process's exit semantics.
+fn notify_error_code(error: &NotifyError) -> &'static str {
+    if matches!(error, NotifyError::PlanGap { .. }) {
         "NOTIFICATION_PROVIDER_REJECTED"
     } else {
         "NOTIFICATION_REQUEST_REJECTED"
-    };
-    Response::Error {
-        code,
-        detail: error.to_string(),
     }
 }
 

@@ -54,7 +54,8 @@ pub use notify_fallback_ensure::{
     NotifyFallbackRegistration, ensure_notify_fallback_registered,
 };
 pub use notify_launch_callin::{
-    BrokerNotifyError, NotifyLaunchStage, VerifiedLaunchRef, resolve_broker_notify_launch,
+    BrokerNotifyError, BrokerNotifyLaunchAuthority, NotifyLaunchStage, VerifiedLaunchRef,
+    admit_notify_request, request_names_notify_image, resolve_broker_notify_launch,
     stage_normal_notify_launch,
 };
 use operation_identity::{
@@ -702,6 +703,12 @@ pub struct BrokerComposition {
     launch_lease: Option<ProtectedPathLease>,
     registration_digest: Option<String>,
     identity_issuer: IssuerHandle,
+    /// Broker-retained normal Notify launch authority: the verified installed
+    /// `eliot-notify.exe` reference resolved from the installer-published
+    /// declaration at startup. This is what makes the notification adapter
+    /// launchable only from here; see
+    /// [`BrokerComposition::launch_notify`].
+    notify_launch: BrokerNotifyLaunchAuthority,
 }
 
 impl BrokerComposition {
@@ -817,6 +824,9 @@ impl BrokerComposition {
             launch_lease,
             registration_digest,
             identity_issuer: issuer,
+            notify_launch: BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::Deferred {
+                reason: "NOT_STAGED",
+            }),
         })
     }
 
@@ -1007,6 +1017,62 @@ impl BrokerComposition {
             session_id,
             challenge,
         )
+    }
+
+    /// Stages the installer-published Notify declaration and RETAINS the
+    /// verified launch reference used by [`Self::launch_notify`].
+    ///
+    /// This is the composition's production entry to
+    /// [`stage_normal_notify_launch`]. The reference it retains is the whole
+    /// point: without it the broker could prove it *can* name the installed
+    /// image but had no authority to spawn one, which is exactly the gap that
+    /// left normal `eliot-notify` invocation unconstrained.
+    pub fn stage_notify_launch(&mut self) -> NotifyLaunchStage {
+        let authority = stage_normal_notify_launch(self);
+        let stage = authority.stage().clone();
+        self.notify_launch = authority;
+        stage
+    }
+
+    /// The broker-retained normal Notify launch authority.
+    #[must_use]
+    pub fn notify_launch_authority(&self) -> &BrokerNotifyLaunchAuthority {
+        &self.notify_launch
+    }
+
+    /// Spawns the per-user notification adapter on a Kernel-authorized grant.
+    ///
+    /// This is the ONLY dispatcher that may start `eliot-notify.exe`, and it is
+    /// notify-specific on purpose (I11.6:3, "Normal delivery is launched
+    /// through the authorized User Broker"). Before anything is dispatched the
+    /// request must satisfy three independent gates:
+    ///
+    /// 1. the protected launch lease still verifies and the registration is
+    ///    heartbeated, so a revoked or expired broker cannot spawn;
+    /// 2. this broker currently RETAINS a verified launch reference, resolved at
+    ///    startup from the installer-published declaration and bound to the
+    ///    broker's authenticated SID/session plus the Kernel-issued
+    ///    registration digest;
+    /// 3. the request names exactly that executable path and its artifact
+    ///    digest equals the digest of the bytes this broker observed.
+    ///
+    /// Only then is the request dispatched on the existing authority/process
+    /// ports, which apply the Kernel grant. A generic `Launch` request naming
+    /// the notify image is refused by the binary before reaching here (see
+    /// [`request_names_notify_image`]), so no other request shape can produce a
+    /// normal notification invocation.
+    pub fn launch_notify(
+        &mut self,
+        request: LaunchRequest,
+    ) -> Result<eliot_user_broker_core::LaunchReceipt, CompositionError> {
+        self.verify_launch_lease()?;
+        notify_launch_callin::admit_notify_request(&self.notify_launch, &request).map_err(
+            |error| CompositionError::Launch(format!("notify launch rejected: {}", error.code())),
+        )?;
+        // The dispatch itself is the existing generic authority/process path,
+        // so the Kernel grant, operation identity, and fencing stay exactly
+        // where they are; only the admission above is notify-specific.
+        self.launch(request)
     }
 
     /// Heartbeats the protected registration before an admitted launch.
