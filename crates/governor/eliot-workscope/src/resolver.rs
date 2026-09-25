@@ -20,17 +20,19 @@
 //! disambiguation reference instead of selecting a convenient candidate.
 //!
 //! Display name, nearest path, longest prefix, most recently used task, and
-//! semantic similarity are never sufficient to bind an existing scope: no such
-//! input exists on [`ResolutionRequest`], so no tier can consume them. Step 4
+//! semantic similarity are never sufficient to bind an existing scope: they
+//! enter [`ResolutionRequest`] only as supporting evidence, which no tier
+//! reads to select, and any conflicting or missing item withholds a unique
+//! outcome as ambiguous. Step 4
 //! matches only on exact root identity or exact VCS identity, never on prefix
 //! or proximity. Unambiguous is not authenticated: selecting one candidate
 //! here never mints authority; owner-issued [`WorkScopeResolutionReceipt`]
 //! authentication belongs to the issuance slice.
 
 use super::{
-    RepositoryLineageIdentity, ScopeBinding, ScopeRelocationOrAttachReceipt, ScopeResolution,
-    WorkScopeCandidate, WorkScopeCandidateSet, WorkScopeError, WorkspaceInstanceIdentity, counter,
-    text, unique,
+    EvidenceStanding, IdentityEvidence, RepositoryLineageIdentity, ScopeBinding,
+    ScopeRelocationOrAttachReceipt, ScopeResolution, WorkScopeCandidate, WorkScopeCandidateSet,
+    WorkScopeError, WorkspaceInstanceIdentity, counter, text, unique,
 };
 use crate::guard::{IdentityLegOutcome, identity_legs};
 use schemars::JsonSchema;
@@ -120,6 +122,11 @@ pub struct ManifestBoundaryClaim {
 /// scanner travel on `governing_source_refs` as opaque references only: the
 /// resolver never reads source content, and their presence never authenticates
 /// a candidate.
+/// `supporting_evidence` carries display/proximity/recency/manifest/marker/
+/// remote observations bound to this attempt: no tier reads them to select a
+/// candidate (supporting-only, I4.1), but any conflicting or missing item
+/// withholds a unique outcome as `Ambiguous` with the full preserved set,
+/// because a unique authenticated binding is then unproven.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResolutionRequest {
@@ -132,6 +139,7 @@ pub struct ResolutionRequest {
     pub lineage: Option<RepositoryLineageIdentity>,
     pub manifest_boundary: Option<ManifestBoundaryClaim>,
     pub governing_source_refs: Vec<String>,
+    pub supporting_evidence: Vec<IdentityEvidence>,
 }
 
 /// What the ordered resolver decided, and where.
@@ -283,9 +291,10 @@ impl ResolutionRequest {
     ///
     /// # Errors
     ///
-    /// Returns an error when any present tier evidence is malformed, or when a
-    /// governing-source reference is blank or duplicated, or more than 32
-    /// source references are carried.
+    /// Returns an error when any present tier evidence is malformed, when a
+    /// governing-source reference is blank or duplicated, when more than 32
+    /// source references are carried, or when a supporting-evidence item
+    /// carries a blank detail reference.
     pub fn validate(&self) -> Result<(), WorkScopeError> {
         if let Some(claim) = &self.session_task {
             claim.validate()?;
@@ -317,6 +326,9 @@ impl ResolutionRequest {
             text(source, "governing_source_refs")?;
         }
         unique(self.governing_source_refs.iter(), "governing_source_refs")?;
+        for item in &self.supporting_evidence {
+            text(&item.detail_ref, "supporting_evidence.detail_ref")?;
+        }
         Ok(())
     }
 }
@@ -327,7 +339,12 @@ impl WorkScopeResolver {
     /// Returns the first tier with usable evidence; tiers without evidence
     /// are skipped. With no tier evidence the candidate set's own disposition
     /// decides (tier 8: a `NewScope` disposition means the caller builds a
-    /// provisional descriptor bound to the current session).
+    /// provisional descriptor bound to the current session). Supporting
+    /// evidence never selects: a `Unique` tier outcome is withheld as
+    /// `Ambiguous` with the full preserved candidate set whenever the attempt
+    /// carries conflicting or missing supporting evidence, because a unique
+    /// authenticated binding is then unproven (I4.2). Issuance records the
+    /// same evidence on the receipt; admission carries it to the question.
     ///
     /// # Errors
     ///
@@ -336,35 +353,39 @@ impl WorkScopeResolver {
     pub fn resolve(request: &ResolutionRequest) -> Result<ResolutionOutcome, WorkScopeError> {
         request.validate()?;
         let set = &request.candidates;
-        if let Some(claim) = &request.session_task {
-            return Ok(Self::tier_session_task(set, claim));
-        }
-        if let Some(token) = &request.binding_token {
-            return Ok(Self::tier_binding_token(set, token));
-        }
-        if let Some(task) = &request.resumed_task {
-            return Ok(Self::tier_resumed_task(set, task));
-        }
-        if let Some(handles) = &request.host_handles {
-            return Ok(Self::tier_host_handles(set, handles));
-        }
-        if let Some(registered) = &request.registered {
-            return Ok(Self::tier_registered(set, registered));
-        }
-        if let Some(lineage) = &request.lineage {
-            return Ok(Self::tier_lineage(set, lineage));
-        }
-        if let Some(boundary) = &request.manifest_boundary {
+        let mut outcome = if let Some(claim) = &request.session_task {
+            Self::tier_session_task(set, claim)
+        } else if let Some(token) = &request.binding_token {
+            Self::tier_binding_token(set, token)
+        } else if let Some(task) = &request.resumed_task {
+            Self::tier_resumed_task(set, task)
+        } else if let Some(handles) = &request.host_handles {
+            Self::tier_host_handles(set, handles)
+        } else if let Some(registered) = &request.registered {
+            Self::tier_registered(set, registered)
+        } else if let Some(lineage) = &request.lineage {
+            Self::tier_lineage(set, lineage)
+        } else if let Some(boundary) = &request.manifest_boundary {
             let _ = boundary;
-            return Ok(ResolutionOutcome {
+            ResolutionOutcome {
                 resolution: ScopeResolution::NewScope,
                 decided_at: Some(ResolutionTier::ManifestBoundary),
-            });
+            }
+        } else {
+            ResolutionOutcome {
+                resolution: set.resolve(),
+                decided_at: Some(ResolutionTier::ProvisionalAdHoc),
+            }
+        };
+        if matches!(outcome.resolution, ScopeResolution::Unique(_))
+            && request.supporting_evidence.iter().any(|item| {
+                item.standing == EvidenceStanding::Conflicting
+                    || item.standing == EvidenceStanding::Missing
+            })
+        {
+            outcome.resolution = ScopeResolution::Ambiguous(Box::new(set.clone()));
         }
-        Ok(ResolutionOutcome {
-            resolution: set.resolve(),
-            decided_at: Some(ResolutionTier::ProvisionalAdHoc),
-        })
+        Ok(outcome)
     }
 
     fn tier_session_task(

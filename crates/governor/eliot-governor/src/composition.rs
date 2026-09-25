@@ -21,6 +21,9 @@ use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
 use crate::owner_closure_feed::{OwnerPublishPort, synchronize_owner_feed};
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
+use crate::scope_identity_admission::{
+    ensure_snapshot_fresh, guard_recovery_error, require_fresh_matched_binding,
+};
 use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
 use crate::{
@@ -78,11 +81,15 @@ use eliot_testd_core::{
     TestdSourceObservationRange, TestdStore, TestdTerminalCompletionEvidence, VerificationReceipt,
 };
 use eliot_workscope::{
-    GenerationEvidence, GuardTrigger, GuardVerdict, IdentityLegOutcome, MaterialAdmission,
-    MaterialReadinessInputs, RequestedEffect, ScopeBinding, ScopeRelocationOrAttachReceipt,
-    TriggerAdmission, TriggerReport, WorkScopeBindingOwner, WorkScopeBindingSnapshot,
-    WorkScopeDescriptor, WorkScopeResolutionReceipt, admit_at_trigger, check_at_trigger,
-    evaluate_material_request, rebind_with_receipt,
+    BootstrapScanner, GenerationEvidence, GoverningSourceSet, GuardTrigger, GuardVerdict,
+    IdentityEvidence, IdentityLegOutcome, MaterialAdmission, MaterialReadinessInputs,
+    ObservedScopeResources, PrivacyProfile, RequestedEffect, ResolutionAuthentication,
+    ResolutionRequest, ScannerResolverInputs, ScopeBinding, ScopeBindingDisposition,
+    ScopeBindingGuard, ScopeRelocationOrAttachReceipt, ScopeResolution, TriggerAdmission,
+    TriggerReport, WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidateSet,
+    WorkScopeDescriptor, WorkScopeResolutionReceipt, WorkScopeResolver, admit_at_trigger,
+    admit_initial_binding, check_at_trigger, evaluate_material_request, issue_resolution_receipt,
+    produce_attach_receipt, rebind_with_receipt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -4217,6 +4224,313 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Ok(binding)
     }
 
+    /// Runs one scope-identity resolution request through the evidence-first
+    /// order (issue #1787, resolver production caller).
+    ///
+    /// Entry for attach callers: the request carries session/task authority
+    /// references, binding tokens, resumed-task evidence, host handles,
+    /// registered instances or relocation receipts, lineage evidence, or a
+    /// manifest boundary, plus supporting-only evidence that can withhold a
+    /// unique outcome but never select. The first tier with usable evidence
+    /// decides; ambiguity preserves the candidate set instead of selecting.
+    ///
+    /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+    pub fn resolve_scope_identity(
+        request: &ResolutionRequest,
+    ) -> Result<ScopeResolution, CompositionError> {
+        WorkScopeResolver::resolve(request)
+            .map(|outcome| outcome.resolution)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Resolves scanner-derived inputs through the evidence-first resolver
+    /// (issue #1787, scanner-seam production caller).
+    ///
+    /// Runs [`BootstrapScanner::resolve_with_scan`] for an attach caller:
+    /// discovery evidence populates only the host-handles, lineage, and
+    /// manifest-boundary tiers, so resolution can distinguish candidates but
+    /// never authenticates a scope; owner issuance stays separate.
+    pub fn resolve_scope_identity_from_scan(
+        inputs: &ScannerResolverInputs,
+        candidates: &WorkScopeCandidateSet,
+    ) -> Result<ScopeResolution, CompositionError> {
+        BootstrapScanner::resolve_with_scan(inputs, candidates)
+            .map(|outcome| outcome.resolution)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Issues a durable resolution receipt from the live owner binding (issue
+    /// #1787, issuance production caller).
+    ///
+    /// Issuance reads `owner` at `fence` and requires the retained binding to
+    /// match `descriptor` with a `MATCHED` guard receipt; `Authenticated`
+    /// issuance additionally requires the supplied source closure to
+    /// re-validate. The receipt proves owner issuance; its fields alone do not.
+    ///
+    /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "issuance joins every durable receipt field in one owner-checked entry"
+    )]
+    pub fn issue_scope_resolution_receipt(
+        &self,
+        receipt_ref: &str,
+        proposal_ref: &str,
+        descriptor: &WorkScopeDescriptor,
+        owner: &WorkScopeBindingOwner,
+        fence: &StateFence,
+        authentication: ResolutionAuthentication,
+        supporting_evidence: Vec<IdentityEvidence>,
+        rejected_candidate_refs: Vec<String>,
+        unresolved_candidate_refs: Vec<String>,
+        authority_ref: &str,
+        source_closure: Option<(&GoverningSourceSet, &PrivacyProfile)>,
+    ) -> Result<WorkScopeResolutionReceipt, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        issue_resolution_receipt(
+            receipt_ref,
+            proposal_ref,
+            descriptor,
+            owner,
+            fence,
+            authentication,
+            supporting_evidence,
+            rejected_candidate_refs,
+            unresolved_candidate_refs,
+            authority_ref,
+            source_closure,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Enforces the scope binding guard at one trigger (issue #1787, guard
+    /// admission-chain production caller).
+    ///
+    /// Reads the retained binding at the retained fence, evaluates `observed`
+    /// at `trigger` with the caller-retained source closure, and returns the
+    /// current snapshot only when the verdict is `Allow` (full `MATCHED`
+    /// receipt). Any other verdict fails closed with the trigger and
+    /// disposition; the retained binding, task state, and project memory are
+    /// untouched.
+    ///
+    /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+    pub fn require_scope_guard_for_observed(
+        &self,
+        observed: &ScopeBinding,
+        source_closure: Option<(&GoverningSourceSet, &PrivacyProfile)>,
+        trigger: GuardTrigger,
+    ) -> Result<WorkScopeBindingSnapshot, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "WorkScope binding is unbound; scope-guarded work is unavailable".to_owned(),
+            )
+        })?;
+        let snapshot = owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let report = check_at_trigger(&snapshot.binding, observed, source_closure, trigger);
+        match report.verdict {
+            GuardVerdict::Allow => Ok(snapshot),
+            GuardVerdict::Withhold | GuardVerdict::Quarantine => {
+                Err(guard_recovery_error(&report, "scope guard withheld"))
+            }
+        }
+    }
+
+    /// Admits an authorized relocation/attach receipt as the new expected
+    /// `WorkScope` binding (issue #1787, rebind production caller).
+    ///
+    /// The receipt must name the retained scope and match the retained fence;
+    /// the new binding carries the observed workspace-instance identity and
+    /// generation, and admission additionally requires a fresh `MATCHED`
+    /// source-closure check for that instance. Afterwards the same operation
+    /// is admitted only with the observed identity and fence. The prior
+    /// identity stays preserved inside the receipt. The returned owner is not
+    /// retained here: persist it with
+    /// [`Self::install_admitted_work_scope_owner`], which enforces
+    /// generation-aligned installation at the same fence.
+    ///
+    /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+    pub fn admit_scope_relocation(
+        &self,
+        receipt: &ScopeRelocationOrAttachReceipt,
+        privacy_class: PrivacyClass,
+        governing_source_generation: u64,
+        sources: &GoverningSourceSet,
+        privacy: &PrivacyProfile,
+        owner_revision: u64,
+    ) -> Result<WorkScopeBindingOwner, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "WorkScope binding is unbound; relocation has no retained scope".to_owned(),
+            )
+        })?;
+        let retained = owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let relocated = rebind_with_receipt(
+            receipt,
+            &retained.binding.scope.scope_ref,
+            privacy_class,
+            governing_source_generation,
+            &fence,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let fresh = ScopeBindingGuard.check(&relocated, &relocated, sources, privacy);
+        if fresh.disposition != ScopeBindingDisposition::Matched {
+            return Err(CompositionError::Recovery(
+                "relocation source closure is not matched for the observed instance".to_owned(),
+            ));
+        }
+        let snapshot = WorkScopeBindingSnapshot::new(fence, owner_revision, relocated, fresh)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        WorkScopeBindingOwner::new(snapshot)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Admits an observed workspace instance as an attach to the retained scope
+    /// (issue #1787, attach production caller).
+    ///
+    /// This is the owning thin caller for the attach trigger path: `observed`
+    /// is the live mechanical observation already derived from workspace facts
+    /// (the daemon trigger ingress observes the explicit root and derives at
+    /// the admission fence generation; the CLI scope-observe ingress derives
+    /// the same shape as evidence). The entry produces the owner-issued attach
+    /// receipt from that observation, the retained descriptor and owner, and
+    /// the explicit authorization reference, then admits it through
+    /// [`Self::admit_scope_relocation`], which rebinds with the receipt and
+    /// requires a fresh `MATCHED` source-closure check for the observed
+    /// instance. Both the receipt and the admitted owner return, so the caller
+    /// retains the authorization evidence alongside the new binding; persist
+    /// the owner with [`Self::install_admitted_work_scope_owner`]. The prior
+    /// identity stays preserved inside the receipt; the retained binding, task
+    /// state, and project memory are untouched on any failure.
+    ///
+    /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "attach admission joins the live observation, retained records, authorization, and source closure in one entry"
+    )]
+    pub fn admit_observed_scope_attach(
+        &self,
+        receipt_ref: &str,
+        observed: &ObservedScopeResources,
+        descriptor: &WorkScopeDescriptor,
+        authorizing_ref: &str,
+        privacy_class: PrivacyClass,
+        governing_source_generation: u64,
+        sources: &GoverningSourceSet,
+        privacy: &PrivacyProfile,
+        owner_revision: u64,
+    ) -> Result<(ScopeRelocationOrAttachReceipt, WorkScopeBindingOwner), CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "WorkScope binding is unbound; attach has no retained scope".to_owned(),
+            )
+        })?;
+        let receipt = produce_attach_receipt(
+            receipt_ref,
+            descriptor,
+            owner,
+            observed,
+            authorizing_ref,
+            &fence,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let bound = self.admit_scope_relocation(
+            &receipt,
+            privacy_class,
+            governing_source_generation,
+            sources,
+            privacy,
+            owner_revision,
+        )?;
+        Ok((receipt, bound))
+    }
+
+    /// Admits the initial binding for a newly resolved scope (issue #1787,
+    /// bootstrap-constructor production caller).
+    ///
+    /// Used when no retained owner exists yet: the bootstrap caller supplies
+    /// the described scope, the binding it actually read, the current
+    /// observation, and the source closure that authenticates it. Admission
+    /// mints the owner only after descriptor agreement, clear identity legs,
+    /// and a fresh `MATCHED` guard check at the retained fence. Persist the
+    /// minted owner with [`Self::install_admitted_work_scope_owner`].
+    ///
+    /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+    pub fn admit_initial_scope_binding(
+        &self,
+        descriptor: &WorkScopeDescriptor,
+        owner_revision: u64,
+        binding: &ScopeBinding,
+        observed: &ScopeBinding,
+        sources: &GoverningSourceSet,
+        privacy: &PrivacyProfile,
+    ) -> Result<WorkScopeBindingOwner, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        admit_initial_binding(
+            descriptor,
+            owner_revision,
+            &fence,
+            binding,
+            observed,
+            sources,
+            privacy,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Persists an admitted `WorkScope` owner as the retained binding
+    /// (issue #1787, rebind/attach persistence).
+    ///
+    /// Installs the owner minted by [`Self::admit_scope_relocation`],
+    /// [`Self::admit_observed_scope_attach`], or
+    /// [`Self::admit_initial_scope_binding`] only when it is readable at the
+    /// retained fence, its guard receipt is freshly `MATCHED` and agrees with
+    /// the binding on every identity field, and the binding generation equals
+    /// the fence generation, so the same operation is admitted afterwards
+    /// only with that instance identity and generation fence. Anything else
+    /// fails without touching the retained binding.
+    pub fn install_admitted_work_scope_owner(
+        &mut self,
+        owner: WorkScopeBindingOwner,
+    ) -> Result<WorkScopeBindingSnapshot, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let snapshot = owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        ensure_snapshot_fresh(&snapshot, "install admitted WorkScope owner")?;
+        if snapshot.binding.scope.generation != fence.resource_generation.value() {
+            return Err(CompositionError::Recovery(
+                "admitted WorkScope binding generation disagrees with the installation fence"
+                    .to_owned(),
+            ));
+        }
+        self.owners.work_scope = Some(owner);
+        Ok(snapshot)
+    }
+
     /// Guards one scope-sensitive canonical write with the `ScopeBindingGuard`
     /// (issue #1787, `CanonicalWrite` trigger production caller).
     ///
@@ -4259,9 +4573,20 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if report.verdict == GuardVerdict::Quarantine
             || report.identity != IdentityLegOutcome::IdentityClear
         {
+            // Issue #1787: the mismatch carries its withholding proof instead
+            // of a bare error — trigger, identity legs, verdict, and the
+            // expected/observed instance pair — while the retained binding,
+            // task state, and project memory stay preserved. No source closure
+            // exists on this edge, so no receipt is minted here; source
+            // closure is enforced at issuance and admission.
             return Err(CompositionError::Recovery(format!(
-                "canonical write addresses scope {scope_id} while WorkScope is bound to {}; guard verdict {:?}",
-                snapshot.binding.scope.scope_ref, report.verdict,
+                "canonical write addresses scope {scope_id} while WorkScope is bound to {}; guard withheld at trigger {:?} (identity {:?}, verdict {:?}; expected instance {} observed instance {}); retained binding preserved, write withheld",
+                snapshot.binding.scope.scope_ref,
+                report.trigger,
+                report.identity,
+                report.verdict,
+                snapshot.binding.scope.instance_ref,
+                observed.scope.instance_ref,
             )));
         }
         Ok(Some(report))
@@ -4279,6 +4604,26 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ) -> Result<WriteReceipt, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
+        }
+        // Issue #1787: a task-bound canonical write is scope-sensitive work and
+        // requires the retained binding to be freshly `MATCHED` at the request
+        // fence. The retained guard receipt must agree with the binding on
+        // every identity field and the write must address the bound scope; any
+        // drift fails the write before any canonical commit, without selecting
+        // another candidate or transferring task state or project memory.
+        // Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+        if envelope.task_id.is_some() {
+            let scope = require_fresh_matched_binding(
+                self.owners.work_scope.as_ref(),
+                &envelope.request.state_fence,
+                "canonical write work scope is not freshly matched",
+            )?;
+            if scope.binding.scope.scope_ref != envelope.scope_id.as_str() {
+                return Err(CompositionError::Recovery(
+                    "canonical write addresses a different WorkScope than the bound scope"
+                        .to_owned(),
+                ));
+            }
         }
         self.owners
             .canonical
@@ -4505,6 +4850,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 "native binding work scope does not match the bound WorkScope".to_owned(),
             ));
         }
+        // Issue #1787: a stale or drifted guard receipt cannot back a native
+        // executable binding; rebind or revalidate first.
+        ensure_snapshot_fresh(&scope, "native binding work scope is not freshly matched")?;
         let mut binding = NativeWorkerExecutableBinding {
             claim_id: claim_id.to_owned(),
             registration_id: registration_id.to_owned(),
@@ -5191,6 +5539,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let scope = scope_owner
             .read_current(&state_fence)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        // Issue #1787: activation cannot proceed on a stale or drifted guard
+        // receipt; a generation change requires a fresh `MATCHED` receipt.
+        ensure_snapshot_fresh(&scope, "activation work scope is not freshly matched")?;
         let plan = self.owners.canonical.read_current_plan(&state_fence)?;
         if plan.task_id != task_id || plan.work_scope_id != scope.binding.scope.scope_ref {
             return Err(CompositionError::Recovery(

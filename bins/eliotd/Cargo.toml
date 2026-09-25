@@ -19,6 +19,7 @@ eliot-agent-bridge-core.workspace = true
 eliot-agent-contracts.workspace = true
 eliot-agent-coordinator.workspace = true
 eliot-authority.workspace = true
+eliot-bootstrap.workspace = true
 eliot-cognitive-quality = { path = "../../crates/smart/eliot-cognitive-quality", version = "0.1.0" }
 eliot-contracts.workspace = true
 eliot-context-contracts.workspace = true

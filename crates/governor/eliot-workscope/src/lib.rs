@@ -26,7 +26,8 @@ mod transition;
 
 pub use caller::{
     DescriptorPolicy, ObservedScopeResources, ReceiptAdmission, TriggerAdmission, WithholdReason,
-    admit_at_trigger, describe_observed_scope, propose_scope, verify_receipt_for_admission,
+    admit_at_trigger, derive_observed_resources, describe_observed_scope, propose_scope,
+    verify_receipt_for_admission,
 };
 pub use governance::{
     AuthorityBasis, GoverningSourceAdmission, GoverningSourceCandidate, NewSourceCandidate,
