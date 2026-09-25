@@ -45,7 +45,8 @@
 use super::{
     GoverningSourceRole, GoverningSourceSet, OnboardingLease, OnboardingReadinessReceipt,
     ReadinessLifecycle, ScopeBindingDisposition, ScopeBindingGuardReceipt, ScopeResolutionState,
-    TaskBindingState, WorkScopeDescriptor, WorkScopeError, counter, text, unique,
+    TaskBindingState, WorkScopeDescriptor, WorkScopeError, candidate_source_roles, counter, text,
+    unique,
 };
 use eliot_contracts::{StateFence, fences_match_exact};
 use schemars::JsonSchema;
@@ -380,7 +381,13 @@ fn coverage_closes(
         GoverningCoverage::AdmittedSources(set) => set
             .validate_for(&receipt.scope, &descriptor.privacy)
             .is_ok(),
-        GoverningCoverage::ExplicitAbsence(_) => true,
+        // An absence claim is sufficient only when it surveys the whole
+        // governing-source set: every role the source model may surface
+        // (see `candidate_source_roles`) must be declared absent with
+        // backing evidence. A partial absence leaves coverage open.
+        GoverningCoverage::ExplicitAbsence(record) => candidate_source_roles()
+            .iter()
+            .all(|role| record.absent_roles.contains(role)),
     }
 }
 
@@ -538,10 +545,11 @@ fn evaluate_material_depth(
 /// Admits or denies one requested effect under current readiness.
 ///
 /// Fail-closed evaluation order: receipt/descriptor/coverage shape, then
-/// currency (Kernel fence, lease, descriptor instance binding, coverage
-/// binding to the scope generation) denies with
+/// currency (Kernel fence, lease, descriptor instance binding, sufficient
+/// governing-source closure) denies with
 /// `READINESS_REEVALUATION_REQUIRED`; a non-matched guard denies with
 /// `AMBIGUOUS_RESULT` for an ambiguous scope and `REEVALUATION` otherwise;
+/// an ambiguous scope resolution denies every effect with `AMBIGUOUS_RESULT`;
 /// a Material effect then needs full grounding (`GOVERNING_CONTEXT_REQUIRED`
 /// when sources, truth surface, verifier, or authority route are deficient)
 /// and an exact current task contract at `READY_MATERIAL`
@@ -560,12 +568,15 @@ pub fn evaluate_material_request(
 ) -> Result<MaterialAdmission, WorkScopeError> {
     let report = assess_material_readiness(inputs)?;
     let receipt = inputs.receipt;
+    // Currency is fence, lease, descriptor instance binding, and sufficient
+    // governing coverage: stale or conflicted sources deny with
+    // `READINESS_REEVALUATION_REQUIRED` even when the coverage still names
+    // the scope generation, so no effect — read-only or material — proceeds
+    // on unclosed coverage.
     let currency_ok = report.fence_current
         && report.lease_current
         && report.instance_bound
-        && inputs
-            .coverage
-            .binds_scope(&receipt.scope.scope_ref, receipt.scope.generation);
+        && report.coverage_sufficient;
     if !currency_ok {
         return Ok(denied(
             &report.receipt_ref,
@@ -591,6 +602,18 @@ pub fn evaluate_material_request(
             MaterialReadinessDirective::ReadinessReevaluationRequired,
             &report.missing_inputs,
             "readiness_refresh",
+        ));
+    }
+    // An ambiguous scope resolution is never selected silently (I4.2): even
+    // with a current task contract at `READY_MATERIAL`, an ambiguous scope
+    // denies every effect with `AMBIGUOUS_RESULT` until resolution.
+    if receipt.scope_resolution == ScopeResolutionState::Ambiguous {
+        return Ok(denied(
+            &report.receipt_ref,
+            effect,
+            MaterialReadinessDirective::AmbiguousResult,
+            &report.missing_inputs,
+            "scope_disambiguation",
         ));
     }
     if effect.requires_material_readiness() {
@@ -1010,7 +1033,9 @@ mod tests {
         let absence = ExplicitAbsenceRecord {
             scope_ref: "scope:instance:a".into(),
             generation: 1,
-            absent_roles: vec![GoverningSourceRole::Architecture],
+            // Absence must survey the whole governing-source set: every
+            // role the source model may surface is declared not applicable.
+            absent_roles: candidate_source_roles(),
             reason_ref: "none-found:no-architecture-doc".into(),
             evidence_refs: vec!["evidence:manifest-scan:empty".into()],
         };
@@ -1073,6 +1098,114 @@ mod tests {
                 .directive()
                 .map(MaterialReadinessDirective::kind_str),
             Some("AMBIGUOUS_RESULT")
+        );
+    }
+
+    #[test]
+    fn ambiguous_scope_resolution_denies_material_with_ambiguous_result() {
+        let mut receipt = receipt_with(current_task());
+        receipt.scope_resolution = ScopeResolutionState::Ambiguous;
+        let descriptor_value = descriptor();
+        let coverage = GoverningCoverage::AdmittedSources(sources());
+        let guard = guard_receipt();
+        let lease_value = lease();
+        let fence_value = fence();
+        let admission = match evaluate_material_request(
+            &inputs(
+                &receipt,
+                &descriptor_value,
+                &coverage,
+                &guard,
+                &lease_value,
+                &fence_value,
+            ),
+            RequestedEffect::CanonicalWrite,
+        ) {
+            Ok(value) => value,
+            Err(error) => panic!("gate evaluation failed: {error}"),
+        };
+        assert!(!admission.is_admitted());
+        assert_eq!(
+            admission.directive(),
+            Some(MaterialReadinessDirective::AmbiguousResult)
+        );
+        assert_eq!(
+            admission
+                .directive()
+                .map(MaterialReadinessDirective::kind_str),
+            Some("AMBIGUOUS_RESULT")
+        );
+    }
+
+    #[test]
+    fn stale_governing_coverage_requires_reevaluation() {
+        let receipt = receipt_with(current_task());
+        let descriptor_value = descriptor();
+        let mut stale = sources();
+        stale.sources[0].status = SourceStatus::Stale;
+        let coverage = GoverningCoverage::AdmittedSources(stale);
+        let guard = guard_receipt();
+        let lease_value = lease();
+        let fence_value = fence();
+        for effect in [RequestedEffect::MaterialEffect, RequestedEffect::Discovery] {
+            let admission = match evaluate_material_request(
+                &inputs(
+                    &receipt,
+                    &descriptor_value,
+                    &coverage,
+                    &guard,
+                    &lease_value,
+                    &fence_value,
+                ),
+                effect,
+            ) {
+                Ok(value) => value,
+                Err(error) => panic!("gate evaluation failed: {error}"),
+            };
+            assert!(!admission.is_admitted());
+            assert_eq!(
+                admission.directive(),
+                Some(MaterialReadinessDirective::ReadinessReevaluationRequired)
+            );
+        }
+    }
+
+    #[test]
+    fn partial_absence_does_not_close_governing_coverage() {
+        let receipt = receipt_with(current_task());
+        let descriptor_value = descriptor();
+        let absence = ExplicitAbsenceRecord {
+            scope_ref: "scope:instance:a".into(),
+            generation: 1,
+            absent_roles: vec![GoverningSourceRole::Architecture],
+            reason_ref: "none-found:no-architecture-doc".into(),
+            evidence_refs: vec!["evidence:manifest-scan:empty".into()],
+        };
+        if let Err(error) = absence.validate() {
+            panic!("absence fixture is invalid: {error}");
+        }
+        let coverage = GoverningCoverage::ExplicitAbsence(absence);
+        let guard = guard_receipt();
+        let lease_value = lease();
+        let fence_value = fence();
+        let admission = match evaluate_material_request(
+            &inputs(
+                &receipt,
+                &descriptor_value,
+                &coverage,
+                &guard,
+                &lease_value,
+                &fence_value,
+            ),
+            RequestedEffect::MaterialEffect,
+        ) {
+            Ok(value) => value,
+            Err(error) => panic!("gate evaluation failed: {error}"),
+        };
+        assert!(!admission.is_admitted());
+        assert_eq!(
+            admission.directive(),
+            Some(MaterialReadinessDirective::ReadinessReevaluationRequired)
         );
     }
 }

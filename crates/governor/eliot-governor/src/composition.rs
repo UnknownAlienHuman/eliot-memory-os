@@ -76,7 +76,10 @@ use eliot_testd_core::{
     JobState, RawArtifactStream, ReceiptBinding, TestJob, TestdSourceObservation,
     TestdSourceObservationRange, TestdStore, TestdTerminalCompletionEvidence, VerificationReceipt,
 };
-use eliot_workscope::{WorkScopeBindingOwner, WorkScopeBindingSnapshot};
+use eliot_workscope::{
+    MaterialAdmission, MaterialReadinessInputs, RequestedEffect, WorkScopeBindingOwner,
+    WorkScopeBindingSnapshot, evaluate_material_request,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -3865,6 +3868,95 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .await
     }
 
+    /// Admits one scope-sensitive canonical write under material readiness
+    /// (issue #1789, readiness-gate production caller).
+    ///
+    /// Evaluates [`evaluate_material_request`] for
+    /// [`RequestedEffect::CanonicalWrite`] over the presented readiness
+    /// facts. Currency is judged against the retained Kernel fence, never a
+    /// caller-presented fence: the evaluated inputs carry the presented
+    /// receipt, descriptor, coverage, guard receipt, lease, and tick with
+    /// the live fence substituted, so a stale receipt fails even when it
+    /// agrees with its own fence (re-evaluation on fence change is owned
+    /// here, not delegated to the presenter).
+    ///
+    /// An admission is then bound to the retained authenticated instance:
+    /// the presented receipt must name exactly the live `WorkScope` binding
+    /// read at the retained fence. Without a retained binding there is no
+    /// authenticated instance to bind, so the write fails closed. A denial
+    /// or a malformed bundle fails as [`CompositionError::Recovery`] carrying
+    /// the typed directive token; nothing is committed on any failure.
+    pub fn check_material_readiness_for_write(
+        &self,
+        readiness: &MaterialReadinessInputs<'_>,
+    ) -> Result<MaterialAdmission, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let live_fence = self.kernel_snapshot().state_fence().clone();
+        let effective = MaterialReadinessInputs {
+            fence: &live_fence,
+            ..*readiness
+        };
+        let admission = evaluate_material_request(&effective, RequestedEffect::CanonicalWrite)
+            .map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "material readiness inputs are malformed: {error}"
+                ))
+            })?;
+        if matches!(admission, MaterialAdmission::Admitted { .. }) {
+            let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+                CompositionError::Recovery(
+                    "WorkScope binding is unbound; material readiness cannot bind an authenticated instance"
+                        .to_owned(),
+                )
+            })?;
+            let snapshot = owner
+                .read_current(&live_fence)
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            if snapshot.binding.scope != readiness.receipt.scope {
+                return Err(CompositionError::Recovery(format!(
+                    "material readiness receipt addresses scope {} while WorkScope is bound to {}",
+                    readiness.receipt.scope.scope_ref, snapshot.binding.scope.scope_ref,
+                )));
+            }
+        }
+        Ok(admission)
+    }
+
+    /// Applies one Canonical-admitted transition only after material
+    /// readiness admits the write (issue #1789, canonical-write production
+    /// path).
+    ///
+    /// Runs [`Self::check_material_readiness_for_write`] and commits through
+    /// the existing [`Self::commit_canonical`] path only when the admission
+    /// is `Admitted`. A typed denial (`TASK_SELECTION_REQUIRED`,
+    /// `AMBIGUOUS_RESULT`, `GOVERNING_CONTEXT_REQUIRED`,
+    /// `READINESS_REEVALUATION_REQUIRED`) fails the write before any
+    /// canonical commit: nothing is launched on a denial. The daemon
+    /// canonical-write edge calls this method instead of `commit_canonical`
+    /// directly; safe-capture experience commits keep using `commit_canonical`
+    /// because the contract permits safe capture before `READY_MATERIAL`.
+    pub async fn commit_canonical_with_readiness(
+        &self,
+        identity: &RequestIdentity,
+        envelope: CanonicalWriteEnvelope,
+        readiness: &MaterialReadinessInputs<'_>,
+    ) -> Result<WriteReceipt, CompositionError> {
+        match self.check_material_readiness_for_write(readiness)? {
+            MaterialAdmission::Admitted { .. } => self.commit_canonical(identity, envelope).await,
+            MaterialAdmission::Denied {
+                directive,
+                missing_inputs,
+                ..
+            } => Err(CompositionError::Recovery(format!(
+                "material readiness denies canonical write: {}; missing: {}",
+                directive.kind_str(),
+                missing_inputs.join(",")
+            ))),
+        }
+    }
+
     /// Publishes one versioned Governor-owned executable binding projection
     /// (T9-01 M1, `T9.md` 3.2) for a registered native-worker attempt.
     ///
@@ -7080,6 +7172,277 @@ mod tests {
             GovernorComposition::new(kernel.clone(), None, &expected, QueueLimits::default())
                 .expect("composition");
         (kernel, composition)
+    }
+
+    /// Owned material-readiness facts for the issue #1789 gate tests.
+    ///
+    /// Every identity names the retained activation `WorkScope` binding
+    /// (`scope:work` / `instance:work` / `lineage:work`, generation 1), so
+    /// the Governor instance anchor passes and the gate verdict decides.
+    struct MaterialReadinessBundle {
+        receipt: eliot_workscope::OnboardingReadinessReceipt,
+        descriptor: eliot_workscope::WorkScopeDescriptor,
+        coverage: eliot_workscope::GoverningCoverage,
+        guard: eliot_workscope::ScopeBindingGuardReceipt,
+        lease: eliot_workscope::OnboardingLease,
+    }
+
+    impl MaterialReadinessBundle {
+        fn inputs<'a>(
+            &'a self,
+            fence: &'a StateFence,
+        ) -> eliot_workscope::MaterialReadinessInputs<'a> {
+            eliot_workscope::MaterialReadinessInputs {
+                receipt: &self.receipt,
+                descriptor: &self.descriptor,
+                coverage: &self.coverage,
+                guard_receipt: &self.guard,
+                lease: &self.lease,
+                fence,
+                now: 1,
+            }
+        }
+    }
+
+    fn readiness_scope() -> eliot_workscope::ScopeIdentity {
+        eliot_workscope::ScopeIdentity {
+            scope_ref: "scope:work".to_owned(),
+            kind: eliot_workscope::ScopeKind::GitRepo,
+            lineage_ref: Some("lineage:work".to_owned()),
+            instance_ref: "instance:work".to_owned(),
+            root_identity: "root:work".to_owned(),
+            generation: 1,
+        }
+    }
+
+    fn readiness_lineage() -> eliot_workscope::RepositoryLineageIdentity {
+        eliot_workscope::RepositoryLineageIdentity {
+            lineage_ref: "lineage:work".to_owned(),
+            object_store_ref: "store:work".to_owned(),
+            initial_history_ref: "history:work".to_owned(),
+            normalized_remote_ref: None,
+            manifest_identity_ref: None,
+        }
+    }
+
+    fn readiness_instance() -> eliot_workscope::WorkspaceInstanceIdentity {
+        eliot_workscope::WorkspaceInstanceIdentity {
+            instance_ref: "instance:work".to_owned(),
+            root_identity: "root:work".to_owned(),
+            vcs_identity_ref: None,
+            generation: 1,
+        }
+    }
+
+    fn readiness_lease() -> eliot_workscope::OnboardingLease {
+        eliot_workscope::OnboardingLease {
+            lease_ref: "onboarding:work".to_owned(),
+            lineage_candidate_ref: "lineage:work".to_owned(),
+            workspace_instance_candidate_ref: "instance:work".to_owned(),
+            governing_source_generation: 1,
+            compiler_epoch: 1,
+            state: eliot_workscope::OnboardingLeaseState::Compiling,
+            deadline: 10,
+        }
+    }
+
+    fn readiness_privacy() -> eliot_workscope::PrivacyProfile {
+        eliot_workscope::PrivacyProfile {
+            admitted_classes: vec![eliot_security_contracts::PrivacyClass::Internal],
+        }
+    }
+
+    fn readiness_assurance(fence: &StateFence) -> eliot_security_contracts::SourceAssurance {
+        serde_json::from_value(serde_json::json!({
+            "source_ref": "architecture",
+            "provenance_ref": "artifact:architecture",
+            "integrity": "VERIFIED",
+            "freshness": "CURRENT",
+            "competence": "DOMAIN_VERIFIED",
+            "independence": "INDEPENDENT",
+            "privacy_class": serde_json::to_value(eliot_security_contracts::PrivacyClass::Internal)
+                .expect("privacy class"),
+            "instruction_taint": "CLEARED",
+            "allowed_epistemic_use": ["OBSERVATION"],
+            "allowed_effects": ["READ_ONLY"],
+            "required_verifier": null,
+            "quarantine": "NONE",
+            "state_fence": fence,
+        }))
+        .expect("source assurance fixture")
+    }
+
+    fn readiness_sources(fence: &StateFence) -> eliot_workscope::GoverningSourceSet {
+        eliot_workscope::GoverningSourceSet::new(
+            "scope:work".to_owned(),
+            1,
+            vec![eliot_workscope::GoverningSource {
+                source_ref: "architecture".to_owned(),
+                role: eliot_workscope::GoverningSourceRole::Architecture,
+                assurance: readiness_assurance(fence),
+                applicable_generation: 1,
+                status: eliot_workscope::SourceStatus::Admitted,
+                domains: Vec::new(),
+            }],
+            Vec::new(),
+        )
+        .expect("source fixture")
+    }
+
+    fn readiness_descriptor(fence: &StateFence) -> eliot_workscope::WorkScopeDescriptor {
+        eliot_workscope::WorkScopeDescriptor {
+            scope_ref: "scope:work".to_owned(),
+            descriptor_revision: 1,
+            kind: eliot_workscope::ScopeKind::GitRepo,
+            display_name: "work".to_owned(),
+            lineage: Some(readiness_lineage()),
+            instances: vec![readiness_instance()],
+            owner_refs: vec!["owner:test".to_owned()],
+            canonical_resource_refs: Vec::new(),
+            root_identities: vec!["root:work".to_owned()],
+            external_resource_refs: Vec::new(),
+            truth_surface_refs: vec!["truth:work".to_owned()],
+            verifier_refs: vec!["verifier:work".to_owned()],
+            privacy: readiness_privacy(),
+            authority_profile_ref: Some("authority:test".to_owned()),
+            execution_identity: eliot_workscope::ResourceExecutionIdentity::Service,
+            generation: eliot_workscope::GenerationEvidence {
+                branch_ref: None,
+                commit_ref: None,
+                dirty_summary_ref: None,
+                task_revision: None,
+                resource_generation: ResourceGeneration::genesis(),
+            },
+            state_fence: fence.clone(),
+            available_capabilities: Vec::new(),
+            missing_capabilities: Vec::new(),
+            lifecycle: eliot_workscope::ScopeLifecycle::Active,
+        }
+    }
+
+    fn readiness_bundle(
+        fence: &StateFence,
+        task: eliot_workscope::TaskBindingInput,
+    ) -> MaterialReadinessBundle {
+        let scope = readiness_scope();
+        let instance = readiness_instance();
+        let lineage = readiness_lineage();
+        let candidate = eliot_workscope::WorkScopeCandidate {
+            scope: scope.clone(),
+            lineage: Some(lineage.clone()),
+            instance: instance.clone(),
+            privacy_class: eliot_security_contracts::PrivacyClass::Internal,
+        };
+        let sources = readiness_sources(fence);
+        let privacy = readiness_privacy();
+        let binding = eliot_workscope::ScopeBinding {
+            scope: scope.clone(),
+            privacy_class: eliot_security_contracts::PrivacyClass::Internal,
+            governing_source_generation: 1,
+        };
+        let guard =
+            eliot_workscope::ScopeBindingGuard.check(&binding, &binding, &sources, &privacy);
+        let lease = readiness_lease();
+        let receipt = eliot_workscope::ColdStartController
+            .compile(
+                "receipt:work",
+                &lease,
+                "principal:test",
+                "session:test",
+                &scope,
+                &instance,
+                Some(&lineage),
+                &candidate,
+                &sources,
+                fence,
+                "governance:test",
+                vec!["integration:evidence:one".to_owned()],
+                "route:test",
+                "serializer:test",
+                "serializer-version:test",
+                "serializer-options:test",
+                "tokenizer:test",
+                "tokenizer-version:test",
+                "tokenizer-hash:test",
+                "projection:test",
+                1,
+                &privacy,
+                task,
+                1,
+            )
+            .expect("readiness receipt");
+        MaterialReadinessBundle {
+            receipt,
+            descriptor: readiness_descriptor(fence),
+            coverage: eliot_workscope::GoverningCoverage::AdmittedSources(sources),
+            guard,
+            lease,
+        }
+    }
+
+    fn readiness_composition() -> (Arc<FakeKernel>, GovernorComposition<FakeKernel>) {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let kernel = Arc::new(activation_fake(&observed));
+        let composition =
+            GovernorComposition::new(kernel.clone(), None, &expected, QueueLimits::default())
+                .expect("composition");
+        (kernel, composition)
+    }
+
+    #[test]
+    fn canonical_write_without_task_is_denied_before_commit() {
+        let (kernel, composition) = readiness_composition();
+        let fence = composition.kernel_snapshot().state_fence().clone();
+        let identity = commit_identity(&fence);
+        let envelope = commit_envelope(
+            &fence,
+            identity.request.metadata.clone(),
+            &identity.idempotency_key,
+            "op-1789-no-task",
+        );
+        let bundle = readiness_bundle(&fence, eliot_workscope::TaskBindingInput::NoTask);
+        let denied = block_on(composition.commit_canonical_with_readiness(
+            &identity,
+            envelope,
+            &bundle.inputs(&fence),
+        ));
+        assert!(
+            matches!(denied, Err(CompositionError::Recovery(ref message)) if message.contains("TASK_SELECTION_REQUIRED")),
+            "no-task write was not denied with TASK_SELECTION_REQUIRED: {denied:?}"
+        );
+        assert_eq!(*kernel.apply_calls.lock().expect("apply call lock"), 0);
+        assert!(kernel.committed.lock().expect("committed lock").is_empty());
+    }
+
+    #[test]
+    fn canonical_write_with_full_grounding_commits() {
+        let (kernel, composition) = readiness_composition();
+        let fence = composition.kernel_snapshot().state_fence().clone();
+        let identity = commit_identity(&fence);
+        let envelope = commit_envelope(
+            &fence,
+            identity.request.metadata.clone(),
+            &identity.idempotency_key,
+            "op-1789-grounded",
+        );
+        let bundle = readiness_bundle(
+            &fence,
+            eliot_workscope::TaskBindingInput::Current {
+                task_ref: "task:one".to_owned(),
+                task_revision: 1,
+                acceptance_digest: "digest:acceptance:one".to_owned(),
+            },
+        );
+        let receipt = block_on(composition.commit_canonical_with_readiness(
+            &identity,
+            envelope,
+            &bundle.inputs(&fence),
+        ))
+        .expect("grounded write commits");
+        assert_eq!(receipt.operation_id.as_str(), "op-1789-grounded");
+        assert_eq!(receipt.status, WriteReceiptStatus::Committed);
+        assert_eq!(*kernel.apply_calls.lock().expect("apply call lock"), 1);
     }
 
     #[test]

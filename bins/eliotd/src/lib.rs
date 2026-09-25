@@ -512,6 +512,15 @@ impl DaemonComposition {
     /// a local rehash. No Store client or second ledger is involved: the
     /// only write path is the retained neutral Kernel port.
     ///
+    /// The write is material-readiness gated (issue #1789): `readiness`
+    /// carries the presented onboarding facts and this method commits through
+    /// the Governor readiness-gated path instead of `commit_canonical`
+    /// directly, so a typed denial (`TASK_SELECTION_REQUIRED`,
+    /// `AMBIGUOUS_RESULT`, `GOVERNING_CONTEXT_REQUIRED`,
+    /// `READINESS_REEVALUATION_REQUIRED`) fails the write before any commit.
+    /// A denial propagates as [`DaemonError::Composition`] and never reaches
+    /// the refresh below.
+    ///
     /// Post-commit behavior:
     /// - The refresh runs before a receipt is returned. A failed refresh
     ///   keeps the already durable receipt, marks this composition's
@@ -529,6 +538,7 @@ impl DaemonComposition {
         &mut self,
         identity: &eliot_protocol::RequestIdentity,
         envelope: eliot_governor::CanonicalWriteEnvelope,
+        readiness: &eliot_workscope::MaterialReadinessInputs<'_>,
     ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
         // #740: request/result span over the neutral handoff boundary. The
         // handoff (prepared envelope submitted) and the commitment (validated
@@ -536,7 +546,7 @@ impl DaemonComposition {
         let _span = tracing::info_span!("eliotd.canonical_commit").entered();
         let receipt = self
             .governor
-            .commit_canonical(identity, envelope)
+            .commit_canonical_with_readiness(identity, envelope, readiness)
             .await
             .map_err(DaemonError::Composition)?;
         if self.governor.refresh_from_kernel().is_err() {
