@@ -1727,8 +1727,12 @@ impl KernelComposition {
                         let value = serde_json::to_value(&receipt)
                             .map_err(|_| TransportError::SessionFenced)?;
                         Ok(serde_json::json!({
-                            "kind": "authority_activation_receipt",
-                            "value": value,
+                            "status": "known",
+                            "value": {
+                                "kind": "authority_activation_receipt",
+                                "value": value,
+                            },
+                            "recovery": null,
                         }))
                     }
                     Err(refusal) => Ok(p07_refusal_response("activate_grant", &refusal)),
@@ -1758,8 +1762,12 @@ impl KernelComposition {
                         let value = serde_json::to_value(&receipt)
                             .map_err(|_| TransportError::SessionFenced)?;
                         Ok(serde_json::json!({
-                            "kind": "authority_revocation_receipt",
-                            "value": value,
+                            "status": "known",
+                            "value": {
+                                "kind": "authority_revocation_receipt",
+                                "value": value,
+                            },
+                            "recovery": null,
                         }))
                     }
                     Err(refusal) => Ok(p07_refusal_response("revoke_grant", &refusal)),
@@ -1801,8 +1809,12 @@ impl KernelComposition {
                         let value = serde_json::to_value(&receipt)
                             .map_err(|_| TransportError::SessionFenced)?;
                         Ok(serde_json::json!({
-                            "kind": "authority_activation_receipt",
-                            "value": value,
+                            "status": "known",
+                            "value": {
+                                "kind": "authority_activation_receipt",
+                                "value": value,
+                            },
+                            "recovery": null,
                         }))
                     }
                     Err(refusal) => Ok(p07_refusal_response("activate_introduction", &refusal)),
@@ -1837,8 +1849,12 @@ impl KernelComposition {
                         let value = serde_json::to_value(&receipt)
                             .map_err(|_| TransportError::SessionFenced)?;
                         Ok(serde_json::json!({
-                            "kind": "authority_revocation_receipt",
-                            "value": value,
+                            "status": "known",
+                            "value": {
+                                "kind": "authority_revocation_receipt",
+                                "value": value,
+                            },
+                            "recovery": null,
                         }))
                     }
                     Err(refusal) => Ok(p07_refusal_response("revoke_introduction", &refusal)),
