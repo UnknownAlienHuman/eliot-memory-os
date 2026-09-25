@@ -4143,30 +4143,41 @@ struct ServiceSecurityBinding {
     group_sid: String,
 }
 
+/// The live OWNER/GROUP/DACL triple read from one service security descriptor.
+///
+/// `descriptor` is the allocation `GetSecurityInfo` produced; the caller owns
+/// it and releases it with `LocalFree` exactly once. `owner` and `group` borrow
+/// that same descriptor, so they stay valid only while it is alive.
 #[cfg(windows)]
-fn read_service_security_binding(
+struct LiveServiceSecurityDescriptor {
+    descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+    owner: windows_sys::Win32::Security::PSID,
+    group: windows_sys::Win32::Security::PSID,
+    dacl: *const windows_sys::Win32::Security::ACL,
+}
+
+/// Reads the live OWNER, GROUP and DACL of a service in one call.
+///
+/// The security-information mask requests only
+/// `OWNER | GROUP | DACL` and the SACL out-pointer is null, so SACL observation
+/// remains an installer-only contour and is never a requirement of this read.
+/// Every failure — the descriptor query itself, a null owner, or a null group —
+/// is reported through the typed [`ServiceGrantReadError`] `Unknown` owner with
+/// its own `GetLastError` and failing stage, never as a proven `AclMismatch`.
+#[cfg(windows)]
+fn read_live_service_security_descriptor(
     service: windows_sys::Win32::Foundation::HANDLE,
-    expected_dacl: *const windows_sys::Win32::Security::ACL,
-) -> Result<ServiceSecurityBinding, ServiceGrantReadError> {
+) -> Result<LiveServiceSecurityDescriptor, ServiceGrantReadError> {
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SUCCESS, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_SERVICE};
     use windows_sys::Win32::Security::{
-        GetSecurityDescriptorControl, GetSecurityDescriptorGroup, GetSecurityDescriptorOwner,
-        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+        GetSecurityDescriptorGroup, GetSecurityDescriptorOwner, PSECURITY_DESCRIPTOR, PSID,
     };
 
-    if expected_dacl.is_null() {
-        return Err(ServiceGrantReadError::mismatch(
-            WindowsAdapterError::InvalidInput,
-        ));
-    }
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let mut actual_owner: PSID = std::ptr::null_mut();
     let mut actual_group: PSID = std::ptr::null_mut();
     let mut actual_dacl = std::ptr::null_mut();
-    // OWNER, GROUP and DACL are read from one live service handle. The SACL
-    // pointer and security-information bit are deliberately null/absent:
-    // SACL observation remains an installer-only contour.
     // SAFETY: GetSecurityInfo reads the service security descriptor through a live
     // READ_CONTROL handle; all requested SID/ACL/descriptor out-pointers are valid
     // writable locals; the descriptor is paired with LocalFree below.
@@ -4208,7 +4219,7 @@ fn read_service_security_binding(
     let owner_ok =
         // SAFETY: GetSecurityDescriptorOwner borrows the validated descriptor; owner/defaulted are valid
         // writable out-pointers; descriptor outlives the borrow.
-        unsafe { GetSecurityDescriptorOwner(descriptor, &raw mut owner, &raw mut owner_defaulted) } != 0
+        unsafe { GetSecurityDescriptorOwner(descriptor, &raw mut owner, &raw mut owner_defaulted) != 0 }
             && !owner.is_null();
     if !owner_ok {
         // SAFETY: LocalFree releases the descriptor allocated above exactly once.
@@ -4224,7 +4235,7 @@ fn read_service_security_binding(
     let group_ok =
         // SAFETY: GetSecurityDescriptorGroup borrows the validated descriptor; group/defaulted are valid
         // writable out-pointers; descriptor outlives the borrow.
-        unsafe { GetSecurityDescriptorGroup(descriptor, &raw mut group, &raw mut group_defaulted) } != 0
+        unsafe { GetSecurityDescriptorGroup(descriptor, &raw mut group, &raw mut group_defaulted) != 0 }
             && !group.is_null();
     if !group_ok {
         // SAFETY: LocalFree releases the descriptor allocated above exactly once.
@@ -4235,13 +4246,36 @@ fn read_service_security_binding(
             "query-group",
         ));
     }
+    Ok(LiveServiceSecurityDescriptor {
+        descriptor,
+        owner,
+        group,
+        dacl: actual_dacl,
+    })
+}
 
-    let owner_text = sid_to_string(owner).map_err(|kind| {
+#[cfg(windows)]
+fn read_service_security_binding(
+    service: windows_sys::Win32::Foundation::HANDLE,
+    expected_dacl: *const windows_sys::Win32::Security::ACL,
+) -> Result<ServiceSecurityBinding, ServiceGrantReadError> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::{GetSecurityDescriptorControl, SE_DACL_PROTECTED};
+
+    if expected_dacl.is_null() {
+        return Err(ServiceGrantReadError::mismatch(
+            WindowsAdapterError::InvalidInput,
+        ));
+    }
+    let live = read_live_service_security_descriptor(service)?;
+    let descriptor = live.descriptor;
+
+    let owner_text = sid_to_string(live.owner).map_err(|kind| {
         // SAFETY: LocalFree releases the descriptor allocated above exactly once.
         unsafe { LocalFree(descriptor.cast()) };
         ServiceGrantReadError::from_adapter(kind, "query-owner")
     })?;
-    let group_text = sid_to_string(group).map_err(|kind| {
+    let group_text = sid_to_string(live.group).map_err(|kind| {
         // SAFETY: LocalFree releases the descriptor allocated above exactly once.
         unsafe { LocalFree(descriptor.cast()) };
         ServiceGrantReadError::from_adapter(kind, "query-group")
@@ -4281,14 +4315,12 @@ fn read_service_security_binding(
     // SAFETY: ACL byte compare dereferences the live DACL returned by GetSecurityInfo and the
     // validated expected DACL for exactly their declared sizes; both pointers are non-null.
     let dacl_matches = unsafe {
-        (*actual_dacl).AclSize == (*expected_dacl).AclSize
-            && std::slice::from_raw_parts(
-                actual_dacl.cast::<u8>(),
-                usize::from((*actual_dacl).AclSize),
-            ) == std::slice::from_raw_parts(
-                expected_dacl.cast::<u8>(),
-                usize::from((*expected_dacl).AclSize),
-            )
+        (*live.dacl).AclSize == (*expected_dacl).AclSize
+            && std::slice::from_raw_parts(live.dacl.cast::<u8>(), usize::from((*live.dacl).AclSize))
+                == std::slice::from_raw_parts(
+                    expected_dacl.cast::<u8>(),
+                    usize::from((*expected_dacl).AclSize),
+                )
     };
     // SAFETY: LocalFree releases the descriptor allocated above exactly once; all SID text and
     // comparison results were materialized before this point.

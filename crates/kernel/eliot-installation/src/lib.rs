@@ -4543,8 +4543,13 @@ impl WindowsInstallationEffectPort {
                 // typed stage/Win32/state/PID cause through the existing
                 // `PortError::ProviderReference` owner so the coordinator
                 // retains it as `InstallationEffectProgressState::Unknown`
-                // instead of publishing a known `Mismatch`.
-                Err(service_registration_unknown_port_error(request, &detail))
+                // instead of publishing a known `Mismatch`. A detail that
+                // cannot form its own bounded reference is a typed
+                // `PortError` contract rejection, propagated unchanged.
+                Err(PortError::ProviderReference {
+                    error: service_registration_unknown_provider_error(&detail),
+                    reference: service_registration_unknown_reference(request, &detail)?,
+                })
             }
         }
     }
@@ -4639,7 +4644,10 @@ impl WindowsInstallationEffectPort {
                 // reference is correlated to this exact request identity, so
                 // the unresolved read stays attributable to its original
                 // operation instead of becoming a known mismatch.
-                Err(service_registration_unknown_port_error(request, &detail))
+                Err(PortError::ProviderReference {
+                    error: service_registration_unknown_provider_error(&detail),
+                    reference: service_registration_unknown_reference(request, &detail)?,
+                })
             }
         }
     }
@@ -4874,8 +4882,17 @@ impl WindowsInstallationEffectPort {
             }
             ServiceRegistrationRuntimeInspection::Absent => Ok(root_mismatch("service-missing")),
             ServiceRegistrationRuntimeInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationRuntimeInspection::Unknown { .. } => {
-                Ok(root_mismatch("service-readback"))
+            ServiceRegistrationRuntimeInspection::Unknown { detail } => {
+                // Issue #1352: `service-readback` named no cause, so an
+                // access-denied open, an unstable two-sample state/PID pair or
+                // a missing process identity was published as a proven
+                // configuration mismatch. The typed detail is preserved
+                // instead, through the same bounded owner the
+                // `RegisterService` inspect/reconcile arms use.
+                Err(PortError::ProviderReference {
+                    error: service_registration_unknown_provider_error(&detail),
+                    reference: service_registration_unknown_reference(request, &detail)?,
+                })
             }
         }
     }
@@ -4939,8 +4956,16 @@ impl WindowsInstallationEffectPort {
             }
             ServiceRegistrationRuntimeInspection::Absent => Ok(root_mismatch("service-missing")),
             ServiceRegistrationRuntimeInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationRuntimeInspection::Unknown { .. } => {
-                Ok(root_mismatch("service-readback"))
+            ServiceRegistrationRuntimeInspection::Unknown { detail } => {
+                // Issue #1352: the same bounded non-`Known` projection as
+                // `service_start_inspect` and `reconcile_service`. After a
+                // start effect the retained reference is correlated to this
+                // exact request identity, so the unresolved read stays
+                // attributable to its original operation.
+                Err(PortError::ProviderReference {
+                    error: service_registration_unknown_provider_error(&detail),
+                    reference: service_registration_unknown_reference(request, &detail)?,
+                })
             }
         }
     }
@@ -9776,6 +9801,19 @@ const REDACTED_PROVIDER_REFERENCE_PENDING: &str = "pending:provider-reference-re
 /// sample the platform did not read. `win32` is exactly eight lowercase hex
 /// digits; `state`/`pid` are exactly eight lowercase hex digits when the stage
 /// carries a status sample and the literal `none` when it does not.
+///
+/// Every installation inspect/reconcile arm that observes a typed
+/// `ServiceRegistrationRuntimeInspection::Unknown` or
+/// `ServiceRegistrationRuntimeReadback::Unknown` publishes the cause as
+/// `PortError::ProviderReference { error: .., reference: .. }` built from
+/// `service_registration_unknown_provider_error` and
+/// `service_registration_unknown_reference`. A failed or indeterminate read is
+/// therefore never published as `InstallationEffectObservation::Mismatch`,
+/// never as `Absent` and never as `Matching`; only an actual `Mismatched`
+/// readback stays a known mismatch. A detail that cannot form its own bounded
+/// reference is a typed `PortError` contract rejection and is propagated
+/// unchanged, never widened into a mismatch, a synthesized reference, or a
+/// string.
 const SERVICE_REGISTRATION_UNKNOWN_REFERENCE_PREFIX: &str = "service-registration-unknown-v1:";
 
 /// The exact platform-owned `ServiceInspectionUnknownDetail` stages that the
@@ -9822,10 +9860,15 @@ fn is_typed_service_registration_unknown_reference(value: &str) -> bool {
         return false;
     };
     let mut parts = rest.split(':');
+    // The field names below name four distinct facts: the request identity
+    // `digest`, the `read_stage` that failed, the raw `GetLastError` `code`,
+    // and the two observed SCM sample fields. `read_stage` deliberately does
+    // not reuse the `state` word: the stage is the read that failed, while
+    // `state`/`pid` are the sample it read.
     let Some(digest) = parts.next() else {
         return false;
     };
-    let Some(stage) = parts.next() else {
+    let Some(read_stage) = parts.next() else {
         return false;
     };
     let Some(code) = parts.next() else {
@@ -9839,7 +9882,7 @@ fn is_typed_service_registration_unknown_reference(value: &str) -> bool {
     };
     if parts.next().is_some()
         || !is_lower_sha256(digest)
-        || !is_service_registration_unknown_stage(stage)
+        || !is_service_registration_unknown_stage(read_stage)
         || !is_lowercase_hex8(code)
     {
         return false;
@@ -9847,7 +9890,7 @@ fn is_typed_service_registration_unknown_reference(value: &str) -> bool {
     if (state, pid) == ("none", "none") {
         return true;
     }
-    is_service_registration_unknown_sample_stage(stage)
+    is_service_registration_unknown_sample_stage(read_stage)
         && is_lowercase_hex8(state)
         && is_lowercase_hex8(pid)
 }
@@ -9869,7 +9912,9 @@ fn service_registration_unknown_reference(
         .intent_digest()
         .map_err(|_| PortError::InvalidRequestMetadata)?;
     let (state, pid) = match (detail.current_state(), detail.process_id()) {
-        (Some(state), Some(pid)) if is_service_registration_unknown_sample_stage(detail.stage()) => {
+        (Some(state), Some(pid))
+            if is_service_registration_unknown_sample_stage(detail.stage()) =>
+        {
             (format!("{state:08x}"), format!("{pid:08x}"))
         }
         (None, None) => ("none".to_owned(), "none".to_owned()),
@@ -9912,24 +9957,6 @@ fn service_registration_unknown_provider_error(
     ProviderError {
         code,
         retryable: false,
-    }
-}
-
-/// Preserves a typed indeterminate service-registration read as a
-/// non-`Known` port error carrying its exact bounded cause.
-///
-/// This is the single production projection used by both
-/// `WindowsInstallationEffectPort::inspect_service` and
-/// `::reconcile_service`. A failed or indeterminate read is never published as
-/// `InstallationEffectObservation::Mismatch`, never as `Absent`, and never as
-/// `Matching`; only an actual `Mismatched` readback stays a known mismatch.
-fn service_registration_unknown_port_error(
-    request: &InstallationEffectRequest,
-    detail: &ServiceInspectionUnknownDetail,
-) -> PortError {
-    PortError::ProviderReference {
-        error: service_registration_unknown_provider_error(detail),
-        reference: service_registration_unknown_reference(request, detail)?,
     }
 }
 
