@@ -2440,15 +2440,75 @@ impl KernelComposition {
             eliot_kernel_service::UserAutomationStoreOutcome::Committed { .. } => "committed",
             eliot_kernel_service::UserAutomationStoreOutcome::Replayed { .. } => "replayed",
         };
+        // The Human inspect surface shows the deterministic schedule
+        // projection before activation: the same normalized occurrence set the
+        // trigger contract uses, compiled here into the immutable
+        // revision-bound occurrence identities. A schedule the compiler cannot
+        // compile fails closed instead of projecting a guessed occurrence.
+        let occurrences =
+            Self::user_automation_inspection_occurrences(&response.outcome).map_err(|_error| {
+                super::kernel_diagnostics::observe_terminal_error(
+                    "daemon_user_automation_occurrence_projection",
+                );
+                TransportError::SessionFenced
+            })?;
         Ok(serde_json::json!({
             "status": "known",
             "value": {
                 "outcome": outcome,
                 "state_fence": response.state_fence,
                 "result": response.outcome,
+                "occurrences": occurrences,
             },
             "recovery": null,
         }))
+    }
+
+    /// Compiles the deterministic next-occurrence projection of every revision
+    /// a read operation returned.
+    ///
+    /// A mutation answer carries no schedule projection, so it yields an empty
+    /// list rather than re-deriving a revision the caller did not ask for.
+    #[cfg(windows)]
+    fn user_automation_inspection_occurrences(
+        outcome: &eliot_kernel_service::UserAutomationStoreOutcome,
+    ) -> Result<Vec<serde_json::Value>, UserAutomationRuntimeError> {
+        use eliot_kernel_service::UserAutomationReadResult;
+        let eliot_kernel_service::UserAutomationStoreOutcome::Read { result } = outcome else {
+            return Ok(Vec::new());
+        };
+        let revisions: Vec<&eliot_kernel_core::UserAutomationRevision> = match result {
+            UserAutomationReadResult::List { revisions } => revisions.iter().collect(),
+            UserAutomationReadResult::Status { revision, .. }
+            | UserAutomationReadResult::InspectLastFailure { revision, .. } => vec![revision],
+            UserAutomationReadResult::History { .. } => Vec::new(),
+        };
+        let mut projections = Vec::with_capacity(revisions.len());
+        for revision in revisions {
+            let identities = revision
+                .compile_occurrence_identities()
+                .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+            projections.push(
+                serde_json::to_value(serde_json::json!({
+                    "automation_id": revision.automation_id,
+                    "revision": revision.revision,
+                    "kind": revision.schedule.kind,
+                    "expression": revision.schedule.expression,
+                    "calendar": revision.schedule.calendar,
+                    "timezone": revision.schedule.timezone,
+                    "dst_fold": revision.schedule.dst_fold,
+                    "dst_gap": revision.schedule.dst_gap,
+                    "configuration_state": revision.configuration_state,
+                    "occurrences": identities,
+                }))
+                .map_err(|error| {
+                    UserAutomationRuntimeError::Rejected(format!(
+                        "UserAutomation occurrence projection encoding failed: {error}"
+                    ))
+                })?,
+            );
+        }
+        Ok(projections)
     }
 
     #[cfg(windows)]
