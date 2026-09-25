@@ -2806,16 +2806,32 @@ impl SecretPort for WindowsPlatform {
 }
 
 impl NotificationPort for WindowsPlatform {
+    /// Normal native notification delivery for the per-user one-shot adapter.
+    ///
+    /// I11.6:3: "Normal delivery is launched through the authorized User
+    /// Broker." This port is the P-01 native provider of the per-user
+    /// `eliot-notify.exe` process, not of the Host/Kernel service: the
+    /// Host/Kernel contour never calls it, and the only production consumer is
+    /// the one-shot process whose normal invocation the authorized User Broker
+    /// owns. I11.6:19 therefore still holds -- the Host/Kernel service does not
+    /// attempt to display desktop toasts directly; this process does, and only
+    /// once the broker has launched it on a Kernel-authorized grant.
+    ///
+    /// The result is observed OS acceptance evidence, never an assumption:
+    /// `Known` requires the bounded callback pump to have observed the shell
+    /// balloon callback for this submission. Every other case is reported as
+    /// `Unknown` so the caller persists delivery degradation and never claims a
+    /// toast. I11.6:13-14: without an interactive user session no immediate
+    /// desktop toast is promised, so a missing session is not delivered and not
+    /// guessed.
     fn deliver(&mut self, request: &NotificationRequest) -> PortOutcome<NotificationObservation> {
         if let Err(error) = request.validate() {
             return PortOutcome::Error(error);
         }
-        // I11.6 normal delivery belongs to the interactive User Broker and a
-        // WinUI/AppNotificationManager owner. This low-level adapter is not a
-        // second toast authority; callers must keep the result unavailable
-        // until that owner returns authenticated OS acceptance evidence.
-        let _ = request;
-        PortOutcome::Unknown(UnknownReason::Unsupported)
+        if !interactive_non_elevated_session() {
+            return PortOutcome::Unknown(UnknownReason::NotObserved);
+        }
+        submit_native_notification(request)
     }
 }
 
@@ -2834,15 +2850,42 @@ impl WindowsPlatform {
         if !interactive_non_elevated_session() {
             return PortOutcome::Unknown(UnknownReason::NotObserved);
         }
-        match deliver_shell_notification(request) {
-            Ok(true) => PortOutcome::Known(NotificationObservation {
-                notification: request.notification.clone(),
-                delivered: true,
-            }),
-            Ok(false) => PortOutcome::Unknown(UnknownReason::NotObserved),
-            Err(_) => PortOutcome::Unknown(UnknownReason::Indeterminate),
-        }
+        submit_native_notification(request)
     }
+}
+
+/// Submits one native notification through the Windows Shell and projects the
+/// observed result into the neutral P-01 outcome.
+///
+/// Shared by the normal per-user delivery port and the restricted X-01 recovery
+/// banner: both are per-user, non-elevated, and both are proved only by the
+/// bounded callback observation. `Ok(true)` means the shell reported the
+/// submission and the callback pump observed the balloon callback; it never
+/// means a Human read or acknowledged anything.
+fn submit_native_notification(
+    request: &NotificationRequest,
+) -> PortOutcome<NotificationObservation> {
+    match deliver_shell_notification(request) {
+        Ok(true) => PortOutcome::Known(NotificationObservation {
+            notification: request.notification.clone(),
+            delivered: true,
+        }),
+        Ok(false) => PortOutcome::Unknown(UnknownReason::NotObserved),
+        Err(_) => PortOutcome::Unknown(UnknownReason::Indeterminate),
+    }
+}
+
+/// Reports whether this process holds a live, non-elevated interactive user
+/// session.
+///
+/// I11.6:13-14: "no interactive user session: no immediate desktop toast is
+/// promised". Both native notification ports gate on exactly this observation,
+/// and it is exposed so a delivery caller can name the no-session condition
+/// honestly instead of inferring it from a generic adapter failure. It observes
+/// only: it never creates, elevates, or switches a session.
+#[must_use]
+pub fn interactive_user_session_available() -> bool {
+    interactive_non_elevated_session()
 }
 
 /// Delivers one bounded Shell balloon and returns the observed API result.

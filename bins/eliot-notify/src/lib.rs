@@ -16,10 +16,10 @@ use eliot_contracts::{
     ResourceGeneration, SessionId, SourceId, StateFence,
 };
 use eliot_notify_core::{
-    A08AdmissionPort, AdmissionRequest, AdmissionResult, DeliveryObservation,
-    DeliveryProviderEvidence, DeliveryReceiptEvidence, DeliveryReceiptPort, G08NotificationPort,
-    LedgerCommitOutcome, LedgerIntent, LedgerReservation, LedgerReserveOutcome,
-    NotificationEnvelope, NotificationSeverity, NotificationStatePort,
+    A08AdmissionPort, AdmissionRequest, AdmissionResult, CanonicalObligation, DeliveryConfidence,
+    DeliveryObservation, DeliveryProviderEvidence, DeliveryReceiptEvidence, DeliveryReceiptPort,
+    G08NotificationPort, LedgerCommitOutcome, LedgerIntent, LedgerReservation,
+    LedgerReserveOutcome, NotificationEnvelope, NotificationSeverity, NotificationStatePort,
     NotificationStateReadRequest, NotificationStateReadResponse, NotificationStateRequest,
     NotificationStateResponse, NotifyCore, OneShotLedgerPort, SignedWatchdogFallbackEnvelope,
     UserAutomationFailureRequest, UserAutomationInvocation, UserAutomationPreflightProjection,
@@ -108,6 +108,106 @@ impl NotificationPort for NotificationPlatform {
             self.platform.deliver(request)
         }
     }
+}
+
+/// Stable condition codes for one unsatisfied notification obligation.
+///
+/// These are the only values handed to
+/// [`no_session_persist::record_no_session`]; anything unrecognised is
+/// downgraded to a fixed code there, so a caller can never smuggle payload
+/// text into the Event Log or the spool.
+const DELIVER_NO_SESSION: &str = "deliver:no-session";
+const DELIVER_ADAPTER_UNAVAILABLE: &str = "deliver:adapter-unavailable";
+const FALLBACK_NO_SESSION: &str = "fallback:no-session";
+const FALLBACK_ADAPTER_UNAVAILABLE: &str = "fallback:adapter-unavailable";
+
+/// Which delivery contour recorded the unsatisfied obligation.
+///
+/// The contour selects the condition code only; it never changes what is
+/// persisted, and it carries no payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObligationContour {
+    /// Normal per-user delivery launched by the authorized User Broker.
+    Normal,
+    /// Separately registered signed Watchdog fallback / recovery banner.
+    WatchdogFallback,
+}
+
+impl ObligationContour {
+    /// Condition recorded when no live interactive user session was observed.
+    const fn no_session_code(self) -> &'static str {
+        match self {
+            Self::Normal => DELIVER_NO_SESSION,
+            Self::WatchdogFallback => FALLBACK_NO_SESSION,
+        }
+    }
+
+    /// Condition recorded when a session exists but the adapter returned no
+    /// observed acceptance.
+    const fn adapter_unavailable_code(self) -> &'static str {
+        match self {
+            Self::Normal => DELIVER_ADAPTER_UNAVAILABLE,
+            Self::WatchdogFallback => FALLBACK_ADAPTER_UNAVAILABLE,
+        }
+    }
+}
+
+/// Durable disposition of one notification obligation that no toast satisfied.
+///
+/// I11.6:13-14 (no toast is promised without an interactive session; the
+/// Event Log / spool persist the obligation), I11.6:19 (adapter loss degrades
+/// delivery only) and I11.7:7 (the critical unresolved item remains on the
+/// board). `claimed_toast` is structurally always `false`: this value is only
+/// ever produced on a path where no desktop toast was observed, and it is never
+/// a resolution or an acknowledgement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct UnsatisfiedObligation {
+    /// Always `false`; no toast is claimed on this path.
+    pub claimed_toast: bool,
+    /// Stable delivery-degradation code persisted in the Event Log / spool.
+    pub reason_code: &'static str,
+    /// Whether the Windows Event Log insertion was accepted by the OS.
+    pub event_logged: bool,
+    /// Whether the spool marker survived its own readback.
+    pub spool_persisted: bool,
+    /// Whether a durable no-session marker is still readable from the spool.
+    /// Read back from the owning store, never assumed from the write.
+    pub spool_obligation_available: bool,
+    /// The canonical obligation read back from the canonical owner, when this
+    /// notification has a canonical scope to read. The owner's own unresolved
+    /// flag is reported as observed; delivery loss never writes a resolution.
+    pub canonical: Option<CanonicalObligation>,
+}
+
+/// Returns whether one delivery outcome carries an observed OS acceptance.
+///
+/// `Known` plus `delivered == Some(true)` is the only claimed-toast outcome: it
+/// is the shape the platform adapter produces solely after observing the
+/// native notification acceptance. `Partial`, `Unknown`, a reported failure, and
+/// every provider error leave the obligation unsatisfied.
+fn claims_toast(outcome: &Result<DeliveryObservation, eliot_notify_core::NotifyError>) -> bool {
+    matches!(outcome, Ok(observation)
+        if observation.confidence == DeliveryConfidence::Known
+            && observation.delivered == Some(true))
+}
+
+/// Returns whether one delivery outcome must persist the obligation.
+///
+/// A canonical quiet-hours popup suppression is deliberately excluded: there the
+/// item is already on the board and the policy suppressed only the popup, so
+/// recording a no-session marker would misreport a policy decision as a lost
+/// session. Everything else that fails to produce an observed acceptance is an
+/// unsatisfied obligation.
+fn records_obligation(
+    outcome: &Result<DeliveryObservation, eliot_notify_core::NotifyError>,
+) -> bool {
+    if claims_toast(outcome) {
+        return false;
+    }
+    !matches!(
+        outcome,
+        Err(eliot_notify_core::NotifyError::DeliverySuppressed)
+    )
 }
 
 impl NotificationComposition {
@@ -219,9 +319,41 @@ impl NotificationComposition {
         envelope: &NotificationEnvelope,
         request: &NotificationRequest,
     ) -> Result<DeliveryObservation, eliot_notify_core::NotifyError> {
+        self.deliver_with_obligation(envelope, request).0
+    }
+
+    /// Delivers a normal G-08 notification and reports the durable obligation
+    /// when no toast was observed.
+    ///
+    /// The second element is `Some` exactly when the delivery outcome carries
+    /// no observed OS acceptance, which is the production no-session and
+    /// adapter-loss contour called out by I11.6:13-14 and I11.6:19. The
+    /// canonical obligation is read back from the canonical owner afterwards so
+    /// the surviving item is evidenced, not assumed.
+    pub fn deliver_with_obligation(
+        &mut self,
+        envelope: &NotificationEnvelope,
+        request: &NotificationRequest,
+    ) -> (
+        Result<DeliveryObservation, eliot_notify_core::NotifyError>,
+        Option<UnsatisfiedObligation>,
+    ) {
+        // A quiet-hours policy rejection is a request defect, not a delivery
+        // degradation, so it is never recorded as a no-session obligation.
         let quiet_hours_active = self.quiet_hours_active(request)?;
-        self.core
-            .deliver_with_quiet_hours(envelope, request, quiet_hours_active)
+        let outcome = self
+            .core
+            .deliver_with_quiet_hours(envelope, request, quiet_hours_active);
+        if !records_obligation(&outcome) {
+            return (outcome, None);
+        }
+        let obligation = self.record_unsatisfied_obligation(
+            &envelope.notification_id,
+            Some(&envelope.canonical.affected_scope),
+            request,
+            ObligationContour::Normal,
+        );
+        (outcome, Some(obligation))
     }
 
     /// Delivers one deterministic UserAutomation failure through the existing
@@ -235,9 +367,29 @@ impl NotificationComposition {
         failure: UserAutomationFailureRequest,
         request: &NotificationRequest,
     ) -> Result<DeliveryObservation, eliot_notify_core::NotifyError> {
-        let bound_request = failure.bind_notification_request(request)?;
-        let envelope = failure.into_notification_envelope()?;
-        self.deliver(&envelope, &bound_request)
+        self.deliver_user_automation_failure_with_obligation(failure, request)
+            .0
+    }
+
+    /// Delivers one deterministic UserAutomation failure and reports the
+    /// durable obligation when no toast was observed. Same contour and same
+    /// obligation record as every other normal delivery.
+    pub fn deliver_user_automation_failure_with_obligation(
+        &mut self,
+        failure: UserAutomationFailureRequest,
+        request: &NotificationRequest,
+    ) -> (
+        Result<DeliveryObservation, eliot_notify_core::NotifyError>,
+        Option<UnsatisfiedObligation>,
+    ) {
+        let (bound_request, envelope) = match failure.bind_notification_request(request) {
+            Ok(bound_request) => match failure.into_notification_envelope() {
+                Ok(envelope) => (bound_request, envelope),
+                Err(error) => return (Err(error), None),
+            },
+            Err(error) => return (Err(error), None),
+        };
+        self.deliver_with_obligation(&envelope, &bound_request)
     }
 
     /// Reads one authenticated canonical notification page through the same
@@ -256,7 +408,80 @@ impl NotificationComposition {
         envelope: &SignedWatchdogFallbackEnvelope,
         request: &NotificationRequest,
     ) -> Result<DeliveryObservation, eliot_notify_core::NotifyError> {
-        self.core.deliver_watchdog_fallback(envelope, request)
+        self.deliver_watchdog_fallback_with_obligation(envelope, request)
+            .0
+    }
+
+    /// Delivers the restricted signed Watchdog recovery notification and
+    /// reports the durable obligation when no banner was observed.
+    ///
+    /// The fallback contour has no canonical notification draft: the minimal
+    /// signed envelope deliberately carries no canonical record, so the
+    /// surviving obligation is the Event Log / spool record, exactly as
+    /// I11.6:9-11 describes the control-loss fallback.
+    pub fn deliver_watchdog_fallback_with_obligation(
+        &mut self,
+        envelope: &SignedWatchdogFallbackEnvelope,
+        request: &NotificationRequest,
+    ) -> (
+        Result<DeliveryObservation, eliot_notify_core::NotifyError>,
+        Option<UnsatisfiedObligation>,
+    ) {
+        let outcome = self.core.deliver_watchdog_fallback(envelope, request);
+        if !records_obligation(&outcome) {
+            return (outcome, None);
+        }
+        let obligation = self.record_unsatisfied_obligation(
+            &request.notification,
+            None,
+            request,
+            ObligationContour::WatchdogFallback,
+        );
+        (outcome, Some(obligation))
+    }
+
+    /// Persists one unsatisfied obligation and reads the canonical record back.
+    ///
+    /// Order matters and is fixed: the Windows Event Log insertion and the
+    /// spool marker are the durable delivery-degradation record, and only then
+    /// is the canonical obligation read back through the same authenticated
+    /// owner route used for delivery. Nothing here resolves, acknowledges, or
+    /// removes an item; the read is a bounded projection at the same fence.
+    ///
+    /// `affected_scope` is the canonical scope the read is filtered by. The
+    /// fallback contour passes `None`: the minimal signed envelope carries no
+    /// canonical draft by design, so there is no canonical record to project
+    /// and the Event Log / spool are the whole obligation (I11.6:9-11).
+    fn record_unsatisfied_obligation(
+        &mut self,
+        notification_id: &PlatformHandle,
+        affected_scope: Option<&str>,
+        request: &NotificationRequest,
+        contour: ObligationContour,
+    ) -> UnsatisfiedObligation {
+        // The no-session condition is observed, not assumed: a live
+        // non-elevated interactive session is the same observation the native
+        // delivery port gates on, so an unavailable adapter is never relabelled
+        // as a missing session (or the reverse).
+        let condition = if eliot_platform_windows::interactive_user_session_available() {
+            contour.adapter_unavailable_code()
+        } else {
+            contour.no_session_code()
+        };
+        let persisted = no_session_persist::record_no_session(condition);
+        let canonical = affected_scope.and_then(|scope| {
+            self.core
+                .canonical_obligation(notification_id, scope, request)
+                .ok()
+        });
+        UnsatisfiedObligation {
+            claimed_toast: false,
+            reason_code: persisted.reason_code,
+            event_logged: persisted.event_logged,
+            spool_persisted: persisted.spool_persisted,
+            spool_obligation_available: no_session_persist::spool_obligation_available(),
+            canonical,
+        }
     }
 
     fn quiet_hours_active(

@@ -161,6 +161,13 @@ pub use watchdog_composition::{
     WatchdogAuthorityState, WatchdogBackupPort, WatchdogComposition, WatchdogReadiness,
 };
 pub use watchdog_config::WatchdogConfig;
+pub use watchdog_fallback_composition::{
+    ControlLossFallbackBinding, FallbackCompositionError, FallbackMintInput,
+    FallbackPublishEffects, FallbackPublishReceipt, LiveFallbackEffects,
+    NOTIFY_FALLBACK_DECLARATION_RELATIVE, ProtectedFallbackKeyBinding,
+    WATCHDOG_FALLBACK_ENVELOPE_RELATIVE, WATCHDOG_FALLBACK_KEY_RELATIVE, incident_class_for,
+    mint_and_publish_fallback, publish_control_loss_fallback,
+};
 pub use watchdog_fallback_envelope::{
     WatchdogFallbackMintError, WatchdogFallbackMintInputs, mint_watchdog_fallback_envelope,
     publish_watchdog_fallback_envelope,
@@ -713,6 +720,10 @@ impl KernelWatchdogPort for IndependentKernelSensor {
     ) -> Pin<Box<dyn Future<Output = Result<(), KernelWatchdogError>> + Send + 'a>> {
         Box::pin(async move { self.record_gap(disposition) })
     }
+
+    fn installation_identity(&self) -> Option<&str> {
+        Some(self.installation_id.as_str())
+    }
 }
 
 #[must_use]
@@ -736,6 +747,15 @@ pub trait KernelWatchdogPort: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<(), KernelWatchdogError>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
     }
+
+    /// The installation identity this sensor is bound to.
+    ///
+    /// The signed fallback producer binds the envelope's installation identity
+    /// to the value the sensor admitted at startup, so a sensor without a bound
+    /// installation declines to publish rather than minting for an unknown one.
+    fn installation_identity(&self) -> Option<&str> {
+        None
+    }
 }
 
 async fn report_gap_nonfatal(kernel: &dyn KernelWatchdogPort, reason: GapRecoveryReason) {
@@ -748,7 +768,71 @@ async fn report_gap_nonfatal(kernel: &dyn KernelWatchdogPort, reason: GapRecover
     };
     // A spool/provider failure is itself only an observation gap. Never turn
     // it into TaskFailure: the SCM process stays alive for the next tick.
-    let _ = kernel.report_gap(disposition).await;
+    let _ = kernel.report_gap(disposition.clone()).await;
+    // I11.6:9-11: after a control loss the Watchdog publishes the signed
+    // minimal fallback envelope so the separately registered Task Scheduler
+    // task (or the next `eliot` launch) can read it without the User Broker.
+    // This is the production producer; it is strictly best-effort and never
+    // turns a recorded gap into a failure, because the durable evidence is
+    // already in the Watchdog's own spool (I11.6:19).
+    publish_control_loss_fallback_best_effort(&disposition, kernel);
+}
+
+/// Publishes the signed minimal fallback envelope for one recorded control loss.
+///
+/// The installer key ceremony owns provisioning; until its protected binding
+/// exists, or while it disagrees with the consumer's pinned declaration, this
+/// fails closed and the control-loss evidence remains durable in the Watchdog
+/// spool. That is the documented control-loss contour, not a silent drop: the
+/// attempt and its disposition are traced without any payload or key material.
+fn publish_control_loss_fallback_best_effort(
+    disposition: &GapRecoveryDisposition,
+    kernel: &dyn KernelWatchdogPort,
+) {
+    let _runtime_span = tracing::debug_span!("watchdog.fallback_publish").entered();
+    let Some(installation_id) = kernel.installation_identity() else {
+        tracing::debug!(
+            event = "watchdog.fallback_publish_unavailable",
+            observation = "attempted",
+            reason = "no admitted installation identity",
+            "watchdog fallback publish skipped without an admitted installation identity"
+        );
+        return;
+    };
+    let binding = match ProtectedFallbackKeyBinding::load() {
+        Ok(binding) => binding,
+        Err(error) => {
+            tracing::debug!(
+                event = "watchdog.fallback_publish_unavailable",
+                observation = "attempted",
+                reason = error.to_string().as_str(),
+                "watchdog fallback key binding unavailable; control-loss evidence stays in the spool"
+            );
+            return;
+        }
+    };
+    let clock_now_ms = current_unix_ms().unwrap_or(0);
+    match publish_control_loss_fallback(
+        disposition,
+        installation_id,
+        &binding,
+        &LiveFallbackEffects,
+        clock_now_ms,
+    ) {
+        Ok(receipt) => tracing::info!(
+            event = "watchdog.fallback_published",
+            observation = "published",
+            envelope_digest = receipt.envelope_digest.as_str(),
+            incident_class = incident_class_for(disposition.reason),
+            "watchdog published the signed minimal fallback envelope"
+        ),
+        Err(error) => tracing::debug!(
+            event = "watchdog.fallback_publish_failed",
+            observation = "attempted",
+            reason = error.to_string().as_str(),
+            "watchdog fallback publish failed; control-loss evidence stays in the spool"
+        ),
+    }
 }
 
 /// Non-secret failure returned by the kernel supervision boundary.

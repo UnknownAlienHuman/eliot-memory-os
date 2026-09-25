@@ -6,7 +6,9 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use eliot_process::OperationId;
-use eliot_user_broker::{BrokerComposition, BrokerConfig, canonical_root};
+use eliot_user_broker::{
+    BrokerComposition, BrokerConfig, canonical_root, request_names_notify_image,
+};
 use eliot_user_broker_core::LaunchRequest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,9 +25,21 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 // The line protocol mirrors the existing launch contract without a second boxed wire shape.
 #[allow(clippy::large_enum_variant)]
 enum Request {
-    Launch { request: LaunchRequest },
-    Cancel { operation_id: OperationId },
-    Reconcile { operation_id: OperationId },
+    Launch {
+        request: LaunchRequest,
+    },
+    /// Per-notification spawn of the canonical installed `eliot-notify.exe` on
+    /// a Kernel-authorized grant. This is the ONLY operation that can start the
+    /// notification adapter: the generic `Launch` operation refuses that image.
+    NotifyLaunch {
+        request: LaunchRequest,
+    },
+    Cancel {
+        operation_id: OperationId,
+    },
+    Reconcile {
+        operation_id: OperationId,
+    },
     Status,
     Stop,
 }
@@ -96,11 +110,12 @@ fn main() {
     let fallback_status = fallback.status_value();
     // Normal-launch staging for the installer-published Notify declaration:
     // best-effort and infallible by design, so staging can never fail broker
-    // startup. `Staged` means this broker verified it can name the exact
-    // installed `eliot-notify.exe` for later Kernel-approved grants;
-    // per-notification spawn stays on the `composition.launch` path.
-    let notify_launch = eliot_user_broker::stage_normal_notify_launch(&composition);
-    let notify_launch_status = notify_launch.status_value();
+    // startup. The verified launch reference is RETAINED by the composition —
+    // `staged` means this broker verified it can name the exact installed
+    // `eliot-notify.exe` and holds the authority to spawn exactly that image on
+    // a Kernel-authorized notify grant through `composition.launch_notify`.
+    composition.stage_notify_launch();
+    let notify_launch_status = composition.notify_launch_authority().status_value();
     let mut readiness = serde_json::to_value(composition.readiness())
         .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
     if let Value::Object(map) = &mut readiness {
@@ -250,25 +265,21 @@ fn dispatch(
         }
     };
     match request {
-        Request::Launch { request } => match composition.launch(request) {
-            Err(error) => composition_error(error.to_string()),
-            Ok(receipt) => {
-                let projection = receipt.operator_receipt();
-                match projection.validate() {
-                    Err(error) => Message::Error {
-                        code: "BROKER_RECEIPT_BINDING_REJECTED",
-                        detail: error.to_string(),
-                    },
-                    Ok(()) => match serde_json::to_value(projection) {
-                        Ok(receipt) => Message::Launched { receipt },
-                        Err(error) => Message::Error {
-                            code: "BROKER_RECEIPT_ENCODING",
-                            detail: error.to_string(),
-                        },
-                    },
-                }
+        Request::Launch { request } => {
+            // I11.6:3: normal `eliot-notify` delivery is launched through the
+            // authorized User Broker's notify-specific admitted path. A generic
+            // launch naming the canonical notify image is refused here, so no
+            // other request shape can produce a normal notification invocation.
+            if request_names_notify_image(&request) {
+                return Message::Error {
+                    code: "BROKER_NOTIFY_LAUNCH_REQUIRES_ADMISSION",
+                    detail: "the canonical notify image is only launchable through the admitted notify operation"
+                        .to_owned(),
+                };
             }
-        },
+            dispatch_launch(composition.launch(request))
+        }
+        Request::NotifyLaunch { request } => dispatch_launch(composition.launch_notify(request)),
         Request::Cancel { operation_id } => composition.cancel(&operation_id).map_or_else(
             |error| composition_error(error.to_string()),
             |receipt| Message::Cancelled {
@@ -300,6 +311,32 @@ fn composition_error(detail: String) -> Message {
     Message::Error {
         code: "BROKER_COMPOSITION_REJECTED",
         detail,
+    }
+}
+
+/// Projects one admitted launch outcome onto the wire, validating the exact
+/// operator receipt binding before it leaves the broker.
+fn dispatch_launch(
+    outcome: Result<eliot_user_broker_core::LaunchReceipt, eliot_user_broker::CompositionError>,
+) -> Message {
+    match outcome {
+        Err(error) => composition_error(error.to_string()),
+        Ok(receipt) => {
+            let projection = receipt.operator_receipt();
+            match projection.validate() {
+                Err(error) => Message::Error {
+                    code: "BROKER_RECEIPT_BINDING_REJECTED",
+                    detail: error.to_string(),
+                },
+                Ok(()) => match serde_json::to_value(projection) {
+                    Ok(receipt) => Message::Launched { receipt },
+                    Err(error) => Message::Error {
+                        code: "BROKER_RECEIPT_ENCODING",
+                        detail: error.to_string(),
+                    },
+                },
+            }
+        }
     }
 }
 

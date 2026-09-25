@@ -5,9 +5,17 @@
 //! I11.6:19 (adapter loss degrades delivery only), I11.7:7-8 (a suppressed
 //! delivery never resolves its item).
 //!
-//! [`record_no_session`] is called from the fail-closed no-session branches of
-//! the Watchdog fallback composition (`register`, `activate`, `load`). It
-//! never claims a toast, never resolves an item, and never echoes payloads,
+//! [`record_no_session`] is called from three production contours, all of them
+//! real delivery outcomes rather than identity-lookup failures:
+//!
+//! - the fail-closed no-session branches of the Watchdog fallback composition
+//!   (`register`, `activate`, `load`);
+//! - the normal and fallback delivery contours of
+//!   [`crate::NotificationComposition`], whenever the adapter returned no
+//!   observed OS acceptance (a missing interactive session, an unavailable
+//!   adapter, or a provider failure).
+//!
+//! It never claims a toast, never resolves an item, and never echoes payloads,
 //! identities, or secrets: every persisted value is a fixed code.
 //!
 //! The Windows Event Log write reuses the already-used repository facility
@@ -18,6 +26,8 @@
 //! root, inserting a schema-compatible marker entry. Both attempts are a
 //! single best-effort pass with no retry: failure is reported in the outcome,
 //! never escalated, and the caller's existing error variant is preserved.
+//! [`spool_obligation_available`] reads the marker back so the surviving
+//! obligation is observable rather than assumed.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -112,8 +122,47 @@ fn classify_condition(condition: &str) -> &'static str {
         "register:no-session" => "register:no-session",
         "activate:no-session" => "activate:no-session",
         "load:no-session" => "load:no-session",
+        "deliver:no-session" => "deliver:no-session",
+        "deliver:adapter-unavailable" => "deliver:adapter-unavailable",
+        "fallback:no-session" => "fallback:no-session",
+        "fallback:adapter-unavailable" => "fallback:adapter-unavailable",
         _ => "unknown-no-session",
     }
+}
+
+/// Prefix of every durable no-session marker key. The read-back below matches
+/// exactly this prefix, and the `no-session/` namespace is disjoint from every
+/// one-shot reservation key, so a marker can never be mistaken for a delivery
+/// claim or a resolution.
+const NO_SESSION_KEY_PREFIX: &str = "no-session/";
+
+/// Reports whether a durable no-session marker is still readable from the
+/// spool.
+///
+/// I11.6:13-14 requires the Event Log / spool to persist the obligation, so the
+/// obligation's survival is read back from the owning store rather than assumed
+/// from the write's return value. This appends no marker, mutates no
+/// reservation, and resolves nothing: it applies exactly the same bounded
+/// protected-lease read the marker writer uses. An unreadable or absent ledger
+/// reports `false` so a caller reports spool-unavailable instead of claiming a
+/// durable record it cannot see.
+#[must_use]
+pub fn spool_obligation_available() -> bool {
+    let relative = PathBuf::from(crate::FALLBACK_LEDGER_RELATIVE);
+    let Some(bytes) = read_ledger_bytes(&relative) else {
+        return false;
+    };
+    let Some(snapshot) = parse_ledger_snapshot(&bytes) else {
+        return false;
+    };
+    snapshot
+        .get("entries")
+        .and_then(Value::as_object)
+        .is_some_and(|entries| {
+            entries
+                .keys()
+                .any(|key| key.starts_with(NO_SESSION_KEY_PREFIX))
+        })
 }
 
 /// Durable marker key for one no-session observation. The `no-session/`
@@ -124,7 +173,7 @@ fn no_session_key(condition_code: &'static str) -> String {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis());
-    format!("no-session/{condition_code}/{now_ms}")
+    format!("{NO_SESSION_KEY_PREFIX}{condition_code}/{now_ms}")
 }
 
 /// Reads the protected fallback ledger through a verified lease. Returns
