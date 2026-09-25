@@ -20,9 +20,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_governor::KernelTransitionPort;
 use eliot_protocol::{
-    AgentActivationOwnerReadback, AgentActivationResolutionDisposition,
-    AgentActivationResolutionResult, AgentActivationResolutionTicket, AgentActivationResultAck,
-    AgentActivationResultAckOutcome, AgentActivationResultReconcile,
+    AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
+    AgentActivationResolutionDisposition, AgentActivationResolutionResult,
+    AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultAckOutcome,
+    AgentActivationResultReconcile,
 };
 use eliot_runtime_contracts::DaemonProgressChannel;
 use eliot_store_api::{StoreHealth, StoreHealthStatus};
@@ -1500,7 +1501,7 @@ async fn submit_supervision_heartbeat(
 /// surfaced only once a `Resolved` result actually needs the pair.
 fn resolve_valid_ticket(
     composition: &DaemonComposition,
-    kernel_owner: Result<Option<AgentActivationOwnerReadback>, String>,
+    kernel_owner: Result<Option<AgentActivationKernelOwnerReadback>, String>,
     ticket: AgentActivationResolutionTicket,
     now: u64,
 ) -> Result<Option<Box<ActivationResolvedTicket>>, String> {
