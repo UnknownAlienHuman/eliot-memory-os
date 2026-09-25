@@ -242,6 +242,12 @@ pub(crate) enum LocalReadSubmitDisposition {
     StaleAttempt(StaleLocalReadObservation),
 }
 
+#[derive(Clone, Copy)]
+enum DaemonReadQueue {
+    Query,
+    CampaignPacket,
+}
+
 impl KernelComposition {
     /// Admits one versioned host-request envelope for routing.
     ///
@@ -1790,6 +1796,29 @@ impl KernelComposition {
         session: &Session,
         body: &HostRequestResultBody,
     ) -> Result<LocalReadSubmitDisposition, TransportError> {
+        self.submit_claimed_result(session, body, DaemonReadQueue::Query)
+    }
+
+    /// Submits a campaign packet result through its independent attempt and
+    /// queue ledger. It cannot consume a query claim.
+    pub(crate) fn submit_campaign_packet_result(
+        &self,
+        session: &Session,
+        body: &HostRequestResultBody,
+    ) -> Result<LocalReadSubmitDisposition, TransportError> {
+        self.submit_claimed_result(session, body, DaemonReadQueue::CampaignPacket)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the submit gate keeps replay, deadline, currency, fence, and persistence joins in one audited order"
+    )]
+    fn submit_claimed_result(
+        &self,
+        session: &Session,
+        body: &HostRequestResultBody,
+        queue: DaemonReadQueue,
+    ) -> Result<LocalReadSubmitDisposition, TransportError> {
         body.validate().map_err(|_| TransportError::SessionFenced)?;
         let _transition = self.agent_bridge_transition_read()?;
         let _admission_owner = self
@@ -1806,6 +1835,11 @@ impl KernelComposition {
             .ok_or(TransportError::UnknownRequest)?;
         if stored.operation_id.as_str() != body.operation_id
             || stored.request_digest != body.request_sha256
+            || stored.capability_ref.as_str()
+                != match queue {
+                    DaemonReadQueue::Query => "eliot.query",
+                    DaemonReadQueue::CampaignPacket => "eliot.packet",
+                }
         {
             return Err(TransportError::SessionFenced);
         }
@@ -1823,8 +1857,12 @@ impl KernelComposition {
         }
         // Governed attempt currency: only the live (attempt_id, generation,
         // owner) triple completes.
-        let live = self
-            .live_local_read_attempt_under_transition(&body.operation_id, &body.request_sha256)?;
+        let live = match queue {
+            DaemonReadQueue::Query => self
+                .live_local_read_attempt_under_transition(&body.operation_id, &body.request_sha256)?,
+            DaemonReadQueue::CampaignPacket => self
+                .live_campaign_packet_attempt(&body.operation_id, &body.request_sha256)?,
+        };
         match (&body.attempt, live) {
             (Some(attempt), Some(state))
                 if attempt.attempt_id == state.attempt_id
@@ -1907,7 +1945,12 @@ impl KernelComposition {
                     candidate.operation_id == body.operation_id
                         && candidate.request_digest == body.request_sha256
                 })
-                .and_then(|candidate| candidate.local_read_envelope.clone())
+                .and_then(|candidate| match queue {
+                    DaemonReadQueue::Query => candidate.local_read_envelope.clone(),
+                    DaemonReadQueue::CampaignPacket => {
+                        candidate.campaign_packet_envelope.clone()
+                    }
+                })
         };
         validate_campaign_view_result(&stored, queued_envelope.as_ref(), &body.response)?;
         if let Some(envelope) = queued_envelope {
