@@ -1115,6 +1115,12 @@ pub const fn derive_recall_disposition(
             "required server observation unavailable",
         );
     }
+    if inputs.visible_count > 0 && inputs.top_score.is_none() {
+        return (
+            RecallDisposition::IncompleteCoverage,
+            "admitted count has no authoritative score observation",
+        );
+    }
     if inputs.visible_count > 0 {
         return match inputs.top_score {
             Some(score) if score >= 200 => (
@@ -1294,6 +1300,12 @@ impl ServerRecallVerdict {
             .rank_trace
             .feature_scores
             .iter()
+            .filter(|score| {
+                response
+                    .handles
+                    .iter()
+                    .any(|handle| handle.handle == score.handle)
+            })
             .map(|score| score.total)
             .max();
         let inputs = RecallDispositionInputs {

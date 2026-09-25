@@ -408,6 +408,7 @@ impl KernelComposition {
                 peer,
                 accepted_transport: None,
                 session: None,
+                authenticated_binding: None,
                 activation_completed: false,
             },
         );
@@ -1667,7 +1668,7 @@ impl KernelComposition {
                 .clone(),
             request_sha256: pending.request.request_sha256.clone(),
             disposition: eliot_protocol::AgentBridgeActivationDisposition::Authenticated {
-                binding: Box::new(authenticated),
+                binding: Box::new(authenticated.clone()),
             },
             response_sha256: String::new(),
         }
@@ -1697,6 +1698,7 @@ impl KernelComposition {
             return Err(TransportError::IdentityConflict);
         }
         state.session = Some(session);
+        state.authenticated_binding = Some(authenticated);
         state.activation_completed = true;
         Ok(reply)
     }

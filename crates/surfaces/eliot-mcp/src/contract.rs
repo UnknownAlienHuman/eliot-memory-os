@@ -6,6 +6,7 @@ use eliot_kernel_core::UserAutomationOperation;
 use eliot_protocol::{HARD_STRUCTURED_RESPONSE_BYTES, RequestIdentity};
 use eliot_receipts::{ProofCeiling, SessionBinding};
 use eliot_security_contracts::{EffectCeiling, InstructionTaint, PrivacyClass};
+use eliot_store_api::EVIDENCE_PACK_MAX_RECORDS;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -288,8 +289,31 @@ impl QueryInput {
             self.exact_resource_uri.as_deref(),
             "query.exact_resource_uri",
         )?;
-        if let Some(max_records) = self.max_records {
-            positive(u64::from(max_records), "query.max_records")?;
+        let exact_subject_evidence = self.exact_resource_uri.is_none()
+            && !matches!(self.intent.mode, QueryMode::CurrentPosition)
+            && self
+                .query
+                .strip_prefix("subject:")
+                .map(str::trim)
+                .is_some_and(|subject| {
+                    !subject.is_empty() && !subject.chars().any(char::is_control)
+                });
+        if exact_subject_evidence {
+            let max_records = self.max_records.ok_or(ContractViolation::InvalidField {
+                field: "query.max_records",
+                reason: "exact subject evidence queries require an explicit positive decimal bound",
+            })?;
+            if max_records == 0 || max_records > EVIDENCE_PACK_MAX_RECORDS {
+                return Err(ContractViolation::InvalidField {
+                    field: "query.max_records",
+                    reason: "must be within the evidence-pack catalogue bound",
+                });
+            }
+        } else if self.max_records.is_some() {
+            return Err(ContractViolation::InvalidField {
+                field: "query.max_records",
+                reason: "must be omitted for non-evidence query intents",
+            });
         }
         Ok(())
     }

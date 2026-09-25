@@ -234,6 +234,35 @@ impl AuthenticatedHostSession {
         &self.descriptor
     }
 
+    /// Validates the independent Session and `WorkScope` identities required by
+    /// the local-read response owner. The `WorkScope` is never synthesized from
+    /// the Session or connection identity.
+    fn validate_local_read_admission_scope(
+        envelope: &HostRequestEnvelope,
+        scope_id: &str,
+    ) -> Result<(), String> {
+        if envelope
+            .identity
+            .session_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty() || value.chars().any(char::is_control))
+        {
+            return Err("local-read envelope is missing its exact Session identity".to_owned());
+        }
+        let admitted_scope = envelope
+            .identity
+            .work_scope_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))
+            .ok_or_else(|| {
+                "local-read envelope is missing its exact WorkScope identity".to_owned()
+            })?;
+        if admitted_scope != scope_id {
+            return Err("local-read scope does not match the admitted WorkScope".to_owned());
+        }
+        Ok(())
+    }
+
     /// Builds the exact bounded local-read result body for one admitted query.
     ///
     /// Session-namespaced constructor (Implements #18: local read result): it
@@ -281,6 +310,7 @@ impl AuthenticatedHostSession {
         if envelope.identity.capability != "eliot.query" {
             return Err("presented capability is not the admitted local-read query".to_owned());
         }
+        Self::validate_local_read_admission_scope(envelope, scope_id)?;
         let mode = match intent_mode {
             "verification" => QueryMode::Verification,
             "provenance" => QueryMode::Provenance,
@@ -437,6 +467,13 @@ pub fn validate_local_read_result_response(
     max_records: u32,
     response: &serde_json::Value,
 ) -> Result<bool, String> {
+    AuthenticatedHostSession::validate_local_read_admission_scope(envelope, scope_id)?;
+    if subject.trim().is_empty() || subject.chars().any(char::is_control) {
+        return Err("local-read subject must be exact and non-blank".to_owned());
+    }
+    if max_records == 0 || max_records > EVIDENCE_PACK_MAX_RECORDS {
+        return Err("local-read max_records must be within the catalogue bound".to_owned());
+    }
     let response: McpResponse = serde_json::from_value(response.clone())
         .map_err(|error| format!("local-read result is not an MCP response: {error}"))?;
     let expected_request_sha256 = sha256_hex(
@@ -1729,7 +1766,7 @@ mod local_read_build_tests {
             },
             "query":"subject:evidence-alpha",
             "exact_resource_uri":null,
-            "max_records":32
+            "max_records":10
         }},
         "deadline_preference_ms":5000,
         "observed_context":{
@@ -1791,7 +1828,7 @@ mod local_read_build_tests {
         json!({
             "version": EVIDENCE_PACK_PROJECTION_VERSION,
             "subject": "evidence-alpha",
-            "scope_id": "scope-1",
+            "scope_id": "work-scope-1",
             "records": [
                 {
                     "capture_index": 0,
@@ -1814,7 +1851,7 @@ mod local_read_build_tests {
             operation: NamedReadOperation::GetEvidencePack,
             state_fence: test_fence(),
             revision_heads: vec![RevisionHead {
-                key: RevisionKey::new("scope:scope-1").expect("valid revision key"),
+                key: RevisionKey::new("scope:work-scope-1").expect("valid revision key"),
                 revision: 3,
                 state_fence: test_fence(),
             }],
@@ -1829,7 +1866,7 @@ mod local_read_build_tests {
         let store_response = evidence_store_response(payload.clone());
         let (digest, body) = AuthenticatedHostSession::build_local_read_result_body(
             &envelope,
-            "scope-1",
+            "work-scope-1",
             "evidence-alpha",
             10,
             "verification",
@@ -1852,7 +1889,7 @@ mod local_read_build_tests {
         assert_eq!(body["proof_ceiling"], json!("SCOPED_VERIFICATION"));
         assert_eq!(body["content"]["operation"], json!("GetEvidencePack"));
         assert_eq!(body["content"]["subject"], json!("evidence-alpha"));
-        assert_eq!(body["content"]["scope_id"], json!("scope-1"));
+        assert_eq!(body["content"]["scope_id"], json!("work-scope-1"));
         assert_eq!(
             body["content"]["revision_heads"],
             serde_json::to_value(&store_response.revision_heads)
@@ -1881,7 +1918,7 @@ mod local_read_build_tests {
         let store_response = evidence_store_response(evidence_payload());
         let first = AuthenticatedHostSession::build_local_read_result_body(
             &envelope,
-            "scope-1",
+            "work-scope-1",
             "evidence-alpha",
             10,
             "verification",
@@ -1890,7 +1927,7 @@ mod local_read_build_tests {
         .expect("first build must succeed");
         let second = AuthenticatedHostSession::build_local_read_result_body(
             &envelope,
-            "scope-1",
+            "work-scope-1",
             "evidence-alpha",
             10,
             "verification",
@@ -1934,19 +1971,26 @@ mod local_read_build_tests {
         let mut other = envelope.clone();
         other.identity.capability = "eliot.state".to_owned();
         assert!(
-            build(&other, "scope-1", "evidence-alpha", 10, "verification").is_err(),
+            build(&other, "work-scope-1", "evidence-alpha", 10, "verification").is_err(),
             "non-query capability must be rejected before serving"
         );
 
         // The explicit bound is catalogue-closed: zero and over-bound fail.
         assert!(
-            build(&envelope, "scope-1", "evidence-alpha", 0, "verification").is_err(),
+            build(
+                &envelope,
+                "work-scope-1",
+                "evidence-alpha",
+                0,
+                "verification"
+            )
+            .is_err(),
             "zero bound must be rejected before serving"
         );
         assert!(
             build(
                 &envelope,
-                "scope-1",
+                "work-scope-1",
                 "evidence-alpha",
                 EVIDENCE_PACK_MAX_RECORDS + 1,
                 "verification",
@@ -1959,7 +2003,7 @@ mod local_read_build_tests {
         assert!(
             build(
                 &envelope,
-                "scope-1",
+                "work-scope-1",
                 "evidence-alpha",
                 10,
                 "current_position"
@@ -1968,13 +2012,13 @@ mod local_read_build_tests {
             "position intent must be rejected before serving"
         );
         assert!(
-            build(&envelope, "scope-1", "evidence-alpha", 10, "freeform").is_err(),
+            build(&envelope, "work-scope-1", "evidence-alpha", 10, "freeform").is_err(),
             "unknown mode must be rejected before serving"
         );
 
         // Blank selectors prove nothing.
         assert!(
-            build(&envelope, "scope-1", "   ", 10, "verification").is_err(),
+            build(&envelope, "work-scope-1", "   ", 10, "verification").is_err(),
             "blank subject must be rejected before serving"
         );
         assert!(

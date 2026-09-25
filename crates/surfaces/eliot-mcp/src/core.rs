@@ -515,10 +515,13 @@ pub fn plan_evidence_pack_query(
             "must be within the evidence-pack catalogue bound",
         ));
     }
-    if input
-        .max_records
-        .is_some_and(|input_bound| input_bound != bound)
-    {
+    let typed_bound = input.max_records.ok_or_else(|| {
+        BridgeError::invalid(
+            "query.max_records",
+            "exact subject evidence queries require the typed max_records selector",
+        )
+    })?;
+    if typed_bound != bound {
         return Err(BridgeError::invalid(
             "query.max_records",
             "typed selector and admitted bound must match",
@@ -564,6 +567,10 @@ pub fn project_evidence_pack_projection(
         "subject": plan.subject,
         "scope_id": plan.scope_id,
         "evidence_pack": payload,
+        // The direct MCP contour has no separate Store head carrier. Keep the
+        // required observation explicit; the local-read owner replaces this
+        // empty list with the exact heads returned by Store.
+        "revision_heads": [],
     });
     let expected_max_records = plan.max_records.parse::<u64>().map_err(|_| {
         BridgeError::Serialization("evidence-pack plan has an invalid max_records bound".to_owned())
@@ -972,6 +979,25 @@ fn validate_evidence_query_max_records(tool: &ToolRequest) -> Result<Option<u32>
     Ok(Some(max_records))
 }
 
+fn validate_projected_evidence_heads(content: &Value) -> Result<(), BridgeError> {
+    let fence_value = content
+        .pointer("/evidence_pack/provenance/state_fence")
+        .cloned()
+        .ok_or_else(|| {
+            BridgeError::Serialization(
+                "evidence-pack provenance is missing its State Fence".to_owned(),
+            )
+        })?;
+    let fence: eliot_store_api::StateFence =
+        serde_json::from_value(fence_value).map_err(|error| {
+            BridgeError::Serialization(format!("evidence_pack State Fence is invalid: {error}"))
+        })?;
+    fence.validate().map_err(|error| {
+        BridgeError::Serialization(format!("evidence_pack State Fence is invalid: {error}"))
+    })?;
+    validate_projected_revision_heads(content, &fence)
+}
+
 fn validate_projection_content_for_tool(
     tool: &ToolRequest,
     content: &Value,
@@ -979,6 +1005,9 @@ fn validate_projection_content_for_tool(
     metadata: Option<&EvidencePackRecallMetadata>,
 ) -> Result<(), BridgeError> {
     let parsed = validate_projected_recall_metadata(tool.canonical_name(), content, metadata)?;
+    if parsed.is_some() {
+        validate_projected_evidence_heads(content)?;
+    }
     if requires_evidence_pack_response(tool) {
         let subject = tool.query_subject().ok_or_else(|| {
             BridgeError::Serialization("exact evidence subject is missing".to_owned())
@@ -986,6 +1015,25 @@ fn validate_projection_content_for_tool(
         if content.get("subject").and_then(Value::as_str) != Some(subject) {
             return Err(BridgeError::Serialization(
                 "evidence-pack subject does not match the admitted query".to_owned(),
+            ));
+        }
+        let ToolRequest::Query(input) = tool else {
+            return Err(BridgeError::Serialization(
+                "exact evidence query type is invalid".to_owned(),
+            ));
+        };
+        let expected_max_records = input.max_records.ok_or_else(|| {
+            BridgeError::Serialization(
+                "exact evidence query is missing its admitted max_records".to_owned(),
+            )
+        })?;
+        if content
+            .pointer("/evidence_pack/provenance/max_records")
+            .and_then(Value::as_u64)
+            != Some(u64::from(expected_max_records))
+        {
+            return Err(BridgeError::Serialization(
+                "evidence-pack max_records does not match the admitted query".to_owned(),
             ));
         }
         if parsed.is_none() {
@@ -1400,10 +1448,10 @@ pub fn plan_context_reconstruction_query(
             "must be a positive decimal bound",
         )
     })?;
-    if bound == 0 {
+    if bound == 0 || bound > EVIDENCE_PACK_MAX_RECORDS {
         return Err(BridgeError::invalid(
             "query.evidence_max_records",
-            "must be a positive decimal bound",
+            "must be within the evidence-pack catalogue bound",
         ));
     }
     if position.trim().is_empty() || position.chars().any(char::is_control) {
@@ -2729,7 +2777,7 @@ mod evidence_pack_query_plan_tests {
             intent: verification_intent(mode),
             query: query.to_owned(),
             exact_resource_uri: None,
-            max_records: None,
+            max_records: Some(8),
         }
     }
 
@@ -2738,11 +2786,11 @@ mod evidence_pack_query_plan_tests {
         let plan = plan_evidence_pack_query(
             &input(QueryMode::Verification, "subject:evidence-alpha"),
             "scope-evidence",
-            "10",
+            "8",
         )
         .expect("exact selector plans");
         assert_eq!(plan.subject, "evidence-alpha");
-        assert_eq!(plan.max_records, "10");
+        assert_eq!(plan.max_records, "8");
         assert_eq!(plan.scope_id, "scope-evidence");
         assert_eq!(EvidencePackQueryPlan::operation_name(), "GetEvidencePack");
     }

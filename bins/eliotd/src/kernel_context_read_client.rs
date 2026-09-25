@@ -78,9 +78,9 @@ pub struct KernelContextReadClient {
 /// Closed local-read selectors for one admitted `eliot.query` pair.
 ///
 /// Mirrors the MGR01 Kernel derivation (`local_read_selectors_from_tool`):
-/// the trusted envelope scope (work scope else session — never an MCP
-/// argument), the exact `subject:` selector (never free text), and the
-/// catalogue `max_records` bound. The Kernel re-admits authoritatively on
+/// the exact trusted envelope `WorkScope` (never a Session-ID fallback and
+/// never an MCP argument), the exact `subject:` selector (never free text),
+/// and the catalogue `max_records` bound. The Kernel re-admits authoritatively on
 /// its leg; these selectors shape only the local `evidence_query` call.
 struct LocalReadSelectors {
     scope: ScopeId,

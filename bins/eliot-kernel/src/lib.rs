@@ -667,6 +667,9 @@ struct AgentBridgeConnectionState {
     accepted_transport: Option<AcceptedAgentBridgeTransport>,
     /// Kernel-owned transport Session retained after successful activation.
     session: Option<Session>,
+    /// Exact semantic `Session`/`WorkScope` binding resolved by activation. The
+    /// transport `Session` alone is not authority for host-request identity.
+    authenticated_binding: Option<AgentBridgeAuthenticatedBinding>,
     activation_completed: bool,
 }
 

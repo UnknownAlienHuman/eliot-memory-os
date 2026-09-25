@@ -100,6 +100,13 @@ pub(crate) const AGENT_HOST_REQUEST_INVOKE_READ_OPERATION: &str = "agent_host_re
 /// memory and never fabricates admission.
 const MAX_QUEUED_LOCAL_READS: usize = 64;
 
+/// Returns whether a durable host-request state may still be dispatched to the
+/// daemon read leg. Terminal and uncertainty states must have their queued
+/// reference retired before another claim can occur.
+fn local_read_state_is_dispatchable(state: HostRequestState) -> bool {
+    matches!(state, HostRequestState::Admitted)
+}
+
 /// Returns whether the operation string selects the P-04 host-request route.
 pub(crate) fn is_host_request_operation(operation: &str) -> bool {
     matches!(
@@ -314,6 +321,10 @@ impl KernelComposition {
                     Err(_) => return Err(TransportError::SessionFenced),
                 }
             }
+            self.retire_local_read_pair_under_transition(
+                operation_id.as_str(),
+                &envelope.envelope_sha256,
+            );
             self.note_host_request_operation_under_transition(envelope)?;
             return Err(TransportError::Timeout);
         }
@@ -420,10 +431,32 @@ impl KernelComposition {
         // Queue admitted query/skill pairs for the outbound-only eliotd
         // poller (`local_read_claim`, Implements #18). Enqueue is best-effort
         // after the ORS record is durable and never changes admission.
-        if record.result_digest.is_none()
+        let has_digest = record.result_digest.is_some();
+        let has_body = record.result_response.is_some();
+        if has_digest != has_body
+            || (has_digest
+                && !matches!(
+                    record.state,
+                    HostRequestState::ResultReceived | HostRequestState::Terminal
+                ))
+        {
+            self.retire_local_read_pair_under_transition(
+                &host_request_operation_id(envelope),
+                &envelope.envelope_sha256,
+            );
+            return Err(TransportError::SessionFenced);
+        }
+        if !has_digest
+            && !has_body
+            && local_read_state_is_dispatchable(record.state)
             && matches!(carrier, LocalReadCarrier::Query | LocalReadCarrier::Skill)
         {
             let _ = self.enqueue_local_read_pair_under_transition(envelope, tool);
+        } else if matches!(carrier, LocalReadCarrier::Query | LocalReadCarrier::Skill) {
+            self.retire_local_read_pair_under_transition(
+                &host_request_operation_id(envelope),
+                &envelope.envelope_sha256,
+            );
         }
         // Coherence gate before serving: a resulted record must carry a
         // digest-bound body, otherwise the row is never served as an answer.
@@ -627,6 +660,16 @@ impl KernelComposition {
             | HostRequestKind::Status
             | HostRequestKind::Reconciliation => {
                 if !activation_done || !session_live {
+                    return Err(TransportError::SessionFenced);
+                }
+                let activated = state
+                    .authenticated_binding
+                    .as_ref()
+                    .ok_or(TransportError::SessionFenced)?;
+                if envelope.identity.session_id.as_deref() != Some(activated.session_id.as_str())
+                    || envelope.identity.work_scope_id.as_deref()
+                        != Some(activated.work_scope_id.as_str())
+                {
                     return Err(TransportError::SessionFenced);
                 }
             }
@@ -836,6 +879,7 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
         require_current_generation_parent(&parent, descriptor)?;
+        self.retire_local_read_pair_under_transition(parent_operation.as_str(), &parent_digest);
         if parent.state.is_terminal() {
             return Ok(());
         }
@@ -962,6 +1006,19 @@ impl KernelComposition {
 static LOCAL_READ_ENQUEUE_SALT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl KernelComposition {
+    fn local_read_durable_record(
+        &self,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<HostRequestRecord, TransportError> {
+        let operation_id = OperationIdentity::new(host_request_operation_id(envelope))
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.generation_gateway
+            .ors
+            .load_host_request(&operation_id, &envelope.envelope_sha256)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)
+    }
+
     /// Queues one admitted local-read pair for the daemon poller.
     ///
     /// Called best-effort from [`Self::invoke_read_host_request`] after the
@@ -995,6 +1052,18 @@ impl KernelComposition {
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
         self.host_request_connection_gate_under_transition(envelope)?;
+        let record = self.local_read_durable_record(envelope)?;
+        if !local_read_state_is_dispatchable(record.state)
+            || record.result_digest.is_some()
+            || record.result_response.is_some()
+            || activation_deadline_expired(unix_ms(), envelope.identity.deadline_unix_ms)
+        {
+            self.retire_local_read_pair_under_transition(
+                &host_request_operation_id(envelope),
+                &envelope.envelope_sha256,
+            );
+            return Ok(());
+        }
         let mut index = self
             .host_request_connection_index
             .lock()
@@ -1083,6 +1152,10 @@ impl KernelComposition {
     /// a null poll, not an error. Pure queue memory: no store IO, so
     /// already-resulted pairs are retired by the submit legs rather than
     /// re-checked here.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "claim keeps queue invalidation, durable-state gating, and attempt ownership in one ordered pass"
+    )]
     pub(crate) fn claim_local_read_pair(
         &self,
         session: &Session,
@@ -1104,6 +1177,58 @@ impl KernelComposition {
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
         let now = unix_ms();
+        let queued = index
+            .values()
+            .flatten()
+            .filter_map(|candidate| {
+                let envelope = candidate.local_read_envelope.as_ref()?;
+                let tool = candidate.local_read_tool.as_ref()?;
+                Some((
+                    candidate.operation_id.clone(),
+                    candidate.request_digest.clone(),
+                    envelope.clone(),
+                    tool.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut invalid = Vec::new();
+        for (operation_id, request_digest, envelope, tool) in queued {
+            let state = if activation_deadline_expired(now, envelope.identity.deadline_unix_ms)
+                || !is_local_read_carrier_capability(&envelope.identity.capability)
+                || tool.get("name").and_then(serde_json::Value::as_str)
+                    != Some(envelope.identity.capability.as_str())
+            {
+                None
+            } else {
+                let operation = OperationIdentity::new(operation_id.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
+                self.generation_gateway
+                    .ors
+                    .load_host_request(&operation, &request_digest)
+                    .map_err(|_| TransportError::SessionFenced)?
+            };
+            let is_invalid = match state {
+                None => true,
+                Some(record) => {
+                    !local_read_state_is_dispatchable(record.state)
+                        || record.result_digest.is_some()
+                        || record.result_response.is_some()
+                }
+            };
+            if is_invalid {
+                invalid.push((operation_id, request_digest));
+            }
+        }
+        if !invalid.is_empty() {
+            for refs in index.values_mut() {
+                refs.retain(|candidate| {
+                    !invalid.iter().any(|(operation_id, request_digest)| {
+                        candidate.operation_id == *operation_id
+                            && candidate.request_digest == *request_digest
+                    })
+                });
+            }
+        }
         // Deterministic order: `BTreeMap` iterates connections sorted, pairs
         // stay in enqueue (fifo) order within one connection.
         for refs in index.values_mut() {
@@ -1386,13 +1511,60 @@ impl KernelComposition {
         // Exact replay is idempotent even across deadline expiry: a retained
         // terminal result never takes the expiry path, and serving it is
         // canonical readback rather than a second completion.
-        if stored.state == HostRequestState::ResultReceived
+        let has_digest = stored.result_digest.is_some();
+        let has_body = stored.result_response.is_some();
+        if has_digest != has_body {
+            self.retire_local_read_pair_under_transition(&body.operation_id, &body.request_sha256);
+            return Err(TransportError::SessionFenced);
+        }
+        let exact_result = has_digest
+            && has_body
             && stored.result_digest.as_deref() == Some(body.result_digest.as_str())
-            && stored.result_response.as_ref() == Some(&body.response)
+            && stored.result_response.as_ref() == Some(&body.response);
+        if exact_result
+            && matches!(
+                stored.state,
+                HostRequestState::ResultReceived | HostRequestState::Terminal
+            )
         {
+            self.retire_local_read_pair_under_transition(&body.operation_id, &body.request_sha256);
             return Ok(LocalReadSubmitDisposition::Persisted(Box::new(stored)));
         }
+        if matches!(
+            stored.state,
+            HostRequestState::ResultReceived | HostRequestState::Terminal
+        ) {
+            self.retire_local_read_pair_under_transition(&body.operation_id, &body.request_sha256);
+            return Err(TransportError::IdentityConflict);
+        }
+        if stored.state == HostRequestState::Expired {
+            self.retire_local_read_pair_under_transition(&body.operation_id, &body.request_sha256);
+            return Err(TransportError::Timeout);
+        }
+        if matches!(
+            stored.state,
+            HostRequestState::Cancelled | HostRequestState::Conflicted
+        ) {
+            self.retire_local_read_pair_under_transition(&body.operation_id, &body.request_sha256);
+            return Ok(LocalReadSubmitDisposition::StaleAttempt(
+                StaleLocalReadObservation {
+                    operation_id: body.operation_id.clone(),
+                    request_digest: body.request_sha256.clone(),
+                    presented_attempt_id: body
+                        .attempt
+                        .as_ref()
+                        .map(|attempt| attempt.attempt_id.clone()),
+                    presented_generation: body
+                        .attempt
+                        .as_ref()
+                        .map(|attempt| attempt.fencing_generation),
+                    current_generation: None,
+                    reason: StaleLocalReadReason::Unclaimed,
+                },
+            ));
+        }
         if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
+            self.retire_local_read_pair_under_transition(&body.operation_id, &body.request_sha256);
             return Err(TransportError::Timeout);
         }
         // Governed attempt currency: only the live (attempt_id, generation,
@@ -2109,17 +2281,25 @@ pub(crate) fn local_read_replay_response(
         return Err(TransportError::SessionFenced);
     }
 
-    let carries_result = record.result_digest.is_some() || record.result_response.is_some();
-    if !matches!(
+    let has_digest = record.result_digest.is_some();
+    let has_body = record.result_response.is_some();
+    if has_digest != has_body {
+        return Err(TransportError::SessionFenced);
+    }
+    let (digest, body) = if matches!(
         record.state,
         HostRequestState::ResultReceived | HostRequestState::Terminal
     ) {
-        if carries_result {
+        let (Some(digest), Some(body)) = (&record.result_digest, &record.result_response) else {
+            return Err(TransportError::SessionFenced);
+        };
+        (digest, body)
+    } else if record.state.is_terminal() {
+        return Err(TransportError::SessionFenced);
+    } else {
+        if has_digest {
             return Err(TransportError::SessionFenced);
         }
-        return Ok(None);
-    }
-    let (Some(digest), Some(body)) = (&record.result_digest, &record.result_response) else {
         return Ok(None);
     };
     let canonical =

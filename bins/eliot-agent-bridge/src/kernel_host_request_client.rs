@@ -853,10 +853,14 @@ fn decode_record_view(
     if record.operation_id != expected_operation_id {
         return None;
     }
-    let carries_result = record.result_digest.is_some() || record.result_response.is_some();
-    match (&record.state, carries_result) {
-        (HostRequestRecordState::ResultReceived | HostRequestRecordState::Terminal, true)
-        | (_, false) => {}
+    let has_digest = record.result_digest.is_some();
+    let has_body = record.result_response.is_some();
+    if has_digest != has_body {
+        return None;
+    }
+    match (&record.state, has_digest, has_body) {
+        (HostRequestRecordState::ResultReceived | HostRequestRecordState::Terminal, true, true)
+        | (_, false, false) => {}
         _ => return None,
     }
     if let (Some(digest), Some(body)) = (&record.result_digest, &record.result_response) {

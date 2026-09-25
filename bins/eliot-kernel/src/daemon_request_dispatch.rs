@@ -26,6 +26,7 @@ use eliot_kernel_service::{
     UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationWakeCancellation,
     UserAutomationWakePort, UserAutomationWakeReadRequest,
 };
+use eliot_ors::HostRequestState;
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlOperation, OriginControlPresentation,
     ProcessExecutionView, ProcessLifecycle,
@@ -3149,6 +3150,9 @@ impl KernelComposition {
         let operation: LocalReadOperation =
             serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
         let envelope = operation.envelope;
+        if envelope.kind != eliot_protocol::HostRequestKind::Invocation {
+            return Err(TransportError::SessionFenced);
+        }
         let tool = operation.tool;
         let attempt = operation.attempt;
         attempt
@@ -3159,6 +3163,19 @@ impl KernelComposition {
         // descriptor, or a malformed selector never reaches Gateway IO.
         let selectors = host_request_route::check_local_read_admission(&envelope, &tool)?;
         let (receipt, record) = self.admit_host_request_envelope(&envelope)?;
+        if matches!(
+            record.state,
+            HostRequestState::Cancelled
+                | HostRequestState::Expired
+                | HostRequestState::Conflicted
+                | HostRequestState::Terminal
+        ) && record.result_digest.is_none()
+            && record.result_response.is_none()
+        {
+            return Ok(host_request_route::host_request_admitted_response(
+                &receipt, &record,
+            ));
+        }
         if let Some(replayed) = host_request_route::local_read_replay_response(
             &receipt,
             &record,
@@ -4036,7 +4053,7 @@ mod local_read_dispatch_tests {
             "fencing_generation": 1,
             "session_id": "kernel-session-1",
             "authority_epoch": authority_epoch,
-            "scope_id": "kernel-session-1",
+            "scope_id": "work-scope-1",
             "facet_method": "eliot.query",
             "expires_at_unix_ms": 2_000_000,
             "use_budget": 1,
