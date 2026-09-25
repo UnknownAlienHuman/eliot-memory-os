@@ -11,9 +11,12 @@
 //! ([`cap_assessment`]). Task authority stays with the owning Governor/task
 //! controller; this module only projects selection evidence and computes
 //! `BOUND | UNIQUE | AMBIGUOUS | NONE` deterministically. It never silently
-//! selects among multiple open candidates, and a task sourced solely via a
+//! selects among multiple open candidates, never binds a historical
+//! (non-current) task as current, and a task sourced solely via a
 //! prior evaluation candidate stays [`CROSSOVER_CONTAMINATED`] until an
-//! independent binding record is supplied.
+//! independent binding record is supplied. Any candidate marked historical
+//! by the owning task producer carries [`HISTORICAL_CANDIDATE`] and is
+//! refused with `SELECTION_HISTORICAL` on every bind path.
 //!
 //! Non-ownership: onboarding compilation, task admission, governance
 //! derivation, coverage observation, and canonical stores. Field names mirror
@@ -26,6 +29,13 @@ use std::fmt;
 /// Marker preserved from the selection route while a task lacks an
 /// independent binding record.
 pub const CROSSOVER_CONTAMINATED: &str = "CROSSOVER_CONTAMINATED";
+
+/// Marker carried when any selection candidate names a historical
+/// (non-current) task supplied by the owning task producer.
+///
+/// Presence never selects: sole or authoritatively named historical
+/// candidates fail closed with `SELECTION_HISTORICAL`.
+pub const HISTORICAL_CANDIDATE: &str = "HISTORICAL_CANDIDATE";
 
 /// Maximum candidate task handles projected in one bootstrap.
 pub const MAX_CANDIDATE_HANDLES: usize = 16;
@@ -107,6 +117,14 @@ pub struct TaskCandidate {
     pub handle: String,
     pub task_revision: Option<u64>,
     pub acceptance_digest: Option<String>,
+    /// True when the owning task producer marks this handle as a
+    /// historical (non-current) task that must never bind as current.
+    ///
+    /// Serde-defaulted so receipts compiled before the marker still parse
+    /// as current (`false`); the Governor/task owner supplies `true` for
+    /// historical corpus entries going forward.
+    #[serde(default)]
+    pub historical: bool,
     /// True when this handle arrived only through a prior evaluation
     /// candidate and has no independent binding record yet.
     #[serde(default)]
@@ -478,6 +496,12 @@ const fn is_crossover(candidate: &TaskCandidate) -> bool {
     candidate.prior_evaluation_candidate_only && !candidate.independent_binding_supplied
 }
 
+/// Whether the owning task producer marked this candidate historical.
+/// A historical task is never current selection evidence.
+const fn is_historical(candidate: &TaskCandidate) -> bool {
+    candidate.historical
+}
+
 const fn assessment_rank(assessment: CurrentAssessment) -> u8 {
     match assessment {
         CurrentAssessment::NotOnboarded => 0,
@@ -491,12 +515,23 @@ const fn assessment_rank(assessment: CurrentAssessment) -> u8 {
 /// bootstrap can never overstate readiness. `READY_READ_ONLY` readiness cannot
 /// support a `READY` assessment; anything before material readiness caps at
 /// `NOT_ONBOARDED`, except `SCANNING` which caps at `STALE`.
+///
+/// Decision Safety Floor enforcement (default output): material readiness
+/// without a selected qualified route profile (`route_profile_ref`) and at
+/// least one Decision Safety Floor member (`decision_safety_floor_refs`)
+/// cannot project `READY`; it degrades to `DEGRADED`. The bridge never
+/// qualifies a route or invents floor content itself — it only enforces
+/// presence of the owner-supplied refs carried verbatim in the context, so
+/// an empty route/floor set projects no floor and withholds `READY` rather
+/// than forging one.
 #[must_use]
-pub const fn cap_assessment(
+pub fn cap_assessment(
     readiness: ReadinessDisposition,
     requested: CurrentAssessment,
+    route_profile_ref: &str,
+    decision_safety_floor_refs: &[String],
 ) -> CurrentAssessment {
-    let cap: u8 = match readiness {
+    let mut cap: u8 = match readiness {
         ReadinessDisposition::ReadyMaterial => 3,
         ReadinessDisposition::ReadyReadOnly
         | ReadinessDisposition::Degraded
@@ -507,6 +542,9 @@ pub const fn cap_assessment(
         | ReadinessDisposition::NeedsTask
         | ReadinessDisposition::NeedsSources => 0,
     };
+    if cap == 3 && (route_profile_ref.trim().is_empty() || decision_safety_floor_refs.is_empty()) {
+        cap = 2;
+    }
     let wanted = assessment_rank(requested);
     let clamped = if wanted < cap { wanted } else { cap };
     match clamped {
@@ -526,11 +564,14 @@ fn selection_handles(tasks: &BootstrapTaskInputs) -> Vec<String> {
 }
 
 fn selection_contamination_flags(tasks: &BootstrapTaskInputs) -> Vec<String> {
+    let mut flags = Vec::new();
     if tasks.candidates.iter().any(is_crossover) {
-        vec![CROSSOVER_CONTAMINATED.to_owned()]
-    } else {
-        Vec::new()
+        flags.push(CROSSOVER_CONTAMINATED.to_owned());
     }
+    if tasks.candidates.iter().any(is_historical) {
+        flags.push(HISTORICAL_CANDIDATE.to_owned());
+    }
+    flags
 }
 
 fn bind_authoritative(
@@ -553,6 +594,12 @@ fn bind_authoritative(
         return Err(BootstrapError::new(
             "SELECTION_CONTAMINATED",
             "authoritative selection names a crossover-contaminated candidate without an independent binding record; refusing to bind",
+        ));
+    }
+    if is_historical(matched) {
+        return Err(BootstrapError::new(
+            "SELECTION_HISTORICAL",
+            "authoritative selection names a historical task; current binding required, refusing to bind",
         ));
     }
     let Some(revision) = matched.task_revision else {
@@ -605,6 +652,12 @@ fn bind_uncontended(
         });
     }
     let only = &tasks.candidates[0];
+    if is_historical(only) {
+        return Err(BootstrapError::new(
+            "SELECTION_HISTORICAL",
+            "sole candidate is a historical task; current binding required, refusing to bind",
+        ));
+    }
     if is_crossover(only) {
         return Ok(TaskSelectionView {
             disposition: TaskSelectionDisposition::None,
@@ -695,11 +748,16 @@ pub fn get_understanding_bootstrap(
     let mut relevant_handles = context.orientation_handles.clone();
     relevant_handles.truncate(MAX_HANDLES);
     // Без привязанной задачи готовности нет: проекция не вправе подтверждать
-    // READY по чужому слову хозяина входных данных.
+    // READY по чужому слову хозяина входных данных. Привязанная задача
+    // дополнительно ограничена Decision Safety Floor: без выбранного
+    // qualified route profile и floor-членов оценка снижается до DEGRADED.
     let current_assessment = match task_selection.disposition {
-        TaskSelectionDisposition::Bound | TaskSelectionDisposition::Unique => {
-            cap_assessment(context.onboarding_disposition, requested_assessment)
-        }
+        TaskSelectionDisposition::Bound | TaskSelectionDisposition::Unique => cap_assessment(
+            context.onboarding_disposition,
+            requested_assessment,
+            &context.route_profile_ref,
+            &context.decision_safety_floor_refs,
+        ),
         TaskSelectionDisposition::Ambiguous | TaskSelectionDisposition::None => {
             CurrentAssessment::NotOnboarded
         }
@@ -819,6 +877,7 @@ mod tests {
             handle: format!("task-{index}"),
             task_revision: Some(u64::try_from(index + 1).expect("index must fit")),
             acceptance_digest: Some("a".repeat(64)),
+            historical: false,
             prior_evaluation_candidate_only: false,
             independent_binding_supplied: true,
         }
@@ -896,6 +955,7 @@ mod tests {
             handle: "task-eval-1".to_owned(),
             task_revision: Some(2),
             acceptance_digest: Some("b".repeat(64)),
+            historical: false,
             prior_evaluation_candidate_only: true,
             independent_binding_supplied: false,
         };
@@ -923,6 +983,7 @@ mod tests {
                 handle: "task-eval-1".to_owned(),
                 task_revision: Some(2),
                 acceptance_digest: Some("b".repeat(64)),
+                historical: false,
                 prior_evaluation_candidate_only: true,
                 independent_binding_supplied: true,
             }],
@@ -956,6 +1017,7 @@ mod tests {
             handle: "task-eval-9".to_owned(),
             task_revision: Some(9),
             acceptance_digest: Some("c".repeat(64)),
+            historical: false,
             prior_evaluation_candidate_only: true,
             independent_binding_supplied: false,
         });
@@ -1019,6 +1081,7 @@ mod tests {
                 handle: "task-eval-1".to_owned(),
                 task_revision: Some(2),
                 acceptance_digest: Some("b".repeat(64)),
+                historical: false,
                 prior_evaluation_candidate_only: true,
                 independent_binding_supplied: false,
             }],
@@ -1095,6 +1158,7 @@ mod tests {
                 handle: "task-zero".to_owned(),
                 task_revision: Some(0),
                 acceptance_digest: Some("d".repeat(64)),
+                historical: false,
                 prior_evaluation_candidate_only: false,
                 independent_binding_supplied: true,
             }],
@@ -1110,6 +1174,7 @@ mod tests {
                 handle: "task-noaccept".to_owned(),
                 task_revision: Some(3),
                 acceptance_digest: None,
+                historical: false,
                 prior_evaluation_candidate_only: false,
                 independent_binding_supplied: true,
             }],
@@ -1126,6 +1191,7 @@ mod tests {
                 handle: "task-forged".to_owned(),
                 task_revision: Some(0),
                 acceptance_digest: None,
+                historical: false,
                 prior_evaluation_candidate_only: false,
                 independent_binding_supplied: true,
             }],
