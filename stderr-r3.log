@@ -1,0 +1,15 @@
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit status --short --branch; git rev-parse HEAD; gh --version | head -n 2
+## HEAD (no branch)
+?? prompt.txt
+?? stderr-r2.log
+?? stderr-r3.log
+?? stderr.log
+?? stdout-r2.log
+?? stdout-r3.log
+?? stdout.log
+9fc33c0366b9f536ae61182061e6dbbbdd1ad9b0
+head: The term 'head' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+> build · muse-spark-1.3-contributor-free

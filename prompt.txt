@@ -1,0 +1,4 @@
+You are an OpenCode nested swarm manager. Work YOURSELF with at most 2 subagents. READ-ONLY task: run no builds, no cargo, no tests. Commit nothing, push nothing, modify nothing.
+Repo copy: this worktree (detached, read-only use). Do all issue research with gh issue view commands only.
+Task: triage the I14-audit wave (issues 1678-1696, 1950-1956) for the manager queue. For each issue: read title plus body plus last comment, then write one line: issue number, owning crate or area, and disposition (ready-to-slice, needs-ruling, blocked-on-what, or already-covered-elsewhere with evidence).
+Deliverable: a TRIAGE TABLE in stdout, one line per issue, plus a suggested slice order for the paid line. No code changes, no commits, no pushes, no PRs.

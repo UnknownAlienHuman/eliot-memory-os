@@ -1,0 +1,33 @@
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgit status --short --branch; git rev-parse HEAD; echo "---"; gh issue list --limit 5 2>&1 | head -20
+## HEAD (no branch)
+?? prompt.txt
+?? stderr-r2.log
+?? stderr-r3.log
+?? stderr-r4.log
+?? stderr-solo.log
+?? stderr.log
+?? stdout-r2.log
+?? stdout-r3.log
+?? stdout-r4.log
+?? stdout-solo.log
+?? stdout.log
+9fc33c0366b9f536ae61182061e6dbbbdd1ad9b0
+---
+head: The term 'head' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+> build · muse-spark-1.3-contributor-free
+[0m$ [0mgh issue list --limit 5 2>&1 | Select-Object -First 20; echo "---OK---"
+2031	OPEN	[kernel/ors] Vend Kernel-route fixture and reserved-submission API required by S-CONC acceptance		2026-09-19T03:04:21Z
+2030	OPEN	[store/concurrency] Vend production fault, occupancy, and cleanup APIs required by S-CONC acceptance		2026-09-19T03:04:20Z
+1972	OPEN	[I1-audit] Enforce Kernel-unavailable admission and recovery-view behavior		2026-09-16T20:21:32Z
+1971	OPEN	[I1-audit] Preserve immutable versioned artifacts during generation replacement		2026-09-16T20:21:31Z
+1970	OPEN	[I1-audit] Model process health separately from module-generation lifecycle		2026-09-16T20:21:31Z
+---OK---
+> build · muse-spark-1.3-contributor-free
+[0m✗ [0mTriage issues 1678-1687 failed
+[91m[1mError: [0mTool execution interrupted (sessionID: ses_f45d207d1ffejvGGxUB4x3myaG)
+[0m✗ [0mTriage issues 1688-1696 failed
+[91m[1mError: [0mTool execution interrupted (sessionID: ses_f45d207d1ffdjmyW4cIfC7Dh53)
+[91m[1mError: [0mSession interrupted: inactivity
