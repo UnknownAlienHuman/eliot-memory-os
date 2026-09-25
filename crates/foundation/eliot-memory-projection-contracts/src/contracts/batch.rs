@@ -6,6 +6,15 @@
 //! carries the denominator context every consumer needs: how many canonical
 //! records the read side observed, what was truncated or omitted, and whether
 //! revalidation is required before use.
+//!
+//! Coverage is accounted exactly, not conservatively. Under a known
+//! denominator every observed record lands in exactly one of three places —
+//! a projected record, a named omission, or a deferred resume-frontier handle
+//! — the three lists are pairwise disjoint, and their combined length equals
+//! the denominator. Completeness is therefore a property the batch proves
+//! about itself, not a claim a consumer has to take on trust; a remainder that
+//! nobody can name is refused at the boundary instead of surfacing later as a
+//! quietly short read.
 
 use std::collections::BTreeSet;
 
@@ -48,7 +57,8 @@ pub enum DenominatorState {
     /// Exact canonical records observed by the read side.
     #[serde(rename = "KNOWN")]
     Known {
-        /// Total observed records, projected or omitted.
+        /// Total observed records: projected, omitted, or deferred to the
+        /// resume frontier, counted once each.
         total: usize,
     },
     /// The read side could not establish the denominator, with a reason.
@@ -98,8 +108,14 @@ pub struct ProjectionCoverage {
     /// Whether volume truncation cut the projected records.
     pub truncated: bool,
     /// Resume handles for truncated volume; nonempty exactly when truncated.
+    ///
+    /// Each deferred record contributes one handle, so a truncated batch keeps
+    /// the exact remainder it did not return and the place to resume from.
     pub frontier: Vec<String>,
     /// Named omissions with exact reasons.
+    ///
+    /// Handles are distinct from every projected record and from every other
+    /// omission, so one observed record can never be both returned and lost.
     pub omissions: Vec<CoverageOmission>,
     /// Whether the consumer must revalidate before use.
     pub revalidation_required: bool,
@@ -145,8 +161,15 @@ pub struct MemoryProjectionBatch {
 }
 
 impl MemoryProjectionBatch {
-    /// Validate the batch: shapes, shared-fence gating, scope equality,
-    /// handle uniqueness, and coverage accounting.
+    /// Validate the batch: shapes, shared-fence gating, scope equality, handle
+    /// uniqueness across records, omissions and frontier, and exact disjoint
+    /// coverage accounting against a known denominator.
+    ///
+    /// A `Known` denominator is an equality, not a lower bound: the projected
+    /// records, the named omissions and the deferred resume frontier together
+    /// account for exactly `total` distinct handles. `Unknown` stays
+    /// representable — it claims no count, so nothing here can contradict it,
+    /// and the consumers that need a count fail closed on it instead.
     pub fn validate(&self) -> Result<(), MemoryProjectionError> {
         if self.contract_version != crate::CONTRACT_VERSION {
             return Err(MemoryProjectionError::VersionMismatch);
@@ -185,14 +208,46 @@ impl MemoryProjectionBatch {
                 });
             }
         }
-        // Every observed record is either projected or omitted: a known
-        // denominator below the accounted volume contradicts the read side.
-        if let DenominatorState::Known { total } = &self.coverage.denominator
-            && *total < self.records.len() + self.coverage.omissions.len()
-        {
-            return Err(MemoryProjectionError::CoverageMismatch {
-                reason: "denominator is below projected plus omitted volume",
-            });
+        // Exact, disjoint member accounting. Every canonical record the read
+        // side observed is projected, omitted, or deferred to the resume
+        // frontier, and it is exactly one of those three. The same handle may
+        // not appear in two of them, and a known denominator must equal the
+        // volume those three lists carry — no more, and no less. A total larger
+        // than the accounted volume with nothing deferred and nothing omitted
+        // is unclaimed completeness, not evidence of it, so it is refused here
+        // rather than discovered later by whichever consumer happens to look.
+        //
+        // This is deliberately stricter than the r6 freeze note at
+        // `cognitive-rev12-contract-schema-freeze.toml` ("Known{total} must
+        // cover projected plus omitted volume"), which states a lower bound
+        // and never mentions the frontier. That note under-specifies the rule;
+        // it does not grant the remainder. The freeze is a published wave
+        // revision under a recorded digest, so reconciling the wording is the
+        // owner's revision decision and is escalated, not edited here.
+        for omission in &self.coverage.omissions {
+            if !seen.insert(omission.handle.as_str().to_owned()) {
+                return Err(MemoryProjectionError::Duplicate {
+                    field: "coverage.omissions",
+                    value: omission.handle.as_str().to_owned(),
+                });
+            }
+        }
+        for handle in &self.coverage.frontier {
+            if !seen.insert(handle.clone()) {
+                return Err(MemoryProjectionError::Duplicate {
+                    field: "coverage.frontier",
+                    value: handle.clone(),
+                });
+            }
+        }
+        if let DenominatorState::Known { total } = &self.coverage.denominator {
+            let accounted =
+                self.records.len() + self.coverage.omissions.len() + self.coverage.frontier.len();
+            if accounted != *total {
+                return Err(MemoryProjectionError::CoverageMismatch {
+                    reason: "known denominator must equal projected plus omitted plus deferred volume",
+                });
+            }
         }
         // Volume truncation must name where to resume; a frontier without
         // truncation is unclaimed volume and is rejected.
