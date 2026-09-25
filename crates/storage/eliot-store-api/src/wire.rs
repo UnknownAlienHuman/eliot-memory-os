@@ -324,27 +324,12 @@ impl StoreRequest {
                         reason: "learning records require the dedicated Kernel learning capability",
                     });
                 }
-                if context.state_fence != transition.state_fence {
-                    return Err(StoreError::FenceMismatch);
-                }
-                bounded_unique(expected_revision_heads, "expected_revision_heads", |head| {
-                    head.key.clone()
-                })?;
-                bounded_unique(expected_ordering_heads, "expected_ordering_heads", |head| {
-                    head.scope.clone()
-                })?;
-                for head in expected_revision_heads {
-                    head.validate()?;
-                    if head.state_fence != transition.state_fence {
-                        return Err(StoreError::FenceMismatch);
-                    }
-                }
-                for head in expected_ordering_heads {
-                    head.validate()?;
-                    if head.state_fence != transition.state_fence {
-                        return Err(StoreError::FenceMismatch);
-                    }
-                }
+                validate_transition_heads(
+                    context,
+                    transition,
+                    expected_revision_heads,
+                    expected_ordering_heads,
+                )?;
                 Ok(())
             }
             Self::RecordLearningRecord {
@@ -355,27 +340,12 @@ impl StoreRequest {
             } => {
                 context.validate().map_err(StoreError::Foundation)?;
                 transition.validate()?;
-                if context.state_fence != transition.state_fence {
-                    return Err(StoreError::FenceMismatch);
-                }
-                bounded_unique(expected_revision_heads, "expected_revision_heads", |head| {
-                    head.key.clone()
-                })?;
-                bounded_unique(expected_ordering_heads, "expected_ordering_heads", |head| {
-                    head.scope.clone()
-                })?;
-                for head in expected_revision_heads {
-                    head.validate()?;
-                    if head.state_fence != transition.state_fence {
-                        return Err(StoreError::FenceMismatch);
-                    }
-                }
-                for head in expected_ordering_heads {
-                    head.validate()?;
-                    if head.state_fence != transition.state_fence {
-                        return Err(StoreError::FenceMismatch);
-                    }
-                }
+                validate_transition_heads(
+                    context,
+                    transition,
+                    expected_revision_heads,
+                    expected_ordering_heads,
+                )?;
                 if transition.named_operations.len() != 1
                     || transition.named_operations[0].operation
                         != crate::NamedMutationOperation::RecordLearningRecord
@@ -1566,6 +1536,36 @@ pub fn decode_response_frame(
         .map_err(|error| StoreWireError::Payload(error.to_string()))?;
     response.validate()?;
     Ok((request_id, response))
+}
+
+fn validate_transition_heads(
+    context: &RequestMeta,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<(), StoreError> {
+    if context.state_fence != transition.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    bounded_unique(expected_revision_heads, "expected_revision_heads", |head| {
+        head.key.clone()
+    })?;
+    bounded_unique(expected_ordering_heads, "expected_ordering_heads", |head| {
+        head.scope.clone()
+    })?;
+    for head in expected_revision_heads {
+        head.validate()?;
+        if head.state_fence != transition.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+    }
+    for head in expected_ordering_heads {
+        head.validate()?;
+        if head.state_fence != transition.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+    }
+    Ok(())
 }
 
 fn bounded_unique<T, I, F>(values: &[T], field: &'static str, key: F) -> Result<(), StoreError>

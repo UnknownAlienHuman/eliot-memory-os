@@ -503,7 +503,7 @@ impl LearningAdmissionPermit {
             source_campaign_id: self.source_campaign_id().to_owned(),
             target_task_id: self.target_task_id().to_owned(),
             fence: self.fence().clone(),
-            record_kind: binding.record_kind.clone(),
+            record_kind: binding.record_kind,
             record_handle: binding.record_handle.clone(),
             record_digest: binding.record_digest.clone(),
             scope_id: binding.scope_id.clone(),

@@ -239,7 +239,7 @@ pub enum LearningRecordDocument {
     /// Closure handoff.
     Closure(ClosureHandoff),
     /// Activation receipt candidate.
-    ActivationReceipt(HarnessActivationReceiptCandidate),
+    ActivationReceipt(Box<HarnessActivationReceiptCandidate>),
     /// Reusable candidate.
     Candidate(AttemptLearningDeltaCandidate),
     /// Immutable view reference. The recipe remains an owner-side validation
@@ -268,7 +268,7 @@ impl LearningRecordDocument {
                 .map_err(invalid),
             LearningRecordKind::ActivationReceipt => {
                 serde_json::from_str::<HarnessActivationReceiptCandidate>(record_json)
-                    .map(Self::ActivationReceipt)
+                    .map(|record| Self::ActivationReceipt(Box::new(record)))
                     .map_err(invalid)
             }
             LearningRecordKind::Candidate => {

@@ -799,6 +799,10 @@ async fn commit_learning_record_inner<P: KernelGenerationPort + ?Sized>(
 /// the internal capability check; the public typed entrypoint below is the
 /// sole durable-write seam. Possession of a `NamedMutationRequest` alone
 /// cannot cross into the canonical owner path.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the capability wrapper preserves the complete typed handoff"
+)]
 pub(crate) async fn commit_learning_record_with_capability<P: KernelGenerationPort + ?Sized>(
     composition: &GovernorComposition<P>,
     capability: &LearningWriteCapability,
