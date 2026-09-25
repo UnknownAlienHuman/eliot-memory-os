@@ -2498,7 +2498,7 @@ fn rehydrate_activation_results(
                 "activation result retention order is not unique".to_owned(),
             ));
         }
-        let (ticket_id, record) = rehydrate_one_activation_result(retained, lifecycle)?;
+        let (ticket_id, record) = rehydrate_one_activation_result(&retained, lifecycle)?;
         if results.insert(ticket_id, record).is_some() {
             return Err(KernelBuildError::Ors(
                 "activation result retention ticket identity is duplicated".to_owned(),
@@ -2513,7 +2513,7 @@ fn rehydrate_activation_results(
 /// record itself retained.
 #[cfg(windows)]
 fn rehydrate_one_activation_result(
-    retained: eliot_ors::ActivationResultRetentionRecord,
+    retained: &eliot_ors::ActivationResultRetentionRecord,
     lifecycle: &BTreeMap<String, AgentActivationLifecycle>,
 ) -> Result<(String, AgentActivationResultRecord), KernelBuildError> {
     retained.validate().map_err(|_| {
