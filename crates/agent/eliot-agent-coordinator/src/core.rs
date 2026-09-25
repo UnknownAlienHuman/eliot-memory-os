@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_api::{
-    AgentAttempt, AttemptId, AttemptState, AuthorityEnvelope, CancellationState,
+    AgentAttempt, AgentResult, AttemptId, AttemptState, AuthorityEnvelope, CancellationState,
     CandidateSelectionDisposition, ContinuityKind, ContractError, EffectCeiling, EffectKind,
     HostEventNormalizationReceipt, HostEventQuarantineReason, HostEventReplayDisposition,
     NormalizedHostEventEnvelope, ProviderExecutionBinding, ProviderObservationLineage,
@@ -103,6 +103,15 @@ struct AdmissionRecord {
 struct IdempotentRecord<T> {
     canonical_input: String,
     receipt: T,
+}
+
+/// Whether result intake must retain writer/resource ownership (issue #370
+/// P1): the outer disposition never overrides the embedded physical
+/// execution axis. Genuinely unknown execution retains ownership and the
+/// same reconciliation identity until the owner proves termination/fencing;
+/// see `AgentResult::execution_unknown` for the shared contract.
+fn retains_ownership_on_unknown_execution(result: &AgentResult) -> bool {
+    result.disposition == ResultDisposition::UnknownOutcome || result.execution_unknown()
 }
 
 /// Accepted v7 host-event observation entry (issue #371 S7). The canonical
@@ -1272,7 +1281,12 @@ impl AgentCoordinator {
             evidence_refs: submission.result.evidence_refs.clone(),
             proposed_effect_count: submission.result.proposed_effects.len(),
         };
-        let next_state = if submission.result.disposition == ResultDisposition::UnknownOutcome {
+        // Ownership retention on unknown execution (issue #370 P1): the outer
+        // disposition never overrides the embedded physical execution axis;
+        // `result_by_attempt` below preserves the submission linkage the
+        // `reconcile_unknown_outcome` leg requires. Only observed execution
+        // releases the writer or settles terminally.
+        let next_state = if retains_ownership_on_unknown_execution(&submission.result) {
             CoordinatedAttemptState::UnknownOutcome
         } else {
             self.release_writer(&current);
