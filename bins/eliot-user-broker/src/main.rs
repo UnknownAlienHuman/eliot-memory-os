@@ -281,14 +281,14 @@ fn dispatch(
         }
         Request::NotifyLaunch { request } => dispatch_launch(composition.launch_notify(request)),
         Request::Cancel { operation_id } => composition.cancel(&operation_id).map_or_else(
-            |error| composition_error(error.to_string()),
+            |error| composition_rejection(&error),
             |receipt| Message::Cancelled {
                 receipt: serde_json::to_value(receipt)
                     .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
             },
         ),
         Request::Reconcile { operation_id } => composition.reconcile(&operation_id).map_or_else(
-            |error| composition_error(error.to_string()),
+            |error| composition_rejection(&error),
             |view| Message::Reconciled {
                 view: serde_json::to_value(view)
                     .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
@@ -314,13 +314,27 @@ fn composition_error(detail: String) -> Message {
     }
 }
 
+/// Projects one composition failure onto the wire without collapsing the
+/// broker's own admission refusals into the generic composition code: each
+/// refusal keeps its exact stable cause and only its adapter detail is
+/// rendered as text.
+fn composition_rejection(error: &eliot_user_broker::CompositionError) -> Message {
+    match error {
+        eliot_user_broker::CompositionError::Admission { refusal, .. } => Message::Error {
+            code: refusal.code(),
+            detail: error.to_string(),
+        },
+        other => composition_error(other.to_string()),
+    }
+}
+
 /// Projects one admitted launch outcome onto the wire, validating the exact
 /// operator receipt binding before it leaves the broker.
 fn dispatch_launch(
     outcome: Result<eliot_user_broker_core::LaunchReceipt, eliot_user_broker::CompositionError>,
 ) -> Message {
     match outcome {
-        Err(error) => composition_error(error.to_string()),
+        Err(error) => composition_rejection(&error),
         Ok(receipt) => {
             let projection = receipt.operator_receipt();
             match projection.validate() {

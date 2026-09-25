@@ -34,10 +34,11 @@ use eliot_process::{
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_user_broker_core::{
-    AuthorityPort, BrokerError, BrokerSnapshot, DurableRegistrationPort, HeartbeatReceipt,
-    HeartbeatRequest, IssuedOperationIdentity, IssuedOperationIdentityLedger, LaunchGrant,
-    LaunchRequest, LostOperation, PortError, ProcessPort, ProcessStartOutcome, RegistrationReceipt,
-    RequiredProvider, UserBroker,
+    AuthorityPort, BrokerAdmissionIdentity, BrokerControlOperation, BrokerError, BrokerSnapshot,
+    DurableRegistrationPort, HeartbeatReceipt, HeartbeatRequest, IssuedOperationIdentity,
+    IssuedOperationIdentityLedger, LaunchGrant, LaunchRequest, LostOperation, PortError,
+    ProcessPort, ProcessStartOutcome, RegistrationReceipt, RegistrationStatus, RequiredProvider,
+    UserBroker,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -62,7 +63,8 @@ use operation_identity::{
     BrokerOperation, DurableIssuedIdentity, IssuerHandle, OperationIdentityIssuer,
 };
 use protected_launch_config::{
-    BrokerLaunchBinding, REGISTRATION_LEASE_TTL_MS, binding_digest, fresh_registration_request,
+    BrokerLaunchBinding, BrokerProcessBinding, REGISTRATION_LEASE_TTL_MS, binding_digest,
+    current_process_binding, current_process_identity, fresh_registration_request,
     load_protected_launch_binding,
 };
 
@@ -102,6 +104,56 @@ impl BrokerConfig {
     }
 }
 
+/// Typed, closed refusal taxonomy for the broker's own admission boundary.
+///
+/// A refusal keeps its exact cause across the composition and reaches the
+/// operation stream as its own stable code. Collapsing these into one
+/// "composition rejected" string would make an unverifiable principal
+/// indistinguishable from a lost lease, which is precisely the read the
+/// registration contour must never leave ambiguous.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum BrokerAdmissionRefusal {
+    /// The live process identity (id, start instant, or running image) could
+    /// not be proven, or the running image is not the executable this process
+    /// started from.
+    #[error("BROKER_PROCESS_IDENTITY_UNPROVABLE")]
+    ProcessIdentityUnprovable,
+    /// The live process identity changed after admission: a replaced image, a
+    /// recycled process id, or a substituted process.
+    #[error("BROKER_PROCESS_IDENTITY_CHANGED")]
+    ProcessIdentityChanged,
+    /// The durable registration belongs to another installation, SID, logon
+    /// Session, or boot Session, so this broker is not its owner.
+    #[error("BROKER_REGISTRATION_IDENTITY_FOREIGN")]
+    RegistrationIdentityForeign,
+    /// A broker-owned control operation named an effect whose outcome is not
+    /// yet proven; it must be reconciled before it can be cancelled.
+    #[error("BROKER_OPERATION_OUTCOME_UNRECONCILED")]
+    OperationOutcomeUnreconciled,
+}
+
+impl BrokerAdmissionRefusal {
+    /// Returns the exact stable wire code of this refusal.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ProcessIdentityUnprovable => "BROKER_PROCESS_IDENTITY_UNPROVABLE",
+            Self::ProcessIdentityChanged => "BROKER_PROCESS_IDENTITY_CHANGED",
+            Self::RegistrationIdentityForeign => "BROKER_REGISTRATION_IDENTITY_FOREIGN",
+            Self::OperationOutcomeUnreconciled => "BROKER_OPERATION_OUTCOME_UNRECONCILED",
+        }
+    }
+
+    /// Attaches the adapter detail that explains *why* the refusal happened
+    /// without letting that detail become the refusal's identity.
+    pub fn with_platform(self, detail: impl std::fmt::Display) -> CompositionError {
+        CompositionError::Admission {
+            refusal: self,
+            detail: detail.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CompositionError {
     #[error("invalid broker configuration: {0}")]
@@ -114,6 +166,13 @@ pub enum CompositionError {
     Protected(String),
     #[error("protected launch configuration: {0}")]
     Launch(String),
+    #[error("broker admission refused: {refusal} ({detail})")]
+    Admission {
+        /// Exact closed refusal cause.
+        refusal: BrokerAdmissionRefusal,
+        /// Adapter detail explaining the refusal; never its identity.
+        detail: String,
+    },
     #[error("broker recovery: {0}")]
     Recovery(#[source] BrokerError),
     #[error("Kernel front-door composition: {0}")]
@@ -701,6 +760,9 @@ pub struct BrokerComposition {
     providers_admitted: bool,
     launch_binding: Option<BrokerLaunchBinding>,
     launch_lease: Option<ProtectedPathLease>,
+    /// The live process identity this broker admitted itself as. Re-observed
+    /// on every authenticated operation; see [`Self::verify_launch_lease`].
+    process_binding: Option<BrokerProcessBinding>,
     registration_digest: Option<String>,
     identity_issuer: IssuerHandle,
     /// Broker-retained normal Notify launch authority: the verified installed
@@ -797,6 +859,37 @@ impl BrokerComposition {
             issuer: issuer.clone(),
         }));
         broker.recover().map_err(CompositionError::Recovery)?;
+        // The live process identity is observed before anything is admitted:
+        // an unprovable id/start/image means this process cannot name which
+        // process the declaration describes, so no registration is refreshed,
+        // no launch is admitted, and no control operation is accepted.
+        let process_binding = current_process_binding()?;
+        // Single-broker admission. A registration recovered from shared
+        // durable state is adopted only when it carries exactly this
+        // installation/SID/Session/boot-Session tuple; a surviving
+        // registration of another principal is refused, never heartbeated.
+        let (launch_binding, launch_lease) = launch.map_or((None, None), |(binding, lease)| {
+            (Some(binding), Some(lease))
+        });
+        if let Some(binding) = launch_binding.as_ref() {
+            broker
+                .bind_admission(&BrokerAdmissionIdentity {
+                    installation_id: binding.registration.installation_id.clone(),
+                    windows_sid: binding.registration.windows_sid.clone(),
+                    interactive_session_id: binding.registration.interactive_session_id.clone(),
+                    boot_session_id: binding.registration.boot_session_id.clone(),
+                    broker_process_id: binding.registration.broker_process_id.clone(),
+                    broker_artifact_digest: binding.registration.broker_artifact_digest.clone(),
+                    protocol_generation: binding.registration.protocol_generation,
+                    launch_nonce: binding.registration.launch_nonce.clone(),
+                })
+                .map_err(|error| match error {
+                    BrokerError::StaleRegistrationIdentity => {
+                        BrokerAdmissionRefusal::RegistrationIdentityForeign.with_platform(error)
+                    }
+                    other => CompositionError::Recovery(other),
+                })?;
+        }
         // A4: a restart continues from the protected launch/caller identity
         // plus a new registration operation and never revives a historical
         // request id.  Re-seeding the issuer from the recovered durable ledger
@@ -813,15 +906,13 @@ impl BrokerComposition {
         }
         drop(identity);
         let registration_digest = broker.registration_digest().map(ToOwned::to_owned);
-        let (launch_binding, launch_lease) = launch.map_or((None, None), |(binding, lease)| {
-            (Some(binding), Some(lease))
-        });
         Ok(Self {
             broker,
             snapshot,
             providers_admitted,
             launch_binding,
             launch_lease,
+            process_binding: Some(process_binding),
             registration_digest,
             identity_issuer: issuer,
             notify_launch: BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::Deferred {
@@ -865,7 +956,18 @@ impl BrokerComposition {
                 CompositionError::Launch("registration lease window overflowed".to_owned())
             })?;
         let declaration = fresh_registration_request(&binding, observed_at, lease_expires_at)?;
-        if self.broker.registration_digest().is_some() {
+        // A recovered registration is only refreshable while it is still the
+        // current one. A `Closed`/`Draining` registration — this process's
+        // own previous process after a clean stop, or a registration the
+        // Kernel already fenced — carries no launch authority, and renewing
+        // it would either resurrect a fenced lease or leave the broker unable
+        // to ever start again. Such a broker registers afresh under a new
+        // broker generation instead.
+        let refreshable = self.broker.registration().is_some_and(|registration| {
+            registration.status == RegistrationStatus::Active
+                && observed_at < registration.expires_at
+        });
+        if refreshable {
             let receipt = self.heartbeat()?;
             self.registration_digest = Some(receipt.registration_digest);
         } else {
@@ -1088,11 +1190,18 @@ impl BrokerComposition {
 
     /// Cancels a broker-owned operation selected by its admitted operation
     /// identity.  The sealed operation permit remains inside `UserBroker`.
+    ///
+    /// The cancellation first passes the broker's own control-operation
+    /// admission: an exact durable cancel identity is recorded for that exact
+    /// target under the current registration, and a target whose outcome is
+    /// still unproven is refused so an unknown launch/effect is reconciled
+    /// before anything tries to erase it.
     pub fn cancel(
         &mut self,
         operation_id: &OperationId,
     ) -> Result<CancellationReceipt, CompositionError> {
         self.verify_launch_lease()?;
+        self.admit_control_operation(BrokerControlOperation::Cancel, operation_id)?;
         self.broker
             .cancel_operation(operation_id)
             .map_err(CompositionError::Recovery)
@@ -1105,17 +1214,55 @@ impl BrokerComposition {
         operation_id: &OperationId,
     ) -> Result<ProcessExecutionView, CompositionError> {
         self.verify_launch_lease()?;
+        self.admit_control_operation(BrokerControlOperation::Reconcile, operation_id)?;
         self.broker
             .reconcile_operation(operation_id)
             .map_err(CompositionError::Recovery)
     }
 
+    /// Records this broker-owned control operation's distinct durable
+    /// operation identity before its effect is dispatched.
+    fn admit_control_operation(
+        &mut self,
+        operation: BrokerControlOperation,
+        operation_id: &OperationId,
+    ) -> Result<(), CompositionError> {
+        let observed_at = now_unix_ms()?;
+        self.broker
+            .admit_control_operation(operation, operation_id, observed_at)
+            .map_err(|error| match error {
+                BrokerError::UnreconciledEffect(_) => {
+                    BrokerAdmissionRefusal::OperationOutcomeUnreconciled.with_platform(error)
+                }
+                other => CompositionError::Recovery(other),
+            })
+    }
+
+    /// Proves, before any authenticated broker operation, that the protected
+    /// launch declaration is still the retained protected object *and* that
+    /// this process is still the process that was admitted.
+    ///
+    /// The launch lease alone cannot carry that: it proves the declaration
+    /// bytes are intact, not that the running image, process id, and process
+    /// start are the ones the broker authenticated itself with. Both are
+    /// re-proven here so a replaced image, a recycled process id, or a
+    /// substituted process fails closed before a register, heartbeat, launch,
+    /// cancel, reconcile, or close can cross the Kernel boundary.
     fn verify_launch_lease(&self) -> Result<(), CompositionError> {
         if let Some(lease) = &self.launch_lease {
             lease
                 .verify_stable_identity()
                 .and_then(|()| lease.verify_path_identity())
                 .map_err(|error| CompositionError::Protected(error.to_string()))?;
+        }
+        let bound = self.process_binding.as_ref().ok_or_else(|| {
+            BrokerAdmissionRefusal::ProcessIdentityUnprovable
+                .with_platform("broker process identity is not bound")
+        })?;
+        let observed = current_process_identity()?;
+        if !bound.identity.is_same_process(&observed) {
+            return Err(BrokerAdmissionRefusal::ProcessIdentityChanged
+                .with_platform("live process identity differs from the admitted one"));
         }
         Ok(())
     }
