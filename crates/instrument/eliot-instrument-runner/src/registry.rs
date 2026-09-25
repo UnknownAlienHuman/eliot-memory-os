@@ -16,10 +16,10 @@
 //! [`ResolvedExecutableIdentity`] and rejects stale, unsupported, missing,
 //! duplicate, ambiguous, and identity-mismatched mappings. The registry pins
 //! no per-executable digest expectation of its own: the executable digest is
-//! compared against the intent-sealed `executable_sha256` at launch (see
-//! `eliot-process-executor`), and registry-pinned per-executable digests
-//! remain follow-up work with the environment owner (see
-//! [`ProviderRegistry::ready`]).
+//! compared against the intent-sealed `executable_sha256` before launch by
+//! the runner and again at launch (see `eliot-process-executor`), and
+//! registry-pinned per-executable digests remain follow-up work with the
+//! environment owner (see [`ProviderRegistry::ready`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -565,10 +565,11 @@ impl RegistryEntry {
     /// observation whose executable file name matches the registry-bound
     /// executable; a missing, incomplete, or renamed executable fails closed
     /// so the result can never take authoritative PASS. This check pins the
-    /// executable *name*; the content digest is compared against the
-    /// intent-sealed `executable_sha256` at launch by the executor, and
-    /// argv is compared against the sealed request argv by the binding (argv
-    /// to argv, never argv to invocation filters).
+    /// executable *name*; the runner additionally binds the content digest
+    /// against the intent-sealed `executable_sha256` before launch (and the
+    /// executor compares again at launch), and argv is compared against the
+    /// sealed request argv by the binding (argv to argv, never argv to
+    /// invocation filters).
     ///
     /// # Errors
     ///
