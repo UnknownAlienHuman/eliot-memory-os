@@ -13,6 +13,7 @@ use std::num::NonZeroU64;
 
 use eliot_contracts::{
     ArtifactId, EpochId, EpochLineageId, ReceiptId, ResourceGeneration, SourceId, StateFence,
+    sha256_hex,
 };
 use eliot_dreamer_contracts::self_query::{
     AcceptedSourceProjection, AcceptedSourceRef, ArchitectureSourceStatus, NormativePairBinding,
@@ -44,10 +45,19 @@ fn fence() -> StateFence {
 }
 
 fn pair() -> NormativePairBinding {
+    // `NormativePairBinding::validate` recomputes the domain-separated pair
+    // key from both digests, so the fixture derives it the same way.
+    let architecture_digest = hex64("a1");
+    let implementation_digest = hex64("b2");
+    let mut preimage = b"eliot-normative-pair-v1\0".to_vec();
+    preimage.extend_from_slice(architecture_digest.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(implementation_digest.as_bytes());
+    preimage.push(0);
     NormativePairBinding {
-        architecture_digest: hex64("a1"),
-        implementation_digest: hex64("b2"),
-        pair_key: format!("sha256:{}", hex64("c3")),
+        architecture_digest,
+        implementation_digest,
+        pair_key: format!("sha256:{}", sha256_hex(&preimage)),
         document_set: "arch-docs".to_owned(),
         architecture_revision: "4.5-draft".to_owned(),
         implementation_revision: "0.29-draft".to_owned(),

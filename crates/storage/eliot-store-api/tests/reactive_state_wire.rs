@@ -89,7 +89,7 @@ fn wire_identity_is_stable_and_versioned() {
 #[test]
 fn catalogue_activates_all_four_reactive_operations() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 26);
+    assert_eq!(entries.len(), 33);
     for name in [
         REACTIVE_LEDGER_MUTATION_NAME,
         RESOURCE_SNAPSHOT_MUTATION_NAME,

@@ -1660,7 +1660,7 @@ pub fn trigger_closure_due(event: ClosureLifecycleEvent, policy: &ClosurePolicy)
     }
 }
 
-/// Visible learning debt while closure completes asynchronously.
+/// Visible learning debt while closure completes out of band.
 ///
 /// Raw evidence must already be durable; the next task cannot silently use
 /// an unclosed candidate until this debt resolves to a disposition.

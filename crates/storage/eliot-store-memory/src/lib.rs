@@ -4985,6 +4985,9 @@ mod tests {
         prepared.named_operations[0]
             .parameters
             .insert("subject".to_owned(), json!(subject));
+        // The plan changed after `transition()` bound the issue-#18 digests:
+        // re-derive them from the mutated plan before rebinding the hash.
+        eliot_store_api::bind_issue18_digests(&mut prepared)?;
         let view = CanonicalRequestView::from_apply(ctx, &prepared, &[], &[]);
         prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
         Ok(prepared)
@@ -5043,6 +5046,7 @@ mod tests {
             )?;
             capture.scope_id = ScopeId::new(scope)?;
             capture.ordering_scopes = vec![OrderingScopeId::new(scope)?];
+            eliot_store_api::bind_issue18_digests(&mut capture)?;
             capture.identity.canonical_request_hash = canonical_request_hash(
                 &CanonicalRequestView::from_apply(&ctx, &capture, &[], &[]),
             )?;
@@ -5573,6 +5577,10 @@ mod tests {
         ctx: &RequestMeta,
         transition: &mut PreparedTransition,
     ) -> Result<(), StoreError> {
+        // Re-derive every identity bound to the mutated content (issue-#18
+        // plan/admission digests, then the canonical request hash) so the
+        // negative case reaches the downstream check it targets.
+        eliot_store_api::bind_issue18_digests(transition)?;
         let view = CanonicalRequestView::from_apply(ctx, transition, &[], &[]);
         transition.identity.canonical_request_hash = canonical_request_hash(&view)?;
         Ok(())
