@@ -28,6 +28,7 @@ mod native_worker_claim;
 mod native_worker_replay;
 mod process_authority_handoff;
 mod provider_capability;
+mod research_provider;
 pub use native_worker_claim::{
     NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
     NATIVE_WORKER_CLAIM_WIRE_VERSION_V1, NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
@@ -54,6 +55,18 @@ pub use process_authority_handoff::ProcessAuthorityHandoffDescriptor;
 pub use provider_capability::{
     PROVIDER_CAPABILITY_WIRE_VERSION, ProviderCapabilityError, ProviderCapabilityExpectation,
     ProviderCapabilityRequest, ProviderProofKind, verify_provider_capability,
+};
+pub use research_provider::{
+    REASON_CANCELLATION_UNCONFIRMED, REASON_CAPABILITY_UNAVAILABLE, REASON_DEADLINE_EXCEEDED,
+    REASON_IDENTITY_CONFLICT, REASON_INSTRUMENT_EVIDENCE_INCOMPLETE, REASON_INVALID_ARGUMENT,
+    REASON_POLICY_DENIED, REASON_PROTOCOL_INCOMPATIBLE, REASON_RESEARCH_SOURCE_UNAVAILABLE,
+    REASON_RUNTIME_FAILED, REASON_STALE_AUTHORITY_EPOCH, REASON_STALE_STATE_FENCE,
+    REASON_UNKNOWN_OUTCOME, RESEARCH_PROVIDER_CANCEL_OPERATION,
+    RESEARCH_PROVIDER_DISPATCH_OPERATION, RESEARCH_PROVIDER_DISPATCH_WIRE_VERSION,
+    RESEARCH_PROVIDER_MAX_TEXT, RESEARCH_PROVIDER_OPERATIONS,
+    RESEARCH_PROVIDER_RECONCILE_OPERATION, RESEARCH_PROVIDER_STATUS_OPERATION,
+    RESEARCH_PROVIDER_WIRE_ID, ResearchProviderDispatch, ResearchProviderDispatchReceipt,
+    ResearchProviderDisposition, ResearchProviderError,
 };
 
 fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServiceError> {

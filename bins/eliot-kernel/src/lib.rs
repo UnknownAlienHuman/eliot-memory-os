@@ -167,6 +167,7 @@ pub mod notify_operation_identity;
 mod provider_capability_route;
 pub mod reactive_restore_serve;
 mod request_dispatch;
+mod research_provider_route;
 mod runtime_identity;
 mod shutdown_drain;
 mod startup_coordinator;
@@ -1009,6 +1010,23 @@ pub enum KernelFrameAction {
         /// Closed operation name; must equal `DREAMER_JOB_WIRE_ID`.
         operation: String,
         /// Bounded operation payload carrying context plus typed job request.
+        payload: serde_json::Value,
+    },
+    /// Execute one authenticated bounded research-provider operation (#24).
+    ///
+    /// The operation carries the exact research dispatch wire identity; the
+    /// admission itself is owned by the Kernel research-provider route
+    /// (`crate::research_provider_route`), which re-queries the live authority
+    /// epoch and the session's module-generation State Fence on every call. No
+    /// provider process is spawned inside this handler: the admitted operation
+    /// is executed by `eliot-mod-research` through the shared governed process
+    /// contour, and the returned material stays candidate-only.
+    Research {
+        /// Correlation identity to echo in the response.
+        request_id: RequestId,
+        /// Closed operation name from the research-provider wire.
+        operation: String,
+        /// Bounded operation payload carrying the typed dispatch envelope.
         payload: serde_json::Value,
     },
     /// Return a typed rejection, then fence the connection.
