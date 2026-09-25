@@ -2074,9 +2074,10 @@ async fn collect_window_accepts(
 /// observations, admits the freshest against the supervision incarnation
 /// and the SCM-bound process, and persists the audit twin.
 ///
-/// A disarmed contour (no descriptor file) returns no refs and preserves
-/// current behavior exactly. An armed contour with no fresh admitted
-/// heartbeat fails closed: no supervised claim without fresh observation.
+/// A supervised `SystemService` contour requires a present, bound descriptor;
+/// an absent descriptor is an unavailable coverage proof, not an empty
+/// successful observation. An armed contour with no fresh admitted heartbeat
+/// likewise fails closed: no supervised claim without fresh observation.
 ///
 /// Callers run on the sync Host contour; the async accept loop drives on a
 /// throwaway current-thread runtime (precedent: the Kernel `ProbeReady`
@@ -2084,16 +2085,46 @@ async fn collect_window_accepts(
 ///
 /// # Errors
 ///
-/// Returns an error for listener, read, derive, admission, or persistence
-/// failures on an armed contour.
+/// Returns an error for a missing/unbound descriptor, listener, read, derive,
+/// admission, or persistence failures.
+/// Observation-only compatibility projection retained for existing callers.
+///
+/// This projection deliberately does not carry enough information to grant
+/// live authority: callers that publish readiness must use
+/// [`observe_armed_heartbeat_admitted`] and retain the typed coverage
+/// disposition. An absent descriptor remains an empty observation here for
+/// non-supervised historical call sites; the supervised admission entry below
+/// rejects that contour instead of treating it as coverage.
 pub fn observe_armed_heartbeat(
     host_state_root: &Path,
     expected_kernel_epoch: u64,
     expected_watchdog_epoch: u64,
     scm: &VerifiedWatchdogScmRunning,
 ) -> Result<Vec<PlatformHandle>, HostError> {
-    let Some(descriptor) = HeartbeatTransportDescriptor::load(host_state_root)? else {
+    if HeartbeatTransportDescriptor::load(host_state_root)?.is_none() {
         return Ok(Vec::new());
+    }
+    observe_armed_heartbeat_admitted(
+        host_state_root,
+        expected_kernel_epoch,
+        expected_watchdog_epoch,
+        scm,
+    )
+    .map(|admitted| admitted.evidence_refs)
+}
+
+/// Observes and admits one heartbeat while retaining the typed Host coverage
+/// disposition for the readiness owner.
+pub fn observe_armed_heartbeat_admitted(
+    host_state_root: &Path,
+    expected_kernel_epoch: u64,
+    expected_watchdog_epoch: u64,
+    scm: &VerifiedWatchdogScmRunning,
+) -> Result<AdmittedHostHeartbeat, HostError> {
+    let Some(descriptor) = HeartbeatTransportDescriptor::load(host_state_root)? else {
+        return Err(HostError::RecoveryRequired(
+            "supervised readiness requires a bound Watchdog heartbeat descriptor".to_owned(),
+        ));
     };
     // An unbound rendezvous names no proven peer: bind (post-start SCM
     // verification) must complete before any admission window opens.
@@ -2186,7 +2217,7 @@ pub fn observe_armed_heartbeat(
         "host-heartbeat-rejected-peers:{rejected_peers}"
     ))?);
     persist_heartbeat_observation(host_state_root, &admitted.observation)?;
-    Ok(admitted.evidence_refs)
+    Ok(admitted)
 }
 #[cfg(test)]
 #[path = "watchdog_heartbeat_two_process_tests.rs"]

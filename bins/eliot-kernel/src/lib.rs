@@ -60,7 +60,7 @@ mod process_execution_client;
 mod supervision_lease_authority;
 mod testd_terminal_completion_route;
 
-/// Public wire-operation name for the authenticated TestD completion route.
+/// Public wire-operation name for the authenticated `TestD` completion route.
 pub use testd_terminal_completion_route::OPERATION as TESTD_TERMINAL_COMPLETION_OPERATION;
 
 pub use backup_capture::{
@@ -115,10 +115,11 @@ pub(crate) use shutdown_drain::{
 /// Kernel-owned exact-fence lease census for the I1.5 idle-drain gate.
 mod idle_lease_census;
 pub(crate) use idle_lease_census::KernelIdleLeaseCensus;
+pub(crate) use startup_coordinator::StartupCoordinator;
 pub use startup_coordinator::{
     AuthorityCeiling, GovernanceEnforcement, GovernanceObservation, GovernanceProfile,
-    GovernanceSupervision, STARTUP_FINAL_STEP, STARTUP_FIRST_STEP, StartupCoordinator,
-    StartupPrerequisite, StartupRejection, StartupStatus, startup_step_name,
+    GovernanceSupervision, STARTUP_FINAL_STEP, STARTUP_FIRST_STEP, StartupPrerequisite,
+    StartupRejection, StartupStatus, startup_step_name,
 };
 #[cfg(windows)]
 pub use supervision_lease_authority::{
@@ -442,11 +443,14 @@ const ACTIVE_DAEMON_CALLER: &str = "eliotd";
 /// constants must not be reintroduced beside it. The windows preserve the
 /// established lease shape (60s validity, renewal due after 30s); the
 /// observation freshness bounds match the wave-1 contract proof values.
-/// Watchdog coverage stays opt-in until wave 3 reports per-tick
-/// `watchdog_covered` from the daemon; the stale-cursor horizon (three missed
-/// renewal intervals, see `DaemonSupervisionProgressState`) applies
-/// regardless. `StoreHealth` (`health_view::daemon_health`) remains a separate
-/// evidence-only view and never renews.
+/// Watchdog coverage is not inferred from daemon self-report. Lease renewal
+/// remains available for front-door/lease continuity, while I1.11 step 11 and
+/// Material/Critical supervision admission stay closed until an independent
+/// Host-observed Watchdog signal is carried into Kernel. The stale-cursor
+/// horizon (three missed renewal intervals, see
+/// `DaemonSupervisionProgressState`) applies regardless. `StoreHealth`
+/// (`health_view::daemon_health`) remains a separate evidence-only view and
+/// never renews.
 #[cfg(windows)]
 pub(crate) const SUPERVISION_LEASE_RENEWAL_POLICY: DaemonSupervisionRenewalPolicy =
     DaemonSupervisionRenewalPolicy {
@@ -981,6 +985,9 @@ pub enum KernelFrameAction {
         operation: String,
         /// Bounded operation payload carrying the typed repair-attempt request.
         payload: serde_json::Value,
+        /// The original transport control classification.  The typed Doctor
+        /// owner still validates the closed envelope before admitting it.
+        control: bool,
     },
     /// Execute one authenticated testd admission operation (T6-X1 P-07).
     /// The operation carries the exact testd wire identity; job-bound
@@ -999,6 +1006,9 @@ pub enum KernelFrameAction {
         operation: String,
         /// Bounded operation payload carrying the typed admission request.
         payload: serde_json::Value,
+        /// The original transport control classification. The typed `TestD`
+        /// owner remains the final authority on cancellation versus submit.
+        control: bool,
     },
     /// Execute one authenticated Dreamer job operation (T12-05 K2).
     /// The operation carries the exact Dreamer wire identity; ledger-bound
@@ -2240,27 +2250,16 @@ impl KernelComposition {
             })
     }
 
-    /// Normal canonical-write admission through the startup coordinator.
-    /// Inspection remains allowed; a blocked write fails with the named
-    /// unmet startup prerequisite.
-    ///
-    /// # Errors
-    ///
-    /// Returns the blocking [`StartupRejection`] naming the unmet
-    /// prerequisite, or a lock-poison platform error.
-    pub fn admit_normal_write(&self) -> Result<(), KernelServiceError> {
-        let coordinator = self
-            .startup_coordinator
-            .lock()
-            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
-        coordinator
-            .admit_normal_write()
-            .map_err(|rejection| KernelServiceError::Platform(rejection.to_string()))
-    }
-
     /// Material/Critical authority admission for one Governance Profile.
     /// Startup completeness is checked first with its named prerequisite;
     /// the profile ceiling alone decides once startup is complete.
+    ///
+    /// This is the startup-gate half of the Material decision and is the
+    /// surface the origin-control decide path consults. It does not stand in
+    /// for current independent Watchdog coverage: a protected effect that must
+    /// be admitted as independently supervised additionally passes
+    /// [`Self::admit_material_authority_for_fence`], which verifies the live
+    /// Watchdog branch for the exact target fence.
     ///
     /// # Errors
     ///
@@ -2279,28 +2278,272 @@ impl KernelComposition {
             .map_err(|rejection| KernelServiceError::Platform(rejection.to_string()))
     }
 
-    /// Advances one I1.11 startup step in order. Production calls this as
-    /// each probe/handshake actually completes; out-of-order steps fail.
+    /// Normal canonical-write admission through the startup coordinator.
+    /// Inspection remains allowed; a blocked write fails with the named
+    /// unmet startup prerequisite.
     ///
     /// # Errors
     ///
-    /// Returns the ordering error when `step` is not the next expected step
-    /// or lies outside 1-11, or a lock-poison platform error.
-    pub fn complete_startup_step(&self, step: u8) -> Result<(), KernelServiceError> {
-        let mut coordinator = self
+    /// Returns the blocking [`StartupRejection`] naming the unmet
+    /// prerequisite, or a lock-poison platform error.
+    pub fn admit_normal_write(&self) -> Result<(), KernelServiceError> {
+        let coordinator = self
             .startup_coordinator
             .lock()
             .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
         coordinator
-            .complete_step(step)
-            .map_err(KernelServiceError::Platform)
+            .admit_normal_write()
+            .map_err(|rejection| KernelServiceError::Platform(rejection.to_string()))
+    }
+
+    /// Validate the exact Kernel target fence before a protected effect.
+    ///
+    /// The fence is supplied by the authenticated route, never reconstructed
+    /// from an operation payload.  This check is deliberately separate from
+    /// the global startup cursor: a cursor can prove that prerequisites were
+    /// observed, but it cannot stand in for current independent Watchdog
+    /// coverage.  The verified current candidate binding is returned so the
+    /// supervision check reuses this one read instead of taking the
+    /// non-reentrant service lock twice.
+    fn validate_material_target_fence(
+        &self,
+        target: &StateFence,
+    ) -> Result<eliot_kernel_service::HostKernelCandidateBinding, KernelServiceError> {
+        target
+            .validate()
+            .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+        let service = self.service.lock().map_err(|_| {
+            KernelServiceError::Platform("material target lock poisoned".to_owned())
+        })?;
+        if service.state() != KernelServiceState::Ready || service.generation_fenced() {
+            return Err(KernelServiceError::Platform(
+                "material target is not the current Ready Kernel generation".to_owned(),
+            ));
+        }
+        let candidate = service.candidate_binding().ok_or_else(|| {
+            KernelServiceError::Platform(
+                "material target has no current candidate binding".to_owned(),
+            )
+        })?;
+        let activation = service.activation_receipt().ok_or_else(|| {
+            KernelServiceError::Platform(
+                "material target has no current activation receipt".to_owned(),
+            )
+        })?;
+        if candidate.kernel_epoch != target.authority_epoch
+            || activation.generation != target.resource_generation
+            || activation.authority_epoch != target.authority_epoch
+        {
+            return Err(KernelServiceError::Platform(
+                "material target fence is not the current activation generation".to_owned(),
+            ));
+        }
+        // The activation receipt is the authoritative live fence. Compare it
+        // two-sidedly so a caller cannot smuggle a `task_revision`,
+        // `policy_revision`, or `integration_revision` that Kernel never
+        // issued: `is_compatible_with` treats the live side's `None` as a
+        // wildcard, and only the reverse direction rejects that asymmetry.
+        let live_fence = StateFence::new(activation.authority_epoch.clone(), activation.generation);
+        if !eliot_contracts::fences_match_exact(target, &live_fence) {
+            return Err(KernelServiceError::Platform(
+                "material target fence carries revisions the current activation did not issue"
+                    .to_owned(),
+            ));
+        }
+        Ok(candidate.clone())
+    }
+
+    /// Material/Critical authority admission for one exact target fence.
+    ///
+    /// The decision has two independent halves. The first is mechanical: the
+    /// presented fence must be the live, Ready, unfenced activation contour
+    /// (see [`Self::validate_material_target_fence`]) and the profile ceiling
+    /// must actually permit Material effects. The second is supervision: the
+    /// independent Watchdog branch must currently verify. Only then is work
+    /// admitted as independently supervised.
+    ///
+    /// A verified branch admits; an unverified branch pauses with the explicit
+    /// `WATCHDOG_COVERAGE_UNAVAILABLE` degraded-profile refusal and the
+    /// Human-risk path requirement. The supervision half reads the revocable
+    /// I1.11 supervision step, never a latched cursor and never lease
+    /// continuity alone.
+    pub(crate) fn admit_material_authority_for_fence(
+        &self,
+        profile: GovernanceProfile,
+        target: &StateFence,
+    ) -> Result<(), KernelServiceError> {
+        let candidate = self.validate_material_target_fence(target)?;
+        if !matches!(
+            profile.ceiling(),
+            AuthorityCeiling::Material | AuthorityCeiling::Critical
+        ) {
+            return Err(KernelServiceError::Platform(
+                "material authority refused: governance profile does not permit Material effects"
+                    .to_owned(),
+            ));
+        }
+        self.verify_watchdog_supervision_branch(&candidate, target)
+            .map_err(|reason| {
+                KernelServiceError::Platform(format!(
+                    "{}: {reason}; Material/Critical work is paused under runtime-degraded-v3 and requires the explicit Human-risk path",
+                    eliot_kernel_service::ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE
+                ))
+            })
+    }
+
+    /// Admits one Host-observed live Watchdog branch observation for the exact
+    /// candidate contour it was probed under, and records the I1.11 supervision
+    /// step from it.
+    ///
+    /// This consumes the existing `HostStartupEvidence` carrier. Host already
+    /// revalidates the live SCM Watchdog incarnation when it builds that
+    /// carrier: the bound PID/start pair must still be live in the OS and the
+    /// live image bytes must still hash to the approved Watchdog artifact.
+    /// Kernel re-reads the named incarnation, binds it to the presented
+    /// candidate and State Fence, and only then marks the supervision step. The
+    /// step is revocable, so a new activation contour is unverified again until
+    /// Host observes the branch under that contour. Coverage is never re-derived
+    /// from lease continuity or `eliotd` self-report.
+    ///
+    /// # Errors
+    ///
+    /// Returns a platform error when the carrier is not exactly bound to the
+    /// presented candidate, when the probe fence is not the presented target
+    /// fence, when the supervision incarnation has no non-zero Watchdog epoch,
+    /// or when the SCM Watchdog incarnation digest is not a well-formed live
+    /// observation.
+    #[cfg(windows)]
+    pub(crate) fn admit_host_observed_watchdog_branch(
+        &self,
+        evidence: &HostStartupEvidence,
+        candidate: &eliot_kernel_service::HostKernelCandidateBinding,
+        target: &StateFence,
+    ) -> Result<(), KernelServiceError> {
+        let malformed = || {
+            KernelServiceError::Platform("Host SCM Watchdog observation is malformed".to_owned())
+        };
+        let candidate_digest = candidate.compute_digest().map_err(|_| {
+            KernelServiceError::Platform(
+                "Watchdog branch observation candidate has no computable digest".to_owned(),
+            )
+        })?;
+        if evidence.candidate_digest != candidate_digest
+            || evidence.state_fence != *target
+            || !eliot_contracts::fences_match_exact(&evidence.state_fence, target)
+        {
+            return Err(KernelServiceError::Platform(
+                "Host Watchdog branch observation is not bound to the presented candidate contour"
+                    .to_owned(),
+            ));
+        }
+        let incarnation = &candidate.supervision_incarnation;
+        if incarnation.watchdog_epoch.sequence == 0 {
+            return Err(KernelServiceError::Platform(
+                "Host Watchdog branch observation has no non-zero Watchdog epoch".to_owned(),
+            ));
+        }
+        let mut parts = evidence.scm_watchdog_observation_digest.as_str().split(':');
+        if parts.next() != Some("host-scm-watchdog") {
+            return Err(malformed());
+        }
+        let Ok(process_id) = parts.next().ok_or_else(malformed)?.parse::<u32>() else {
+            return Err(malformed());
+        };
+        let Ok(process_start) = parts.next().ok_or_else(malformed)?.parse::<u64>() else {
+            return Err(malformed());
+        };
+        let image_sha256 = parts.next().ok_or_else(malformed)?;
+        if parts.next().is_some()
+            || process_id == 0
+            || process_start == 0
+            || image_sha256.is_empty()
+        {
+            return Err(malformed());
+        }
+        self.record_host_observed_supervision_evidence()
+    }
+
+    /// Revokes the recorded independent-supervision evidence at the one
+    /// owner-correct moment it can no longer describe the live contour: a new
+    /// candidate activation is admitted (I1.5).
+    ///
+    /// A previously verified Watchdog branch belonged to the previous
+    /// activation generation, host epoch, and Watchdog epoch. Admitting a new
+    /// contour therefore withdraws the claim until Host observes the branch
+    /// again under that contour. This never un-observes an earlier I1.11 step
+    /// and never grants anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lock-poison platform error.
+    pub(crate) fn revoke_supervision_evidence(&self) -> Result<(), KernelServiceError> {
+        let mut coordinator = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        coordinator.revoke_supervision_evidence();
+        Ok(())
+    }
+
+    /// Admits a process `Start` admission under Material/Critical authority.
+    ///
+    /// The target fence is derived from the already-validated admission, never
+    /// from caller-supplied loose fields, so the front-door path and the
+    /// dispatch-launch path cannot drift into checking different generations.
+    /// This performs no external effect and never retries.
+    pub(crate) fn admit_material_process_start(
+        &self,
+        admission: &eliot_process::ProcessExecutionAdmissionRequest,
+    ) -> Result<(), KernelServiceError> {
+        let target_generation =
+            eliot_contracts::ResourceGeneration::new(admission.state_fence().generation().get())
+                .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+        let target_fence = StateFence::new(
+            admission.state_fence().authority_epoch().clone(),
+            target_generation,
+        );
+        self.admit_material_authority_for_fence(GovernanceProfile::full(), &target_fence)
     }
 
     /// Records one real owner-produced I1.11 evidence item. Out-of-order
     /// evidence is retained without advancing the contiguous readiness cursor;
     /// missing earlier steps therefore remain blocking and cannot be inferred
     /// from a later successful probe.
+    ///
+    /// I1.11 step 11 is the supervision step. It is not reachable here: a
+    /// signed lease, a successful process handshake, or `ProbeReady` alone is
+    /// lease continuity, not an independent Watchdog observation. The only
+    /// production producer is
+    /// [`Self::record_host_observed_supervision_evidence`], which runs only
+    /// after `admit_host_observed_watchdog_branch` accepted a live SCM
+    /// Watchdog incarnation for the presented contour.
     pub(crate) fn record_startup_evidence(&self, step: u8) -> Result<(), KernelServiceError> {
+        if step == STARTUP_FINAL_STEP {
+            return Err(KernelServiceError::Platform(
+                "startup step 11 requires an independent Host-observed Watchdog signal".to_owned(),
+            ));
+        }
+        self.record_startup_evidence_inner(step)
+    }
+
+    /// Records the I1.11 supervision step from one verified independent
+    /// Watchdog branch observation.
+    ///
+    /// This is the sole production producer of [`STARTUP_FINAL_STEP`]. The
+    /// caller must have just accepted a live SCM Watchdog incarnation bound to
+    /// the presented candidate contour. The step is revocable, so a later
+    /// contour change keeps Material/Critical admission closed until Host
+    /// observes the branch again.
+    #[cfg(windows)]
+    pub(crate) fn record_host_observed_supervision_evidence(
+        &self,
+    ) -> Result<(), KernelServiceError> {
+        self.record_startup_evidence_inner(STARTUP_FINAL_STEP)
+    }
+
+    /// Ordered I1.11 cursor update shared by the general and
+    /// supervision-only producers.
+    fn record_startup_evidence_inner(&self, step: u8) -> Result<(), KernelServiceError> {
         let mut coordinator = self
             .startup_coordinator
             .lock()
@@ -2656,6 +2899,10 @@ impl KernelComposition {
         Ok(current)
     }
 
+    /// Renews the exact active supervision lease from process continuity when
+    /// no admitted progress observation is available. This preserves the
+    /// front-door lease only; it never records I1.11 step 11 or grants
+    /// Material authority.
     #[cfg(windows)]
     fn renew_current_supervision(
         authority: &KernelSupervisionLeaseAuthority,
@@ -2936,11 +3183,12 @@ impl KernelComposition {
         Ok((contour, snapshot))
     }
 
-    // Issue #88, wave 3: the ProbeReady path renews through the typed
-    // progress route when the latest retained per-tick observation cites the
-    // exact durable head, so ProbeReady and the per-tick submits decide on
-    // the same evidence. Without a current retained observation the
-    // policy-driven bootstrap renew covers the pre-observation window.
+    // Issue #88, wave 3: the ProbeReady path uses the latest retained
+    // per-tick observation when it is bound to the current durable head (or
+    // is the exact observation that produced its immediately preceding
+    // successor). A missing or refused progress observation falls back only to
+    // lease continuity for front-door responsiveness; that fallback never
+    // records I1.11 step 11 or grants Material authority.
     // `StoreHealth` (`health_view::daemon_health`) stays evidence-only and
     // must never be passed as renewal evidence.
     #[cfg(windows)]
@@ -2957,23 +3205,42 @@ impl KernelComposition {
         ready: &EliotdLiveReadyEvidence,
         head: &SupervisionLeaseSnapshot,
     ) -> Result<Option<(SupervisionLeaseSnapshot, EliotdLiveReceipt)>, KernelServiceError> {
-        let retained = self
+        let (observation, progress_state) = self
             .daemon_runtime
             .lock()
-            .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))?
-            .last_progress_observation
-            .clone();
-        let Some(observation) = retained else {
+            .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))
+            .map(|state| {
+                (
+                    state.last_progress_observation.clone(),
+                    state.supervision_progress.clone(),
+                )
+            })?;
+        if progress_state.reconciliation_pending {
+            // A staged ticket with an unresolved publication is reconciled by
+            // identity only; never fall through to process-continuity renewal.
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        let Some(observation) = observation else {
             return Ok(None);
         };
-        // The retained observation must cite this exact head. Anything older
-        // (including a predecessor advanced by a per-tick submit since) keeps
-        // the bootstrap path instead of deciding from stale evidence.
-        if observation.lease_id != head.record.lease_id.as_str()
-            || observation.lease_revision != head.record.revision
-            || observation.predecessor_receipt_sha256 != head.receipt.receipt_sha256
+        if !Self::progress_observation_matches_current_head(&observation, head, &progress_state) {
+            return Ok(None);
+        }
+        let now_ms = unix_ms();
+        if observation.observed_wall_ms > now_ms.saturating_add(5_000)
+            || now_ms.saturating_sub(observation.observed_wall_ms) > 10_000
         {
             return Ok(None);
+        }
+        // A successful renewal retains the observation that was evaluated
+        // against the predecessor head. When that exact observation is
+        // recorded as the producer of the current successor, ProbeReady can
+        // reconcile the publication from that successor; it must not submit the
+        // predecessor again as a new renewal request.
+        if observation.predecessor_receipt_sha256 != head.receipt.receipt_sha256 {
+            let published =
+                self.publish_eliotd_live_receipt(launch, process, ready, contour, Some(head))?;
+            return Ok(Some((head.clone(), published)));
         }
         let predecessor = eliot_runtime_contracts::SupervisionLeasePredecessorProof {
             lease_id: head.record.lease_id.as_str().to_owned(),
@@ -3024,13 +3291,25 @@ impl KernelComposition {
             }
             Ok(())
         };
-        let Ok((snapshot, decision, receipt)) = renewal else {
-            // Any refusal or authority failure keeps the bootstrap path:
-            // ProbeReady must not turn a stale retained observation into
-            // a readiness failure while the policy renew still applies.
-            // An expired lease fails closed in the bootstrap renew below.
-            put_back(progress, None)?;
-            return Ok(None);
+        let (snapshot, decision, receipt) = match renewal {
+            Ok(value) => value,
+            Err(error) => {
+                let expired = matches!(
+                    error,
+                    SupervisionProgressRenewalError::Heartbeat(
+                        DaemonSupervisionHeartbeatError::SupervisionLeaseExpired
+                    )
+                );
+                put_back(progress, Some(expired))?;
+                if expired {
+                    self.promote_agent_bridge_profile(None)
+                        .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+                }
+                // A failed renewal must not fall through to process-only
+                // continuity. Otherwise a terminal lease expiry could be
+                // revived by a later ProbeReady without a new generation.
+                return Err(KernelServiceError::ReadinessNotProven);
+            }
         };
         put_back(progress, Some(false))?;
         // A non-renewing decision still publishes the unchanged head
@@ -3074,7 +3353,10 @@ impl KernelComposition {
                 // lease expiry for this contour. Fail readiness closed on the
                 // expired marker until a new admitted generation rebinds (the
                 // rebind clears the marker); the durable-head verify below
-                // would fail identically on the expired binding.
+                // would fail identically on the expired binding. A terminal
+                // progress expiry therefore fences this contour until a newly
+                // admitted generation rebinds: a live lease snapshot or a later
+                // ProbeReady cannot revive the expired claim.
                 return Err(KernelServiceError::ReadinessNotProven);
             }
             (
@@ -3139,6 +3421,8 @@ impl KernelComposition {
         {
             pair
         } else {
+            // Front-door continuity only. This fallback cannot satisfy I1.11
+            // step 11 and therefore cannot admit Material/Critical authority.
             let renewed = Self::renew_current_supervision(authority, &contour, unix_ms())
                 .map_err(|_| KernelServiceError::ReadinessNotProven)?;
             let published = self.publish_eliotd_live_receipt(

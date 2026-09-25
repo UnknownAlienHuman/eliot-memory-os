@@ -7,10 +7,11 @@ pub(super) use readiness_append::{
 use super::{HostError, fresh_identity, fresh_lineage_id, operation, record_fence, sha256_json};
 use eliot_host_state::{
     ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, EliotActivationRecord,
-    EpochTransition, HostInstallationEpoch, HostKernelStoreLineage, HostState,
-    HostStateJournalService, HostStateRecord, JOURNAL_VERSION, JournalBackend, JournalError,
-    JournalManifest, KernelJobBinding, KernelRecord, LifecycleTimestamps, PriorKernelDisposition,
-    PriorKernelSource, ReadinessEvidence, ReconcileOutcome, WakeDisposition,
+    EpochTransition, FailureRecoveryDirective, HostInstallationEpoch, HostKernelStoreLineage,
+    HostState, HostStateJournalService, HostStateRecord, JOURNAL_VERSION, JournalBackend,
+    JournalError, JournalManifest, KernelJobBinding, KernelRecord, LifecycleTimestamps,
+    PriorKernelDisposition, PriorKernelSource, ReadinessEvidence, ReconcileOutcome,
+    WakeDisposition,
 };
 #[cfg(windows)]
 use eliot_host_state::{StoreRebindRecord, StoreRebindState};
@@ -222,6 +223,21 @@ pub(super) fn transition_activation_record(
     );
     next.readiness.control_ready = ready;
     next.readiness.supervision_ready = ready;
+    if state == ActivationState::Starting {
+        // A new explicit activation attempt does not inherit readiness or a
+        // recovery directive from the stopped/degraded generation. The new
+        // attempt must publish fresh evidence before any live transition.
+        // Keep one explicit non-live marker because the durable readiness
+        // projection requires a non-empty evidence set even while Starting.
+        next.readiness.evidence_refs = vec![
+            PlatformHandle::new("host-starting-fresh-readiness-required")
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        ];
+        next.timestamps.ready_at = None;
+        next.failure_and_recovery_directive = None;
+        next.governance_profile = PlatformHandle::new("runtime-degraded-v3")
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+    }
     // I1.5 (#1750): governance turns live only on a proven-ready transition.
     // On Windows that transition runs after the Watchdog SCM verification and
     // the ProbeReady watchdog-branch gate; other platforms have no
@@ -247,6 +263,51 @@ pub(super) fn transition_activation_record(
     if state == ActivationState::StoppedClean {
         next.timestamps.stopped_at = Some(fresh_identity("host-stopped-at")?);
     }
+    Ok(next)
+}
+
+/// Carries the exact fresh readiness evidence into the activation record.
+/// The generic transition helper intentionally remains small for historical
+/// callers, while a live supervised transition must not erase the heartbeat
+/// receipt that authorized it.
+pub(super) fn transition_activation_record_with_evidence(
+    current: &EliotActivationRecord,
+    state: ActivationState,
+    label: &str,
+    evidence_refs: &[PlatformHandle],
+) -> Result<EliotActivationRecord, HostError> {
+    let mut next = transition_activation_record(current, state, label)?;
+    if matches!(
+        state,
+        ActivationState::ControlReady | ActivationState::Active
+    ) && !evidence_refs.is_empty()
+    {
+        next.readiness.evidence_refs = evidence_refs.to_vec();
+    }
+    Ok(next)
+}
+
+/// Projects a live contour loss as an explicit recovery state. The caller
+/// supplies the bounded failure reference and recovery directive; this helper
+/// only records that fact and never invents a Watchdog-specific cause.
+pub(super) fn degraded_activation(
+    current: &EliotActivationRecord,
+    label: &str,
+    failure_ref: &PlatformHandle,
+    directive: &str,
+) -> Result<EliotActivationRecord, HostError> {
+    let mut next = transition_activation_record(current, ActivationState::DegradedRecovery, label)?;
+    next.governance_profile = PlatformHandle::new("runtime-degraded-v3")
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+    next.readiness.evidence_refs = vec![failure_ref.clone()];
+    next.timestamps.ready_at = None;
+    next.failure_and_recovery_directive = Some(FailureRecoveryDirective {
+        failure_ref: failure_ref.clone(),
+        recovery_owner: PlatformHandle::new("host-composition")
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        directive: PlatformHandle::new(directive)
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+    });
     Ok(next)
 }
 

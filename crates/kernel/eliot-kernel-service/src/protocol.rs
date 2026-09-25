@@ -2446,18 +2446,37 @@ pub struct ProcessExecutionRejection {
 }
 
 impl ProcessExecutionRejection {
+    /// Stable code for the explicit Host-observed Watchdog coverage refusal.
+    ///
+    /// A Material/Critical process start is not merely "unavailable" while the
+    /// authorized Host-to-Kernel Watchdog carrier is absent. The caller must be
+    /// able to distinguish that fail-closed coverage refusal from an ordinary
+    /// port outage without parsing a provider or child error string.
+    pub const WATCHDOG_COVERAGE_UNAVAILABLE: &'static str = "WATCHDOG_COVERAGE_UNAVAILABLE";
+
     /// Converts a process execution error into a bounded transport projection.
     pub fn from_error(error: &ProcessExecutionError) -> Self {
-        Self {
-            code: match error {
-                ProcessExecutionError::UnknownOutcome => "UNKNOWN_OUTCOME",
-                ProcessExecutionError::NotFound => "NOT_FOUND",
-                ProcessExecutionError::Contract(_) => "CONTRACT_REJECTED",
-                ProcessExecutionError::Unavailable(_) => "UNAVAILABLE",
-                ProcessExecutionError::EvidenceSink(_) => "EVIDENCE_REJECTED",
+        let (code, detail) = match error {
+            ProcessExecutionError::UnknownOutcome => ("UNKNOWN_OUTCOME", error.to_string()),
+            ProcessExecutionError::NotFound => ("NOT_FOUND", error.to_string()),
+            ProcessExecutionError::Contract(_) => ("CONTRACT_REJECTED", error.to_string()),
+            ProcessExecutionError::Unavailable(reason)
+                if reason.starts_with(&format!("{}:", Self::WATCHDOG_COVERAGE_UNAVAILABLE)) =>
+            {
+                (
+                    Self::WATCHDOG_COVERAGE_UNAVAILABLE,
+                    reason
+                        .trim_start_matches(&format!("{}:", Self::WATCHDOG_COVERAGE_UNAVAILABLE))
+                        .trim_start()
+                        .to_owned(),
+                )
             }
-            .to_owned(),
-            detail: error.to_string().chars().take(512).collect(),
+            ProcessExecutionError::Unavailable(_) => ("UNAVAILABLE", error.to_string()),
+            ProcessExecutionError::EvidenceSink(_) => ("EVIDENCE_REJECTED", error.to_string()),
+        };
+        Self {
+            code: code.to_owned(),
+            detail: detail.chars().take(512).collect(),
         }
     }
 }

@@ -131,6 +131,8 @@ fn host_error_variant(error: &HostError) -> &'static str {
         HostError::RecoveryRequired(_) => "recovery_required",
         #[cfg(windows)]
         HostError::StoreRecoveryRequired(_) => "store_recovery_required",
+        #[cfg(windows)]
+        HostError::WatchdogCoverageUnavailable(_) => "watchdog_coverage_unavailable",
         HostError::OwnerLeaseHeld => "owner_lease_held",
         HostError::OwnerLeaseRecovery(_) => "owner_lease_recovery",
     }
@@ -871,22 +873,8 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
     let _ = report_service_status(&handle, &report);
     let mut idle_drain = HostIdleDrainSupervisor::new();
     while !STOP_REQUESTED.load(Ordering::Acquire) && host.running() {
-        process_phase_b_requests(&mut host, &phase_b_queue);
-        // I1.5: an authenticated request on the runtime-control plane is an
-        // observable-use trigger. It both restarts the idle grace and may
-        // cancel a pre-linearization drain.
-        for evidence in process_runtime_control_requests(&mut host, &runtime_queue) {
-            idle_drain.note_observable_use(&mut host, &evidence);
-        }
-        match host.has_durable_branch_fence() {
-            Ok(true) => {
-                // A degraded branch has fenced the shared authority in the
-                // durable state store. Keep the healthy sibling alive, but do
-                // not continue claiming or reconciling stale authority.
-                std::thread::sleep(std::time::Duration::from_millis(250));
-                continue;
-            }
-            Ok(false) => {}
+        let durable_fence = match host.has_durable_branch_fence() {
+            Ok(fenced) => fenced,
             Err(error) => {
                 let _ = writeln!(
                     io::stderr().lock(),
@@ -895,8 +883,11 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                 STOP_REQUESTED.store(true, Ordering::Release);
                 break;
             }
-        }
-        let tick = if host.has_process_contour() {
+        };
+        // Liveness/readiness observation precedes every material queue poll.
+        // If the current tick discovers a loss, the handlers below see the
+        // newly persisted degraded fence before accepting new work.
+        let tick = if !durable_fence && host.has_process_contour() {
             match run_scm_contour_tick(&mut host) {
                 Ok(outcome) => {
                     let reconciled = match outcome {
@@ -921,6 +912,23 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
         };
         if let Some(disposition) = tick {
             idle_drain.observe_readiness(&mut host, disposition);
+        }
+        // Recovery/cancel requests remain drainable under a durable fence;
+        // material handlers enforce their stricter admission independently.
+        process_phase_b_requests(&mut host, &phase_b_queue);
+        // I1.5: an authenticated request on the runtime-control plane is an
+        // observable-use trigger. It both restarts the idle grace and may
+        // cancel a pre-linearization drain.
+        for evidence in process_runtime_control_requests(&mut host, &runtime_queue) {
+            idle_drain.note_observable_use(&mut host, &evidence);
+        }
+        if durable_fence {
+            // A degraded branch has fenced the shared authority in the durable
+            // state store. Keep the healthy sibling alive, but do not continue
+            // claiming or reconciling stale authority, and do not evaluate the
+            // idle-drain sequence against a fenced branch.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            continue;
         }
         let now = std::time::Instant::now();
         let drain_tick = idle_drain.evaluate(&mut host, now);

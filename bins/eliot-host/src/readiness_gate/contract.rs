@@ -123,6 +123,7 @@ pub(crate) fn readiness_failure_kind(error: &HostError) -> ReadinessFailureKind 
         | HostError::MissingInstallation
         | HostError::StoreNotLive { .. }
         | HostError::StoreRecoveryRequired(_)
+        | HostError::WatchdogCoverageUnavailable(_)
         | HostError::OwnerLeaseHeld
         | HostError::OwnerLeaseRecovery(_) => ReadinessFailureKind::ProbeRejected,
     }

@@ -323,7 +323,7 @@ impl Default for StartupCoordinator {
 impl StartupCoordinator {
     /// New coordinator with no steps completed and every mandatory gate open.
     #[must_use]
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             completed_step: 0,
             observed_steps: 0,
@@ -337,6 +337,7 @@ impl StartupCoordinator {
     }
 
     /// Highest contiguously completed I1.11 step.
+    #[cfg(test)]
     #[must_use]
     pub const fn completed_step(&self) -> u8 {
         self.completed_step
@@ -429,7 +430,7 @@ impl StartupCoordinator {
     ///
     /// Returns the blocking [`StartupRejection`] naming the unmet
     /// prerequisite.
-    pub fn admit_normal_write(&self) -> Result<(), StartupRejection> {
+    pub(crate) fn admit_normal_write(&self) -> Result<(), StartupRejection> {
         if let Some(gate) = self.blocking_prerequisite() {
             return Err(StartupRejection::new(gate, "normal canonical write"));
         }
@@ -444,7 +445,13 @@ impl StartupCoordinator {
     ///
     /// Returns the blocking [`StartupRejection`] or a profile-ceiling
     /// rejection when the profile does not permit Material authority.
-    pub fn admit_material_authority(
+    ///
+    /// Production reaches this through
+    /// [`KernelComposition::admit_material_authority`](super::KernelComposition::admit_material_authority),
+    /// which the origin-control decide path consults; it is the startup-gate
+    /// half of the Material/Critical decision, and the dynamic Watchdog-coverage
+    /// half is [`KernelComposition::admit_material_authority_for_fence`](super::KernelComposition::admit_material_authority_for_fence).
+    pub(crate) fn admit_material_authority(
         &self,
         profile: GovernanceProfile,
     ) -> Result<(), StartupRejection> {
@@ -476,6 +483,7 @@ impl StartupCoordinator {
         self.capability_degraded = true;
     }
 
+    #[cfg(test)]
     fn require_next(&self, step: u8) -> Result<(), String> {
         if step == self.completed_step.saturating_add(1) {
             Ok(())
@@ -508,6 +516,7 @@ impl StartupCoordinator {
         Ok(())
     }
 
+    #[cfg(test)]
     fn complete_ordered(&mut self, step: u8) -> Result<(), String> {
         self.require_next(step)?;
         self.record_step_evidence(step)
@@ -521,7 +530,8 @@ impl StartupCoordinator {
     ///
     /// Returns a fixed-shape ordering error when `step` is not exactly the
     /// next expected step or lies outside 1-11.
-    pub fn complete_step(&mut self, step: u8) -> Result<(), String> {
+    #[cfg(test)]
+    pub(crate) fn complete_step(&mut self, step: u8) -> Result<(), String> {
         match step {
             1 | 2 | 4 | 7..=10 => self.complete_ordered(step),
             3 => {
@@ -559,6 +569,31 @@ impl StartupCoordinator {
         self.record_step_evidence(step)
     }
 
+    /// True when the I1.11 supervision step has been produced for the current
+    /// activation contour.
+    ///
+    /// I1.5 (#1750): this is the revocable, owner-correct record of one
+    /// Host-observed live Watchdog branch. It is deliberately not a latched
+    /// success: [`Self::revoke_supervision_evidence`] clears it whenever a new
+    /// activation contour is admitted, so a new generation must be observed
+    /// again before Material/Critical work is admitted as independently
+    /// supervised.
+    #[must_use]
+    pub const fn supervision_evidence_is_complete(&self) -> bool {
+        self.completed_step >= STARTUP_FINAL_STEP && self.supervision_evidence_complete
+    }
+
+    /// Revokes the recorded independent-supervision evidence.
+    ///
+    /// The contiguous cursor is left untouched so no earlier I1.11 step is
+    /// un-observed; only the supervision claim itself is withdrawn. Callers use
+    /// this at the one owner-correct moment a new candidate contour is admitted
+    /// (I1.5), because the previous observation belonged to the previous
+    /// activation.
+    pub const fn revoke_supervision_evidence(&mut self) {
+        self.supervision_evidence_complete = false;
+    }
+
     /// Completes every mandatory gate in I1.11 order (1-11). Test and
     /// composition-recovery helper; production advances step by step as each
     /// probe/handshake actually completes.
@@ -567,7 +602,8 @@ impl StartupCoordinator {
     ///
     /// Returns the ordering error if the coordinator has already advanced
     /// past the start.
-    pub fn complete_all_mandatory(&mut self) -> Result<(), String> {
+    #[cfg(test)]
+    pub(crate) fn complete_all_mandatory(&mut self) -> Result<(), String> {
         for step in STARTUP_FIRST_STEP..=STARTUP_FINAL_STEP {
             self.complete_step(step)?;
         }
