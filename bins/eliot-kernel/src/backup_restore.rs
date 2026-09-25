@@ -84,14 +84,16 @@ use eliot_backup::{
 };
 use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreProvenance};
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_ors::RedbRecoveryStore;
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::{RevocationHistoryPayload, WriteReceipt, parse_revocation_history_payload};
 use serde::Serialize;
 
 use super::backup_restore_ports::{
     DESTINATION_ADMISSION_FILE, DestinationManifestEvidence, KernelIsolatedDestination,
-    KernelRestoreError, PinnedDestinationAdmission, RESTORE_EVIDENCE_FILE, RestorePorts,
-    check_kernel_effect_fence, require_production_admitted,
+    KernelRestoreError, OrsRestoreBinding, OrsRestoreJournal, PinnedDestinationAdmission,
+    RESTORE_EVIDENCE_FILE, RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts, check_kernel_effect_fence,
+    require_production_admitted,
 };
 
 /// Maps one accepted restore step to its responsible owner.
@@ -511,6 +513,40 @@ impl KernelBackupRestore {
     #[must_use]
     pub fn work_root(&self) -> &std::path::Path {
         &self.work_root
+    }
+
+    /// Production execution path (issue #960): runs the restore with the
+    /// composition-owned durable ORS journal as its
+    /// [`RestoreJournalPort`](eliot_backup::RestoreJournalPort).
+    ///
+    /// This is the call the composition makes, so the journal a production
+    /// restore runs on is derived here from the owner handle and the Kernel's
+    /// own live effect fence, not chosen by the caller. The writer fence the
+    /// ORS owner binds for every row is the same `ports.kernel_fence` that
+    /// [`check_kernel_effect_fence`] already admitted, so the journal can
+    /// never name a different writer authority than the effect gate accepted,
+    /// and no epoch or generation is minted here.
+    ///
+    /// [`restore`](Self::restore) stays available with its injected `J` seam
+    /// unchanged: this method is an additional production entry over the same
+    /// single phase engine, not a second engine and not a fallback.
+    pub fn restore_with_ors_journal(
+        &self,
+        ors: &std::sync::Arc<RedbRecoveryStore>,
+        bundle: &BackupBundle,
+        target: RestoreContext,
+        ports: &RestorePorts<'_>,
+        identity: &OrsRestoreBinding,
+    ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
+        let mut journal = OrsRestoreJournal::production(
+            std::sync::Arc::clone(ors),
+            ports.kernel_fence,
+            identity.clone(),
+            self.work_root
+                .join(".eliot")
+                .join(RESTORE_JOURNAL_PAYLOAD_AREA),
+        )?;
+        self.restore(bundle, target, ports, &mut journal)
     }
 
     /// Compiles the governed plan for one archive and target context.

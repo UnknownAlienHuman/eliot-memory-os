@@ -26,18 +26,26 @@
 //! [`KernelRestoreError`] vocabulary with lossless mapping to the accepted
 //! [`BackupError`](eliot_backup::BackupError) seam.
 //!
-//! What this file deliberately does NOT own: any journal implementation.
-//! There is no in-memory, filesystem-JSON, or no-op journal here. The durable
-//! journal is always an injected `J: RestoreJournalPort` supplied by
-//! production composition (the admitted persistent owner is #957's ORS
-//! journal, bound by the #962 composition turn through the accepted
-//! [`RestoreJournalAdmission`](eliot_backup::RestoreJournalAdmission)).
-//! The coordinator ([`KernelBackupRestore`](super::backup_restore::KernelBackupRestore),
-//! registered by the #959 turn) takes the journal as a required parameter
-//! with no `Default` and no fallback constructor, so production cannot
-//! introduce a substitute by construction: an unadmitted or fixture-flagged
-//! admission refuses effects ([`JournalNotAdmitted`](KernelRestoreError::JournalNotAdmitted))
-//! instead of standing in for durability.
+//! What this file deliberately does NOT own: a journal implementation. There
+//! is no in-memory, filesystem-JSON, or no-op journal here. It owns only the
+//! **adapter** onto the one admitted persistent owner: [`OrsRestoreJournal`]
+//! maps the accepted `load`/`compare_and_swap` seam onto #957's durable ORS
+//! restore journal ([`RedbRecoveryStore`]) and owns no ORS row meaning, no
+//! second database, and no journal state machine. The coordinator
+//! ([`KernelBackupRestore`](super::backup_restore::KernelBackupRestore),
+//! registered by the #959 turn) still takes the journal as a required
+//! parameter with no `Default` and no fallback constructor, so production
+//! cannot introduce a substitute by construction: an unadmitted or
+//! fixture-flagged admission refuses effects
+//! ([`JournalNotAdmitted`](KernelRestoreError::JournalNotAdmitted)) instead of
+//! standing in for durability.
+//!
+//! The adapter is the seam #960 contributes and #957 depends on. `eliot-ors`
+//! must not depend on `eliot-backup` (the ORS-to-backup edge is forbidden), so
+//! `impl RestoreJournalPort for RedbRecoveryStore` cannot live in `eliot-ors`.
+//! `eliot-kernel` depends on both owners, so the mapping lives here, in the
+//! file the issue scopes to "minimal adapters to the accepted
+//! RestoreTarget/RestoreJournalPort only".
 //!
 //! Capability cell: Kernel restore ownership (journal admission, isolated
 //! destination admission, effect-fence gating). Read through the restore
@@ -46,10 +54,24 @@
 //! backup phase rules, no epoch minting, no cutover, no activation/retirement
 //! of any installation, no in-memory/no-op journal substitute in any path.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use eliot_backup::{BackupBundle, BackupError, RestoreJournalAdmission};
-use eliot_contracts::StateFence;
+use eliot_backup::{
+    BackupBundle, BackupError, RestoreJournalAdmission, RestoreJournalPort, RestoreJournalRecord,
+    RestoreJournalState,
+};
+use eliot_contracts::{StateFence, sha256_hex};
+use eliot_ors::{
+    EpochIdentity, EpochLineage, JournalPredecessor, MAX_JOURNAL_PAGE_ENTRIES,
+    MAX_JOURNAL_PAYLOAD_BYTES, MAX_JOURNAL_STREAM_KEY_BYTES, OpaqueLabel, OrsError,
+    RESTORE_JOURNAL_RECORD_SCHEMA, RecoveryAccessClass, RecoveryEnvelopeContext,
+    RecoveryPayloadEnvelope, RedbRecoveryStore, RestoreJournalArchiveClass,
+    RestoreJournalOperation, RestoreJournalResult, RestoreJournalStreamBinding, StateFenceSnapshot,
+};
+use eliot_platform::PlatformHandle;
+use eliot_security_contracts::PrivacyClass;
 
 /// Stable identity of the restore-journal stream namespace for admission
 /// bindings. Composition must place this identity in the admission it issues
@@ -62,6 +84,13 @@ pub const RESTORE_JOURNAL_IDENTITY: &str = "kernel-restore-journal-v1";
 pub const RESTORE_JOURNAL_OWNER_LABEL: &str = "kernel-operational-ors";
 /// Isolated-restore area below `<work_root>/.eliot`.
 pub const RESTORE_ISOLATED_AREA: &str = "restore-isolated";
+/// Content-addressed sealed journal-payload area below `<work_root>/.eliot`.
+///
+/// The ORS journal rows carry a locator into this area rather than the
+/// journaled record body. ORS deliberately does not fetch or hash a locator
+/// target, so [`OrsRestoreJournal`] verifies the declared length and SHA-256
+/// on every read before the bytes are parsed.
+pub const RESTORE_JOURNAL_PAYLOAD_AREA: &str = "restore-journal-payloads";
 /// File name of the pinned destination admission inside the isolated root.
 pub const DESTINATION_ADMISSION_FILE: &str = "destination-admission.json";
 /// File name of the finalized restore evidence inside the isolated root.
@@ -479,4 +508,656 @@ pub struct PinnedDestinationAdmission {
     pub target_id: String,
     /// Owner-approved manifest evidence pinned at prepare.
     pub evidence: DestinationManifestEvidence,
+}
+
+// ---------------------------------------------------------------------------
+// Issue #960: the ORS-backed durable journal adapter.
+//
+// This is the seam issue #957 names as its blocker. `eliot-ors` must not
+// depend on `eliot-backup` (the ORS-to-backup edge is forbidden by the
+// architecture boundary audit), so `impl RestoreJournalPort` cannot live in
+// `eliot-ors`. `eliot-kernel` depends on both owners, so the mapping lives in
+// the file issue #960 scopes to "minimal adapters to the accepted
+// RestoreTarget/RestoreJournalPort only".
+//
+// What this adapter is: a lossless translation of the two accepted seam
+// methods onto #957's durable ORS restore journal.
+//
+// What this adapter is NOT: a journal. It keeps no restore state machine, no
+// phase rules, and no in-memory substitute. The engine remains
+// `RestorePlan::execute_with_journal`; the durability remains the ORS
+// `RedbRecoveryStore` that production composition already owns.
+// ---------------------------------------------------------------------------
+
+/// Owner-derived identity of one ORS restore-journal stream family.
+///
+/// Every field is an exact owner fact taken from live composition. The adapter
+/// never derives, defaults, or guesses any of them, and a blank or malformed
+/// value refuses at construction instead of being replaced with a placeholder.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrsRestoreBinding {
+    /// Exact source archive identity under restore.
+    pub source_archive_id: String,
+    /// Exact archive class of that source. A class is never silently changed
+    /// to make an effect admissible.
+    pub archive_class: RestoreJournalArchiveClass,
+    /// Exact isolated destination identity (owner-issued by #958).
+    pub destination_ref: String,
+    /// Exact Kernel writer identity that owns the stream.
+    pub writer_id: String,
+}
+
+impl OrsRestoreBinding {
+    fn stream_binding(
+        &self,
+        transaction_id: &str,
+        writer_fence_digest: &str,
+    ) -> RestoreJournalStreamBinding {
+        RestoreJournalStreamBinding {
+            transaction_id: transaction_id.to_owned(),
+            source_archive_id: self.source_archive_id.clone(),
+            archive_class: self.archive_class,
+            destination_ref: self.destination_ref.clone(),
+            writer_id: self.writer_id.clone(),
+            writer_fence_digest: writer_fence_digest.to_owned(),
+        }
+    }
+}
+
+/// Adapter from the accepted [`RestoreJournalPort`] seam onto the durable ORS
+/// restore journal owned by production composition (#957).
+///
+/// ## Lossless mapping
+///
+/// One eliot-backup `compare_and_swap` is one immutable ORS *append*; nothing
+/// is ever mutated in place. The ORS stream is the eliot-backup `journal_key`,
+/// so every stream row is bound to the exact source archive, archive class,
+/// destination, writer identity and writer fence through
+/// [`RestoreJournalStreamBinding`], and every row is chained to its exact
+/// durable predecessor through `expected_predecessor`.
+///
+/// The ORS phase slot is `(stream, transaction, phase_operation)`, and
+/// `phase_operation` is derived from the record's own revision and phase
+/// digest. Every compare-and-swap therefore owns a distinct slot, so a resumed
+/// transaction re-drives the same revisions and lands on the same slots, where
+/// the ORS owner recognises the exact replay instead of appending twice.
+///
+/// A CAS whose state is terminal for its slot (`ReceiptPersisted`, `Completed`,
+/// `RollbackRequired`) additionally appends the ORS *result* row for that same
+/// slot, so the post-effect receipt is a first-class durable owner row rather
+/// than an inferred fact.
+///
+/// ## Payload medium
+///
+/// The journaled record is sealed as an `ImmutableLocator` envelope whose
+/// locator names one content-addressed file under the Kernel-owned payload
+/// root. The ORS owner deliberately does not fetch or hash a locator target,
+/// so this adapter verifies the declared length and SHA-256 on every read
+/// before the bytes are parsed. A record is journal state, not plaintext key
+/// material, and no key or secret provider is invented for it.
+///
+/// ## Bounded work
+///
+/// Reads are bounded by the ORS page ceiling. A stream that outgrows one page
+/// fails closed through the owner rather than being silently truncated, so a
+/// restore never resumes from a partial view of its own history.
+pub struct OrsRestoreJournal {
+    store: Arc<RedbRecoveryStore>,
+    binding: OrsRestoreBinding,
+    writer_fence_digest: String,
+    epoch: EpochIdentity,
+    fence_snapshot: StateFenceSnapshot,
+    sealed_root: PathBuf,
+    heads: BTreeMap<String, JournalPredecessor>,
+}
+
+impl OrsRestoreJournal {
+    /// Binds the adapter to the composition-owned durable ORS owner.
+    ///
+    /// The writer fence and the authority epoch are taken from the Kernel's
+    /// own live effect fence, never from the journaled record: a caller cannot
+    /// name its own writer authority. The `sealed_root` is the Kernel-owned
+    /// payload root under the work root.
+    pub fn production(
+        store: Arc<RedbRecoveryStore>,
+        kernel_fence: &StateFence,
+        binding: OrsRestoreBinding,
+        sealed_root: PathBuf,
+    ) -> Result<Self, KernelRestoreError> {
+        for (value, field) in [
+            (
+                binding.source_archive_id.as_str(),
+                "restore.journal.source_archive_id",
+            ),
+            (
+                binding.destination_ref.as_str(),
+                "restore.journal.destination_ref",
+            ),
+            (binding.writer_id.as_str(), "restore.journal.writer_id"),
+        ] {
+            non_blank(value, field)?;
+        }
+        if !sealed_root.is_absolute() {
+            return Err(KernelRestoreError::InvalidInput {
+                field: "restore.journal.sealed_root",
+                reason: "the sealed payload root must be absolute",
+            });
+        }
+        let sequence = kernel_fence.authority_epoch.sequence.get();
+        let epoch = EpochIdentity {
+            lineage_id: OpaqueLabel::new(kernel_fence.authority_epoch.lineage_id.as_str())
+                .map_err(|error| KernelRestoreError::OwnerEvidenceInvalid(error.to_string()))?,
+            epoch: sequence,
+        };
+        // The captured snapshot's own digest is the exact writer fence digest
+        // the ORS owner binds: the envelope fence and the operation fence are
+        // then the same value by construction, not by agreement.
+        let fence_snapshot = StateFenceSnapshot::capture(kernel_fence, sequence)
+            .map_err(|error| KernelRestoreError::FenceMismatch(error.to_string()))?;
+        Ok(Self {
+            store,
+            binding,
+            writer_fence_digest: fence_snapshot.sha256.clone(),
+            epoch,
+            fence_snapshot,
+            sealed_root,
+            heads: BTreeMap::new(),
+        })
+    }
+
+    /// Returns the exact writer fence digest the ORS owner binds for every row.
+    #[must_use]
+    pub fn writer_fence_digest(&self) -> &str {
+        &self.writer_fence_digest
+    }
+
+    /// Returns the Kernel-owned content-addressed payload root.
+    #[must_use]
+    pub fn sealed_root(&self) -> &Path {
+        &self.sealed_root
+    }
+
+    /// Ensures the stream carries the exact immutable owner binding.
+    ///
+    /// A stream already bound to another transaction, source, class,
+    /// destination, writer or fence is left bound: the ORS owner refuses the
+    /// rebind, and the old transaction never continues under new authority.
+    fn ensure_bound(&self, stream: &str, transaction_id: &str) -> Result<(), BackupError> {
+        let binding = self
+            .binding
+            .stream_binding(transaction_id, &self.writer_fence_digest);
+        match self.store.load_restore_journal_binding(stream) {
+            Ok(Some(existing)) if existing == binding => Ok(()),
+            Ok(Some(_)) => Err(BackupError::RestoreJournalMismatch),
+            Ok(None) => self
+                .store
+                .bind_restore_journal_stream(stream, &binding)
+                .map_err(ors_to_backup),
+            Err(error) => Err(ors_to_backup(error)),
+        }
+    }
+
+    /// Reads the newest durably appended record and the durable head of one
+    /// stream.
+    ///
+    /// The head is **derived from the retained rows**, not from the
+    /// `load_restore_journal_readback` fence argument: the ORS owner only
+    /// installs that fence when a prune retired a phase slot, so a normal
+    /// stream that already holds rows still reports no fence. Trusting it as
+    /// "the head" would read a populated journal as empty and restart a
+    /// committed restore from revision zero.
+    ///
+    /// A pruned stream is refused outright. Its retained page is a suffix, not
+    /// a complete history, so its newest row is not provably the journal head
+    /// and resuming from it would re-drive phases that already completed.
+    /// Refusing keeps the ceiling honest: the member denominator and
+    /// complete-restore proof are #949's contract, not something this adapter
+    /// may assume.
+    fn read_state(
+        &mut self,
+        stream: &str,
+    ) -> Result<(Option<RestoreJournalRecord>, Option<JournalPredecessor>), BackupError> {
+        let (entries, fence_head) = self
+            .store
+            .load_restore_journal_readback(stream, MAX_JOURNAL_PAGE_ENTRIES)
+            .map_err(ors_to_backup)?;
+        let latest = entries.iter().max_by_key(|entry| entry.sequence);
+        if fence_head.is_some() {
+            return Err(BackupError::IntegrityMismatch {
+                subject: "restore journal retained suffix is not a complete history".to_owned(),
+            });
+        }
+        let Some(latest) = latest else {
+            return Ok((None, None));
+        };
+        // The head digest is the owner's canonical digest of exactly this row,
+        // so a row that does not hash to its own head is corruption rather
+        // than a resume point.
+        let digest = sha256_hex(
+            serde_json::to_string(latest)
+                .map_err(|error| BackupError::Serialization(error.to_string()))?
+                .as_bytes(),
+        );
+        let head = JournalPredecessor {
+            sequence: latest.sequence,
+            digest,
+        };
+        self.heads.insert(stream.to_owned(), head.clone());
+        let record = self.open_sealed(latest.payload.as_str())?;
+        Ok((Some(record), Some(head)))
+    }
+
+    /// Returns the durable head this adapter must chain its next append to.
+    fn durable_head(&mut self, stream: &str) -> Result<Option<JournalPredecessor>, BackupError> {
+        if let Some(head) = self.heads.get(stream) {
+            return Ok(Some(head.clone()));
+        }
+        Ok(self.read_state(stream)?.1)
+    }
+
+    /// Reads the newest durably appended record for one stream.
+    fn read_record(&mut self, stream: &str) -> Result<Option<RestoreJournalRecord>, BackupError> {
+        Ok(self.read_state(stream)?.0)
+    }
+
+    /// Seals one record into the content-addressed payload root.
+    ///
+    /// Returns `(locator, sha256, length)`. The write is temp-file plus
+    /// atomic rename, so a reader never observes a partial body.
+    fn seal(&self, record: &RestoreJournalRecord) -> Result<(String, String, u64), BackupError> {
+        let bytes = serde_json::to_vec(record)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        if bytes.len() > MAX_JOURNAL_PAYLOAD_BYTES {
+            return Err(BackupError::LimitExceeded {
+                field: "restore.journal_payload",
+                limit: MAX_JOURNAL_PAYLOAD_BYTES,
+            });
+        }
+        let digest = sha256_hex(&bytes);
+        let locator = format!("{}/{}", &digest[..2], digest);
+        let path = self.sealed_path(&locator)?;
+        if !path.is_file() {
+            let parent = path.parent().ok_or(BackupError::RestoreJournalCorrupt)?;
+            std::fs::create_dir_all(parent)
+                .map_err(|error| BackupError::Target(error.to_string()))?;
+            let mut temporary = path.clone();
+            temporary.set_extension("json.partial");
+            std::fs::write(&temporary, &bytes)
+                .map_err(|error| BackupError::Target(error.to_string()))?;
+            std::fs::rename(&temporary, &path)
+                .map_err(|error| BackupError::Target(error.to_string()))?;
+        }
+        let length = u64::try_from(bytes.len()).map_err(|_| BackupError::IntegrityMismatch {
+            subject: "restore journal payload length".to_owned(),
+        })?;
+        Ok((locator, digest, length))
+    }
+
+    /// Resolves one locator inside the payload root, refusing any other shape.
+    fn sealed_path(&self, locator: &str) -> Result<PathBuf, BackupError> {
+        let mut parts = locator.split('/');
+        let (Some(shard), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+            return Err(BackupError::RestoreJournalCorrupt);
+        };
+        if shard.len() != 2 || name.len() != 64 || !is_hex64(name) {
+            return Err(BackupError::RestoreJournalCorrupt);
+        }
+        Ok(self.sealed_root.join(shard).join(format!("{name}.json")))
+    }
+
+    /// Opens a sealed record body, verifying its exact length and digest.
+    fn open_sealed(&self, envelope_json: &str) -> Result<RestoreJournalRecord, BackupError> {
+        let envelope: RecoveryPayloadEnvelope =
+            serde_json::from_str(envelope_json).map_err(|_| BackupError::RestoreJournalCorrupt)?;
+        let eliot_ors::RecoveryPayload::ImmutableLocator { locator } = &envelope.payload else {
+            return Err(BackupError::RestoreJournalCorrupt);
+        };
+        let path = self.sealed_path(locator.as_str())?;
+        let bytes = std::fs::read(&path).map_err(|error| BackupError::Target(error.to_string()))?;
+        let length = u64::try_from(bytes.len()).map_err(|_| BackupError::RestoreJournalCorrupt)?;
+        if length != envelope.payload_length || sha256_hex(&bytes) != envelope.payload_sha256 {
+            return Err(BackupError::IntegrityMismatch {
+                subject: "restore journal sealed payload".to_owned(),
+            });
+        }
+        serde_json::from_slice(&bytes).map_err(|_| BackupError::RestoreJournalCorrupt)
+    }
+
+    /// Builds the exact ORS operation identity for one compare-and-swap.
+    fn operation(
+        &self,
+        record: &RestoreJournalRecord,
+        body_digest: &str,
+        payload_handle: &str,
+        expected_predecessor: Option<JournalPredecessor>,
+    ) -> Result<RestoreJournalOperation, BackupError> {
+        Ok(RestoreJournalOperation {
+            transaction_id: record.transaction.transaction_id.clone(),
+            source_archive_id: self.binding.source_archive_id.clone(),
+            archive_class: self.binding.archive_class,
+            destination_ref: self.binding.destination_ref.clone(),
+            writer_id: self.binding.writer_id.clone(),
+            writer_fence_digest: self.writer_fence_digest.clone(),
+            record_schema: RESTORE_JOURNAL_RECORD_SCHEMA.to_owned(),
+            phase_operation: phase_operation(record)?,
+            request_digest: request_digest(record)?,
+            body_digest: body_digest.to_owned(),
+            expected_predecessor,
+            payload_handle: payload_handle.to_owned(),
+        })
+    }
+
+    /// Builds the versioned ORS payload envelope for one sealed record.
+    fn envelope(
+        &self,
+        operation: &RestoreJournalOperation,
+        stream: &str,
+        digest: &str,
+        length: u64,
+    ) -> Result<RecoveryPayloadEnvelope, BackupError> {
+        let identity = operation.identity(stream).map_err(ors_to_backup)?;
+        let context = RecoveryEnvelopeContext {
+            operation_or_checkpoint_id: OpaqueLabel::new(identity).map_err(|_error| {
+                BackupError::InvalidField {
+                    field: "restore.journal_operation_identity",
+                    reason: leak_free(),
+                }
+            })?,
+            privacy_and_visibility_class: RecoveryAccessClass {
+                privacy: PrivacyClass::Private,
+                visibility: OpaqueLabel::new(RESTORE_JOURNAL_IDENTITY).map_err(|_error| {
+                    BackupError::InvalidField {
+                        field: "restore.journal_visibility",
+                        reason: leak_free(),
+                    }
+                })?,
+            },
+            authority_epoch: EpochLineage {
+                current: self.epoch.clone(),
+                predecessor: None,
+            },
+            state_fence: self.fence_snapshot.clone(),
+            created_at_ms: 0,
+            known_at_ms: 0,
+            // An unresolved restore journal row must never expire: an expired
+            // intent is not reconcilable.
+            expires_at_ms: None,
+        };
+        let locator = PlatformHandle::new(operation.payload_handle.clone()).map_err(|_error| {
+            BackupError::InvalidField {
+                field: "restore.journal_payload_locator",
+                reason: leak_free(),
+            }
+        })?;
+        RecoveryPayloadEnvelope::immutable_locator(context, locator, digest.to_owned(), length)
+            .map_err(ors_to_backup)
+    }
+}
+
+/// Maps a typed ORS owner failure onto the accepted seam without losing its
+/// causal class.
+///
+/// Rules held here:
+///
+/// - No typed cause is flattened into an opaque code. Each ORS failure class
+///   keeps a semantically exact [`BackupError`] variant, and the ORS record
+///   type, reason or operation identity travels in the variant's own subject
+///   field rather than being discarded.
+/// - `IntegrityProblem` is subdivided by its `record_type` because the ORS
+///   owner uses one variant for four genuinely different journal refusals: a
+///   binding mismatch, a rewritten operation in an occupied phase slot, a
+///   stale expected predecessor, and index/closure corruption. Collapsing them
+///   would turn "retry against the durable head" and "this journal is
+///   unreadable" into the same answer.
+/// - ORS variants outside the journal vocabulary (supervision leases, worker
+///   replay, versioned artifacts, activation and reservation state) cannot be
+///   raised by a journal append. They are still mapped, per cause class, to a
+///   typed seam variant instead of being gathered into one catch-all, so a
+///   future ORS call that can reach them still reports a real class.
+#[allow(
+    clippy::too_many_lines,
+    reason = "an exhaustive 55-variant owner mapping stays readable as one reviewed table"
+)]
+pub fn ors_to_backup(error: OrsError) -> BackupError {
+    match error {
+        OrsError::InvalidField { field, reason } => BackupError::InvalidField { field, reason },
+        OrsError::FenceMismatch => BackupError::FenceMismatch {
+            subject: "restore journal writer fence".to_owned(),
+        },
+        OrsError::EpochMismatch => BackupError::FenceMismatch {
+            subject: "restore journal authority epoch".to_owned(),
+        },
+        OrsError::InvalidEpochLineage => BackupError::StaleRestoreLineage,
+        OrsError::PayloadIntegrityMismatch => BackupError::IntegrityMismatch {
+            subject: "restore journal payload".to_owned(),
+        },
+        OrsError::PayloadTooLarge => BackupError::LimitExceeded {
+            field: "restore.journal_payload",
+            limit: MAX_JOURNAL_PAYLOAD_BYTES,
+        },
+        OrsError::ProjectionLimitExceeded => BackupError::LimitExceeded {
+            field: "restore.journal_page",
+            limit: MAX_JOURNAL_PAGE_ENTRIES,
+        },
+        OrsError::UnsupportedContractVersion(version) => BackupError::UnsupportedFormat(format!(
+            "restore journal envelope contract version {version}"
+        )),
+        OrsError::InvalidExpiry => BackupError::InvalidField {
+            field: "restore.journal_expiry",
+            reason: "an unresolved journal row must not expire",
+        },
+        OrsError::MigrationRequired { reason } => {
+            BackupError::UnsupportedFormat(format!("restore journal migration: {reason}"))
+        }
+        OrsError::Encoding(detail) => BackupError::Serialization(detail),
+        OrsError::Storage(_) => {
+            BackupError::Target("restore journal owner storage failure".to_owned())
+        }
+        OrsError::CanonicalEvidence(detail) => BackupError::Target(detail),
+        OrsError::DuplicateConflict
+        | OrsError::HostRequestIdentityConflict { .. }
+        | OrsError::ActivationResultRetentionIdentityConflict { .. }
+        | OrsError::NativeWorkerClaimIdentityConflict { .. }
+        | OrsError::WorkerReplayIdentityConflict { .. }
+        | OrsError::WorkerReplayStaleStream { .. } => BackupError::Duplicate {
+            field: "restore.journal",
+        },
+        OrsError::IntegrityProblem {
+            record_type,
+            reason,
+        } => match record_type {
+            "restore_journal_binding" | "restore_journal_operation" => {
+                BackupError::RestoreJournalMismatch
+            }
+            "restore_journal_entry" => BackupError::RestoreJournalCasConflict,
+            other => BackupError::IntegrityMismatch {
+                subject: format!("restore journal {other}: {reason}"),
+            },
+        },
+        OrsError::Contract(detail) => BackupError::Foundation(detail),
+        OrsError::AuthorityHandoffNotFresh
+        | OrsError::StaleWriterEpoch
+        | OrsError::RecoveryOwnerMismatch => BackupError::FenceMismatch {
+            subject: "restore journal writer authority".to_owned(),
+        },
+        OrsError::AuthoritySnapshotUnavailable | OrsError::RecoveryProblemRetained { .. } => {
+            BackupError::RestoreEvidenceIncomplete
+        }
+        OrsError::OrderingHeadMismatch | OrsError::ReconciliationMismatch => {
+            BackupError::ReceiptChainGap {
+                event_id: "restore journal ordering head".to_owned(),
+            }
+        }
+        OrsError::InboxIntegrityMismatch => BackupError::IntegrityMismatch {
+            subject: "restore journal inbox binding".to_owned(),
+        },
+        OrsError::UnknownReceiptCannotResolve
+        | OrsError::ReservationNotFound
+        | OrsError::PredecessorPending
+        | OrsError::StagingNotDurable(_) => BackupError::RestoreRollbackRequired,
+        OrsError::EmptyScopeSet | OrsError::DuplicateScope => {
+            BackupError::MissingRecoveryComponent("restore journal ordering scope set")
+        }
+        OrsError::InvalidCursorLimit | OrsError::InvalidSupervisionLeaseHistoryLimit => {
+            BackupError::InvalidField {
+                field: "restore.journal_page_limit",
+                reason: "must be a supported bounded page",
+            }
+        }
+        OrsError::InvalidTransition | OrsError::ScopeRecoveryRequired | OrsError::UnsafeExpiry => {
+            BackupError::RestorePhaseMismatch
+        }
+        OrsError::ActiveExecutableReplacement
+        | OrsError::IncompatibleArtifact
+        | OrsError::VersionedArtifactConflict
+        | OrsError::VersionedArtifactNotFound
+        | OrsError::VersionedArtifactNotDrained => BackupError::IntegrityMismatch {
+            subject: "restore journal versioned artifact".to_owned(),
+        },
+        OrsError::WorkerReplayAckMismatch { .. } | OrsError::WorkerReplayIncomplete { .. } => {
+            BackupError::RestoreJournalCorrupt
+        }
+        OrsError::SupervisionLeaseStaleRevision | OrsError::SupervisionLeaseTicketConflict => {
+            BackupError::FenceMismatch {
+                subject: "restore journal supervision lease".to_owned(),
+            }
+        }
+        OrsError::SupervisionLeaseBindingMismatch
+        | OrsError::SupervisionLeaseTicketNotStaged
+        | OrsError::SupervisionLeaseTicketResolved
+        | OrsError::SupervisionLeaseTicketNotExpired
+        | OrsError::SupervisionLeaseTicketExpired
+        | OrsError::SupervisionLeaseTicketAlreadyCommitted => BackupError::IntegrityMismatch {
+            subject: "restore journal supervision ticket".to_owned(),
+        },
+    }
+}
+
+/// Maps a rejected opaque label onto a static seam reason. The owner error is
+/// deliberately not interpolated: journal labels are bounded opaque identities,
+/// never free text a diagnostic should echo back.
+fn leak_free() -> &'static str {
+    "must be a bounded opaque journal label"
+}
+
+/// The ORS phase slot for one compare-and-swap: its exact revision plus its
+/// exact phase digest, so every CAS owns a distinct durable slot and an exact
+/// resume re-lands on the same one.
+///
+/// A phase that cannot be encoded is a refusal, never a fallback digest: a
+/// zeroed digest would let two different phases share one durable slot.
+fn phase_operation(record: &RestoreJournalRecord) -> Result<String, BackupError> {
+    let phase = sha256_hex(
+        serde_json::to_string(&record.phase)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?
+            .as_bytes(),
+    );
+    Ok(format!(
+        "restore-cas-revision-{:020}-{phase}",
+        record.revision
+    ))
+}
+
+/// Digest of the exact requested effect for this CAS, or of the exact
+/// phase/state advance when the record carries no intent.
+///
+/// An unencodable request is a refusal rather than the digest of empty bytes,
+/// because `request_digest` is what the ORS owner compares to detect a
+/// rewritten request in an occupied phase slot.
+fn request_digest(record: &RestoreJournalRecord) -> Result<String, BackupError> {
+    let encoded = match &record.intent {
+        Some(intent) => serde_json::to_string(intent),
+        None => serde_json::to_string(&(&record.phase, record.state)),
+    }
+    .map_err(|error| BackupError::Serialization(error.to_string()))?;
+    Ok(sha256_hex(encoded.as_bytes()))
+}
+
+impl RestoreJournalPort for OrsRestoreJournal {
+    fn load(&mut self, journal_key: &str) -> Result<Option<RestoreJournalRecord>, BackupError> {
+        if journal_key.is_empty() || journal_key.len() > MAX_JOURNAL_STREAM_KEY_BYTES {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
+        self.read_record(journal_key)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the CAS keeps the revision gate, the binding, the seal, the append and the owner readback together"
+    )]
+    fn compare_and_swap(
+        &mut self,
+        journal_key: &str,
+        expected_revision: u64,
+        next: RestoreJournalRecord,
+    ) -> Result<(), BackupError> {
+        if journal_key.is_empty() || journal_key.len() > MAX_JOURNAL_STREAM_KEY_BYTES {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
+        if next.journal_key != journal_key {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
+        let current = self.read_record(journal_key)?;
+        match (&current, expected_revision) {
+            (Some(record), expected) if record.revision != expected => {
+                return Err(BackupError::RestoreJournalCasConflict);
+            }
+            (None, expected) if expected != 0 => {
+                return Err(BackupError::RestoreJournalCasConflict);
+            }
+            _ => {}
+        }
+        // The engine only ever advances by one revision. Binding the exact
+        // advance keeps a rewritten record from being appended as if it were
+        // the next step of this transaction.
+        if next.revision != expected_revision.saturating_add(1) {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
+        self.ensure_bound(journal_key, &next.transaction.transaction_id)?;
+
+        let (locator, body_digest, length) = self.seal(&next)?;
+        let head = self.durable_head(journal_key)?;
+        let operation = self.operation(&next, &body_digest, &locator, head)?;
+        let envelope = self.envelope(&operation, journal_key, &body_digest, length)?;
+        let payload = serde_json::to_string(&envelope)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        let payload_sha256 = sha256_hex(payload.as_bytes());
+        let receipt = self
+            .store
+            .append_restore_journal_intent(journal_key, &operation, &payload_sha256, &payload)
+            .map_err(ors_to_backup)?;
+        self.store
+            .verify_restore_journal_receipt(journal_key, &receipt)
+            .map_err(ors_to_backup)?;
+        self.heads.insert(
+            journal_key.to_owned(),
+            JournalPredecessor {
+                sequence: receipt.sequence,
+                digest: receipt.record_digest.clone(),
+            },
+        );
+
+        if matches!(
+            next.state,
+            RestoreJournalState::ReceiptPersisted
+                | RestoreJournalState::Completed
+                | RestoreJournalState::RollbackRequired
+        ) {
+            let result = RestoreJournalResult {
+                transaction_id: operation.transaction_id.clone(),
+                phase_operation: operation.phase_operation.clone(),
+                intent_sequence: receipt.sequence,
+                receipt_sha256: payload_sha256.clone(),
+                receipt: payload,
+            };
+            let result_receipt = self
+                .store
+                .append_restore_journal_result(journal_key, &result)
+                .map_err(ors_to_backup)?;
+            self.store
+                .verify_restore_journal_receipt(journal_key, &result_receipt)
+                .map_err(ors_to_backup)?;
+        }
+        Ok(())
+    }
 }

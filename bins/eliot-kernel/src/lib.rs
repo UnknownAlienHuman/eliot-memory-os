@@ -78,10 +78,11 @@ pub use backup_restore::{
 };
 pub use backup_restore_ports::{
     DESTINATION_ADMISSION_FILE, DestinationManifestEvidence, KernelIsolatedDestination,
-    KernelRestoreError, MAX_DESTINATION_LABEL_LEN, PinnedDestinationAdmission,
-    RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA, RESTORE_JOURNAL_IDENTITY,
-    RESTORE_JOURNAL_OWNER_LABEL, RestorePorts, backup_to_kernel, check_kernel_effect_fence,
-    kernel_to_backup, require_production_admitted,
+    KernelRestoreError, MAX_DESTINATION_LABEL_LEN, OrsRestoreBinding, OrsRestoreJournal,
+    PinnedDestinationAdmission, RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA,
+    RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_OWNER_LABEL, RESTORE_JOURNAL_PAYLOAD_AREA,
+    RestorePorts, backup_to_kernel, check_kernel_effect_fence, kernel_to_backup, ors_to_backup,
+    require_production_admitted,
 };
 pub use blob_store_controller::{
     BLOB_INLINE_THRESHOLD_DEFAULT_BYTES, BLOB_INLINE_THRESHOLD_MAX_BYTES,
@@ -624,6 +625,29 @@ impl KernelComposition {
     #[must_use]
     pub fn backup_capture(&self) -> &KernelBackupCapture {
         &self.backup_capture
+    }
+
+    /// Runs one isolated restore on the composition-owned durable ORS journal
+    /// (issue #960).
+    ///
+    /// This is the production entry: the journal is the `RedbRecoveryStore`
+    /// this composition already opened and owns, so a caller cannot substitute
+    /// an in-memory, JSON-file or no-op journal for a production restore, and
+    /// the per-execution journal is built from that owner handle plus the
+    /// Kernel's own live effect fence.
+    ///
+    /// The owner-channel transport that reaches this entry is #962's frame
+    /// arm; until it lands, nothing dispatches here, and no placeholder call
+    /// stands in for it.
+    pub fn backup_restore_with_ors_journal(
+        &self,
+        bundle: &eliot_backup::BackupBundle,
+        target: eliot_backup::RestoreContext,
+        ports: &RestorePorts<'_>,
+        identity: &OrsRestoreBinding,
+    ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
+        self.backup_restore
+            .restore_with_ors_journal(&self.p07_ors, bundle, target, ports, identity)
     }
 }
 
