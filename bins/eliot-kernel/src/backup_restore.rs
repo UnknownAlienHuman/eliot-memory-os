@@ -274,8 +274,12 @@ pub const MAX_STAGED_OUTPUT_MEMBERS: usize = 65_536;
 /// the budget is checked before the write rather than measured after it.
 pub const MAX_STAGED_OUTPUT_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// Byte allowance for ONE file the restore owner serializes itself: a phase
-/// receipt, a phase marker, or a staged member file whose canonical form the
-/// archive does not declare a length for.
+/// receipt, a phase marker, or a staged member file this owner does not copy
+/// byte-for-byte from the archive.
+///
+/// A re-sealed blob falls in the last case: its staged length is the destination
+/// envelope, not the archive's sealed length, so this allowance is also the
+/// headroom that keeps a legitimate re-seal from tripping the byte bound.
 pub const MAX_STAGED_RECEIPT_BYTES: usize = 64 * 1024;
 /// Byte allowance for the finalize evidence document, which is assembled by
 /// this owner from the plan and the archive rather than copied from either.
@@ -322,9 +326,21 @@ fn archive_member_count(bundle: &BackupBundle) -> usize {
 ///
 /// Measured, never guessed: a blob's sealed envelope length, a canonical
 /// record's canonical payload length, a receipt's canonical length, the purge
-/// ledger's canonical length, and the ORS snapshot's canonical length. Each
-/// is the same value the corresponding phase serializes into the destination,
-/// so the derived ceiling cannot understate a legitimate restore.
+/// ledger's canonical length, and the ORS snapshot's canonical length.
+///
+/// NOT every one of these is byte-identical to what lands in the destination.
+/// A canonical record, a receipt, the purge ledger and the ORS snapshot are
+/// serialized by this owner as canonical JSON, so their lengths are exact. A
+/// blob is NOT: [`KernelRestoreTarget::apply_blob`] stages
+/// `restored.resealed_bytes`, the envelope re-sealed for the destination scope
+/// and key manifest, whose length is decided by that owner call and not by
+/// `blob.sealed_bytes`. The difference is envelope metadata (destination scope
+/// identity, key identity, nonce, authentication tag) and is per blob, not per
+/// byte, which is why the derived ceiling covers it with a named per-staged-file
+/// allowance rather than by claiming the two lengths are equal. Anyone tightening
+/// [`MAX_STAGED_RECEIPT_BYTES`] must re-check that allowance still covers a
+/// destination re-seal, or a legitimate large restore starts being refused
+/// mid-flight.
 fn staged_member_bytes(bundle: &BackupBundle) -> Result<usize, BackupError> {
     let canonical = |value: &serde_json::Value| -> Result<usize, BackupError> {
         canonical_json_bytes(value)
@@ -366,10 +382,16 @@ fn staged_member_bytes(bundle: &BackupBundle) -> Result<usize, BackupError> {
 /// - the byte ceiling is the archive's declared member bytes plus a named
 ///   per-file allowance for the receipts and markers this owner serializes
 ///   and a named allowance for the finalize evidence, capped by
-///   [`MAX_STAGED_OUTPUT_BYTES`].
+///   [`MAX_STAGED_OUTPUT_BYTES`]. The same per-file allowance is what covers the
+///   destination re-seal of each blob, whose staged length is not the declared
+///   sealed length (see [`staged_member_bytes`]).
 ///
 /// So a restore that fits its archive never meets the bound, and one that does
-/// not is refused BEFORE the exceeding write instead of after it.
+/// not is refused BEFORE the exceeding write instead of after it. The only
+/// archive that can meet the byte bound is one whose declared members plus this
+/// owner's own output exceed [`MAX_STAGED_OUTPUT_BYTES`]; that refusal is
+/// deliberate, and the failure path removes what this execution staged rather
+/// than leaving a half-written destination behind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StagedOutputBudget {
     members: usize,
