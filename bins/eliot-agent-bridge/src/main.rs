@@ -144,6 +144,25 @@ enum Request {
         authority_epoch: EpochId,
         fence_nonce: String,
     },
+    /// Closed host-facing transport release carrying bearer claims only.
+    ///
+    /// Validates the exact live attach like [`Request::Reconnect`] and then
+    /// answers with a typed acknowledgement instead of replacing anything:
+    /// no connection is minted, no session is terminated, no authority is
+    /// minted, widened, or revived, and the kernel transport is untouched.
+    /// `session_id`, `activation_generation`, `authority_epoch`, and
+    /// `fence_nonce` are bearer claims compared against the live activation
+    /// binding, and any mismatch fails closed with typed `DETACH_*` errors.
+    /// A match releases only the host-facing transport correlation for
+    /// `expected_connection_id`; the durable session persists kernel-side
+    /// and a replacement connection still requires a new admission.
+    Detach {
+        expected_connection_id: ConnectionId,
+        session_id: String,
+        activation_generation: u64,
+        authority_epoch: EpochId,
+        fence_nonce: String,
+    },
     Status,
     Stop,
 }
@@ -163,7 +182,7 @@ enum Response {
         activation_port: &'static str,
         host_request_port: &'static str,
         observation_forwarding_port: &'static str,
-        recovery: &'static str,
+        recovery: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reactive: Option<ReactiveStatusView>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,6 +196,22 @@ enum Response {
     },
     Reconnected {
         previous_connection_id: String,
+        connection_id: String,
+        session_id: String,
+        activation_generation: u64,
+        authority_epoch: EpochId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
+    },
+    /// Typed acknowledgement of one host-facing transport release.
+    ///
+    /// Carries only owner-derived echoes of the live activation binding the
+    /// bearer claims matched: no new connection, session, generation, epoch,
+    /// or fence is minted here, and the durable session is not terminated.
+    /// Deliberately distinct from [`Response::Reconnected`]: reusing that
+    /// shape would imply a replacement transport was admitted, which detach
+    /// never performs.
+    Detached {
         connection_id: String,
         session_id: String,
         activation_generation: u64,
@@ -615,6 +650,20 @@ fn main() {
                 authority_epoch,
                 &fence_nonce,
             ),
+            Ok(Request::Detach {
+                expected_connection_id,
+                session_id,
+                activation_generation,
+                authority_epoch,
+                fence_nonce,
+            }) => handle_detach(
+                &runner,
+                &expected_connection_id,
+                &session_id,
+                activation_generation,
+                authority_epoch,
+                &fence_nonce,
+            ),
             Ok(Request::Status) => status_response(config.profile, &runner),
             Ok(Request::Stop) => handle_stop(&runner),
             Err(detail) => Response::Error {
@@ -707,6 +756,7 @@ fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
         Response::Status { bootstrap, .. }
         | Response::Attached { bootstrap }
         | Response::Reconnected { bootstrap, .. }
+        | Response::Detached { bootstrap, .. }
         | Response::Invocation { bootstrap, .. }
         | Response::Cancellation { bootstrap, .. }
         | Response::Forwarded { bootstrap, .. }
@@ -787,6 +837,80 @@ fn record_invocation_delivery(runner: &mut BridgeRunner, response: &mut Response
     }
 }
 
+/// Classifies one forward-dispatch failure into its recovery stage.
+///
+/// The stages name where the failure happened, not who owns the data:
+/// `durability` covers the durable acknowledgement and reconciliation
+/// gates, `normalization` covers contract, identity, and projection-shape
+/// rejections, and `application` covers admission, authority, and provider
+/// dispatch itself. Receipt failures never reach this classifier: the
+/// reactive receipt drain reports them under `REACTIVE_RECEIPT_REJECTED`
+/// with the receipt stage named in the detail.
+fn forward_stage(error: &BridgeError) -> &'static str {
+    match error {
+        BridgeError::MissingDurableAck
+        | BridgeError::OutstandingDeliveryReconciliationRequired { .. }
+        | BridgeError::ExternalAttachReconciliationRequired
+        | BridgeError::ExternalReconciliationDenied(_) => "durability",
+        BridgeError::InvalidContract { .. }
+        | BridgeError::ProviderContract(_)
+        | BridgeError::AckIdentityMismatch
+        | BridgeError::InvalidResourceUri { .. }
+        | BridgeError::UnknownResource { .. }
+        | BridgeError::ResourceDigestMismatch
+        | BridgeError::ResourceImmutableConflict
+        | BridgeError::ResourceRegistryFull { .. }
+        | BridgeError::ResourceTooLarge { .. }
+        | BridgeError::IncompleteDelivery { .. }
+        | BridgeError::UnmeasuredTokens { .. }
+        | BridgeError::Skill(_) => "normalization",
+        _ => "application",
+    }
+}
+
+/// Shapes one forward-dispatch failure with staged typed recovery.
+///
+/// Keeps the exact [`bridge_error`] code mapping and fail-closed behavior;
+/// only the detail is sharpened to name the failing stage, the durable
+/// owner (the Kernel observation route, which this bridge holds unadmitted),
+/// and the reconcile path. No ledger is built and no readiness is claimed:
+/// pending entries stay pending for explicit reconcile under their original
+/// identity.
+fn forward_dispatch_error(error: &BridgeError) -> (Response, bool) {
+    let provider_failed = is_provider_failure(error);
+    let response = match bridge_error(error) {
+        Response::Error { code, detail } => Response::Error {
+            code,
+            detail: format!(
+                "forward {} stage: {detail}; durable owner: Kernel observation route (not admitted); \
+                reconcile pending entries under their original stream, event, and sequence identity \
+                with explicit reconcile, then retry the forward",
+                forward_stage(error),
+            ),
+        },
+        other => other,
+    };
+    (response, provider_failed)
+}
+
+/// Shapes one reactive-receipt failure with staged typed recovery.
+///
+/// The forward itself already succeeded at this point: only the per-item
+/// Delivery/Injection Receipt drain failed, so the code stays
+/// `REACTIVE_RECEIPT_REJECTED` while the detail names the receipt stage,
+/// the durable owner (the Kernel observation route, which this bridge holds
+/// unadmitted), and the reconcile path. No ledger is built and no readiness
+/// is claimed.
+fn forward_receipt_error(error: &BridgeError) -> Response {
+    Response::Error {
+        code: "REACTIVE_RECEIPT_REJECTED",
+        detail: format!(
+            "reactive receipt stage: {error}; durable owner: Kernel observation route (not admitted); \
+            delivered items keep their live-session identity — reconcile explicitly, then retry the forward"
+        ),
+    }
+}
+
 /// Delivers hook-carried reactive injections through the live stdio consumer.
 ///
 /// Runs the exact ForwardHook dispatch step: forwards the owner-observed
@@ -796,10 +920,7 @@ fn record_invocation_delivery(runner: &mut BridgeRunner, response: &mut Response
 /// assessment, no minting — admitted items arrive through the transport and
 /// this consumer only carries them to the host. Returns the response with
 /// whether the failure (if any) was a provider failure for exit accounting.
-fn handle_forward_hook(
-    runner: &mut BridgeRunner,
-    event: &HostEventEnvelope,
-) -> (Response, bool) {
+fn handle_forward_hook(runner: &mut BridgeRunner, event: &HostEventEnvelope) -> (Response, bool) {
     match runner.forward_hook(event) {
         Ok(()) => match runner.deliver_reactive_pending_via_hook(event.event_id.as_str()) {
             Ok(receipts) => (
@@ -809,15 +930,9 @@ fn handle_forward_hook(
                 },
                 false,
             ),
-            Err(error) => (
-                Response::Error {
-                    code: "REACTIVE_RECEIPT_REJECTED",
-                    detail: error.to_string(),
-                },
-                false,
-            ),
+            Err(error) => (forward_receipt_error(&error), false),
         },
-        Err(error) => (bridge_error(&error), is_provider_failure(&error)),
+        Err(error) => forward_dispatch_error(&error),
     }
 }
 
@@ -840,16 +955,10 @@ fn handle_forward_event(runner: &mut BridgeRunner, event: &EventEnvelope) -> (Re
                     },
                     false,
                 ),
-                Err(error) => (
-                    Response::Error {
-                        code: "REACTIVE_RECEIPT_REJECTED",
-                        detail: error.to_string(),
-                    },
-                    false,
-                ),
+                Err(error) => (forward_receipt_error(&error), false),
             }
         }
-        Err(error) => (bridge_error(&error), is_provider_failure(&error)),
+        Err(error) => forward_dispatch_error(&error),
     }
 }
 
@@ -1109,6 +1218,93 @@ fn handle_reconnect(
     }
 }
 
+/// Validates one closed detach claim and releases the host-facing transport correlation.
+///
+/// This mirrors [`handle_reconnect`] validation without adding replacement
+/// surface: inert claims are shaped into typed authority facts *before* the
+/// runner is read, and host text is never trusted — `session_id`,
+/// `activation_generation`, `authority_epoch`, and `fence_nonce` are bearer
+/// claims compared field-for-field against the live activation binding, with
+/// any mismatch failing closed under typed `DETACH_*` errors. The session,
+/// generation, and fence stay kernel-issued and are never minted, widened,
+/// or inferred from process identity here.
+///
+/// A match releases only the host-facing transport correlation for the
+/// presented connection: the runner is deliberately not mutated (this binary
+/// owns no detach port, and mutating attach state here would invent
+/// authority), so the kernel transport is untouched, the activation one-shot
+/// guard is preserved, and cursors, replay, and ledger projections survive
+/// exactly as the owner sealed them — survival rides only on that exact
+/// owner-authorized match. The durable session is NOT terminated and
+/// authority is NOT revived: process exit drops only this process's
+/// projections while the durable record persists kernel-side, recoverable
+/// solely through the kernel-owned
+/// `AGENT_HOST_REQUEST_REHYDRATE_OPERATION` exact (envelope,
+/// admission-receipt) pair. A replacement connection requires a new
+/// admission; cached state cannot revive the prior one.
+fn handle_detach(
+    runner: &BridgeRunner,
+    expected_connection_id: &ConnectionId,
+    session_id: &str,
+    activation_generation: u64,
+    authority_epoch: EpochId,
+    fence_nonce: &str,
+) -> Response {
+    let Some(live) = runner.attach_view() else {
+        return Response::Error {
+            code: "BRIDGE_NOT_ATTACHED",
+            detail: "bridge is not attached; nothing holds a host-facing transport correlation to release"
+                .to_owned(),
+        };
+    };
+    if expected_connection_id.as_str() != live.binding().connection_id().as_str() {
+        return Response::Error {
+            code: "DETACH_STALE_CONNECTION",
+            detail: format!(
+                "detach presents stale connection `{}`; the live connection is `{}` — re-read status for the live facts and retry; wrong/stale targets fail closed",
+                expected_connection_id.as_str(),
+                live.binding().connection_id().as_str(),
+            ),
+        };
+    }
+    let Ok(session) = SessionId::new(session_id) else {
+        return Response::Error {
+            code: "DETACH_INVALID",
+            detail: "detach session_id is not a valid opaque identity; present the exact live session from status".to_owned(),
+        };
+    };
+    let Ok(generation) = Generation::new(activation_generation) else {
+        return Response::Error {
+            code: "DETACH_INVALID",
+            detail: "detach activation_generation must be non-zero; present the exact live generation from status".to_owned(),
+        };
+    };
+    let Ok(fence) = FencingToken::new(authority_epoch, generation, fence_nonce) else {
+        return Response::Error {
+            code: "DETACH_INVALID",
+            detail: "detach authority_epoch must be non-zero and fence_nonce must be a non-blank opaque value; present the exact live fence from status".to_owned(),
+        };
+    };
+    if session.as_str() != live.binding().session_id().as_str()
+        || generation.get() != live.binding().activation_generation().get()
+        || !fence.matches(live.binding().state_fence())
+    {
+        return Response::Error {
+            code: "DETACH_STALE_AUTHORITY",
+            detail: format!(
+                "detach session, generation, or fence does not match the live attach; the host-facing correlation is not released. The durable session persists kernel-side and recovers solely through the kernel-owned `{AGENT_HOST_REQUEST_REHYDRATE_OPERATION}` exact (envelope, admission-receipt) pair; a replacement connection requires a new admission and cached state cannot revive the prior one"
+            ),
+        };
+    }
+    Response::Detached {
+        connection_id: live.binding().connection_id().as_str().to_owned(),
+        session_id: live.binding().session_id().as_str().to_owned(),
+        activation_generation: live.binding().activation_generation().get(),
+        authority_epoch: live.binding().state_fence().authority_epoch().clone(),
+        bootstrap: None,
+    }
+}
+
 /// Builds the terminal Stop response with bounded drain accounting.
 ///
 /// Snapshots the exact core-retained outstanding deliveries without
@@ -1165,8 +1361,10 @@ fn handle_stop(runner: &BridgeRunner) -> Response {
 /// Pre-activation reports `not-attached` with no liveness text; post-activation
 /// reports the admitted-session facts but never a probe-backed readiness claim —
 /// dispatch still traverses the live admitted transport per operation, and
-/// staleness surfaces as typed `RECONNECT_*` failures pointing back at this
-/// status and the reconnect operation.
+/// staleness surfaces as typed `RECONNECT_*`/`DETACH_*` failures pointing back
+/// at this status, the reconnect/detach operations, and the kernel-owned
+/// `AGENT_HOST_REQUEST_REHYDRATE_OPERATION` exact (envelope, admission-receipt)
+/// pair path. A replacement connection always requires a new admission.
 fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
     match runner.attach_view() {
         None => Response::Status {
@@ -1181,7 +1379,12 @@ fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
             activation_port: "not-attached",
             host_request_port: "no-session: attach and activate before host-request dispatch",
             observation_forwarding_port: "unavailable: Kernel observation route not admitted",
-            recovery: "attach and activate before host requests; reconnect requires a live attach",
+            recovery: format!(
+                "attach and activate before host requests; reconnect requires a live attach; \
+                one exact operation recovers only through the kernel-owned \
+                `{AGENT_HOST_REQUEST_REHYDRATE_OPERATION}` exact (envelope, admission-receipt) pair, \
+                and a replacement connection requires a new admission"
+            ),
             reactive: None,
             bootstrap: None,
             resources: None,
@@ -1198,7 +1401,12 @@ fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
             activation_port: "attached",
             host_request_port: "session-bound: dispatch joins the admitted Kernel session",
             observation_forwarding_port: "unavailable: Kernel observation route not admitted",
-            recovery: "reconnect with the live connection, session, generation, epoch, and fence nonce from this status; stale targets fail closed",
+            recovery: format!(
+                "reconnect with the live connection, session, generation, epoch, and fence nonce from this status; \
+                stale targets fail closed; one exact operation recovers only through the kernel-owned \
+                `{AGENT_HOST_REQUEST_REHYDRATE_OPERATION}` exact (envelope, admission-receipt) pair, \
+                and a replacement connection requires a new admission"
+            ),
             reactive: Some(reactive_status_view(runner)),
             bootstrap: None,
             resources: Some(resource_status_view(runner)),
@@ -2194,6 +2402,7 @@ mod tests {
                         Request::ForwardEvent { .. } => "forward_event",
                         Request::ReconcileExternal {} => "reconcile_external",
                         Request::Reconnect { .. } => "reconnect",
+                        Request::Detach { .. } => "detach",
                         Request::Status => "status",
                         Request::Stop => "stop",
                         Request::Bootstrap { .. } => "bootstrap",
@@ -2341,8 +2550,7 @@ mod tests {
         // Main-side bounded decode dispatches known operations — including
         // the bridge-side bootstrap op through the admitted envelope shape —
         // and rejects malformed input without dispatch.
-        let decoded =
-            decode_bounded_request(r#"{"op":"status"}"#).expect("status op must decode");
+        let decoded = decode_bounded_request(r#"{"op":"status"}"#).expect("status op must decode");
         assert!(
             matches!(decoded, Request::Status),
             "status op must decode to its own request"
@@ -2365,20 +2573,16 @@ mod tests {
             "unknown operations must reject"
         );
         assert!(
-            decode_bounded_request(
-                &BOOTSTRAP_OP.replace(
-                    "\"requested_assessment\":\"READY\"",
-                    "\"requested_assessment\":\"READY\",\"extra\":1"
-                )
-            )
+            decode_bounded_request(&BOOTSTRAP_OP.replace(
+                "\"requested_assessment\":\"READY\"",
+                "\"requested_assessment\":\"READY\",\"extra\":1"
+            ))
             .is_err(),
             "extra envelope members must reject"
         );
         assert!(
-            decode_bounded_request(
-                &BOOTSTRAP_OP.replace("source-gen-9", &"g".repeat(600_000))
-            )
-            .is_err(),
+            decode_bounded_request(&BOOTSTRAP_OP.replace("source-gen-9", &"g".repeat(600_000)))
+                .is_err(),
             "oversized records must reject"
         );
         // Bridge-side bootstrap injection: the first successful response
@@ -2386,8 +2590,7 @@ mod tests {
         // evidence; the second carries none, while explicit retrieval
         // stays available (including via the admitted stdio op above).
         let mut runner = fixture_runner();
-        let context: BootstrapContext =
-            serde_json::from_str(BOOTSTRAP_CONTEXT_JSON).unwrap();
+        let context: BootstrapContext = serde_json::from_str(BOOTSTRAP_CONTEXT_JSON).unwrap();
         runner
             .note_bootstrap_context(context)
             .expect("valid context must note");
@@ -2435,12 +2638,9 @@ mod tests {
     /// stubbed trusted port standing in for the Kernel boundary, exactly as the
     /// `UnavailableKernelHostRequestPort` placeholder does for rejections.
     mod tool_result_delivery_tests {
-        use super::super::{
-            BridgeRunner, Profile, record_invocation_delivery, status_response,
-        };
+        use super::super::{BridgeRunner, Profile, record_invocation_delivery, status_response};
         use super::{
-            HostInvocationRequest, PortFailure, decode_bounded_request,
-            handle_invocation,
+            HostInvocationRequest, PortFailure, decode_bounded_request, handle_invocation,
         };
         use eliot_agent_bridge_core::{
             ActivationPortOutcome, ActivationPortResult, AttachRequest, DemandId, FencingToken,
@@ -2456,8 +2656,7 @@ mod tests {
         use std::num::NonZeroU64;
 
         const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
-        const DIGEST_A: &str =
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
         struct StaticActivation {
             result: ActivationPortResult,
@@ -2718,17 +2917,16 @@ mod tests {
             BridgeRunner, Profile, RiskTier, SettledPlanAdmission, governor_assess,
         };
         use eliot_agent_bridge_core::{
-            ActivationPortOutcome, ActivationPortResult, AttachBinding, AttachRequest,
-            CoverageGap, DemandId, EventEnvelope, EventPortOutcome, FencingToken, Generation,
-            HostActivationPort, HostEventEnvelope, McpForwardingPort, PrincipalId,
-            ProviderFailure, ProviderReadiness, ReconciliationPortOutcome, SessionId, TaskId,
-            WorkUnitId,
+            ActivationPortOutcome, ActivationPortResult, AttachBinding, AttachRequest, CoverageGap,
+            DemandId, EventEnvelope, EventPortOutcome, FencingToken, Generation,
+            HostActivationPort, HostEventEnvelope, McpForwardingPort, PrincipalId, ProviderFailure,
+            ProviderReadiness, ReconciliationPortOutcome, SessionId, TaskId, WorkUnitId,
         };
         use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
         use eliot_integration_coverage::{
             ALL_EVENTS, DispatchOrdering, EventCompleteness, EventCoverage, EventDisposition,
-            GovernorCoverageDerivation, IntegrationCoverageProfile, LogicalEvent,
-            TraceFreshness, WatchdogEvidence,
+            GovernorCoverageDerivation, IntegrationCoverageProfile, LogicalEvent, TraceFreshness,
+            WatchdogEvidence,
         };
         use eliot_reactive_context_plan::{
             BridgeAdmissionBatch, BridgeAdmissionDelivery, BridgeAdmissionInstruction,
@@ -2831,8 +3029,7 @@ mod tests {
             runner
                 .attach(AttachRequest::managed(
                     DemandId::new("demand-consumer-1").expect("valid demand"),
-                    super::super::ConnectionId::new("conn-consumer-1")
-                        .expect("valid connection"),
+                    super::super::ConnectionId::new("conn-consumer-1").expect("valid connection"),
                 ))
                 .expect("managed attach admits");
             runner
@@ -2938,8 +3135,7 @@ mod tests {
 
         fn batch(item_id: &str) -> BridgeAdmissionBatch {
             BridgeAdmissionBatch {
-                session_id: eliot_contracts::SessionId::new(TEST_SESSION)
-                    .expect("valid session"),
+                session_id: eliot_contracts::SessionId::new(TEST_SESSION).expect("valid session"),
                 scope_id: eliot_receipts::WorkScopeId::new("scope-consumer-1")
                     .expect("valid scope"),
                 invalidations: Vec::new(),
@@ -2979,10 +3175,7 @@ mod tests {
             let receipt = &reactive_receipts[0];
             assert_eq!(receipt.session_id, TEST_SESSION);
             assert_eq!(receipt.admission.risk, RiskTier::Severe);
-            assert_eq!(
-                receipt.admission.fence_epoch,
-                format!("{TEST_LINEAGE}:3")
-            );
+            assert_eq!(receipt.admission.fence_epoch, format!("{TEST_LINEAGE}:3"));
             assert_eq!(receipt.admission.fence_generation, 7);
             assert_eq!(runner.reactive_pending_count(), 0);
             // The receipt rides the wire frame with the Governor tier.
