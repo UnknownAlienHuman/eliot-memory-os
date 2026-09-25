@@ -11,6 +11,7 @@ pub enum HealthStatus {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ComponentHealth {
     pub component: String,
     pub status: HealthStatus,
@@ -18,6 +19,7 @@ pub struct ComponentHealth {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StartupHealthReport {
     pub schema_version: String,
     pub service_name: String,

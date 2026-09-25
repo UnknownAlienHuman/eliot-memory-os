@@ -46,6 +46,7 @@ impl ServiceHealthState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     pub mode: RuntimeMode,
     pub data_root: String,
@@ -56,6 +57,7 @@ pub struct RuntimeConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeLoggingConfig {
     pub format: String,
     pub level: String,
@@ -64,6 +66,7 @@ pub struct RuntimeLoggingConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeIpcConfig {
     pub enabled: bool,
     pub bind: String,
@@ -71,12 +74,14 @@ pub struct RuntimeIpcConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeModulesConfig {
     pub enabled: bool,
     pub manifest_dir: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeLocalConfig {
     pub runtime: RuntimeConfig,
     pub logging: RuntimeLoggingConfig,
@@ -85,6 +90,7 @@ pub struct RuntimeLocalConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceRuntimeStatus {
     pub service_name: String,
     pub health: ServiceHealthState,
@@ -94,6 +100,7 @@ pub struct ServiceRuntimeStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeHealthReport {
     pub component: String,
     pub mode: RuntimeMode,
@@ -105,6 +112,7 @@ pub struct RuntimeHealthReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SchemaRef {
     pub schema_id: String,
     pub version: String,
@@ -196,6 +204,7 @@ pub enum EndpointDirection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModuleEndpoint {
     pub endpoint_id: String,
     pub name: String,
@@ -205,7 +214,11 @@ pub struct ModuleEndpoint {
     pub requires_ack: bool,
 }
 
+// `Default` here is the application-level empty authority profile used when a
+// caller builds one in code. It is not a Serde default: the wire form still
+// requires every field, so a missing authority field can never decode.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModuleAuthorityProfile {
     pub allowed_projects: Vec<ProjectId>,
     pub allowed_roles: Vec<AgentRole>,
@@ -215,7 +228,10 @@ pub struct ModuleAuthorityProfile {
     pub can_finish_task: bool,
 }
 
+// `Default` below is the application-level resource limit set. The wire form
+// requires every field, so a missing limit can never be defaulted on decode.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModuleResourceLimits {
     pub max_runtime_seconds: u64,
     pub max_payload_bytes: usize,
@@ -237,6 +253,7 @@ impl Default for ModuleResourceLimits {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModuleManifest {
     pub module_id: ModuleId,
     pub name: String,
@@ -254,6 +271,7 @@ pub struct ModuleManifest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModuleHealth {
     pub module_id: ModuleId,
     pub name: String,
@@ -263,6 +281,7 @@ pub struct ModuleHealth {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModuleRegistryReport {
     pub component: String,
     pub modules: Vec<ModuleHealth>,
@@ -273,6 +292,7 @@ pub struct ModuleRegistryReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EliotExchangeEnvelope<T> {
     pub envelope_id: String,
     pub schema_version: String,
@@ -314,6 +334,7 @@ pub enum ExchangeKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CausalityHeader {
     pub trace_id: String,
     pub parent_envelope_id: Option<String>,
@@ -323,6 +344,7 @@ pub struct CausalityHeader {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityHeader {
     pub role: Option<AgentRole>,
     pub capabilities: Vec<ModuleCapability>,
@@ -362,6 +384,7 @@ pub enum LogEventKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RedactionInfo {
     pub secrets_redacted: bool,
     pub raw_payload_redacted: bool,
@@ -369,6 +392,7 @@ pub struct RedactionInfo {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EliotLogEvent {
     pub timestamp: OffsetDateTime,
     pub level: LogLevel,
@@ -390,6 +414,7 @@ pub struct EliotLogEvent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeLogReport {
     pub component: String,
     pub log_path: String,
