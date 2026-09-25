@@ -125,6 +125,10 @@ pub enum ReadConsistencyMode {
     AtLeastRevision,
 }
 
+/// Decoder: derived `#[serde(tag = "kind")]` dispatch over newtype variants.
+/// An unknown or repeated `kind`, a repeated payload key, and a payload key
+/// outside the selected variant are refused before a typed command is
+/// returned; every variant payload struct carries `deny_unknown_fields`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 // Commands are serialized at the single-writer boundary. Boxing the largest
@@ -202,7 +206,9 @@ pub enum TaskAcceptanceEvidenceKind {
     Verification,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskAcceptanceItem {
     pub item_id: String,
     pub description: String,
@@ -214,7 +220,9 @@ pub struct TaskAcceptanceItem {
     pub verification_scope_hash: Option<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionSourceScope {
     pub kind: String,
     pub worktree_ref: Option<PathRef>,
@@ -232,6 +240,9 @@ pub struct ActionSourceScope {
 /// the named memory was durably delivered to the authenticated session before
 /// the action request and that the agent cited it for that action. It does not
 /// by itself prove that the memory changed the agent's decision.
+///
+/// Decoder: preserved `deny_unknown_fields` closure. Unknown member keys are
+/// refused; the derived map reader refuses a repeated key before insertion.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActionMemoryDeliveryRef {
@@ -272,6 +283,9 @@ pub const ACTION_MEMORY_GRANT_REDEMPTION_SCHEMA_VERSION: &str =
 /// This is a transport acknowledgement plus an agent-declared use binding. It
 /// does not reveal an exact memory handle and does not claim that the offered
 /// guidance causally changed the action.
+///
+/// Decoder: preserved `deny_unknown_fields` closure. Unknown member keys are
+/// refused; the derived map reader refuses a repeated key before insertion.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActionMemoryGrantRef {
@@ -300,6 +314,9 @@ pub struct ActionMemoryGrantRef {
 /// `ActionRequest` that consumed the grant. It therefore proves a durable
 /// offer-return-to-action binding without claiming that the memory changed the
 /// agent's decision.
+///
+/// Decoder: preserved `deny_unknown_fields` closure. Unknown member keys are
+/// refused; the derived map reader refuses a repeated key before insertion.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActionMemoryGrantRedemption {
@@ -329,7 +346,9 @@ pub enum ActionMemoryGrantEvidenceClass {
     AgentReturnedOpaqueGrantAfterServerOffer,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionProvenanceSet {
     pub provenance_set_id: String,
     pub task_id: TaskId,
@@ -351,13 +370,17 @@ pub struct ActionProvenanceSet {
     pub hash: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifierArtifactRef {
     pub resource_ref: String,
     pub content_hash: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifierArtifactScope {
     pub verification_id: VerificationId,
     pub verifier_id: String,
@@ -378,7 +401,9 @@ pub struct VerifierArtifactScope {
     pub canonical_scope_hash: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskContractInput {
     pub task_id: TaskId,
     pub title: String,
@@ -400,7 +425,9 @@ pub struct TaskContractInput {
     pub completion_write_id: Option<WriteId>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskContractWriteCommand {
     pub context: CommandContext,
     pub contract: TaskContractInput,
@@ -408,7 +435,9 @@ pub struct TaskContractWriteCommand {
     pub verification: Option<VerificationRunInput>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskContract {
     pub task_id: TaskId,
     pub project_id: ProjectId,
@@ -433,7 +462,9 @@ pub struct TaskContract {
     pub write_id: WriteId,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandContext {
     pub write_id: WriteId,
     pub agent_id: AgentId,
@@ -447,14 +478,18 @@ pub struct CommandContext {
     pub lifecycle_status: LifecycleStatus,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceIngestCommand {
     pub context: CommandContext,
     pub source: SourceSnapshotInput,
     pub evidence: EvidenceAtomInput,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolObservationRecordCommand {
     pub context: CommandContext,
     pub tool_name: String,
@@ -462,19 +497,25 @@ pub struct ToolObservationRecordCommand {
     pub payload: Value,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiagnosticBatchRecordCommand {
     pub context: CommandContext,
     pub diagnostics: Vec<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimProposeCommand {
     pub context: CommandContext,
     pub claim: ClaimCardInput,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimSupportCommand {
     pub context: CommandContext,
     pub claim_id: ClaimId,
@@ -483,7 +524,9 @@ pub struct ClaimSupportCommand {
     pub payload: Value,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimVerifyCommand {
     pub context: CommandContext,
     pub claim_id: ClaimId,
@@ -492,7 +535,9 @@ pub struct ClaimVerifyCommand {
     pub payload: Value,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FailureRecordCommand {
     pub context: CommandContext,
     pub fingerprint: String,
@@ -500,22 +545,32 @@ pub struct FailureRecordCommand {
     pub payload: Value,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActiveDecisionTransitionCommand {
     pub context: CommandContext,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProbeRecordCommand {
     pub context: CommandContext,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationRecordCommand {
     pub context: CommandContext,
     pub verification: VerificationRunInput,
 }
 
+/// Decoder: preserved `#[serde(tag = "outcome")]` with `deny_unknown_fields`.
+/// Unknown variants, wrong payloads, and repeated keys are refused. A trailing
+/// key beside the unit `NothingToSave` variant is ignored by the derived
+/// decoder; the variant carries no payload to poison.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CompletionMemoryRequest {
@@ -523,7 +578,9 @@ pub enum CompletionMemoryRequest {
     SaveDecision { statement: String },
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControllerCommitHandoff {
     pub child_session_id: SessionId,
     pub task_id: TaskId,
@@ -540,7 +597,9 @@ pub struct ControllerCommitHandoff {
     pub provenance_set_hash: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompletionDecisionMemory {
     pub source: SourceSnapshotInput,
     pub evidence: EvidenceAtomInput,
@@ -550,8 +609,12 @@ pub struct CompletionDecisionMemory {
     pub freshness_rule: String,
 }
 
+/// Decoder: derived `#[serde(tag = "outcome")]` with `deny_unknown_fields`.
+/// Unknown variants, wrong payloads, and repeated keys are refused. A trailing
+/// key beside the unit `NothingToSave` variant is ignored by the derived
+/// decoder; the variant carries no payload to poison.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CompletionMemoryAdmission {
     NothingToSave,
     SaveDecision {
@@ -559,36 +622,48 @@ pub enum CompletionMemoryAdmission {
     },
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentResultRecordCommand {
     pub context: CommandContext,
     pub lineage: ControllerCommitHandoff,
     pub memory: CompletionMemoryAdmission,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompletionProofSubmitCommand {
     pub context: CommandContext,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlArtifactBatchRecordCommand {
     pub context: CommandContext,
     pub artifacts: Vec<UlArtifact>,
     pub relations: Vec<RelationInput>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryWriteEnvelopeInput {
     pub command: SemanticCommand,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryWriteEnvelopeValidated {
     pub envelope: MemoryWriteEnvelope,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryWriteEnvelope {
     pub write_id: WriteId,
     pub operation_id: OperationId,
@@ -616,7 +691,9 @@ pub struct MemoryWriteEnvelope {
     pub idempotency: IdempotencyOptions,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceSnapshotInput {
     pub source_id: String,
     pub uri: String,
@@ -625,7 +702,9 @@ pub struct SourceSnapshotInput {
     pub excerpt: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceAtomInput {
     pub evidence_id: EvidenceId,
     pub source_id: String,
@@ -633,7 +712,9 @@ pub struct EvidenceAtomInput {
     pub payload: Value,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolObservationInput {
     pub observation_id: String,
     pub tool_name: String,
@@ -641,7 +722,9 @@ pub struct ToolObservationInput {
     pub payload: Value,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimCardInput {
     pub claim_id: ClaimId,
     pub statement: String,
@@ -649,7 +732,9 @@ pub struct ClaimCardInput {
     pub payload: Value,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationRunInput {
     pub verification_id: VerificationId,
     pub claim_id: Option<ClaimId>,
@@ -667,7 +752,9 @@ pub enum VerificationResult {
     Inconclusive,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RelationInput {
     pub relation_type: RelationType,
     pub from: String,
@@ -692,26 +779,34 @@ pub enum RelationType {
     CardCovers,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FailureFingerprintInput {
     pub fingerprint: String,
     pub summary: String,
     pub payload: Value,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LifecycleWriteOptions {
     pub status: LifecycleStatus,
     pub visibility: Visibility,
     pub taint: TaintClass,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IdempotencyOptions {
     pub allow_replay: bool,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WriteReceipt {
     pub receipt_id: ReceiptId,
     pub write_id: WriteId,
@@ -731,20 +826,26 @@ pub struct WriteReceipt {
     pub created_at: OffsetDateTime,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WriteReceiptRef {
     pub receipt_id: ReceiptId,
     pub write_id: WriteId,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CurrentStateRequest {
     pub project_id: ProjectId,
     pub consistency: ReadConsistencyMode,
     pub at_least_revision: Option<MemoryRevision>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CurrentStateResponse {
     pub project_id: ProjectId,
     pub memory_revision: MemoryRevision,
@@ -758,7 +859,9 @@ pub struct CurrentStateResponse {
     pub truncation: TruncationInfo,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecallL0Request {
     pub project_id: ProjectId,
     pub query: String,
@@ -776,7 +879,9 @@ pub struct RecallL0Request {
     pub concept_refs: Vec<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecallL0Response {
     pub project_id: ProjectId,
     pub at_revision: MemoryRevision,
@@ -830,7 +935,9 @@ impl MemoryConfidence {
     }
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct L0RankTrace {
     pub query: String,
     pub normalized_query: String,
@@ -845,7 +952,9 @@ pub struct L0RankTrace {
     pub query_mode: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct L0FeatureScore {
     pub handle: String,
     pub exact_identifier: i32,
@@ -886,13 +995,17 @@ pub struct L0FeatureScore {
     pub reasons: Vec<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct L0SuppressionTrace {
     pub handle: String,
     pub reason: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct L0CollapsedDuplicateTrace {
     pub authoritative_handle: String,
     pub collapsed_record_refs: Vec<String>,
@@ -1080,6 +1193,9 @@ fn validate_receipt_text(value: &str, limit: usize) -> Result<(), String> {
 ///
 /// The receipt is minted by the memory/packet response owner alongside the
 /// derived [`RecallDisposition`]; agents receive it but never author it.
+///
+/// Decoder: preserved `deny_unknown_fields` closure. Unknown member keys are
+/// refused; the derived map reader refuses a repeated key before insertion.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecallReceipt {
@@ -1146,6 +1262,9 @@ impl RecallReceipt {
 /// complete delivered rank trace, so swapping any bound fact invalidates the
 /// handle. Packet responses reuse this verdict shape with packet-side inputs;
 /// only the response owner may issue it.
+///
+/// Decoder: preserved `deny_unknown_fields` closure. Unknown member keys are
+/// refused; the derived map reader refuses a repeated key before insertion.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerRecallVerdict {
@@ -1423,7 +1542,9 @@ impl RecallL0Response {
     }
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FetchAtomsL2Request {
     pub project_id: ProjectId,
     pub handles: Vec<String>,
@@ -1433,7 +1554,9 @@ pub struct FetchAtomsL2Request {
     pub at_least_revision: Option<MemoryRevision>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FetchAtomsL2Response {
     pub project_id: ProjectId,
     pub at_revision: MemoryRevision,
@@ -1460,7 +1583,9 @@ pub struct FetchAtomsL2Response {
     pub truncation: TruncationInfo,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlMemoryArtifact {
     pub handle: String,
     pub record_type: String,
@@ -1469,7 +1594,9 @@ pub struct UlMemoryArtifact {
     pub freshness: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraphHealthResponse {
     pub project_id: ProjectId,
     pub scan_limit: u64,
@@ -1492,7 +1619,9 @@ pub struct GraphHealthResponse {
     pub latest_memory_revision_by_project: Vec<ProjectRevisionSummary>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WriterStatusResponse {
     #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
@@ -1518,7 +1647,9 @@ pub struct WriterStatusResponse {
     pub operation_status: OperationStatus,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimSummary {
     pub claim_id: ClaimId,
     pub statement: String,
@@ -1526,13 +1657,17 @@ pub struct ClaimSummary {
     pub memory_revision: MemoryRevision,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FailureSummary {
     pub fingerprint: String,
     pub summary: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryHandlePreview {
     pub handle: String,
     pub record_type: String,
@@ -1543,14 +1678,18 @@ pub struct MemoryHandlePreview {
     pub lifecycle_badge: Option<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceAtom {
     pub evidence_id: EvidenceId,
     pub summary: String,
     pub payload: Value,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimCard {
     pub claim_id: ClaimId,
     pub statement: String,
@@ -1558,7 +1697,9 @@ pub struct ClaimCard {
     pub payload: Value,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationRun {
     pub verification_id: VerificationId,
     #[serde(default)]
@@ -1578,7 +1719,9 @@ pub struct VerificationRun {
     pub payload: Value,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolObservation {
     pub observation_id: String,
     pub tool_name: String,
@@ -1588,41 +1731,58 @@ pub struct ToolObservation {
     pub write_id: Option<WriteId>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FailureFingerprint {
     pub fingerprint: String,
     pub summary: String,
     pub payload: Value,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RelationSummary {
     pub relation_type: RelationType,
     pub from: String,
     pub to: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TruncationInfo {
     pub truncated: bool,
     pub limit: usize,
     pub returned: usize,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CountByName {
     pub name: String,
     pub count: u64,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectRevisionSummary {
     pub project_id: ProjectId,
     pub memory_revision: MemoryRevision,
     pub project_sequence: ProjectSequence,
 }
 
+// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+// by `deny_unknown_fields`; repeated keys are refused while reading the raw
+// map. (Plain comment: this type derives `JsonSchema`, and a doc comment
+// would feed the published schema description. The #933-owned flattened
+// wrapper routes only declared request keys here; `max_tokens` keeps its
+// 1,800 preferred-target default.)
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompilePacketL3Request {
     pub project_id: ProjectId,
     pub task_id: String,
@@ -1642,7 +1802,9 @@ const fn default_context_packet_preferred_tokens() -> usize {
     DEFAULT_CONTEXT_PACKET_PREFERRED_TOKENS
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GovernedGitScope {
     pub project_id: ProjectId,
     pub branch: String,
@@ -1654,7 +1816,9 @@ pub struct GovernedGitScope {
     pub artifact_refs: Vec<VerifierArtifactRef>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CurrentGitScopeView {
     pub project_id: ProjectId,
     pub branch: String,
@@ -1670,7 +1834,9 @@ pub enum MemoryApplicabilityDisposition {
     SuppressedHistorical,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryProvenanceView {
     pub source_id: Option<String>,
     pub project_scope: Option<String>,
@@ -1682,7 +1848,9 @@ pub struct MemoryProvenanceView {
     pub artifact_refs: Vec<VerifierArtifactRef>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryApplicabilityDecision {
     pub memory_ref: String,
     pub disposition: MemoryApplicabilityDisposition,
@@ -1690,7 +1858,9 @@ pub struct MemoryApplicabilityDecision {
     pub reason: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryApplicabilityPacketView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_git_scope: Option<CurrentGitScopeView>,
@@ -1704,7 +1874,9 @@ pub struct MemoryApplicabilityPacketView {
     pub revalidation_reasons: Vec<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextPacketL3 {
     #[serde(default)]
     pub packet_id: String,
@@ -1766,7 +1938,9 @@ pub struct ContextPacketL3 {
     pub truncation: TruncationInfo,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CodeCortexPacketView {
     pub report_refs: Vec<String>,
     pub git_head: Option<String>,
@@ -1780,7 +1954,9 @@ pub struct CodeCortexPacketView {
     pub unknowns: Vec<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenBudgetReport {
     pub max_tokens: usize,
     pub estimated_tokens: usize,
@@ -1788,7 +1964,9 @@ pub struct TokenBudgetReport {
     pub sections_truncated: Vec<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnderstandingProof {
     pub task_id: String,
     pub project_id: ProjectId,
@@ -1826,7 +2004,9 @@ pub struct UnderstandingProof {
     pub risk_level: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnderstandingProofReceipt {
     pub task_id: String,
     pub project_id: ProjectId,
@@ -1843,7 +2023,9 @@ pub struct UnderstandingProofReceipt {
     pub files_to_inspect: Vec<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveGateRequest {
     pub receipt: UnderstandingProofReceipt,
     pub requested_action: String,
@@ -1884,7 +2066,9 @@ pub enum CognitiveGateReason {
     Allowed,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveGateDecision {
     pub task_id: String,
     pub project_id: ProjectId,
@@ -1955,7 +2139,9 @@ pub enum LeaseDenyReason {
     SkillWouldBypassGate,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionRequest {
     pub request_id: ActionRequestId,
     pub project_id: ProjectId,
@@ -1976,7 +2162,9 @@ pub struct ActionRequest {
     pub created_at: OffsetDateTime,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionLease {
     pub lease_id: ActionLeaseId,
     pub request_id: ActionRequestId,
@@ -1997,13 +2185,17 @@ pub struct ActionLease {
     pub created_at: OffsetDateTime,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionLeaseRecord {
     pub lease: ActionLease,
     pub write_receipt: Option<WriteReceiptRef>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionScope {
     pub repo_root: PathRef,
     pub git_head: Option<String>,
@@ -2015,7 +2207,9 @@ pub struct ActionScope {
     pub max_runtime_seconds: u64,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChangePlan {
     pub summary: String,
     pub files: Vec<FileChangeIntent>,
@@ -2025,7 +2219,9 @@ pub struct ChangePlan {
     pub rollback_plan: Option<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileChangeIntent {
     pub path: PathRef,
     pub reason: String,
@@ -2043,7 +2239,9 @@ pub enum FileChangeKind {
     Rename,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SymbolChangeIntent {
     pub symbol: String,
     pub reason: String,
@@ -2051,14 +2249,18 @@ pub struct SymbolChangeIntent {
     pub code_evidence_refs: Vec<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifierPlan {
     pub required: Vec<VerifierRequirement>,
     pub optional: Vec<VerifierRequirement>,
     pub acceptance_items: Vec<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifierRequirement {
     pub name: String,
     pub command_kind: VerifierCommandKind,
@@ -2082,13 +2284,17 @@ pub enum VerifierCommandKind {
     ManualReview,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnifiedDiff {
     pub text: String,
     pub byte_len: usize,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PatchRequest {
     pub patch_request_id: PatchRequestId,
     pub project_id: ProjectId,
@@ -2125,14 +2331,18 @@ pub enum VerifierStatus {
     NotAllowed,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifierRunRef {
     pub verifier_run_id: VerifierRunId,
     pub name: String,
     pub status: VerifierStatus,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PatchRun {
     pub patch_run_id: PatchRunId,
     pub patch_request_id: PatchRequestId,
@@ -2157,7 +2367,9 @@ pub struct PatchRun {
     pub finished_at: OffsetDateTime,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifierRun {
     pub verifier_run_id: VerifierRunId,
     pub project_id: ProjectId,
@@ -2180,7 +2392,9 @@ pub struct VerifierRun {
     pub finished_at: OffsetDateTime,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompletionProof {
     pub task_id: String,
     pub project_id: ProjectId,
@@ -2199,7 +2413,9 @@ pub struct CompletionProof {
     pub known_risks: Vec<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompletionAcceptanceItem {
     pub item: String,
     pub status: String,
@@ -2245,7 +2461,9 @@ impl std::fmt::Display for OperationStatus {
     }
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompletionGateDecision {
     pub task_id: String,
     pub project_id: ProjectId,
@@ -2253,7 +2471,9 @@ pub struct CompletionGateDecision {
     pub reasons: Vec<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CodeCortexRequest {
     pub project: String,
     pub task: String,
@@ -2264,7 +2484,9 @@ pub struct CodeCortexRequest {
     pub include_diagnostics: bool,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CodeCortexReport {
     pub project: String,
     pub task: String,
@@ -2293,7 +2515,9 @@ pub struct CodeCortexReport {
     pub operation_status: OperationStatus,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CodeCortexScopeBinding {
     pub branch: String,
     pub commit: String,
@@ -2302,7 +2526,9 @@ pub struct CodeCortexScopeBinding {
     pub verifier_config_hash: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileEvidence {
     pub path: String,
     pub content_hash: Option<String>,
@@ -2312,7 +2538,9 @@ pub struct FileEvidence {
     pub source: CodeEvidenceSource,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SymbolEvidence {
     pub name: String,
     pub kind: String,
@@ -2321,7 +2549,9 @@ pub struct SymbolEvidence {
     pub source: CodeEvidenceSource,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiagnosticEvidence {
     pub source: CodeEvidenceSource,
     pub status: String,
@@ -2331,7 +2561,9 @@ pub struct DiagnosticEvidence {
     pub message: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifierEvidence {
     pub name: String,
     pub command: String,
@@ -2340,14 +2572,18 @@ pub struct VerifierEvidence {
     pub source: CodeEvidenceSource,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlastRadiusView {
     pub files: Vec<String>,
     pub crates: Vec<String>,
     pub reasons: Vec<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InvariantCard {
     pub name: String,
     pub status: String,
@@ -2396,7 +2632,9 @@ pub enum AgentSessionStatus {
     Unavailable,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentSession {
     pub agent_session_id: AgentSessionId,
     pub agent_id: AgentId,
@@ -2444,7 +2682,9 @@ pub enum AuthorityPermission {
     DelegateExternal,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityProfile {
     pub permissions: BTreeSet<AuthorityPermission>,
 }
@@ -2472,7 +2712,9 @@ impl AuthorityProfile {
     }
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkScope {
     pub repo_root: PathRef,
     pub read_set: Vec<PathRef>,
@@ -2484,7 +2726,9 @@ pub struct WorkScope {
     pub requires_active_work_lease: bool,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkItem {
     pub work_item_id: WorkItemId,
     pub project_id: ProjectId,
@@ -2555,7 +2799,9 @@ pub enum WorkLeaseDecisionReason {
     UnavailableAdapter,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkLeaseDecision {
     pub kind: WorkLeaseDecisionKind,
     pub reason: WorkLeaseDecisionReason,
@@ -2566,7 +2812,9 @@ pub struct WorkLeaseDecision {
     pub expires_at: Option<OffsetDateTime>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkLease {
     pub work_lease_id: WorkLeaseId,
     pub work_item_id: WorkItemId,
@@ -2613,7 +2861,9 @@ pub enum WorkConflictResolution {
     WaivedReadOnlyOverlap,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkConflict {
     pub conflict_id: String,
     pub work_item_id: WorkItemId,
@@ -2637,7 +2887,9 @@ pub enum AgentRunStatus {
     Unavailable,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentRun {
     pub agent_run_id: AgentRunId,
     pub agent_session_id: AgentSessionId,
@@ -2652,7 +2904,9 @@ pub struct AgentRun {
     pub write_receipt: Option<WriteReceiptRef>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorktreeLeaseRequest {
     pub request_id: WorktreeLeaseRequestId,
     pub project_id: ProjectId,
@@ -2698,7 +2952,9 @@ impl WorktreeLeaseKind {
     }
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorktreeLease {
     pub worktree_lease_id: WorktreeLeaseId,
     pub project_id: ProjectId,
@@ -2742,7 +2998,9 @@ pub enum CandidateDiffStatus {
     AcceptedForPatchRunner,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CandidateDiff {
     pub candidate_diff_id: CandidateDiffId,
     pub worktree_lease_id: WorktreeLeaseId,
@@ -2774,7 +3032,9 @@ pub enum CandidateReviewDecision {
     RequireHumanReview,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CandidateReview {
     pub review_id: String,
     pub candidate_diff_id: CandidateDiffId,
@@ -2820,7 +3080,9 @@ pub enum BlackboardItemStatus {
     Expired,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlackboardScope {
     pub memory_scope: Vec<String>,
     pub files: Vec<PathRef>,
@@ -2828,7 +3090,9 @@ pub struct BlackboardScope {
     pub work_items: Vec<WorkItemId>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlackboardItem {
     pub blackboard_item_id: BlackboardItemId,
     pub project_id: ProjectId,
@@ -2850,6 +3114,9 @@ pub struct BlackboardItem {
     pub write_receipt: Option<WriteReceiptRef>,
 }
 
+/// Decoder: derived externally tagged enum. An unknown variant, a wrong
+/// payload, a repeated key, and a trailing key are all refused by the derived
+/// decoder; the single-key envelope has no other member surface.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MailboxRecipient {
@@ -2886,7 +3153,9 @@ pub enum MailboxMessageStatus {
     Failed,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MailboxMessage {
     pub message_id: MailboxMessageId,
     pub project_id: ProjectId,
@@ -2920,7 +3189,9 @@ pub enum RecoveryAction {
     AdvanceLeaseEpoch,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LostAgentRecoveryRecord {
     pub recovery_id: String,
     pub project_id: ProjectId,
@@ -2951,7 +3222,9 @@ pub enum ContributionEffect {
     NoObservableEffect,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentContributionTrace {
     pub agent_session_id: AgentSessionId,
     pub role: AgentRole,
@@ -2961,7 +3234,9 @@ pub struct AgentContributionTrace {
     pub evidence_refs: Vec<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RejectedCandidateTrace {
     pub candidate_ref: String,
     pub reviewer_session_id: Option<AgentSessionId>,
@@ -2969,7 +3244,9 @@ pub struct RejectedCandidateTrace {
     pub evidence_refs: Vec<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifierEffectTrace {
     pub verifier_ref: String,
     pub effect: ContributionEffect,
@@ -2977,7 +3254,9 @@ pub struct VerifierEffectTrace {
     pub evidence_refs: Vec<String>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CollectiveTrace {
     pub collective_trace_id: String,
     pub project_id: ProjectId,
@@ -2992,7 +3271,9 @@ pub struct CollectiveTrace {
     pub write_receipt: Option<WriteReceiptRef>,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EliotHookEvent {
     pub kind: HookEventKind,
     #[serde(with = "time::serde::rfc3339")]
@@ -3022,7 +3303,9 @@ pub enum HookEventKind {
     Stop,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HookDecision {
     pub event_id: String,
     pub kind: HookEventKind,
@@ -3033,14 +3316,18 @@ pub struct HookDecision {
     pub stdout: Value,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HookDecisionReason {
     pub code: String,
     pub severity: String,
     pub detail: String,
 }
 
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HookSpoolRecord {
     pub event: EliotHookEvent,
     pub decision: HookDecision,
