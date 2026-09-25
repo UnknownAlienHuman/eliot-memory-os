@@ -3,9 +3,10 @@
 use std::io::{self, Write};
 
 use eliot_wasm_host::{
-    CliError, PrototypeContourDecision, TypedWorld, admit_generation, admit_prototype,
-    default_experimental_limits, execute_describe_experimental, experimental_manifest, parse_args,
-    read_bounded_artifact, resolve_kernel_port_grant, run_guest_exec, typed_wit_digest,
+    CliError, GenerationManifest, HostAdmitError, PrototypeContourDecision, TypedWorld,
+    admit_generation, admit_prototype, default_experimental_limits, execute_describe_experimental,
+    experimental_manifest, parse_args, read_bounded_artifact, resolve_kernel_port_grant,
+    run_guest_exec, typed_wit_digest,
 };
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
@@ -29,6 +30,33 @@ fn emit_receipt(fields: &[(&str, &str)]) {
     }
     let _ = writeln!(stdout);
     let _ = writeln!(stdout, "}}");
+}
+
+/// Governed-learning carryover preflight for guest-affecting dispatch
+/// (issue #1869, work item W4).
+///
+/// The pre-Governor experimental callsite binds no authenticated Governor
+/// learning channel: no live `Governor` handle, no `LearningAdmissionClaim`,
+/// no verified permit, and no overlay, backlog, or cross-task admission
+/// records exist here (the Governor grant carrier is honestly absent — see
+/// the phase-two comment below). Fabricating any of those from ambient CLI
+/// input would invent authority, so the full owner-bound compilation
+/// (`admit_governed_host`) and the honored-output gate
+/// (`check_governed_host_output`) stay unreachable until such a channel
+/// lands. Until then, a manifest that ever carries capability grants fails
+/// closed here, before any guest code runs: capability-bearing behavior
+/// could carry learning-derived overlays or candidates whose campaign
+/// identity, local-admission status, expiry, closure status, State Fence,
+/// and cross-task admission receipt were never verified.
+fn deny_unadmitted_learning_exposure(
+    manifest: &GenerationManifest,
+) -> Result<(), HostAdmitError> {
+    if manifest.capability_grants.is_empty() {
+        return Ok(());
+    }
+    Err(HostAdmitError::Admission(
+        "capability-bearing manifest requires governed learning admission".to_owned(),
+    ))
 }
 
 fn main() {
@@ -94,6 +122,17 @@ fn main() {
         let decision = PrototypeContourDecision::default_for_new_prototype();
         if let Err(error) = admit_prototype(Some(&decision), &manifest) {
             emit_error("ADMISSION_DENIED", &error.to_string());
+            std::process::exit(ADMISSION_REQUIRED_EXIT);
+        }
+        // Governed-learning preflight (#1869 W4): refuse a
+        // capability-bearing manifest before any guest code runs. The
+        // governed admission chain (`admit_governed_host` /
+        // `check_governed_host_output`) cannot verify campaign identity,
+        // expiry, closure, fence, or cross-task receipt on this callsite —
+        // no authenticated Governor learning channel is bound — so only a
+        // grant-free manifest may proceed toward exposure.
+        if let Err(error) = deny_unadmitted_learning_exposure(&manifest) {
+            emit_error("LEARNING_ADMISSION_REQUIRED", &error.to_string());
             std::process::exit(ADMISSION_REQUIRED_EXIT);
         }
         match execute_describe_experimental(world, &artifact, &limits) {
