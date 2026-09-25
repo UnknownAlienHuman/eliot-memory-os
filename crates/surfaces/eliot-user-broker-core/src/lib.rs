@@ -1836,7 +1836,7 @@ impl UserBroker {
                 .as_mut()
                 .ok_or(BrokerError::PlanGap(RequiredProvider::P03Process))?
                 .cancel(&record.cursor.operation_id);
-            if !matches!(outcome, Ok(_)) {
+            if outcome.is_err() {
                 retained.push(record.cursor.operation_id.clone());
             }
         }
