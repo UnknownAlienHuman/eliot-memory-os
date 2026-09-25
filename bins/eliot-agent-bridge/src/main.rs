@@ -5,8 +5,8 @@ mod request_input;
 use eliot_agent_bridge::{
     AdmissionBasis, BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError,
     CurrentAssessment, FiringEvidence, HotResourceView, InjectionReceipt, ItemDisposition,
-    NormalizedCue, Profile, UnderstandingBootstrap, UseOutcome, kernel_ports_with_declaration,
-    parse_args, reactive_runtime_composition,
+    KernelHostRequestClient, NormalizedCue, Profile, UnderstandingBootstrap, UseOutcome,
+    kernel_ports_with_declaration, parse_args, reactive_runtime_composition,
 };
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
@@ -522,7 +522,7 @@ fn main() {
             std::process::exit(INVALID_ARGUMENT_EXIT);
         }
     };
-    let (host_activation, mut host_request_port, mcp_forwarding) =
+    let (host_activation, mut host_request_client, mcp_forwarding) =
         match kernel_ports_with_declaration(&config.client_declaration) {
             Ok(ports) => ports,
             Err(error) => {
@@ -669,7 +669,7 @@ fn main() {
                     // attach that already succeeded.
                     if let Err(error) = reactive_runtime_composition::restore_reactive_runtime(
                         &mut runner,
-                        &mut *host_request_port,
+                        &mut host_request_client,
                         &[],
                     ) {
                         emit_error("REACTIVE_RESTORE_REFUSED", &error.to_string());
@@ -683,7 +683,7 @@ fn main() {
             },
             Ok(Request::Invoke { request }) => {
                 let mut response =
-                    handle_invocation(&host_gateway, &mut *host_request_port, &request);
+                    handle_invocation(&host_gateway, &mut host_request_client, &request);
                 record_invocation_delivery(&mut runner, &mut response);
                 drain_reactive_pending_into_invocation(
                     &mut runner,
@@ -693,7 +693,7 @@ fn main() {
                 response
             }
             Ok(Request::Cancel { request }) => {
-                handle_cancellation(&host_gateway, &mut *host_request_port, &request)
+                handle_cancellation(&host_gateway, &mut host_request_client, &request)
             }
             Ok(Request::DryRunInvoke { request }) => dry_run_invocation(&runner, &request),
             Ok(Request::DryRunCancel { request }) => dry_run_cancellation(&runner, &request),
@@ -754,12 +754,15 @@ fn main() {
                 fence_nonce,
             }) => handle_reconnect(
                 &mut runner,
-                &expected_connection_id,
-                &new_connection_id,
-                &session_id,
-                activation_generation,
-                authority_epoch,
-                &fence_nonce,
+                &mut host_request_client,
+                ReconnectClaim {
+                    expected_connection_id: &expected_connection_id,
+                    new_connection_id: &new_connection_id,
+                    session_id: &session_id,
+                    activation_generation,
+                    authority_epoch,
+                    fence_nonce: &fence_nonce,
+                },
             ),
             Ok(Request::Detach {
                 expected_connection_id,
@@ -1379,6 +1382,22 @@ fn dry_run_cancellation(runner: &BridgeRunner, request: &HostCancellationRequest
     }
 }
 
+/// Closed reconnect claim: the expected live connection, its replacement,
+/// and the bearer authority triple the host presents for the live binding.
+///
+/// Borrowed straight from the decoded stdin record: no minting, no widening,
+/// no inference. Shaped once at the dispatch site so [`handle_reconnect`]
+/// stays within its argument bound while the claim fields keep their exact
+/// validation order inside.
+struct ReconnectClaim<'a> {
+    expected_connection_id: &'a ConnectionId,
+    new_connection_id: &'a ConnectionId,
+    session_id: &'a str,
+    activation_generation: u64,
+    authority_epoch: EpochId,
+    fence_nonce: &'a str,
+}
+
 /// Validates one closed reconnect claim and advances the host-facing transport binding.
 ///
 /// This follows the [`HostRequestGateway`] pattern without adding gateway
@@ -1392,20 +1411,33 @@ fn dry_run_cancellation(runner: &BridgeRunner, request: &HostCancellationRequest
 /// kernel-issued — sealed at activation from the admission receipt established
 /// by `kernel_ports_with_declaration` (declaration lease, front-door
 /// expectation/SID, challenge → hello → receipt, fence joins) — and are never
-/// minted, widened, or inferred from process identity here. Cursors and replay
-/// inheritance survive only through that exact owner-authorized match; the
-/// kernel transport itself is untouched, so kernel envelopes keep riding the
-/// admitted receipt connection until a new process admission replaces it (the
-/// activation one-shot guard is preserved: this path never reactivates).
+/// minted, widened, or inferred from process identity here.
+///
+/// Local authority match alone does not move the binding: after the claims
+/// shape up, the live Kernel binding is proven current through
+/// [`KernelHostRequestClient::check_kernel_binding`] — one observation-only
+/// reconcile probe over the shared admitted transport — before
+/// `Runner::reconnect` runs. A failed probe fails closed with
+/// `RECONNECT_STALE_AUTHORITY` without mutating the runner, so a fenced,
+/// rotated, or dead Kernel binding can never be papered over with a fresh
+/// local label. Cursors and replay inheritance survive only through that
+/// exact owner-authorized match; the kernel transport itself is untouched, so
+/// kernel envelopes keep riding the admitted receipt connection until a new
+/// process admission replaces it (the activation one-shot guard is preserved:
+/// this path never reactivates).
 fn handle_reconnect(
     runner: &mut BridgeRunner,
-    expected_connection_id: &ConnectionId,
-    new_connection_id: &ConnectionId,
-    session_id: &str,
-    activation_generation: u64,
-    authority_epoch: EpochId,
-    fence_nonce: &str,
+    client: &mut KernelHostRequestClient,
+    claim: ReconnectClaim<'_>,
 ) -> Response {
+    let ReconnectClaim {
+        expected_connection_id,
+        new_connection_id,
+        session_id,
+        activation_generation,
+        authority_epoch,
+        fence_nonce,
+    } = claim;
     let Some(live) = runner.attach_view() else {
         return Response::Error {
             code: "BRIDGE_NOT_ATTACHED",
@@ -1458,6 +1490,19 @@ fn handle_reconnect(
             };
         }
     };
+    // The bearer claims shaped up against the live local binding; the
+    // binding itself is proven current against the Kernel before anything
+    // mutates. A failed probe leaves the runner untouched: the replacement
+    // inherits only a Kernel-current binding, never a fresh label over a
+    // fenced, rotated, or dead one.
+    if let Err(error) = client.check_kernel_binding() {
+        return Response::Error {
+            code: "RECONNECT_STALE_AUTHORITY",
+            detail: format!(
+                "reconnect refused: the live Kernel binding is no longer current ({error}); the local attach is unchanged — re-attach and activate for a new admission; a replacement connection requires a new admission and cached state cannot revive the prior one"
+            ),
+        };
+    }
     match runner.reconnect(request) {
         Ok(view) => Response::Reconnected {
             previous_connection_id: expected_connection_id.as_str().to_owned(),

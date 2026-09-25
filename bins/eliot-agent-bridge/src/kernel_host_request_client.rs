@@ -88,7 +88,11 @@ const DEFAULT_DEADLINE_PREFERENCE_MS: u64 = 60_000;
 /// Holds no transport of its own: every call borrows the shared owner, so the
 /// admitted transport, runtime, receipt facts, and activation session stay
 /// singular while the activation face serves the one-shot exchange beside it.
-pub(super) struct KernelHostRequestClient {
+///
+/// `pub` for the binary composition root only: the bridge binary threads this
+/// concrete client into its reconnect path to prove the live Kernel binding
+/// before mutating local attach state. Construction stays inside this crate.
+pub struct KernelHostRequestClient {
     pub(super) shared: SharedTransport,
 }
 
@@ -1189,6 +1193,62 @@ impl KernelHostRequestClient {
             .exchange(&frame)
             .map_err(|_| unknown_outcome(&digest))?;
         decode_rehydrated_reply(&reply, envelope).ok_or_else(|| unknown_outcome(&digest))
+    }
+
+    /// Proves the live Kernel binding is still current before a reconnect
+    /// mutates local attach state.
+    ///
+    /// Sends one observation-only reconcile probe parented to a retained
+    /// replay-cache entry over the shared admitted transport: success proves
+    /// the Kernel still admits this bridge under the current descriptor,
+    /// generation, fence, and authority epoch, so the replacement connection
+    /// inherits exactly that binding and nothing inferred. Any exchange or
+    /// admission failure fails closed as
+    /// [`PortFailure::TransportBindingRejected`] without touching the replay
+    /// cache, staging no dispatch and reviving no authority: the caller keeps
+    /// the live local binding and reports stale authority.
+    ///
+    /// When no invocation has been admitted yet the cache holds no parent and
+    /// there is no Kernel-side operation binding that could have gone stale,
+    /// so the check passes vacuously and the attach-time Kernel handshake
+    /// stands until the first exchange. The probe stages one observation-only
+    /// reconciliation record kernel-side (the existing unknown-delivery probe
+    /// semantics); it never resubmits an operation and never writes the
+    /// replay cache: there is exactly one ledger, kernel-side.
+    pub fn check_kernel_binding(&mut self) -> Result<(), PortFailure> {
+        let now_ms = unix_ms()?;
+        let facts = self
+            .shared
+            .try_borrow()
+            .map_err(|_| request_failure())?
+            .snapshot();
+        let session = facts.session.clone().ok_or_else(plan_gap_no_session)?;
+        let parent = self
+            .shared
+            .try_borrow()
+            .map_err(|_| request_failure())?
+            .replay_cache
+            .values()
+            .next()
+            .map(|entry| ParentLink::of(&entry.envelope));
+        let Some(parent) = parent else {
+            return Ok(());
+        };
+        let probe = build_reconciliation_envelope(&facts, &session, &parent, now_ms)?;
+        let frame = host_request_frame_for_envelope(
+            AGENT_HOST_REQUEST_RECONCILE_OPERATION,
+            &probe,
+            &facts,
+        )?;
+        let reply = self.exchange(&frame).map_err(|_| PortFailure::TransportBindingRejected {
+            reason: "kernel binding check failed: the admitted transport rejected the probe; re-attach and activate for a new admission".to_owned(),
+        })?;
+        match decode_admitted_reply(&reply, &probe) {
+            Some(_) => Ok(()),
+            None => Err(PortFailure::TransportBindingRejected {
+                reason: "kernel binding check failed: the Kernel no longer admits this binding under the current generation, fence, or epoch; re-attach and activate for a new admission".to_owned(),
+            }),
+        }
     }
 
     /// Sends one observation-only reconcile probe for an invocation whose
