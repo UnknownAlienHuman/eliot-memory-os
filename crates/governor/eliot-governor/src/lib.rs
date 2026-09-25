@@ -52,7 +52,9 @@ pub use cue_composition::{
 };
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
 pub use experience_commit::{commit_experience_bank, commit_experience_feedback};
-pub use finish_attempt::{FinishAttemptError, GovernorFinishAttempt};
+pub use finish_attempt::{
+    FinishAttemptError, GovernorFinishAttempt, PreparedFinishDecision, PreparedKernelExchange,
+};
 mod controlboard_projection;
 mod learning_admission;
 mod learning_delta_integration;

@@ -33,8 +33,9 @@ use eliotd::startup_capability_bindings::{
 use eliotd::startup_readiness::StartupReadinessProjection;
 use eliotd::testd_terminal_completion::{
     TestdOwnerDrainOutcome, ack_testd_owner_terminal_completion,
-    bind_testd_owner_verifier_dispatch, emit_testd_owner_drain_skip,
-    query_testd_owner_pending_dispatches, query_testd_owner_terminal_evidence,
+    bind_testd_owner_verifier_dispatch, commit_testd_terminal_owner_fact,
+    emit_testd_owner_drain_skip, query_testd_owner_pending_dispatches,
+    query_testd_owner_terminal_evidence,
 };
 use eliotd::{
     ActivationClaim, DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus,
@@ -2077,8 +2078,7 @@ fn settle_testd_owner_completion(
 /// Runs one TestD owner drain step through the production finish caller.
 ///
 /// #18 item B: the bounded step is split into phases so the composition guard
-/// is never held across a Kernel exchange except for the two Governor-owned
-/// canonical legs that structurally require the single Governor owner:
+/// is never held across a Kernel exchange at all:
 ///
 /// ```text
 /// (a) guard held   — read the composition readiness gate (no exchange);
@@ -2086,15 +2086,18 @@ fn settle_testd_owner_completion(
 /// (c) guard held   — plan the exact owner bind payload for one pending
 ///                    dispatch (a pure read of the retained owners);
 /// (d) no guard     — the owner bind leg;
-/// (e) guard held   — publish the verifier-execution fact and derive its finish
-///                    decision for one terminal row (the irreducible
-///                    `&mut GovernorComposition` legs);
+/// (e) no guard     — the two Governor-owned canonical legs for one terminal
+///                    row, phase-split inside
+///                    `commit_testd_terminal_owner_fact` (plan under the guard,
+///                    exchange without it, revalidate under it again);
 /// (f) no guard     — the owner terminal ack leg.
 /// ```
 ///
 /// Before this change the guard was held across the whole step: both polls plus
 /// three Kernel exchanges per row, so one bounded step stalled every other task
-/// waiting on the same lock. Semantics are unchanged: one bounded step per
+/// waiting on the same lock. The remaining guard-held phases are pure reads of
+/// the retained owners and synchronous owner refreshes, so none of them awaits.
+/// Semantics are unchanged: one bounded step per
 /// tick, at most one outstanding drain, exact replay rather than duplication,
 /// a poisoned row recorded as a diagnostic and skipped, and only a transport
 /// failure of a poll failing the daemon closed.
@@ -2141,11 +2144,9 @@ async fn run_testd_owner_drain(
         .await
         .map_err(|error| format!("TestD owner drain: {error}"))?;
     for evidence in &terminals {
-        // (e) guard held: the two Governor-owned canonical legs for this row.
-        let committed = {
-            let mut guard = composition.lock().await;
-            Box::pin(guard.commit_testd_terminal_owner_fact(evidence)).await
-        };
+        // (e) no guard: the two Governor-owned canonical legs, phase-split
+        // inside so the guard covers only their pure reads.
+        let committed = commit_testd_terminal_owner_fact(kernel, &composition, evidence).await;
         match committed {
             Ok(receipt) => {
                 // (f) no guard: the owner terminal ack leg.

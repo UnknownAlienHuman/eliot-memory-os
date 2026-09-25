@@ -8,7 +8,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{OperationId, TaskId, canonical_json_bytes};
-use eliot_governor::CanonicalPlanBinding;
+use eliot_governor::{
+    CanonicalPlanBinding, FinishAttemptDraft, PreparedFinishDecision, PreparedKernelExchange,
+};
 use eliot_instrument_api::InstrumentInvocation;
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
@@ -20,6 +22,11 @@ use eliot_testd_core::{
 
 use crate::daemon_kernel_client::TESTD_OWNER_POLL_LIMIT;
 use crate::{DaemonComposition, DaemonError, DaemonKernelClient};
+
+/// The shared `TestD` owner composition. Named here so the terminal completion
+/// seam can be driven from [`commit_testd_terminal_owner_fact`] without the
+/// drain holding a guard across an exchange.
+type SharedTestdOwnerComposition = std::sync::Arc<tokio::sync::Mutex<DaemonComposition>>;
 
 fn completion_error(error: impl std::fmt::Display) -> DaemonError {
     DaemonError::Lifecycle(format!("TestD terminal completion: {error}"))
@@ -340,36 +347,28 @@ impl DaemonComposition {
         )
     }
 
-    /// Commits the two Governor-owned canonical legs for one terminal evidence
-    /// row: publishes the verifier-execution fact and submits the evidence-led
-    /// finish candidate through the Governor production caller. The returned
-    /// [`WriteReceipt`] is the committed verifier-execution receipt the owner
-    /// ack leg must carry.
+    /// Plans the two Governor-owned canonical legs for one terminal evidence
+    /// row and returns the exact exchanges they still owe.
     ///
-    /// ```text
-    /// publish the verifier-execution fact (rehydrate -> canonical write)
-    /// -> submit the finish candidate draft (rehydrate -> FinishService::evaluate -> persisted decision)
-    /// ```
+    /// This is the pure prepare half of the terminal finish ceremony: it reads
+    /// the retained owners, derives the verifier-execution fact and the
+    /// evidence-led finish candidate, and hands back the immutable transitions
+    /// with the identity, operation and pre-commit fence each one binds. It
+    /// performs no transport and mutates nothing, so the caller holds the
+    /// composition guard for this call alone and releases it before
+    /// [`exchange_testd_owner_finish_leg`].
     ///
-    /// The daemon never opens the `TestD` database: the row arrives through the
-    /// Kernel owner poll. The candidate draft carries only the terminal job
-    /// identity and the evidence-led candidate outcome; the Governor rehydrates
-    /// canonical evidence and derives the decision, so worker success never
-    /// becomes a Task outcome here.
-    ///
-    /// #18 item B: these two legs are the one place the drain still holds the
-    /// composition guard across a Kernel exchange. Both are `&mut
-    /// GovernorComposition` operations on the single Governor owner — the fact
-    /// publication rehydrates the retained owner state and the finish decision
-    /// refreshes it — so they are reachable only through this guard; moving
-    /// them out would require a second handle to that owner. They stay one
-    /// contiguous, per-row phase. The caller acknowledges the terminal through
-    /// [`ack_testd_owner_terminal_completion`] with no guard held, and a
-    /// fence-moved row simply rejects owner-side on the next poll.
-    pub async fn commit_testd_terminal_owner_fact(
-        &mut self,
+    /// The task-binding denial stays ahead of both legs exactly as before: a
+    /// missing admitted task denies the whole completion with the readiness
+    /// gate's typed directive before anything launches. The finish candidate is
+    /// derived here rather than after the fact leg, and that reorder is not
+    /// observable: its only rejection cases are an absent task id or task
+    /// revision fence and a job state that is not settled terminal, and the
+    /// fact prepare already refuses exactly those rows.
+    pub fn plan_testd_terminal_owner_fact(
+        &self,
         evidence: &TestdTerminalCompletionEvidence,
-    ) -> Result<WriteReceipt, DaemonError> {
+    ) -> Result<TestdTerminalOwnerPlan, DaemonError> {
         let identity = &evidence.request_identity;
         let job = &evidence.job;
         // Issue #1789 A1: both legs below publish canonical Material effects,
@@ -378,27 +377,162 @@ impl DaemonComposition {
         if identity.request.metadata.task_id.is_none() {
             return Err(no_task_material_denial("TestD terminal completion"));
         }
-        // Boxed: the committed receipt carries the full issue-#18 digest
-        // bindings and is held across the finish await, so keeping it inline
-        // would push this future past the large-future bound. Same value, same
-        // move into the caller's ack leg.
-        let committed = Box::new(
-            self.governor
-                .publish_testd_verifier_execution_fact_from_evidence(evidence)
-                .await
-                .map_err(DaemonError::Finish)?
-                .ok_or_else(|| {
-                    completion_error(
-                        "Governor reported a verifier fact without its committed receipt",
-                    )
-                })?,
-        );
         let draft = finish_draft_from_testd_terminal_evidence(job, identity)?;
         let operation_id = OperationId::new(format!("testd-owner-finish-{}", job.job_id))
             .map_err(completion_error)?;
-        let _decision = self.finish_attempt(identity, operation_id, draft).await?;
-        Ok(*committed)
+        let verifier_fact = self
+            .governor
+            .prepare_testd_verifier_execution_fact_from_evidence(evidence)
+            .map_err(DaemonError::Finish)?;
+        Ok(TestdTerminalOwnerPlan {
+            verifier_fact,
+            finish_draft: draft,
+            finish_operation_id: operation_id,
+        })
     }
+
+    /// Re-checks a completed exchange against the live canonical owner and, for
+    /// the finish decision, publishes the refreshed image it was evaluated
+    /// against.
+    ///
+    /// The prepared leg captured its owner fence before the caller began the
+    /// exchange, and the exchange ran with no composition borrow, so this is
+    /// where a fence that moved in the meantime refuses the leg with the
+    /// Governor's own typed mismatch. Nothing is re-derived and no receipt is
+    /// repaired.
+    pub fn accept_testd_terminal_owner_fact(
+        &self,
+        prepared: &PreparedKernelExchange,
+    ) -> Result<(), DaemonError> {
+        self.governor
+            .accept_prepared_exchange(prepared)
+            .map_err(DaemonError::Finish)
+    }
+
+    /// Publishes the verifier-execution fact's owner image and derives the
+    /// exact exchange that persists the finish decision for this row.
+    ///
+    /// The synchronous `refresh_from_kernel` runs here, under the caller's
+    /// `&mut self`, because the decision must be evaluated against the
+    /// canonical image the fact leg actually published and never against a
+    /// pre-publish snapshot. Nothing is transported, so the guard is released
+    /// again before the decision exchange.
+    pub fn plan_testd_terminal_owner_finish(
+        &mut self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        draft: FinishAttemptDraft,
+    ) -> Result<PreparedFinishDecision, DaemonError> {
+        self.governor
+            .prepare_finish_decision(identity, operation_id, draft)
+            .map_err(DaemonError::Finish)
+    }
+}
+
+/// The two Governor-owned canonical legs planned for one terminal `TestD` row.
+///
+/// Each leg carries its own identity, operation binding and pre-commit fence;
+/// a caller that exchanges them is running the Governor's decision, not
+/// inventing one.
+pub struct TestdTerminalOwnerPlan {
+    /// The exchange that publishes the verifier-execution fact. `None` means
+    /// the derived fact is already the current canonical owner image, so the
+    /// row yields no committed verifier-execution receipt to acknowledge.
+    pub verifier_fact: Option<PreparedKernelExchange>,
+    /// The evidence-led finish candidate derived for this row.
+    pub finish_draft: FinishAttemptDraft,
+    /// The exact finish operation identity derived for this row.
+    pub finish_operation_id: OperationId,
+}
+
+/// Runs one prepared Governor-owned exchange over the daemon's own Kernel port.
+///
+/// The port is the daemon's mechanical boundary: it applies the immutable
+/// transition the Governor already derived, under the exact admitted identity,
+/// and re-checks the canonical request hash before transport. Taking no
+/// composition handle at all is the point — that is what lets a caller run the
+/// exchange with no composition guard held.
+pub async fn exchange_testd_owner_finish_leg(
+    kernel: &DaemonKernelClient,
+    prepared: &PreparedKernelExchange,
+) -> Result<WriteReceipt, DaemonError> {
+    prepared.exchange(kernel).await.map_err(completion_error)
+}
+
+/// Commits the two Governor-owned canonical legs for one terminal evidence row
+/// as plan, exchange, apply.
+///
+/// ```text
+/// publish the verifier-execution fact (rehydrate -> canonical write)
+/// -> submit the finish candidate draft (rehydrate -> FinishService::evaluate -> persisted decision)
+/// ```
+///
+/// The ceremony is now three phases, and the composition guard is alive only
+/// across the two that are pure reads of the retained owners:
+///
+/// ```text
+/// (1) guard held  — plan both legs: derive the two immutable transitions and
+///                   the evidence-led candidate (no exchange);
+/// (2) no guard    — publish the verifier-execution fact over the Kernel port;
+/// (3) guard held  — revalidate the fact against the live owner fence, refresh,
+///                   and derive the finish decision against that image;
+/// (4) no guard    — persist the finish decision over the Kernel port;
+/// (5) guard held  — revalidate the decision against the live owner fence.
+/// ```
+///
+/// Before the split the guard was taken once and held across every await in the
+/// row, including both Kernel round trips. A `tokio::sync::MutexGuard` is
+/// not reentrant and blocks every other `run_loop` arm on the same lock, so one
+/// bounded drain step could stall the activation feed and the local-read poller
+/// for the whole duration of a Kernel exchange. The mutual exclusion the guard
+/// does provide is unchanged — each phase still runs alone, and phases (1)/(3)/
+/// (5) still observe exactly the state the preceding exchange published,
+/// because (3) refreshes the owner before the decision is derived and (3)/(5)
+/// re-check the pre-commit fence before the receipt is admitted.
+///
+/// The daemon never opens the `TestD` database: the row arrives through the
+/// Kernel owner poll. The candidate draft carries only the terminal job
+/// identity and the evidence-led candidate outcome; the Governor rehydrates
+/// canonical evidence and derives the decision, so worker success never becomes
+/// a Task outcome here. A fence-moved row is refused with the Governor's typed
+/// mismatch and simply rejects owner-side on the next poll.
+pub async fn commit_testd_terminal_owner_fact(
+    kernel: &DaemonKernelClient,
+    composition: &SharedTestdOwnerComposition,
+    evidence: &TestdTerminalCompletionEvidence,
+) -> Result<WriteReceipt, DaemonError> {
+    // (1) guard held, no exchange.
+    let plan = {
+        let guard = composition.lock().await;
+        guard.plan_testd_terminal_owner_fact(evidence)?
+    };
+    let Some(fact) = plan.verifier_fact.as_ref() else {
+        return Err(completion_error(
+            "Governor reported a verifier fact without its committed receipt",
+        ));
+    };
+    // (2) no guard: the verifier-execution fact exchange.
+    let committed = exchange_testd_owner_finish_leg(kernel, fact).await?;
+    // (3) guard held, no exchange: revalidate the fact, publish its image, and
+    // derive the finish decision against that refreshed canonical owner.
+    let decision = {
+        let mut guard = composition.lock().await;
+        guard.accept_testd_terminal_owner_fact(fact)?;
+        guard.plan_testd_terminal_owner_finish(
+            &evidence.request_identity,
+            &plan.finish_operation_id,
+            plan.finish_draft,
+        )?
+    };
+    // (4) no guard: the finish decision exchange.
+    if let Some(prepared) = decision.exchange() {
+        let _receipt = exchange_testd_owner_finish_leg(kernel, prepared).await?;
+        // (5) guard held, no exchange: revalidate the decision.
+        let guard = composition.lock().await;
+        guard.accept_testd_terminal_owner_fact(prepared)?;
+    }
+    let _decision = decision.into_decision();
+    Ok(committed)
 }
 
 /// Queries the Kernel-owned pending verifier dispatches for one bounded drain
