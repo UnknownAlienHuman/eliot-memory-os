@@ -445,7 +445,7 @@ def _render_human(result: dict) -> str:
             lines.append("PASS: explicitly requested full-project proof satisfied.")
         else:
             lines.append(f"PASS: explicitly requested {result['proof']} proof satisfied "
-                         "(selected-verification-only; not full completion).")
+                         f"(ceiling {result['proof_ceiling']}; not full completion).")
     elif result["exit"] == 2:
         lines.append(f"CONFIGURATION: {result['terminal_detail']}")
     else:
