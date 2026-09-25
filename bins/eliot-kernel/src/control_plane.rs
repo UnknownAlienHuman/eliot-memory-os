@@ -655,6 +655,15 @@ impl KernelComposition {
             activation_receipt,
             store_rebind_receipt,
             supervision_lease,
+            // #961 read-only retirement projections. The authenticated
+            // boundary below refuses `ReadRuntimeLeaseCensus` and
+            // `ReadIntroductionRows` with a typed `InvalidField`, because no
+            // ORS owner read returns a complete runtime-lease census or a
+            // complete introduction set. A response therefore never carries
+            // either projection, and the two refusals keep the census out of
+            // readiness, activation and rebind answers by construction.
+            runtime_lease_census: None,
+            introduction_rows: None,
             error: None,
             payload_digest: String::new(),
         }

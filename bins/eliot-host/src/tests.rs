@@ -285,6 +285,10 @@ fn activate_response_uncertainty_reconciles_but_exact_rejection_does_not() -> Te
         activation_receipt: None,
         store_rebind_receipt: None,
         supervision_lease: None,
+        // #961 read-only retirement projections; the authenticated Kernel
+        // boundary never authors either, and this fixture authors none.
+        runtime_lease_census: None,
+        introduction_rows: None,
         error,
         payload_digest: String::new(),
     };

@@ -13,6 +13,9 @@
 
 /// Backup configuration evidence projection (B-BACKUP-HOST-PREP #958).
 pub mod backup_config_projection;
+/// Host-owned installation post-restore cutover (#961).
+#[cfg(windows)]
+pub mod backup_cutover;
 /// Host-owned isolated backup destination preparation (B-BACKUP-HOST-PREP #958).
 pub mod backup_preparation;
 mod credential_control;
@@ -28,11 +31,19 @@ mod host_composition_validation;
 /// own serialized turns, never a second copy.
 pub mod host_diagnostics;
 mod host_job_launch;
+/// Authenticated Kernel ORS introduction readback for cutover evidence
+/// (issue #961, F-AUR-1).
+#[cfg(windows)]
+mod introduction_readback;
 #[cfg(windows)]
 mod launch_artifact;
 #[cfg(windows)]
 mod launch_descriptor_validation;
 mod launch_options;
+/// Exact-generation lease census and retirement admission (#1751 Host
+/// owner, consumed by #961 cutover).
+#[cfg(windows)]
+mod lease_drain;
 #[cfg(windows)]
 mod reactive_context_delivery;
 mod scm_launch;
@@ -148,6 +159,8 @@ use launch_descriptor_validation::{
 };
 pub use launch_options::HostLaunchOptions;
 use launch_options::valid_sha256_text;
+#[cfg(windows)]
+pub use lease_drain::{GenerationRetirementBarrier, GenerationRetirementFence};
 #[cfg(windows)]
 pub use reactive_context_delivery::{
     HostReactiveContextDeliveryError, HostReactiveContextProducer, HostReactiveContextProducerError,
@@ -3984,6 +3997,25 @@ pub(crate) fn open_registry_store_at(
     })
 }
 
+/// One real, type-checked backup dispatch target (#961).
+///
+/// The dispatch table in
+/// [`HostComposition::register_backup_dispatch`] carries owner-path markers
+/// for documentation; this enum is the routing decision the production
+/// dispatch arms actually follow, so a cutover cannot reach the #961 owner
+/// chain through an unchecked string. Each variant names exactly one
+/// admitted owner port:
+/// - `Prepare` — [`HostComposition::backup_dispatch_prepare`], delegating to
+///   [`crate::backup_preparation::DelegatedPreparation::prepare`];
+/// - `Cutover` — [`HostComposition::backup_dispatch_cutover`], delegating to
+///   [`crate::backup_cutover::execute_cutover`] under a separate cutover
+///   admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackupDispatchTarget {
+    Prepare,
+    Cutover,
+}
+
 impl HostComposition {
     /// Opens one short-lived installation-registry handle below the retained
     /// Host root (#1339, A13.9). The caller drops it after one CAS or load.
@@ -4118,6 +4150,38 @@ impl HostComposition {
             Self::backup_dispatch_needs_cutover_admission(BackupOp::CompleteRehearsal),
             None
         );
+        // Pin the type-checked routing table against the admission table and
+        // the registration table: every registration entry must resolve
+        // the same real dispatch target, and rehearsal completion must
+        // resolve none in both.
+        debug_assert_eq!(
+            Self::backup_dispatch_target(BackupOp::PrepareIsolatedRestore),
+            Some(BackupDispatchTarget::Prepare)
+        );
+        debug_assert_eq!(
+            Self::backup_dispatch_target(BackupOp::AdmitCutover),
+            Some(BackupDispatchTarget::Cutover)
+        );
+        debug_assert_eq!(
+            Self::backup_dispatch_target(BackupOp::CompleteRehearsal),
+            None
+        );
+        for (operation, _, needs_cutover_admission) in dispatch {
+            // Every registered entry must resolve a real type-checked
+            // dispatch target: the marker table alone is documentation, so
+            // without this an entry could name a path that no typed arm
+            // follows.
+            debug_assert!(Self::backup_dispatch_target(operation).is_some());
+            // The registration flag is the "needs a separate cutover
+            // admission" bit, so it must agree with the admission table.
+            // It is deliberately NOT compared against `is_some()`: a
+            // prepared operation resolves a `Prepare` target and still
+            // needs no cutover admission.
+            debug_assert_eq!(
+                Self::backup_dispatch_needs_cutover_admission(operation),
+                Some(needs_cutover_admission)
+            );
+        }
     }
 
     /// Reports whether one backup operation needs a separate cutover
@@ -4137,6 +4201,32 @@ impl HostComposition {
             // `CompleteRehearsal` and every other operation share this arm:
             // rehearsal completion has no dispatch entry, so it can never
             // resolve cutover.
+            _ => None,
+        }
+    }
+
+    /// Resolves one admitted backup operation to the real owner dispatch
+    /// target the Host composition actually follows (#961).
+    ///
+    /// The dispatch table's `&'static str` markers stay documentation; this
+    /// typed resolution is the routing decision the production cutover arm
+    /// is dispatched on, so a cutover reaches
+    /// [`HostComposition::backup_dispatch_cutover`] through a type-checked
+    /// match instead of an unchecked string. `None` is returned for every
+    /// operation with no dispatch entry, including `COMPLETE_REHEARSAL`.
+    /// [`HostComposition::validate_backup_dispatch_prepare_routing`] pins
+    /// this table against the registration table and against
+    /// [`HostComposition::backup_dispatch_needs_cutover_admission`], so the
+    /// two cannot rot apart.
+    pub fn backup_dispatch_target(
+        operation: eliot_protocol::backup::BackupOperationKind,
+    ) -> Option<BackupDispatchTarget> {
+        use eliot_protocol::backup::BackupOperationKind as BackupOp;
+        match operation {
+            BackupOp::PrepareIsolatedRestore => Some(BackupDispatchTarget::Prepare),
+            BackupOp::AdmitCutover => Some(BackupDispatchTarget::Cutover),
+            // No dispatch entry: rehearsal completion and every other
+            // operation can never resolve a dispatch target.
             _ => None,
         }
     }
@@ -4171,6 +4261,134 @@ impl HostComposition {
         // it, and rehearsal completion to no entry.
         Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
         self.prepare_backup_destination(journal, caller, request)
+    }
+
+    /// Dispatches one admitted installation cutover through the existing
+    /// owner chain (#961). This is the exact admitted cutover port
+    /// delegation: it is the production caller of
+    /// [`crate::backup_cutover::execute_cutover`], which is the owner path
+    /// the registration marker names.
+    ///
+    /// Real owner calls, in order: the type-checked
+    /// [`HostComposition::backup_dispatch_target`] resolution (a
+    /// non-`Cutover` operation, including `COMPLETE_REHEARSAL`, refuses
+    /// before any owner call, so a rehearsal completion can never reach
+    /// cutover); the shared
+    /// [`HostComposition::validate_backup_dispatch_prepare_routing`] pin; a
+    /// fresh short-lived registry readback through
+    /// [`Self::open_registry_store`] plus
+    /// [`RedbInstallationRegistry::load`] feeding
+    /// [`crate::backup_cutover::validate_cutover_request`] (the same
+    /// fail-closed gate set the owner runs, never a local boolean); the
+    /// durable Host activation identity read from the journal owner, so the
+    /// activation bound by the cutover is the Host's own committed
+    /// generation and not a caller-supplied copy; then
+    /// [`crate::backup_cutover::execute_cutover`], which re-reads the
+    /// registry owner (TOCTOU fence), live-verifies the prior
+    /// capability-introduction set through the authenticated Kernel front
+    /// door, requires the exact-fence
+    /// [`GenerationRetirementBarrier`], and only then performs the
+    /// activation CAS. Finally the bounded reconciliation is closed by
+    /// re-reading the real registry owner and projecting it through
+    /// [`crate::backup_cutover::reconcile_cutover_outcome`] under the same
+    /// operation identity, so a lost response or a crash between the
+    /// registry and the journal returns the exact `Unknown` disposition
+    /// instead of a local assumption. No algorithm is reimplemented here and
+    /// no cutover is executed at Host startup: this method runs only when an
+    /// admitted cutover operation is dispatched.
+    ///
+    /// Prior-generation process/SCM retirement remains a separate explicitly
+    /// authorized
+    /// [`crate::backup_cutover::retire_prior_generation`] step holding the
+    /// returned barrier; source retention and erasure are never automatic
+    /// cleanup here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CutoverError`](crate::backup_cutover::CutoverError) when the
+    /// operation does not resolve to the cutover dispatch target, the Host
+    /// activation is absent, the owner gate set, retirement barrier, or
+    /// registry CAS refuses, or the post-commit owner readback does not show
+    /// the committed target generation.
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the admitted cutover port delegation keeps the owner gate set, the durable activation binding, and the owner-readback reconciliation in one fail-closed boundary"
+    )]
+    pub fn backup_dispatch_cutover(
+        &mut self,
+        operation: eliot_protocol::backup::BackupOperationKind,
+        request: &crate::backup_cutover::CutoverRequest,
+        evidence: &crate::backup_cutover::IsolatedRecoveryEvidence,
+        retirement: &GenerationRetirementFence,
+    ) -> Result<
+        (
+            crate::backup_cutover::CutoverOutcome,
+            GenerationRetirementBarrier,
+        ),
+        crate::backup_cutover::CutoverError,
+    > {
+        use crate::backup_cutover::{
+            CutoverDisposition, CutoverError, execute_cutover, reconcile_cutover_outcome,
+            validate_cutover_request,
+        };
+        // Real dispatch decision: only the separately admitted cutover
+        // operation resolves `Cutover`. Rehearsal completion and preparation
+        // refuse here, before any owner call.
+        if Self::backup_dispatch_target(operation) != Some(BackupDispatchTarget::Cutover) {
+            return Err(CutoverError::NotSeparatelyAdmitted(format!(
+                "backup operation {operation:?} is not the admitted cutover dispatch"
+            )));
+        }
+        // Route through the shared dispatch validation before delegating,
+        // exactly as the preparation arm does.
+        Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
+        // Owner gate set against a fresh registry projection, through the
+        // owner's own validator. No local boolean stands in for any gate.
+        let registry = self
+            .open_registry_store()?
+            .load()
+            .map_err(|error| CutoverError::Registry(error.to_string()))?;
+        let validated = validate_cutover_request(request, evidence, &registry)?;
+        drop(registry);
+        // The activation bound to the cutover is the Host journal owner's
+        // committed generation, never a caller-supplied copy.
+        let state = self.journal.snapshot().map_err(|error| {
+            CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string()))
+        })?;
+        let activation = state
+            .activation
+            .as_ref()
+            .ok_or(CutoverError::HostTransition(HostError::OwnerLeaseRecovery(
+                "cutover dispatch has no durable Host activation".to_owned(),
+            )))?;
+        let activation_id = activation.activation_id.clone();
+        let activation_generation = activation.fence.activation_generation.clone();
+        let (committed, barrier) = execute_cutover(
+            self,
+            &validated,
+            retirement,
+            &activation_id,
+            &activation_generation,
+        )?;
+        // Bounded reconciliation closed by a real owner readback under the
+        // same operation identity. The journal retirement receipt is
+        // genuinely absent here: retirement is a separate explicitly
+        // authorized step, so the registry flip alone is the observed proof.
+        let readback = self
+            .open_registry_store()?
+            .load()
+            .map_err(|error| CutoverError::Registry(error.to_string()))?;
+        let reconciled = reconcile_cutover_outcome(
+            &committed.operation,
+            readback.active_generation(),
+            &validated.request.target_generation,
+            None,
+        );
+        if reconciled.disposition != CutoverDisposition::Committed {
+            return Ok((reconciled, barrier));
+        }
+        Ok((committed, barrier))
     }
 
     /// Opens the durable Host contour for one installation identity and

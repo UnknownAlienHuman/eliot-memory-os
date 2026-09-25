@@ -1937,7 +1937,10 @@ pub enum OperationalPhase {
 }
 
 /// Integrity-bound receipt created only by the durable store implementation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+///
+/// `Deserialize` (M2 integration adaptation, mirroring every neighboring
+/// row type) is transport only; issuance stays store-owned.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OperationalMutationReceipt {
     record_id: OperationIdentity,
     subject_id: OperationIdentity,
@@ -2045,7 +2048,12 @@ impl CapabilityGrantProjection {
 /// Introductions never reactivate: only an `Active` row carries usable
 /// authority and only a `Fenced` row carries fence evidence. Any other phase
 /// under this kind is an integrity problem, never a third lifecycle state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// `Deserialize` (M2 integration adaptation, mirroring every neighboring
+/// row type) lets the admitted-cutover console envelope carry exact
+/// owner-shaped readback rows; it grants no authority and changes no row
+/// semantics.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct CapabilityIntroductionProjection {
     record: OperationalRecordInput,
     phase: OperationalPhase,
