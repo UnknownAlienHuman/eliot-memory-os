@@ -218,18 +218,14 @@ impl KernelComposition {
     /// open pipe, or a heartbeat.
     #[must_use]
     pub fn activation_operational_view(&self) -> KernelActivationView {
-        let state = match self.service_state() {
-            Ok(state) => state,
-            Err(_) => {
-                observe_health("kernel.activation.view_projected", "fenced");
-                return KernelActivationView::FENCED;
-            }
+        let Ok(state) = self.service_state() else {
+            observe_health("kernel.activation.view_projected", "fenced");
+            return KernelActivationView::FENCED;
         };
         let generation_bound = self
             .front_door_policy
             .lock()
-            .map(|policy| policy.module_generation.generation.value() != 0)
-            .unwrap_or(false);
+            .is_ok_and(|policy| policy.module_generation.generation.value() != 0);
         let census = self.idle_lease_census();
         let view = KernelActivationView {
             service_state: kernel_service_state_code(state),

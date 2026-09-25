@@ -129,9 +129,11 @@ impl KernelComposition {
                 }
             }
             // An absent head for an admitted contour is an exact-mismatch, not
-            // an expired lease; coverage cannot be claimed from it.
-            Ok(None) => KernelIdleLeaseCensus::Unavailable,
-            Err(_) => KernelIdleLeaseCensus::Unavailable,
+            // an expired lease; coverage cannot be claimed from it. A read that
+            // cannot be proven is treated exactly the same way: neither is
+            // evidence that the installation is idle, so both legs answer
+            // Unavailable and the drain gate stays closed.
+            Ok(None) | Err(_) => KernelIdleLeaseCensus::Unavailable,
         }
     }
 

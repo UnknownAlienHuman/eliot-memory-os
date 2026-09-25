@@ -116,8 +116,8 @@ pub(super) fn read_manifest_current_supervision_lease(
 /// Returns the exact Kernel-signed supervision lease that still owes coverage
 /// for `activation_id`, or `None` when no published lease is live for it.
 ///
-/// I1.5 idle-drain gate: "Idle drain starts only when no RuntimeLease remains
-/// and no valid SupervisionLease requires live sensing/containment". This is
+/// I1.5 idle-drain gate: "Idle drain starts only when no `RuntimeLease` remains
+/// and no valid `SupervisionLease` requires live sensing/containment". This is
 /// the read-only half of the same publisher/decoder pair that commits the
 /// publication, so the census never introduces a second reader of a
 /// Watchdog-owned file, a second signature policy, or a second copy of the

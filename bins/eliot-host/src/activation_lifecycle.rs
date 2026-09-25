@@ -80,7 +80,7 @@ pub enum ActivationTriggerClass {
     UiRequest,
     /// Agent bridge / MCP attach or tool call.
     AgentBridgeAttach,
-    /// ELIOT-launched AgentAttempt or external-agent reconciliation.
+    /// ELIOT-launched `AgentAttempt` or external-agent reconciliation.
     AgentAttempt,
     /// Approved maintenance, backup, migration or recovery job.
     ApprovedMaintenanceJob,
@@ -237,7 +237,7 @@ pub struct ActivationAdmission {
     pub runtime_lease_refs: Vec<PlatformHandle>,
     /// Supervision-lease references the generation holds.
     pub supervision_lease_refs: Vec<PlatformHandle>,
-    /// WakeIntent references the generation holds.
+    /// `WakeIntent` references the generation holds.
     pub wake_intent_refs: Vec<PlatformHandle>,
     /// Durable wake-during-drain disposition, once a drain ran.
     pub drain_disposition: Option<WakeDisposition>,
@@ -337,7 +337,7 @@ impl HostComposition {
             // observable request is exactly that revalidation point, so the
             // generation revalidates its queued WakeIntents here instead of
             // executing anything it once scheduled.
-            self.revalidate_pending_wakes(&activation, trigger, &evidence)?;
+            self.revalidate_pending_wakes(&activation, trigger, evidence)?;
             DrainWakeOutcome::Proceed
         } else {
             return Err(HostError::OwnerLeaseRecovery(format!(
@@ -438,7 +438,7 @@ impl HostComposition {
                 host_terminal.disarm();
                 return Ok(true);
             }
-            Some(DrainState::Cancelled) | Some(DrainState::Failed) => {
+            Some(DrainState::Cancelled | DrainState::Failed) => {
                 host_lifecycle_observe_drain("host.idle-drain generation-spent");
                 host_terminal.disarm();
                 return Ok(false);
@@ -474,8 +474,8 @@ impl HostComposition {
 
     /// Establishes the generation-scoped lease census that gates idle drain.
     ///
-    /// I1.5: "Idle drain starts only when no RuntimeLease remains and no valid
-    /// SupervisionLease requires live sensing/containment." The census has two
+    /// I1.5: "Idle drain starts only when no `RuntimeLease` remains and no valid
+    /// `SupervisionLease` requires live sensing/containment." The census has two
     /// independent legs and reports `Unavailable` rather than `Idle` whenever a
     /// leg cannot be established.
     ///
@@ -598,7 +598,7 @@ impl HostComposition {
     /// Marks every `CLAIMED` `WakeIntent` of the current generation as started
     /// and satisfied.
     ///
-    /// The caller is the readiness-proving path: a claimed WakeIntent may only
+    /// The caller is the readiness-proving path: a claimed `WakeIntent` may only
     /// be reported satisfied after a fresh authenticated readiness proof
     /// established that this generation is back in service. A `WakeIntent` is
     /// never satisfied from liveness, an open pipe, or a queued state.
