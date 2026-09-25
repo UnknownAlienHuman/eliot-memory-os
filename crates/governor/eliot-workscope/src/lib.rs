@@ -2098,4 +2098,130 @@ mod tests {
             TaskBindingState::Exploratory { .. }
         ));
     }
+
+    fn bootstrap_evidence() -> BootstrapScanEvidence {
+        BootstrapScanEvidence {
+            canonical_root_ref: "root:a".into(),
+            filesystem_identity_ref: "root:a".into(),
+            vcs_branch_ref: None,
+            vcs_commit_ref: None,
+            vcs_dirty_summary_ref: None,
+            file_distribution: Vec::new(),
+            manifests: Vec::new(),
+            build_profiles: Vec::new(),
+            root_services: Vec::new(),
+            editor_workspaces: Vec::new(),
+            existing_records: Vec::new(),
+            adapters: Vec::new(),
+            recent_changes: Vec::new(),
+            artifact_dirs: Vec::new(),
+            execution_identity: None,
+            broker_attached: None,
+            redacted_literal_identities: Vec::new(),
+            unresolved_fields: Vec::new(),
+        }
+    }
+
+    fn bootstrap_lease() -> DiscoveryReadLease {
+        match issue_discovery_lease(&DiscoveryLeaseRequest {
+            proposer_ref: "proposer:one".into(),
+            session_ref: "session:one".into(),
+            host_ref: "host:one".into(),
+            candidate_root_ref: "root:a".into(),
+            root_filesystem_identity_ref: "root:a".into(),
+            allowed_reads: vec![DiscoveryRead::FilesystemIdentity],
+            consumption_limit: 4,
+            deadline: 10,
+        }) {
+            Ok(value) => value,
+            Err(error) => panic!("lease fixture is invalid: {error}"),
+        }
+    }
+
+    fn bootstrap_boundary() -> PrivacyBoundary {
+        PrivacyBoundary {
+            boundary_ref: "boundary:one".into(),
+            admitted_classes: vec![PrivacyClass::Internal],
+            lineage: None,
+        }
+    }
+
+    #[test]
+    fn a1_valid_lease_bootstrap_returns_profile_and_receipt_with_allowed_classes_only() {
+        let mut lease = bootstrap_lease();
+        let boundary = bootstrap_boundary();
+        let outcome = match BootstrapScanner::scan(
+            "scan:one",
+            &mut lease,
+            PrivacyClass::Internal,
+            Some(&boundary),
+            &bootstrap_evidence(),
+            ScopeKind::GitRepo,
+            "fingerprint:one",
+            Vec::new(),
+            1,
+        ) {
+            Ok(value) => value,
+            Err(error) => panic!("valid-lease bootstrap failed: {error}"),
+        };
+        let (profile, receipt) = match outcome {
+            BootstrapScanOutcome::Completed {
+                profile,
+                receipt,
+                resolver_inputs: _,
+            } => (profile, receipt),
+            BootstrapScanOutcome::PrivacyBoundaryRequired { code, .. } => {
+                panic!("valid-lease bootstrap demanded a boundary: {code}")
+            }
+        };
+        assert_eq!(receipt.allowed, vec![DiscoveryRead::FilesystemIdentity]);
+        assert!(receipt.omitted.contains(&ForbiddenScanClass::CommandLines));
+        assert!(receipt.omitted.contains(&ForbiddenScanClass::RecentOutput));
+        assert!(
+            receipt
+                .omitted
+                .contains(&ForbiddenScanClass::NeighboringRoots)
+        );
+        assert!(
+            receipt
+                .omitted
+                .contains(&ForbiddenScanClass::SecretLiterals)
+        );
+        assert!(receipt.redacted.is_empty());
+        assert_eq!(receipt.lease_ref, lease.lease_ref);
+        assert_eq!(receipt.candidate_root_ref, "root:a");
+        assert_eq!(profile.roots, vec!["root:a".to_owned()]);
+        assert_eq!(lease.consumed, 1);
+    }
+
+    #[test]
+    fn a2_missing_boundary_returns_boundary_required_with_question_only() {
+        let mut lease = bootstrap_lease();
+        let outcome = match BootstrapScanner::scan(
+            "scan:one",
+            &mut lease,
+            PrivacyClass::Internal,
+            None,
+            &bootstrap_evidence(),
+            ScopeKind::GitRepo,
+            "fingerprint:one",
+            Vec::new(),
+            1,
+        ) {
+            Ok(value) => value,
+            Err(error) => panic!("boundary-less scan failed: {error}"),
+        };
+        let (code, question) = match outcome {
+            BootstrapScanOutcome::PrivacyBoundaryRequired {
+                code,
+                discriminative_question,
+            } => (code, discriminative_question),
+            BootstrapScanOutcome::Completed { .. } => {
+                panic!("boundary-less scan persisted a profile")
+            }
+        };
+        assert_eq!(code, SCAN_PRIVACY_BOUNDARY_REQUIRED);
+        assert!(!question.trim().is_empty());
+        assert_eq!(lease.consumed, 0);
+    }
 }
