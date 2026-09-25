@@ -141,10 +141,15 @@ pub struct WorkspaceInstanceIdentity {
 }
 
 /// Evidence-backed candidate, not an authenticated authority binding.
+///
+/// `descriptor_revision` is the `WorkScopeDescriptor` revision this candidate
+/// was observed at; the binding-token tier (I4.2 step 2) names exactly this
+/// revision, so a token for a superseded revision never resolves here.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkScopeCandidate {
     pub scope: ScopeIdentity,
+    pub descriptor_revision: u64,
     pub lineage: Option<RepositoryLineageIdentity>,
     pub instance: WorkspaceInstanceIdentity,
     pub privacy_class: PrivacyClass,
@@ -546,6 +551,10 @@ impl WorkScopeCandidateSet {
         text(&observed_root_ref, "observed_root_ref")?;
         for candidate in &candidates {
             candidate.scope.validate()?;
+            counter(
+                candidate.descriptor_revision,
+                "candidate.descriptor_revision",
+            )?;
             candidate.instance.validate()?;
             if let Some(lineage) = &candidate.lineage {
                 lineage.validate()?;
@@ -1613,6 +1622,7 @@ mod tests {
                 generation: 1,
             },
             scope,
+            descriptor_revision: 1,
             lineage: Some(RepositoryLineageIdentity {
                 lineage_ref: "lineage:one".into(),
                 object_store_ref: "store:one".into(),

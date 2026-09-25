@@ -544,6 +544,14 @@ impl DaemonComposition {
         // handoff (prepared envelope submitted) and the commitment (validated
         // owner receipt) stay distinguishable in the sink.
         let _span = tracing::info_span!("eliotd.canonical_commit").entered();
+        // Issue #1787: the scope-sensitive canonical-write trigger runs before
+        // any commit. When a WorkScope binding is retained, a write addressing
+        // another scope quarantines here instead of committing against the
+        // wrong workspace; with no retained binding there is nothing to
+        // revalidate and the write proceeds unchanged.
+        self.governor
+            .check_canonical_write_work_scope(envelope.scope_id.as_str())
+            .map_err(DaemonError::Composition)?;
         let receipt = self
             .governor
             .commit_canonical_with_readiness(identity, envelope, readiness)

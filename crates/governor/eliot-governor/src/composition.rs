@@ -65,6 +65,7 @@ use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
 use eliot_protocol::RequestIdentity;
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
+use eliot_security_contracts::PrivacyClass;
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
@@ -77,8 +78,11 @@ use eliot_testd_core::{
     TestdSourceObservationRange, TestdStore, TestdTerminalCompletionEvidence, VerificationReceipt,
 };
 use eliot_workscope::{
-    MaterialAdmission, MaterialReadinessInputs, RequestedEffect, WorkScopeBindingOwner,
-    WorkScopeBindingSnapshot, evaluate_material_request,
+    GenerationEvidence, GuardTrigger, GuardVerdict, IdentityLegOutcome, MaterialAdmission,
+    MaterialReadinessInputs, RequestedEffect, ScopeBinding, ScopeRelocationOrAttachReceipt,
+    TriggerAdmission, TriggerReport, WorkScopeBindingOwner, WorkScopeBindingSnapshot,
+    WorkScopeDescriptor, WorkScopeResolutionReceipt, admit_at_trigger, check_at_trigger,
+    evaluate_material_request, rebind_with_receipt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -4110,6 +4114,150 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )
     }
 
+    /// Runs the `ScopeBindingGuard` at one mandatory trigger against the live
+    /// retained `WorkScope` binding (issue #1787, `CanonicalWrite` trigger
+    /// wiring).
+    ///
+    /// Reads the live [`WorkScopeBindingOwner`] at the retained fence and
+    /// evaluates [`check_at_trigger`] with the caller-supplied observation:
+    /// mechanical truth enters only through `observed`, never from retained
+    /// fields. Without governing-source closure only the identity legs run, so
+    /// a mismatching observation withholds or quarantines exactly as with a
+    /// receipt while an identity-clear observation withholds pending source
+    /// closure instead of allowing. Fails closed when no binding is retained
+    /// or the owner read disagrees with the fence.
+    pub fn check_work_scope_at_trigger(
+        &self,
+        observed: &ScopeBinding,
+        trigger: GuardTrigger,
+    ) -> Result<TriggerReport, CompositionError> {
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "WorkScope binding is unbound; guard revalidation is unavailable".to_owned(),
+            )
+        })?;
+        let fence = self.snapshot.state_fence();
+        let snapshot = owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        Ok(check_at_trigger(&snapshot.binding, observed, None, trigger))
+    }
+
+    /// Admits one trigger-gated operation against live `WorkScope` authority
+    /// (issue #1787, admission wiring).
+    ///
+    /// Joins the live owner read, the retained resource descriptor, and the
+    /// owner-issued resolution receipt through [`admit_at_trigger`]. Authority
+    /// comes from the live owner read and the retained descriptor, never from
+    /// receipt fields alone. Fails closed when no binding is retained.
+    pub fn admit_work_scope_at_trigger(
+        &self,
+        descriptor: &WorkScopeDescriptor,
+        receipt: &WorkScopeResolutionReceipt,
+        observed_generation: &GenerationEvidence,
+        fence: &StateFence,
+        trigger: GuardTrigger,
+    ) -> Result<TriggerAdmission, CompositionError> {
+        let Some(owner) = self.owners.work_scope.as_ref() else {
+            return Err(CompositionError::Recovery(
+                "WorkScope binding is unbound; trigger admission is unavailable".to_owned(),
+            ));
+        };
+        admit_at_trigger(
+            owner,
+            descriptor,
+            receipt,
+            observed_generation,
+            fence,
+            trigger,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Admits an authorized relocation/attach receipt as the new expected
+    /// `WorkScope` binding (issue #1787, rebind wiring).
+    ///
+    /// Validates the receipt through [`rebind_with_receipt`] and requires the
+    /// derived binding to be identity-clear against the caller-supplied live
+    /// observation: a rebind that disagrees with what is actually observed
+    /// fails instead of installing a stale binding. The returned binding is
+    /// the expected binding for the next owner snapshot; persisting it as the
+    /// current owner snapshot belongs to the recovery/bootstrap path that
+    /// owns owner writes.
+    pub fn rebind_work_scope_with_receipt(
+        receipt: &ScopeRelocationOrAttachReceipt,
+        expected_scope_ref: &str,
+        privacy_class: PrivacyClass,
+        governing_source_generation: u64,
+        fence: &StateFence,
+        observed: &ScopeBinding,
+    ) -> Result<ScopeBinding, CompositionError> {
+        let binding = rebind_with_receipt(
+            receipt,
+            expected_scope_ref,
+            privacy_class,
+            governing_source_generation,
+            fence,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if eliot_workscope::identity_legs(&binding, observed) != IdentityLegOutcome::IdentityClear {
+            return Err(CompositionError::Recovery(
+                "rebound WorkScope binding disagrees with the live observation".to_owned(),
+            ));
+        }
+        Ok(binding)
+    }
+
+    /// Guards one scope-sensitive canonical write with the `ScopeBindingGuard`
+    /// (issue #1787, `CanonicalWrite` trigger production caller).
+    ///
+    /// When a `WorkScope` binding is retained, the write's own scope claim is
+    /// tested against it through [`check_at_trigger`] at
+    /// [`GuardTrigger::CanonicalWrite`]: the observed binding carries the
+    /// write-claimed scope reference over the retained instance, root,
+    /// generation, privacy, and source-generation facts, so the guard can
+    /// prove a scope mismatch without ever minting authority from the claim.
+    /// A quarantined or non-identity-clear report fails the write before any
+    /// canonical commit; an identity-clear observation proceeds because the
+    /// guard proved no mismatch (source-closure enforcement lives at
+    /// issuance and admission, where sources exist). With no retained binding
+    /// there is nothing to revalidate and the write proceeds unchanged, so
+    /// pre-bootstrap genesis writes keep working.
+    pub fn check_canonical_write_work_scope(
+        &self,
+        scope_id: &str,
+    ) -> Result<Option<TriggerReport>, CompositionError> {
+        let Some(owner) = self.owners.work_scope.as_ref() else {
+            return Ok(None);
+        };
+        let fence = self.snapshot.state_fence();
+        let snapshot = owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let mut observed_scope = snapshot.binding.scope.clone();
+        scope_id.clone_into(&mut observed_scope.scope_ref);
+        let observed = ScopeBinding {
+            scope: observed_scope,
+            privacy_class: snapshot.binding.privacy_class,
+            governing_source_generation: snapshot.binding.governing_source_generation,
+        };
+        let report = check_at_trigger(
+            &snapshot.binding,
+            &observed,
+            None,
+            GuardTrigger::CanonicalWrite,
+        );
+        if report.verdict == GuardVerdict::Quarantine
+            || report.identity != IdentityLegOutcome::IdentityClear
+        {
+            return Err(CompositionError::Recovery(format!(
+                "canonical write addresses scope {scope_id} while WorkScope is bound to {}; guard verdict {:?}",
+                snapshot.binding.scope.scope_ref, report.verdict,
+            )));
+        }
+        Ok(Some(report))
+    }
+
     /// Applies one Canonical-admitted transition through the sole retained
     /// Kernel port under the exact admitted request identity. Callers cannot
     /// provide a second client or bypass Canonical admission with an
@@ -7590,6 +7738,7 @@ mod tests {
         let lineage = readiness_lineage();
         let candidate = eliot_workscope::WorkScopeCandidate {
             scope: scope.clone(),
+            descriptor_revision: 1,
             lineage: Some(lineage.clone()),
             instance: instance.clone(),
             privacy_class: eliot_security_contracts::PrivacyClass::Internal,

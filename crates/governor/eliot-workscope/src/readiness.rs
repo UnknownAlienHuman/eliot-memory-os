@@ -712,6 +712,7 @@ mod tests {
                 generation: 1,
             },
             scope,
+            descriptor_revision: 1,
             lineage: Some(RepositoryLineageIdentity {
                 lineage_ref: "lineage:one".into(),
                 object_store_ref: "store:one".into(),
