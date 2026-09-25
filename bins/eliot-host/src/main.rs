@@ -6,6 +6,8 @@ use std::io::{self, BufRead, Write};
 use std::sync::OnceLock;
 
 #[cfg(windows)]
+use eliot_host::activation_lifecycle::{ActivationTriggerClass, DrainWakeOutcome, IdleLeaseCensus};
+#[cfg(windows)]
 use eliot_host::{
     HostBranchDisposition, HostLivenessTick, HostReactiveContextProducer,
     HostRuntimeControlOperation, HostRuntimeControlResponse,
@@ -14,6 +16,10 @@ use eliot_host::{
     HostComposition, HostError, HostLaunchOptions, HostPhaseBRequestQueue, PROTOCOL_VERSION,
     SERVICE_NAME,
 };
+#[cfg(windows)]
+use eliot_host_state::WakeDisposition;
+#[cfg(windows)]
+use eliot_platform::PlatformHandle;
 use host_console_protocol::{Request, Response, write_response};
 
 static PROCESS_BOOTSTRAP: OnceLock<Result<HostLaunchOptions, String>> = OnceLock::new();
@@ -863,9 +869,15 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
     report.controls_accepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
     report.check_point = 0;
     let _ = report_service_status(&handle, &report);
+    let mut idle_drain = HostIdleDrainSupervisor::new();
     while !STOP_REQUESTED.load(Ordering::Acquire) && host.running() {
         process_phase_b_requests(&mut host, &phase_b_queue);
-        process_runtime_control_requests(&mut host, &runtime_queue);
+        // I1.5: an authenticated request on the runtime-control plane is an
+        // observable-use trigger. It both restarts the idle grace and may
+        // cancel a pre-linearization drain.
+        for evidence in process_runtime_control_requests(&mut host, &runtime_queue) {
+            idle_drain.note_observable_use(&mut host, &evidence);
+        }
         match host.has_durable_branch_fence() {
             Ok(true) => {
                 // A degraded branch has fenced the shared authority in the
@@ -884,9 +896,17 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                 break;
             }
         }
-        if host.has_process_contour() {
+        let tick = if host.has_process_contour() {
             match run_scm_contour_tick(&mut host) {
-                Ok(outcome) => report_scm_tick(outcome),
+                Ok(outcome) => {
+                    let reconciled = match outcome {
+                        ScmContourTickOutcome::Reconciled(disposition) => Some(disposition),
+                        ScmContourTickOutcome::LeasePreserved
+                        | ScmContourTickOutcome::ReadinessRetryPending => None,
+                    };
+                    report_scm_tick(outcome);
+                    reconciled
+                }
                 Err(error) => {
                     let _ = writeln!(
                         io::stderr().lock(),
@@ -896,6 +916,25 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                     break;
                 }
             }
+        } else {
+            None
+        };
+        if let Some(disposition) = tick {
+            idle_drain.observe_readiness(&mut host, disposition);
+        }
+        let now = std::time::Instant::now();
+        let drain_tick = idle_drain.evaluate(&mut host, now);
+        report_activation_diagnostics(&host, &idle_drain.last_census);
+        if drain_tick == IdleDrainTick::CommitDue {
+            // The ordered I1.5 idle-drain sequence lives in
+            // `HostComposition::stop`: it records `DrainCommitRecord`,
+            // terminates `eliotd` and the store bridge before Host exits,
+            // commits the clean marker and publishes `STOPPED_CLEAN`.
+            let _ = writeln!(
+                io::stderr().lock(),
+                "eliot-host: idle grace elapsed with no runtime or supervision lease; running the ordered idle-drain sequence"
+            );
+            break;
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
@@ -1062,11 +1101,20 @@ fn process_user_automation_request(
     )
 }
 
+/// Serves every queued authenticated runtime-control request and returns the
+/// durable trigger evidence of every request admitted in this pass.
+///
+/// I1.5 makes an authenticated Kernel/CLI/UI/bridge request an activation
+/// trigger, and the same request must be able to cancel a pre-linearization
+/// drain. Returning the evidence — instead of leaving the trigger implicit in
+/// the request handler — lets
+/// [`HostComposition::note_observable_use`] record it durably.
 #[cfg(windows)]
 fn process_runtime_control_requests(
     host: &mut HostComposition,
     queue: &eliot_host::HostRuntimeControlQueue,
-) {
+) -> Vec<PlatformHandle> {
+    let mut observed = Vec::new();
     loop {
         let request = match queue.lock() {
             Ok(mut q) => q.pop_front(),
@@ -1085,8 +1133,12 @@ fn process_runtime_control_requests(
                 process_user_automation_request(host, envelope.request())
             }
         };
+        // The authenticated request digest is the durable trigger evidence; the
+        // endpoint already proved the peer before queueing this envelope.
+        observed.push(envelope.request().request_digest.clone());
         let _ = envelope.respond(response);
     }
+    observed
 }
 
 #[cfg(windows)]
@@ -1182,6 +1234,257 @@ fn report_scm_tick(outcome: ScmContourTickOutcome) {
         io::stderr().lock(),
         "eliot-host: independent contour disposition: {disposition:?}"
     );
+}
+
+/// I1.5 Config Default: the default idle grace is five minutes. This is a
+/// configuration default, not an invariant, so the supervisor keeps it as one
+/// named constant instead of burying the value in the tick arithmetic.
+#[cfg(windows)]
+const HOST_IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// Bounded interval between two exact-fence lease censuses. The census reads
+/// durable state, so it stays off the 250 ms tick cadence.
+#[cfg(windows)]
+const HOST_LEASE_CENSUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Pre-linearization cancel window. The window is bounded so a stuck tick can
+/// never hold a cancelled-drain generation open indefinitely; the linearization
+/// point itself is the durable `DrainCommitRecord`, never this timer.
+#[cfg(windows)]
+const HOST_DRAIN_PRECOMMIT_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Terminal drain decision for one SCM tick.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdleDrainTick {
+    /// Nothing is due; the installation keeps running.
+    Idle,
+    /// A lease census leg is not established, so drain fails closed.
+    CensusDeferred,
+    /// The idle grace elapsed with no lease; the pre-commit drain window is now
+    /// open and cancellable.
+    PreCommitWindowOpen,
+    /// The pre-commit window elapsed unrecovered; run the ordered drain.
+    CommitDue,
+    /// The current generation's drain machine is already spent; a fresh
+    /// direct-child generation must be established before another drain.
+    GenerationSpent,
+}
+
+/// I1.5 idle-grace supervisor for the SCM service loop.
+///
+/// The supervisor owns no lifecycle: it opens the durable pre-commit drain
+/// window through [`HostComposition::begin_idle_drain`], and the ordered
+/// shutdown itself stays inside [`HostComposition::stop`]. Idle detection is
+/// reset by every authenticated observable-use request, so a request that
+/// arrives during the pre-commit window cancels the drain instead of racing
+/// the linearization point.
+#[cfg(windows)]
+struct HostIdleDrainSupervisor {
+    idle_since: Option<std::time::Instant>,
+    next_census_at: std::time::Instant,
+    precommit_opened_at: Option<std::time::Instant>,
+    last_census: IdleLeaseCensus,
+}
+
+#[cfg(windows)]
+impl HostIdleDrainSupervisor {
+    fn new() -> Self {
+        Self {
+            idle_since: None,
+            next_census_at: std::time::Instant::now(),
+            precommit_opened_at: None,
+            last_census: IdleLeaseCensus::Unavailable {
+                reason: "census-not-observed",
+            },
+        }
+    }
+
+    /// One authenticated observable-use trigger was admitted. I1.5: a trigger
+    /// before the durable drain linearization point cancels drain and returns
+    /// the same generation to `ACTIVE` after readiness revalidation.
+    fn note_observable_use(&mut self, host: &mut HostComposition, evidence: &PlatformHandle) {
+        self.idle_since = None;
+        self.precommit_opened_at = None;
+        match host.note_observable_use(ActivationTriggerClass::AgentBridgeAttach, evidence) {
+            Ok(DrainWakeOutcome::CancelDrain) => {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "eliot-host: observable use cancelled the pre-commit drain; readiness revalidation decides the return to ACTIVE"
+                );
+            }
+            Ok(DrainWakeOutcome::QueueNextGeneration) => {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "eliot-host: observable use arrived after DrainCommitRecord and was queued as the next activation generation"
+                );
+            }
+            Ok(DrainWakeOutcome::Proceed) => {}
+            Err(error) => {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "eliot-host: observable use was not admitted by the current activation generation: {error}"
+                );
+            }
+        }
+    }
+
+    /// Records a fresh authenticated readiness disposition. A drain cancelled
+    /// inside the pre-commit window only returns to `ACTIVE` through a
+    /// readiness proof, never through the cancellation itself.
+    fn observe_readiness(
+        &mut self,
+        host: &mut HostComposition,
+        disposition: HostBranchDisposition,
+    ) {
+        if disposition != HostBranchDisposition::Healthy {
+            return;
+        }
+        match host.resume_cancelled_drain(disposition) {
+            Ok(true) => {
+                self.precommit_opened_at = None;
+                self.idle_since = Some(std::time::Instant::now());
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "eliot-host: cancelled drain returned the same activation generation to ACTIVE after readiness revalidation"
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "eliot-host: cancelled drain could not be resumed into ACTIVE: {error}"
+                );
+            }
+        }
+        // I1.5: a claimed WakeIntent may only be reported satisfied from a fresh
+        // authenticated readiness proof, never from liveness or a queued state.
+        match host.satisfy_claimed_wakes() {
+            Ok(0) => {}
+            Ok(satisfied) => {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "eliot-host: {satisfied} revalidated WakeIntent(s) satisfied under the proven generation"
+                );
+            }
+            Err(error) => {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "eliot-host: claimed WakeIntents could not be satisfied: {error}"
+                );
+            }
+        }
+    }
+
+    /// Evaluates the idle grace and the exact-fence lease census for one tick,
+    /// opens the pre-commit drain window when the grace elapsed, and reports
+    /// the durable terminal decision.
+    fn evaluate(&mut self, host: &mut HostComposition, now: std::time::Instant) -> IdleDrainTick {
+        if host.has_durable_branch_fence().unwrap_or(true) {
+            // A degraded branch already fences shared authority; draining on
+            // top of it would report a clean stop for an unreconciled contour.
+            self.idle_since = None;
+            self.precommit_opened_at = None;
+            return IdleDrainTick::Idle;
+        }
+        if now >= self.next_census_at {
+            self.next_census_at = now + HOST_LEASE_CENSUS_INTERVAL;
+            self.last_census = host
+                .idle_lease_census()
+                .unwrap_or(IdleLeaseCensus::Unavailable {
+                    reason: "census-unreadable",
+                });
+        }
+        if !self.last_census.admits_drain() {
+            self.idle_since = None;
+            self.precommit_opened_at = None;
+            return IdleDrainTick::CensusDeferred;
+        }
+        let idle_since = *self.idle_since.get_or_insert(now);
+        if now.duration_since(idle_since) < HOST_IDLE_GRACE {
+            return IdleDrainTick::Idle;
+        }
+        let Some(opened) = self.precommit_opened_at else {
+            return match host.begin_idle_drain(self.last_census.observation_code()) {
+                Ok(true) => {
+                    self.precommit_opened_at = Some(now);
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "eliot-host: idle drain entered its pre-commit window; a new observable request can still cancel it"
+                    );
+                    IdleDrainTick::PreCommitWindowOpen
+                }
+                Ok(false) => {
+                    // The current generation's drain machine is already spent;
+                    // another drain needs a fresh direct-child generation.
+                    self.idle_since = None;
+                    IdleDrainTick::GenerationSpent
+                }
+                Err(error) => {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "eliot-host: idle drain could not open its pre-commit window: {error}"
+                    );
+                    self.idle_since = None;
+                    IdleDrainTick::CensusDeferred
+                }
+            };
+        };
+        if now.duration_since(opened) < HOST_DRAIN_PRECOMMIT_WINDOW {
+            IdleDrainTick::PreCommitWindowOpen
+        } else {
+            IdleDrainTick::CommitDue
+        }
+    }
+}
+
+/// Projects the activation state, generation, governance profile, active lease
+/// state and drain disposition through the existing minimal Host operational
+/// diagnostics (F-LOG-HOST-1, I15.4: bounded codes only, no identity, digest or
+/// free-text payload). Process liveness is never part of this projection.
+#[cfg(windows)]
+fn report_activation_diagnostics(host: &HostComposition, census: &IdleLeaseCensus) {
+    let admission = host.activation_admission();
+    let _ = writeln!(
+        io::stderr().lock(),
+        "eliot-host: activation state={} governance={} requested={} admitted={} runtime-leases={} supervision-leases={} wake-intents={} drain-leases={} drain-disposition={}",
+        admission
+            .as_ref()
+            .map_or("unavailable", |admission| admission.observation_code),
+        admission
+            .as_ref()
+            .map_or("unknown", |admission| admission.governance_profile.as_str()),
+        admission
+            .as_ref()
+            .map_or(0, |admission| admission.requested_capabilities.len()),
+        admission
+            .as_ref()
+            .map_or(0, |admission| admission.admitted_capabilities.len()),
+        admission
+            .as_ref()
+            .map_or(0, |admission| admission.runtime_lease_refs.len()),
+        admission
+            .as_ref()
+            .map_or(0, |admission| admission.supervision_lease_refs.len()),
+        admission
+            .as_ref()
+            .map_or(0, |admission| admission.wake_intent_refs.len()),
+        census.observation_code(),
+        match admission.as_ref() {
+            Ok(admission) => match admission.drain_disposition {
+                Some(disposition) => wake_disposition_code(disposition),
+                None => "none",
+            },
+            Err(_) => "unavailable",
+        },
+    );
+}
+
+#[cfg(windows)]
+const fn wake_disposition_code(disposition: WakeDisposition) -> &'static str {
+    match disposition {
+        WakeDisposition::CancelDrain => "cancel-drain",
+        WakeDisposition::QueueNextGeneration => "queue-next-generation",
+        WakeDisposition::RejectStale => "reject-stale",
+    }
 }
 
 #[cfg(windows)]

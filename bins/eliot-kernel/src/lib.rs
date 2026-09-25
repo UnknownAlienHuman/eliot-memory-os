@@ -109,10 +109,12 @@ use process_execution::{
 };
 pub use process_execution_client::process_execution_client;
 pub(crate) use shutdown_drain::{
-    DRAIN_RECEIPT_DEADLINE, DrainCommitDecision, DrainHalt, DrainWakeDisposition,
-    ShutdownDrainCoordinator, ShutdownPhase, ShutdownTerminal, coordinator_for,
-    reverse_quiescence_order,
+    DRAIN_RECEIPT_DEADLINE, DrainCommitDecision, DrainHalt, DrainWakeDisposition, ShutdownPhase,
+    ShutdownTerminal, coordinator_for, reverse_quiescence_order,
 };
+/// Kernel-owned exact-fence lease census for the I1.5 idle-drain gate.
+mod idle_lease_census;
+pub(crate) use idle_lease_census::KernelIdleLeaseCensus;
 pub use startup_coordinator::{
     AuthorityCeiling, GovernanceEnforcement, GovernanceObservation, GovernanceProfile,
     GovernanceSupervision, STARTUP_FINAL_STEP, STARTUP_FIRST_STEP, StartupCoordinator,
@@ -157,6 +159,7 @@ mod front_door_session;
 mod generation_control;
 mod generation_recovery;
 mod health_view;
+pub use health_view::KernelActivationView;
 #[cfg(windows)]
 mod host_request_route;
 pub mod kernel_unavailability;
@@ -3534,15 +3537,20 @@ impl KernelComposition {
         )?;
 
         // StoreStopLeaseZero: the store-stop request below is admitted only
-        // with no outstanding canonical-data lease.
-        if ShutdownDrainCoordinator::check_lease_zero(
-            self.canonical_store_claimed.load(Ordering::Acquire),
-        )
-        .is_err()
-        {
+        // with no outstanding lease. I1.5 widens the existing I14.23
+        // canonical-data precondition to the full Kernel-owned lease census:
+        // a live supervision lease, a live authenticated front-door Session,
+        // or an outstanding host-request operation each keeps an obligation
+        // that shutdown may not abandon.
+        let census = self.idle_lease_census();
+        health_view::observe_shutdown_observation(
+            "kernel.shutdown.lease_census_observed",
+            census.observation_code(),
+        );
+        if !census.admits_drain() {
             return Err(DrainHalt::with_pending(
-                "canonical-data-lease-outstanding",
-                vec!["canonical-store-lease".to_owned()],
+                "runtime-or-supervision-lease-outstanding",
+                vec![census.observation_code().to_owned()],
             ));
         }
         #[cfg(windows)]
@@ -3558,7 +3566,10 @@ impl KernelComposition {
         let store_evidence = "store-gateway-absent";
         record(
             ShutdownPhase::StoreStopLeaseZero,
-            format!("canonical-leases-zero;{store_evidence}"),
+            format!(
+                "lease-census:{};{store_evidence}",
+                census.observation_code()
+            ),
         )?;
 
         // DrainCommit linearization point.

@@ -11,6 +11,10 @@
     reason = "windows-only helpers are live on Windows; allow for cross-platform check"
 )]
 
+/// Host-owned I1.5 activation / demand-start / idle-drain orchestration over
+/// the crash-safe `HostStateJournal`.
+#[cfg(windows)]
+pub mod activation_lifecycle;
 /// Backup configuration evidence projection (B-BACKUP-HOST-PREP #958).
 pub mod backup_config_projection;
 /// Host-owned installation post-restore cutover (#961).
