@@ -6,7 +6,7 @@ use eliot_receipts::{EffectClass, ProofCeiling};
 
 use crate::contract::{
     CyclePhase, CyclePolicy, CycleStep, DreamerCycleState, InertOwnerRequest, ObservedOutcome,
-    OutcomeDisposition, RequestKind, StepDisposition,
+    OutcomeDisposition, RequestKind, StepDisposition, outcome_matches_pending,
 };
 use crate::error::CycleError;
 use crate::policy::{check_dispatch_budget, validate_pending_rule};
@@ -391,21 +391,31 @@ fn requests_for_pending(state: &DreamerCycleState) -> Result<Vec<InertOwnerReque
         .collect()
 }
 
-fn pending_has_blocked_outcome(
-    state: &DreamerCycleState,
-    pending: &crate::contract::PendingRequest,
-) -> bool {
+fn latest_outcome_for_request<'a>(
+    state: &'a DreamerCycleState,
+    request_id: &eliot_contracts::RequestId,
+) -> Option<&'a ObservedOutcome> {
+    let pending = state
+        .pending
+        .iter()
+        .find(|pending| &pending.request_id == request_id)?;
     state
         .outcomes
         .iter()
         .rev()
-        .find(|outcome| outcome.receipt.core.request.metadata.request_id == pending.request_id)
-        .is_some_and(|outcome| {
-            !matches!(
-                outcome.disposition,
-                OutcomeDisposition::Accepted | OutcomeDisposition::Unknown
-            )
-        })
+        .find(|outcome| outcome_matches_pending(outcome, pending))
+}
+
+fn pending_has_blocked_outcome(
+    state: &DreamerCycleState,
+    pending: &crate::contract::PendingRequest,
+) -> bool {
+    latest_outcome_for_request(state, &pending.request_id).is_some_and(|outcome| {
+        !matches!(
+            outcome.disposition,
+            OutcomeDisposition::Accepted | OutcomeDisposition::Unknown
+        )
+    })
 }
 
 fn reconciliation_requests(
@@ -415,11 +425,7 @@ fn reconciliation_requests(
     let mut requests = requests_for_pending(state)?;
     requests.retain(|request| &request.request_id == request_id);
     for request in &mut requests {
-        request.predecessor_receipt_id = state
-            .outcomes
-            .iter()
-            .rev()
-            .find(|outcome| outcome.receipt.core.request.metadata.request_id == request.request_id)
+        request.predecessor_receipt_id = latest_outcome_for_request(state, &request.request_id)
             .map(|outcome| outcome.receipt.identity.receipt_id.clone());
         request.kind = RequestKind::EffectReconciliation;
         "reconcile the same operation; do not issue a replacement retry"
@@ -433,11 +439,7 @@ fn requests_for_pending_with_reconciliation(
 ) -> Result<Vec<InertOwnerRequest>, CycleError> {
     let mut requests = requests_for_pending(state)?;
     for request in &mut requests {
-        let Some(outcome) =
-            state.outcomes.iter().rev().find(|outcome| {
-                outcome.receipt.core.request.metadata.request_id == request.request_id
-            })
-        else {
+        let Some(outcome) = latest_outcome_for_request(state, &request.request_id) else {
             continue;
         };
         if matches!(

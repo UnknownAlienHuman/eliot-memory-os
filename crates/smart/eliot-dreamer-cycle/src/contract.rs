@@ -697,18 +697,48 @@ fn validate_handler_request(
     Ok(())
 }
 
+/// Returns whether an observed outcome belongs to exactly one frozen pending
+/// operation. Request, operation, and idempotency identities are all part of
+/// the join; a request-id-only match can redirect reconciliation to a foreign
+/// operation after deserialization.
+pub(crate) fn outcome_matches_pending(outcome: &ObservedOutcome, pending: &PendingRequest) -> bool {
+    let core = &outcome.receipt.core;
+    core.request.metadata.request_id == pending.request_id
+        && core.operation.request_id == pending.request_id
+        && core.operation.operation_id == pending.operation_id
+        && core.operation.idempotency_key == pending.idempotency_key
+}
+
 fn validate_historical_request_binding(
     pending: &PendingRequest,
     outcomes: &[ObservedOutcome],
 ) -> Result<(), CycleError> {
     let expected_digest = crate::receipt::request_digest(pending)?;
-    for outcome in outcomes.iter().filter(|outcome| {
-        outcome.receipt.core.request.metadata.request_id == pending.request_id
-            || outcome.receipt.core.operation.operation_id == pending.operation_id
-    }) {
-        let request_artifacts: Vec<_> = outcome
-            .receipt
-            .core
+    for outcome in outcomes {
+        let core = &outcome.receipt.core;
+        let request_matches = core.request.metadata.request_id == pending.request_id;
+        let operation_request_matches = core.operation.request_id == pending.request_id;
+        let operation_matches = core.operation.operation_id == pending.operation_id;
+        let idempotency_matches = core.operation.idempotency_key == pending.idempotency_key;
+        if !(request_matches
+            || operation_request_matches
+            || operation_matches
+            || idempotency_matches)
+        {
+            continue;
+        }
+        if !(request_matches
+            && operation_request_matches
+            && operation_matches
+            && idempotency_matches)
+            || outcome.phase != pending.phase
+            || outcome.payload_digest != pending.payload_digest
+        {
+            return Err(CycleError::IdentityConflict {
+                identity: pending.request_id.as_str().to_owned(),
+            });
+        }
+        let request_artifacts: Vec<_> = core
             .artifacts
             .iter()
             .filter(|artifact| artifact.role == ReceiptKind::Request)

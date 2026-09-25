@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::contract::{
     CYCLE_SCHEMA_VERSION, CyclePhase, CyclePolicy, DreamerCycleState, InertOwnerRequest,
     MAX_CANONICAL_BYTES, MAX_REQUESTS, MAX_TEXT_BYTES, ObservedOutcome, OutcomeDisposition,
-    PendingRequest, RequestKind, validate_text,
+    PendingRequest, RequestKind, outcome_matches_pending, validate_text,
 };
 use crate::error::CycleError;
 use crate::sample::CycleSample;
@@ -131,7 +131,7 @@ fn latest_outcome_for<'a>(
         .outcomes
         .iter()
         .rev()
-        .find(|outcome| outcome.receipt.core.request.metadata.request_id == pending.request_id)
+        .find(|outcome| outcome_matches_pending(outcome, pending))
 }
 
 /// Returns whether the latest owner outcome has stopped the pending request.
@@ -428,8 +428,14 @@ impl CyclePlan {
                 maximum: MAX_REQUESTS,
             });
         }
+        if self.experiments.len() != projection.experiments.len() {
+            return Err(CycleError::BindingMismatch {
+                field: "plan.experiments",
+                reason: "experiments do not cover the exact frozen pending projection",
+            });
+        }
         let mut targets = BTreeSet::new();
-        for experiment in &self.experiments {
+        for (index, experiment) in self.experiments.iter().enumerate() {
             experiment.validate()?;
             if !targets.insert(experiment.target.clone()) {
                 return Err(CycleError::IdentityConflict {
@@ -470,16 +476,7 @@ impl CyclePlan {
                     reason: "experiment target is not eligible in the adjacent phase",
                 });
             }
-            let Some(expected) = projection
-                .experiments
-                .iter()
-                .find(|candidate| candidate.target == experiment.target)
-            else {
-                return Err(CycleError::BindingMismatch {
-                    field: "experiment.target",
-                    reason: "experiment is not eligible for the frozen pending outcome",
-                });
-            };
+            let expected = &projection.experiments[index];
             if let Some(field) = experiment_projection_mismatch(experiment, expected) {
                 return Err(CycleError::BindingMismatch {
                     field,

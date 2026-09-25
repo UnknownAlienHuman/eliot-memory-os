@@ -2384,6 +2384,26 @@ fn cycle_plan_rechecks_blocked_outcome_and_experiment_kind() {
     wrong_kind.plan_digest = wrong_kind.computed_digest().unwrap();
     assert!(wrong_kind.validate(&sample, &current, &policy).is_err());
 
+    let mut missing_experiment = plan.clone();
+    missing_experiment.experiments.clear();
+    missing_experiment.plan_digest = missing_experiment.computed_digest().unwrap();
+    assert!(
+        missing_experiment
+            .validate(&sample, &current, &policy)
+            .is_err()
+    );
+
+    let mut extra_experiment = plan.clone();
+    extra_experiment
+        .experiments
+        .push(extra_experiment.experiments[0].clone());
+    extra_experiment.plan_digest = extra_experiment.computed_digest().unwrap();
+    assert!(
+        extra_experiment
+            .validate(&sample, &current, &policy)
+            .is_err()
+    );
+
     let blocked_outcome = outcome(
         &request,
         receipt(
@@ -2411,4 +2431,31 @@ fn cycle_plan_rechecks_blocked_outcome_and_experiment_kind() {
             .validate(&blocked_sample, &blocked_state, &policy)
             .is_err()
     );
+}
+
+#[test]
+fn cycle_state_rejects_historical_outcome_with_foreign_idempotency() {
+    let fence = fence();
+    let policy = policy(&fence, "bundle_validation");
+    let request = pending(&policy);
+    let current = state(&policy, request.clone());
+    let observed = outcome(
+        &request,
+        receipt(
+            &request,
+            ReceiptDisposition::Success {
+                proof: ProofCeiling::Observation,
+            },
+            None,
+        ),
+        OutcomeDisposition::Accepted,
+        false,
+    );
+    let step = step_dreamer_cycle(&current, &[observed], &policy).unwrap();
+    let mut tampered = step.next_state;
+    let mut core = tampered.outcomes[0].receipt.core.clone();
+    core.operation.idempotency_key = "idem-foreign".to_owned();
+    tampered.outcomes[0].receipt = ReceiptEnvelope::issue(core).unwrap();
+    tampered.seal().unwrap();
+    assert!(tampered.validate().is_err());
 }
