@@ -4065,13 +4065,22 @@ impl HostComposition {
         ),
         crate::backup_preparation::PreparationError,
     > {
-        use crate::backup_preparation::{DelegatedPreparation, OwnerEvidence};
+        use crate::backup_preparation::{DelegatedPreparation, OwnerEvidence, PreparationError};
         caller.authenticate_for_owner(
             &self.owner_lease,
             self.launch_options.installation(),
             &request.source_installation_id,
         )?;
         let evidence = OwnerEvidence::inspect(&self.registry_host_root)?;
+        // Registry-revision fence (A13.9 short-lived reads): the owner evidence
+        // above was read at one CAS revision, and preparing against a registry
+        // that moved since would mix owner generations. Refuse with no effect.
+        if evidence.revision() != self.registry.revision() {
+            return Err(PreparationError::InvalidRequest {
+                field: "owner_evidence_revision",
+                reason: "owner registry moved between inspection and preparation".to_owned(),
+            });
+        }
         let mut sink = DelegatedPreparation::new(journal);
         let prepared = sink.prepare(&evidence, request)?;
         Ok((sink, prepared))
