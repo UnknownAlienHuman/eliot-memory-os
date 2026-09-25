@@ -48,7 +48,9 @@ use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId,
     ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
 };
-use eliot_coordination::{ActiveWorkLeaseSelection, CoordinationError, CoordinationOwner};
+use eliot_coordination::{
+    ActiveWorkLeaseProjection, ActiveWorkLeaseSelection, CoordinationError, CoordinationOwner,
+};
 use eliot_diagnostic::{
     CONTRACT_NAME as DIAGNOSTIC_CONTRACT, DiagnosticClassifier, DiagnosticEvent, DiagnosticInput,
     DiagnosticSeverity, DiagnosticStatus,
@@ -81,7 +83,7 @@ use eliot_store_api::{
     CanonicalReadClient, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
     ScopeRevisionView, StoreHealth, WriteReceipt,
 };
-use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskState};
+use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskRecord, TaskState};
 use eliot_testd_core::{
     JobState, RawArtifactStream, ReceiptBinding, TestJob, TestdSourceObservation,
     TestdSourceObservationRange, TestdStore, TestdTerminalCompletionEvidence, VerificationReceipt,
@@ -5899,10 +5901,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// No semantic identity is accepted from the caller: coordination first
     /// proves one unique live work lease, then task, `WorkScope` and Canonical
     /// owners must agree on its exact fence and linked identities.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "activation admission validates one coherent semantic owner projection before binding"
-    )]
+    ///
+    /// Split note: activation admission validates one coherent semantic owner
+    /// projection before binding. The seam is still one ordered admission
+    /// cascade; each owner agreement is now a named private function, so every
+    /// guard still runs in the same order over the same effects.
     pub fn read_unique_agent_activation(
         &self,
         now: u64,
@@ -5911,10 +5914,38 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(CompositionError::NotReady);
         }
         let state_fence = self.snapshot.state_fence();
+        let work = self.prove_unique_activation_work(now, &state_fence)?;
+        let task_id = self.admit_activation_lifecycle_session(now, &state_fence, &work)?;
+        let task = self.admit_activation_task(&task_id, &state_fence)?;
+        let (work_scope_id, plan) = self.admit_activation_plan(&task_id, &state_fence)?;
+        Ok(GovernorActivationSnapshot {
+            state_fence,
+            owner_revision: self.owners.canonical.owner_revision(),
+            principal_id: work.session.principal_id,
+            session_id: work.session.session_id,
+            task_id,
+            work_unit_id: work.work_item.work_item_id,
+            work_scope_id,
+            task_revision: task.revision,
+            plan_id: plan.plan_id,
+            plan_revision: plan.plan_revision,
+        })
+    }
+
+    /// Proves exactly one live work lease for this exact fence.
+    ///
+    /// No selection, more than one selection and any coordination read failure
+    /// are three distinct typed refusals; only the unique validated projection
+    /// is ever handed to the rest of the admission cascade.
+    fn prove_unique_activation_work(
+        &self,
+        now: u64,
+        state_fence: &StateFence,
+    ) -> Result<ActiveWorkLeaseProjection, CompositionError> {
         let work = match self.owners.coordination.read_active_work_lease_selection(
             now,
             state_fence.authority_epoch.clone(),
-            &state_fence,
+            state_fence,
         ) {
             Ok(ActiveWorkLeaseSelection::None) => {
                 return Err(CompositionError::ActivationTaskSelectionRequired);
@@ -5930,6 +5961,22 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             }
             Err(error) => return Err(map_activation_coordination_error(error)),
         };
+        Ok(work)
+    }
+
+    /// Proves the one live owner session named by the unique work lease and
+    /// returns the exact task id that session is bound to.
+    ///
+    /// The semantic ids are rebuilt from the lease itself, the stored session
+    /// must be that same active session under the same authority epoch and the
+    /// same fence, its lease window must still be live, and any task scope it
+    /// names must be the same task.
+    fn admit_activation_lifecycle_session(
+        &self,
+        now: u64,
+        state_fence: &StateFence,
+        work: &ActiveWorkLeaseProjection,
+    ) -> Result<TaskId, CompositionError> {
         let task_id = TaskId::new(work.work_item.task_id.clone())
             .map_err(|_| CompositionError::ActivationTaskSelectionRequired)?;
         let lifecycle_session_id = SessionId::new(work.session.session_id.clone())
@@ -5944,7 +5991,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             || !lifecycle_session
                 .authority_epoch
                 .is_same_authority(&state_fence.authority_epoch)
-            || lifecycle_session.state_fence != state_fence
+            || lifecycle_session.state_fence != *state_fence
         {
             return Err(CompositionError::ActivationStaleFence);
         }
@@ -5962,12 +6009,25 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         {
             return Err(CompositionError::ActivationTaskSelectionRequired);
         }
+        Ok(task_id)
+    }
+
+    /// Proves the durable task owner agrees with the admitted session.
+    ///
+    /// The task must be the same task under the same fence, must be at a
+    /// nonzero revision in an authorized or running state, and must be the
+    /// exact revision the fence names when the fence names one.
+    fn admit_activation_task(
+        &self,
+        task_id: &TaskId,
+        state_fence: &StateFence,
+    ) -> Result<&TaskRecord, CompositionError> {
         let task = self
             .owners
             .task
-            .task(&task_id)
+            .task(task_id)
             .ok_or(CompositionError::ActivationTaskSelectionRequired)?;
-        if task.task_id != task_id || task.state_fence != state_fence {
+        if task.task_id != *task_id || task.state_fence != *state_fence {
             return Err(CompositionError::ActivationStaleFence);
         }
         if task.revision == 0
@@ -5983,13 +6043,27 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         {
             return Err(CompositionError::ActivationStaleFence);
         }
+        Ok(task)
+    }
+
+    /// Proves the `WorkScope` and Canonical owners agree with the admitted
+    /// task, and returns the bound work scope id with the current plan.
+    ///
+    /// The scope must be installed, freshly `MATCHED`, and the plan must name
+    /// the same task and the same bound work scope, so a drifted scope is
+    /// never paired with a plan the #1115 v2 resolution would publish.
+    fn admit_activation_plan(
+        &self,
+        task_id: &TaskId,
+        state_fence: &StateFence,
+    ) -> Result<(String, CanonicalPlanBinding), CompositionError> {
         let scope_owner = self
             .owners
             .work_scope
             .as_ref()
             .ok_or(CompositionError::ActivationScopeSelectionRequired)?;
         let scope = scope_owner
-            .read_current(&state_fence)
+            .read_current(state_fence)
             // #1115: the activation boundary maps every `WorkScopeError` into a
             // typed `CompositionError` class, so a scope failure is a semantic
             // classifier here and never human error text.
@@ -6005,22 +6079,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let plan = self
             .owners
             .canonical
-            .read_current_activation_plan(&state_fence)?;
-        if plan.task_id != task_id || plan.work_scope_id != scope.binding.scope.scope_ref {
+            .read_current_activation_plan(state_fence)?;
+        if plan.task_id != *task_id || plan.work_scope_id != scope.binding.scope.scope_ref {
             return Err(CompositionError::ActivationScopeSelectionRequired);
         }
-        Ok(GovernorActivationSnapshot {
-            state_fence,
-            owner_revision: self.owners.canonical.owner_revision(),
-            principal_id: work.session.principal_id,
-            session_id: work.session.session_id,
-            task_id,
-            work_unit_id: work.work_item.work_item_id,
-            work_scope_id: scope.binding.scope.scope_ref,
-            task_revision: task.revision,
-            plan_id: plan.plan_id,
-            plan_revision: plan.plan_revision,
-        })
+        Ok((scope.binding.scope.scope_ref, plan))
     }
 
     /// Returns the current canonical owner revision used by activation

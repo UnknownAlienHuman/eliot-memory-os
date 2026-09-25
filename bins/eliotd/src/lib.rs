@@ -954,10 +954,11 @@ impl DaemonComposition {
     /// ticket to the canonical v2 typed result. Every
     /// `GovernorActivationOutcome` variant maps 1:1 to its
     /// protocol disposition without coercion to success.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "activation resolution keeps readiness, fence, successor observation, and typed mapping together"
-    )]
+    ///
+    /// Split note: activation resolution keeps readiness, fence, successor
+    /// observation, and typed mapping together. The seam is still one ordered
+    /// spine; each step is now a named private function, so every guard still
+    /// runs in the same order over the same effects.
     pub fn resolve_agent_activation_v2(
         &self,
         ticket: &AgentActivationResolutionTicket,
@@ -981,60 +982,49 @@ impl DaemonComposition {
         });
         if self.readiness() != CompositionReadiness::Ready {
             // #204: an unready Governor is an internal failure for this exact
-            // ticket, not a loop-fatal error. Answer with a typed
-            // FailedInternal terminal result so the Kernel records a
-            // disposition that stays distinct from every other negative and
-            // from the result-less deadline outcome, and the daemon stays
-            // alive for the next claim. The ticket is already validated
-            // above, so the fallback binds; if it cannot bind, the original
-            // readiness error returns unchanged: fail closed, never silence.
-            let unready = DaemonError::Lifecycle(
-                "semantic activation resolution requires a ready Governor".to_owned(),
-            );
-            return match activation_projection::failed_internal_for_unready_governor_with_observation(
-                ticket,
-                now.max(1),
-                successor_observation,
-            ) {
-                Ok(result) => {
-                    let _ = crate::diagnostics::ErrorRecord::of_daemon_error(&unready).emit();
-                    Ok(result)
-                }
-                Err(_) => Err(unready),
-            };
+            // ticket, not a loop-fatal error; the typed terminal result and its
+            // fail-closed fallback live in
+            // [`unready_governor_activation_result`].
+            return unready_governor_activation_result(ticket, now, successor_observation);
         }
         if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
             return Err(DaemonError::Lifecycle(
                 "semantic activation ticket deadline has expired".to_owned(),
             ));
         }
-        let outcome = match self.governor.resolve_activation_outcome(now) {
+        let outcome = self.map_activation_outcome(ticket, now, successor_observation.as_ref());
+        emit_activation_admission_diagnostics(ticket, &outcome);
+        outcome
+    }
+
+    /// Resolves this Governor's typed activation outcome for one already
+    /// validated ticket and maps it to the canonical v2 result.
+    ///
+    /// The exact `successor_observation` captured before the readiness gate
+    /// decides whether a mapping is a successor-fenced mapping, and the
+    /// stale-fence and mapping-failure terminals keep the same class of
+    /// evidence they carried inline.
+    fn map_activation_outcome(
+        &self,
+        ticket: &AgentActivationResolutionTicket,
+        now: u64,
+        successor_observation: Option<&(u64, String)>,
+    ) -> Result<AgentActivationResolutionResult, DaemonError> {
+        match self.governor.resolve_activation_outcome(now) {
             GovernorActivationOutcome::Resolved(snapshot) => {
                 if snapshot.state_fence == ticket.state_fence {
-                    let mapped = if let Some((owner_revision, dependency_revision)) =
-                        &successor_observation
-                    {
-                        activation_projection::map_governor_outcome_to_protocol_for_successor(
-                            ticket,
-                            GovernorActivationOutcome::Resolved(snapshot),
-                            now.max(1),
-                            *owner_revision,
-                            dependency_revision.clone(),
-                        )
-                    } else {
-                        activation_projection::map_governor_outcome_to_protocol(
-                            ticket,
-                            GovernorActivationOutcome::Resolved(snapshot),
-                            now.max(1),
-                        )
-                    };
-                    match mapped {
+                    match map_governor_outcome_under_observation(
+                        ticket,
+                        GovernorActivationOutcome::Resolved(snapshot),
+                        now.max(1),
+                        successor_observation,
+                    ) {
                         Ok(result) => Ok(result),
                         Err(error) => failed_internal_or_mapping_error(
                             ticket,
                             "RESOLVED",
                             now.max(1),
-                            successor_observation,
+                            successor_observation.cloned(),
                             error,
                         ),
                     }
@@ -1052,54 +1042,29 @@ impl DaemonComposition {
                         ticket,
                         observed,
                         now.max(1),
-                        successor_observation,
+                        successor_observation.cloned(),
                     )
                 }
             }
             outcome => {
                 let kind = outcome.kind_str();
-                let mapped =
-                    if let Some((owner_revision, dependency_revision)) = &successor_observation {
-                        activation_projection::map_governor_outcome_to_protocol_for_successor(
-                            ticket,
-                            outcome,
-                            now.max(1),
-                            *owner_revision,
-                            dependency_revision.clone(),
-                        )
-                    } else {
-                        activation_projection::map_governor_outcome_to_protocol(
-                            ticket,
-                            outcome,
-                            now.max(1),
-                        )
-                    };
-                match mapped {
+                match map_governor_outcome_under_observation(
+                    ticket,
+                    outcome,
+                    now.max(1),
+                    successor_observation,
+                ) {
                     Ok(result) => Ok(result),
                     Err(error) => failed_internal_or_mapping_error(
                         ticket,
                         kind,
                         now.max(1),
-                        successor_observation,
+                        successor_observation.cloned(),
                         error,
                     ),
                 }
             }
-        };
-        match &outcome {
-            Ok(result) => {
-                let _ = crate::diagnostics::AdmissionRecord::of(
-                    crate::diagnostics::disposition_of_resolution(&result.disposition),
-                    &ticket.ticket_id,
-                    &result.result_sha256,
-                )
-                .emit();
-            }
-            Err(error) => {
-                let _ = crate::diagnostics::ErrorRecord::of_daemon_error(error).emit();
-            }
         }
-        outcome
     }
 
     /// Records the already-validated Kernel-issued owner session facts for
@@ -2175,6 +2140,84 @@ fn failed_internal_or_mapping_error(
             Ok(result)
         }
         Err(_) => Err(error),
+    }
+}
+
+/// Answers one already validated ticket for an unready Governor with the typed
+/// `FailedInternal` terminal result.
+///
+/// #204: an unready Governor is an internal failure for this exact ticket, not
+/// a loop-fatal error. The typed result keeps the disposition distinct from
+/// every other negative and from the result-less deadline outcome, and the
+/// daemon stays alive for the next claim. The ticket is validated before this
+/// seam is reached, so the fallback binds; if it cannot bind, the original
+/// readiness error returns unchanged: fail closed, never silence.
+fn unready_governor_activation_result(
+    ticket: &AgentActivationResolutionTicket,
+    now: u64,
+    successor_observation: Option<(u64, String)>,
+) -> Result<AgentActivationResolutionResult, DaemonError> {
+    let unready = DaemonError::Lifecycle(
+        "semantic activation resolution requires a ready Governor".to_owned(),
+    );
+    match activation_projection::failed_internal_for_unready_governor_with_observation(
+        ticket,
+        now.max(1),
+        successor_observation,
+    ) {
+        Ok(result) => {
+            let _ = crate::diagnostics::ErrorRecord::of_daemon_error(&unready).emit();
+            Ok(result)
+        }
+        Err(_) => Err(unready),
+    }
+}
+
+/// Maps one Governor outcome to the wire v2 result under the exact successor
+/// observation captured before the readiness gate.
+///
+/// The observation is taken from the same coherent Governor read as the
+/// outcome, so a successor claim is only published when the owner and
+/// dependency revisions really moved.
+fn map_governor_outcome_under_observation(
+    ticket: &AgentActivationResolutionTicket,
+    outcome: GovernorActivationOutcome,
+    now: u64,
+    successor_observation: Option<&(u64, String)>,
+) -> Result<AgentActivationResolutionResult, DaemonError> {
+    match successor_observation {
+        Some((owner_revision, dependency_revision)) => {
+            activation_projection::map_governor_outcome_to_protocol_for_successor(
+                ticket,
+                outcome,
+                now,
+                *owner_revision,
+                dependency_revision.clone(),
+            )
+        }
+        None => activation_projection::map_governor_outcome_to_protocol(ticket, outcome, now),
+    }
+}
+
+/// Emits the one admission or error record that every v2 resolution terminal
+/// shares, so a typed success, a typed rejection and a fallback all report
+/// through the same diagnostics seam.
+fn emit_activation_admission_diagnostics(
+    ticket: &AgentActivationResolutionTicket,
+    outcome: &Result<AgentActivationResolutionResult, DaemonError>,
+) {
+    match outcome {
+        Ok(result) => {
+            let _ = crate::diagnostics::AdmissionRecord::of(
+                crate::diagnostics::disposition_of_resolution(&result.disposition),
+                &ticket.ticket_id,
+                &result.result_sha256,
+            )
+            .emit();
+        }
+        Err(error) => {
+            let _ = crate::diagnostics::ErrorRecord::of_daemon_error(error).emit();
+        }
     }
 }
 
