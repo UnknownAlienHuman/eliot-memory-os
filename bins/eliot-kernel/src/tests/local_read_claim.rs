@@ -23,7 +23,9 @@ use eliot_protocol::{
     HostRequestIdentity, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
 };
 use eliot_store_api::EVIDENCE_PACK_MAX_RECORDS;
-use host_request_route::{LocalReadSubmitDisposition, StaleLocalReadReason};
+use host_request_route::{
+    LocalReadEnqueueDisposition, LocalReadSubmitDisposition, StaleLocalReadReason,
+};
 
 fn tool_digest(tool: &serde_json::Value) -> String {
     let bytes = eliot_contracts::canonical_json_bytes(tool).expect("tool must canonicalize");
@@ -403,40 +405,38 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
         "replay preserves the exact digest"
     );
 
-    // A changed body after completion is stale, not a second completion: the
-    // persist retired the attempt, so no live generation remains.
+    // A changed body after completion fails closed as an identity conflict.
+    // The durable record is terminal with a stored result, so a different
+    // body is neither a second completion nor a stale observation: the
+    // refusal is typed and the stored answer stays authoritative.
     assert!(
         matches!(
             kernel.submit_local_read_result(&daemon_session, &conflicting),
-            Ok(LocalReadSubmitDisposition::StaleAttempt(_))
-        ),
-        "a changed body after completion must quarantine as stale"
-    );
-
-    // A changed body under a fresh live attempt still conflicts: currency
-    // passes, then the ORS result path refuses the overwrite. The caller
-    // re-invokes (re-enqueue after retire), claims anew, and submits.
-    kernel
-        .enqueue_local_read_pair(&envelope, &tool)
-        .expect("re-enqueue after retire must succeed");
-    let (_, _, fresh) = kernel
-        .claim_local_read_pair(&daemon_session)
-        .expect("fresh claim must not fail")
-        .expect("re-enqueued pair must claim");
-    assert_ne!(
-        fresh.attempt_id, attempt.attempt_id,
-        "a new claim mints a fresh attempt identity"
-    );
-    let mut fresh_conflicting = conflicting.clone();
-    fresh_conflicting.attempt = Some(fresh);
-    assert!(
-        matches!(
-            kernel.submit_local_read_result(&daemon_session, &fresh_conflicting),
             Err(TransportError::IdentityConflict)
         ),
-        "a changed same-identity body must conflict under a live attempt"
+        "a changed body after completion must fail closed as an identity conflict"
     );
-    // Retire the proof pair so the expiry leg below polls an empty queue.
+
+    // A completed operation is no longer dispatchable. The enqueue gate
+    // re-reads the durable record, refuses anything that is not `Admitted`,
+    // retires the reference, and reports the refusal; the poller therefore
+    // never sees a second read for a finished operation.
+    assert_eq!(
+        kernel
+            .enqueue_local_read_pair(&envelope, &tool)
+            .expect("enqueue must not fail"),
+        LocalReadEnqueueDisposition::Retired,
+        "a resulted record is refused, not re-queued"
+    );
+    assert!(
+        kernel
+            .claim_local_read_pair(&daemon_session)
+            .expect("claim must not fail")
+            .is_none(),
+        "a retired completed pair is never re-claimed"
+    );
+    // Explicit retirement stays available and is a no-op once the gate has
+    // already retired the pair.
     kernel.retire_local_read_pair(
         &eliot_protocol::host_request_operation_id(&envelope),
         &envelope.envelope_sha256,
@@ -587,12 +587,16 @@ fn governed_stale_then_current(
             panic!("the current attempt must persist, got stale: {observation:?}")
         }
     }
+    // The replaced attempt stays refused after completion. The record is
+    // terminal with a result, so a superseded capability presenting a
+    // different body is an identity conflict rather than a stale
+    // observation, and it never persists over the current completion.
     assert!(
         matches!(
             kernel.submit_local_read_result(owner, &stale_body),
-            Ok(LocalReadSubmitDisposition::StaleAttempt(_))
+            Err(TransportError::IdentityConflict)
         ),
-        "a replaced attempt must stay stale after completion"
+        "a replaced attempt must stay refused after completion"
     );
     let waiter = waiter_record(kernel, envelope);
     assert_eq!(
@@ -642,27 +646,61 @@ fn governed_revocation_roundtrip(kernel: &KernelComposition, fence: &StateFence,
         waiter.result_digest.is_none() && waiter.result_response.is_none(),
         "the waiter must observe no revoked result"
     );
-    kernel
-        .enqueue_local_read_pair(&revoked, &revoked_tool)
-        .expect("re-enqueue after revoke must succeed");
+    // Revocation retires the pair: fencing moved the durable record off
+    // `Admitted`, so the enqueue gate refuses it and no daemon read leg can
+    // be entered. A revoked operation is never resurrected by re-invocation.
+    assert_eq!(
+        kernel
+            .enqueue_local_read_pair(&revoked, &revoked_tool)
+            .expect("enqueue must not fail"),
+        LocalReadEnqueueDisposition::Retired,
+        "a revoked record is refused, not re-queued"
+    );
+    assert!(
+        kernel
+            .claim_local_read_pair(owner)
+            .expect("claim must not fail")
+            .is_none(),
+        "a retired revoked pair is never re-claimed"
+    );
+
+    // Recovery after revocation is a new operation identity, not a
+    // re-invocation of the revoked one: a fresh admitted pair claims and
+    // completes normally.
+    let recovery_tool = query_tool();
+    let recovery = query_envelope(
+        fence,
+        unix_ms().saturating_add(60_000),
+        "host-request-governed-3",
+        &tool_digest(&recovery_tool),
+    );
+    stage_admitted(kernel, &recovery);
+    assert_eq!(
+        kernel
+            .enqueue_local_read_pair(&recovery, &recovery_tool)
+            .expect("enqueue must not fail"),
+        LocalReadEnqueueDisposition::Queued,
+        "a new admitted operation queues after revocation"
+    );
     let (_, _, fresh) = kernel
         .claim_local_read_pair(owner)
-        .expect("fresh claim must not fail")
-        .expect("re-enqueued pair must claim");
-    let fresh_body = body_with_revision(&revoked, fresh, 6);
+        .expect("claim must not fail")
+        .expect("a new admitted pair must claim");
+    let fresh_body = body_with_revision(&recovery, fresh, 6);
     assert!(
         matches!(
             kernel.submit_local_read_result(owner, &fresh_body),
             Ok(LocalReadSubmitDisposition::Persisted(_))
         ),
-        "the current attempt completes after revocation"
+        "a new operation completes after revocation"
     );
 }
 
 /// Acceptance (#1808): exactly one completion per current fencing generation.
 /// A superseded attempt quarantines as stale and leaves the waiter clean,
 /// then the current attempt completes; a revoked attempt quarantines as
-/// stale, then the re-invoked current attempt completes.
+/// stale and its pair is retired rather than re-dispatched, then a new
+/// operation identity completes.
 #[test]
 fn governed_attempt_replacement_and_revocation_quarantine_stale_and_current_completes() {
     let root = std::env::temp_dir().join(format!(
