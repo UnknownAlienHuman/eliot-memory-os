@@ -635,11 +635,13 @@ function Get-CodeBearingExecutableExtensions {
     # plugin/governor binaries (.exe/.dll), and runtime PEs all fall in this
     # set.  All other extensions carry an explicit non-executable disposition
     # (data, manifests, resources, docs) and must never be executed.
-    # GATED (#1189/#1217): legacy eliot-governor/Codex bridge binaries remain
-    # canonical on disk at this base; they are NOT deleted here.  They fail
-    # closed in Assert-CompleteCodeBearingDenominator as
-    # unmanifested/unsigned executables until their owners land retirement or
-    # an explicit signed role.
+    # GATED (#1189/#1217/#1719): legacy eliot-governor/Codex bridge binaries
+    # and the flagged #1719 Claude Code front-door bridge
+    # (eliot-agent-bridge.exe) remain canonical on disk at this base; they
+    # are NOT deleted here.  They fail closed in
+    # Assert-CompleteCodeBearingDenominator as unmanifested/unsigned
+    # executables until their owners land retirement or an explicit signed
+    # role.
     @('.exe', '.dll', '.sys', '.drv', '.efi', '.scr', '.cpl', '.ocx', '.ax', '.winmd', '.node')
 }
 
@@ -711,7 +713,7 @@ function Assert-CompleteCodeBearingDenominator([string]$Bundle) {
             continue
         }
         if (-not $roleSet.Contains($relative)) {
-            throw "release bundle contains an unmanifested code-bearing executable outside the exact signing scope: $relative (expected one of the exact Authenticode roles; Operator/plugin/governor legacy gated on #1189/#1217 — retirement or explicit signed role required, never silent adoption)"
+            throw "release bundle contains an unmanifested code-bearing executable outside the exact signing scope: $relative (expected one of the exact Authenticode roles; Operator/plugin/governor/front-door legacy gated on #1189/#1217/#1719 - retirement or explicit signed role required, never silent adoption)"
         }
     }
     foreach ($role in $roles) {

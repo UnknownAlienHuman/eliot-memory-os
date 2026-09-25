@@ -10,6 +10,8 @@ param(
     [switch]$BuildOperator,
     [switch]$SkipBuild,
     [switch]$PlanOnly,
+    [ValidateSet('legacy', 'agent-bridge')]
+    [string]$ClaudeCodeFrontDoor = 'legacy',
     [Alias('VerifyBundle')]
     [string]$BuilderVerifyBundle
 )
@@ -203,6 +205,62 @@ function Get-RuntimeArtifactPlan([object]$Metadata) {
         }
     }
     return @($plan)
+}
+
+# Issue #1719 Claude Code front door (OSP1 step 1', owner decision
+# 2026-09-25): exactly one host moves off the legacy Governor MCP entry
+# behind an explicit flag; every other host stays on legacy. The operator
+# launch flag is ELIOT_CLAUDE_FRONT_DOOR (absent/legacy = today's
+# `eliot-governor.exe mcp stdio --host claude --instance default`;
+# agent-bridge = the staged `eliot-agent-bridge.exe` with its
+# `--profile/--transport/--client-declaration` argv). The bundle switch
+# -ClaudeCodeFrontDoor provisions the selected command: legacy stages
+# today's set unchanged, agent-bridge additionally builds and stages the
+# bridge so the flagged command always exists in the bundle. No new
+# composition binary: the bridge is the existing bins/eliot-agent-bridge
+# owner. The client-declaration file itself stays installation-owned
+# (absolute <...>/agent-bridge/client-declaration-v2.json); the bundle
+# never invents it.
+function Get-FrontDoorBridgePlan([object]$Metadata, [string]$Selection) {
+    if ([string]::IsNullOrWhiteSpace($Selection)) {
+        throw 'Claude Code front-door selection must be legacy or agent-bridge, never empty'
+    }
+    if ($Selection -cne 'legacy' -and $Selection -cne 'agent-bridge') {
+        throw "Claude Code front-door selection is not supported: $Selection (expected legacy or agent-bridge)"
+    }
+    $targetDirectory = $null
+    if ($Metadata -and -not [string]::IsNullOrWhiteSpace([string]$Metadata.target_directory)) {
+        $targetDirectory = [System.IO.Path]::GetFullPath([string]$Metadata.target_directory)
+    }
+    $entry = [pscustomobject]@{
+        package = 'eliot-agent-bridge'
+        binary = 'eliot-agent-bridge'
+        relative_path = 'eliot-agent-bridge.exe'
+        path = if ($targetDirectory) { Join-Path $targetDirectory 'release\eliot-agent-bridge.exe' } else { $null }
+        provisioned = $Selection -ceq 'agent-bridge'
+    }
+    if ($Selection -ceq 'agent-bridge') {
+        if (-not $Metadata) {
+            throw 'Cargo metadata is required to provision the Claude Code agent-bridge front door'
+        }
+        $packages = @{}
+        foreach ($package in @($Metadata.packages)) {
+            $packageName = [string]$package.name
+            if ($packageName) {
+                $packages[$packageName] = $package
+            }
+        }
+        if (-not $packages.ContainsKey('eliot-agent-bridge')) {
+            throw 'Cargo metadata is missing required front-door package: eliot-agent-bridge'
+        }
+        $targets = @($packages['eliot-agent-bridge'].targets | Where-Object {
+                [string]$_.name -eq 'eliot-agent-bridge' -and @($_.kind) -contains 'bin'
+            })
+        if ($targets.Count -ne 1) {
+            throw "Cargo metadata must expose exactly one binary target 'eliot-agent-bridge' for package 'eliot-agent-bridge'"
+        }
+    }
+    return $entry
 }
 
 function Get-VerifiedRuntimeArtifacts([object[]]$Plan, [string]$Version) {
@@ -1419,7 +1477,7 @@ function Get-VerifiedOperatorBuildReceipt([string]$Repo, [string]$SourceCommit, 
     }
 }
 
-function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt) {
+function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt, [object]$FrontDoorBridge) {
     $entries = @()
     foreach ($artifact in @($RuntimePlan)) {
         $entries += [ordered]@{
@@ -1489,6 +1547,17 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
         generation = $SourceCommit
         proof_ceiling = 'unsigned-build-evidence (retirement scope is Part B after #1189)'
         gate = '#1189-legacy-retirement (GATED: retained explicitly, never by repository presence)'
+    }
+    if ($FrontDoorBridge) {
+        $entries += [ordered]@{
+            path = 'eliot-agent-bridge.exe'
+            selection = 'cargo --frozen -p eliot-agent-bridge --bin eliot-agent-bridge'
+            owner = 'bins/eliot-agent-bridge'
+            install_destination = './'
+            generation = $SourceCommit
+            proof_ceiling = 'unsigned-build-evidence (Claude Code front-door selection; signing scope is Part B)'
+            gate = '#1719-claude-front-door (GATED: flagged selection, legacy default; other hosts remain legacy)'
+        }
     }
     $entries += [ordered]@{
         path = 'operator/'
@@ -1734,6 +1803,37 @@ function Test-ReleaseBundle([string]$Path) {
     $pluginGovernorHash = (Get-FileHash -LiteralPath (Join-Path $codexPluginRoot 'bin/eliot-governor.exe') -Algorithm SHA256).Hash
     if ($rootGovernorHash -ne $pluginGovernorHash) {
         throw 'release Codex plugin binary differs from the release Governor binary'
+    }
+
+    # Issue #1719 Claude Code front door: the bundle provisions exactly the
+    # selected command. Legacy (and pre-flag bundles without the record)
+    # keep today's Governor-only root; agent-bridge additionally requires
+    # the staged bridge with matching digest and Windows x64 PE identity.
+    $frontDoor = $release.claude_code_front_door
+    $frontDoorBridgeCandidate = Join-Path $resolved 'eliot-agent-bridge.exe'
+    if ($frontDoor -and [string]$frontDoor.selection -ceq 'agent-bridge') {
+        if ([string]$frontDoor.operator_flag -cne 'ELIOT_CLAUDE_FRONT_DOOR' -or
+            [string]$frontDoor.bridge_path -cne 'eliot-agent-bridge.exe' -or
+            [bool]$frontDoor.bridge_provisioned -ne $true -or
+            [string]$frontDoor.bridge_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [int64]$frontDoor.bridge_bytes -le 0) {
+            throw 'RELEASE.json Claude Code front-door bridge binding is missing or non-canonical'
+        }
+        if (-not (Test-Path -LiteralPath $frontDoorBridgeCandidate -PathType Leaf)) {
+            throw 'release bundle selects the agent-bridge front door but eliot-agent-bridge.exe is missing'
+        }
+        $frontDoorBridgeFile = Get-Item -LiteralPath $frontDoorBridgeCandidate
+        $frontDoorBridgeHash = (Get-FileHash -LiteralPath $frontDoorBridgeCandidate -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($frontDoorBridgeHash -cne [string]$frontDoor.bridge_sha256 -or
+            $frontDoorBridgeFile.Length -ne [int64]$frontDoor.bridge_bytes) {
+            throw 'release Claude Code front-door bridge digest differs from RELEASE.json'
+        }
+        Assert-WindowsX64Pe $frontDoorBridgeCandidate 'eliot-agent-bridge.exe'
+    }
+    elseif ($frontDoor -and [string]$frontDoor.selection -ceq 'legacy') {
+        if (Test-Path -LiteralPath $frontDoorBridgeCandidate) {
+            throw 'release bundle selects the legacy front door but contains an unselected eliot-agent-bridge.exe'
+        }
     }
 
     $payloadManifest = Get-Content -LiteralPath (Join-Path $resolved 'STAGED_PAYLOAD_MANIFEST.json') -Raw | ConvertFrom-Json
@@ -2236,6 +2336,7 @@ if ($LASTEXITCODE -ne 0 -or -not $cargoMetadata.target_directory) {
     throw 'failed to resolve the Cargo target directory'
 }
 $runtimeArtifactPlan = Get-RuntimeArtifactPlan $cargoMetadata
+$frontDoorBridgePlan = Get-FrontDoorBridgePlan $cargoMetadata $ClaudeCodeFrontDoor
 $governorPath = Join-Path ([string]$cargoMetadata.target_directory) 'release\eliot-governor.exe'
 $sourceCommit = (& git -C $repo rev-parse HEAD 2>$null | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') {
@@ -2300,6 +2401,18 @@ $plan = [ordered]@{
     operator_binding = 'locked-build-receipt-required (OPERATOR_BUILD_RECEIPT.json pinned to source commit; arbitrary OperatorSource rejected)'
     output = $bundle
     governor = $governorPath
+    claude_code_front_door = [ordered]@{
+        selection = $ClaudeCodeFrontDoor
+        operator_flag = 'ELIOT_CLAUDE_FRONT_DOOR'
+        legacy_command = 'eliot-governor.exe'
+        legacy_argv = @('mcp', 'stdio', '--host', 'claude', '--instance', 'default')
+        bridge_command = 'eliot-agent-bridge.exe'
+        bridge_build = 'cargo --frozen -p eliot-agent-bridge --bin eliot-agent-bridge'
+        bridge_argv = @('--profile', 'SPINE_FUNCTIONAL', '--transport', 'stdio', '--client-declaration', '<installation-absolute>/agent-bridge/client-declaration-v2.json')
+        bridge_path = [string]$frontDoorBridgePlan.path
+        bridge_provisioned = [bool]$frontDoorBridgePlan.provisioned
+        other_hosts = 'legacy-unchanged (codex/opencode/claude-desktop keep eliot-governor MCP entries)'
+    }
     operator_source = if ($BuildOperator) { '<generated-by-locked-winui-publish>' } else { $OperatorSource }
     operator_build = if ($BuildOperator) { 'builder-invoked locked WinUI Publish; receipt emitted by the project AfterTargets=Publish target' } else { 'consume externally supplied receipt-bound publish directory' }
     codex_marketplace_source = (Join-Path $repo 'integrations/codex/marketplace.json')
@@ -2341,7 +2454,9 @@ $plan = [ordered]@{
                 build_path = $_.path
             }
         })
-    includes = @('governor-gated-legacy', 'runtime-artifacts', 'pinned-surrealdb', 'operator-receipt-bound', 'codex-marketplace-gated', 'codex-plugin-gated', 'skills', 'antigravity-official-plugin', 'operations-runbooks', 'release-catalogue')
+    includes = @('governor-gated-legacy', 'runtime-artifacts', 'pinned-surrealdb', 'operator-receipt-bound', 'codex-marketplace-gated', 'codex-plugin-gated', 'skills', 'antigravity-official-plugin', 'operations-runbooks', 'release-catalogue') + @(
+        if ($ClaudeCodeFrontDoor -ceq 'agent-bridge') { 'claude-frontdoor-bridge' } else { 'claude-frontdoor-legacy' }
+    )
     signing_required_before_public_distribution = $true
 }
 
@@ -2421,6 +2536,12 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "cargo Governor release build failed with exit code $LASTEXITCODE"
     }
+    if ($frontDoorBridgePlan.provisioned) {
+        & $cargoInvokePath build --frozen --locked --offline --release -p eliot-agent-bridge --bin eliot-agent-bridge
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo Claude Code front-door release build failed with exit code $LASTEXITCODE"
+        }
+    }
     foreach ($artifact in $runtimeArtifactPlan) {
         & $cargoInvokePath build --frozen --locked --offline --release -p $artifact.package --bin $artifact.binary
         if ($LASTEXITCODE -ne 0) {
@@ -2452,9 +2573,30 @@ try {
     if (-not (Test-Path -LiteralPath $governor -PathType Leaf)) {
         throw "release governor executable is missing: $governor"
     }
+    $frontDoorBridge = [string]$frontDoorBridgePlan.path
+    $frontDoorBridgeStaged = $null
+    if ($frontDoorBridgePlan.provisioned) {
+        if (-not (Test-Path -LiteralPath $frontDoorBridge -PathType Leaf)) {
+            throw "release Claude Code front-door executable is missing: $frontDoorBridge"
+        }
+        $frontDoorBridgeFile = Get-Item -LiteralPath $frontDoorBridge
+        Assert-NoSecretFile $frontDoorBridgeFile 'eliot-agent-bridge.exe'
+        [void](Assert-WindowsX64Pe $frontDoorBridgeFile.FullName 'eliot-agent-bridge.exe')
+        $frontDoorBridgeStaged = [ordered]@{
+            package = 'eliot-agent-bridge'
+            binary = 'eliot-agent-bridge'
+            path = 'eliot-agent-bridge.exe'
+            sha256 = (Get-FileHash -LiteralPath $frontDoorBridgeFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            bytes = $frontDoorBridgeFile.Length
+        }
+    }
     $verifiedRuntimeArtifacts = @(Get-VerifiedRuntimeArtifacts $runtimeArtifactPlan $Version)
     $governorLinkerVersion = Get-WindowsPeLinkerVersion $governor 'eliot-governor.exe'
     $peLinkerVersions = @(@($verifiedRuntimeArtifacts | ForEach-Object { [string]$_.linker_version }) + @($governorLinkerVersion) | Sort-Object -Unique)
+    if ($frontDoorBridgeStaged) {
+        $frontDoorBridgeLinkerVersion = Get-WindowsPeLinkerVersion $frontDoorBridge 'eliot-agent-bridge.exe'
+        $peLinkerVersions = @(@($peLinkerVersions) + @($frontDoorBridgeLinkerVersion) | Sort-Object -Unique)
+    }
     $stageToolchain.linker = [ordered]@{
         policy = 'msvc-link-via-rustc'
         vswhere = $stageToolchain.linker.vswhere
@@ -2469,6 +2611,9 @@ try {
     New-Item -ItemType Directory -Path $bundle | Out-Null
     Assert-NoSecretFile (Get-Item -LiteralPath $governor) 'eliot-governor.exe'
     Copy-Item -LiteralPath $governor -Destination $bundle
+    if ($frontDoorBridgeStaged) {
+        Copy-Item -LiteralPath $frontDoorBridge -Destination (Join-Path $bundle 'eliot-agent-bridge.exe')
+    }
     $runtimeRoot = Join-Path $bundle 'runtime'
     New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
     foreach ($artifact in $runtimeArtifactPlan) {
@@ -2587,7 +2732,7 @@ try {
     }
     Copy-OperatorPayload $verifiedOperator.source (Join-Path $bundle 'operator')
     Copy-Item -LiteralPath $verifiedOperator.receipt_path -Destination (Join-Path $bundle 'operator/OPERATOR_BUILD_RECEIPT.json')
-    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt
+    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged
     $stagedPayloadManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Encoding utf8
     $stagedPayloadManifestHash = (Get-FileHash -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Algorithm SHA256).Hash.ToLowerInvariant()
     [ordered]@{
@@ -2596,6 +2741,14 @@ try {
         source_commit = $sourceCommit
         generation_binding = $generationBinding
         governor_version = $Version
+        claude_code_front_door = [ordered]@{
+            selection = $ClaudeCodeFrontDoor
+            operator_flag = 'ELIOT_CLAUDE_FRONT_DOOR'
+            bridge_path = 'eliot-agent-bridge.exe'
+            bridge_provisioned = [bool]$frontDoorBridgeStaged
+            bridge_sha256 = if ($frontDoorBridgeStaged) { [string]$frontDoorBridgeStaged.sha256 } else { $null }
+            bridge_bytes = if ($frontDoorBridgeStaged) { [int64]$frontDoorBridgeStaged.bytes } else { $null }
+        }
         operator_schema_version = $verifiedOperator.schema_version
         operator_protocol_version = $verifiedOperator.protocol_version
         operator_protocol_hash = $verifiedOperator.protocol_hash
