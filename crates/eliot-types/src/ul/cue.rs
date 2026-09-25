@@ -173,7 +173,13 @@ pub enum CueStrength {
     Secondary,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`. `expected_reuse_note` stays `#[serde(default)]`: `None` is the
+/// approved capture-first optional-note domain (V2 pages), `Some` the legacy
+/// v1 domain (V1 pages).
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CueBinding {
     pub cue_kind: LegacyCueKindV1,
     pub cue_value: String,
@@ -190,7 +196,11 @@ pub const MAX_CUE_BINDING_PAGE_BYTES: usize = 96 * 1024;
 pub const CUE_BINDING_PAGE_SCHEMA_VERSION_V1: &str = "eliot-cue-binding-page-v1";
 pub const CUE_BINDING_PAGE_SCHEMA_VERSION_V2: &str = "eliot-cue-binding-page-v2";
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`. Nested bindings and the blob reference are closed too.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CueBindingPage {
     pub schema_version: String,
     pub page_id: String,
@@ -539,7 +549,11 @@ pub fn cue_binding_page_set_hash(pages: &[CueBindingPage]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CueIndexRow {
     pub row_id: String,
     pub project_id: ProjectId,
@@ -554,7 +568,13 @@ pub struct CueIndexRow {
     pub token_estimate: u32,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`. `payload` stays `#[serde(default)]`: a missing key and an
+/// explicit null both mean absent free-form payload, never fabricated
+/// bindings or admission. Nested bindings are closed too.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CueRecordSource {
     pub record_ref: String,
     pub record_kind: String,

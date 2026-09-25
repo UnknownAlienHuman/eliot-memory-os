@@ -20,7 +20,11 @@ pub enum ActivationEdgeKind {
     VerifiedBy,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActivationNode {
     pub node_ref: String,
     pub score_milli: u16,
@@ -28,14 +32,22 @@ pub struct ActivationNode {
     pub via: Vec<String>,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SuppressedActivation {
     pub node_ref: String,
     pub score_milli: u16,
     pub reason: String,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`. Nested nodes and suppressions are closed too.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActivationTrace {
     pub trace_id: String,
     pub project_id: ProjectId,
@@ -50,14 +62,24 @@ pub struct ActivationTrace {
     pub suppressed: Vec<SuppressedActivation>,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlActivationGraphEdge {
     pub from_ref: String,
     pub to_ref: String,
     pub kind: ActivationEdgeKind,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`. `co_change`/`relations` stay `#[serde(default)]`: the store
+/// materializer builds this shape explicitly from raw rows, so the defaults
+/// only preserve decode acceptance and never assert graph coverage.
 #[derive(Clone, Debug, Default, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlActivationGraphRows {
     #[serde(default)]
     pub co_change: Vec<CoChangeEdge>,

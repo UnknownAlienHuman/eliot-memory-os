@@ -24,7 +24,11 @@ pub enum UlInjectionMode {
     HandlesOnly,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlTaskClass {
     pub action_class: String,
     pub subsystem: String,
@@ -41,7 +45,11 @@ impl UlTaskClass {
     }
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`. The nested task class is closed too.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlTaskExperimentAssignment {
     pub project_id: ProjectId,
     pub task_id: TaskId,
@@ -52,7 +60,11 @@ pub struct UlTaskExperimentAssignment {
     pub config_hash: String,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`.
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlTaskClassPolicy {
     pub project_id: ProjectId,
     pub task_class_key: String,
@@ -65,7 +77,13 @@ pub struct UlTaskClassPolicy {
     pub evidence_task_ids: Vec<TaskId>,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`. The six `#[serde(default)]` fields keep their absence
+/// semantics: an empty class key, unassigned arm/mode, and zero token
+/// counters mean not yet measured, never measured benefit.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlTaskLedger {
     pub task_id: TaskId,
     pub project_id: ProjectId,
@@ -89,7 +107,11 @@ pub struct UlTaskLedger {
     pub first_mutation_seen: bool,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`.
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlUseReport {
     pub project_id: ProjectId,
     pub tasks: u32,
@@ -99,7 +121,11 @@ pub struct UlUseReport {
     pub expanded_after_injection_fraction: f64,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlArtifactInventory {
     pub concept_count: u32,
     pub capsule_count: u32,
@@ -110,7 +136,12 @@ pub struct UlArtifactInventory {
     pub system_map_count: u32,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`. `total_ul_edges` stays `#[serde(default)]`: the readiness
+/// projection omits it and the caller recomputes the sum after decode.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlGraphInventory {
     pub co_change_edges: u32,
     pub card_covers_edges: u32,
@@ -121,7 +152,11 @@ pub struct UlGraphInventory {
     pub total_ul_edges: u32,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlPredictionInventory {
     pub total: u32,
     pub unresolved: u32,
@@ -138,13 +173,21 @@ pub enum UlReadinessState {
     NotEligible,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlFeatureReadiness {
     pub state: UlReadinessState,
     pub reasons: Vec<String>,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`. Nested feature rows are closed too.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlTask08Readiness {
     pub spreading_activation: UlFeatureReadiness,
     pub reverse_dependency_index: UlFeatureReadiness,
@@ -154,7 +197,11 @@ pub struct UlTask08Readiness {
     pub host_surface_optimization: UlFeatureReadiness,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`. Nested inventories are closed too.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlReadinessInventory {
     pub artifacts: UlArtifactInventory,
     pub graph: UlGraphInventory,
@@ -170,7 +217,12 @@ pub struct UlReadinessInventory {
     pub expanded_after_injection_fraction: f64,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`. `schema_version` semantics stay with the readiness owner, not
+/// with this wire shape. Nested rows are closed too.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlFieldValidationManifest {
     pub schema_version: String,
     pub project_id: ProjectId,
@@ -197,7 +249,11 @@ impl Default for UlFieldValidationManifest {
     }
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlSecondRepositoryValidation {
     pub project_id: ProjectId,
     pub project_root: String,
@@ -211,7 +267,11 @@ pub struct UlSecondRepositoryValidation {
     pub completed_at: OffsetDateTime,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlFieldTaskAnnotation {
     pub task_id: TaskId,
     pub task_class: String,
@@ -221,21 +281,33 @@ pub struct UlFieldTaskAnnotation {
     pub notes: String,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlProseFailureSignal {
     pub capsule_ref: String,
     pub kind: String,
     pub evidence_ref: String,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlHostSurfaceIncident {
     pub kind: String,
     pub session_ref: String,
     pub evidence_ref: String,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlFieldEvidenceSummary {
     pub manifest_present: bool,
     pub manifest_valid: bool,
@@ -245,7 +317,11 @@ pub struct UlFieldEvidenceSummary {
     pub second_repository_status: String,
 }
 
+/// Decoder: derived struct, no `flatten`, no tag. Unknown member keys are
+/// refused; duplicate member keys are already refused by the derived
+/// `MapAccess`. Nested inventory, readiness, and evidence rows are closed too.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlReadinessSnapshot {
     pub inventory: UlReadinessInventory,
     pub task08_readiness: UlTask08Readiness,
