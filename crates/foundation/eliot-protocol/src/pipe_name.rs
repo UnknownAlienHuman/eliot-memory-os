@@ -157,6 +157,66 @@ impl EliotPipeOwner {
         Err(EliotPipeNameError::LegacyMappingUnavailable)
     }
 
+    /// Validates daemon fields into an owner-approved bundle.
+    ///
+    /// This is the only constructor of [`ValidatedDaemonFields`]: fallible
+    /// edge validation (including the nonzero-generation check) whose output
+    /// feeds the infallible [`EliotPipeName::kernel_daemon_from_validated`]
+    /// core constructor.
+    pub(crate) fn validate_daemon_fields(
+        generation: ResourceGeneration,
+    ) -> Result<ValidatedDaemonFields, EliotPipeNameError> {
+        Self::validate_generation(generation, 0)?;
+        Ok(ValidatedDaemonFields { generation })
+    }
+
+    /// Validates module fields into an owner-approved bundle.
+    ///
+    /// This is the only constructor of [`ValidatedModuleFields`]: it carries
+    /// the existing checks — owner-segment rules, nonzero generation, and
+    /// the joint full-name bound — so the infallible
+    /// [`EliotPipeName::module_from_validated`] core constructor cannot fail.
+    pub(crate) fn validate_module_fields(
+        module_id: ContractId,
+        generation: ResourceGeneration,
+    ) -> Result<ValidatedModuleFields, EliotPipeNameError> {
+        // Validate through the owner segment type so segment and module
+        // rules (reserved-device refusal, segment bound) cannot drift; remap
+        // the redacted field to the public constructor argument.
+        let module_segment =
+            EliotPipeSegment::new(module_id.as_str()).map_err(|error| match error {
+                EliotPipeNameError::InvalidSegment { reason, .. } => {
+                    EliotPipeNameError::InvalidSegment {
+                        offset: 0,
+                        field: "module_id",
+                        reason,
+                    }
+                }
+                other => other,
+            })?;
+        Self::validate_generation(generation, 0)?;
+        let fields = ValidatedModuleFields {
+            module_id,
+            module_segment,
+            generation,
+        };
+        // Joint full-name bound: render the exact canonical bytes the
+        // endpoint Display would emit and measure them, as before.
+        let actual = format!(
+            "{ELIOT_PIPE_PREFIX}module\\{}\\{}",
+            fields.module_id,
+            fields.generation.value()
+        )
+        .len();
+        if actual > MAX_PIPE_NAME_BYTES {
+            return Err(EliotPipeNameError::NameTooLong {
+                actual,
+                maximum: MAX_PIPE_NAME_BYTES,
+            });
+        }
+        Ok(fields)
+    }
+
     fn validate_segment(
         value: &str,
         offset: usize,
@@ -385,6 +445,30 @@ impl TryFrom<String> for EliotPipeSegment {
     }
 }
 
+/// Owner-validated daemon fields accepted by the infallible core constructor.
+///
+/// Constructible only via [`EliotPipeOwner::validate_daemon_fields`]: the
+/// fields are private and that validator is the sole construction site, so
+/// [`EliotPipeName::kernel_daemon_from_validated`] cannot observe an
+/// unchecked generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedDaemonFields {
+    generation: ResourceGeneration,
+}
+
+/// Owner-validated module fields accepted by the infallible core constructor.
+///
+/// Constructible only via [`EliotPipeOwner::validate_module_fields`]: the
+/// fields are private and that validator is the sole construction site, so
+/// [`EliotPipeName::module_from_validated`] cannot observe an unchecked
+/// module identity, generation, or over-long joint name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedModuleFields {
+    module_id: ContractId,
+    module_segment: EliotPipeSegment,
+    generation: ResourceGeneration,
+}
+
 /// Private endpoint shapes retained beneath the top-level owner family.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum EliotPipeEndpoint {
@@ -432,44 +516,46 @@ impl EliotPipeName {
     }
 
     /// Constructs a generation-specific Kernel daemon identity.
+    ///
+    /// Validated edge: owner validation first, then infallible core
+    /// construction. Rejection behavior is unchanged.
     pub fn kernel_daemon(generation: ResourceGeneration) -> Result<Self, EliotPipeNameError> {
-        EliotPipeOwner::validate_generation(generation, 0)?;
-        Ok(Self(EliotPipeEndpoint::KernelDaemon { generation }))
+        EliotPipeOwner::validate_daemon_fields(generation).map(Self::kernel_daemon_from_validated)
+    }
+
+    /// Constructs a Kernel daemon identity from owner-validated fields.
+    ///
+    /// Infallible core: the bundle exists only after
+    /// [`EliotPipeOwner::validate_daemon_fields`] enforced every check.
+    pub(crate) fn kernel_daemon_from_validated(fields: ValidatedDaemonFields) -> Self {
+        Self(EliotPipeEndpoint::KernelDaemon {
+            generation: fields.generation,
+        })
     }
 
     /// Constructs a generation-specific module identity.
+    ///
+    /// Validated edge: owner validation first, then infallible core
+    /// construction. Rejection behavior is unchanged.
     pub fn module(
         module_id: ContractId,
         generation: ResourceGeneration,
     ) -> Result<Self, EliotPipeNameError> {
-        // Validate through the owner segment type so segment and module
-        // rules (reserved-device refusal, segment bound) cannot drift; remap
-        // the redacted field to the public constructor argument.
-        let module_segment =
-            EliotPipeSegment::new(module_id.as_str()).map_err(|error| match error {
-                EliotPipeNameError::InvalidSegment { reason, .. } => {
-                    EliotPipeNameError::InvalidSegment {
-                        offset: 0,
-                        field: "module_id",
-                        reason,
-                    }
-                }
-                other => other,
-            })?;
-        EliotPipeOwner::validate_generation(generation, 0)?;
-        let name = Self(EliotPipeEndpoint::Module {
-            module_id,
-            module_segment,
-            generation,
-        });
-        let actual = name.to_string().len();
-        if actual > MAX_PIPE_NAME_BYTES {
-            return Err(EliotPipeNameError::NameTooLong {
-                actual,
-                maximum: MAX_PIPE_NAME_BYTES,
-            });
-        }
-        Ok(name)
+        EliotPipeOwner::validate_module_fields(module_id, generation)
+            .map(Self::module_from_validated)
+    }
+
+    /// Constructs a module identity from owner-validated fields.
+    ///
+    /// Infallible core: the bundle exists only after
+    /// [`EliotPipeOwner::validate_module_fields`] enforced every check,
+    /// including the joint full-name bound.
+    pub(crate) fn module_from_validated(fields: ValidatedModuleFields) -> Self {
+        Self(EliotPipeEndpoint::Module {
+            module_id: fields.module_id,
+            module_segment: fields.module_segment,
+            generation: fields.generation,
+        })
     }
 
     /// Constructs the static Watchdog signal identity.
