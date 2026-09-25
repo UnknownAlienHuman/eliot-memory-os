@@ -127,6 +127,21 @@ required_files = []
 optional_files = []
 
 [[route]]
+id = "memory-admission-trace"
+description = "Memory admission decisions, retrieval plans, and per-material retrieval trace linkage (I12.26)."
+path_globs = [
+  "crates/smart/eliot-context-admission/**",
+  "crates/smart/eliot-reactive-context-plan/src/retrieval_plan.rs",
+  "crates/smart/eliot-reactive-context-plan/src/compiler.rs",
+  "crates/governor/eliot-governor/src/reactive_admission.rs",
+]
+topic_keywords = ["memory admission", "retrieval plan", "retrieval trace", "recall disposition"]
+required_handles = ["I12.26"]
+optional_handles = ["I12.*", "I13"]
+required_files = []
+optional_files = []
+
+[[route]]
 id = "dreamer"
 description = "Dreamer orientation, reflection, hypotheses, sleep-like processing, and bounded cognitive improvement."
 path_globs = ["bins/eliot-dreamer/**", "crates/**/*dream*/**"]
@@ -203,7 +218,7 @@ max_required_bytes = 458752
 id = "workspace-governance"
 description = "Workspace build graph, repository policy, tests, scripts, active workstreams, and configuration changes."
 path_globs = [
-  "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml", ".typos.toml", "Justfile", "tool-versions.json", "mcpls.toml",
+  "Cargo.toml", "Cargo.lock", "**/Cargo.toml", "rust-toolchain.toml", "deny.toml", ".typos.toml", "Justfile", "tool-versions.json", "mcpls.toml",
   ".github/**", "scripts/**", "tests/**", "config/**", "workspace/**", "workstreams/**", "workers/**", "T*.md",
 ]
 topic_keywords = ["workspace", "cargo", "repository policy", "workstream", "build graph", "configuration"]

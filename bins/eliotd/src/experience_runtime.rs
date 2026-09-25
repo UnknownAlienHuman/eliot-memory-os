@@ -50,21 +50,24 @@ use eliot_observation::{
     bank_admission::{
         BankStoreSnapshot, ExperienceRevisionLedger, FeedbackStoreSnapshot,
         bank_records_from_range_payload, feedback_records_from_range_payload,
+        produce_bank_commit, produce_feedback_commit,
         supply_bank_projection_from_store, supply_feedback_projection_from_store,
     },
 };
 use eliot_observation_contracts::{
-    ObservationScope, ProjectionCoverage, ProjectionOmission, RetentionHold, RetentionSchedule,
-};
-use eliot_understanding_assessment::{
-    AssessmentClosure, AssessmentScope, CommonGroundAssessment, CommonGroundInput, EvidenceCite,
-    ExperienceEvidence, OwnerContext, ScopedUnderstandingAssessment,
+    AgentFeedbackRecord, ExperienceBankRecord, ObservationScope, ProjectionCoverage,
+    ProjectionOmission, RetentionHold, RetentionSchedule,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{RequestBinding, WorkScopeId};
 use eliot_store_api::{
-    CanonicalReadClient, NamedReadOperation, NamedReadRequest, ReadConsistency, RevisionKey,
-    ScopeId, StoreError, epistemic_revision::EpistemicPositionReadback,
+    CanonicalReadClient, NamedReadOperation, NamedReadRequest, OrderingHeadExpectation, ReadConsistency,
+    RevisionHeadExpectation, RevisionKey, ScopeId, StoreError, WriteReceipt,
+    epistemic_revision::EpistemicPositionReadback,
+};
+use eliot_understanding_assessment::{
+    AssessmentClosure, AssessmentScope, CommonGroundAssessment, CommonGroundInput, EvidenceCite,
+    ExperienceEvidence, OwnerContext, ScopedUnderstandingAssessment,
 };
 use thiserror::Error;
 
@@ -99,6 +102,9 @@ pub enum ExperienceDriverError {
         field: &'static str,
         reason: &'static str,
     },
+    /// The Governor-backed experience commit failed.
+    #[error("experience commit failed: {0}")]
+    Commit(String),
 }
 
 /// Read the TRUE admitted edge position through the real bridge client.
@@ -641,6 +647,13 @@ pub async fn run_experience_quality_event(
 /// same admitted `ctx`, the live Kernel fence, the owner-derived key,
 /// and its own lifecycle scope, then passes the identity to the
 /// canonical commit caller.
+/// Terminal output bundle: durable commit receipts per family.
+pub struct ExperienceCommitOutput {
+    /// Owner receipts for committed bank records, in input order.
+    pub bank_receipts: Vec<WriteReceipt>,
+    /// Owner receipts for committed feedback records, in input order.
+    pub feedback_receipts: Vec<WriteReceipt>,
+}
 pub fn derive_commit_ingress(
     ctx: &RequestMetadata,
     kernel_fence: &StateFence,
@@ -684,4 +697,118 @@ pub fn derive_commit_ingress(
         reason: "derived ingress identity is invalid",
     })?;
     Ok(identity)
+}
+
+/// Terminal commit entry: admitted event records to durable rows.
+///
+/// Arc-callable: takes `composition` by shared reference so trigger
+/// contexts holding `Arc<DaemonComposition>` can invoke it with no
+/// lock, no restructuring, and no second authority. No refresh runs
+/// here and no stale flag is set (both need `&mut`); the owning
+/// context runs [`DaemonComposition::refresh_dependent_view`] on its
+/// own mutably-held discipline afterwards, and until then projections
+/// read through the composition may lag the durable store. Reads stay
+/// reads and writes stay owner-checked: the canonical Governor commit
+/// caller re-validates identity, fence, scope, and heads downstream.
+///
+/// Runs, in source terms: ledger rebuild from the admitted slices (only
+/// the greatest admitted revision per handle passes the owner
+/// sequencing gate; older revisions fail closed, never silently
+/// skipped), per-record owner commit payload (`produce_bank_commit` /
+/// `produce_feedback_commit`), admitted ingress derivation with
+/// edge-owned lifecycle scope, the canonical Governor commit caller
+/// (`commit_experience_bank` / `commit_experience_feedback`), and
+/// returns the owner `WriteReceipt`s unmodified. Proof refs are
+/// verbatim admitted refs from the edge-supplied per-attempt receipts
+/// (admission + activation-request receipt identities, blanks
+/// dropped); nothing is inferred.
+#[allow(clippy::too_many_arguments)]
+pub async fn commit_experience_event_records(
+    composition: &DaemonComposition,
+    ctx: &RequestMetadata,
+    event: &ExperienceQualityEvent<'_>,
+    bank_records: &[ExperienceBankRecord],
+    feedback_records: &[AgentFeedbackRecord],
+    expected_revision_heads: Vec<RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    deadline_unix_ms: u64,
+    cancellation_id: String,
+) -> Result<ExperienceCommitOutput, ExperienceDriverError> {
+    ctx.validate().map_err(|_| ExperienceDriverError::Ingress {
+        field: "request_metadata",
+        reason: "retained invocation metadata is invalid",
+    })?;
+    let kernel_fence = composition.kernel_snapshot().state_fence().clone();
+    let mut proof_refs: Vec<String> = Vec::new();
+    for receipt in event.receipts {
+        for identity in [
+            receipt.admission_receipt.as_str(),
+            receipt.activation_request_receipt.as_str(),
+        ] {
+            if !identity.trim().is_empty()
+                && !proof_refs.iter().any(|existing| existing == identity)
+            {
+                proof_refs.push(identity.to_owned());
+            }
+        }
+    }
+    let mut ledger = ExperienceRevisionLedger::new();
+    ledger.rebuild_bank(bank_records);
+    ledger.rebuild_feedback(feedback_records);
+    let mut bank_receipts = Vec::with_capacity(bank_records.len());
+    for record in bank_records {
+        let commit_key = produce_bank_commit(&ledger, record)
+            .map_err(ExperienceDriverError::Governor)?
+            .idempotency_key;
+        let identity = derive_commit_ingress(
+            ctx,
+            &kernel_fence,
+            &commit_key,
+            deadline_unix_ms,
+            cancellation_id.clone(),
+        )?;
+        let receipt = eliot_governor::commit_experience_bank(
+            &composition.governor,
+            &identity,
+            &ledger,
+            record,
+            event.scope_id.clone(),
+            proof_refs.clone(),
+            expected_revision_heads.clone(),
+            expected_ordering_heads.clone(),
+        )
+        .await
+        .map_err(ExperienceDriverError::Governor)?;
+        bank_receipts.push(receipt);
+    }
+    let mut feedback_receipts = Vec::with_capacity(feedback_records.len());
+    for record in feedback_records {
+        let commit_key = produce_feedback_commit(&ledger, record)
+            .map_err(ExperienceDriverError::Governor)?
+            .idempotency_key;
+        let identity = derive_commit_ingress(
+            ctx,
+            &kernel_fence,
+            &commit_key,
+            deadline_unix_ms,
+            cancellation_id.clone(),
+        )?;
+        let receipt = eliot_governor::commit_experience_feedback(
+            &composition.governor,
+            &identity,
+            &ledger,
+            record,
+            event.scope_id.clone(),
+            proof_refs.clone(),
+            expected_revision_heads.clone(),
+            expected_ordering_heads.clone(),
+        )
+        .await
+        .map_err(ExperienceDriverError::Governor)?;
+        feedback_receipts.push(receipt);
+    }
+    Ok(ExperienceCommitOutput {
+        bank_receipts,
+        feedback_receipts,
+    })
 }

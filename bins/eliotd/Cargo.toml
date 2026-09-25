@@ -35,6 +35,8 @@ eliot-evaluation-contracts.workspace = true
 eliot-epistemic-contracts.workspace = true
 eliot-experience-provider = { path = "../../crates/smart/eliot-experience-provider", version = "0.1.0" }
 eliot-governor.workspace = true
+eliot-instrument-api.workspace = true
+eliot-testd-core.workspace = true
 eliot-ipc.workspace = true
 eliot-kernel-core.workspace = true
 eliot-learning-contracts.workspace = true

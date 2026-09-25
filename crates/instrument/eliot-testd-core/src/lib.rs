@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_contracts::EpochId;
+use eliot_contracts::{ArtifactId, ClockReading, ContractId, EpochId, RequestId, canonical_json_bytes};
 pub use eliot_instrument_api::KernelProcessAdmissionRequest;
 use eliot_instrument_api::{
     ExecutionStatus, InstrumentInvocation, InstrumentKind, VerificationRun,
@@ -15,12 +15,15 @@ use eliot_instrument_api::{
 use eliot_process::{
     EnvironmentInheritance, EnvironmentProjection, ProcessRequest, ResourceLimits,
 };
+use eliot_protocol::RequestIdentity;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use uuid::Uuid;
@@ -52,14 +55,14 @@ pub use claim::{
 // * `program_path` is relative and closed (`cargo` only): absolute paths
 //   and parent traversal are refused, so no caller can redirect execution
 //   by path.
-// * `fixed_argv` is the complete argv. This slice's single profile takes
-//   no typed slots, so any invocation-supplied argument is refused at
-//   registration: there is no caller passthrough. A future profile with
-//   typed slots arrives as a new registry entry with its own slot
-//   validation, never by widening this one.
+// * `fixed_argv` is the complete argv. The probe and productive nextest
+//   profiles take no caller slots, so any invocation-supplied argument is
+//   refused at registration: there is no caller passthrough. A future
+//   profile with typed slots arrives as a new registry entry with its own
+//   slot validation, never by widening these.
 // * `env_allowlist` is the exact non-secret environment for the child.
-//   This profile takes none (`EnvironmentInheritance::None` with an empty
-//   map): the bounded probe needs no environment, so none is supplied.
+//   The productive libtest-json profile receives only the explicitly
+//   registered feature gate below; no ambient environment is inherited.
 // * the working directory is never stored here: the Drive always uses the
 //   generation root supplied with the admitted material, never a
 //   caller-chosen directory.
@@ -72,18 +75,35 @@ pub use claim::{
 // `eliot-kernel-service`); [`testd_binding_digest`] additionally covers
 // the installed artifact digest and binds one Drive registration.
 
-/// The single admitted testd profile in this slice.
+/// The retained harmless process probe profile.
 ///
-/// The name keeps the established `cargo-test` instrument profile spelling
-/// already used across testd fixtures; in this slice it executes the
-/// bounded `cargo --version` tool probe. A real `cargo test` execution with
-/// scoped arguments arrives as a new profile, never by widening this one.
+/// A clean `cargo --version` exit is never promoted into a task verifier
+/// result.
 pub const TESTD_ADMITTED_PROFILE: &str = "cargo-test";
+/// Separately registered productive nextest profile.
+pub const TESTD_PRODUCTIVE_PROFILE: &str = "cargo-nextest";
 /// Relative program for the admitted probe, resolved through the platform
 /// tool locator at Drive time. Never absolute, never parent traversal.
 pub const TESTD_PROFILE_PROGRAM: &str = "cargo";
+/// Relative executable for the productive profile. Resolving the installed
+/// subcommand directly pins nextest rather than hashing the cargo wrapper.
+pub const TESTD_PRODUCTIVE_PROFILE_PROGRAM: &str = "cargo-nextest";
 /// Fixed argv for the admitted probe. No caller slot exists.
 pub const TESTD_PROFILE_ARGV: &[&str] = &["--version"];
+/// Fixed machine-readable argv for the productive nextest profile.
+pub const TESTD_PRODUCTIVE_PROFILE_ARGV: &[&str] =
+    &[
+        "run",
+        "--message-format",
+        "libtest-json-plus",
+        "--message-format-version",
+        "0.1",
+    ];
+/// Exact environment required by nextest 0.9.143's experimental libtest JSON
+/// reporter. The value is owner-registered and is never read from ambient
+/// process state.
+pub const TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT: &[(&str, &str)] =
+    &[("NEXTEST_EXPERIMENTAL_LIBTEST_JSON", "1")];
 /// Bounded wall timeout for the probe, in milliseconds.
 pub const TESTD_PROFILE_WALL_TIMEOUT_MS: u64 = 15_000;
 /// Bounded CPU ceiling for the probe, in milliseconds.
@@ -96,6 +116,18 @@ pub const TESTD_PROFILE_STDOUT_BYTES: u64 = 64 * 1024;
 pub const TESTD_PROFILE_STDERR_BYTES: u64 = 64 * 1024;
 /// Bounded descendant ceiling for the probe.
 pub const TESTD_PROFILE_MAX_DESCENDANTS: u32 = 4;
+/// Independent wall timeout for the productive nextest profile.
+pub const TESTD_PRODUCTIVE_PROFILE_WALL_TIMEOUT_MS: u64 = 15 * 60 * 1_000;
+/// Independent CPU ceiling for the productive nextest profile.
+pub const TESTD_PRODUCTIVE_PROFILE_CPU_TIME_MS: u64 = 10 * 60 * 1_000;
+/// Independent memory ceiling for the productive nextest profile.
+pub const TESTD_PRODUCTIVE_PROFILE_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Independent stdout capture bound for the productive nextest profile.
+pub const TESTD_PRODUCTIVE_PROFILE_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
+/// Independent stderr capture bound for the productive nextest profile.
+pub const TESTD_PRODUCTIVE_PROFILE_STDERR_BYTES: u64 = 16 * 1024 * 1024;
+/// Independent descendant ceiling for the productive nextest profile.
+pub const TESTD_PRODUCTIVE_PROFILE_MAX_DESCENDANTS: u32 = 32;
 
 /// Closed executable binding for one admitted testd profile.
 ///
@@ -115,8 +147,8 @@ pub struct TestdExecutableBinding {
     pub program_path: String,
     /// Complete fixed argv (`--version` only).
     pub fixed_argv: Vec<String>,
-    /// Exact non-secret environment allowlist (empty for this profile).
-    pub env_allowlist: Vec<String>,
+    /// Exact non-secret environment name/value bindings for this profile.
+    pub env_allowlist: Vec<(String, String)>,
     /// Bounded wall timeout, in milliseconds.
     pub wall_timeout_ms: u64,
     /// Bounded CPU ceiling, in milliseconds.
@@ -134,10 +166,10 @@ pub struct TestdExecutableBinding {
 impl TestdExecutableBinding {
     /// Validates the closed binding shape.
     pub fn validate(&self) -> Result<(), TestdError> {
-        if self.profile != TESTD_ADMITTED_PROFILE {
+        if !is_admitted_testd_profile(&self.profile) {
             return Err(TestdError::Invalid {
                 field: "profile",
-                reason: "testd admits only the closed cargo-test tool-probe profile",
+                reason: "testd admits only registered probe or productive nextest profiles",
             });
         }
         if !is_binding_digest(&self.package_artifact_digest) {
@@ -149,32 +181,54 @@ impl TestdExecutableBinding {
         // Closed by equality: the admitted program is relative by
         // construction, so absolute paths and parent traversal have no
         // spelling that validates.
-        if self.program_path != TESTD_PROFILE_PROGRAM {
+        let expected_program = if self.profile == TESTD_PRODUCTIVE_PROFILE {
+            TESTD_PRODUCTIVE_PROFILE_PROGRAM
+        } else {
+            TESTD_PROFILE_PROGRAM
+        };
+        if self.program_path != expected_program {
             return Err(TestdError::Invalid {
                 field: "program_path",
-                reason: "testd admits only the closed relative tool program",
+                reason: "testd admits only the closed relative cargo tool program",
             });
         }
-        let expected_argv: Vec<String> =
-            TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect();
+        let expected_argv: Vec<String> = if self.profile == TESTD_ADMITTED_PROFILE {
+            TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect()
+        } else {
+            TESTD_PRODUCTIVE_PROFILE_ARGV
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
         if self.fixed_argv != expected_argv {
             return Err(TestdError::Invalid {
                 field: "fixed_argv",
-                reason: "the admitted profile takes fixed argv; caller arguments are refused",
+                reason: "the registered profile takes fixed argv; caller arguments are refused",
             });
         }
-        if !self.env_allowlist.is_empty() {
+        let expected_environment: Vec<(String, String)> = if self.profile == TESTD_PRODUCTIVE_PROFILE
+        {
+            TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if self.env_allowlist != expected_environment {
             return Err(TestdError::Invalid {
                 field: "env_allowlist",
-                reason: "the admitted profile takes no environment passthrough",
+                reason: "the admitted profile takes only its registered environment bindings",
             });
         }
-        if self.wall_timeout_ms != TESTD_PROFILE_WALL_TIMEOUT_MS
-            || self.cpu_time_ms != Some(TESTD_PROFILE_CPU_TIME_MS)
-            || self.memory_bytes != Some(TESTD_PROFILE_MEMORY_BYTES)
-            || self.stdout_bytes != TESTD_PROFILE_STDOUT_BYTES
-            || self.stderr_bytes != TESTD_PROFILE_STDERR_BYTES
-            || self.max_descendants != TESTD_PROFILE_MAX_DESCENDANTS
+        let (wall_timeout_ms, cpu_time_ms, memory_bytes, stdout_bytes, stderr_bytes, max_descendants) =
+            profile_limits(&self.profile);
+        if self.wall_timeout_ms != wall_timeout_ms
+            || self.cpu_time_ms != cpu_time_ms
+            || self.memory_bytes != memory_bytes
+            || self.stdout_bytes != stdout_bytes
+            || self.stderr_bytes != stderr_bytes
+            || self.max_descendants != max_descendants
         {
             return Err(TestdError::Invalid {
                 field: "resource_limits",
@@ -185,10 +239,32 @@ impl TestdExecutableBinding {
     }
 }
 
+fn profile_limits(profile: &str) -> (u64, Option<u64>, Option<u64>, u64, u64, u32) {
+    if profile == TESTD_PRODUCTIVE_PROFILE {
+        (
+            TESTD_PRODUCTIVE_PROFILE_WALL_TIMEOUT_MS,
+            Some(TESTD_PRODUCTIVE_PROFILE_CPU_TIME_MS),
+            Some(TESTD_PRODUCTIVE_PROFILE_MEMORY_BYTES),
+            TESTD_PRODUCTIVE_PROFILE_STDOUT_BYTES,
+            TESTD_PRODUCTIVE_PROFILE_STDERR_BYTES,
+            TESTD_PRODUCTIVE_PROFILE_MAX_DESCENDANTS,
+        )
+    } else {
+        (
+            TESTD_PROFILE_WALL_TIMEOUT_MS,
+            Some(TESTD_PROFILE_CPU_TIME_MS),
+            Some(TESTD_PROFILE_MEMORY_BYTES),
+            TESTD_PROFILE_STDOUT_BYTES,
+            TESTD_PROFILE_STDERR_BYTES,
+            TESTD_PROFILE_MAX_DESCENDANTS,
+        )
+    }
+}
+
 /// Returns true only for the closed admitted testd profile name.
 #[must_use]
 pub fn is_admitted_testd_profile(profile: &str) -> bool {
-    profile == TESTD_ADMITTED_PROFILE
+    matches!(profile, TESTD_ADMITTED_PROFILE | TESTD_PRODUCTIVE_PROFILE)
 }
 
 /// Resolves the closed binding for one admitted profile.
@@ -201,18 +277,40 @@ pub fn testd_profile_binding(
     profile: &str,
     package_artifact_digest: &str,
 ) -> Result<TestdExecutableBinding, TestdError> {
+    if !is_admitted_testd_profile(profile) {
+        return Err(TestdError::Invalid {
+            field: "profile",
+            reason: "testd admits only registered probe or productive nextest profiles",
+        });
+    }
+    let fixed_argv = if profile == TESTD_ADMITTED_PROFILE {
+        TESTD_PROFILE_ARGV
+    } else {
+        TESTD_PRODUCTIVE_PROFILE_ARGV
+    };
     let binding = TestdExecutableBinding {
         profile: profile.to_owned(),
         package_artifact_digest: package_artifact_digest.to_owned(),
-        program_path: TESTD_PROFILE_PROGRAM.to_owned(),
-        fixed_argv: TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect(),
-        env_allowlist: Vec::new(),
-        wall_timeout_ms: TESTD_PROFILE_WALL_TIMEOUT_MS,
-        cpu_time_ms: Some(TESTD_PROFILE_CPU_TIME_MS),
-        memory_bytes: Some(TESTD_PROFILE_MEMORY_BYTES),
-        stdout_bytes: TESTD_PROFILE_STDOUT_BYTES,
-        stderr_bytes: TESTD_PROFILE_STDERR_BYTES,
-        max_descendants: TESTD_PROFILE_MAX_DESCENDANTS,
+        program_path: if profile == TESTD_PRODUCTIVE_PROFILE {
+            TESTD_PRODUCTIVE_PROFILE_PROGRAM.to_owned()
+        } else {
+            TESTD_PROFILE_PROGRAM.to_owned()
+        },
+        fixed_argv: fixed_argv.iter().map(ToString::to_string).collect(),
+        env_allowlist: if profile == TESTD_PRODUCTIVE_PROFILE {
+            TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect()
+        } else {
+            Vec::new()
+        },
+        wall_timeout_ms: profile_limits(profile).0,
+        cpu_time_ms: profile_limits(profile).1,
+        memory_bytes: profile_limits(profile).2,
+        stdout_bytes: profile_limits(profile).3,
+        stderr_bytes: profile_limits(profile).4,
+        max_descendants: profile_limits(profile).5,
     };
     binding.validate()?;
     Ok(binding)
@@ -228,10 +326,21 @@ pub fn testd_profile_binding(
 /// mirrors these constants without a dependency: `canonical_json_bytes`
 /// sorts object keys, so only the field set and values must agree.
 pub fn testd_definition_digest() -> Result<String, TestdError> {
+    testd_definition_digest_for_profile(TESTD_ADMITTED_PROFILE)
+}
+
+/// Canonical definition digest for one registered testd profile.
+pub fn testd_definition_digest_for_profile(profile: &str) -> Result<String, TestdError> {
+    if !is_admitted_testd_profile(profile) {
+        return Err(TestdError::Invalid {
+            field: "profile",
+            reason: "testd admits only registered probe or productive nextest profiles",
+        });
+    }
     #[derive(Serialize)]
     struct Canonical<'a> {
         cpu_time_ms: Option<u64>,
-        env_allowlist: &'a [String],
+        env_allowlist: &'a [(String, String)],
         fixed_argv: &'a [String],
         max_descendants: u32,
         memory_bytes: Option<u64>,
@@ -241,19 +350,37 @@ pub fn testd_definition_digest() -> Result<String, TestdError> {
         stdout_bytes: u64,
         wall_timeout_ms: u64,
     }
-    let empty: Vec<String> = Vec::new();
-    let argv: Vec<String> = TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect();
+    let empty: Vec<(String, String)> = Vec::new();
+    let fixed_argv = if profile == TESTD_ADMITTED_PROFILE {
+        TESTD_PROFILE_ARGV
+    } else {
+        TESTD_PRODUCTIVE_PROFILE_ARGV
+    };
+    let argv: Vec<String> = fixed_argv.iter().map(ToString::to_string).collect();
+    let limits = profile_limits(profile);
+    let env_allowlist = if profile == TESTD_PRODUCTIVE_PROFILE {
+        TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect::<Vec<_>>()
+    } else {
+        empty
+    };
     let canonical = Canonical {
-        cpu_time_ms: Some(TESTD_PROFILE_CPU_TIME_MS),
-        env_allowlist: &empty,
+        cpu_time_ms: limits.1,
+        env_allowlist: &env_allowlist,
         fixed_argv: &argv,
-        max_descendants: TESTD_PROFILE_MAX_DESCENDANTS,
-        memory_bytes: Some(TESTD_PROFILE_MEMORY_BYTES),
-        profile: TESTD_ADMITTED_PROFILE,
-        program_path: TESTD_PROFILE_PROGRAM,
-        stderr_bytes: TESTD_PROFILE_STDERR_BYTES,
-        stdout_bytes: TESTD_PROFILE_STDOUT_BYTES,
-        wall_timeout_ms: TESTD_PROFILE_WALL_TIMEOUT_MS,
+        max_descendants: limits.5,
+        memory_bytes: limits.2,
+        profile,
+        program_path: if profile == TESTD_PRODUCTIVE_PROFILE {
+            TESTD_PRODUCTIVE_PROFILE_PROGRAM
+        } else {
+            TESTD_PROFILE_PROGRAM
+        },
+        stderr_bytes: limits.4,
+        stdout_bytes: limits.3,
+        wall_timeout_ms: limits.0,
     };
     eliot_contracts::canonical_json_bytes(&canonical)
         .map(|bytes| eliot_contracts::sha256_hex(&bytes))
@@ -300,7 +427,7 @@ pub fn testd_profile_resource_limits(
 }
 
 /// Builds the closed environment projection for one validated binding:
-/// no inherited values and no supplied values for this profile.
+/// no inherited values and only the exact registered name/value bindings.
 pub fn testd_profile_environment(
     binding: &TestdExecutableBinding,
 ) -> Result<EnvironmentProjection, TestdError> {
@@ -309,7 +436,7 @@ pub fn testd_profile_environment(
         binding
             .env_allowlist
             .iter()
-            .map(|key| (key.clone(), String::new()))
+            .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
         Vec::new(),
         EnvironmentInheritance::None,
@@ -773,10 +900,388 @@ pub struct TestJob {
     pub verification: Option<VerificationRun>,
     /// Exact receipt identity retained with a completed attempt.
     pub receipt: Option<ReceiptBinding>,
+    /// Full validated receipt retained with the durable attempt.  The
+    /// binding above is the compact scheduling projection; this record is
+    /// the only source from which a canonical verifier fact may recover raw
+    /// artifact lineage after the worker has returned.
+    #[serde(default)]
+    pub verification_receipt: Option<VerificationReceipt>,
+    /// Exact request identity and canonical verifier plan captured before a
+    /// productive verifier is dispatched. The TestD owner stores the bytes;
+    /// the daemon rehydrates and compares the Governor-owned plan at publish.
+    #[serde(default)]
+    pub verifier_dispatch: Option<TestdVerifierDispatchBinding>,
+    /// Actual repository identity observed immediately before productive
+    /// worker claim. The terminal receipt must retain this exact baseline.
+    #[serde(default)]
+    pub source_observation_before: Option<TestdSourceObservation>,
+    /// Durable handoff to the daemon's canonical verifier-fact publisher.
+    /// A pending marker is never a completion receipt.
+    #[serde(default)]
+    pub terminal_publication: Option<TestdTerminalPublication>,
     /// Last durable mutation time.
     pub updated_at_ms: u64,
     /// Immutable digest of the submitted contracts and scheduling fields.
     pub payload_digest: String,
+}
+
+/// Immutable owner binding persisted before a productive verifier starts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdVerifierDispatchBinding {
+    pub request_identity: RequestIdentity,
+    pub operation_id: String,
+    pub canonical_plan_json: String,
+    pub canonical_plan_sha256: String,
+}
+
+/// Immutable observation of the source repository used by one verifier run.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdSourceObservation {
+    pub repository_root: String,
+    pub branch: String,
+    pub commit: String,
+    pub dirty_state_sha256: String,
+}
+
+impl TestdSourceObservation {
+    /// Reads the live Git repository identity and a content-bound working-tree
+    /// digest. Any unavailable or oversized observation fails closed.
+    pub fn capture(repository_root: impl AsRef<Path>) -> Result<Self, TestdError> {
+        const MAX_GIT_OUTPUT: usize = 64 * 1024 * 1024;
+        let repository_root = std::fs::canonicalize(repository_root).map_err(|_| {
+            TestdError::Invalid {
+                field: "source_observation.repository_root",
+                reason: "source root cannot be canonicalized",
+            }
+        })?;
+        if !repository_root.is_dir() {
+            return Err(TestdError::Invalid {
+                field: "source_observation.repository_root",
+                reason: "source root is not a directory",
+            });
+        }
+        let run_git = |arguments: &[&str]| -> Result<Vec<u8>, TestdError> {
+            let mut command = Command::new("git");
+            command.current_dir(&repository_root);
+            for variable in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_COMMON_DIR",
+                "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_PREFIX",
+                "GIT_CEILING_DIRECTORIES",
+                "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+                "GIT_EXTERNAL_DIFF",
+                "GIT_CONFIG",
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_PARAMETERS",
+                "GIT_CONFIG_SYSTEM",
+                "GIT_CONFIG_GLOBAL",
+                "GIT_CONFIG_NOSYSTEM",
+            ] {
+                command.env_remove(variable);
+            }
+            let output = command
+                .args(arguments)
+                .output()
+                .map_err(|_| TestdError::Invalid {
+                    field: "source_observation.git",
+                    reason: "Git could not be started for source observation",
+                })?;
+            if !output.status.success() || output.stdout.len() > MAX_GIT_OUTPUT {
+                return Err(TestdError::Invalid {
+                    field: "source_observation.git",
+                    reason: "Git source observation failed or exceeded its bound",
+                });
+            }
+            Ok(output.stdout)
+        };
+        let decode_text = |bytes: Vec<u8>, field| -> Result<String, TestdError> {
+            String::from_utf8(bytes)
+                .map(|value| value.trim().to_owned())
+                .map_err(|_| TestdError::Invalid {
+                    field,
+                    reason: "Git returned non-UTF-8 source identity",
+                })
+        };
+        let top_level = decode_text(
+            run_git(&["rev-parse", "--show-toplevel"] )?,
+            "source_observation.repository_root",
+        )?;
+        let observed_root = std::fs::canonicalize(top_level).map_err(|_| TestdError::Invalid {
+            field: "source_observation.repository_root",
+            reason: "Git repository root cannot be canonicalized",
+        })?;
+        if observed_root != repository_root {
+            return Err(TestdError::Invalid {
+                field: "source_observation.repository_root",
+                reason: "admitted source root is not the Git repository root",
+            });
+        }
+        let branch = decode_text(
+            run_git(&["rev-parse", "--abbrev-ref", "HEAD"] )?,
+            "source_observation.branch",
+        )?;
+        let branch = if branch == "HEAD" {
+            "detached".to_owned()
+        } else {
+            branch
+        };
+        let commit = decode_text(
+            run_git(&["rev-parse", "--verify", "HEAD^{commit}"] )?,
+            "source_observation.commit",
+        )?;
+        let status = run_git(&["status", "--porcelain=v2", "-z", "--untracked-files=all"])?;
+        let diff = run_git(&["diff", "--binary", "--no-ext-diff", "HEAD", "--"])?;
+        let untracked = run_git(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+        let mut untracked_paths = untracked
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                String::from_utf8(path.to_vec()).map_err(|_| TestdError::Invalid {
+                    field: "source_observation.untracked_path",
+                    reason: "Git returned a non-UTF-8 untracked path",
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        untracked_paths.sort();
+        let mut hasher = Sha256::new();
+        hasher.update(b"eliot-testd-source-dirty-state-v1\0");
+        hash_source_part(&mut hasher, &status);
+        hash_source_part(&mut hasher, &diff);
+        for relative in untracked_paths {
+            let relative_path = Path::new(&relative);
+            if relative_path.is_absolute()
+                || relative_path.components().any(|component| {
+                    matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+                })
+            {
+                return Err(TestdError::Invalid {
+                    field: "source_observation.untracked_path",
+                    reason: "Git returned an untracked path outside the source root",
+                });
+            }
+            let path = repository_root.join(relative_path);
+            let metadata = std::fs::symlink_metadata(&path).map_err(|_| TestdError::Invalid {
+                field: "source_observation.untracked_path",
+                reason: "untracked source path cannot be observed",
+            })?;
+            hasher.update((relative.len() as u64).to_be_bytes());
+            hasher.update(relative.as_bytes());
+            if is_reparse_point(&metadata) {
+                let target = std::fs::read_link(&path).map_err(|_| TestdError::Invalid {
+                    field: "source_observation.untracked_path",
+                    reason: "untracked link target cannot be observed",
+                })?;
+                hasher.update(b"link\0");
+                hash_source_part(&mut hasher, target.to_string_lossy().as_bytes());
+            } else {
+                let bytes = std::fs::read(&path).map_err(|_| TestdError::Invalid {
+                    field: "source_observation.untracked_path",
+                    reason: "untracked file cannot be read for source observation",
+                })?;
+                if bytes.len() > MAX_GIT_OUTPUT {
+                    return Err(TestdError::Invalid {
+                        field: "source_observation.untracked_path",
+                        reason: "untracked file exceeds the source-observation bound",
+                    });
+                }
+                hasher.update(b"file\0");
+                hash_source_part(&mut hasher, &bytes);
+            }
+        }
+        let observation = Self {
+            repository_root: repository_root.to_string_lossy().into_owned(),
+            branch,
+            commit,
+            dirty_state_sha256: format!("{:x}", hasher.finalize()),
+        };
+        observation.validate()?;
+        Ok(observation)
+    }
+
+    pub fn validate(&self) -> Result<(), TestdError> {
+        let commit_valid = matches!(self.commit.len(), 40 | 64)
+            && self
+                .commit
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !Path::new(&self.repository_root).is_absolute()
+            || self.branch.trim().is_empty()
+            || self.branch.chars().any(char::is_control)
+            || !commit_valid
+            || !is_binding_digest(&self.dirty_state_sha256)
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+}
+
+/// Before/after source identity around one physical verifier execution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdSourceObservationRange {
+    pub before: TestdSourceObservation,
+    pub after: TestdSourceObservation,
+}
+
+impl TestdSourceObservationRange {
+    pub fn validate(&self) -> Result<(), TestdError> {
+        self.before.validate()?;
+        self.after.validate()?;
+        if self.before.repository_root != self.after.repository_root {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn unchanged(&self) -> bool {
+        self.before == self.after
+    }
+}
+
+fn hash_source_part(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+impl TestdVerifierDispatchBinding {
+    /// Checks request, operation and plan identity against the durable job.
+    /// Governor must still re-read the live task and plan before publishing.
+    pub fn validate_for_job(&self, job: &TestJob) -> Result<(), TestdError> {
+        self.request_identity
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        let metadata = &self.request_identity.request.metadata;
+        let Some(task_id) = metadata.task_id.as_ref() else {
+            return Err(TestdError::InvalidBinding);
+        };
+        let task_revision = self
+            .request_identity
+            .request
+            .state_fence
+            .task_revision
+            .as_ref()
+            .map(|revision| revision.value())
+            .ok_or(TestdError::InvalidBinding)?;
+        if self.operation_id.trim().is_empty()
+            || self.operation_id.chars().any(char::is_control)
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        if metadata != &job.invocation.request
+            || self.request_identity.request.state_fence != job.invocation.request.state_fence
+            || self.operation_id != job.process.operation_id.as_str()
+            || task_revision == 0
+            || job.process.generation == 0
+            || !job
+                .process
+                .authority_epoch
+                .is_same_authority(&job.invocation.request.state_fence.authority_epoch)
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        let plan_value: serde_json::Value = serde_json::from_str(&self.canonical_plan_json)
+            .map_err(|_| TestdError::InvalidBinding)?;
+        let canonical = canonical_json_bytes(&plan_value)
+            .map_err(|_| TestdError::InvalidBinding)?;
+        let canonical_text =
+            String::from_utf8(canonical.clone()).map_err(|_| TestdError::InvalidBinding)?;
+        if canonical_text != self.canonical_plan_json
+            || sha256_hex(&canonical) != self.canonical_plan_sha256
+            || plan_value.get("task_id").and_then(serde_json::Value::as_str)
+                != Some(task_id.as_str())
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        let verifier = plan_value
+            .get("verifier")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(TestdError::InvalidBinding)?;
+        let invocation = serde_json::to_value(&job.invocation)
+            .map_err(|_| TestdError::InvalidBinding)?;
+        for field in [
+            "instrument",
+            "kind",
+            "profile",
+            "target",
+            "arguments",
+            "declared_scope",
+            "input_artifacts",
+        ] {
+            if verifier.get(field) != invocation.get(field) {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
+        let evaluator = verifier
+            .get("evaluator")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TestdError::InvalidBinding)?;
+        let required_test_ids = verifier
+            .get("required_test_ids")
+            .and_then(serde_json::Value::as_array)
+            .filter(|ids| !ids.is_empty())
+            .ok_or(TestdError::InvalidBinding)?;
+        let mut unique_test_ids = BTreeSet::new();
+        for id in required_test_ids {
+            let id = id.as_str().ok_or(TestdError::InvalidBinding)?;
+            validate_text(id, "verifier_dispatch.required_test_id")?;
+            if !unique_test_ids.insert(id) {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
+        let planned = verifier
+            .get("planned")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(TestdError::InvalidBinding)?;
+        let planned_id = planned
+            .get("verifier_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TestdError::InvalidBinding)?;
+        let planned_scope = planned
+            .get("scope")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TestdError::InvalidBinding)?;
+        let declared_scope = verifier
+            .get("declared_scope")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TestdError::InvalidBinding)?;
+        let config_hash = planned
+            .get("verifier_config_hash")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TestdError::InvalidBinding)?;
+        if planned_id != evaluator
+            || planned_scope != declared_scope
+            || !is_binding_digest(config_hash)
+            || plan_value.get("work_scope_id").and_then(serde_json::Value::as_str).is_none()
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+}
+
+/// Authenticated terminal notification for the daemon completion poller.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TestdTerminalCompletionNotice {
+    pub job_id: String,
+    pub receipt_sha256: String,
+}
+
+/// Persisted completion handoff. The receipt body is stored only after the
+/// Governor returns a committed canonical WriteReceipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdTerminalPublication {
+    pub receipt_sha256: String,
+    #[serde(default)]
+    pub committed_receipt_json: Option<String>,
 }
 
 /// Contract spelling used by the test-execution-plane boundary.
@@ -814,6 +1319,21 @@ pub struct ReceiptBinding {
     pub cache_root: String,
 }
 
+/// Physical stream from which a raw process artifact was captured.
+///
+/// The stream identity is part of the TestD-owned receipt so a verifier can
+/// join stdout chunks before parsing and exclude stderr from the nextest
+/// event dialect. `Unknown` is retained for legacy/unresolved handles and is
+/// deliberately non-certifying.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RawArtifactStream {
+    Stdout,
+    Stderr,
+    #[default]
+    Unknown,
+}
+
 /// A raw process artifact captured before any normalization.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -824,6 +1344,16 @@ pub struct RawArtifact {
     pub length: u64,
     pub sha256: String,
     pub truncated: bool,
+    /// Monotonic sequence allocated by the TestD capture owner. Handle text
+    /// is not a stream-order authority (`...-10` must not precede `...-2`).
+    #[serde(default)]
+    pub capture_sequence: u64,
+    /// Owning process stream; unknown legacy handles cannot certify parsing.
+    #[serde(default)]
+    pub stream: RawArtifactStream,
+    /// Clock captured by TestD at the stream-retention boundary.
+    #[serde(default)]
+    pub captured_at: ClockReading,
 }
 
 impl RawArtifact {
@@ -843,7 +1373,27 @@ impl RawArtifact {
             length,
             sha256,
             truncated,
+            capture_sequence: 0,
+            stream: RawArtifactStream::Unknown,
+            captured_at: ClockReading::default(),
         };
+        artifact.validate()?;
+        Ok(artifact)
+    }
+
+    /// Captures bytes with the stream and retention clock observed by the
+    /// TestD owner. The clock is never borrowed from request admission.
+    pub fn from_observation(
+        handle: impl Into<String>,
+        content_type: impl Into<String>,
+        bytes: Vec<u8>,
+        truncated: bool,
+        stream: RawArtifactStream,
+        captured_at: ClockReading,
+    ) -> Result<Self, TestdError> {
+        let mut artifact = Self::from_bytes(handle, content_type, bytes, truncated)?;
+        artifact.stream = stream;
+        artifact.captured_at = captured_at;
         artifact.validate()?;
         Ok(artifact)
     }
@@ -865,6 +1415,9 @@ impl RawArtifact {
         {
             return Err(TestdError::InvalidBinding);
         }
+        self.captured_at
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
         Ok(())
     }
 }
@@ -877,6 +1430,71 @@ pub struct NormalizedEvidence {
     pub summary: String,
     pub raw_handles: Vec<String>,
     pub execution: ExecutionStatus,
+}
+
+/// Owner-observed identity of the productive verifier toolchain.
+///
+/// These paths and digests are captured from the admitted process environment
+/// after the resolver has asked rustup for the selected toolchain executables.
+/// A plan/evaluator version is not a substitute for this observation, and a
+/// rustup shim digest is not accepted as the selected cargo/rustc identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdToolObservation {
+    pub nextest_path: String,
+    pub nextest_sha256: String,
+    pub cargo_path: String,
+    pub cargo_sha256: String,
+    pub rustc_path: String,
+    pub rustc_sha256: String,
+    pub selected_toolchain: String,
+}
+
+impl TestdToolObservation {
+    /// Validates the owner-observed executable identity without consulting a
+    /// caller or ambient locator.
+    pub fn validate(&self) -> Result<(), TestdError> {
+        for (field, value) in [
+            ("nextest_path", self.nextest_path.as_str()),
+            ("cargo_path", self.cargo_path.as_str()),
+            ("rustc_path", self.rustc_path.as_str()),
+        ] {
+            validate_text(value, field)?;
+            if !Path::new(value).is_absolute()
+                || Path::new(value)
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir))
+            {
+                return Err(TestdError::Invalid {
+                    field,
+                    reason: "owner-observed tool identity must use absolute traversal-free paths",
+                });
+            }
+        }
+        validate_text(&self.selected_toolchain, "selected_toolchain")?;
+        for (field, value) in [
+            ("nextest_sha256", self.nextest_sha256.as_str()),
+            ("cargo_sha256", self.cargo_sha256.as_str()),
+            ("rustc_sha256", self.rustc_sha256.as_str()),
+        ] {
+            if !is_binding_digest(value) {
+                return Err(TestdError::Invalid {
+                    field,
+                    reason: "owner-observed tool identity requires a lowercase SHA-256",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Stable diagnostic identity derived only from the observed nextest
+    /// executable, never from the evaluator contract version.
+    pub fn nextest_identity(&self) -> String {
+        format!(
+            "path={};sha256={}",
+            self.nextest_path, self.nextest_sha256
+        )
+    }
 }
 
 /// Candidate verification receipt accepted by the canonical finish boundary.
@@ -895,8 +1513,87 @@ pub struct VerificationReceipt {
     pub target_root: String,
     pub cache_root: String,
     pub execution: ExecutionStatus,
+    /// TestD-owner observation when the admitted process was resumed.
+    #[serde(default)]
+    pub started_at: ClockReading,
+    /// TestD-owner observation after terminal inspection and stream closure.
+    #[serde(default)]
+    pub finished_at: ClockReading,
+    /// Productive profile tool identity observed by the TestD owner. Probe
+    /// and refused/unknown paths may omit it; a productive succeeded attempt
+    /// cannot be accepted without it.
+    #[serde(default)]
+    pub tool_observation: Option<TestdToolObservation>,
+    /// Actual repository identity immediately before and after the physical
+    /// verifier execution. A mismatch remains visible and cannot certify.
+    #[serde(default)]
+    pub source_observation: Option<TestdSourceObservationRange>,
     pub raw_artifacts: Vec<RawArtifact>,
     pub normalized: Vec<NormalizedEvidence>,
+}
+
+/// Evaluates the admitted TestD profile after the process observation has
+/// been durably captured. The current closed profile is a bounded cargo tool
+/// probe, so a clean process exit proves only execution of that probe; it
+/// does not prove the requested task. The evaluator therefore records an
+/// explicit `UNKNOWN` semantic outcome with the exact invocation, scope,
+/// fence, and captured raw artifacts. A future profile adds its own
+/// evaluator here and may return `PASS` only from profile-specific evidence.
+pub fn evaluate_testd_verification(
+    job: &TestJob,
+    receipt: &VerificationReceipt,
+    _finished_at_ms: u64,
+) -> Result<VerificationRun, TestdError> {
+    receipt.validate(job)?;
+    let run_id = RequestId::new(format!(
+        "{}:verification",
+        job.invocation.request.request_id.as_str()
+    ))
+    .map_err(|error| TestdError::Contract(error.to_string()))?;
+    let verifier = ContractId::new(job.invocation.profile.clone())
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
+    let raw_evidence = receipt
+        .raw_artifacts
+        .iter()
+        .map(|artifact| {
+            ArtifactId::new(artifact.handle.clone())
+                .map_err(|error| TestdError::Contract(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let run = VerificationRun {
+        run_id,
+        verifier,
+        invocation_id: job.invocation.request.request_id.clone(),
+        property: format!(
+            "admitted {} profile execution has profile-specific verifier evidence",
+            job.invocation.profile
+        ),
+        scope: job.invocation.declared_scope.clone(),
+        execution: receipt.execution,
+        outcome: match receipt.execution {
+            ExecutionStatus::Cancelled => eliot_instrument_api::VerificationOutcome::Cancelled,
+            ExecutionStatus::Blocked => eliot_instrument_api::VerificationOutcome::Blocked,
+            ExecutionStatus::Accepted
+            | ExecutionStatus::Running
+            | ExecutionStatus::Succeeded
+            | ExecutionStatus::Failed
+            | ExecutionStatus::Partial
+            | ExecutionStatus::Unknown => eliot_instrument_api::VerificationOutcome::Unknown,
+        },
+        freshness: eliot_instrument_api::EvidenceFreshness::Unknown,
+        coverage: eliot_instrument_api::EvidenceCoverage::Unknown,
+        // The TestD receipt currently owns raw process evidence only. The
+        // profile evaluator must supply normalized semantic evidence before
+        // this run can certify completion.
+        evidence: Vec::new(),
+        raw_evidence,
+        state_fence: job.invocation.request.state_fence.clone(),
+        started_at: receipt.started_at,
+        finished_at: Some(receipt.finished_at),
+    };
+    run.validate()
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
+    Ok(run)
 }
 
 impl VerificationReceipt {
@@ -922,9 +1619,45 @@ impl VerificationReceipt {
         job.target_roots.validate()?;
         let binding = self.binding();
         validate_receipt_binding(job, &binding)?;
+        self.started_at
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        self.finished_at
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        if let Some(observation) = &self.tool_observation {
+            observation.validate()?;
+        } else if job.invocation.profile == TESTD_PRODUCTIVE_PROFILE
+            && matches!(self.execution, ExecutionStatus::Succeeded)
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        if let Some(source) = &self.source_observation {
+            source.validate()?;
+            if source.before.repository_root != job.target_roots.source_root
+                || source.after.repository_root != job.target_roots.source_root
+                || (job.invocation.profile == TESTD_PRODUCTIVE_PROFILE
+                    && job.source_observation_before.as_ref() != Some(&source.before))
+            {
+                return Err(TestdError::InvalidBinding);
+            }
+        } else if job.invocation.profile == TESTD_PRODUCTIVE_PROFILE
+            && matches!(self.execution, ExecutionStatus::Succeeded)
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        if let (Some(start), Some(finish)) =
+            (self.started_at.known_time_ms, self.finished_at.known_time_ms)
+            && finish < start
+        {
+            return Err(TestdError::InvalidBinding);
+        }
         let mut artifacts = BTreeMap::new();
         for artifact in &self.raw_artifacts {
             artifact.validate()?;
+            if artifact.capture_sequence == 0 {
+                return Err(TestdError::InvalidBinding);
+            }
             if artifacts
                 .insert(artifact.handle.clone(), artifact)
                 .is_some()
@@ -952,6 +1685,8 @@ impl VerificationReceipt {
 pub struct EvidenceCollector {
     records: Arc<Mutex<Vec<eliot_process::ProcessEvidence>>>,
     raw_artifacts: Arc<Mutex<BTreeMap<String, RawArtifact>>>,
+    next_capture_sequence: Arc<AtomicU64>,
+    tool_observation: Arc<Mutex<Option<TestdToolObservation>>>,
 }
 
 impl EvidenceCollector {
@@ -971,15 +1706,68 @@ impl EvidenceCollector {
         truncated: bool,
     ) -> Result<(), TestdError> {
         let artifact = RawArtifact::from_bytes(handle, content_type, bytes, truncated)?;
+        self.insert_raw_artifact(artifact)
+    }
+
+    /// Captures one stream artifact with the actual TestD retention clock and
+    /// stream boundary observed by the worker.
+    pub fn record_raw_artifact_at(
+        &self,
+        handle: impl Into<String>,
+        content_type: impl Into<String>,
+        bytes: Vec<u8>,
+        truncated: bool,
+        stream: RawArtifactStream,
+        captured_at: ClockReading,
+    ) -> Result<(), TestdError> {
+        let artifact = RawArtifact::from_observation(
+            handle,
+            content_type,
+            bytes,
+            truncated,
+            stream,
+            captured_at,
+        )?;
+        self.insert_raw_artifact(artifact)
+    }
+
+    /// Records the exact productive tool identity observed at the owner
+    /// boundary before the consuming process starts.
+    pub fn record_tool_observation(
+        &self,
+        observation: TestdToolObservation,
+    ) -> Result<(), TestdError> {
+        observation.validate()?;
+        let mut current = self
+            .tool_observation
+            .lock()
+            .map_err(|_| TestdError::Contract("evidence collector lock poisoned".to_owned()))?;
+        if let Some(existing) = &*current {
+            if existing != &observation {
+                return Err(TestdError::InvalidBinding);
+            }
+        } else {
+            *current = Some(observation);
+        }
+        Ok(())
+    }
+
+    fn insert_raw_artifact(&self, artifact: RawArtifact) -> Result<(), TestdError> {
+        let mut artifact = artifact;
         let mut artifacts = self
             .raw_artifacts
             .lock()
             .map_err(|_| TestdError::Contract("evidence collector lock poisoned".to_owned()))?;
         if let Some(existing) = artifacts.get(&artifact.handle) {
+            artifact.capture_sequence = existing.capture_sequence;
             if existing != &artifact {
                 return Err(TestdError::InvalidBinding);
             }
         } else {
+            artifact.capture_sequence = self
+                .next_capture_sequence
+                .fetch_add(1, AtomicOrdering::Relaxed)
+                .saturating_add(1);
             artifacts.insert(artifact.handle.clone(), artifact);
         }
         Ok(())
@@ -990,6 +1778,23 @@ impl EvidenceCollector {
         &self,
         job: &TestJob,
         execution: ExecutionStatus,
+    ) -> VerificationReceipt {
+        self.verification_receipt_at(
+            job,
+            execution,
+            ClockReading::default(),
+            ClockReading::default(),
+        )
+    }
+
+    /// Builds a receipt with the clocks observed by the TestD owner at the
+    /// actual resume and terminal capture boundaries.
+    pub fn verification_receipt_at(
+        &self,
+        job: &TestJob,
+        execution: ExecutionStatus,
+        started_at: ClockReading,
+        finished_at: ClockReading,
     ) -> VerificationReceipt {
         let records = self.snapshot();
         let raw = self
@@ -1010,7 +1815,11 @@ impl EvidenceCollector {
                 }
             }
         }
-        raw_artifacts.sort_by(|left, right| left.handle.cmp(&right.handle));
+        raw_artifacts.sort_by(|left, right| {
+            left.capture_sequence
+                .cmp(&right.capture_sequence)
+                .then_with(|| left.handle.cmp(&right.handle))
+        });
         let normalized = records
             .iter()
             .map(|record| NormalizedEvidence {
@@ -1037,6 +1846,13 @@ impl EvidenceCollector {
             target_root: job.target_roots.target_root.clone(),
             cache_root: job.target_roots.cache_root.clone(),
             execution,
+            started_at,
+            finished_at,
+            tool_observation: self
+                .tool_observation
+                .lock()
+                .map_or(None, |observation| observation.clone()),
+            source_observation: None,
             raw_artifacts,
             normalized,
         }
@@ -1251,7 +2067,325 @@ impl TestdStore {
                 serde_json::from_slice(value.value())
                     .map(Some)
                     .map_err(|error| TestdError::Corrupt(error.to_string()))
-            })
+        })
+    }
+
+    /// Attaches the exact Governor request and current plan before a
+    /// productive job can be claimed. Replays must supply byte-identical
+    /// binding; a changed binding under the same durable job id conflicts.
+    pub fn bind_verifier_dispatch(
+        &self,
+        job_id: &str,
+        binding: TestdVerifierDispatchBinding,
+        now: u64,
+    ) -> Result<TestJob, TestdError> {
+        validate_text(job_id, "job_id")?;
+        if now == 0 {
+            return Err(TestdError::Invalid {
+                field: "verifier_dispatch",
+                reason: "binding time must be non-zero",
+            });
+        }
+        let write = self.database.begin_write().map_err(database)?;
+        let mut job = {
+            let table = write.open_table(JOBS).map_err(database)?;
+            let value = table
+                .get(job_id)
+                .map_err(database)?
+                .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        binding.validate_for_job(&job)?;
+        if job.invocation.profile != TESTD_PRODUCTIVE_PROFILE {
+            return Err(TestdError::Invalid {
+                field: "verifier_dispatch",
+                reason: "canonical verifier binding is only valid for productive nextest jobs",
+            });
+        }
+        if let Some(existing) = &job.verifier_dispatch {
+            if existing == &binding {
+                return Ok(job);
+            }
+            return Err(TestdError::JobConflict(job_id.to_owned()));
+        }
+        if job.state != JobState::Queued || job.attempts != 0 || job.lease.is_some() {
+            return Err(TestdError::InvalidBinding);
+        }
+        job.verifier_dispatch = Some(binding);
+        job.updated_at_ms = now;
+        let encoded = serde_json::to_vec(&job)
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let mut table = write.open_table(JOBS).map_err(database)?;
+        table
+            .insert(job_id, encoded.as_slice())
+            .map_err(database)?;
+        drop(table);
+        append_event(
+            &write,
+            &job,
+            Some(JobState::Queued),
+            JobState::Queued,
+            "verifier-dispatch-owner",
+            now,
+            Some("immutable canonical verifier plan bound before dispatch".to_owned()),
+        )?;
+        write.commit().map_err(database)?;
+        Ok(job)
+    }
+
+    /// Persists the real source identity before the first productive claim.
+    /// An exact retry is idempotent; any changed source snapshot or post-claim
+    /// rewrite is rejected.
+    pub fn bind_source_observation_before_dispatch(
+        &self,
+        job_id: &str,
+        observation: TestdSourceObservation,
+        now: u64,
+    ) -> Result<TestJob, TestdError> {
+        validate_text(job_id, "job_id")?;
+        observation.validate()?;
+        if now == 0 {
+            return Err(TestdError::Invalid {
+                field: "source_observation",
+                reason: "observation time must be non-zero",
+            });
+        }
+        let write = self.database.begin_write().map_err(database)?;
+        let mut job = {
+            let table = write.open_table(JOBS).map_err(database)?;
+            let value = table
+                .get(job_id)
+                .map_err(database)?
+                .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        if job.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+            || job.verifier_dispatch.is_none()
+            || job.state != JobState::Queued
+            || job.attempts != 0
+            || job.lease.is_some()
+            || job.target_roots.source_root != observation.repository_root
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        if let Some(existing) = &job.source_observation_before {
+            if existing == &observation {
+                return Ok(job);
+            }
+            return Err(TestdError::JobConflict(job_id.to_owned()));
+        }
+        job.source_observation_before = Some(observation);
+        job.updated_at_ms = now;
+        let encoded = serde_json::to_vec(&job)
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let mut table = write.open_table(JOBS).map_err(database)?;
+        table
+            .insert(job_id, encoded.as_slice())
+            .map_err(database)?;
+        drop(table);
+        append_event(
+            &write,
+            &job,
+            Some(JobState::Queued),
+            JobState::Queued,
+            "verifier-source-observation",
+            now,
+            Some("actual branch, commit, and dirty state captured before dispatch".to_owned()),
+        )?;
+        write.commit().map_err(database)?;
+        Ok(job)
+    }
+
+    /// Records one authenticated terminal notification. Only a terminal row
+    /// with a full durable verification receipt and the exact active launch
+    /// fence can enter the daemon publication queue.
+    pub fn request_terminal_publication(
+        &self,
+        job_id: &str,
+        receipt_sha256: &str,
+        authority_epoch: &EpochId,
+        generation: u64,
+        operation_id: &str,
+        now: u64,
+    ) -> Result<TestJob, TestdError> {
+        validate_text(job_id, "job_id")?;
+        if !is_binding_digest(receipt_sha256) {
+            return Err(TestdError::Invalid {
+                field: "terminal_publication.receipt_sha256",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+        validate_text(operation_id, "terminal_publication.operation_id")?;
+        if generation == 0 || now == 0 {
+            return Err(TestdError::InvalidBinding);
+        }
+        let write = self.database.begin_write().map_err(database)?;
+        let mut job = {
+            let table = write.open_table(JOBS).map_err(database)?;
+            let value = table
+                .get(job_id)
+                .map_err(database)?
+                .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        let terminal = matches!(job.state, JobState::Succeeded | JobState::Failed | JobState::Cancelled);
+        let Some(binding) = job.verifier_dispatch.as_ref() else {
+            return Err(TestdError::InvalidBinding);
+        };
+        binding.validate_for_job(&job)?;
+        let receipt = job
+            .verification_receipt
+            .as_ref()
+            .ok_or(TestdError::InvalidBinding)?;
+        if !terminal
+            || job.lease.is_some()
+            || job.process.generation != generation
+            || !job.process.authority_epoch.is_same_authority(authority_epoch)
+            || job.process.operation_id.as_str() != operation_id
+            || verification_receipt_sha256(receipt)? != receipt_sha256
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        if let Some(existing) = &job.terminal_publication {
+            if existing.receipt_sha256 == receipt_sha256 {
+                return Ok(job);
+            }
+            return Err(TestdError::JobConflict(job_id.to_owned()));
+        }
+        job.terminal_publication = Some(TestdTerminalPublication {
+            receipt_sha256: receipt_sha256.to_owned(),
+            committed_receipt_json: None,
+        });
+        job.updated_at_ms = now;
+        let encoded = serde_json::to_vec(&job)
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let mut table = write.open_table(JOBS).map_err(database)?;
+        table
+            .insert(job_id, encoded.as_slice())
+            .map_err(database)?;
+        drop(table);
+        append_event(
+            &write,
+            &job,
+            Some(job.state),
+            job.state,
+            "authenticated-testd-terminal",
+            now,
+            Some(format!("receipt-sha256={receipt_sha256}")),
+        )?;
+        write.commit().map_err(database)?;
+        Ok(job)
+    }
+
+    /// Returns pending terminal notifications in stable job-id order for the
+    /// daemon's reactive completion feed.
+    pub fn pending_terminal_publications(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<TestdTerminalCompletionNotice>, TestdError> {
+        if limit == 0 || limit > 256 {
+            return Err(TestdError::Invalid {
+                field: "terminal_publication.limit",
+                reason: "must be between one and 256",
+            });
+        }
+        let read = self.database.begin_read().map_err(database)?;
+        let table = read.open_table(JOBS).map_err(database)?;
+        let mut pending = Vec::new();
+        for item in table.iter().map_err(database)? {
+            let (key, value) = item.map_err(database)?;
+            let job: TestJob = serde_json::from_slice(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            if job.job_id != key.value() {
+                return Err(corrupt("durable job key conflicts with record"));
+            }
+            if let Some(publication) = job.terminal_publication
+                && publication.committed_receipt_json.is_none()
+            {
+                pending.push(TestdTerminalCompletionNotice {
+                    job_id: job.job_id,
+                    receipt_sha256: publication.receipt_sha256,
+                });
+            }
+        }
+        pending.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+        pending.truncate(limit);
+        Ok(pending)
+    }
+
+    /// Stores the exact serialized canonical WriteReceipt after the daemon
+    /// publisher has returned from its committed owner boundary.
+    pub fn record_terminal_publication_receipt(
+        &self,
+        job_id: &str,
+        receipt_sha256: &str,
+        committed_receipt_json: String,
+        now: u64,
+    ) -> Result<TestJob, TestdError> {
+        validate_text(job_id, "job_id")?;
+        if !is_binding_digest(receipt_sha256) {
+            return Err(TestdError::Invalid {
+                field: "terminal_publication.receipt_sha256",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+        if now == 0 {
+            return Err(TestdError::InvalidBinding);
+        }
+        let receipt_value: serde_json::Value = serde_json::from_str(&committed_receipt_json)
+            .map_err(|_| TestdError::InvalidBinding)?;
+        let canonical = canonical_json_bytes(&receipt_value).map_err(|_| TestdError::InvalidBinding)?;
+        if String::from_utf8(canonical.clone()).map_err(|_| TestdError::InvalidBinding)?
+            != committed_receipt_json
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        let write = self.database.begin_write().map_err(database)?;
+        let mut job = {
+            let table = write.open_table(JOBS).map_err(database)?;
+            let value = table
+                .get(job_id)
+                .map_err(database)?
+                .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        let publication = job
+            .terminal_publication
+            .as_mut()
+            .ok_or(TestdError::InvalidBinding)?;
+        if publication.receipt_sha256 != receipt_sha256 {
+            return Err(TestdError::InvalidBinding);
+        }
+        if let Some(existing) = &publication.committed_receipt_json {
+            if existing == &committed_receipt_json {
+                return Ok(job);
+            }
+            return Err(TestdError::JobConflict(job_id.to_owned()));
+        }
+        publication.committed_receipt_json = Some(committed_receipt_json);
+        job.updated_at_ms = now;
+        let encoded = serde_json::to_vec(&job)
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let mut table = write.open_table(JOBS).map_err(database)?;
+        table
+            .insert(job_id, encoded.as_slice())
+            .map_err(database)?;
+        drop(table);
+        append_event(
+            &write,
+            &job,
+            Some(job.state),
+            job.state,
+            "governor-verifier-fact-receipt",
+            now,
+            Some(format!("write-receipt-sha256={}", sha256_hex(&canonical))),
+        )?;
+        write.commit().map_err(database)?;
+        Ok(job)
     }
 
     /// Submits a job exactly once and assigns its project-local sequence.
@@ -1281,14 +2415,14 @@ impl TestdStore {
         if !matches!(invocation.kind, InstrumentKind::Test) {
             return Err(TestdError::WrongInstrumentKind);
         }
-        // Closed-profile registration (issue #20): only the admitted
-        // tool-probe profile registers, and it takes no caller arguments:
-        // the fixed argv comes from the registry binding, never from the
-        // invocation.
+        // Closed-profile registration (issue #20): only registered probe or
+        // productive nextest profiles register, and both take no caller
+        // arguments. Fixed argv comes from the registry binding, never from
+        // the invocation.
         if !is_admitted_testd_profile(&invocation.profile) {
             return Err(TestdError::Invalid {
                 field: "invocation.profile",
-                reason: "testd admits only the closed cargo-test tool-probe profile",
+                reason: "testd admits only registered probe or productive nextest profiles",
             });
         }
         if !invocation.arguments.is_empty() {
@@ -1361,6 +2495,10 @@ impl TestdStore {
             execution: None,
             verification: None,
             receipt: None,
+            verification_receipt: None,
+            verifier_dispatch: None,
+            source_observation_before: None,
+            terminal_publication: None,
             updated_at_ms: at_ms,
             payload_digest: digest,
         };
@@ -1397,7 +2535,14 @@ impl TestdStore {
         // it needs a fresh claim, lease, and permit binding.
         self.reconcile_expired_running_all(now)?;
         let candidates = self.ready_heads(now)?;
-        let Some(candidate) = candidates.into_iter().max_by(compare_ready) else {
+        let Some(candidate) = candidates
+            .into_iter()
+            .filter(|candidate| {
+                candidate.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+                    || candidate.verifier_dispatch.is_some()
+            })
+            .max_by(compare_ready)
+        else {
             return Ok(None);
         };
         let mut job = candidate;
@@ -1502,6 +2647,65 @@ impl TestdStore {
         };
         validate_claim_binding(&job, lease, now, &expected)?;
         Ok(permit.into_parts().0)
+    }
+
+    /// Renews one live worker fence without changing its owner, token, or
+    /// attempt epoch.  The current row read, expiry check, and lease update
+    /// share one write transaction so a reclaimed or cancelled attempt can
+    /// never be renewed by a stale worker.
+    pub fn renew_lease(
+        &self,
+        job_id: &str,
+        lease: &Lease,
+        now: u64,
+        lease_ms: u64,
+    ) -> Result<Lease, TestdError> {
+        validate_text(job_id, "job_id")?;
+        if lease_ms == 0 {
+            return Err(TestdError::Invalid {
+                field: "lease_ms",
+                reason: "must be non-zero",
+            });
+        }
+        let write = self.database.begin_write().map_err(database)?;
+        let mut job = {
+            let table = write.open_table(JOBS).map_err(database)?;
+            let value = table
+                .get(job_id)
+                .map_err(database)?
+                .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        if !lease_matches(&job, lease, now) {
+            return Err(TestdError::LeaseRejected(job_id.to_owned()));
+        }
+        let renewed = Lease {
+            owner: lease.owner.clone(),
+            token: lease.token.clone(),
+            epoch: lease.epoch,
+            expires_at_ms: now.saturating_add(lease_ms),
+        };
+        job.lease = Some(renewed.clone());
+        job.updated_at_ms = now;
+        let encoded =
+            serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let mut table = write.open_table(JOBS).map_err(database)?;
+        table
+            .insert(job.job_id.as_str(), encoded.as_slice())
+            .map_err(database)?;
+        drop(table);
+        append_event(
+            &write,
+            &job,
+            Some(JobState::Running),
+            JobState::Running,
+            &lease.owner,
+            now,
+            Some("worker lease renewed".to_owned()),
+        )?;
+        write.commit().map_err(database)?;
+        Ok(renewed)
     }
 
     /// Recovers one fence-expired running job to Unknown/RetryWait.
@@ -1629,9 +2833,21 @@ impl TestdStore {
             run.validate()
                 .map_err(|error| TestdError::Contract(error.to_string()))?;
         }
-        let mut job = self
-            .get(job_id)?
-            .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+        // The current row and the final mutation share one redb write
+        // transaction.  A read through `self.get` here would leave a race in
+        // which cancel/reclaim commits between the lease check and the
+        // unconditional insert below, allowing a stale worker to overwrite a
+        // newer owner state.
+        let write = self.database.begin_write().map_err(database)?;
+        let mut job = {
+            let table = write.open_table(JOBS).map_err(database)?;
+            let value = table
+                .get(job_id)
+                .map_err(database)?
+                .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
         if !lease_matches(&job, lease, now) {
             // Fail closed: an expired or foreign fence never completes an
             // attempt. Recovery flows through `reconcile_expired`
@@ -1654,6 +2870,7 @@ impl TestdStore {
         job.execution = Some(execution);
         job.verification = verification;
         job.receipt = Some(binding);
+        job.verification_receipt = Some(receipt.clone());
         job.lease = None;
         let retryable = matches!(
             execution,
@@ -1682,7 +2899,6 @@ impl TestdStore {
             now
         };
         job.updated_at_ms = now;
-        let write = self.database.begin_write().map_err(database)?;
         let mut table = write.open_table(JOBS).map_err(database)?;
         let encoded =
             serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
@@ -1700,7 +2916,13 @@ impl TestdStore {
             reason,
         )?;
         write.commit().map_err(database)?;
-        Ok(job)
+        // Resolve the owner row after commit so the caller receives the
+        // durable readback rather than a pre-commit projection.  A later
+        // retry claim may legitimately advance a RetryWait row before this
+        // read; returning that current row keeps callers from treating an
+        // obsolete attempt image as current.
+        self.get(job_id)?
+            .ok_or_else(|| TestdError::Corrupt("committed job disappeared".to_owned()))
     }
 
     /// Cancels a queued or currently leased job using its current fence.
@@ -2083,6 +3305,16 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         output.push_str(&format!("{byte:02x}"));
     }
     output
+}
+
+/// Hashes the canonical durable finish receipt used by the authenticated
+/// TestD terminal notification.
+pub fn verification_receipt_sha256(
+    receipt: &VerificationReceipt,
+) -> Result<String, TestdError> {
+    let bytes = canonical_json_bytes(receipt)
+        .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
 }
 
 /// Computes a length-domain-separated SHA-256 digest for one raw artifact.

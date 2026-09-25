@@ -2939,6 +2939,7 @@ fn first_install_bootstrap_handoff_keeps_both_starts_pending_through_projection(
             ("eliot-testd.exe", true),
             ("eliot-native-worker.exe", true),
             ("eliot-wasm-host.exe", true),
+            ("eliot-notify.exe", true),
             ("generation.json", false),
             ("eliotd-governor.json", false),
             ("eliotd.json", false),

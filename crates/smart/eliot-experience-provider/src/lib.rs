@@ -92,11 +92,16 @@
 //! `work/223-dreamer-memory-revision-scope @
 //! cdd6305ff0ab838e9e2855d5f6f0ac8b940012a79fe0`:
 //! `crates/smart/eliot-dreamer-memory-revision/src/lib.rs` (`propose` at
-//! line 290 over `RevisionIntake` at line 253). Its input types
-//! `FailureObservation` and `MemoryRevisionEvidence` exist nowhere on
-//! main (main carries only that crate's `module.toml`); the sibling
-//! crate is not a workspace member, so no path dependency may target it
-//! and vendoring its core would fork sibling-owned source. A caller here
+//! line 290 over `RevisionIntake` at line 253). Its `RevisionIntake`
+//! input shapes `FailureObservation` (observation-contracts role) and
+//! `MemoryRevisionEvidence` exist nowhere on main (main carries only
+//! that crate's `module.toml`): similarly-named main types do not
+//! satisfy the intake — `FailureObservationState` (dreamer-contracts
+//! failure-curation state enum) is a different type and role, and the
+//! MCP surface `FailureObservation` DTO is explicitly rejected as
+//! owner-neutral contract material by the freeze readback rule. The
+//! sibling crate is not a workspace member, so no path dependency may
+//! target it and vendoring its core would fork sibling-owned source. A caller here
 //! becomes compilable when the sibling crate lands on main as a member:
 //! `RevisionIntake` over owner-held observation, evidence,
 //! `TaskProjection`/`SafetyProjection` (context contracts, on main),

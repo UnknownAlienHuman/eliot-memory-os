@@ -372,6 +372,15 @@ async fn named_read_payload(
         NamedReadOperation::GetUserAutomationState => {
             automation_state_payload(db, &adapter.config, query, state_fence).await
         }
+        NamedReadOperation::GetExperienceBankRange => {
+            experience_bank_range_payload(db, &adapter.config, query, state_fence).await
+        }
+        NamedReadOperation::GetAgentFeedbackRange => {
+            experience_feedback_range_payload(db, &adapter.config, query, state_fence).await
+        }
+        NamedReadOperation::GetAuditRange => {
+            audit_range_payload(db, &adapter.config, query, state_fence).await
+        }
         other => Err(AdapterError::NamedOperationUnavailable {
             operation: format!("{other:?}"),
         }),
@@ -1938,6 +1947,222 @@ async fn automation_failure_payload(
     Ok(json!({
         "failure": failure,
         "revision": revision,
+        "state_fence": state_fence,
+    }))
+}
+
+/// Reads capture rows and projects the bounded same-fence audit range
+/// (issue #223).
+///
+/// Projects durable `CaptureObservation` evidence subjects as envelope
+/// candidates through the shared `audit_envelope_candidate` filter
+/// (memory-contour parity: fence-gated, scope-agnostic, ordinary
+/// non-envelope captures skipped, never failed). F2 resolution: no
+/// store-level scope filtering, per the established in-catalogue
+/// scope-free reads (`GetNotificationState`, `GetReactiveInjectionState`,
+/// `GetResourceSnapshot`: facade caller scope required, catalogue rows
+/// scope-free) with scope gating at the decision layer per I12-26 — filtering here would diverge the
+/// contours and drop scope-free records the consumer must see. Each
+/// candidate row re-validates its bytes/digest provenance before
+/// shaping, so substituted or truncated evidence fails closed instead
+/// of projecting.
+///
+/// Continuation cursors (optional `cursor` selector): an absent cursor
+/// reads from the start and fails closed with `PayloadTooLarge` past
+/// `MAX_AUDIT_RANGE_RECORDS` instead of truncating; a present cursor
+/// verified by `audit_cursor_parse` against this fence resumes paging
+/// past that candidate ordinal (commit-sequence, evidence-position
+/// order) with the same bound and no overflow failure. Cross-fence or
+/// malformed cursors fail closed; cursors stay valid only while
+/// revision heads are unchanged (the consumer re-proves heads per read
+/// and restarts paging on advance). Candidate-only: full envelope
+/// validation and live-journal presence binding stay downstream, so a
+/// carried candidate can never become a false journal record here.
+async fn audit_range_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_typed_read_parameters(
+        NamedReadOperation::GetAuditRange,
+        &query.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let rows = read_evidence_records(db, config).await?;
+    // Deterministic candidate order across calls: commit sequence, then
+    // per-receipt evidence position. Cursors resume by ordinal in this
+    // order and stay valid only while revision heads are unchanged (the
+    // consumer re-proves heads per read and restarts paging on advance).
+    let mut ordered: Vec<(u64, usize, Value)> = Vec::new();
+    for row in &rows {
+        let fenced = match &row.receipt {
+            Some(receipt) if receipt.state_fence == *state_fence => true,
+            _ => false,
+        };
+        if !fenced {
+            continue;
+        }
+        let sequence = row.commit_sequence.unwrap_or(u64::MAX);
+        for (index, evidence) in row.evidence_records.iter().flatten().enumerate() {
+            validate_evidence_record(row, evidence).map_err(AdapterError::Store)?;
+            if let Some(candidate) =
+                eliot_store_api::audit_envelope_candidate(&evidence.subject)
+            {
+                ordered.push((sequence, index, candidate));
+            }
+        }
+    }
+    ordered.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+        None => None,
+        Some(cursor) => Some(
+            eliot_store_api::audit_cursor_parse(cursor, state_fence)
+                .map_err(AdapterError::Store)?,
+        ),
+    };
+    let mut records = Vec::new();
+    let mut ordinal: u64 = 0;
+    for (_, _, candidate) in ordered {
+        ordinal = ordinal.saturating_add(1);
+        if start.is_some_and(|start| ordinal <= start) {
+            continue;
+        }
+        records.push(candidate);
+        if records.len() > eliot_store_api::MAX_AUDIT_RANGE_RECORDS as usize {
+            if start.is_none() {
+                return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+            }
+            records.pop();
+            break;
+        }
+    }
+    Ok(json!({ "records": records }))
+}
+
+/// Reads bank rows and projects the bounded same-fence, same-scope
+/// record set (issue #223).
+///
+/// Parameters are re-validated here (membership and shape via the
+/// catalogue gate upstream; value rules here) so a misrouted query fails
+/// closed without touching state. Scope arrives through the typed
+/// `scope_id` request field; rows project verbatim record documents plus
+/// presented digests in key order with an explicit truncation marker.
+async fn experience_bank_range_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_typed_read_parameters(
+        NamedReadOperation::GetExperienceBankRange,
+        &query.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let decoded = eliot_store_api::validate_experience_read_params(&query.parameters)
+        .map_err(AdapterError::Store)?;
+    let scope_id = query.scope_id.as_ref().ok_or(StoreError::InvalidField {
+        field: "scope_id",
+        reason: "experience range read requires scope_id",
+    })?;
+    let limit = usize::from(decoded.max_records.max(1));
+    let rows = super::surreal_experience::read_bank_for_read(
+        db,
+        config,
+        scope_id.as_str(),
+        limit.saturating_add(1),
+    )
+    .await?;
+    let mut records = Vec::new();
+    for row in rows {
+        if row.state_fence != *state_fence {
+            continue;
+        }
+        if records.len() > limit {
+            break;
+        }
+        records.push(json!({
+            "handle": row.handle,
+            "revision": row.revision,
+            "record_json": row.record_json,
+            "record_digest": row.record_digest,
+        }));
+    }
+    let mut truncated = false;
+    if records.len() > limit {
+        records.pop();
+        truncated = true;
+    }
+    let matched_total = projection_len(records.len())?;
+    Ok(json!({
+        "records": records,
+        "matched_total": matched_total,
+        "truncated": truncated,
+        "state_fence": state_fence,
+    }))
+}
+
+/// Reads feedback rows and projects the bounded same-fence, same-scope
+/// record set (issue #223). Same scope-gated rule as the bank range.
+async fn experience_feedback_range_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_typed_read_parameters(
+        NamedReadOperation::GetAgentFeedbackRange,
+        &query.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let decoded = eliot_store_api::validate_experience_read_params(&query.parameters)
+        .map_err(AdapterError::Store)?;
+    let scope_id = query.scope_id.as_ref().ok_or(StoreError::InvalidField {
+        field: "scope_id",
+        reason: "experience range read requires scope_id",
+    })?;
+    let limit = usize::from(decoded.max_records.max(1));
+    let rows = super::surreal_experience::read_feedback_for_read(
+        db,
+        config,
+        scope_id.as_str(),
+        limit.saturating_add(1),
+    )
+    .await?;
+    let mut records = Vec::new();
+    for row in rows {
+        if row.state_fence != *state_fence {
+            continue;
+        }
+        if records.len() > limit {
+            break;
+        }
+        records.push(json!({
+            "handle": row.handle,
+            "revision": row.revision,
+            "record_json": row.record_json,
+            "record_digest": row.record_digest,
+        }));
+    }
+    let mut truncated = false;
+    if records.len() > limit {
+        records.pop();
+        truncated = true;
+    }
+    let matched_total = projection_len(records.len())?;
+    Ok(json!({
+        "records": records,
+        "matched_total": matched_total,
+        "truncated": truncated,
         "state_fence": state_fence,
     }))
 }

@@ -2,7 +2,7 @@
 //!
 //! This module owns the single Rust declaration table that generates one
 //! [`NamedOperationManifest`](crate::NamedOperationManifest) descriptor per
-//! activated operation. The table activates exactly the fourteen reads with
+//! activated operation. The table activates the reads with
 //! proven adapter handlers, parameter shapes, and consumers on base
 //! (`GetRevisionHeads`, `GetOrderingHeads`, `GetScopeRevisionView`,
 //! `ResolveWriteReceipt`, `GetEvidencePack`, `GetCurrentEpistemicPosition`,
@@ -10,7 +10,11 @@
 //! `GetUnderstandingProjectionInputs`, `GetCapabilityEvidenceState`, plus
 //! issue #1780 `GetNotificationState`, plus issue #1941 C4
 //! `GetReactiveInjectionState` and `GetResourceSnapshot`, plus issue #1779
-//! `GetUserAutomationState`), the four `CaptureObservation` /
+//! `GetUserAutomationState`), plus issue #223 the two experience range
+//! reads (`GetExperienceBankRange`, `GetAgentFeedbackRange`, scope-addressed
+//! with proven adapter handlers in this slice) and the activated audit
+//! range read (`GetAuditRange`: fence-gated envelope-candidate range over
+//! durable capture evidence with proven adapter handlers in this slice), the four `CaptureObservation` /
 //! `AppendAuditEvent` / `ApplyLifecyclePolicy` mutations (AUD-C01:
 //! `CaptureObservation` and `AppendAuditEvent` persist
 //! `TransitionClass::CaptureCandidate` with the `EffectClass::Candidate`
@@ -25,6 +29,9 @@
 //! ceiling and the owner-approved six-field task-control schema emitted by
 //! the Governor task lifecycle envelope
 //! (`crates/governor/eliot-governor/src/task_lifecycle.rs`, `task_envelope`)),
+//! plus the `RecordFinishDecision` mutation (issue #325: persists the
+//! Governor-owned opaque finish receipt through the existing `RecoverySchema`
+//! owner path),
 //! plus the `ApplyEpistemicRevision` mutation (T11.2: persists
 //! `TransitionClass::Epistemic` with the `EffectClass::Candidate`
 //! ceiling and the owner-approved epistemic-revision payload),
@@ -204,6 +211,28 @@ const _: () = assert!(
     "evidence-pack worst case must fit the read output bound"
 );
 
+/// Maximum envelope candidates one audit-range read may carry.
+///
+/// Mirrors the evidence-pack byte discipline: every candidate arrives as
+/// a capture subject bounded by [`READ_MAX_INPUT_BYTES`], so 32 records
+/// stay far below [`READ_MAX_OUTPUT_BYTES`] (see the guard below).
+/// Reads beyond the bound fail closed with
+/// [`StoreError::PayloadTooLarge`](crate::StoreError) instead of
+/// truncating silently: a truncated audit range cannot prove journal
+/// completeness, so partial success is never reported. Larger journals
+/// page forward with the opaque `cursor` selector (fence-bound,
+/// owner-verified); the bound applies per page, unchanged.
+pub const MAX_AUDIT_RANGE_RECORDS: u32 = 32;
+
+/// Compile-time guard for the bound above: the worst case (every
+/// candidate carrying a full input-bound subject) stays strictly inside
+/// [`READ_MAX_OUTPUT_BYTES`].
+const _: () = assert!(
+    (MAX_AUDIT_RANGE_RECORDS as u64) * (READ_MAX_INPUT_BYTES as u64)
+        < (READ_MAX_OUTPUT_BYTES as u64),
+    "audit-range worst case must fit the read output bound"
+);
+
 /// Compatibility floor for generated entries: the current contract is the
 /// first version carrying per-operation manifests.
 pub const MINIMUM_COMPATIBLE_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
@@ -234,8 +263,12 @@ struct ActivatedReadDescriptor {
 /// `cursor` parameters; `GetReactiveInjectionState` addresses no scope and
 /// selects through the declared exact `session_id` parameter;
 /// `GetResourceSnapshot` addresses no scope and selects through the
-/// declared exact `uri` parameter.
-const ACTIVATED_READS: [ActivatedReadDescriptor; 14] = [
+/// declared exact `uri` parameter; `GetAuditRange` addresses no scope
+/// (issue #223: fence-gated journal-global scan; scope filtering lives
+/// consumer-side per I12-26, mirroring the established in-catalogue
+/// scope-free reads where the Governor facade requires a caller scope
+/// while catalogue rows stay scope-free).
+const ACTIVATED_READS: [ActivatedReadDescriptor; 17] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -306,11 +339,26 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 14] = [
         requires_scope_id: false,
         scope_kind: SCOPE_KIND_NONE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetExperienceBankRange,
+        requires_scope_id: true,
+        scope_kind: SCOPE_KIND_SCOPE,
+    },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetAgentFeedbackRange,
+        requires_scope_id: true,
+        scope_kind: SCOPE_KIND_SCOPE,
+    },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetAuditRange,
+        requires_scope_id: false,
+        scope_kind: SCOPE_KIND_NONE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 14] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 17] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -326,6 +374,9 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 14] {
         ACTIVATED_READS[11].operation,
         ACTIVATED_READS[12].operation,
         ACTIVATED_READS[13].operation,
+        ACTIVATED_READS[14].operation,
+        ACTIVATED_READS[15].operation,
+        ACTIVATED_READS[16].operation,
     ]
 }
 
@@ -343,8 +394,9 @@ struct ActivatedMutationDescriptor {
 /// `CaptureObservation` and `AppendAuditEvent` persist the lowest ceiling
 /// (`Candidate`) through the `CaptureCandidate` family; `ApplyLifecyclePolicy`
 /// persists `ReversibleMutation` through the `LifecyclePolicy` family;
-/// `ReconcileRecovery` persists `ReversibleMutation` through the
-/// `RecoverySchema` family; `UpdateTaskState` persists `ReversibleMutation`
+/// `ReconcileRecovery`, `RecordFinishEvidence`, and `RecordFinishDecision` persist
+/// `ReversibleMutation` through the `RecoverySchema` family;
+/// `UpdateTaskState` persists `ReversibleMutation`
 /// through the `TaskControl` family; `ApplyEpistemicRevision` persists
 /// `ReversibleMutation` through the `Epistemic` family; `ApplyErasure`
 /// persists `ReversibleMutation` through the `Erasure` family (issue #1712:
@@ -355,10 +407,14 @@ struct ActivatedMutationDescriptor {
 /// `ApplyReactiveInjectionState` and `ApplyResourceSnapshot` persist
 /// `ReversibleMutation` through the `ReactiveState` family (issue #1941 C4:
 /// Store-owned durable reactive delivery records and revisioned resource
-/// snapshots with the closed reactive typed contract). All
-/// ten address no scope, mirroring the scope-free read descriptors. Every
+/// snapshots with the closed reactive typed contract);
+/// `CommitExperienceBank` and `CommitAgentFeedback` persist `Candidate`
+/// through the `CaptureCandidate` family (issue #223: Store-owned durable
+/// experience-bank/feedback rows with the closed experience typed
+/// contract). All fifteen address no scope, mirroring the scope-free read
+/// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 11] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 15] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -385,6 +441,18 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 11] = [
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ReconcileRecovery,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: READ_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordFinishDecision,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: READ_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordFinishEvidence,
         transition_classes: &[TransitionClass::RecoverySchema],
         maximum_effect: EffectClass::ReversibleMutation,
         max_input_bytes: READ_MAX_INPUT_BYTES,
@@ -423,6 +491,18 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 11] = [
         operation: NamedMutationOperation::ApplyUserAutomationState,
         transition_classes: &[TransitionClass::UserAutomation],
         maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::CommitExperienceBank,
+        transition_classes: &[TransitionClass::CaptureCandidate],
+        maximum_effect: EffectClass::Candidate,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::CommitAgentFeedback,
+        transition_classes: &[TransitionClass::CaptureCandidate],
+        maximum_effect: EffectClass::Candidate,
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
 ];
@@ -488,8 +568,8 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 
 /// Generates the per-operation manifest descriptors from the declaration table.
 ///
-/// Declaration order is the canonical order: the fourteen activated reads, the
-/// eleven activated mutations, then the genesis bootstrap entry. Generation is
+/// Declaration order is the canonical order: the seventeen activated reads, the
+/// fifteen activated mutations, then the genesis bootstrap entry. Generation is
 /// pure over crate constants, so the same source always yields byte-identical
 /// entries.
 pub fn generated_operation_manifests() -> Result<Vec<NamedOperationManifest>, StoreError> {
@@ -721,6 +801,8 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::AppendAuditEvent
             | NamedMutationOperation::ApplyLifecyclePolicy
             | NamedMutationOperation::ReconcileRecovery
+            | NamedMutationOperation::RecordFinishDecision
+            | NamedMutationOperation::RecordFinishEvidence
             | NamedMutationOperation::UpdateTaskState
             | NamedMutationOperation::ApplyEpistemicRevision
             | NamedMutationOperation::ApplyErasure => {
@@ -738,6 +820,11 @@ pub fn validate_transition_against_catalogue(
             NamedMutationOperation::ApplyUserAutomationState => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 crate::validate_automation_mutation_params(command.operation, &command.parameters)?;
+            }
+            NamedMutationOperation::CommitExperienceBank
+            | NamedMutationOperation::CommitAgentFeedback => {
+                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+                crate::validate_experience_mutation_params(command.operation, &command.parameters)?;
             }
             NamedMutationOperation::RecordAuthorityRevocation => {
                 return Err(StoreError::UnknownOperation);

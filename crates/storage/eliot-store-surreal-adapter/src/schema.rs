@@ -70,6 +70,14 @@ pub(crate) mod table {
     /// row per `automation_id` naming the most recently committed
     /// failure key. Last write wins; no compare-and-set.
     pub(crate) const AUTOMATION_LAST_FAILURE: &str = "automation_last_failure";
+    /// Immutable experience-bank row per handle + owner revision
+    /// (issue #223). One row per joined `(handle, revision)` key
+    /// carrying the verbatim Governor-admitted bank-record document.
+    /// Create-only; divergent rewrites fail closed.
+    pub(crate) const EXPERIENCE_BANK: &str = "experience_bank";
+    /// Immutable agent-feedback row per handle + owner revision
+    /// (issue #223). Same create-only rule as the bank rows.
+    pub(crate) const EXPERIENCE_FEEDBACK: &str = "experience_feedback";
 }
 
 /// Record key of the single canonical fence/sequence row.
@@ -279,6 +287,34 @@ DEFINE FIELD task_id ON automation_invocation TYPE option<string>;
 DEFINE INDEX invocation_occurrence ON automation_invocation FIELDS occurrence_id UNIQUE;
 ";
 
+/// Experience bank/feedback tables (issue #223).
+/// Additive delta in the automation style: `experience_bank` carries one
+/// immutable row per joined handle/revision key with the verbatim
+/// Governor-admitted bank-record document plus presented digests;
+/// `experience_feedback` carries the same shape for feedback records.
+/// Applied explicitly where the owning slice proves it; never executed
+/// implicitly by the adapter.
+#[allow(dead_code)]
+pub(crate) const EXPERIENCE_TABLES_DDL: &str = r"
+DEFINE TABLE experience_bank SCHEMALESS;
+DEFINE FIELD handle ON experience_bank TYPE string;
+DEFINE FIELD revision ON experience_bank TYPE int;
+DEFINE FIELD record_json ON experience_bank TYPE string;
+DEFINE FIELD record_digest ON experience_bank TYPE string;
+DEFINE FIELD state_fence ON experience_bank TYPE object;
+DEFINE FIELD scope_id ON experience_bank TYPE string;
+DEFINE FIELD task_id ON experience_bank TYPE option<string>;
+
+DEFINE TABLE experience_feedback SCHEMALESS;
+DEFINE FIELD handle ON experience_feedback TYPE string;
+DEFINE FIELD revision ON experience_feedback TYPE int;
+DEFINE FIELD record_json ON experience_feedback TYPE string;
+DEFINE FIELD record_digest ON experience_feedback TYPE string;
+DEFINE FIELD state_fence ON experience_feedback TYPE object;
+DEFINE FIELD scope_id ON experience_feedback TYPE string;
+DEFINE FIELD task_id ON experience_feedback TYPE option<string>;
+";
+
 pub(crate) const SCHEMA_DDL_V2: &str = r"
 DEFINE TABLE schema_meta SCHEMALESS;
 DEFINE FIELD generation ON schema_meta TYPE string;
@@ -457,6 +493,19 @@ pub(crate) const TX_CREATE_OUTBOX: &str =
 /// Create of the write receipt, the durable linearization point.
 pub(crate) const TX_CREATE_RECEIPT: &str =
     "CREATE type::record($receipt_table, $receipt_operation_id) CONTENT $receipt;";
+
+/// Fenced upsert of the Governor finish-owner snapshot.  The outer recovery
+/// record is the only storage-owned part of a finish decision: its payload is
+/// opaque canonical receipt bytes, while the fixed `owner/finish` address,
+/// state fence, and outer revision are arbitrated here.  Creation and update
+/// use distinct markers so a stale create cannot be mistaken for a normal
+/// revision conflict by the adapter.
+pub(crate) const TX_FINISH_OWNER: &str = "LET $finish_existing = (SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision } FROM ONLY type::record($finish_owner_table, $finish_owner_id)); IF type::is_object($finish_existing) { LET $finish_owner_cas = (UPDATE type::record($finish_owner_table, $finish_owner_id) CONTENT $finish_owner_record WHERE state_fence = $finish_expected_state_fence AND revision = $finish_expected_revision RETURN AFTER); IF array::len($finish_owner_cas ?? []) != 1 { THROW 'finish_owner_cas_conflict'; }; } ELSE { IF $finish_expected_revision != 0 { THROW 'finish_owner_create_conflict'; }; LET $finish_owner_create = (CREATE type::record($finish_owner_table, $finish_owner_id) CONTENT $finish_owner_record RETURN AFTER); IF array::len($finish_owner_create ?? []) != 1 { THROW 'finish_owner_create_conflict'; }; };";
+
+/// Fenced upsert of the Governor-produced canonical admission owner image.
+/// The payload remains opaque to the adapter; only the fixed owner address,
+/// fence, and outer revision are provider-arbitrated.
+pub(crate) const TX_CANONICAL_OWNER: &str = "LET $canonical_existing = (SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision } FROM ONLY type::record($canonical_owner_table, $canonical_owner_id)); IF type::is_object($canonical_existing) { LET $canonical_owner_cas = (UPDATE type::record($canonical_owner_table, $canonical_owner_id) CONTENT $canonical_owner_record WHERE state_fence = $canonical_expected_state_fence AND revision = $canonical_expected_revision RETURN AFTER); IF array::len($canonical_owner_cas ?? []) != 1 { THROW 'canonical_owner_cas_conflict'; }; } ELSE { IF $canonical_expected_revision != 0 { THROW 'canonical_owner_create_conflict'; }; LET $canonical_owner_create = (CREATE type::record($canonical_owner_table, $canonical_owner_id) CONTENT $canonical_owner_record RETURN AFTER); IF array::len($canonical_owner_create ?? []) != 1 { THROW 'canonical_owner_create_conflict'; }; };";
 
 /// Renders an indexed transaction template for the given binding index.
 pub(crate) fn indexed(template: &str, index: usize) -> String {

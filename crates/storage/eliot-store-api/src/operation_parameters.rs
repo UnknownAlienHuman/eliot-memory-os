@@ -33,7 +33,13 @@
 //! `problem_id` + `max_records`), `GetUnderstandingProjectionInputs`
 //! (`selector` + `max_records`), and `GetCapabilityEvidenceState`
 //! (`skill_id` + `max_records`), each scope-addressed and bounded like
-//! `GetEvidencePack`.
+//! `GetEvidencePack`, plus issue #223 the two experience range reads
+//! `GetExperienceBankRange` / `GetAgentFeedbackRange` (`max_records` only;
+//! scope through the typed `scope_id` request field) and the two
+//! `CommitExperienceBank` / `CommitAgentFeedback` mutations
+//! (`CaptureCandidate` with the `Candidate` ceiling; verbatim record
+//! document plus presented digests, decimal owner revision, and
+//! idempotency key).
 //! Every other [`NamedReadOperation`](crate::NamedReadOperation) variant and
 //! every other [`NamedMutationOperation`](crate::NamedMutationOperation)
 //! variant stays known-but-unsupported and unadvertised, and no other mutation
@@ -302,6 +308,41 @@ static RECONCILE_RECOVERY_PARAMETERS: [ParameterDeclaration; 10] = [
     },
     ParameterDeclaration {
         name: "observation_request_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+/// Owner-approved Governor finish persistence fields. The receipt remains an
+/// opaque canonical JSON document at this boundary; only the fixed
+/// `owner/finish` record address and outer revision are storage semantics.
+static RECORD_FINISH_DECISION_PARAMETERS: [ParameterDeclaration; 3] = [
+    ParameterDeclaration {
+        name: "attempt_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_finish_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "receipt_json",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+/// Owner-approved Governor finish-evidence persistence fields. The canonical
+/// owner image remains an opaque JSON document at this boundary; the store
+/// only arbitrates its fixed owner address and revision.
+static RECORD_FINISH_EVIDENCE_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "expected_canonical_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "snapshot_json",
         shape: ParameterShape::Subject,
         required: true,
     },
@@ -702,6 +743,65 @@ static GET_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 4] = [
     },
 ];
 
+/// Shared closed selector for both experience range reads (issue #223):
+/// the explicit `max_records` bound as its decimal string. Scope arrives
+/// through the typed `scope_id` request field, mirroring `GetEvidencePack`.
+static GET_EXPERIENCE_RANGE_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "max_records",
+    shape: ParameterShape::Subject,
+    required: true,
+}];
+
+/// Closed selector for the audit-range read (issue #223): the optional
+/// opaque continuation cursor minted by the store-api audit cursor
+/// issuer. Absent cursors read from the start with legacy fail-closed
+/// overflow; present cursors resume paging after owner verification.
+/// The empty-parameter request shape stays valid, so existing planners
+/// keep working.
+static GET_AUDIT_RANGE_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "cursor",
+    shape: ParameterShape::Subject,
+    required: false,
+}];
+
+/// Closed commit parameters shared by both experience legs (issue #223):
+/// the verbatim record document, the presented record/scope/fence
+/// digests, the decimal owner revision, and the idempotency key. The
+/// family is bound by the operation variant, never by a discriminator
+/// parameter.
+static COMMIT_EXPERIENCE_PARAMETERS: [ParameterDeclaration; 6] = [
+    ParameterDeclaration {
+        name: "record_json",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "record_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "record_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "scope_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "fence_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "idempotency_key",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+
 /// Owner-approved task-control fields emitted by the Governor task lifecycle
 /// envelope (`crates/governor/eliot-governor/src/task_lifecycle.rs`,
 /// `task_envelope`): the transitioned `task_id`, the admitted `event_id`, the
@@ -755,6 +855,8 @@ pub const fn named_read_operation_name(operation: NamedReadOperation) -> &'stati
         NamedReadOperation::GetReactiveInjectionState => "GetReactiveInjectionState",
         NamedReadOperation::GetResourceSnapshot => "GetResourceSnapshot",
         NamedReadOperation::GetUserAutomationState => "GetUserAutomationState",
+        NamedReadOperation::GetExperienceBankRange => "GetExperienceBankRange",
+        NamedReadOperation::GetAgentFeedbackRange => "GetAgentFeedbackRange",
         NamedReadOperation::GetScopeRevisionView => "GetScopeRevisionView",
         NamedReadOperation::GetOrderingHeads => "GetOrderingHeads",
         NamedReadOperation::GetTaskState => "GetTaskState",
@@ -799,6 +901,8 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
         b"GetReactiveInjectionState" => Some(NamedReadOperation::GetReactiveInjectionState),
         b"GetResourceSnapshot" => Some(NamedReadOperation::GetResourceSnapshot),
         b"GetUserAutomationState" => Some(NamedReadOperation::GetUserAutomationState),
+        b"GetExperienceBankRange" => Some(NamedReadOperation::GetExperienceBankRange),
+        b"GetAgentFeedbackRange" => Some(NamedReadOperation::GetAgentFeedbackRange),
         _ => None,
     }
 }
@@ -812,6 +916,8 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::UpdateTaskState => "UpdateTaskState",
         NamedMutationOperation::ApplyLifecyclePolicy => "ApplyLifecyclePolicy",
         NamedMutationOperation::ReconcileRecovery => "ReconcileRecovery",
+        NamedMutationOperation::RecordFinishDecision => "RecordFinishDecision",
+        NamedMutationOperation::RecordFinishEvidence => "RecordFinishEvidence",
         NamedMutationOperation::AppendAuditEvent => "AppendAuditEvent",
         NamedMutationOperation::RecordAuthorityRevocation => "RecordAuthorityRevocation",
         NamedMutationOperation::ApplyErasure => "ApplyErasure",
@@ -819,6 +925,8 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::ApplyReactiveInjectionState => "ApplyReactiveInjectionState",
         NamedMutationOperation::ApplyResourceSnapshot => "ApplyResourceSnapshot",
         NamedMutationOperation::ApplyUserAutomationState => "ApplyUserAutomationState",
+        NamedMutationOperation::CommitExperienceBank => "CommitExperienceBank",
+        NamedMutationOperation::CommitAgentFeedback => "CommitAgentFeedback",
     }
 }
 
@@ -831,6 +939,8 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"UpdateTaskState" => Some(NamedMutationOperation::UpdateTaskState),
         b"ApplyLifecyclePolicy" => Some(NamedMutationOperation::ApplyLifecyclePolicy),
         b"ReconcileRecovery" => Some(NamedMutationOperation::ReconcileRecovery),
+        b"RecordFinishDecision" => Some(NamedMutationOperation::RecordFinishDecision),
+        b"RecordFinishEvidence" => Some(NamedMutationOperation::RecordFinishEvidence),
         b"AppendAuditEvent" => Some(NamedMutationOperation::AppendAuditEvent),
         b"RecordAuthorityRevocation" => Some(NamedMutationOperation::RecordAuthorityRevocation),
         b"ApplyErasure" => Some(NamedMutationOperation::ApplyErasure),
@@ -838,6 +948,8 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"ApplyReactiveInjectionState" => Some(NamedMutationOperation::ApplyReactiveInjectionState),
         b"ApplyResourceSnapshot" => Some(NamedMutationOperation::ApplyResourceSnapshot),
         b"ApplyUserAutomationState" => Some(NamedMutationOperation::ApplyUserAutomationState),
+        b"CommitExperienceBank" => Some(NamedMutationOperation::CommitExperienceBank),
+        b"CommitAgentFeedback" => Some(NamedMutationOperation::CommitAgentFeedback),
         _ => None,
     }
 }
@@ -864,6 +976,11 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
 /// selector; `GetUserAutomationState` declares the required `query`
 /// discriminator, the optional exact `automation_id` selector, the required
 /// `include_retired` flag, and the required decimal `max_records` bound;
+/// `GetExperienceBankRange` and `GetAgentFeedbackRange` declare the required
+/// decimal `max_records` bound (issue #223; scope arrives through the typed
+/// `scope_id` request field, mirroring `GetEvidencePack`);
+/// `GetAuditRange` declares the optional opaque `cursor` continuation
+/// selector (issue #223; absent cursors read from the start);
 /// every other variant declares none, so any supplied parameter fails closed. Variants without a catalogue entry never
 /// reach this table: they fail as [`StoreError::UnknownOperation`] first.
 #[must_use]
@@ -887,13 +1004,15 @@ pub const fn declared_read_parameters(
         NamedReadOperation::GetReactiveInjectionState => &GET_REACTIVE_LEDGER_PARAMETERS,
         NamedReadOperation::GetResourceSnapshot => &GET_RESOURCE_SNAPSHOT_PARAMETERS,
         NamedReadOperation::GetUserAutomationState => &GET_USER_AUTOMATION_PARAMETERS,
+        NamedReadOperation::GetExperienceBankRange => &GET_EXPERIENCE_RANGE_PARAMETERS,
+        NamedReadOperation::GetAgentFeedbackRange => &GET_EXPERIENCE_RANGE_PARAMETERS,
+        NamedReadOperation::GetAuditRange => &GET_AUDIT_RANGE_PARAMETERS,
         NamedReadOperation::GetRevisionHeads
         | NamedReadOperation::GetScopeRevisionView
         | NamedReadOperation::GetOrderingHeads
         | NamedReadOperation::GetModuleCatalogState
         | NamedReadOperation::GetConformanceState
-        | NamedReadOperation::GetMailbox
-        | NamedReadOperation::GetAuditRange => &NO_PARAMETERS,
+        | NamedReadOperation::GetMailbox => &NO_PARAMETERS,
     }
 }
 
@@ -934,6 +1053,11 @@ pub const fn declared_read_parameters(
 /// payloads (`revision`, `revision_json`, `previous_revision`,
 /// `configuration_state`, `occurrence_id`, `invocation_json`; leg
 /// completeness is enforced by the automation-state contract);
+/// `CommitExperienceBank` and `CommitAgentFeedback` declare the six
+/// required commit fields (`record_json`, `record_digest`,
+/// `record_revision` as its decimal string, `scope_digest`,
+/// `fence_digest`, `idempotency_key`; family bound by the operation
+/// variant, digest re-proof at the Governor read edge);
 /// every other variant declares none,
 /// so any supplied parameter fails closed. Variants without a catalogue entry
 /// never reach this table: they fail as [`StoreError::UnknownOperation`] first.
@@ -946,6 +1070,8 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::AppendAuditEvent => &APPEND_AUDIT_EVENT_PARAMETERS,
         NamedMutationOperation::ApplyLifecyclePolicy => &APPLY_LIFECYCLE_POLICY_PARAMETERS,
         NamedMutationOperation::ReconcileRecovery => &RECONCILE_RECOVERY_PARAMETERS,
+        NamedMutationOperation::RecordFinishDecision => &RECORD_FINISH_DECISION_PARAMETERS,
+        NamedMutationOperation::RecordFinishEvidence => &RECORD_FINISH_EVIDENCE_PARAMETERS,
         NamedMutationOperation::UpdateTaskState => &UPDATE_TASK_STATE_PARAMETERS,
         NamedMutationOperation::RecordAuthorityRevocation => {
             &RECORD_AUTHORITY_REVOCATION_PARAMETERS
@@ -956,6 +1082,8 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::ApplyReactiveInjectionState => &APPLY_REACTIVE_LEDGER_PARAMETERS,
         NamedMutationOperation::ApplyResourceSnapshot => &APPLY_RESOURCE_SNAPSHOT_PARAMETERS,
         NamedMutationOperation::ApplyUserAutomationState => &APPLY_USER_AUTOMATION_PARAMETERS,
+        NamedMutationOperation::CommitExperienceBank => &COMMIT_EXPERIENCE_PARAMETERS,
+        NamedMutationOperation::CommitAgentFeedback => &COMMIT_EXPERIENCE_PARAMETERS,
     }
 }
 

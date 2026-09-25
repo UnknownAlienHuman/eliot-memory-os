@@ -11,10 +11,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{EpochId, ResourceGeneration, StateFence};
+use eliot_agent_api::{
+    AdmittedRouteReceipt, AgentResult, EffectCeiling, ProviderExecutionBinding, ResultDisposition,
+};
+use eliot_contracts::{EpochId, OperationId, ResourceGeneration, StateFence};
 use eliot_governor::{
-    CompositionError, CompositionReadiness, GovernorActivationOutcome, GovernorComposition,
-    GovernorLaunchConfig, KernelGenerationPort, KernelGenerationSnapshotProvider, QueueLimits,
+    CompositionError, CompositionReadiness, FinishAttemptDraft, FinishAttemptError,
+    FinishDecisionReceipt, GovernorActivationOutcome, GovernorComposition, GovernorLaunchConfig,
+    KernelGenerationPort, KernelGenerationSnapshotProvider, QueueLimits,
 };
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
@@ -67,6 +71,7 @@ mod skill_surface_adapters;
 pub mod staffing_policy;
 pub mod startup_evidence_producer;
 mod store_failure_projection;
+pub mod testd_terminal_completion;
 pub mod task_binding_admission;
 mod task_lifecycle_adapters;
 
@@ -152,10 +157,10 @@ pub use governor_local_read::{
     serve_admitted_local_read,
 };
 pub use experience_runtime::{
-    CommonGroundEventInputs, ExperienceDriverError, ExperienceJournalDriverInputs,
-    ExperienceQualityEvent, ExperienceQualityEventOutput, UnderstandingEventInputs,
-    derive_commit_ingress, produce_journal_projection, read_current_position,
-    run_experience_quality_event,
+    CommonGroundEventInputs, ExperienceCommitOutput, ExperienceDriverError,
+    ExperienceJournalDriverInputs, ExperienceQualityEvent, ExperienceQualityEventOutput,
+    UnderstandingEventInputs, commit_experience_event_records, derive_commit_ingress,
+    produce_journal_projection, read_current_position, run_experience_quality_event,
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
@@ -237,6 +242,10 @@ pub enum DaemonError {
     /// Exact Kernel/provider or Governor recovery admission failed.
     #[error("Governor composition: {0}")]
     Composition(#[from] CompositionError),
+    /// Governor-owned FinishAttempt evaluation or canonical persistence
+    /// rejected the candidate.
+    #[error("Governor FinishAttempt: {0}")]
+    Finish(#[from] FinishAttemptError),
     /// Authenticated Kernel B1 transport or admission failed.
     #[error("Kernel B1 transport: {0}")]
     Kernel(String),
@@ -453,6 +462,129 @@ impl DaemonComposition {
             return Err(DaemonError::Composition(error));
         }
         Ok(())
+    /// Commits one ledger-sequenced experience-bank record through the
+    /// canonical Governor experience-commit caller.
+    ///
+    /// Arc-callable narrowed form: shared borrow only, so trigger
+    /// contexts holding `Arc<DaemonComposition>` can invoke it with no
+    /// lock and no restructuring. No refresh runs here and no stale
+    /// flag is set (both need `&mut`); pair with
+    /// [`Self::refresh_dependent_view`] from a mutably-held context,
+    /// and until then treat projections read through this composition
+    /// as possibly lagging the durable store. The identity must be
+    /// admitted ingress agreeing with the record (fence, scope,
+    /// idempotency); the owner re-validates everything downstream.
+    /// Receipts stay durable regardless of later refresh outcome.
+    pub async fn commit_experience_bank_record(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        ledger: &eliot_observation::bank_admission::ExperienceRevisionLedger,
+        record: &eliot_observation_contracts::ExperienceBankRecord,
+        scope_id: eliot_store_api::ScopeId,
+        proof_refs: Vec<String>,
+        expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
+    ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
+        let receipt = eliot_governor::commit_experience_bank(
+            &self.governor,
+            identity,
+            ledger,
+            record,
+            scope_id,
+            proof_refs,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .await
+        .map_err(DaemonError::Composition)?;
+        Ok(receipt)
+    }
+
+    /// Commits one ledger-sequenced agent-feedback record through the
+    /// canonical Governor experience-commit caller. Same Arc-callable
+    /// narrowed rule as [`Self::commit_experience_bank_record`]: shared
+    /// borrow only, no refresh here, pair with
+    /// [`Self::refresh_dependent_view`] afterwards.
+    pub async fn commit_experience_feedback_record(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        ledger: &eliot_observation::bank_admission::ExperienceRevisionLedger,
+        record: &eliot_observation_contracts::AgentFeedbackRecord,
+        scope_id: eliot_store_api::ScopeId,
+        proof_refs: Vec<String>,
+        expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
+    ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
+        let receipt = eliot_governor::commit_experience_feedback(
+            &self.governor,
+            identity,
+            ledger,
+            record,
+            scope_id,
+            proof_refs,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .await
+        .map_err(DaemonError::Composition)?;
+        Ok(receipt)
+    }
+    /// Submits one candidate finish through the Governor owner, commits the
+    /// derived decision through the canonical `RecordFinishDecision` path,
+    /// and rehydrates the daemon projection before returning the decision
+    /// receipt. The caller supplies only a candidate draft; task completion,
+    /// evidence binding, and persistence remain Governor/Canonical-owned.
+    ///
+    /// A committed receipt is preserved when the post-commit refresh cannot
+    /// publish the new projection. In that case the daemon is marked stale,
+    /// matching [`Self::commit_canonical_and_refresh`], and the receipt still
+    /// reports the durable operation rather than a false failure.
+    pub async fn finish_attempt(
+        &mut self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        draft: FinishAttemptDraft,
+    ) -> Result<FinishDecisionReceipt, DaemonError> {
+        let _span = tracing::info_span!("eliotd.finish_attempt").entered();
+        let decision = self
+            .governor
+            .finish_attempt(identity, operation_id, draft)
+            .await
+            .map_err(DaemonError::Finish)?;
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+        Ok(decision)
+    }
+
+    /// Submits a validated API v7 candidate result to the Governor Finish owner.
+    ///
+    /// API v7 is candidate-only: this adapter validates the result against its
+    /// admitted route and execution binding, then copies only candidate handles
+    /// and declared unknowns into a [`FinishAttemptDraft`].  It never copies a
+    /// provider disposition into a completion decision, supplies no proof, and
+    /// does not close the task; [`Self::finish_attempt`] rehydrates canonical
+    /// evidence and lets the Governor derive and persist the outcome.
+    pub async fn finish_agent_api_v7_result(
+        &mut self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        task_id: String,
+        expected_task_revision: u64,
+        result: &AgentResult,
+        binding: &ProviderExecutionBinding,
+        admission: &AdmittedRouteReceipt,
+        effect_ceiling: &EffectCeiling,
+    ) -> Result<FinishDecisionReceipt, DaemonError> {
+        result
+            .validate_for_binding(binding, admission, effect_ceiling)
+            .map_err(|error| {
+                DaemonError::Lifecycle(format!(
+                    "API v7 candidate result is not bound to the admitted execution: {error}"
+                ))
+            })?;
+        let draft = finish_draft_from_agent_api_v7(task_id, expected_task_revision, result);
+        self.finish_attempt(identity, operation_id, draft).await
     }
 
     /// Returns the admitted Kernel snapshot.
@@ -1446,6 +1578,46 @@ impl DaemonComposition {
         self.started = false;
         let _ = (&self.config_lease, &self.state_lease);
         Ok(())
+    }
+}
+
+fn finish_draft_from_agent_api_v7(
+    task_id: String,
+    expected_task_revision: u64,
+    result: &AgentResult,
+) -> FinishAttemptDraft {
+    let mut remaining_unknowns_declared_by_caller = result.unresolved_questions.clone();
+    if let Some(reason) = &result.unknown_reason {
+        remaining_unknowns_declared_by_caller.push(reason.clone());
+    }
+    FinishAttemptDraft {
+        task_id,
+        expected_task_revision,
+        requested_outcome: match result.disposition {
+            ResultDisposition::CandidateSucceeded => {
+                eliot_governor::RequestedFinishOutcome::CompleteCandidate
+            }
+            ResultDisposition::Partial => eliot_governor::RequestedFinishOutcome::Partial,
+            ResultDisposition::Blocked => eliot_governor::RequestedFinishOutcome::Blocked,
+            ResultDisposition::FailedVerification => {
+                eliot_governor::RequestedFinishOutcome::FailedVerification
+            }
+            ResultDisposition::DegradedNoProof | ResultDisposition::UnknownOutcome => {
+                eliot_governor::RequestedFinishOutcome::DegradedNoProof
+            }
+            ResultDisposition::Unsafe => eliot_governor::RequestedFinishOutcome::UnsafeToFinish,
+            ResultDisposition::CancelledObserved => {
+                eliot_governor::RequestedFinishOutcome::Cancelled
+            }
+            ResultDisposition::Superseded => eliot_governor::RequestedFinishOutcome::Superseded,
+        },
+        artifact_refs: result.artifacts.iter().map(ToString::to_string).collect(),
+        observation_refs: result.evidence_refs.clone(),
+        // Verifier ownership remains in the canonical evidence projection;
+        // an API v7 candidate result cannot assert a verifier run.
+        verifier_run_refs: Vec::new(),
+        remaining_unknowns_declared_by_caller,
+        rationale_candidate: format!("api-v7-candidate:{}", result.attempt_id.as_str()),
     }
 }
 
