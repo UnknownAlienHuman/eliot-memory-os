@@ -159,6 +159,34 @@ fn local_read_state_is_dispatchable(state: HostRequestState) -> bool {
     matches!(state, HostRequestState::Admitted)
 }
 
+fn local_read_retired_error(state: HostRequestState, deadline_unix_ms: u64) -> TransportError {
+    if state == HostRequestState::Expired || activation_deadline_expired(unix_ms(), deadline_unix_ms)
+    {
+        TransportError::Timeout
+    } else {
+        match state {
+            HostRequestState::Cancelled => TransportError::Cancelled,
+            HostRequestState::Conflicted => TransportError::IdentityConflict,
+            _ => TransportError::UnknownRequest,
+        }
+    }
+}
+
+/// Observable outcome of one bounded local-read enqueue attempt.
+///
+/// A refusal is never reported as a queue write: the durable record owns
+/// dispatchability, so a pair that is cancelled, expired, conflicted,
+/// already resulted, fenced away from `Admitted`, or evicted from the ORS
+/// never becomes claimable and the caller must be able to observe that.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LocalReadEnqueueDisposition {
+    /// The pair is on the bounded queue and may be claimed by the poller.
+    Queued,
+    /// The durable record is not dispatchable; any queued reference was
+    /// retired and no daemon read leg can be entered for this operation.
+    Retired,
+}
+
 /// Returns whether the operation string selects the P-04 host-request route.
 ///
 /// The closed agent-bridge event-delivery entries ride this same predicate:
@@ -832,7 +860,7 @@ impl KernelComposition {
             Err(_) => return Err(TransportError::SessionFenced),
         };
         let _transition = self.agent_bridge_transition_read()?;
-        let (receipt, record) = self.admit_host_request_envelope_under_transition(envelope)?;
+        let (receipt, mut record) = self.admit_host_request_envelope_under_transition(envelope)?;
         // A retained result is one closed digest/body pair in a result state.
         // Refuse a half-pair or a result attached to a live state before any
         // queue path can expose it for dispatch.
@@ -857,12 +885,38 @@ impl KernelComposition {
             && local_read_state_is_dispatchable(record.state);
         match carrier {
             Some(LocalReadCarrier::Query) if dispatchable => {
-                self.enqueue_local_read_pair_under_transition(envelope, tool)?;
+                match self.enqueue_local_read_pair_under_transition(envelope, tool)? {
+                    LocalReadEnqueueDisposition::Queued => {}
+                    LocalReadEnqueueDisposition::Retired => {
+                        // The enqueue gate re-reads the durable row, so a
+                        // result may have arrived since admission. Serve that
+                        // exact retained result; otherwise return the typed
+                        // terminal/unknown disposition instead of claiming a
+                        // successful query admission with no queued read.
+                        let current = self.local_read_durable_record(envelope)?;
+                        if current.result_digest.is_some() || current.result_response.is_some() {
+                            record = current;
+                        } else {
+                            return Err(local_read_retired_error(
+                                current.state,
+                                envelope.identity.deadline_unix_ms,
+                            ));
+                        }
+                    }
+                }
             }
-            Some(LocalReadCarrier::Query) => self.retire_local_read_pair_under_transition(
-                &host_request_operation_id(envelope),
-                &envelope.envelope_sha256,
-            ),
+            Some(LocalReadCarrier::Query) => {
+                self.retire_local_read_pair_under_transition(
+                    &host_request_operation_id(envelope),
+                    &envelope.envelope_sha256,
+                );
+                if !has_digest || !has_body {
+                    return Err(local_read_retired_error(
+                        record.state,
+                        envelope.identity.deadline_unix_ms,
+                    ));
+                }
+            }
             Some(LocalReadCarrier::Packet) if dispatchable => {
                 self.enqueue_campaign_packet_pair_under_transition(envelope, tool)?;
             }
@@ -872,12 +926,27 @@ impl KernelComposition {
             ),
             Some(LocalReadCarrier::Skill) if dispatchable => {
                 // Skill drivers remain best-effort after durable admission.
-                let _ = self.enqueue_local_read_pair_under_transition(envelope, tool);
+                match self.enqueue_local_read_pair_under_transition(envelope, tool) {
+                    Ok(LocalReadEnqueueDisposition::Queued) | Err(_) => {}
+                    Ok(LocalReadEnqueueDisposition::Retired) => {
+                        let current = self.local_read_durable_record(envelope)?;
+                        return Err(local_read_retired_error(
+                            current.state,
+                            envelope.identity.deadline_unix_ms,
+                        ));
+                    }
+                }
             }
-            Some(LocalReadCarrier::Skill) => self.retire_local_read_pair_under_transition(
-                &host_request_operation_id(envelope),
-                &envelope.envelope_sha256,
-            ),
+            Some(LocalReadCarrier::Skill) => {
+                self.retire_local_read_pair_under_transition(
+                    &host_request_operation_id(envelope),
+                    &envelope.envelope_sha256,
+                );
+                return Err(local_read_retired_error(
+                    record.state,
+                    envelope.identity.deadline_unix_ms,
+                ));
+            }
             None if dispatchable && check_task_controller_admission(envelope, tool).is_ok() => {
                 self.enqueue_task_controller_pair_under_transition(envelope, tool)?;
             }
@@ -889,6 +958,21 @@ impl KernelComposition {
             }
             None if has_digest && has_body => {}
             None => return Err(TransportError::SessionFenced),
+        }
+        let has_digest = record.result_digest.is_some();
+        let has_body = record.result_response.is_some();
+        if has_digest != has_body
+            || (has_digest
+                && !matches!(
+                    record.state,
+                    HostRequestState::ResultReceived | HostRequestState::Terminal
+                ))
+        {
+            self.retire_local_read_pair_under_transition(
+                &host_request_operation_id(envelope),
+                &envelope.envelope_sha256,
+            );
+            return Err(TransportError::SessionFenced);
         }
         // Coherence gate before serving: a resulted record must carry a
         // digest-bound body, otherwise the row is never served as an answer.
@@ -1567,20 +1651,25 @@ impl KernelComposition {
 
     /// Queues one admitted local-read pair for the daemon poller.
     ///
-    /// Called best-effort from [`Self::invoke_read_host_request`] after the
-    /// full admission gate, so only linkage-checked `eliot.query` pairs with
-    /// valid selectors arrive here. An exact replay (same operation and
+    /// Called from [`Self::invoke_read_host_request`] after the full admission
+    /// gate, so only linkage-checked query or Skill carriers arrive here. An
+    /// exact replay (same operation and
     /// digest already queued) is idempotent and never duplicates; when the
     /// bounded queue is full, only an unclaimed queued pair may be evicted
     /// (daemon-leg memory only — the durable ORS record is untouched). A full
     /// queue of claimed/in-flight attempts returns backpressure rather than
     /// silently stealing a live attempt.
-    #[cfg(test)]
+    ///
+    /// The durable record is re-read here: only a record that is still
+    /// dispatchable (`Admitted`), carries no result, and has not passed its
+    /// deadline may be queued. Every other case retires the pair and returns
+    /// [`LocalReadEnqueueDisposition::Retired`] so a caller can never mistake
+    /// a fail-closed refusal for a queued dispatch.
     pub(crate) fn enqueue_local_read_pair(
         &self,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
-    ) -> Result<(), TransportError> {
+    ) -> Result<LocalReadEnqueueDisposition, TransportError> {
         let _transition = self.agent_bridge_transition_read()?;
         self.enqueue_local_read_pair_under_transition(envelope, tool)
     }
@@ -1589,7 +1678,7 @@ impl KernelComposition {
         &self,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
-    ) -> Result<(), TransportError> {
+    ) -> Result<LocalReadEnqueueDisposition, TransportError> {
         if !matches!(
             check_invoke_read_admission(envelope, tool)?,
             LocalReadCarrier::Query | LocalReadCarrier::Skill
@@ -1611,7 +1700,7 @@ impl KernelComposition {
                 &host_request_operation_id(envelope),
                 &envelope.envelope_sha256,
             );
-            return Ok(());
+            return Ok(LocalReadEnqueueDisposition::Retired);
         }
         let mut index = self
             .host_request_connection_index
@@ -1640,7 +1729,7 @@ impl KernelComposition {
                         && candidate.local_read_envelope.is_some()
                 })
             {
-                return Ok(());
+                return Ok(LocalReadEnqueueDisposition::Queued);
             }
         }
         let queued = index
@@ -1700,7 +1789,7 @@ impl KernelComposition {
                 task_controller_attempt: LocalReadAttemptState::default(),
             });
         }
-        Ok(())
+        Ok(LocalReadEnqueueDisposition::Queued)
     }
 
     /// Claims the next admitted query or Skill carrier for the daemon poller
@@ -1713,9 +1802,14 @@ impl KernelComposition {
     /// capability (lost-answer retry without a new identity); a claim by a
     /// different owner reassigns the attempt (generation bump, fresh identity,
     /// new owner), so the superseded capability can never complete. `None` is
-    /// a null poll, not an error. Pure queue memory: no store IO, so
-    /// already-resulted pairs are retired by the submit legs rather than
-    /// re-checked here.
+    /// a null poll, not an error.
+    ///
+    /// The poll is not pure queue memory: before any claim it re-reads each
+    /// queued pair's durable ORS record and sweeps every entry that is no
+    /// longer dispatchable — expired deadline, carrier/digest mismatch, a
+    /// missing or evicted row, a state that left `Admitted`, or an
+    /// already-present result. A pair whose dispatchability cannot be proven
+    /// is never claimed: the durable record decides, not the in-memory queue.
     #[allow(
         clippy::too_many_lines,
         reason = "claim keeps queue invalidation, durable-state gating, and attempt ownership in one ordered pass"
@@ -6102,14 +6196,16 @@ mod invoke_read_tool_tests {
             "forged digest must be rejected before serving"
         );
 
-        // A half-present pair never serves as an answer.
+        // A half-present pair fails closed. It is never served partially and
+        // never falls through to a fresh read, because a row that carries one
+        // half of the result pair cannot be proven to be this operation's
+        // answer.
         let mut half = record.clone();
         half.result_response = None;
         assert_eq!(
-            local_read_replay_response(&receipt, &half, &envelope, Some(&selectors))
-                .expect("half-present pair must not fail"),
-            None,
-            "a half-present pair takes the fresh leg, never a partial serve"
+            local_read_replay_response(&receipt, &half, &envelope, Some(&selectors)),
+            Err(TransportError::SessionFenced),
+            "a half-present pair is refused, never partially served or re-read"
         );
     }
 }
