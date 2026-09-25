@@ -3472,8 +3472,7 @@ impl LocalReadAttempt {
 }
 
 /// Stable wire identity for a Watchdog spool intent-submission payload.
-pub const WATCHDOG_SPOOL_INTENT_BATCH_WIRE_ID: &str =
-    "eliot.protocol.watchdog-spool-intent-batch";
+pub const WATCHDOG_SPOOL_INTENT_BATCH_WIRE_ID: &str = "eliot.protocol.watchdog-spool-intent-batch";
 /// Current Watchdog spool intent-submission payload wire version.
 pub const WATCHDOG_SPOOL_INTENT_BATCH_WIRE_VERSION: u16 = 1;
 /// Exact admitted Kernel route that carries one Watchdog spool intent batch.
@@ -3645,10 +3644,7 @@ impl WatchdogSpoolIntentSubmission {
             });
         }
         for reference in &self.evidence_refs {
-            lowercase_sha256(
-                reference,
-                "watchdog_spool_intent_submission.evidence_refs",
-            )?;
+            lowercase_sha256(reference, "watchdog_spool_intent_submission.evidence_refs")?;
         }
         bounded_text(
             &self.lineage_installation_id,

@@ -865,7 +865,7 @@ impl WatchdogSpool {
     /// sequence, so the Kernel-side exactly-once ledger still admits each of
     /// them at most once.
     ///
-    /// The append is the only write: no ORS, canonical, or HostStateJournal
+    /// The append is the only write: no ORS, canonical, or `HostStateJournal`
     /// write is reachable from this path.
     ///
     /// # Errors
@@ -955,7 +955,10 @@ impl WatchdogSpool {
     ///
     /// Returns [`SpoolError`] when the rule state is not canonical, the
     /// timestamp is uninitialized, or the state cannot be written.
-    pub(crate) fn observe_governor_recovery(&self, observed_at_ms: u64) -> Result<bool, SpoolError> {
+    pub(crate) fn observe_governor_recovery(
+        &self,
+        observed_at_ms: u64,
+    ) -> Result<bool, SpoolError> {
         let mut state = self.read_intent_rule_state()?;
         let was_open = state.close_episode(observed_at_ms)?;
         self.write_intent_rule_state(&state)?;
@@ -981,7 +984,7 @@ impl WatchdogSpool {
     pub(crate) fn pending_watchdog_intents(
         &self,
         limit: usize,
-        epoch_lineage: eliot_contracts::EpochLineageId,
+        epoch_lineage: &eliot_contracts::EpochLineageId,
     ) -> Result<Vec<intent::PendingWatchdogIntent>, SpoolError> {
         if limit == 0 || limit > intent::INTENT_RECONCILIATION_MAX_SUBMISSIONS {
             return Err(SpoolError::Corrupt(
@@ -1597,7 +1600,9 @@ fn encode_intent_receipt(
 
 fn decode_intent_receipt(bytes: &[u8]) -> Result<intent::WatchdogIntentSubmission, SpoolError> {
     let record: WatchdogIntentReceiptRecord = serde_json::from_slice(bytes).map_err(|error| {
-        SpoolError::Corrupt(format!("watchdog intent submit-once receipt is invalid: {error}"))
+        SpoolError::Corrupt(format!(
+            "watchdog intent submit-once receipt is invalid: {error}"
+        ))
     })?;
     if record.schema_version != INTENT_RECEIPT_SCHEMA_VERSION {
         return Err(SpoolError::Corrupt(

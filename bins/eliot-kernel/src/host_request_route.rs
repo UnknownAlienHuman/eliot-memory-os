@@ -395,12 +395,18 @@ impl KernelComposition {
     /// entry's. The canonical Problem/Incident transition, the Current Epistemic
     /// Position, task state, and every other semantic decision stay owned by the
     /// Governor consuming this record. The Watchdog gains no canonical,
-    /// ORS-authoring, or HostStateJournal authority from this entry: it submits
+    /// ORS-authoring, or `HostStateJournal` authority from this entry: it submits
     /// an observation through a named Kernel mutation, exactly as I1.8 requires.
     ///
     /// The original Watchdog record travels verbatim inside each submission and
     /// is retained by the Watchdog spool, so the Kernel projection and the
     /// Governor's later decision both stay forensically linked to it.
+    ///
+    /// The entry and its projection stay inside this crate on purpose: the
+    /// Watchdog reaches the mutation only through the admitted frame front door
+    /// in [`Self::dispatch_watchdog_intent_frame`], and the projections it
+    /// returns are rendered into that frame's typed answer, so no caller outside
+    /// the Kernel can name or hold one.
     ///
     /// # Errors
     ///
@@ -408,7 +414,7 @@ impl KernelComposition {
     /// joins, fence, session, or service state are unusable, and
     /// [`TransportError::IdentityConflict`] when a submission replays under a
     /// key already bound to different bytes.
-    pub fn admit_watchdog_intent_batch(
+    pub(crate) fn admit_watchdog_intent_batch(
         &self,
         session: &Session,
         payload: &WatchdogSpoolIntentBatchPayload,
@@ -2130,7 +2136,9 @@ pub(crate) fn watchdog_intent_batch_from_payload(
         .ok_or(TransportError::SessionFenced)?;
     let batch: WatchdogSpoolIntentBatchPayload =
         serde_json::from_value(batch_value).map_err(|_| TransportError::SessionFenced)?;
-    batch.validate().map_err(|_| TransportError::SessionFenced)?;
+    batch
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
     if batch.route != WATCHDOG_SPOOL_BATCH_ROUTE {
         return Err(TransportError::SessionFenced);
     }
@@ -2225,8 +2233,7 @@ fn watchdog_intent_projection_record(
         task_ref: None,
         scope_ref: None,
         capability_ref: label(WATCHDOG_INTENT_CAPABILITY)?,
-        fence_digest: sha256_json(&submitted_fence)
-            .map_err(|_| TransportError::SessionFenced)?,
+        fence_digest: sha256_json(&submitted_fence).map_err(|_| TransportError::SessionFenced)?,
         authority_epoch: submitted_fence.authority_epoch.clone(),
         generation: intent.lineage_generation,
         deadline_unix_ms: payload.expires_at_ms,

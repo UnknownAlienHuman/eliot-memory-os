@@ -87,9 +87,13 @@ use watchdog_publication_readback::{
     verify_against_durable_current,
 };
 pub use watchdog_spool::export_driver::{
-    WatchdogEntryView, WatchdogExportSink, WatchdogIntentAcknowledgement, WatchdogIntentReconciliation,
-    WatchdogIntentSink, export_once, reconcile_watchdog_intents, watchdog_entry_views,
-    watchog_entry_views,
+    WatchdogEntryView, WatchdogExportSink, WatchdogIntentAcknowledgement,
+    WatchdogIntentReconciliation, WatchdogIntentSink, export_once, reconcile_watchdog_intents,
+    watchdog_entry_views, watchog_entry_views,
+};
+pub(crate) use watchdog_spool::intent::{
+    GovernorIntentOutcome, GovernorUnavailability, IntentLineage, WatchdogIntentSubmission,
+    governor_unavailable_observation_digest,
 };
 pub use watchdog_spool::intent::{
     IntentSubmissionDisposition, PendingWatchdogIntent, WatchdogIntentClass,
@@ -105,10 +109,6 @@ pub use watchdog_spool::{
 };
 pub(crate) use watchdog_spool::{
     SPOOL_EXPORT_CURSOR_SCHEMA_VERSION, WatchdogSpool, watchdog_spool_path,
-};
-pub(crate) use watchdog_spool::intent::{
-    GovernorIntentOutcome, GovernorUnavailability, IntentLineage, WatchdogIntentSubmission,
-    governor_unavailable_observation_digest,
 };
 
 #[cfg(test)]
@@ -627,10 +627,9 @@ impl IndependentKernelSensor {
         // The test contour supplies the same fixed lineage shape the production
         // binding carries, so the reconciliation projection is exercised through
         // the identical field path.
-        let epoch_lineage = eliot_contracts::EpochLineageId::new(
-            "550e8400-e29b-41d4-a716-446655440000",
-        )
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+        let epoch_lineage =
+            eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
         Ok(Self {
             watchdog: Mutex::new(Some(watchdog)),
             spool,
@@ -686,7 +685,7 @@ impl IndependentKernelSensor {
     /// Retention pressure, host-identity observations, and spool I/O failures
     /// are not Governor unavailability and are never counted, so a busy spool
     /// can never escalate the system. The only write is the Watchdog-owned
-    /// `watchdog.redb` append: no ORS, canonical, or HostStateJournal write is
+    /// `watchdog.redb` append: no ORS, canonical, or `HostStateJournal` write is
     /// reachable from this path.
     ///
     /// Non-fatal by construction: a spool or rule failure is itself only an
@@ -759,12 +758,10 @@ impl IndependentKernelSensor {
     ///
     /// Returns an error when the retained spool or its receipt ledger fails
     /// validation.
-    pub fn pending_watchdog_intents(
-        &self,
-    ) -> Result<Vec<PendingWatchdogIntent>, SpoolError> {
+    pub fn pending_watchdog_intents(&self) -> Result<Vec<PendingWatchdogIntent>, SpoolError> {
         self.spool.pending_watchdog_intents(
             crate::watchdog_spool::intent::INTENT_RECONCILIATION_MAX_SUBMISSIONS,
-            self.epoch_lineage.clone(),
+            &self.epoch_lineage,
         )
     }
 
@@ -773,13 +770,16 @@ impl IndependentKernelSensor {
     /// This is the exactly-once boundary of fenced-Kernel reconciliation: the
     /// first acknowledgement writes the receipt, and every later attempt for
     /// the same retained sequence observes the existing receipt instead of
-    /// submitting again.
+    /// submitting again. The receipt is Watchdog-owned durable state, so the
+    /// entry stays inside this crate: only
+    /// [`reconcile_watchdog_intents`](crate::reconcile_watchdog_intents), which
+    /// builds the receipt from a real fenced acknowledgement, may write it.
     ///
     /// # Errors
     ///
     /// Returns an error when the receipt is not canonical, an existing receipt
     /// for the same sequence disagrees, or the ledger cannot be written.
-    pub fn record_intent_submission(
+    pub(crate) fn record_intent_submission(
         &self,
         submission: &WatchdogIntentSubmission,
     ) -> Result<IntentSubmissionDisposition, SpoolError> {
@@ -829,23 +829,22 @@ impl IndependentKernelSensor {
                 return;
             }
         };
-        let outcome = match self.spool.observe_governor_unavailability(
-            proof,
-            digest,
-            lineage,
-            observed_at_ms,
-        ) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                tracing::debug!(
-                    event = "watchdog.intent_spool_failed",
-                    observation = "fenced",
-                    detail = error.to_string().as_str(),
-                    "watchdog could not spool an intent; the observation stays an observation"
-                );
-                return;
-            }
-        };
+        let outcome =
+            match self
+                .spool
+                .observe_governor_unavailability(proof, digest, lineage, observed_at_ms)
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::debug!(
+                        event = "watchdog.intent_spool_failed",
+                        observation = "fenced",
+                        detail = error.to_string().as_str(),
+                        "watchdog could not spool an intent; the observation stays an observation"
+                    );
+                    return;
+                }
+            };
         match outcome {
             GovernorIntentOutcome::Counting { consecutive } => {
                 tracing::debug!(
@@ -989,9 +988,7 @@ impl KernelWatchdogPort for IndependentKernelSensor {
         &'a self,
         lease: &'a VerifiedSupervisionLease,
     ) -> Pin<Box<dyn Future<Output = Result<(), KernelWatchdogError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.observe_supervision_outcome(self.record_heartbeat(lease))
-        })
+        Box::pin(async move { self.observe_supervision_outcome(self.record_heartbeat(lease)) })
     }
 
     fn report_gap<'a>(
@@ -1036,7 +1033,10 @@ pub struct GovernorIntentAdmissionSource {
 impl GovernorIntentAdmissionSource {
     /// Wraps one real admission source with the Watchdog-owned intent rule.
     #[must_use]
-    pub fn new(inner: Arc<dyn WatchdogAdmissionSource>, sensor: Arc<IndependentKernelSensor>) -> Self {
+    pub fn new(
+        inner: Arc<dyn WatchdogAdmissionSource>,
+        sensor: Arc<IndependentKernelSensor>,
+    ) -> Self {
         Self { inner, sensor }
     }
 }

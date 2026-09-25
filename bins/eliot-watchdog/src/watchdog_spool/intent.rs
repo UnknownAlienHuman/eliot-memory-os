@@ -125,7 +125,6 @@ impl IntentLineage {
             watchdog_epoch,
         })
     }
-
 }
 
 /// Proof that the Governor admission path is unavailable, gating intent append.
@@ -417,8 +416,7 @@ pub(crate) const PROBLEM_INTENT_OBSERVATION_THRESHOLD: u32 = 3;
 pub(crate) const INCIDENT_INTENT_OBSERVATION_THRESHOLD: u32 = 9;
 
 const _: () = assert!(PROBLEM_INTENT_OBSERVATION_THRESHOLD >= 2);
-const _: () =
-    assert!(INCIDENT_INTENT_OBSERVATION_THRESHOLD > PROBLEM_INTENT_OBSERVATION_THRESHOLD);
+const _: () = assert!(INCIDENT_INTENT_OBSERVATION_THRESHOLD > PROBLEM_INTENT_OBSERVATION_THRESHOLD);
 
 /// Storage revision of the durable deterministic-rule state.
 pub(crate) const INTENT_RULE_SCHEMA_VERSION: u16 = 1;
@@ -484,7 +482,9 @@ pub(crate) enum GovernorIntentDecision {
 /// threshold is not a mint decision at all, so a jumped or forged counter can
 /// never produce an intent. Only the exact crossing mints, and the caller
 /// closes the episode afterwards, so one episode mints at most one intent.
-fn classify_governor_intent_threshold(consecutive: u32) -> Result<GovernorIntentDecision, SpoolError> {
+fn classify_governor_intent_threshold(
+    consecutive: u32,
+) -> Result<GovernorIntentDecision, SpoolError> {
     match consecutive {
         value if value == PROBLEM_INTENT_OBSERVATION_THRESHOLD => {
             Ok(GovernorIntentDecision::ProblemIntent { consecutive: value })
@@ -550,10 +550,10 @@ const _: () = assert!(INTENT_RECONCILIATION_MAX_SUBMISSIONS == 16);
 // bounds, or the Watchdog could build a submission the fenced Kernel route
 // rejects. These assertions fail the build on any drift instead of at runtime.
 const _: () = assert!(
-    INTENT_RECONCILIATION_MAX_SUBMISSIONS
-        == eliot_protocol::MAX_WATCHDOG_SPOOL_INTENT_SUBMISSIONS
+    INTENT_RECONCILIATION_MAX_SUBMISSIONS == eliot_protocol::MAX_WATCHDOG_SPOOL_INTENT_SUBMISSIONS
 );
-const _: () = assert!(MAX_INTENT_EVIDENCE_REFS == eliot_protocol::MAX_WATCHDOG_INTENT_EVIDENCE_REFS);
+const _: () =
+    assert!(MAX_INTENT_EVIDENCE_REFS == eliot_protocol::MAX_WATCHDOG_INTENT_EVIDENCE_REFS);
 
 /// One observed Governor-unavailability proof resolved against the durable
 /// rule, together with the bounded evidence chain of its episode.
@@ -624,8 +624,7 @@ impl GovernorIntentRuleState {
                 && !self.episode_observation_digests.is_empty())
         {
             return Err(SpoolError::Corrupt(
-                "watchdog intent rule evidence chain is not consistent with its counter"
-                    .to_owned(),
+                "watchdog intent rule evidence chain is not consistent with its counter".to_owned(),
             ));
         }
         if !self
@@ -664,8 +663,7 @@ impl GovernorIntentRuleState {
         self.validate()?;
         if observed_at_ms == 0 || !is_sha256_hex_shape(&observation_digest) {
             return Err(SpoolError::Corrupt(
-                "watchdog intent rule observation is not a usable bounded digest"
-                    .to_owned(),
+                "watchdog intent rule observation is not a usable bounded digest".to_owned(),
             ));
         }
         if self.episode_observation_digests.len() >= MAX_INTENT_EVIDENCE_REFS {
@@ -678,7 +676,8 @@ impl GovernorIntentRuleState {
         self.episode_observation_digests.push(observation_digest);
         self.last_observed_at_ms = observed_at_ms;
         self.last_reason = reason;
-        let decision = classify_governor_intent_threshold(self.consecutive_unavailable_observations)?;
+        let decision =
+            classify_governor_intent_threshold(self.consecutive_unavailable_observations)?;
         let episode_evidence_refs = self.episode_evidence_refs();
         if !matches!(decision, GovernorIntentDecision::Counting { .. }) {
             match decision {
@@ -686,8 +685,7 @@ impl GovernorIntentRuleState {
                     self.problem_intents_spooled = self.problem_intents_spooled.saturating_add(1);
                 }
                 GovernorIntentDecision::IncidentIntent { .. } => {
-                    self.incident_intents_spooled =
-                        self.incident_intents_spooled.saturating_add(1);
+                    self.incident_intents_spooled = self.incident_intents_spooled.saturating_add(1);
                 }
                 GovernorIntentDecision::Counting { .. } => {}
             }
@@ -1057,7 +1055,9 @@ mod tests {
             installation_id: "installation-test".to_owned(),
             sink_id: "sink-test".to_owned(),
         };
-        let high_water = spool.high_water_sequence().expect("intent-headed high-water");
+        let high_water = spool
+            .high_water_sequence()
+            .expect("intent-headed high-water");
         assert_eq!(high_water, 2);
         let (batch, raws) = spool
             .export_batch(
