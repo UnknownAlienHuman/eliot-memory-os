@@ -1,20 +1,30 @@
 //! Coherent bounded snapshot capture over the `SurrealDB` bridge (issue #951).
 //!
-//! Owner-issued consistency points only: [`begin_snapshot`] binds one frozen
-//! capture point (source identity, schema generation, fence, ordered
-//! denominator, bounds, expiry) after the readiness/generation/fence gate,
-//! [`read_snapshot_page`] serves deterministic logical-order pages under that
-//! same point, and [`end_snapshot`] closes with an owner-issued receipt. Any
-//! drift (newer generation), expiry, duration overrun, fence change, or
-//! cursor/continuation mismatch fails closed and releases the capture-owned
-//! registry entry; the registry map itself is never cleared wholesale.
+//! The denominator is read from the provider, never taken from the caller.
+//! [`begin_snapshot`] runs the pinned member batch in one
+//! `BEGIN TRANSACTION;` … `COMMIT TRANSACTION;` sequence, binds the point that
+//! batch observed (schema generation, canonical fence, both allocated
+//! sequences) after the readiness/generation/fence/source-identity gate,
+//! reconciles the caller's declared denominator against the observed set as a
+//! claim to be verified, and freezes the served set, totals, bounds and expiry.
+//! [`read_snapshot_page`] and [`end_snapshot`] re-verify the whole point on
+//! every call, before and after the provider await.
+//!
+//! One release discipline: [`CaptureRelease`] releases exactly the capture-owned
+//! entry on every exit path of a page or end call, including a future dropped
+//! while the provider await is in flight. The registry map is never cleared
+//! wholesale. A capture that stopped being servable — window closed, point
+//! moved, page bound reached, set exhausted — records its exact partial
+//! evidence with [`mark_interruption`] and keeps its entry, so
+//! [`end_snapshot`] issues a real `Partial`/`Expired` receipt carrying the
+//! exact served counts instead of deleting the only record of what was served.
 //!
 //! Reads only: this module never acquires `adapter.write_lock`, issues no
 //! DDL/migration, performs no restore, and defines no archive format. Every
-//! provider statement is a fixed adapter-owned `const`; bindings carry only
-//! allowlisted scalars (here: none — the point probe takes no parameters),
-//! and errors/receipts carry digests and static text, never provider payload
-//! or credentials.
+//! provider statement is a fixed adapter-owned `&'static str` composed from the
+//! single-owner consts in [`crate::schema`]; no snapshot statement carries a
+//! binding, so no caller value can reach the provider, and errors/receipts carry
+//! digests and static text, never provider payload or credentials.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
@@ -459,6 +469,13 @@ struct CapturePoint {
 struct SnapshotState {
     begin: SnapshotBeginRequest,
     point: CapturePoint,
+    /// Proof that the canonical enumeration ran. `None` means the denominator
+    /// is not proven, so the only legal completeness is partial.
+    enumeration: Option<EnumerationEvidence>,
+    /// Exact partial evidence recorded when the capture stopped being
+    /// servable. Never deleted: it is the receipt's `Partial`/`Expired`
+    /// provenance.
+    interruption: Option<CaptureInterruption>,
     ordered_members: Vec<SnapshotMember>,
     total_bytes: u64,
     total_pages: u64,
@@ -496,19 +513,6 @@ fn is_retired(
         return true;
     }
     now_ms.saturating_sub(opened_at_ms) > max_duration_ms
-}
-
-/// Drops every entry whose owner-issued window has passed. Scoped cleanup
-/// only; live entries are never touched.
-fn purge_expired(states: &mut HashMap<String, SnapshotState>, now_ms: u64) {
-    states.retain(|_, state| {
-        !is_retired(
-            state.begin.expires_at_unix_ms,
-            state.opened_at_ms,
-            state.begin.bounds.max_duration_ms,
-            now_ms,
-        )
-    });
 }
 
 /// Gates on readiness/generation (no fallback client, no ambient DB) and then
@@ -997,6 +1001,183 @@ fn reconcile_denominator(
     Ok(())
 }
 
+/// Exact partial evidence for a capture that can no longer serve.
+///
+/// A13.7 and ARCH-RES-03: recovery cannot resurrect invalid state, and a
+/// capture that stopped half way is exactly the state an operator must be able
+/// to see. The evidence is recorded on the capture instead of being deleted, so
+/// `end_snapshot` can issue an exact `Partial`/`Expired` receipt carrying the
+/// real served counts.
+struct CaptureInterruption {
+    /// Static reason the capture stopped being servable.
+    reason: &'static str,
+    /// Pages served before the interruption.
+    pages_served: u64,
+    /// Members served before the interruption.
+    members_served: u64,
+    /// Bytes served before the interruption.
+    bytes_served: u64,
+}
+
+/// The owner-issued window or duration bound closed under the capture.
+const INTERRUPTION_WINDOW_CLOSED: &str = "owner capture window closed";
+/// The bound consistency point moved because the canonical store advanced.
+const INTERRUPTION_POINT_MOVED: &str = "bound consistency point moved";
+/// The per-request page bound was reached before the observed set was served.
+const INTERRUPTION_PAGE_BOUND: &str = "served page bound exceeded";
+/// The observed member set has no further page to serve.
+const INTERRUPTION_CAPTURE_EXHAUSTED: &str = "no further page is available";
+
+/// Records the exact partial evidence on the capture-owned entry.
+///
+/// The entry is deliberately kept: the entry is the only place the served
+/// counters still exist, and deleting it is what previously destroyed the exact
+/// partial evidence on both the page and the end path.
+fn mark_interruption(
+    states: &mut HashMap<String, SnapshotState>,
+    digest: &str,
+    reason: &'static str,
+) {
+    if let Some(state) = states.get_mut(digest) {
+        state.interruption = Some(CaptureInterruption {
+            reason,
+            pages_served: state.pages_served,
+            members_served: state.members_served,
+            bytes_served: state.bytes_served,
+        });
+    }
+}
+
+/// Releases exactly the capture-owned entry on every exit path of a page or end
+/// call, including a future dropped while the provider await is in flight.
+///
+/// This replaces the three inconsistent release sites. The crate has no
+/// `CancellationToken` and no `tokio::select!`, so a dropped future is the only
+/// observable cancellation; the guard's `Drop` runs on that path too. It takes
+/// the registry lock only for the removal, never across an await (I5.7), and it
+/// closes only capture-owned state: `client::session_pool` returns a pooled slot
+/// on `Drop` without poisoning it, so an in-flight response is possible and the
+/// capture entry is released regardless of any slot health assumption.
+struct CaptureRelease {
+    digest: String,
+    armed: bool,
+}
+
+impl CaptureRelease {
+    /// Arms release for the capture named by `digest`.
+    fn arm(digest: String) -> Self {
+        Self {
+            digest,
+            armed: true,
+        }
+    }
+
+    /// Keeps the capture-owned entry because the capture is still live and the
+    /// exact partial evidence must survive for a later `end_snapshot`.
+    fn retain(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CaptureRelease {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut states) = registry().lock() {
+            release_owned(&mut states, &self.digest);
+        }
+    }
+}
+
+/// The typed refusal for a handle that names no open capture.
+fn unknown_snapshot_handle() -> StoreError {
+    StoreError::InvalidField {
+        field: "snapshot.snapshot_digest",
+        reason: "unknown snapshot handle",
+    }
+}
+
+/// Reports whether a capture can no longer serve at `now_ms`.
+fn capture_is_retired(state: &SnapshotState, now_ms: u64) -> bool {
+    is_retired(
+        state.begin.expires_at_unix_ms,
+        state.opened_at_ms,
+        state.begin.bounds.max_duration_ms,
+        now_ms,
+    )
+}
+
+/// Drops every entry whose owner-issued window has passed, except `keep`.
+///
+/// Scoped cleanup only; live entries and the requested capture are never
+/// touched, so a closed window can still be answered with an exact receipt.
+fn purge_expired_except(states: &mut HashMap<String, SnapshotState>, now_ms: u64, keep: &str) {
+    states.retain(|digest, state| digest == keep || !capture_is_retired(state, now_ms));
+}
+
+/// Reports whether one capture proved the complete authoritative denominator
+/// and served all of it.
+///
+/// A complete capture requires the caller's declared completeness, a canonical
+/// enumeration that actually ran, an authoritative known-zero when nothing was
+/// observed, and exact served accounting. If the enumeration never ran, the
+/// only legal completeness is partial — `SnapshotValidationReceipt::validate`
+/// requires a complete authoritative denominator for a known-zero count.
+fn is_complete_capture(state: &SnapshotState) -> bool {
+    let enumeration_ran = state.enumeration.is_some();
+    let known_zero = state
+        .enumeration
+        .is_some_and(EnumerationEvidence::is_authoritative_zero);
+    state.begin.denominator.is_complete
+        && enumeration_ran
+        && state.ordered_members.is_empty() == known_zero
+        && state.members_served == state.ordered_members.len() as u64
+        && state.bytes_served == state.total_bytes
+        && state.pages_served == state.total_pages
+}
+
+/// The exact completeness and served accounting of one closing capture.
+///
+/// When an interruption was recorded, the frozen counts it carries are the
+/// receipt's counts. No page can be served once a capture stopped being
+/// servable, so the interruption record is the authoritative partial evidence
+/// rather than a second copy of the live counters, and any disagreement between
+/// the two is a genuine receipt defect.
+fn closing_accounting(
+    state: &SnapshotState,
+    expired: bool,
+    moved: bool,
+) -> Result<(SnapshotCompleteness, u64, u64), StoreError> {
+    let (members_served, bytes_served) = match &state.interruption {
+        None => (state.members_served, state.bytes_served),
+        Some(interruption) => {
+            if interruption.pages_served > state.total_pages
+                || interruption.members_served != state.members_served
+                || interruption.bytes_served != state.bytes_served
+            {
+                return Err(StoreError::InvalidReceipt);
+            }
+            (interruption.members_served, interruption.bytes_served)
+        }
+    };
+    let window_closed = expired
+        || state
+            .interruption
+            .as_ref()
+            .is_some_and(|interruption| interruption.reason == INTERRUPTION_WINDOW_CLOSED);
+    let completeness = if window_closed {
+        SnapshotCompleteness::Expired
+    } else if moved || state.interruption.is_some() {
+        SnapshotCompleteness::Partial
+    } else if is_complete_capture(state) {
+        SnapshotCompleteness::Complete
+    } else {
+        SnapshotCompleteness::Partial
+    };
+    Ok((completeness, members_served, bytes_served))
+}
+
 /// Removes exactly the capture-owned entry. The map itself is never cleared.
 fn release_owned(states: &mut HashMap<String, SnapshotState>, digest: &str) {
     states.remove(digest);
@@ -1024,12 +1205,13 @@ pub(crate) async fn begin_snapshot(
     }
     bind_source_identity(adapter, &point, &request)?;
     let ordered_members = enumeration.members;
+    let evidence = enumeration.evidence;
     reconcile_denominator(&ordered_members, &request.denominator)?;
     // An empty observed set is only a bindable denominator when the
     // enumeration actually read every admitted canonical class and found
     // nothing. A declared-empty denominator with no provider evidence is not a
     // zero-member capture; it is refused.
-    if ordered_members.is_empty() && !enumeration.evidence.is_authoritative_zero() {
+    if ordered_members.is_empty() && !evidence.is_authoritative_zero() {
         return Err(StoreError::Empty {
             field: "snapshot.members",
         });
@@ -1076,6 +1258,8 @@ pub(crate) async fn begin_snapshot(
         SnapshotState {
             begin: request,
             point,
+            enumeration: Some(evidence),
+            interruption: None,
             ordered_members,
             total_bytes,
             total_pages,
@@ -1131,7 +1315,10 @@ fn serve_next_page(
     let chunk = usize::try_from(SNAPSHOT_PAGE_CHUNK).map_err(|_| StoreError::PayloadTooLarge)?;
     let end = start.saturating_add(chunk).min(state.ordered_members.len());
     if start >= state.ordered_members.len() || start >= end {
-        release_owned(states, digest);
+        // The observed set is exhausted. The exact partial evidence is recorded
+        // instead of being deleted, so a closing receipt can still state what
+        // was served.
+        mark_interruption(states, digest, INTERRUPTION_CAPTURE_EXHAUSTED);
         return Err(StoreError::Unavailable);
     }
     let state = states.get_mut(digest).ok_or(StoreError::Unavailable)?;
@@ -1145,7 +1332,7 @@ fn serve_next_page(
         || cumulative_bytes > state.begin.bounds.max_bytes
         || cumulative_bytes > MAX_SNAPSHOT_BYTES
     {
-        release_owned(states, digest);
+        mark_interruption(states, digest, INTERRUPTION_PAGE_BOUND);
         return Err(StoreError::PayloadTooLarge);
     }
     let is_last = end >= state.ordered_members.len();
@@ -1171,15 +1358,94 @@ fn serve_next_page(
     };
     page.validate()?;
     page.validate_for_begin(&state.begin)?;
-    let page_digest = sha256_hex(
-        &canonical_json_bytes(&page)
-            .map_err(|error| StoreError::Serialization(error.to_string()))?,
-    );
+    let page_digest =
+        sha256_hex(&canonical_json_bytes(&page).map_err(snapshot_serialization_error)?);
     state.pages_served = state.pages_served.saturating_add(1);
     state.members_served = cumulative_members;
     state.bytes_served = cumulative_bytes;
     state.last_digest = page_digest;
     Ok(page)
+}
+
+/// Validates one page request against the live capture without any provider
+/// I/O. Runs under the registry lock with no awaits inside.
+///
+/// When the capture can no longer serve, the exact partial evidence is recorded
+/// and the entry deliberately retained, so a later `end_snapshot` can still
+/// issue an honest `Expired` or `Partial` receipt instead of deleting the only
+/// record of what was served.
+fn prepare_page(
+    states: &mut HashMap<String, SnapshotState>,
+    digest: &str,
+    ctx: &RequestMeta,
+    cursor: &SnapshotCursor,
+    now_ms: u64,
+) -> Result<(), StoreError> {
+    purge_expired_except(states, now_ms, digest);
+    let Some(state) = states.get(digest) else {
+        return Err(unknown_snapshot_handle());
+    };
+    let retired = capture_is_retired(state, now_ms);
+    let next_page = state.pages_served.saturating_add(1);
+    let over_page_bound =
+        next_page > state.begin.bounds.max_pages || next_page > MAX_SNAPSHOT_PAGES;
+    let known_empty = state.ordered_members.is_empty();
+    if retired {
+        mark_interruption(states, digest, INTERRUPTION_WINDOW_CLOSED);
+        return Err(StoreError::Unavailable);
+    }
+    if ctx.state_fence != state.begin.scope.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    check_cursor(state, cursor)?;
+    if known_empty {
+        // Authoritatively known-empty capture: explicit typed refusal, never a
+        // silent or fabricated page. Close via `end_snapshot` for the complete
+        // zero-member accounting path.
+        return Err(StoreError::Empty {
+            field: "snapshot.members",
+        });
+    }
+    if over_page_bound {
+        mark_interruption(states, digest, INTERRUPTION_PAGE_BOUND);
+        return Err(StoreError::PayloadTooLarge);
+    }
+    Ok(())
+}
+
+/// Re-verifies the bound point after the provider await and serves the page, or
+/// records the exact partial evidence that ends the capture.
+fn finish_page(
+    digest: &str,
+    observed: &CapturePoint,
+    handle: SnapshotHandle,
+    cursor: SnapshotCursor,
+    guard: &mut CaptureRelease,
+) -> Result<SnapshotPage, StoreError> {
+    let mut states = lock_registry()?;
+    let (moved, retired) = {
+        let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
+        (
+            observed != &state.point,
+            capture_is_retired(state, crate::write_execution::current_time_ms()),
+        )
+    };
+    if moved {
+        // The source moved under the bound point: never mix a newer point, and
+        // keep the exact partial evidence for the closing receipt.
+        mark_interruption(&mut states, digest, INTERRUPTION_POINT_MOVED);
+        return Err(StoreError::Unavailable);
+    }
+    if retired {
+        mark_interruption(&mut states, digest, INTERRUPTION_WINDOW_CLOSED);
+        return Err(StoreError::Unavailable);
+    }
+    // The point still holds and the capture is still live: keep the entry so
+    // the capture can continue and close with a receipt.
+    guard.retain();
+    let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
+    check_cursor(state, &cursor)?;
+    serve_next_page(&mut states, digest, handle, cursor)
 }
 
 /// Reads one bounded page of an open capture under its bound point.
@@ -1199,80 +1465,64 @@ pub(crate) async fn read_snapshot_page(
         });
     }
     let digest = handle.snapshot_digest.clone();
-    let now_ms = crate::write_execution::current_time_ms();
     {
         let mut states = lock_registry()?;
-        let Some(state) = states.get(&digest) else {
-            return Err(StoreError::InvalidField {
-                field: "snapshot.snapshot_digest",
-                reason: "unknown snapshot handle",
-            });
-        };
-        if is_retired(
-            state.begin.expires_at_unix_ms,
-            state.opened_at_ms,
-            state.begin.bounds.max_duration_ms,
-            now_ms,
-        ) {
-            release_owned(&mut states, &digest);
-            return Err(StoreError::Unavailable);
-        }
-        if ctx.state_fence != state.begin.scope.state_fence {
-            return Err(StoreError::FenceMismatch);
-        }
-        check_cursor(state, &cursor)?;
-        if state.ordered_members.is_empty() {
-            // Known-empty capture: explicit typed refusal, never a silent or
-            // fabricated page. Close via `end_snapshot` for the complete
-            // zero-member accounting path.
-            return Err(StoreError::Empty {
-                field: "snapshot.members",
-            });
-        }
-        if state.pages_served.saturating_add(1) > state.begin.bounds.max_pages
-            || state.pages_served.saturating_add(1) > MAX_SNAPSHOT_PAGES
-        {
-            return Err(StoreError::PayloadTooLarge);
-        }
-        purge_expired(&mut states, now_ms);
+        prepare_page(
+            &mut states,
+            &digest,
+            ctx,
+            &cursor,
+            crate::write_execution::current_time_ms(),
+        )?;
     }
+    // No registry lock is held across this provider await (I5.7). The guard
+    // releases exactly the capture-owned entry on every exit path of this call,
+    // including a future dropped while the await is in flight.
+    let mut guard = CaptureRelease::arm(digest.clone());
+    let observed = observe_capture_point(adapter, SNAPSHOT_PAGE_OPERATION).await?;
+    finish_page(&digest, &observed, handle, cursor, &mut guard)
+}
 
-    // No registry lock is held across this provider await. A failed probe
-    // releases only the capture-owned entry, never the whole map.
-    let observed = observe_capture_point(adapter, SNAPSHOT_PAGE_OPERATION)
-        .await
-        .inspect_err(|_| {
-            if let Ok(mut states) = registry().lock() {
-                release_owned(&mut states, &digest);
-            }
-        })?;
-
+/// Builds and validates the closing receipt, then releases the capture entry.
+///
+/// `observed` is `None` when the owner window had already closed: the point is
+/// then deliberately not re-read, because a receipt must not claim the source
+/// stayed still across a window this store no longer vouches for.
+fn close_capture(
+    digest: &str,
+    observed: Option<&CapturePoint>,
+    handle: SnapshotHandle,
+) -> Result<SnapshotEndReceipt, StoreError> {
     let mut states = lock_registry()?;
-    let Some(state) = states.get(&digest) else {
-        return Err(StoreError::InvalidField {
-            field: "snapshot.snapshot_digest",
-            reason: "unknown snapshot handle",
-        });
+    let (expired, moved) = {
+        let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
+        (
+            observed.is_none()
+                || capture_is_retired(state, crate::write_execution::current_time_ms()),
+            observed.is_some_and(|point| point != &state.point),
+        )
     };
-    if observed != state.point {
-        // The source moved under the bound point: never mix a newer point.
-        release_owned(&mut states, &digest);
-        return Err(StoreError::Unavailable);
+    if expired {
+        mark_interruption(&mut states, digest, INTERRUPTION_WINDOW_CLOSED);
+    } else if moved {
+        mark_interruption(&mut states, digest, INTERRUPTION_POINT_MOVED);
     }
-    // The provider round trip is inside the capture's own duration bound, so
-    // the window is re-checked after the await. Without this a slow round trip
-    // served a page from a capture whose owner window had already closed.
-    if is_retired(
-        state.begin.expires_at_unix_ms,
-        state.opened_at_ms,
-        state.begin.bounds.max_duration_ms,
-        crate::write_execution::current_time_ms(),
-    ) {
-        release_owned(&mut states, &digest);
-        return Err(StoreError::Unavailable);
-    }
-    check_cursor(state, &cursor)?;
-    serve_next_page(&mut states, &digest, handle, cursor)
+    let receipt = {
+        let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
+        let (completeness, members_served, bytes_served) =
+            closing_accounting(state, expired, moved)?;
+        SnapshotEndReceipt {
+            handle,
+            operation: state.begin.operation.clone(),
+            member_count: members_served,
+            byte_count: bytes_served,
+            completeness,
+            validation_revision: SNAPSHOT_VALIDATION_REVISION,
+        }
+    };
+    receipt.validate()?;
+    release_owned(&mut states, digest);
+    Ok(receipt)
 }
 
 /// Closes a capture with an owner-issued end receipt and removes its entry.
@@ -1284,75 +1534,27 @@ pub(crate) async fn end_snapshot(
     ctx.validate().map_err(StoreError::Foundation)?;
     handle.validate()?;
     let digest = handle.snapshot_digest.clone();
-    let now_ms = crate::write_execution::current_time_ms();
-    {
+    let retired = {
         let mut states = lock_registry()?;
-        let Some(state) = states.get(&digest) else {
-            return Err(StoreError::InvalidField {
-                field: "snapshot.snapshot_digest",
-                reason: "unknown snapshot handle",
-            });
-        };
-        if is_retired(
-            state.begin.expires_at_unix_ms,
-            state.opened_at_ms,
-            state.begin.bounds.max_duration_ms,
-            now_ms,
-        ) {
-            release_owned(&mut states, &digest);
-            return Err(StoreError::Unavailable);
-        }
+        purge_expired_except(
+            &mut states,
+            crate::write_execution::current_time_ms(),
+            &digest,
+        );
+        let state = states.get(&digest).ok_or_else(unknown_snapshot_handle)?;
         if ctx.state_fence != state.begin.scope.state_fence {
             return Err(StoreError::FenceMismatch);
         }
-        purge_expired(&mut states, now_ms);
-    }
-
-    // No registry lock is held across this provider await. A failed probe
-    // releases only the capture-owned entry, never the whole map.
-    let observed = observe_capture_point(adapter, SNAPSHOT_END_OPERATION)
-        .await
-        .inspect_err(|_| {
-            if let Ok(mut states) = registry().lock() {
-                release_owned(&mut states, &digest);
-            }
-        })?;
-
-    let mut states = lock_registry()?;
-    let Some(state) = states.get(&digest) else {
-        return Err(StoreError::InvalidField {
-            field: "snapshot.snapshot_digest",
-            reason: "unknown snapshot handle",
-        });
+        capture_is_retired(state, crate::write_execution::current_time_ms())
     };
-    if observed != state.point {
-        release_owned(&mut states, &digest);
-        return Err(StoreError::Unavailable);
-    }
-    // The provider round trip is inside the capture's own duration bound, so
-    // the window is re-checked after the await before the receipt is issued.
-    let retired = is_retired(
-        state.begin.expires_at_unix_ms,
-        state.opened_at_ms,
-        state.begin.bounds.max_duration_ms,
-        crate::write_execution::current_time_ms(),
-    );
-    let complete = state.members_served == state.ordered_members.len() as u64
-        && state.bytes_served == state.total_bytes
-        && state.pages_served == state.total_pages;
-    let receipt = SnapshotEndReceipt {
-        handle,
-        operation: state.begin.operation.clone(),
-        member_count: state.members_served,
-        byte_count: state.bytes_served,
-        completeness: if complete && !retired {
-            SnapshotCompleteness::Complete
-        } else {
-            SnapshotCompleteness::Partial
-        },
-        validation_revision: SNAPSHOT_VALIDATION_REVISION,
+    let observed = if retired {
+        // A closed window still owes the caller an exact partial receipt.
+        None
+    } else {
+        let mut guard = CaptureRelease::arm(digest.clone());
+        let observed = observe_capture_point(adapter, SNAPSHOT_END_OPERATION).await?;
+        guard.retain();
+        Some(observed)
     };
-    receipt.validate()?;
-    release_owned(&mut states, &digest);
-    Ok(receipt)
+    close_capture(&digest, observed.as_ref(), handle)
 }
