@@ -121,8 +121,8 @@ pub use capability_outcome::{
     FallbackOutcomeRequest, OutcomeDisposition, OutcomeError, fallback_outcome,
 };
 pub use controlboard_adapters::{
-    CONTROLBOARD_READ_CAPABILITY, ControlBoardReadOutcome, controlboard_result_body,
-    is_controlboard_read_tool, serve_controlboard_view,
+    CONTROLBOARD_READ_CAPABILITY, ControlBoardReadOutcome, ControlBoardRefusal,
+    controlboard_result_body, is_controlboard_read_tool, serve_controlboard_view,
 };
 pub use daemon_config::DaemonConfig;
 pub(crate) use daemon_kernel_client::kernel_port_error;
