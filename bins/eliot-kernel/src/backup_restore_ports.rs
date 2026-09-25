@@ -838,17 +838,12 @@ impl OrsRestoreJournal {
         std::fs::write(&temporary, &bytes)
             .map_err(|error| BackupError::Target(error.to_string()))?;
         // The body is made durable BEFORE the ORS row that names it is
-        // committed, and a failed sync is a refusal rather than a silent
-        // success: a recovered row must never point at a target that power
-        // loss could still remove.
-        std::fs::File::open(&temporary)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| BackupError::Target(error.to_string()))?;
+        // committed. A failed body flush is a refusal, not a silent success: a
+        // recovered row must never point at a target power loss could remove.
+        sync_file(&temporary)?;
         std::fs::rename(&temporary, &path)
             .map_err(|error| BackupError::Target(error.to_string()))?;
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| BackupError::Target(error.to_string()))?;
+        sync_parent_directory(parent)?;
         Ok((locator, digest, length))
     }
 
@@ -1166,6 +1161,63 @@ fn matches_stream(
         && existing.destination_ref == binding.destination_ref
         && existing.writer_id == binding.writer_id
         && existing.writer_fence_digest == writer_fence_digest
+}
+
+/// Flushes a file's contents to stable storage.
+///
+/// The handle is opened with write access on purpose. On Windows `sync_all`
+/// issues `FlushFileBuffers`, which a read-only handle cannot satisfy, so a
+/// read-only open would refuse on the pinned `x86_64-pc-windows-msvc` target and
+/// no journal row would ever be committed. A failed body flush is a refusal:
+/// the durable claim for a sealed record rests on this call.
+fn sync_file(path: &Path) -> Result<(), BackupError> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| BackupError::Target(error.to_string()))
+}
+
+/// Flushes the directory entry that names a newly created sealed body.
+///
+/// Windows cannot flush a directory handle through an ordinary open, so the
+/// handle is opened with `FILE_FLAG_BACKUP_SEMANTICS`. Even then Windows may
+/// legitimately refuse with `InvalidInput`, `PermissionDenied` or `Unsupported`,
+/// meaning the entry cannot be flushed rather than that a write was lost; the
+/// repository's own snapshot capture
+/// (`eliot-bootstrap/src/capture.rs::sync_parent_directory`) already absorbs
+/// exactly these three kinds, and this follows that precedent. The body itself
+/// is flushed unconditionally by [`sync_file`] before the ORS row is committed,
+/// so the durability claim does not depend on this call.
+#[cfg(unix)]
+fn sync_parent_directory(directory: &Path) -> Result<(), BackupError> {
+    std::fs::File::open(directory)
+        .and_then(|handle| handle.sync_all())
+        .map_err(|error| BackupError::Target(error.to_string()))
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(directory: &Path) -> Result<(), BackupError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(directory)
+        .and_then(|handle| handle.sync_all())
+        .or_else(|error| match error.kind() {
+            std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::Unsupported => Ok(()),
+            _ => Err(error),
+        })
+        .map_err(|error| BackupError::Target(error.to_string()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_parent_directory(_directory: &Path) -> Result<(), BackupError> {
+    Ok(())
 }
 
 /// Checks that a persisted entry and the record body it names agree.
