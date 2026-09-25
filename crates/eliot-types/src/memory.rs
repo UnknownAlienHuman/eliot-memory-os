@@ -1244,12 +1244,12 @@ impl RecallDispositionObservations {
 /// Derives the canonical [`RecallDisposition`] server-side.
 ///
 /// Deterministic priority: authoritative empty corpus, then projection
-/// freshness, then admission strength, then the observed cause of a
-/// zero-delivery result (conflict, then total scope suppression, then ranked
-/// uselessness), and finally no match. The zero-delivery causal claims require
-/// observed conflict state and complete coverage; when either is unavailable
-/// derivation returns `INCOMPLETE_COVERAGE` instead of coercing unknown state to
-/// a boolean, so an undescribed page still refuses. `NO_USEFUL_MEMORY` is
+/// freshness, then an observed conflict, then admission strength, then the
+/// observed cause of a zero-delivery result (total scope suppression, then
+/// ranked uselessness), and finally no match. The required corpus and conflict
+/// observations are never coerced from unknown to false. Zero-delivery causal
+/// claims also require complete coverage; when a required observation is
+/// unavailable derivation returns `INCOMPLETE_COVERAGE`. `NO_USEFUL_MEMORY` is
 /// returned only here, never by an agent.
 ///
 /// Three orderings are load-bearing:
@@ -1258,12 +1258,9 @@ impl RecallDispositionObservations {
 ///    of source/projection revisions and the State Fence is compared before
 ///    exact cue firing, and stale projection data is never silently injected
 ///    into a Material decision.
-/// 2. Conflict is decided *after* the admission arms. A verdict must never
-///    report `CONFLICTED` while handing back the very handles it claims are
-///    blocked. A delivered handle instead carries its observed contradiction
-///    penalty in its own feature score, inside the rank-trace handle, so the
-///    conflict evidence stays bound to the delivery rather than contradicting
-///    it.
+/// 2. An observed conflict is resolved before any admission disposition. An
+///    unavailable conflict observation remains unknown and cannot be treated
+///    as false; only a known conflict-free response can proceed to admission.
 /// 3. Corpus cardinality gates only the final bucket, where it is the sole
 ///    difference between `EMPTY_CORPUS` and `NO_MATCH`. It cannot decide any
 ///    earlier arm: a delivered handle refutes emptiness, and a nonzero
@@ -1287,6 +1284,18 @@ pub const fn derive_recall_disposition(
         };
         return (RecallDisposition::StaleProjection, reason);
     }
+    if let Some(true) = inputs.conflicted {
+        return (
+            RecallDisposition::Conflicted,
+            "conflicting evidence blocks admission",
+        );
+    }
+    if inputs.visible_count > 0 && inputs.top_score.is_none() {
+        return (
+            RecallDisposition::IncompleteCoverage,
+            "admitted count has no authoritative score observation",
+        );
+    }
     if inputs.visible_count > 0 {
         // Contradiction risk is an admission input (I12.26). Without the
         // observation the server cannot say whether the handle it just admitted
@@ -1309,17 +1318,11 @@ pub const fn derive_recall_disposition(
             ),
         };
     }
-    if let Some(true) = inputs.conflicted {
-        return (
-            RecallDisposition::Conflicted,
-            "conflicting evidence blocks admission",
-        );
-    }
     // Nothing was delivered. Naming a cause — scope, ranking, or no match at
     // all — is a claim about the whole candidate set, so it requires the owner
     // to have inspected conflict state and to have covered the corpus without
-    // truncation. Both refusals stay exactly where they were: after the
-    // positive evidence above, and before any zero-delivery cause below.
+    // truncation. The earlier conflict guard handles an observed conflict;
+    // unknown conflict state still refuses before any zero-delivery cause.
     if inputs.conflicted.is_none() {
         return (
             RecallDisposition::IncompleteCoverage,
@@ -1520,6 +1523,12 @@ impl ServerRecallVerdict {
                 .rank_trace
                 .feature_scores
                 .iter()
+                .filter(|score| {
+                    response
+                        .handles
+                        .iter()
+                        .any(|handle| handle.handle == score.handle)
+                })
                 .map(|score| score.total)
                 .max(),
         }
