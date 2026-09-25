@@ -1563,6 +1563,47 @@ impl AcpResultEnvelope {
         }
         Ok(result)
     }
+
+    /// Production terminal assembly for ACP provider output (issue #370
+    /// W29/A21): the in-crate production driver that turns one recorded
+    /// [`AcpResultEnvelope`] into a provider-neutral candidate [`AgentResult`].
+    ///
+    /// Two envelope-self-sufficient arms, no caller-supplied outcome needed:
+    /// - a non-terminal envelope never yields a result disposition: it maps to
+    ///   `Unknown` with an explicit unreconciled reason, preserving the
+    ///   recovery handle so the existing owner reconciles it;
+    /// - a terminal envelope maps to `Completed`, which
+    ///   [`Self::into_agent_result`] projects to
+    ///   [`ResultDisposition::DegradedNoProof`] — candidate/degraded, never
+    ///   Finish authority.
+    ///
+    /// Fail-closed before delegation: the envelope attempt identity must equal
+    /// the bound attempt identity by typed `==` (`into_agent_result` checks
+    /// route and session agreement but never the envelope attempt itself, so
+    /// a foreign-attempt envelope cannot ride a valid binding here).
+    /// Cancellation and provider-reported failure carry caller reasons the
+    /// envelope does not record; assembling those stays on
+    /// [`Self::into_agent_result`] with an explicit [`AcpResultOutcome`].
+    pub fn assemble_candidate_result(
+        self,
+        route: RouteFingerprint,
+        binding: &ProviderExecutionBinding,
+        admission: &AdmittedRouteReceipt,
+    ) -> Result<AgentResult, AcpAdapterError> {
+        if self.attempt_id != binding.attempt_id {
+            return Err(AcpAdapterError::ContractValidation(
+                eliot_agent_api::ContractError::BindingMismatch,
+            ));
+        }
+        let outcome = if self.terminal {
+            AcpResultOutcome::Completed
+        } else {
+            AcpResultOutcome::Unknown {
+                reason: "acp result envelope is not terminal; outcome unreconciled".to_owned(),
+            }
+        };
+        self.into_agent_result(route, binding, admission, outcome)
+    }
 }
 
 /// Short result alias.

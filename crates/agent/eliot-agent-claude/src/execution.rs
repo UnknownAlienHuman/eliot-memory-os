@@ -601,7 +601,10 @@ pub struct ClaudeStreamEvent {
 
 /// Terminal candidate bound to one running sidecar. Candidate-only: see
 /// [`try_promote_to_finish`](crate::try_promote_to_finish), which always
-/// fails with `NotAuthority`.
+/// fails with `NotAuthority`. Issue #370 disposition: PRIVATE_PROJECTION —
+/// this type never leaves the adapter except through
+/// [`translate_candidate_result`], which projects it into the A-01 candidate
+/// contract without any completion authority.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClaudeTerminalCandidate {
     candidate: ClaudeCandidateResult,

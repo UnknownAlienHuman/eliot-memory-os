@@ -391,6 +391,14 @@ pub enum AgentResultStatus {
     UnknownOutcome,
 }
 
+/// Host invocation/result transport envelope (issue #370 disposition:
+/// `RETAIN_DISTINCT`). This is a legacy host-invocation result projection only:
+/// `candidate_only` must hold for candidate transport, and neither a
+/// `Succeeded` status, the `candidate_only` flag itself, nor a supplied
+/// `canonical_receipt` (a host write-receipt reference, not Finish proof)
+/// establishes A-01 attempt attribution or task Finish. Any compatibility
+/// conversion off this envelope stays one-way, loss-visible, and fail-closed
+/// without binding; it is never convertible to a Finish decision or receipt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentResultEnvelope {
     pub result_id: String,
