@@ -307,6 +307,272 @@ impl RestoreJournalStreamBinding {
     }
 }
 
+/// Smallest retained resolved window the accepted retention policy may use.
+///
+/// Reclaiming every retained member while a prune fence exists leaves a
+/// resuming owner with a fence and no retained row, which it cannot read as a
+/// head. Retaining the newest resolved member is therefore a lower bound of
+/// the policy rather than a tunable default.
+pub const MIN_RETAINED_RESOLVED_MEMBERS: usize = 1;
+
+/// The retained member count at which the accepted policy starts reclaiming.
+///
+/// It is half the existing record ceiling, not a second bound. Below it a
+/// journal grows with no reclamation at all; from it on, every new phase
+/// intent first reclaims resolved history instead of letting the stream reach
+/// the ceiling. A stream whose unresolved frontier blocks reclamation keeps
+/// growing and is refused by the existing ceiling exactly as before: the
+/// accepted policy never evicts a recovery-needed member to make room.
+pub const RETENTION_RECLAIM_FROM_MEMBERS: usize = MAX_JOURNAL_HISTORY_ENTRIES / 2;
+
+/// What one retention pass did with the journal.
+///
+/// A disposition is an observation about reclamation, never about a
+/// recovery-needed member: no disposition is reachable by evicting an
+/// unresolved intent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreJournalRetentionDisposition {
+    /// The oldest contiguous resolved prefix was reclaimed.
+    ReclaimedResolvedPrefix,
+    /// No resolved member was reclaimable under the accepted window, so the
+    /// pass changed nothing. Recovery-needed members stay retained.
+    NoResolvedPrefixToReclaim,
+    /// Reclaiming was refused because the retired phase-slot bound is full.
+    /// Nothing was removed and no recovery-needed member was touched.
+    RefusedRetiredSlotBound,
+}
+
+/// The visible frontier of what a retention pass refused to evict.
+///
+/// The frontier is reported rather than applied as a limit: a pass that cannot
+/// reclaim stops at the first unresolved intent, keeps it and everything
+/// newer, and records that boundary here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreJournalRetentionFrontier {
+    /// Recovery-needed members the pass refused to evict, counted at the
+    /// pass. A pass never lowers this by eviction: only a durable result makes
+    /// an unresolved member resolved.
+    pub unresolved_members: u64,
+    /// The oldest recovery-needed member. `None` means the pass refused
+    /// nothing.
+    pub oldest_unresolved_sequence: Option<u64>,
+    /// Resolved members kept by the accepted window rather than because they
+    /// are unresolved.
+    pub policy_retained_members: u64,
+}
+
+/// The accepted retention policy for one restore journal.
+///
+/// Every bound is an existing owner ceiling, so retention introduces no second
+/// policy owner. It reclaims the oldest contiguous RESOLVED prefix under those
+/// ceilings and never evicts an unresolved intent to make room for a newer
+/// one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreJournalRetentionPolicy {
+    /// Newest resolved members always retained as readable history.
+    pub keep_resolved: usize,
+    /// Record/history bound, reused from the existing owner ceiling.
+    pub max_retained_members: usize,
+    /// Aggregate byte bound, reused from the existing ORS byte ceiling.
+    pub max_total_bytes: usize,
+    /// Aggregate table-scan work bound, reused from the existing replay-page
+    /// ceiling.
+    pub max_work_entries: usize,
+    /// Retained member count at which reclamation starts running on the
+    /// append path, derived from the existing record ceiling.
+    pub reclaim_from_members: usize,
+}
+
+impl RestoreJournalRetentionPolicy {
+    /// The accepted production policy.
+    pub fn accepted() -> Self {
+        Self {
+            keep_resolved: MIN_RETAINED_RESOLVED_MEMBERS,
+            max_retained_members: MAX_JOURNAL_HISTORY_ENTRIES,
+            max_total_bytes: MAX_JOURNAL_TOTAL_BYTES,
+            max_work_entries: MAX_JOURNAL_WORK_ENTRIES,
+            reclaim_from_members: RETENTION_RECLAIM_FROM_MEMBERS,
+        }
+    }
+
+    /// Rejects a window that would strand a headless retained stream, exceed
+    /// the owner ceiling it runs under, or claim bounds the journal does not
+    /// actually enforce.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.keep_resolved < MIN_RETAINED_RESOLVED_MEMBERS
+            || self.keep_resolved > MAX_JOURNAL_HISTORY_ENTRIES
+        {
+            return Err(OrsError::InvalidField {
+                field: "journal.retention_keep_resolved",
+                reason: "must retain at least one and at most the journal history bound",
+            });
+        }
+        if self.max_retained_members != MAX_JOURNAL_HISTORY_ENTRIES
+            || self.max_total_bytes != MAX_JOURNAL_TOTAL_BYTES
+            || self.max_work_entries != MAX_JOURNAL_WORK_ENTRIES
+            || self.reclaim_from_members != RETENTION_RECLAIM_FROM_MEMBERS
+        {
+            return Err(OrsError::InvalidField {
+                field: "journal.retention_bounds",
+                reason: "retention must run under the existing journal ceilings",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The durable decision one retention pass committed with its removals.
+///
+/// It is written in the same transaction as the rows it removed, so a
+/// reclaimed set and the report of what it refused can never disagree.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreJournalRetentionRecord {
+    /// Row schema this decision was written under.
+    pub record_schema: String,
+    /// Resolved window the pass ran under.
+    pub keep_resolved: u64,
+    /// Members this pass reclaimed.
+    pub removed_members: u64,
+    /// Phase slots retired in total after this pass. It is the same value the
+    /// prune fence records, which is what keeps a reclaimed slot provably
+    /// retired.
+    pub retired_members: u64,
+    /// What the pass did.
+    pub disposition: RestoreJournalRetentionDisposition,
+    /// What the pass refused to evict.
+    pub frontier: RestoreJournalRetentionFrontier,
+}
+
+impl RestoreJournalRetentionRecord {
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.record_schema != RESTORE_JOURNAL_RECORD_SCHEMA {
+            return Err(OrsError::InvalidField {
+                field: "journal.retention_record_schema",
+                reason: "unsupported restore journal retention record schema",
+            });
+        }
+        if self.keep_resolved > u64::try_from(MAX_JOURNAL_HISTORY_ENTRIES).unwrap_or(u64::MAX) {
+            return Err(OrsError::InvalidField {
+                field: "journal.retention_keep_resolved",
+                reason: "must be within the existing journal history bound",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// What one production retention pass did and what it refused to evict.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreJournalRetentionReport {
+    /// The stream the pass ran on.
+    pub stream: String,
+    /// The durable decision the pass committed together with its removals.
+    pub record: RestoreJournalRetentionRecord,
+    /// Recovery-needed members still retained after the pass, recomputed
+    /// from current owner state. This is never lowered by eviction.
+    pub surviving_unresolved_members: u64,
+    /// The oldest surviving recovery-needed member, when the pass refused to
+    /// evict one.
+    pub oldest_surviving_unresolved: Option<u64>,
+}
+
+/// The full journal member denominator a recovery decision requires.
+///
+/// `members` counts the WHOLE journal, including members an accepted
+/// retention pass already retired. A retained suffix can therefore still be
+/// proved complete instead of being read as the entire history, and a
+/// truncated or partially reclaimed journal fails the check instead of
+/// producing a complete restore proof.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreJournalMemberDenominator {
+    /// Every member the requester requires to be accounted for, retained or
+    /// retired.
+    pub members: u64,
+    /// Exact durable head the requester expects. `None` means the requester
+    /// expects an exact new journal.
+    pub head: Option<JournalPredecessor>,
+}
+
+impl RestoreJournalMemberDenominator {
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if let Some(head) = &self.head {
+            head.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// One bounded, denominator-checked journal readback request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreJournalReadbackRequest {
+    pub stream: String,
+    /// Page bound. The request is refused when the stream retains more
+    /// members than one page can return, never truncated silently.
+    pub limit: usize,
+    pub denominator: RestoreJournalMemberDenominator,
+}
+
+impl RestoreJournalReadbackRequest {
+    pub fn validate(&self) -> Result<(), OrsError> {
+        text(&self.stream, "journal.stream")?;
+        if self.limit == 0 || self.limit > MAX_JOURNAL_PAGE_ENTRIES {
+            return Err(OrsError::InvalidField {
+                field: "journal.page_limit",
+                reason: "page limit must be between 1 and the journal page bound",
+            });
+        }
+        self.denominator.validate()
+    }
+}
+
+/// Whether a readback is admissible as complete restore proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreJournalCompleteness {
+    /// The validated journal accounts for exactly the requested member
+    /// denominator, retained and retired together.
+    Complete,
+    /// The validated journal is an exact new journal: bound, with no retained
+    /// member, no retired phase slot and no prune fence. Zero entries is
+    /// known-empty only here, never for unavailable or unvalidated storage.
+    ExactNew,
+}
+
+/// A validated, denominator-checked journal readback.
+///
+/// Every field is an observation the owner proved from current durable state.
+/// Nothing here is a caller assertion, and a stream whose members cannot be
+/// accounted for never produces a value at all.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreJournalReadback {
+    pub stream: String,
+    /// Every retained member, in sequence order. Bounded by the request page
+    /// and the existing journal history ceiling.
+    pub entries: Vec<RestoreJournalEntry>,
+    /// Retained members returned in full.
+    pub retained_members: u64,
+    /// Members an accepted retention pass already retired on this stream.
+    pub retired_members: u64,
+    /// The full observed denominator: retained plus retired.
+    pub total_members: u64,
+    /// The durable head the readback proved.
+    pub head: Option<JournalPredecessor>,
+    /// The prune boundary when the returned rows are a retained suffix.
+    pub history_fence: Option<JournalPredecessor>,
+    pub completeness: RestoreJournalCompleteness,
+    /// The last durable retention decision, so a reader also sees the
+    /// frontier that refused to evict a recovery-needed member.
+    pub retention: Option<RestoreJournalRetentionRecord>,
+}
+
 /// Which persisted row an append receipt proves.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
