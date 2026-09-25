@@ -34,16 +34,22 @@ pub async fn run_db_status(config_path: &Path) -> Result<()> {
 
 pub async fn run_db_migrate(config_path: &Path) -> Result<()> {
     let config = load_config(config_path)?;
-    let _ = CanonicalStore::new(config.db.surreal.clone())
+    // Issue #19: the schema migration runs entirely through the closed named
+    // operation catalogue. This command used to follow the accepted migration
+    // with a generic `RETURN true;` SurrealQL string through
+    // `SurrealStore::apply_migration`, which takes arbitrary SQL straight to the
+    // provider and then returns a hard-coded "applied" record. That left a
+    // production command able to report a migration that no catalogue operation
+    // performed, and it is the raw-query escape the store boundary requires to
+    // be rejected. The reported record is now the accepted catalogue result, and
+    // the status is derived from that result rather than asserted.
+    let migrated = CanonicalStore::new(config.db.surreal)
         .migrate_schema()
         .await?;
-    let record = SurrealStore::new(config.db.surreal)
-        .apply_migration(NamedSurqlOp::SchemaMigrate.name(), "RETURN true;")
-        .await?;
     write_json(&serde_json::json!({
-        "component": record.component,
-        "status": record.status,
-        "detail": record.detail
+        "component": "surrealdb",
+        "status": if migrated.is_null() { "no_result" } else { "applied" },
+        "detail": migrated
     }))
 }
 
