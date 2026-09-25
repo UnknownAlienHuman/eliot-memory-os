@@ -2099,6 +2099,180 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn historical_stale_task_never_compiles_to_material() {
+        // A superseded historical TaskContract revision compiles to an
+        // explicit STALE binding at NEEDS_TASK: history is preserved as a
+        // refresh directive, never promoted to current material readiness.
+        let one = candidate("instance:a");
+        let receipt = match compile_with(
+            &one,
+            &one.instance,
+            &readiness_fence(),
+            TaskBindingInput::Stale {
+                task_ref: "task:history:archived".into(),
+                task_revision: 4,
+            },
+        ) {
+            Ok(value) => value,
+            Err(error) => panic!("readiness compilation failed: {error}"),
+        };
+        assert_eq!(
+            receipt.task_binding,
+            TaskBindingState::Stale {
+                task_ref: "task:history:archived".into(),
+                task_revision: 4,
+            }
+        );
+        assert_eq!(receipt.readiness, ReadinessLifecycle::NeedsTask);
+        assert_ne!(receipt.readiness, ReadinessLifecycle::ReadyMaterial);
+        assert_eq!(receipt.next_safe_action, "refresh_task_binding");
+        assert!(receipt.missing_inputs.contains(&"task_refresh".to_owned()));
+        match receipt.validate() {
+            Ok(()) => (),
+            Err(error) => panic!("compiled receipt is invalid: {error}"),
+        }
+    }
+
+    #[test]
+    fn oversized_ambiguous_candidate_set_is_rejected() {
+        // Sixteen handles is the preservation bound; seventeen candidates
+        // fail instead of truncating silently into a different selection.
+        let one = candidate("instance:a");
+        let handles: Vec<String> = (0..17)
+            .map(|index| format!("task:history:{index}"))
+            .collect();
+        assert_eq!(
+            compile_with(
+                &one,
+                &one.instance,
+                &readiness_fence(),
+                TaskBindingInput::AmbiguousCandidates(handles),
+            ),
+            Err(WorkScopeError::EmptyCollection {
+                field: "candidate_handles",
+            })
+        );
+    }
+
+    #[test]
+    fn oversized_limiting_evidence_is_rejected() {
+        // Eight limiting-integration evidence handles is the bound; a ninth
+        // fails compilation instead of widening the authority profile.
+        let one = candidate("instance:a");
+        let evidence: Vec<String> = (0..9)
+            .map(|index| format!("integration:evidence:{index}"))
+            .collect();
+        assert_eq!(
+            compile_with_evidence(
+                &one,
+                &one.instance,
+                &readiness_fence(),
+                current_task_input(),
+                evidence,
+            ),
+            Err(WorkScopeError::EmptyCollection {
+                field: "limiting_integration_evidence",
+            })
+        );
+    }
+
+    #[test]
+    fn relocated_worktree_root_is_rejected() {
+        // Same instance reference under a different root identity is a
+        // relocated worktree, not the bound workspace: compilation refuses
+        // instead of carrying the old binding forward.
+        let one = candidate("instance:a");
+        let relocated = WorkspaceInstanceIdentity {
+            instance_ref: "instance:a".into(),
+            root_identity: "root:elsewhere".into(),
+            vcs_identity_ref: Some("vcs:one".into()),
+            generation: 1,
+        };
+        assert_eq!(
+            compile_with(&one, &relocated, &readiness_fence(), current_task_input()),
+            Err(WorkScopeError::BindingReceiptMismatch)
+        );
+    }
+
+    #[test]
+    fn zero_task_revision_and_blank_acceptance_are_rejected() {
+        // A zero revision is not a current TaskContract revision and a
+        // blank acceptance digest is not evidence: both fail closed at the
+        // compiler, mirroring the bridge projection refusals.
+        let one = candidate("instance:a");
+        assert_eq!(
+            compile_with(
+                &one,
+                &one.instance,
+                &readiness_fence(),
+                TaskBindingInput::Current {
+                    task_ref: "task:one".into(),
+                    task_revision: 0,
+                    acceptance_digest: "digest:acceptance:one".into(),
+                },
+            ),
+            Err(WorkScopeError::InvalidCounter {
+                field: "task_revision",
+            })
+        );
+        assert_eq!(
+            compile_with(
+                &one,
+                &one.instance,
+                &readiness_fence(),
+                TaskBindingInput::Current {
+                    task_ref: "task:one".into(),
+                    task_revision: 1,
+                    acceptance_digest: "   ".into(),
+                },
+            ),
+            Err(WorkScopeError::InvalidText {
+                field: "acceptance_digest",
+            })
+        );
+    }
+
+    fn compile_with_evidence(
+        candidate: &WorkScopeCandidate,
+        instance: &WorkspaceInstanceIdentity,
+        fence: &StateFence,
+        task: TaskBindingInput,
+        evidence: Vec<String>,
+    ) -> Result<OnboardingReadinessReceipt, WorkScopeError> {
+        let lease = onboarding_lease();
+        let sources = source_set(candidate);
+        let privacy = PrivacyProfile {
+            admitted_classes: vec![PrivacyClass::Internal],
+        };
+        ColdStartController.compile(
+            "receipt:one",
+            &lease,
+            "principal:test",
+            "session:test",
+            &candidate.scope,
+            instance,
+            candidate.lineage.as_ref(),
+            candidate,
+            &sources,
+            fence,
+            "governance-profile:test",
+            evidence,
+            "route-profile:test",
+            "serializer:test",
+            "serializer-version:test",
+            "serializer-options:test",
+            "tokenizer:test",
+            "tokenizer-version:test",
+            "tokenizer-hash:test",
+            "projection-source:test",
+            1,
+            &privacy,
+            task,
+            1,
+        )
+    }
+
     fn bootstrap_evidence() -> BootstrapScanEvidence {
         BootstrapScanEvidence {
             canonical_root_ref: "root:a".into(),

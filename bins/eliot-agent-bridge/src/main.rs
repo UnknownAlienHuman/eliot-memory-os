@@ -5,8 +5,8 @@ mod request_input;
 use eliot_agent_bridge::{
     AdmissionBasis, BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError,
     CurrentAssessment, FiringEvidence, HotResourceView, InjectionReceipt, ItemDisposition,
-    NormalizedCue, Profile, ScopeLevel, UnderstandingBootstrap, UseOutcome,
-    kernel_ports_with_declaration, parse_args, reactive_runtime_composition,
+    NormalizedCue, Profile, UnderstandingBootstrap, UseOutcome, kernel_ports_with_declaration,
+    parse_args, reactive_runtime_composition,
 };
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
@@ -827,9 +827,13 @@ fn main() {
 /// Serves one bounded `GetUnderstandingBootstrap` retrieval.
 ///
 /// An optional context establishes the session inputs first; invalid context
-/// fails closed and stores nothing. The first successful retrieval in a
-/// session also satisfies the once-per-session auto-boot; later retrievals
-/// use the explicit path so they stay available after auto-boot delivery.
+/// fails closed and stores nothing. The context is noted together with the
+/// supplied task inputs as one owner-produced snapshot sealed to the live
+/// attach, so the once-per-session auto-boot below composes from the same
+/// snapshot rather than a separate empty task set. The first successful
+/// retrieval in a session also satisfies the once-per-session auto-boot;
+/// later retrievals use the explicit path so they stay available after
+/// auto-boot delivery.
 fn handle_bootstrap(
     runner: &mut BridgeRunner,
     context: Option<BootstrapContext>,
@@ -837,7 +841,7 @@ fn handle_bootstrap(
     requested_assessment: CurrentAssessment,
 ) -> Response {
     if let Some(context) = context {
-        if let Err(error) = runner.note_bootstrap_context(context) {
+        if let Err(error) = runner.note_owner_snapshot(context, tasks.clone()) {
             return Response::Error {
                 code: "BOOTSTRAP_CONTEXT_REJECTED",
                 detail: error.to_string(),
@@ -860,8 +864,12 @@ fn handle_bootstrap(
 ///
 /// Error and dry-run responses never carry a bootstrap: a dry run is a
 /// zero-side-effect preview, not a successful ELIOT response, and its
-/// envelope has no bootstrap slot. When no valid context is noted
-/// the response is left untouched rather than carrying invented authority.
+/// envelope has no bootstrap slot. When no owner snapshot is noted, or the
+/// live attach moved away from the noted seal, the response is left
+/// untouched rather than carrying invented authority. The composed task
+/// inputs are always the retained owner-supplied snapshot tasks — never a
+/// separate empty candidate set — so the agent identifies or explicitly
+/// requests the intended task from owner-produced inputs alone.
 fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
     let slot = match response {
         Response::Status { bootstrap, .. }
@@ -881,11 +889,7 @@ fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
         }
     };
     if slot.is_none() {
-        let tasks = BootstrapTaskInputs {
-            scope_level: ScopeLevel::Session,
-            candidates: Vec::new(),
-            authoritative_selection: None,
-        };
+        let tasks = runner.retained_auto_boot_tasks();
         *slot = runner.take_first_response_bootstrap(&tasks, CurrentAssessment::Ready);
     }
 }
@@ -1968,6 +1972,7 @@ fn write_response(response: &Response) -> StdioWriteReceipt {
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use eliot_agent_bridge::ScopeLevel;
     use serde_json::Value;
 
     const INVOKE: &str = r#"{
@@ -2965,6 +2970,240 @@ mod tests {
             .get_understanding_bootstrap(&empty_tasks(), CurrentAssessment::Ready)
             .expect("explicit retrieval stays available");
         assert_eq!(explicit.governance.profile_ref, "governance-profile-1");
+    }
+
+    const SEAL_TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    struct SequencedActivation {
+        results: Vec<eliot_agent_bridge_core::ActivationPortResult>,
+        next: usize,
+    }
+
+    impl eliot_agent_bridge_core::HostActivationPort for SequencedActivation {
+        fn activate(
+            &mut self,
+            _request: &eliot_agent_bridge_core::AttachRequest,
+        ) -> Result<
+            eliot_agent_bridge_core::ActivationPortOutcome,
+            eliot_agent_bridge_core::ProviderFailure,
+        > {
+            let result = self
+                .results
+                .get(self.next)
+                .cloned()
+                .expect("activation step must exist");
+            self.next += 1;
+            Ok(eliot_agent_bridge_core::ActivationPortOutcome::Authenticated(result))
+        }
+    }
+
+    fn seal_activation(
+        session: &str,
+        generation: u64,
+        sequence: u64,
+        nonce: &str,
+    ) -> eliot_agent_bridge_core::ActivationPortResult {
+        let generation = Generation::new(generation).expect("non-zero test generation");
+        let fence = FencingToken::new(
+            EpochId::new(
+                eliot_contracts::EpochLineageId::new(SEAL_TEST_LINEAGE)
+                    .expect("valid test lineage"),
+                std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+            )
+            .expect("valid test epoch"),
+            generation,
+            nonce,
+        )
+        .expect("valid test fence");
+        eliot_agent_bridge_core::ActivationPortResult::authenticated(
+            eliot_agent_bridge_core::PrincipalId::new("principal-attach-1")
+                .expect("valid principal"),
+            eliot_agent_bridge_core::SessionId::new(session).expect("valid session"),
+            generation,
+            fence,
+            eliot_agent_bridge_core::TaskId::new("task-attach-1").expect("valid task"),
+            eliot_agent_bridge_core::WorkUnitId::new("work-unit-attach-1")
+                .expect("valid work unit"),
+            "scope-attach-1",
+            "task-revision-7",
+            "plan-attach-1",
+            "plan-revision-2",
+        )
+        .expect("valid activation result")
+    }
+
+    fn sealed_runner() -> BridgeRunner {
+        let mut runner = BridgeRunner::new(
+            Profile::SpineFunctional,
+            eliot_agent_bridge_core::ProviderReadiness::all_admitted(),
+            Some(Box::new(SequencedActivation {
+                results: vec![
+                    seal_activation("session-attach-1", 5, 2, "fence-attach-5"),
+                    seal_activation("session-attach-2", 6, 3, "fence-attach-6"),
+                ],
+                next: 0,
+            })),
+            None,
+        )
+        .expect("runner composes");
+        runner
+            .attach(eliot_agent_bridge_core::AttachRequest::managed(
+                eliot_agent_bridge_core::DemandId::new("demand-attach-1").expect("valid demand"),
+                ConnectionId::new("conn-attach-1").expect("valid connection"),
+            ))
+            .expect("managed attach admits");
+        runner
+    }
+
+    fn sealed_context() -> BootstrapContext {
+        BootstrapContext {
+            principal_ref: "principal-attach-1".to_owned(),
+            profile_ref: "SPINE_FUNCTIONAL".to_owned(),
+            workscope_ref: "scope-attach-1".to_owned(),
+            onboarding_readiness_ref: "readiness-receipt-attach-1".to_owned(),
+            onboarding_disposition: eliot_agent_bridge::ReadinessDisposition::ReadyMaterial,
+            revision_refs: vec!["source-gen-9".to_owned()],
+            orientation_handles: vec!["orientation:project".to_owned()],
+            attention_handles: vec![],
+            problem_handles: vec![],
+            role_lease_ref: "role-lease-attach-1".to_owned(),
+            state_fence_ref: "fence-epoch-3-gen-7".to_owned(),
+            governance: eliot_agent_bridge::GovernanceEvidence {
+                profile_ref: "governance-profile-1".to_owned(),
+                profile_revision: "rev-7".to_owned(),
+                limiting_integration_evidence: vec!["coverage:PreToolUse:ENFORCED".to_owned()],
+            },
+            route_profile_ref: "route-profile-attach-1".to_owned(),
+            decision_safety_floor_refs: vec!["floor:goal-scope-authority".to_owned()],
+            supported_count: 4,
+            verified_count: 3,
+            candidate_count: 1,
+            conflicts_unknowns: vec![],
+            next_safe_expansion: "bind task before material effects".to_owned(),
+        }
+    }
+
+    fn sealed_unique_tasks() -> BootstrapTaskInputs {
+        BootstrapTaskInputs {
+            scope_level: ScopeLevel::Session,
+            candidates: vec![eliot_agent_bridge::TaskCandidate {
+                handle: "task-attach-1".to_owned(),
+                task_revision: Some(7),
+                acceptance_digest: Some("e".repeat(64)),
+                prior_evaluation_candidate_only: false,
+                independent_binding_supplied: true,
+            }],
+            authoritative_selection: None,
+        }
+    }
+
+    fn forwarded_slot() -> Response {
+        Response::Forwarded {
+            bootstrap: None,
+            reactive_receipts: Vec::new(),
+        }
+    }
+
+    fn carried_bootstrap(response: &Response) -> &UnderstandingBootstrap {
+        match response {
+            Response::Forwarded {
+                bootstrap: Some(bootstrap),
+                ..
+            } => bootstrap,
+            _ => panic!("first successful response must carry the bootstrap"),
+        }
+    }
+
+    #[test]
+    fn sealed_owner_snapshot_auto_boot_delivers_unique_once() {
+        let mut runner = sealed_runner();
+        runner
+            .note_owner_snapshot(sealed_context(), sealed_unique_tasks())
+            .expect("matching snapshot must note");
+        // The auto-boot composes from the retained owner tasks, not from a
+        // separate empty set: one eligible task binds UNIQUE with READY.
+        let mut first = forwarded_slot();
+        attach_auto_bootstrap(&mut runner, &mut first);
+        let carried = carried_bootstrap(&first);
+        assert_eq!(
+            carried.task_selection.disposition,
+            eliot_agent_bridge::TaskSelectionDisposition::Unique
+        );
+        assert_eq!(carried.current_assessment, CurrentAssessment::Ready);
+        assert_eq!(
+            carried.task_selection.selected_task_and_revision,
+            Some(eliot_agent_bridge::SelectedTask {
+                task_ref: "task-attach-1".to_owned(),
+                task_revision: 7,
+            })
+        );
+        let mut second = forwarded_slot();
+        attach_auto_bootstrap(&mut runner, &mut second);
+        assert!(
+            matches!(
+                second,
+                Response::Forwarded {
+                    bootstrap: None,
+                    ..
+                }
+            ),
+            "bootstrap must be injected exactly once"
+        );
+    }
+
+    #[test]
+    fn reseated_attach_refuses_stale_snapshot_without_ready() {
+        let mut runner = sealed_runner();
+        runner
+            .note_owner_snapshot(sealed_context(), sealed_unique_tasks())
+            .expect("matching snapshot must note");
+        // A new session/generation/fence replaces the live binding: the
+        // noted seal no longer matches, so auto-boot and explicit
+        // retrieval refuse instead of projecting stale READY.
+        runner
+            .attach(eliot_agent_bridge_core::AttachRequest::managed(
+                eliot_agent_bridge_core::DemandId::new("demand-attach-2").expect("valid demand"),
+                ConnectionId::new("conn-attach-2").expect("valid connection"),
+            ))
+            .expect("second attach admits");
+        let mut response = forwarded_slot();
+        attach_auto_bootstrap(&mut runner, &mut response);
+        assert!(
+            matches!(
+                response,
+                Response::Forwarded {
+                    bootstrap: None,
+                    ..
+                }
+            ),
+            "stale snapshot must never auto-boot READY on a new session"
+        );
+        let error = runner
+            .get_understanding_bootstrap(&sealed_unique_tasks(), CurrentAssessment::Ready)
+            .expect_err("explicit retrieval on a stale seal must fail closed");
+        assert_eq!(error.code, "BOOTSTRAP_SEAL_MISMATCH");
+    }
+
+    #[test]
+    fn noting_refuses_wrong_principal_and_wrong_scope() {
+        let mut runner = sealed_runner();
+        let mut forged_principal = sealed_context();
+        forged_principal.principal_ref = "principal-forged-9".to_owned();
+        let error = runner
+            .note_owner_snapshot(forged_principal, sealed_unique_tasks())
+            .expect_err("wrong-principal packet must fail closed");
+        assert_eq!(error.code, "BOOTSTRAP_PRINCIPAL_MISMATCH");
+        let mut forged_scope = sealed_context();
+        forged_scope.workscope_ref = "scope-forged-9".to_owned();
+        let error = runner
+            .note_owner_snapshot(forged_scope, sealed_unique_tasks())
+            .expect_err("wrong-worktree packet must fail closed");
+        assert_eq!(error.code, "BOOTSTRAP_SCOPE_MISMATCH");
+        // Refused packets store nothing: retrieval still reports absence.
+        let error = runner
+            .get_understanding_bootstrap(&sealed_unique_tasks(), CurrentAssessment::Ready)
+            .expect_err("nothing stored means retrieval fails closed");
+        assert_eq!(error.code, "BOOTSTRAP_CONTEXT_MISSING");
     }
 
     /// C3 production-path proof: supported Kernel read-result bytes reaching the normal

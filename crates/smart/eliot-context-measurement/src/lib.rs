@@ -509,3 +509,143 @@ pub fn measure_serialized_context(
         receipt_digest: receipt,
     })
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod route_profile_tests {
+    //! Route-profiled payload measurements for issue #8 (W3).
+    //!
+    //! One constrained/weak route profile (tight byte bound, tiny route
+    //! capacity) and one normal route profile measure the same canonical
+    //! payload through the public [`measure_exact_utf8`] entry: the
+    //! constrained route refuses oversize with a typed bound and reports
+    //! unfit capacity instead of truncating, while the normal route records
+    //! exact bytes and proves fit. Omitted material is never hidden: a
+    //! conservative STU estimate cannot prove fit, and oversize content is
+    //! refused rather than silently cut to an expansion handle.
+    use super::*;
+    use eliot_agent_contracts::AgentAttemptId;
+    use eliot_context_contracts::{
+        CapacityLimits, ContextBinding, ContextError, MeasurementStatus, StuEstimate,
+    };
+    use eliot_contracts::{
+        ArtifactId, DecisionId, EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskId,
+        sha256_hex,
+    };
+    use eliot_receipts::WorkScopeId;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn binding() -> ContextBinding {
+        ContextBinding {
+            task_id: TaskId::new("task-route-1").expect("fixture task"),
+            attempt_id: AgentAttemptId::new("attempt-route-1").expect("fixture attempt"),
+            scope_id: WorkScopeId::new("scope-route-1").expect("fixture scope"),
+            state_fence: StateFence::new(
+                EpochId::new(
+                    EpochLineageId::new(TEST_LINEAGE).expect("lineage"),
+                    std::num::NonZeroU64::new(1).expect("sequence"),
+                )
+                .expect("epoch"),
+                ResourceGeneration::new(1).expect("generation"),
+            ),
+            decision_id: DecisionId::new("decision-route-1").expect("fixture decision"),
+            operation_id: None,
+        }
+    }
+
+    fn profile_params(
+        context: &ContextBinding,
+        route_id: &str,
+        max_serialized_bytes: u64,
+        route_capacity: u64,
+    ) -> MeasurementParams {
+        MeasurementParams {
+            measurement_id: ArtifactId::new("measurement-route-1").expect("fixture identity"),
+            context: context.clone(),
+            serializer_id: "fixture-serde-v1".to_owned(),
+            serializer_version: "1".to_owned(),
+            serializer_options_digest: "a".repeat(64),
+            route_id: route_id.to_owned(),
+            model_id: "model-route-1".to_owned(),
+            capacity: CapacityLimits {
+                route_capacity,
+                fixed_overhead: 2,
+                output_reserve: 3,
+                review_reserve: 4,
+            },
+            stu_estimate: None,
+            tokenizer: None,
+            false_safe_overflow: None,
+            false_rejection_or_decomposition: None,
+            valid_until: None,
+            max_serialized_bytes,
+        }
+    }
+
+    #[test]
+    fn constrained_route_refuses_oversize_and_reports_unfit() {
+        let context = binding();
+        let payload = "constrained route payload with material goal".as_bytes();
+        // Oversize for the weak route bound: refused with a typed bound,
+        // never truncated into a smaller expansion.
+        let mut tight = profile_params(&context, "route-constrained-weak-1", 8, 100_000);
+        assert_eq!(
+            measure_exact_utf8(payload, &tight),
+            Err(ContextError::Bounds {
+                field: "measurement.rendered_bytes"
+            })
+        );
+        // Fits the byte bound but exceeds the weak route capacity (reserves
+        // alone already pass the ceiling): the measurement refuses instead
+        // of reporting a fit it cannot honor.
+        tight.max_serialized_bytes = 100_000;
+        tight.capacity.route_capacity = 8;
+        assert_eq!(
+            measure_exact_utf8(payload, &tight),
+            Err(ContextError::CapacityExceeded)
+        );
+    }
+
+    #[test]
+    fn normal_route_measures_exact_and_proves_fit() {
+        let context = binding();
+        let payload = "normal route payload with material goal".as_bytes();
+        let params = profile_params(&context, "route-normal-1", 100_000, 100_000);
+        let measured = measure_exact_utf8(payload, &params).expect("exact measurement");
+        assert_eq!(measured.status, MeasurementStatus::ExactUtf8);
+        assert_eq!(
+            measured.rendered_utf8_bytes,
+            u64::try_from(payload.len()).expect("byte count")
+        );
+        assert_eq!(measured.envelope_digest, sha256_hex(payload));
+        assert_eq!(measured.route_id, "route-normal-1");
+        assert_eq!(measured.proves_fit(100_000), Ok(true));
+        assert_eq!(measured.proves_fit(1), Ok(false));
+    }
+
+    #[test]
+    fn estimate_never_proves_fit_and_omission_is_typed() {
+        let context = binding();
+        let payload = "omitted material stays visible".as_bytes();
+        let params = profile_params(&context, "route-normal-1", 100_000, 100_000);
+        let mut measured = measure_exact_utf8(payload, &params).expect("exact measurement");
+        // A conservative STU estimate is data, not proof: it can never
+        // establish route fit, so omitted material cannot hide behind it.
+        measured.status = MeasurementStatus::ConservativeStu;
+        measured.stu_estimate = Some(StuEstimate {
+            value: 1,
+            empirical: false,
+        });
+        assert_eq!(
+            measured.proves_fit(100_000),
+            Err(ContextError::UnknownMeasurement)
+        );
+        // Non-UTF-8 content is refused with its exact cause, never
+        // coerced into a lossy expansion.
+        assert_eq!(
+            measure_exact_utf8(&[0xff, 0xfe], &params),
+            Err(ContextError::InvalidField("measurement.payload_utf8"))
+        );
+    }
+}

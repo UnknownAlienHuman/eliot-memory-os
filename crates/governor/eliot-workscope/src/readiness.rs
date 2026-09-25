@@ -1138,6 +1138,48 @@ mod tests {
     }
 
     #[test]
+    fn historical_stale_task_denies_material_with_selection_required() {
+        // A historical (superseded-revision) task binding is preserved as
+        // STALE at NEEDS_TASK: a Material effect denies with
+        // TASK_SELECTION_REQUIRED and names the refresh, so history can
+        // never support a Material decision or a reusable task-bound write.
+        let receipt = receipt_with(TaskBindingInput::Stale {
+            task_ref: "task:history:archived".into(),
+            task_revision: 4,
+        });
+        let descriptor_value = descriptor();
+        let coverage = GoverningCoverage::AdmittedSources(sources());
+        let guard = guard_receipt();
+        let lease_value = lease();
+        let fence_value = fence();
+        let admission = match evaluate_material_request(
+            &inputs(
+                &receipt,
+                &descriptor_value,
+                &coverage,
+                &guard,
+                &lease_value,
+                &fence_value,
+            ),
+            RequestedEffect::MaterialEffect,
+        ) {
+            Ok(value) => value,
+            Err(error) => panic!("gate evaluation failed: {error}"),
+        };
+        assert!(!admission.is_admitted());
+        assert_eq!(
+            admission.directive(),
+            Some(MaterialReadinessDirective::TaskSelectionRequired)
+        );
+        assert_eq!(
+            admission
+                .directive()
+                .map(MaterialReadinessDirective::kind_str),
+            Some("TASK_SELECTION_REQUIRED")
+        );
+    }
+
+    #[test]
     fn stale_governing_coverage_requires_reevaluation() {
         let receipt = receipt_with(current_task());
         let descriptor_value = descriptor();
