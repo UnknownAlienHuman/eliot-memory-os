@@ -13,6 +13,7 @@ mod model_control;
 mod model_registry;
 mod provider_account_catalogue;
 mod provider_admission;
+mod swarm_admission_bind;
 mod swarm_command_candidate;
 mod swarm_controlboard;
 mod swarm_launch_bind;
@@ -42,6 +43,7 @@ pub use crate::provider_account_catalogue::{
 pub use crate::provider_admission::{
     AdmittedProviderCapability, OwnerCurrentness, PresentedClaimMaterial, ProviderSelectionHealth,
 };
+pub use crate::swarm_admission_bind::*;
 pub use crate::swarm_command_candidate::*;
 pub use crate::swarm_controlboard::*;
 pub use crate::swarm_launch_bind::*;
