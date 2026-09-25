@@ -1312,7 +1312,7 @@ fn descendant_closure_matches_runtime_before_parent_complete_candidate() -> Test
     )?;
     let accepted = coordinator.submit_result(parent_context, parent_result)?;
     assert_eq!(
-        accepted.proof_ceiling,
+        accepted.proof_ceiling(),
         eliot_receipts::ProofCeiling::CandidateArtifact
     );
     Ok(())
@@ -1689,16 +1689,16 @@ fn coordinator_case_17_candidate_disposition_is_candidate_only_and_capped() -> T
     let result = result_submission("case-17", &lane, ResultDisposition::CandidateSucceeded)?;
     let receipt = coordinator.submit_result(context, result)?;
     assert_eq!(
-        receipt.proof_ceiling,
+        receipt.proof_ceiling(),
         eliot_receipts::ProofCeiling::CandidateArtifact
     );
     assert_eq!(
-        receipt.provider_disposition,
+        receipt.provider_disposition(),
         ResultDisposition::CandidateSucceeded
     );
     // Coordinator never produces a finish-level proof.
     assert_ne!(
-        receipt.proof_ceiling,
+        receipt.proof_ceiling(),
         eliot_receipts::ProofCeiling::ScopedVerification
     );
     // Serialized receipt is candidate-only.
@@ -1802,7 +1802,7 @@ fn coordinator_case_19_replay_conflict_and_snapshot_forgery_fail_closed() -> Tes
     replay.submission_id = first_id.clone();
     replay.result.actual_route = first_route.clone();
     let replayed = coordinator.submit_result(context.clone(), replay)?;
-    assert_eq!(replayed.submission_id, first_id);
+    assert_eq!(replayed.submission_id(), &first_id);
     // Same identity with different bytes (different disposition) is a conflict.
     let mut conflict = result_submission("case-19", &lane, ResultDisposition::Partial)?;
     conflict.submission_id = first_id.clone();
@@ -1922,7 +1922,7 @@ fn coordinator_case_20_parent_closure_is_candidate_only_and_requires_descendant_
     )?;
     let receipt = coordinator.submit_result(parent_context, parent_result)?;
     assert_eq!(
-        receipt.proof_ceiling,
+        receipt.proof_ceiling(),
         eliot_receipts::ProofCeiling::CandidateArtifact
     );
     // Even with two levels of CANDIDATE_SUCCEEDED, no task finish is derived.
@@ -2458,15 +2458,15 @@ fn diverged_observation_is_retained_with_capped_ceiling() -> TestResult {
     submission.result.actual_route = diverged_observation(&lane, &binding, &observed)?;
     let receipt = coordinator.submit_result(context, submission)?;
     assert_eq!(
-        receipt.proof_ceiling,
+        receipt.proof_ceiling(),
         eliot_receipts::ProofCeiling::CandidateArtifact
     );
     assert_eq!(
-        receipt.actual_route.route_state,
+        receipt.actual_route().route_state,
         RouteObservationState::Diverged
     );
     assert_eq!(
-        receipt.actual_route.observed_route.as_ref(),
+        receipt.actual_route().observed_route.as_ref(),
         Some(&observed)
     );
     Ok(())
@@ -2501,14 +2501,14 @@ fn unobserved_observation_is_retained_with_capped_ceiling() -> TestResult {
     submission.result.unknown_reason = Some("provider outcome unresolved".to_owned());
     let receipt = coordinator.submit_result(context, submission)?;
     assert_eq!(
-        receipt.proof_ceiling,
+        receipt.proof_ceiling(),
         eliot_receipts::ProofCeiling::CandidateArtifact
     );
     assert_eq!(
-        receipt.actual_route.route_state,
+        receipt.actual_route().route_state,
         RouteObservationState::Unobserved
     );
-    assert_eq!(receipt.actual_route.observed_route, None);
+    assert_eq!(receipt.actual_route().observed_route, None);
     Ok(())
 }
 
@@ -2685,7 +2685,7 @@ fn s5_stored_admission_closes_binding_and_forged_digest_rejects() -> TestResult 
     let happy = result_submission("s5a-0", &first, ResultDisposition::Partial)?;
     let receipt = restored.submit_result(context.clone(), happy)?;
     assert_eq!(
-        receipt.proof_ceiling,
+        receipt.proof_ceiling(),
         eliot_receipts::ProofCeiling::CandidateArtifact
     );
     // Forged digest: same attempt/binding/route but a zero digest instead of
@@ -3639,7 +3639,7 @@ fn observe_e2e_lost_ack_reconstruct_replay_once_without_duplicate_effects() -> T
     submission.result.actual_route = matched_observation(&lane, &stored)?;
     let intake = restored.submit_result(context.clone(), submission)?;
     assert_eq!(
-        intake.proof_ceiling,
+        intake.proof_ceiling(),
         eliot_receipts::ProofCeiling::CandidateArtifact
     );
     let mut again = result_submission("e2e-observe-again", &lane, ResultDisposition::Partial)?;
@@ -3679,7 +3679,7 @@ fn production_verifier_admits_binds_and_accepts_result() -> TestResult {
     submission.result.actual_route = matched_observation(&lane, &binding)?;
     let receipt = coordinator.submit_result(context, submission)?;
     assert_eq!(
-        receipt.proof_ceiling,
+        receipt.proof_ceiling(),
         eliot_receipts::ProofCeiling::CandidateArtifact
     );
     Ok(())

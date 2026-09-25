@@ -23,8 +23,9 @@ use crate::model::{
     CancellationReconciliationId, CandidateId, CandidateResultReceipt, CoordinatedAttemptState,
     CoordinatorConfig, CoordinatorError, CoordinatorEvent, CoordinatorSnapshot,
     DeliveryBoundaryReceipt, DescendantClosureCandidateReceipt, DescendantClosureSubmission,
-    ExecutionContext, LostWorkerReceipt, OperationId, OutcomeReconciliationId, PeerMessageReceipt,
-    PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot, ProviderCancellationReconciliation,
+    ExecutionContext, LegacyResultWireKind, LostWorkerReceipt, OperationId,
+    OutcomeReconciliationId, PeerMessageReceipt, PlanGap, ProviderAdmissionReceipt,
+    ProviderBindingSnapshot, ProviderCancellationReconciliation,
     ProviderExecutionBindingSubmission, ProviderIdentity, ProviderReassignmentReceipt,
     ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReassignmentId,
     ReassignmentReceipt, ResultSubmission, RoleProfileManifest, RouteCandidateEvidence,
@@ -116,11 +117,13 @@ fn retains_ownership_on_unknown_execution(result: &AgentResult) -> bool {
 
 /// Binding-gated result intake checks shared by `submit_result` (issue
 /// #370 S5 closure + #361 exact execution-unit binding): requested must
-/// equal the admitted route; attempt identity must match; an exact stored
-/// binding must match exactly while a missing stored binding still requires
-/// presented attempt/lease/fence/route agreement; the stored
+/// equal the admitted route; attempt identity must match; the exact stored
+/// provider execution binding must exist and match exactly; the stored
 /// externally-issued admission must exist and the full triple must close
-/// via `validate_for_binding`. No state mutation here.
+/// via `validate_for_binding`. A missing stored binding fails closed with
+/// [`CoordinatorError::MissingExecutionBinding`]: a caller-presented unit is
+/// never accepted without a stored admitted unit to authenticate it against.
+/// No state mutation here.
 fn validate_result_intake_binding(
     current: &AttemptRecord,
     result: &AgentResult,
@@ -133,15 +136,11 @@ fn validate_result_intake_binding(
     if actual.attempt_id != current.attempt_id {
         return Err(CoordinatorError::IdentityConflict("attempt_id"));
     }
-    if let Some(stored) = &current.provider_binding {
-        if &actual.binding != stored {
-            return Err(CoordinatorError::IdentityConflict("execution_binding"));
-        }
-    } else if actual.binding.attempt_id != current.attempt_id
-        || actual.binding.lease_id != current.lease_id
-        || actual.binding.state_fence != current.state_fence
-        || actual.binding.route != current.route
-    {
+    let stored = current
+        .provider_binding
+        .as_ref()
+        .ok_or(CoordinatorError::MissingExecutionBinding)?;
+    if &actual.binding != stored {
         return Err(CoordinatorError::IdentityConflict("execution_binding"));
     }
     if actual.state_fence != current.state_fence {
@@ -211,6 +210,71 @@ pub struct AgentCoordinator {
     peer_messages: BTreeMap<MessageId, IdempotentRecord<PeerMessageReceipt>>,
     peer_message_payloads: BTreeMap<MessageId, LivePeerMessage>,
     events: Vec<CoordinatorEvent>,
+}
+
+/// Reports whether raw snapshot JSON names an unsupported schema version
+/// (issue #370 W24). A decode failure on a version-mismatched wire maps to
+/// the structured [`CoordinatorError::UnsupportedSnapshot`] instead of a
+/// generic serialization string.
+fn snapshot_schema_unsupported(json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|value| value.get("schema_version")?.as_str().map(str::to_owned))
+        .is_some_and(|version| version != SNAPSHOT_SCHEMA_VERSION)
+}
+
+/// Structural walk confirming legacy pre-candidate-only markers inside
+/// snapshot JSON: a `VERIFIED_COMPLETE` string literal or an
+/// `effect_receipts` map key.
+fn walk_legacy_result_wire(
+    value: &serde_json::Value,
+    verified_complete: &mut bool,
+    effect_receipts: &mut bool,
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            if text == "VERIFIED_COMPLETE" {
+                *verified_complete = true;
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if map.contains_key("effect_receipts") {
+                *effect_receipts = true;
+            }
+            for item in map.values() {
+                walk_legacy_result_wire(item, verified_complete, effect_receipts);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                walk_legacy_result_wire(item, verified_complete, effect_receipts);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Classifies a legacy pre-candidate-only result wire (issue #370 W24):
+/// completion-alias dispositions and provider-supplied authoritative effect
+/// receipts. Returns `None` when no legacy marker is present, so genuinely
+/// malformed JSON still maps to the generic serialization error.
+fn legacy_result_wire_kind(json: &str) -> Option<LegacyResultWireKind> {
+    // Cheap substring pre-filter; the structural walk below confirms the
+    // markers so incidental text can never misclassify.
+    if !json.contains("VERIFIED_COMPLETE") && !json.contains("effect_receipts") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let mut verified_complete = false;
+    let mut effect_receipts = false;
+    walk_legacy_result_wire(&value, &mut verified_complete, &mut effect_receipts);
+    if verified_complete {
+        Some(LegacyResultWireKind::VerifiedCompleteDisposition)
+    } else if effect_receipts {
+        Some(LegacyResultWireKind::ProviderEffectReceipts)
+    } else {
+        None
+    }
 }
 
 impl AgentCoordinator {
@@ -1290,15 +1354,14 @@ impl AgentCoordinator {
         if submission.result.disposition == ResultDisposition::CandidateSucceeded {
             self.require_descendant_closure(&current.attempt_id)?;
         }
-        let receipt = CandidateResultReceipt {
-            submission_id: submission.submission_id.clone(),
-            attempt_id: current.attempt_id.clone(),
-            provider_disposition: submission.result.disposition,
-            proof_ceiling: ProofCeiling::CandidateArtifact,
-            actual_route: submission.result.actual_route.clone(),
-            evidence_refs: submission.result.evidence_refs.clone(),
-            proposed_effect_count: submission.result.proposed_effects.len(),
-        };
+        let receipt = CandidateResultReceipt::new(
+            submission.submission_id.clone(),
+            current.attempt_id.clone(),
+            submission.result.disposition,
+            submission.result.actual_route.clone(),
+            submission.result.evidence_refs.clone(),
+            submission.result.proposed_effects.len(),
+        );
         // Ownership retention on unknown execution (issue #370 P1): the outer
         // disposition never overrides the embedded physical execution axis;
         // `result_by_attempt` below preserves the submission linkage the
@@ -1609,13 +1672,28 @@ impl AgentCoordinator {
                 | CoordinatedAttemptState::UnknownOutcome => {
                     DescendantTerminalState::UnknownOutcome
                 }
-                CoordinatedAttemptState::LostFenced => DescendantTerminalState::Stale,
+                // A fenced lost worker is unreachable, not merely stale
+                // (issue #370 W6; I10-15 `NoLostChildInvariant`: a parent
+                // cannot finish while a descendant is unreachable). An
+                // unreconciled loss projects as `UnknownOutcome`, so the
+                // `Complete` ceiling validation rejects it until the loss is
+                // resolved. Only a loss already taken over by reassignment
+                // (`superseded_by`) is fenced-and-handed-off history and may
+                // project as `Stale`; the replacement attempt's own
+                // disposition then governs the ceiling.
+                CoordinatedAttemptState::LostFenced => {
+                    if attempt.superseded_by.is_some() {
+                        DescendantTerminalState::Stale
+                    } else {
+                        DescendantTerminalState::UnknownOutcome
+                    }
+                }
                 CoordinatedAttemptState::Cancelled => DescendantTerminalState::Cancelled,
                 CoordinatedAttemptState::CandidateResultSubmitted => self
                     .result_by_attempt
                     .get(&attempt.attempt_id)
                     .and_then(|submission_id| self.submissions.get(submission_id))
-                    .map(|record| match record.receipt.provider_disposition {
+                    .map(|record| match record.receipt.provider_disposition() {
                         ResultDisposition::CandidateSucceeded => DescendantTerminalState::Completed,
                         ResultDisposition::Partial => DescendantTerminalState::Partial,
                         ResultDisposition::CancelledObserved => DescendantTerminalState::Cancelled,
@@ -1833,9 +1911,24 @@ impl AgentCoordinator {
         live_config: CoordinatorConfig,
         gap: PlanGap,
     ) -> Result<Self, CoordinatorError> {
-        let snapshot = serde_json::from_str(json)
-            .map_err(|error| CoordinatorError::Serialization(error.to_string()))?;
-        Self::restore(snapshot, live_config, gap)
+        match serde_json::from_str(json) {
+            Ok(snapshot) => Self::restore(snapshot, live_config, gap),
+            Err(error) => {
+                // Legacy wires fail typed decode; classify them into
+                // structured errors instead of a generic serialization
+                // string (issue #370 W24). A version mismatch is an
+                // unsupported snapshot; completion-alias dispositions and
+                // authoritative effect receipts are rejected legacy wires
+                // that are never migrated into candidate success.
+                if snapshot_schema_unsupported(json) {
+                    return Err(CoordinatorError::UnsupportedSnapshot);
+                }
+                if let Some(kind) = legacy_result_wire_kind(json) {
+                    return Err(CoordinatorError::LegacyResultWire(kind));
+                }
+                Err(CoordinatorError::Serialization(error.to_string()))
+            }
+        }
     }
 
     #[allow(clippy::needless_pass_by_value)]
