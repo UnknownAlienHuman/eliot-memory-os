@@ -8,6 +8,13 @@
 //! event/projection/relation intents; the security/provenance closure plus
 //! proof/approval refs; and the expected revision and ordering heads.
 //!
+//! The transition's `ordering_scopes` are not hashed as a separate field:
+//! Governor derives them from the admitted expected ordering heads and every
+//! gate enforces exact set-equality through
+//! [`verify_ordering_scope_binding`], so a post-admission scope edit fails
+//! with the same typed mismatch as a digest divergence (see the set-ordering
+//! rule below).
+//!
 //! The input [`CanonicalRequestView`] is the full envelope-equivalent shape:
 //! Governor builds it from [`crate`] admission values, while Kernel/store
 //! build the identical view from their transported
@@ -38,14 +45,27 @@
 //! `security` provenance/lineage vectors are ordered chains and keep their
 //! order. Reordering a set-like collection therefore yields the identical
 //! hash, while reordering `semantic_commands` yields a different hash.
+//!
+//! The transition's `ordering_scopes` follow the same set semantics without
+//! appearing in the hashed view: [`verify_ordering_scope_binding`] requires
+//! the carried scopes to equal the hashed expected ordering heads as sets
+//! (sorted, duplicates rejected) on every path carrying an ordering
+//! contract, so adding or removing that executable set fails closed with
+//! [`StoreError::TransitionDigestMismatch`]. The transition's
+//! `semantic_source_revisions` stay informational receipt lineage and are
+//! deliberately not bound here: reserved-write legs carry revision heads
+//! with explicitly empty revisions, so equality is not a system invariant;
+//! the carried values are still digest-bound into the receipt envelope via
+//! the full-transition artifact digest, so a post-commit substitution is
+//! detectable at replay.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     EffectClass, EventProjectionRelationIntents, NamedMutationRequest, OperationId,
-    OperationManifestDigest, OrderingHeadExpectation, PreparedTransition, RequestMeta,
-    RevisionHeadExpectation, ScopeId, SecurityContext, StoreError, TransitionClass,
+    OperationManifestDigest, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
+    RequestMeta, RevisionHeadExpectation, ScopeId, SecurityContext, StoreError, TransitionClass,
     canonical_json_bytes, sha256_hex,
 };
 
@@ -108,7 +128,10 @@ impl CanonicalRequestView {
     /// expected heads, so both are rebound here from the transported
     /// `context` and head lists. The transition's stored
     /// `identity.canonical_request_hash` is the claimed digest under test and
-    /// is never copied into the hashed input.
+    /// is never copied into the hashed input. The transition's own
+    /// `ordering_scopes` are carried through untouched (the plan executes
+    /// them directly); gates enforce their correspondence with the hashed
+    /// heads via [`verify_ordering_scope_binding`].
     pub fn from_apply(
         context: &RequestMeta,
         transition: &PreparedTransition,
@@ -185,6 +208,79 @@ pub fn verify_canonical_request_hash(
             expected: bound_digest(expected_hex),
             observed: bound_digest(&observed),
         })
+    }
+}
+
+/// Verifies that the transition-carried ordering scopes are the exact
+/// execution of the hashed expected ordering heads (issue #63).
+///
+/// [`CanonicalRequestView`] covers the expected heads but not the
+/// transition's own `ordering_scopes`, which the store executes: the plan
+/// advances one ordering head per declared scope
+/// (`surreal plan.rs`, `memory transaction_plan`) and the attempt reads the
+/// union of declared and expected scopes. Governor derives the carried
+/// scopes from the admitted heads (`prepare()`), so on any path carrying an
+/// ordering contract (non-empty `expected_ordering_heads`) the two sets must
+/// still coincide here: a post-admission scope addition, removal, or
+/// substitution that leaves the shared digest unchanged fails closed with
+/// [`StoreError::TransitionDigestMismatch`] before any idempotency lookup,
+/// transaction, or receipt. The comparison is set-like (sorted, duplicates
+/// rejected), matching the module ordering rule and the Kernel staging
+/// admission (`validate_admitted`, `pre_stage_check`).
+///
+/// Legs carrying no ordering contract (empty `expected_ordering_heads` —
+/// Kernel-direct automation/notification/reactive/lifecycle writes) have
+/// nothing to contradict and are unchecked by this function; their
+/// transitions are admitted by their owning legs. Callers must invoke this
+/// BEFORE any idempotency-lookup success is returned and BEFORE any
+/// transaction/receipt, next to [`verify_canonical_request_hash`].
+pub fn verify_ordering_scope_binding(
+    transition: &PreparedTransition,
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<(), StoreError> {
+    if expected_ordering_heads.is_empty() {
+        return Ok(());
+    }
+    let mut declared: Vec<&str> = transition
+        .ordering_scopes
+        .iter()
+        .map(OrderingScopeId::as_str)
+        .collect();
+    declared.sort_unstable();
+    declared.dedup();
+    // A repeated scope can never be admitted (`PreparedTransition::validate`
+    // rejects it), so a duplicate here is a post-admission edit.
+    if declared.len() != transition.ordering_scopes.len() {
+        return Err(scope_binding_mismatch(expected_ordering_heads, &declared));
+    }
+    let mut expected: Vec<&str> = expected_ordering_heads
+        .iter()
+        .map(|head| head.scope.as_str())
+        .collect();
+    expected.sort_unstable();
+    if expected != declared {
+        return Err(scope_binding_mismatch(expected_ordering_heads, &declared));
+    }
+    Ok(())
+}
+
+/// Builds the typed mismatch for a scope-binding divergence.
+///
+/// Both digests are secret-free SHA-256 hex over the canonical (sorted,
+/// comma-joined) scope sets: the admitted contract first, the executed
+/// declaration second.
+fn scope_binding_mismatch(
+    expected_ordering_heads: &[OrderingHeadExpectation],
+    declared: &[&str],
+) -> StoreError {
+    let mut expected: Vec<&str> = expected_ordering_heads
+        .iter()
+        .map(|head| head.scope.as_str())
+        .collect();
+    expected.sort_unstable();
+    StoreError::TransitionDigestMismatch {
+        expected: bound_digest(&sha256_hex(expected.join(",").as_bytes())),
+        observed: bound_digest(&sha256_hex(declared.join(",").as_bytes())),
     }
 }
 
