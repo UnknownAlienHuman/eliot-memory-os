@@ -2180,9 +2180,7 @@ fn validate_result_for(
         (CommandAvailability::PlanGap { .. }, CommandResult::Forwarded { .. })
             if matches!(
                 command,
-                CommandId::BackupCreate
-                    | CommandId::BackupVerify
-                    | CommandId::BackupRestoreTest
+                CommandId::BackupCreate | CommandId::BackupVerify | CommandId::BackupRestoreTest
             ) => {}
         (
             CommandAvailability::Unsupported { dependency, detail },

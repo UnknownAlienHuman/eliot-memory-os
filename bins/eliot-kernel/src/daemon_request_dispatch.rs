@@ -93,7 +93,7 @@ const NOTIFICATION_STATE_RESPONSE_KIND: &str = "notification_state";
 #[cfg(windows)]
 const NOTIFICATION_STATE_PAGE_RESPONSE_KIND: &str = "notification_state_page";
 
-/// Authenticated operator selector for the UserAutomation CLI/MCP route.
+/// Authenticated operator selector for the `UserAutomation` CLI/MCP route.
 ///
 /// This is the exact string published as `USER_AUTOMATION_ROUTE` in
 /// `crates/surfaces/eliot-mcp/src/contract.rs` and used by
@@ -1022,9 +1022,12 @@ impl KernelComposition {
                 .peer
                 .validate()
                 .map_err(|_| TransportError::PeerIdentityUnavailable)?;
-            let value = self
-                .user_automation_operator_operation(session, request_id.clone(), payload)
-                .await?;
+            let value = Box::pin(self.user_automation_operator_operation(
+                session,
+                request_id.clone(),
+                payload,
+            ))
+            .await?;
             let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
             frame.request_id = Some(request_id);
             frame.validate()?;
@@ -1148,9 +1151,8 @@ impl KernelComposition {
                 if route.operation != USER_AUTOMATION_RUNTIME_OPERATION {
                     return Err(TransportError::SessionFenced);
                 }
-                let identity = match request_identity.cloned().or(route.request_identity) {
-                    Some(identity) => identity,
-                    None => return Err(TransportError::SessionFenced),
+                let Some(identity) = request_identity.cloned().or(route.request_identity) else {
+                    return Err(TransportError::SessionFenced);
                 };
                 Box::pin(self.user_automation_runtime_operation(
                     session,
@@ -2232,8 +2234,7 @@ impl KernelComposition {
             intent,
         };
         let gateway = self.retained_store_gateway()?;
-        let response = gateway
-            .execute_user_automation_operation(request)
+        let response = Box::pin(gateway.execute_user_automation_operation(request))
             .await
             .map_err(|_error| {
                 super::kernel_diagnostics::observe_terminal_error(

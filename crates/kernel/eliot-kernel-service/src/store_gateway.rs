@@ -910,7 +910,7 @@ impl KernelStoreGateway {
         .map_err(|error| error.to_string())
     }
 
-    /// Executes one authenticated UserAutomation operator operation through
+    /// Executes one authenticated `UserAutomation` operator operation through
     /// the existing canonical Store owner.
     ///
     /// The caller contributes only the authenticated request metadata, the
@@ -949,8 +949,7 @@ impl KernelStoreGateway {
         let mut sealed = request;
         sealed.identity.canonical_request_hash =
             canonical_request_hash(&view).map_err(|error| error.to_string())?;
-        UserAutomationService::new(&store)
-            .dispatch(sealed)
+        Box::pin(UserAutomationService::new(&store).dispatch(sealed))
             .await
             .map_err(|error| error.to_string())
     }

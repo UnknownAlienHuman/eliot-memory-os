@@ -1154,7 +1154,7 @@ fn process_user_automation_request(
 #[cfg(windows)]
 fn process_user_automation_owner_requests(host: &HostComposition) {
     let queue = host.user_automation_execution_queue();
-    if queue.lock().map(|queue| queue.is_empty()).unwrap_or(true) {
+    if queue.lock().map_or(true, |queue| queue.is_empty()) {
         return;
     }
     if let Err(error) = host.process_user_automation_requests(&queue) {
