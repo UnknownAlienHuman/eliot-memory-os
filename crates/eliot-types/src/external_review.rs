@@ -40,6 +40,7 @@ pub enum ExternalReviewRole {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ExternalProviderAuthority {
     pub candidate_only: bool,
@@ -68,6 +69,7 @@ impl Default for ExternalProviderAuthority {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalProviderLimits {
     pub timeout_ms: u64,
     pub max_packet_bytes: usize,
@@ -87,6 +89,7 @@ impl Default for ExternalProviderLimits {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalProviderProfile {
     pub provider_id: String,
     pub display_name: String,
@@ -122,6 +125,7 @@ pub enum ExternalOutputSchemaKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalReviewBudget {
     pub max_packet_bytes: usize,
     pub max_output_bytes: usize,
@@ -139,6 +143,7 @@ impl Default for ExternalReviewBudget {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalReviewRequest {
     pub request_id: String,
     pub project: String,
@@ -170,6 +175,7 @@ pub enum ExternalReviewJobStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalReviewJob {
     pub job_id: String,
     pub request_id: String,
@@ -223,6 +229,7 @@ pub enum ExternalCitationStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalEvidenceCitation {
     pub citation_id: String,
     pub evidence_ref: String,
@@ -232,6 +239,7 @@ pub struct ExternalEvidenceCitation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalReviewFinding {
     pub finding_id: String,
     pub title: String,
@@ -249,6 +257,7 @@ pub enum ExternalProposedChangeKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalProposedChange {
     pub change_id: String,
     pub kind: ExternalProposedChangeKind,
@@ -259,6 +268,7 @@ pub struct ExternalProposedChange {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalVerifierSuggestion {
     pub verifier_id: String,
     pub command: String,
@@ -267,6 +277,7 @@ pub struct ExternalVerifierSuggestion {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalUncertainty {
     pub uncertainty_id: String,
     pub summary: String,
@@ -274,6 +285,7 @@ pub struct ExternalUncertainty {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalReviewResult {
     pub result_id: String,
     pub request_id: String,
@@ -322,6 +334,7 @@ pub enum ExternalReviewGateReason {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalReviewGateDecision {
     pub request_id: String,
     pub provider_id: String,
@@ -333,6 +346,7 @@ pub struct ExternalReviewGateDecision {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalReviewNormalizationReceipt {
     pub receipt_id: String,
     pub request_id: String,
@@ -346,6 +360,7 @@ pub struct ExternalReviewNormalizationReceipt {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalReviewPacket {
     pub packet_id: String,
     pub request_id: String,

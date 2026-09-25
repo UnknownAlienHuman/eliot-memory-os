@@ -23,6 +23,7 @@ pub enum DelegationRootOrigin {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationOriginChain {
     pub root_origin: DelegationRootOrigin,
     pub provider_chain: Vec<String>,
@@ -47,6 +48,7 @@ pub enum DelegationProviderPreference {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationRequest {
     pub delegation_id: String,
     pub project_id: ProjectId,
@@ -102,6 +104,7 @@ pub enum DelegationReason {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationDecision {
     pub decision_id: String,
     pub delegation_id: String,
@@ -116,6 +119,7 @@ pub struct DelegationDecision {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationBudget {
     pub budget_id: String,
     pub task_id: TaskId,
@@ -132,6 +136,7 @@ pub struct DelegationBudget {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderCallBudgetState {
     pub campaign_id: String,
     pub schema_version: String,
@@ -159,6 +164,7 @@ pub enum ProviderCallReservationState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderCallReservation {
     pub reservation_id: String,
     pub campaign_id: String,
@@ -179,6 +185,7 @@ pub struct ProviderCallReservation {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderCallLedger {
     pub budgets: Vec<ProviderCallBudgetState>,
     pub reservations: Vec<ProviderCallReservation>,
@@ -196,6 +203,7 @@ pub enum DelegationJobState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationJob {
     pub job_id: String,
     pub delegation_id: String,
@@ -220,6 +228,7 @@ pub enum DelegationOutcomeStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationOutcome {
     pub outcome_id: String,
     pub delegation_id: String,
@@ -245,6 +254,7 @@ pub struct DelegationOutcome {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationState {
     pub requests: Vec<DelegationRequest>,
     pub decisions: Vec<DelegationDecision>,
@@ -285,6 +295,7 @@ pub enum DelegationPublicStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationReviewResponse {
     pub delegation_id: String,
     pub decision: DelegationDecisionKind,

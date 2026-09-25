@@ -30,6 +30,7 @@ pub enum DelegationCalibrationTaskFamily {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationCalibrationLabels {
     pub provider_called: bool,
     pub provider_useful: Option<bool>,
@@ -47,6 +48,7 @@ pub struct DelegationCalibrationLabels {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationCalibrationCosts {
     pub provider_runtime_ms: Option<u64>,
     pub end_to_end_runtime_ms: Option<u64>,
@@ -60,6 +62,7 @@ pub struct DelegationCalibrationCosts {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct CalibrationCompleteness {
     pub route_decision_present: bool,
@@ -74,6 +77,7 @@ pub struct CalibrationCompleteness {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationCalibrationSample {
     pub sample_id: String,
     pub project_id: ProjectId,
@@ -103,6 +107,7 @@ pub enum DelegationShadowDecisionKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationShadowRecord {
     pub shadow_id: String,
     pub project_id: ProjectId,
@@ -128,6 +133,7 @@ pub enum DelegationCounterfactualKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationCounterfactualLabel {
     pub label_id: String,
     pub shadow_ref: String,
@@ -147,6 +153,7 @@ pub enum DelegationCalibrationReadiness {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationFamilyCalibration {
     pub calibration_id: String,
     pub task_family: DelegationCalibrationTaskFamily,
@@ -187,12 +194,14 @@ pub enum DelegationTriggerChangeKind {
     DisableReview,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationTriggerChange {
     pub task_family: DelegationCalibrationTaskFamily,
     pub change: DelegationTriggerChangeKind,
     pub reason: String,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationBudgetChange {
     pub task_family: DelegationCalibrationTaskFamily,
     pub change: String,
@@ -200,6 +209,7 @@ pub struct DelegationBudgetChange {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationPolicyCandidate {
     pub candidate_id: String,
     pub base_policy_ref: String,
@@ -243,6 +253,7 @@ pub enum DelegationPolicyPromotionReason {
     FamilySpecificBenefitObserved,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationPolicyPromotionDecision {
     pub decision_id: String,
     pub candidate_ref: String,
@@ -278,6 +289,7 @@ pub enum DelegationCalibrationCampaignState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationCalibrationCampaignTransition {
     pub from: DelegationCalibrationCampaignState,
     pub to: DelegationCalibrationCampaignState,
@@ -297,6 +309,7 @@ pub enum DelegationCalibrationCampaignCloseoutStatus {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationCalibrationCampaignBudget {
     pub max_provider_calls: u32,
     pub max_cost_if_known: Option<f64>,
@@ -304,6 +317,7 @@ pub struct DelegationCalibrationCampaignBudget {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationEvidenceFloorSnapshot {
     pub minimum_real_tasks_total: u32,
     pub minimum_real_tasks_per_family: u32,
@@ -314,6 +328,7 @@ pub struct DelegationEvidenceFloorSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationCalibrationCampaign {
     pub campaign_id: String,
     pub project_id: ProjectId,
@@ -344,12 +359,14 @@ pub struct DelegationCalibrationCampaign {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FrozenInputDigest {
     pub source_ref: String,
     pub content_hash: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderReviewPreRegistration {
     pub preregistration_id: String,
     pub campaign_id: String,
@@ -406,6 +423,7 @@ pub enum ProviderFindingVerdict {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderFindingDisposition {
     pub campaign_id: String,
     pub review_id: String,
@@ -445,6 +463,7 @@ pub enum ProviderCallLineageTerminalState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderCallLineage {
     pub invocation_index: u32,
     pub trigger_command_or_target: String,
@@ -458,6 +477,7 @@ pub struct ProviderCallLineage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CampaignIntegrityIncidentDetails {
     pub phase: String,
     pub campaign_id: String,
@@ -489,6 +509,7 @@ pub enum ExecutedProviderReviewStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutedProviderReview {
     pub review_id: String,
     pub campaign_id: String,
@@ -540,6 +561,7 @@ pub enum IndependentEvidenceResult {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct IndependentEvidenceContaminationChecks {
     pub producer_is_provider: bool,
@@ -549,6 +571,7 @@ pub struct IndependentEvidenceContaminationChecks {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct IndependentOutcomeEvidence {
     pub evidence_id: String,
@@ -593,6 +616,7 @@ pub enum ProviderUtilityReason {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderUtilityAssessment {
     pub assessment_id: String,
     pub campaign_id: String,
@@ -634,6 +658,7 @@ pub enum CalibrationIntegrityStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CalibrationCorpusEligibility {
     pub sample_ref: String,
     pub sample_kind: CalibrationCorpusSampleKind,
@@ -656,6 +681,7 @@ pub enum DelegationPromotionReadinessVerdict {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CalibrationEvidenceCounts {
     pub real_tasks: u32,
     pub executed_reviews: u32,
@@ -664,6 +690,7 @@ pub struct CalibrationEvidenceCounts {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CalibrationExcludedCounts {
     pub over_budget_calls: u32,
     pub unknown_dispatch_calls: u32,
@@ -672,6 +699,7 @@ pub struct CalibrationExcludedCounts {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CalibrationEvidenceGapReport {
     pub current_counts: CalibrationEvidenceCounts,
     #[serde(default)]
@@ -695,7 +723,7 @@ pub struct CalibrationEvidenceGapReport {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DelegationCalibrationState {
     pub samples: Vec<DelegationCalibrationSample>,
     pub shadows: Vec<DelegationShadowRecord>,

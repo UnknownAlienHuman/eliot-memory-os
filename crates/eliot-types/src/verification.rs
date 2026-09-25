@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestInventory {
     pub inventory_id: String,
     pub project_id: ProjectId,
@@ -14,6 +15,7 @@ pub struct TestInventory {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestMetadata {
     pub test_id: String,
     pub crate_name: String,
@@ -88,6 +90,7 @@ pub enum TestStatefulness {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestSuiteProfile {
     pub profile_id: String,
     pub name: String,
@@ -100,6 +103,7 @@ pub struct TestSuiteProfile {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationPlan {
     pub plan_id: String,
     pub profile_id: String,
@@ -122,6 +126,7 @@ pub enum VerificationRuntimeClass {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkippedTest {
     pub test_id: String,
     pub reason: SkippedTestReason,
@@ -138,6 +143,7 @@ pub enum SkippedTestReason {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationRun {
     pub run_id: String,
     pub plan_id: String,
@@ -151,6 +157,7 @@ pub struct VerificationRun {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationCommandResult {
     pub command: String,
     pub status: VerificationCommandStatus,
@@ -181,6 +188,7 @@ pub enum VerificationRunStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationVerdict {
     pub verdict_id: String,
     pub run_id: String,
@@ -204,6 +212,7 @@ pub enum VerificationDecision {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestCostReport {
     pub report_id: String,
     #[serde(with = "time::serde::rfc3339")]
@@ -217,24 +226,28 @@ pub struct TestCostReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestCountByKind {
     pub key: TestKind,
     pub count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestCountByIntent {
     pub key: TestIntent,
     pub count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestCountByCost {
     pub key: TestCostClass,
     pub count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FlakeReport {
     pub report_id: String,
     #[serde(with = "time::serde::rfc3339")]
@@ -248,6 +261,7 @@ pub struct FlakeReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StatefulDbIsolationReport {
     pub report_id: String,
     #[serde(with = "time::serde::rfc3339")]
@@ -261,6 +275,7 @@ pub struct StatefulDbIsolationReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationDoctorStatus {
     pub last_profile: Option<String>,
     pub last_run_status: Option<VerificationRunStatus>,
