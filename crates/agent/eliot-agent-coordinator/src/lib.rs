@@ -16,6 +16,7 @@ mod provider_admission;
 mod swarm_admission_bind;
 mod swarm_command_candidate;
 mod swarm_controlboard;
+mod swarm_definition_admission;
 mod swarm_launch_bind;
 mod swarm_staffing;
 #[cfg(test)]
@@ -46,6 +47,7 @@ pub use crate::provider_admission::{
 pub use crate::swarm_admission_bind::*;
 pub use crate::swarm_command_candidate::*;
 pub use crate::swarm_controlboard::*;
+pub use crate::swarm_definition_admission::*;
 pub use crate::swarm_launch_bind::*;
 pub use crate::swarm_staffing::*;
 

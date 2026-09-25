@@ -788,6 +788,7 @@ dependencies = [
  "eliot-kernel-service",
  "eliot-receipts",
  "eliot-security-contracts",
+ "eliot-swarm",
  "serde",
  "serde_json",
  "thiserror",
