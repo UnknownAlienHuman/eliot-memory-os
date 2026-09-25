@@ -3,6 +3,16 @@
 //! The binary owns only process lifetime and durable registration wiring. G-01
 //! and P-04 remain explicit provider boundaries; this root never manufactures
 //! authority or process evidence when those providers are not composed.
+//!
+//! Issue #74 makes the per-operation identity ledger durable. The protected
+//! launch binding still carries stable caller/launch fields only and never a
+//! per-operation [`eliot_protocol::RequestIdentity`]; instead every identity
+//! the issuer spends is projected into the same atomic snapshot publication as
+//! the registration state, and a restarted broker re-seeds its issuer from that
+//! recovered ledger before `self_register` can mint. A restart therefore
+//! continues from the protected launch/caller identity plus a *new*
+//! registration operation and never revives a historical request id,
+//! cancellation id, or idempotency key.
 
 #![forbid(unsafe_code)]
 
@@ -25,8 +35,9 @@ use eliot_process::{
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_user_broker_core::{
     AuthorityPort, BrokerError, BrokerSnapshot, DurableRegistrationPort, HeartbeatReceipt,
-    HeartbeatRequest, LaunchGrant, LaunchRequest, PortError, ProcessPort, ProcessStartOutcome,
-    RegistrationReceipt, RequiredProvider, UserBroker,
+    HeartbeatRequest, IssuedOperationIdentity, IssuedOperationIdentityLedger, LaunchGrant,
+    LaunchRequest, LostOperation, PortError, ProcessPort, ProcessStartOutcome, RegistrationReceipt,
+    RequiredProvider, UserBroker,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -46,7 +57,9 @@ pub use notify_launch_callin::{
     BrokerNotifyError, NotifyLaunchStage, VerifiedLaunchRef, resolve_broker_notify_launch,
     stage_normal_notify_launch,
 };
-use operation_identity::{IssuerHandle, OperationIdentityIssuer};
+use operation_identity::{
+    BrokerOperation, DurableIssuedIdentity, IssuerHandle, OperationIdentityIssuer,
+};
 use protected_launch_config::{
     BrokerLaunchBinding, REGISTRATION_LEASE_TTL_MS, binding_digest, fresh_registration_request,
     load_protected_launch_binding,
@@ -106,9 +119,92 @@ pub enum CompositionError {
     Kernel(String),
     #[error("Kernel front-door lock poisoned")]
     KernelLock,
+    /// The durable per-operation identity ledger recovered at startup
+    /// contradicts itself or the retained launch declaration. The broker
+    /// refuses to start rather than mint an identity a previous process
+    /// already spent.
+    #[error("durable operation identity ledger conflict: {0}")]
+    OperationIdentityLedger(String),
+    /// One broker-owned Kernel operation lost its acknowledgement. The exact
+    /// transport identity that issued it is named so the outcome is reconciled
+    /// by operation identity (issue #74 A6), never by a blind retry: a new
+    /// registration refresh, a second logoff, or a second launch is not
+    /// created from this path.
+    #[error(
+        "Kernel {operation} acknowledgement is unknown for request {request_id} (cancellation {cancellation_id}, idempotency key {idempotency_key}, canonical digest {canonical_digest}); the exact operation must be reconciled before any further effect"
+    )]
+    LostOperation {
+        /// Closed Kernel operation selector that issued the identity.
+        operation: &'static str,
+        /// Exact transport request id of the issued identity.
+        request_id: String,
+        /// Exact transport cancellation id of the issued identity.
+        cancellation_id: String,
+        /// Exact transport idempotency key of the issued identity.
+        idempotency_key: String,
+        /// Canonical digest of the exact operation payload.
+        canonical_digest: String,
+    },
 }
 
 type SharedKernelClient = Arc<Mutex<eliot_cli::kernel_client::KernelClient>>;
+
+/// Projects the composed per-operation identity issuer into the durable
+/// broker snapshot.
+///
+/// This is the one place where broker-local transport identity strings become
+/// durable state. It carries no authority: the registration receipt beside it
+/// in the same snapshot remains the only registration/epoch evidence, and the
+/// broker-local `user_broker_epoch` scalar is never copied into these rows.
+struct IssuedIdentityLedger {
+    issuer: IssuerHandle,
+}
+
+impl IssuedOperationIdentityLedger for IssuedIdentityLedger {
+    fn issued_operation_identities(&self) -> Vec<IssuedOperationIdentity> {
+        match self.issuer.lock() {
+            Ok(issuer) => issuer
+                .issued_identities()
+                .into_iter()
+                .map(IssuedOperationIdentity::from)
+                .collect(),
+            // A poisoned identity lock must not silently drop the spent
+            // identities from the durable snapshot; returning the empty
+            // projection makes the next issuance fail closed instead.
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+impl From<DurableIssuedIdentity> for IssuedOperationIdentity {
+    fn from(issued: DurableIssuedIdentity) -> Self {
+        Self {
+            operation: issued.operation,
+            canonical_digest: issued.canonical_digest,
+            request_id: issued.request_id,
+            idempotency_key: issued.idempotency_key,
+            cancellation_id: issued.cancellation_id,
+            deadline_unix_ms: issued.deadline_unix_ms,
+            issued_at_ms: issued.issued_at_ms,
+            caller_request_id: issued.caller_request_id,
+        }
+    }
+}
+
+impl From<&IssuedOperationIdentity> for DurableIssuedIdentity {
+    fn from(issued: &IssuedOperationIdentity) -> Self {
+        Self {
+            operation: issued.operation.clone(),
+            canonical_digest: issued.canonical_digest.clone(),
+            request_id: issued.request_id.clone(),
+            idempotency_key: issued.idempotency_key.clone(),
+            cancellation_id: issued.cancellation_id.clone(),
+            deadline_unix_ms: issued.deadline_unix_ms,
+            issued_at_ms: issued.issued_at_ms,
+            caller_request_id: issued.caller_request_id.clone(),
+        }
+    }
+}
 
 /// Retains observation-only process evidence without granting any additional
 /// authority to the broker or its callers.
@@ -681,12 +777,34 @@ impl BrokerComposition {
                     registration: None,
                     user_broker_epoch: 0,
                     operation_cursors: Vec::new(),
+                    operation_identities: Vec::new(),
                 })
                 .map_err(|error| CompositionError::InvalidConfiguration(error.to_string()))?;
         }
         let providers_admitted = authority.is_some() && process.is_some();
         let mut broker = UserBroker::new(authority, process, Some(Box::new(durable)));
+        // The live identity ledger must be attached before recovery so the
+        // snapshot is republished with the exact identities this process
+        // issues, and before the first Kernel call can mint.
+        broker.attach_issued_operation_identity_ledger(Box::new(IssuedIdentityLedger {
+            issuer: issuer.clone(),
+        }));
         broker.recover().map_err(CompositionError::Recovery)?;
+        // A4: a restart continues from the protected launch/caller identity
+        // plus a new registration operation and never revives a historical
+        // request id.  Re-seeding the issuer from the recovered durable ledger
+        // before `self_register` is what holds that: every request id,
+        // cancellation id, and idempotency key the previous process spent is
+        // already bound to its exact operation, so replaying one is an
+        // identity conflict rather than a fresh mint.  A retained row that
+        // contradicts live state fails the whole composition closed.
+        let mut identity = issuer.lock().map_err(|_| CompositionError::KernelLock)?;
+        for retained in broker.recovered_operation_identities() {
+            identity
+                .restore_issued(&DurableIssuedIdentity::from(&retained))
+                .map_err(|error| CompositionError::OperationIdentityLedger(error.to_string()))?;
+        }
+        drop(identity);
         let registration_digest = broker.registration_digest().map(ToOwned::to_owned);
         let (launch_binding, launch_lease) = launch.map_or((None, None), |(binding, lease)| {
             (Some(binding), Some(lease))
@@ -755,6 +873,14 @@ impl BrokerComposition {
 
     /// Refreshes the exact protected registration lease; the stdin protocol
     /// cannot manufacture or submit a heartbeat identity.
+    ///
+    /// A lost lease-refresh acknowledgement is first reconciled against the
+    /// durable registration bound to that exact operation. When the durable
+    /// projection already proves the renewal, the recovered receipt is
+    /// returned and no second refresh identity is minted; otherwise the exact
+    /// transport identity that lost its acknowledgement is named in
+    /// [`CompositionError::LostOperation`] and the broker must re-attach
+    /// through a fresh protected launch binding.
     pub fn heartbeat(&mut self) -> Result<HeartbeatReceipt, CompositionError> {
         self.verify_launch_lease()?;
         let registration_digest = self
@@ -768,13 +894,14 @@ impl BrokerComposition {
             .as_millis()
             .try_into()
             .map_err(|error| CompositionError::Launch(format!("clock overflow: {error}")))?;
-        let receipt = self
-            .broker
-            .heartbeat(HeartbeatRequest {
-                registration_digest,
-                observed_at,
-            })
-            .map_err(CompositionError::Recovery)?;
+        let receipt = match self.broker.heartbeat(HeartbeatRequest {
+            registration_digest,
+            observed_at,
+        }) {
+            Ok(receipt) => receipt,
+            Err(BrokerError::UnknownOutcome) => return Err(self.lost_operation_error()),
+            Err(error) => return Err(CompositionError::Recovery(error)),
+        };
         self.registration_digest = Some(receipt.registration_digest.clone());
         Ok(receipt)
     }
@@ -784,11 +911,63 @@ impl BrokerComposition {
     /// A clean stdin EOF and an admitted `stop` operation use the same durable
     /// close path; dropping the composition alone must never leave an active
     /// registration lease for the next process instance.
+    ///
+    /// The fence owns its own operation identity, so closing twice is one
+    /// Kernel operation, not two. A lost logoff acknowledgement is reconciled
+    /// against the durable projection of that exact fence: when the fence
+    /// landed, the close completes without a duplicate logoff; otherwise the
+    /// exact transport identity is named in
+    /// [`CompositionError::LostOperation`].
     pub fn close(&mut self) -> Result<(), CompositionError> {
         self.verify_launch_lease()?;
-        self.broker.logoff().map_err(CompositionError::Recovery)?;
-        self.registration_digest = None;
-        Ok(())
+        match self.broker.logoff() {
+            Ok(()) => {
+                self.registration_digest = None;
+                Ok(())
+            }
+            Err(BrokerError::UnknownOutcome) => Err(self.lost_operation_error()),
+            Err(error) => Err(CompositionError::Recovery(error)),
+        }
+    }
+
+    /// Reconciles a lost or unknown broker-owned Kernel acknowledgement by the
+    /// exact transport operation identity that issued it.
+    ///
+    /// The core classifies *which* broker-owned operation lost its outcome
+    /// (a lease refresh or a fence), and the exact transport identity for
+    /// that operation is read back from the issuer's spent ledger: request id,
+    /// cancellation id, idempotency key, and the canonical payload digest it
+    /// is bound to. Naming it here instead of returning a bare error is what
+    /// keeps a heartbeat/fence race from being settled by a second refresh, a
+    /// duplicate logoff, or a second launch under a new identity.
+    fn lost_operation_error(&mut self) -> CompositionError {
+        let Some(lost) = self.broker.take_lost_operation() else {
+            return CompositionError::OperationIdentityLedger(
+                "an unknown outcome was reported without a classified broker operation".to_owned(),
+            );
+        };
+        let operation = match lost {
+            LostOperation::LeaseRefresh => BrokerOperation::HeartbeatRenewal,
+            LostOperation::Fence => BrokerOperation::FenceLogoff,
+        };
+        let issued = self
+            .identity_issuer
+            .lock()
+            .ok()
+            .and_then(|issuer| issuer.last_issued(operation));
+        let Some(issued) = issued else {
+            return CompositionError::OperationIdentityLedger(format!(
+                "{} has no issued operation identity to reconcile",
+                operation.selector()
+            ));
+        };
+        CompositionError::LostOperation {
+            operation: operation.selector(),
+            request_id: issued.request_id,
+            cancellation_id: issued.cancellation_id,
+            idempotency_key: issued.idempotency_key,
+            canonical_digest: issued.canonical_digest,
+        }
     }
 
     /// Stages broker-bound Notify normal-launch inputs for one grant.
