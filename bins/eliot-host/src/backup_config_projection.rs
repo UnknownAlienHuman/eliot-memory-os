@@ -119,6 +119,68 @@ pub struct BackupConfigProjection {
     pub projection_digest: String,
 }
 
+/// Canonical length-prefixed field hashing shared by every #958 digest.
+///
+/// Both the label and the value are length-prefixed, so no two `(label, value)`
+/// sequences — and no field boundary inside one — can produce the same byte
+/// stream. I5.27 requires a deterministic, versioned canonical encoding; an
+/// unprefixed concatenation does not give one.
+pub(crate) fn hash_field(hasher: &mut Sha256, label: &[u8], value: &[u8]) {
+    hasher.update((label.len() as u64).to_le_bytes());
+    hasher.update(label);
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+/// Binds the caller-observed state fence into a projection digest.
+///
+/// `BackupConfigProjection::projection_digest` is documented to bind every field
+/// above it, and `state_fence` is one of those fields, but the v1 digest was
+/// computed without it: two projections differing only in the lineage-aware
+/// authority epoch, resource generation or task/policy/integration revision
+/// hashed identically. `StateFence` is a required durable field (I5.16) and the
+/// fence is what carries authority, so omitting it from the binding is exactly
+/// the silent omission I5.27 forbids.
+///
+/// The fence is encoded through its own derived `Serialize` implementation
+/// (declaration-ordered, no maps), length-prefixed by [`hash_field`], so the
+/// bytes are deterministic for this pinned fence type.
+fn hash_state_fence(hasher: &mut Sha256, fence: &StateFence) -> Result<(), ProjectionError> {
+    let encoded = serde_json::to_vec(fence).map_err(|_| ProjectionError::InvalidDigest {
+        field: "state_fence",
+    })?;
+    hash_field(hasher, b"state_fence", &encoded);
+    Ok(())
+}
+
+/// Binds the optional forensic audit note into a projection digest.
+///
+/// The note is validated request content that never reached the v1 digest, so
+/// two requests differing only in the note produced byte-identical projections
+/// and the receipt could not say which evidence was presented. The note keeps
+/// its forensic ceiling — it is still never a lease, grant or current-state
+/// assertion — binding it only discriminates the request it belongs to.
+fn hash_audit_note(hasher: &mut Sha256, audit: Option<&AuditFenceNote>) {
+    let Some(note) = audit else {
+        hash_field(hasher, b"audit", b"absent");
+        return;
+    };
+    hash_field(hasher, b"audit", b"present");
+    hash_field(
+        hasher,
+        b"audit.disposition_count",
+        &(note.observed_dispositions.len() as u64).to_le_bytes(),
+    );
+    hash_field(hasher, b"audit.note_digest", note.note_digest.as_bytes());
+    for disposition in &note.observed_dispositions {
+        hash_field(
+            hasher,
+            b"audit.observed_dispositions",
+            disposition.as_bytes(),
+        );
+    }
+}
+
 fn check_digest(value: &str, field: &'static str) -> Result<(), ProjectionError> {
     if value.len() != DIGEST_HEX_LEN
         || !value
@@ -207,18 +269,32 @@ pub fn project_backup_config(
         });
     }
     let mut hasher = Sha256::new();
-    hasher.update(b"eliot.backup.config-projection.v1\0");
+    hasher.update(b"eliot.backup.config-projection.v2\0");
     hasher.update(CONFIG_PROJECTION_VERSION.to_le_bytes());
-    hasher.update(request.installation_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(request.owner_lease_ref.as_bytes());
-    hasher.update([0]);
+    hash_field(
+        &mut hasher,
+        b"installation_id",
+        request.installation_id.as_bytes(),
+    );
+    hash_field(
+        &mut hasher,
+        b"owner_lease_ref",
+        request.owner_lease_ref.as_bytes(),
+    );
+    hasher.update(b"generation\0");
     hasher.update(request.generation.to_le_bytes());
-    hasher.update(request.manifest_digest.as_bytes());
+    hash_field(
+        &mut hasher,
+        b"manifest_digest",
+        request.manifest_digest.as_bytes(),
+    );
     for digest in &request.build_digests {
-        hasher.update(digest.as_bytes());
+        hash_field(&mut hasher, b"build_digest", digest.as_bytes());
     }
+    hasher.update(b"purge_ledger_revision\0");
     hasher.update(request.purge_ledger_revision.to_le_bytes());
+    hash_state_fence(&mut hasher, fence)?;
+    hash_audit_note(&mut hasher, request.audit.as_ref());
     let projection_digest = format!("{:x}", hasher.finalize());
     Ok(BackupConfigProjection {
         version: CONFIG_PROJECTION_VERSION,
@@ -343,19 +419,37 @@ pub fn project_backup_config_owner_bound(
         }
     }
     let mut hasher = Sha256::new();
-    hasher.update(b"eliot.backup.config-projection.v1\0");
+    hasher.update(b"eliot.backup.config-projection.v2\0");
     hasher.update(CONFIG_PROJECTION_VERSION.to_le_bytes());
-    hasher.update(request.installation_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(request.owner_lease_ref.as_bytes());
-    hasher.update([0]);
+    hash_field(
+        &mut hasher,
+        b"installation_id",
+        request.installation_id.as_bytes(),
+    );
+    hash_field(
+        &mut hasher,
+        b"owner_lease_ref",
+        request.owner_lease_ref.as_bytes(),
+    );
+    hasher.update(b"generation\0");
     hasher.update(request.generation.to_le_bytes());
-    hasher.update(binding.generation_handle.as_bytes());
-    hasher.update(binding.config_digest.as_bytes());
+    hash_field(
+        &mut hasher,
+        b"generation_handle",
+        binding.generation_handle.as_bytes(),
+    );
+    hash_field(
+        &mut hasher,
+        b"manifest_digest",
+        binding.config_digest.as_bytes(),
+    );
     for digest in &request.build_digests {
-        hasher.update(digest.as_bytes());
+        hash_field(&mut hasher, b"build_digest", digest.as_bytes());
     }
+    hasher.update(b"purge_ledger_revision\0");
     hasher.update(request.purge_ledger_revision.to_le_bytes());
+    hash_state_fence(&mut hasher, fence)?;
+    hash_audit_note(&mut hasher, request.audit.as_ref());
     let projection_digest = format!("{:x}", hasher.finalize());
     Ok(BackupConfigProjection {
         version: CONFIG_PROJECTION_VERSION,

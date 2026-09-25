@@ -18,7 +18,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::backup_config_projection::{ApprovedBuildBinding, ProjectionError, bind_approved_build};
+use crate::backup_config_projection::{
+    ApprovedBuildBinding, ProjectionError, bind_approved_build, hash_field,
+};
 use eliot_installation::{
     ActivationCommitFence, ApprovedGeneration, ApprovedGenerationRegistry,
     RedbInstallationRegistry, RuntimeStateRoots,
@@ -95,6 +97,20 @@ pub enum PreparationError {
 pub enum PreparationClass {
     /// Isolated restore rehearsal destination (fenced, no effects).
     IsolatedRestoreRehearsal,
+}
+
+impl PreparationClass {
+    /// Canonical class token bound into the admission digest.
+    ///
+    /// The admission digest must discriminate the class, so the token is a
+    /// closed `&'static str` rather than a `Debug` rendering: adding a variant
+    /// forces a decision here instead of silently changing the digest input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IsolatedRestoreRehearsal => "isolated_restore_rehearsal",
+        }
+    }
 }
 
 /// Destination admission: explicit, fully-bound request (issue #958, cases 958/5-7, 958/9).
@@ -281,25 +297,92 @@ pub fn derive_destination_epoch(operation_id: &str, authority_nonce: &str) -> u6
     u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap_or([0; 8])).max(1)
 }
 
+/// Hashes a path through its lossless platform byte encoding.
+///
+/// `Path::to_string_lossy` maps unpaired surrogates to U+FFFD, so two distinct
+/// roots can share one digest. The admission digest exists to discriminate the
+/// admitted inputs (I5.27), so the raw OS bytes are hashed instead and a
+/// substituted root can never reuse a recorded digest.
+#[cfg(windows)]
+fn hash_path(hasher: &mut Sha256, label: &[u8], path: &Path) {
+    use std::os::windows::ffi::OsStrExt as _;
+    let units: Vec<u8> = path
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    hash_field(hasher, label, &units);
+}
+
+#[cfg(not(windows))]
+fn hash_path(hasher: &mut Sha256, label: &[u8], path: &Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+    hash_field(hasher, label, path.as_os_str().as_bytes());
+}
+
 /// Admission digest binding every admitted input (idempotency key).
+///
+/// v1 left `class`, `source_root` and `authority_generation` out of the hashed
+/// set while `conflict_field` did compare `class`. The two lists disagreed, and
+/// the disagreement was exploitable rather than cosmetic: `prepare_isolated_destination`
+/// compares the recorded digest first and returns the recorded destination
+/// without re-running [`admit_staging_parent`] when it matches, so re-presenting
+/// a recorded `operation_id` with a different `class` or a different
+/// `source_root` — including the live source installation root — hashed
+/// identically, took the "same inputs" branch, and returned `Ok` with no
+/// conflict, no naming, and no re-admission. I5.27: a field affecting authority
+/// or scope cannot be omitted silently, and reusing an idempotency key with a
+/// different canonical request hash must conflict.
+///
+/// v2 hashes every field of [`DestinationAdmission`], length-prefixed and
+/// domain-separated, with paths encoded losslessly.
 fn admission_digest(admission: &DestinationAdmission) -> String {
-    sha_hex(&[
-        b"eliot.backup.destination-admission.v1\0",
+    let mut hasher = Sha256::new();
+    hasher.update(b"eliot.backup.destination-admission.v2\0");
+    hasher.update(PREPARATION_VERSION.to_le_bytes());
+    hash_field(
+        &mut hasher,
+        b"operation_id",
         admission.operation_id.as_bytes(),
-        b"\0",
+    );
+    hash_field(&mut hasher, b"class", admission.class.as_str().as_bytes());
+    hash_field(
+        &mut hasher,
+        b"source_installation_id",
         admission.source_installation_id.as_bytes(),
-        b"\0",
-        admission.staging_parent.to_string_lossy().as_bytes(),
-        b"\0",
+    );
+    hash_path(&mut hasher, b"source_root", &admission.source_root);
+    hash_path(&mut hasher, b"staging_parent", &admission.staging_parent);
+    hash_field(
+        &mut hasher,
+        b"target_build",
         admission.target_build.as_bytes(),
-        b"\0",
+    );
+    hash_field(
+        &mut hasher,
+        b"target_profile",
         admission.target_profile.as_bytes(),
-        b"\0",
-        &admission.approved_generation.to_le_bytes(),
+    );
+    hasher.update(b"approved_generation\0");
+    hasher.update(admission.approved_generation.to_le_bytes());
+    hasher.update(b"authority_generation\0");
+    hasher.update(admission.authority_generation.to_le_bytes());
+    hash_field(
+        &mut hasher,
+        b"manifest_digest",
         admission.manifest_digest.as_bytes(),
+    );
+    hash_field(
+        &mut hasher,
+        b"authority_nonce",
         admission.authority_nonce.as_bytes(),
+    );
+    hash_field(
+        &mut hasher,
+        b"state_fence_digest",
         admission.state_fence_digest.as_bytes(),
-    ])
+    );
+    format!("{:x}", hasher.finalize())
 }
 
 /// Reparse-point attribute test (case 958/8): the exact bit the OS check enforces.
@@ -436,11 +519,17 @@ fn intent_json(admission: &DestinationAdmission, digest: &str, root: &Path) -> s
 
 /// Names the first differing admission field between the recorded intent and
 /// a changed re-presentation (case 958/13).
+///
+/// The compared list mirrors the v2 [`admission_digest`] hashed set exactly.
+/// `source_root` was missing here while being the field that decides which
+/// installation is the live source, so a conflict could never name it.
 fn conflict_field(intent: &serde_json::Value, admission: &DestinationAdmission) -> &'static str {
     let recorded = intent.get("admission");
     let current = serde_json::to_value(admission).unwrap_or(serde_json::Value::Null);
     for field in [
+        "class",
         "source_installation_id",
+        "source_root",
         "staging_parent",
         "target_build",
         "target_profile",
@@ -449,7 +538,6 @@ fn conflict_field(intent: &serde_json::Value, admission: &DestinationAdmission) 
         "manifest_digest",
         "authority_nonce",
         "state_fence_digest",
-        "class",
     ] {
         if recorded.and_then(|value| value.get(field)) != current.get(field) {
             return field;
