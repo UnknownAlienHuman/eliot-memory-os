@@ -148,10 +148,6 @@ fn task_state_projection(
 /// alias for the task ID. The `TaskPlan` source revision follows the admitted
 /// task fence, while the `TaskObjective` revision follows the resulting record.
 #[allow(
-    clippy::result_large_err,
-    reason = "TaskLifecycleError is the shared typed task-owner failure contract"
-)]
-#[allow(
     clippy::too_many_lines,
     reason = "the two owner publications and recipe CAS binding remain one auditable transaction builder"
 )]
@@ -407,10 +403,6 @@ pub fn build_task_controller_campaign_sources(
     })
 }
 
-#[allow(
-    clippy::result_large_err,
-    reason = "TaskLifecycleError is the shared typed task-owner failure contract"
-)]
 fn task_objective_slot<'a>(
     recipe: &'a LearningStateViewRecipe,
     expected_owner: &OwnerId,
@@ -435,10 +427,6 @@ fn task_objective_slot<'a>(
     Ok(slot)
 }
 
-#[allow(
-    clippy::result_large_err,
-    reason = "TaskLifecycleError is the shared typed task-owner failure contract"
-)]
 fn validate_admitted_task_binding(
     event: &TaskLifecycleEvent,
     record: &TaskRecord,

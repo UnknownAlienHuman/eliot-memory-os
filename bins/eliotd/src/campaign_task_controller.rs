@@ -8,7 +8,9 @@
 //! record or reconstructs a missing owner publication.
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
-use eliot_governor::{CampaignOwnerSourceInput, TaskCommand, TaskCommandContext, TaskProposal};
+use eliot_governor::{
+    CampaignOwnerSourceInput, GuardedTaskCommand, TaskCommand, TaskCommandContext, TaskProposal,
+};
 use eliot_learning_contracts::{
     CampaignSourceBinding, CampaignSourceRevisionRef, CampaignSourceRole, LearningStateViewRecipe,
 };
@@ -242,9 +244,8 @@ pub async fn serve_task_controller_claim(
         None => None,
     };
 
-    let lifecycle = match composition.task_lifecycle() {
-        Ok(lifecycle) => lifecycle,
-        Err(_) => return task_controller_rejection(&claimed, "owner_not_ready"),
+    let Ok(lifecycle) = composition.task_lifecycle() else {
+        return task_controller_rejection(&claimed, "owner_not_ready");
     };
     let outcome: Result<eliot_store_api::WriteReceipt, String> = match invocation.action {
         TaskControllerAction::Propose => {
@@ -290,9 +291,11 @@ pub async fn serve_task_controller_claim(
                     .apply_task_with_complete_campaign_sources(
                         &claimed.request_identity,
                         claimed.operation_id.clone(),
-                        invocation.task_id.clone(),
-                        input.context,
-                        input.command,
+                        GuardedTaskCommand {
+                            task_id: invocation.task_id.clone(),
+                            context: input.context,
+                            command: input.command,
+                        },
                         recipe,
                         publications,
                     )
@@ -303,9 +306,11 @@ pub async fn serve_task_controller_claim(
                     .apply_task_with_learning_state_recipe(
                         &claimed.request_identity,
                         claimed.operation_id.clone(),
-                        invocation.task_id.clone(),
-                        input.context,
-                        input.command,
+                        GuardedTaskCommand {
+                            task_id: invocation.task_id.clone(),
+                            context: input.context,
+                            command: input.command,
+                        },
                         recipe,
                     )
                     .await
