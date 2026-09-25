@@ -21,12 +21,15 @@
 //! One release discipline: [`CaptureRelease`] releases exactly the capture-owned
 //! entry on every exit path of a page or end call, including a future dropped
 //! while the provider await is in flight. The registry map is never cleared
-//! wholesale. A capture that stopped being servable — window closed, point
-//! moved, page bound reached, set exhausted, provider read failed — records its
+//! wholesale. A capture that stopped being servable - window closed, point
+//! moved, page bound reached, set exhausted, provider read failed - records its
 //! exact partial evidence with [`mark_interruption`] and keeps its entry, so
-//! [`end_snapshot`] issues a real `Partial`/`Expired` receipt carrying the
-//! exact served counts instead of deleting the only record of what was served.
-//! A recorded interruption is terminal for serving, but never for closing.
+//! [`end_snapshot`] issues a real receipt carrying the exact served counts
+//! instead of deleting the only record of what was served. A provider read
+//! failure is the one transient reason: a later close that still observes the
+//! exact bound point clears it through [`clear_transient_interruption`], because
+//! a transport failure observed nothing about the source. A recorded
+//! interruption is terminal for serving, but never for closing.
 //!
 //! Reads only: this module never acquires `adapter.write_lock`, issues no
 //! DDL/migration, performs no restore, and defines no archive format. Every
@@ -1593,6 +1596,41 @@ fn retain_with_interruption(guard: &mut CaptureRelease, digest: &str) {
     guard.retain();
 }
 
+/// Clears a recorded provider failure once a later bound-point read proves the
+/// point still holds.
+///
+/// `INTERRUPTION_PROVIDER_FAILED` is the one transient reason: a transport or
+/// RPC blip records no fact about the source, so a later owner read returning
+/// the exact bound point is fresh evidence that the capture never lost its
+/// consistency. Keeping the record anyway permanently downgraded a capture that
+/// had in fact served everything to `Partial`, which is not what actually
+/// completed.
+///
+/// Every other reason records a durable condition and stays terminal, so this
+/// never clears it: `INTERRUPTION_POINT_MOVED` (the source advanced),
+/// `INTERRUPTION_WINDOW_CLOSED` (the owner window or duration bound closed),
+/// `INTERRUPTION_PAGE_BOUND` (a bound was reached before the set was served) and
+/// `INTERRUPTION_CAPTURE_EXHAUSTED` (no further page exists).
+///
+/// Clearing removes no evidence. While any interruption stands, `prepare_page`
+/// and `finish_page` both refuse before `serve_next_page` can reach the
+/// counters, so the frozen counts are the live counts by construction; the
+/// receipt therefore reports exactly the same numbers it would have reported
+/// with the record left in place, and `is_complete_capture` still has to pass
+/// before the closing receipt may say `Complete`.
+fn clear_transient_interruption(states: &mut HashMap<String, SnapshotState>, digest: &str) {
+    let Some(state) = states.get_mut(digest) else {
+        return;
+    };
+    let transient = state
+        .interruption
+        .as_ref()
+        .is_some_and(|interruption| interruption.reason == INTERRUPTION_PROVIDER_FAILED);
+    if transient {
+        state.interruption = None;
+    }
+}
+
 /// Releases exactly the capture-owned entry on every exit path of a page or end
 /// call, including a future dropped while the provider await is in flight.
 ///
@@ -2066,6 +2104,11 @@ pub(crate) async fn read_snapshot_page(
 /// `observed` is `None` when the owner window had already closed: the point is
 /// then deliberately not re-read, because a receipt must not claim the source
 /// stayed still across a window this store no longer vouches for.
+///
+/// A fresh observation that equals the bound point exactly is the evidence that
+/// a recorded provider failure was only a transport blip, so that one transient
+/// record is cleared before completeness is computed. Every other interruption
+/// reason, and every `moved`/`expired` observation, stays terminal.
 fn close_capture(
     digest: &str,
     observed: Option<&CapturePoint>,
@@ -2084,6 +2127,13 @@ fn close_capture(
         mark_interruption(&mut states, digest, INTERRUPTION_WINDOW_CLOSED);
     } else if moved {
         mark_interruption(&mut states, digest, INTERRUPTION_POINT_MOVED);
+    } else {
+        // The bound point still holds on a fresh owner read, so a recorded
+        // provider failure never observed anything about the source. A capture
+        // that really did serve every member of its denominator closes
+        // `Complete`; one that did not still closes `Partial` through
+        // `is_complete_capture`.
+        clear_transient_interruption(&mut states, digest);
     }
     let receipt = {
         let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
