@@ -2745,7 +2745,7 @@ impl KernelComposition {
         Ok(decision)
     }
 
-    /// Typed progress renewal entry (issue #88, wave 2): renews the current
+    /// Typed progress renewal entry (issue #88, wave 3): renews the current
     /// supervision lease from an observed daemon progress request, not from
     /// `StoreHealth`.
     ///
@@ -2764,10 +2764,6 @@ impl KernelComposition {
     /// after live-receipt publication, so a renewal can never ship without
     /// its publication evidence.
     #[cfg(windows)]
-    #[allow(
-        dead_code,
-        reason = "wave 3 (MGR02) wires the eliotd per-tick DaemonProgressObservation into this typed progress route; ProbeReady keeps the policy-driven legacy renew until then"
-    )]
     fn renew_current_supervision_with_progress(
         authority: &KernelSupervisionLeaseAuthority,
         contour: &DaemonSupervisionContour,
@@ -2895,16 +2891,127 @@ impl KernelComposition {
         Ok((contour, snapshot))
     }
 
-    // Wave-3 handoff (MGR02, `eliotd` per-tick observation, Implements #88):
-    // this ProbeReady path still renews through the policy-driven legacy
-    // `renew_current_supervision` because the daemon does not yet submit a
-    // per-tick `DaemonProgressObservation`. Wave 3 must build that observation
-    // in `eliotd`, retain a `DaemonSupervisionProgressState` for the active
-    // lease, build the join state with `daemon_supervision_current_state`,
-    // and call `renew_current_supervision_with_progress` here instead, then
-    // assemble the receipt with `daemon_renewal_receipt_for_decision` after
-    // live-receipt publication. `StoreHealth` (`health_view::daemon_health`)
-    // stays evidence-only and must never be passed as renewal evidence.
+    // Issue #88, wave 3: the ProbeReady path renews through the typed
+    // progress route when the latest retained per-tick observation cites the
+    // exact durable head, so ProbeReady and the per-tick submits decide on
+    // the same evidence. Without a current retained observation the
+    // policy-driven bootstrap renew covers the pre-observation window.
+    // `StoreHealth` (`health_view::daemon_health`) stays evidence-only and
+    // must never be passed as renewal evidence.
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "probe renewal threads the exact launch, process, ready, contour, and head identities explicitly"
+    )]
+    fn progress_renewal_for_probe(
+        &self,
+        authority: &KernelSupervisionLeaseAuthority,
+        contour: &DaemonSupervisionContour,
+        launch: &EliotdLaunchDescriptor,
+        process: &ProcessStartReceipt,
+        ready: &EliotdLiveReadyEvidence,
+        head: &SupervisionLeaseSnapshot,
+    ) -> Result<Option<(SupervisionLeaseSnapshot, EliotdLiveReceipt)>, KernelServiceError> {
+        let retained = self
+            .daemon_runtime
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))?
+            .last_progress_observation
+            .clone();
+        let Some(observation) = retained else {
+            return Ok(None);
+        };
+        // The retained observation must cite this exact head. Anything older
+        // (including a predecessor advanced by a per-tick submit since) keeps
+        // the bootstrap path instead of deciding from stale evidence.
+        if observation.lease_id != head.record.lease_id.as_str()
+            || observation.lease_revision != head.record.revision
+            || observation.predecessor_receipt_sha256 != head.receipt.receipt_sha256
+        {
+            return Ok(None);
+        }
+        let predecessor = eliot_runtime_contracts::SupervisionLeasePredecessorProof {
+            lease_id: head.record.lease_id.as_str().to_owned(),
+            record_id: head.record.record_id.as_str().to_owned(),
+            lease_revision: head.record.revision,
+            receipt_sha256: head.receipt.receipt_sha256.clone(),
+            envelope_sha256: head
+                .record
+                .artifact
+                .envelope_digest()
+                .map_err(|_| KernelServiceError::ReadinessNotProven)?,
+        };
+        let request = DaemonSupervisionRenewalRequest {
+            request_id: observation.observation_id.clone(),
+            observation: observation.clone(),
+            predecessor,
+        };
+        request
+            .validate()
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let mut progress = {
+            let mut state = self.daemon_runtime.lock().map_err(|_| {
+                KernelServiceError::Platform("daemon runtime lock poisoned".to_owned())
+            })?;
+            std::mem::replace(
+                &mut state.supervision_progress,
+                DaemonSupervisionProgressState::unbound(),
+            )
+        };
+        let renewal = Self::renew_current_supervision_with_progress(
+            authority,
+            contour,
+            &request,
+            &mut progress,
+            &SUPERVISION_LEASE_RENEWAL_POLICY,
+            unix_ms(),
+        );
+        let put_back = |progress: DaemonSupervisionProgressState,
+                        expired: Option<bool>|
+         -> Result<(), KernelServiceError> {
+            let mut state = self.daemon_runtime.lock().map_err(|_| {
+                KernelServiceError::Platform("daemon runtime lock poisoned".to_owned())
+            })?;
+            state.supervision_progress = progress;
+            state.last_progress_observation = Some(request.observation.clone());
+            if let Some(expired) = expired {
+                state.supervision_expired = expired;
+            }
+            Ok(())
+        };
+        let Ok((snapshot, decision, receipt)) = renewal else {
+            // Any refusal or authority failure keeps the bootstrap path:
+            // ProbeReady must not turn a stale retained observation into
+            // a readiness failure while the policy renew still applies.
+            // An expired lease fails closed in the bootstrap renew below.
+            put_back(progress, None)?;
+            return Ok(None);
+        };
+        put_back(progress, Some(false))?;
+        // A non-renewing decision still publishes the unchanged head
+        // so the live receipt tracks the durable revision.
+        let published =
+            self.publish_eliotd_live_receipt(launch, process, ready, contour, Some(&snapshot))?;
+        if decision.outcome == DaemonSupervisionRenewalOutcome::Renewed {
+            let live_sha256 = sha256_hex(
+                &eliot_contracts::canonical_json_bytes(&published)
+                    .map_err(|_| KernelServiceError::ReadinessNotProven)?,
+            );
+            // The renewal receipt is validated for coherence here and
+            // then stays with the ORS/live-receipt evidence; ProbeReady
+            // returns the head pair like the legacy path.
+            let _ = daemon_renewal_receipt_for_decision(
+                &decision,
+                Some(snapshot.receipt.receipt_sha256.clone()),
+                Some(live_sha256),
+            )
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        } else {
+            let _ = receipt.ok_or(KernelServiceError::ReadinessNotProven)?;
+        }
+        Ok(Some((snapshot, published)))
+    }
+
     #[cfg(windows)]
     fn renew_daemon_supervision_for_probe(
         &self,
@@ -2974,10 +3081,22 @@ impl KernelComposition {
         // skipping over the receipt that still names the older ORS head.
         let _ =
             self.publish_eliotd_live_receipt(&launch, &process, &ready, &contour, Some(&before))?;
-        let renewed = Self::renew_current_supervision(authority, &contour, unix_ms())
-            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
-        let published =
-            self.publish_eliotd_live_receipt(&launch, &process, &ready, &contour, Some(&renewed))?;
+        let (renewed, published) = if let Some(pair) = self
+            .progress_renewal_for_probe(authority, &contour, &launch, &process, &ready, &before)?
+        {
+            pair
+        } else {
+            let renewed = Self::renew_current_supervision(authority, &contour, unix_ms())
+                .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+            let published = self.publish_eliotd_live_receipt(
+                &launch,
+                &process,
+                &ready,
+                &contour,
+                Some(&renewed),
+            )?;
+            (renewed, published)
+        };
         Ok((renewed, published))
     }
 

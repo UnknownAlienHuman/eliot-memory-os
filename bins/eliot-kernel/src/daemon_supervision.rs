@@ -60,6 +60,23 @@ pub(crate) struct DaemonRuntimeState {
     pub(crate) supervision: Option<DaemonSupervisionContour>,
     #[cfg(windows)]
     pub(crate) live_ready: Option<EliotdLiveReadyEvidence>,
+    /// Kernel-owned progress continuity for the active lease (issue #88,
+    /// wave 3). Reset whenever supervision binds from unset so a restarted or
+    /// replaced daemon generation can never continue the old monotonic
+    /// series or cite the old predecessor.
+    #[cfg(windows)]
+    pub(crate) supervision_progress: DaemonSupervisionProgressState,
+    /// Latest daemon-submitted observation retained for the `ProbeReady`
+    /// progress route. Evidence only; every renewal re-decides against the
+    /// exact durable head.
+    #[cfg(windows)]
+    pub(crate) last_progress_observation: Option<DaemonProgressObservation>,
+    /// Set when the progress route reports terminal lease expiry. The expired
+    /// supervision claim stays degraded and visible until a new admitted
+    /// generation rebinds; it never auto-revives and never asserts process
+    /// death by itself.
+    #[cfg(windows)]
+    pub(crate) supervision_expired: bool,
 }
 
 #[cfg(windows)]
@@ -249,6 +266,27 @@ pub(crate) struct DaemonSupervisionProgressState {
 
 #[cfg(windows)]
 impl DaemonSupervisionProgressState {
+    /// Returns the unbound continuity for a freshly bound supervision: no
+    /// accepted cursors, no admitted idle contract, no boot/session pinning,
+    /// no monotonic evidence, no recorded renewal, no misses, and no pending
+    /// reconciliation. The first shape-valid observation pins boot, session,
+    /// and monotonic evidence anew.
+    pub(crate) fn unbound() -> Self {
+        Self {
+            accepted_cursors: Vec::new(),
+            admitted_idle_contract: None,
+            boot_id: None,
+            transport_session_evidence: None,
+            last_monotonic_ms: 0,
+            last_request_id: None,
+            last_observation_sha256: None,
+            last_successor_revision: None,
+            missed_renewals: 0,
+            last_eligible_observation_ms: None,
+            reconciliation_pending: false,
+        }
+    }
+
     /// Returns the stale-expiry horizon in milliseconds for a policy.
     pub(crate) fn stale_horizon_ms(policy: &DaemonSupervisionRenewalPolicy) -> u64 {
         policy

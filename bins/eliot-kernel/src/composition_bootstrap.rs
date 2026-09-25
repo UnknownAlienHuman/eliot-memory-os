@@ -36,6 +36,11 @@ use super::{
 use super::{CanonicalEvidenceProvider, DispatchValidationPort};
 #[cfg(windows)]
 use super::{
+    DaemonSupervisionProgressState, SupervisionLeaseAuthorityConfig, dispatch_key,
+    load_agent_bridge_declaration, observed_session_principal_binding,
+};
+#[cfg(not(windows))]
+use super::{
     SupervisionLeaseAuthorityConfig, dispatch_key, load_agent_bridge_declaration,
     observed_session_principal_binding,
 };
@@ -1355,6 +1360,12 @@ impl KernelComposition {
                 supervision: None,
                 #[cfg(windows)]
                 live_ready: None,
+                #[cfg(windows)]
+                supervision_progress: DaemonSupervisionProgressState::unbound(),
+                #[cfg(windows)]
+                last_progress_observation: None,
+                #[cfg(windows)]
+                supervision_expired: false,
             }),
             daemon_status_changed: tokio::sync::Notify::new(),
             #[cfg(windows)]
