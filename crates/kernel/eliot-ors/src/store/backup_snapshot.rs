@@ -78,13 +78,14 @@ use crate::backup_snapshot::{
     BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupBlockReason, BackupCapturePoint, BackupCompleteness,
     BackupEntryAvailability, BackupEntryCryptoIdentity, BackupEntryLineage, BackupForensicReason,
     BackupGenerationLineage, BackupPageFamilyCount, BackupRejectReason, BackupUnresolvedReason,
-    CurrentOwnerValidation, MAX_BACKUP_DURATION_MS, MAX_BACKUP_ID_LEN, MAX_BACKUP_MEMBER_KEY_BYTES,
-    MAX_BACKUP_PAGE_ENTRIES, MAX_BACKUP_PAGES, MAX_BACKUP_TABLE_CENSUS, MAX_BACKUP_WORK_UNITS,
-    OpaqueUnavailableCause, OrsBackupDestination, OrsBackupEntry, OrsBackupImportReceipt,
-    OrsBackupImportRequest, OrsBackupPage, OrsBackupRequest, OrsBackupSnapshot,
-    OwnerValidationDisposition, OwnerZeroGate, PerEntryOutcome, RetryCheckpointClass,
-    RowDisposition, RowFamilyAvailability, RowFamilyCensus, RowFamilyDisposition, RowFamilyKind,
-    StoredEffectClass, check_canonical_frozen, row_family_census, validate_import_binding,
+    CurrentOwnerValidation, MAX_BACKUP_BYTES, MAX_BACKUP_DURATION_MS, MAX_BACKUP_ID_LEN,
+    MAX_BACKUP_MEMBER_KEY_BYTES, MAX_BACKUP_PAGE_ENTRIES, MAX_BACKUP_PAGES,
+    MAX_BACKUP_TABLE_CENSUS, MAX_BACKUP_WORK_UNITS, OpaqueUnavailableCause, OrsBackupDestination,
+    OrsBackupEntry, OrsBackupImportReceipt, OrsBackupImportRequest, OrsBackupPage,
+    OrsBackupRequest, OrsBackupSnapshot, OwnerValidationDisposition, OwnerZeroGate,
+    PerEntryOutcome, RetryCheckpointClass, RowDisposition, RowFamilyAvailability, RowFamilyCensus,
+    RowFamilyDisposition, RowFamilyKind, StoredEffectClass, check_canonical_frozen,
+    row_family_census, validate_import_binding,
 };
 use crate::{
     EpochIdentity, EpochLineage, OpaqueLabel, OperationalPhase, OrsError, RecoveryAccessClass,
@@ -172,6 +173,11 @@ fn is_digest_shape(value: &str) -> bool {
 
 /// Cumulative capture budget charged once per observed row and once per
 /// observed byte, across the whole capture rather than per page.
+///
+/// The duration budget is a wall-clock deadline on the whole capture, not a
+/// per-row charge: [`Self::check_deadline`] is evaluated on a live clock reading
+/// at every family boundary and at capture close, so a slow read and a capture
+/// that observes no row at all are both refused instead of running unbounded.
 struct CaptureBudget {
     work_used: u64,
     work_cap: u64,
@@ -187,6 +193,17 @@ impl CaptureBudget {
             started_ms: now_ms,
         }
     }
+    /// Enforces the capture's wall-clock deadline against the clock reading the
+    /// caller already holds. Fails closed with the same typed error the work cap
+    /// uses; the ceiling is exclusive, so a capture that has run past its budget
+    /// is refused rather than truncated.
+    fn check_deadline(&self, now_ms: i64) -> Result<(), OrsError> {
+        let elapsed = now_ms.saturating_sub(self.started_ms).max(0);
+        if u64::try_from(elapsed).unwrap_or(u64::MAX) > self.duration_cap_ms {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        Ok(())
+    }
     /// Charges one observed row. The ceiling is exclusive: the row that would
     /// be the one-over fails closed instead of being silently truncated.
     fn charge_work(&mut self, now_ms: i64) -> Result<(), OrsError> {
@@ -194,10 +211,8 @@ impl CaptureBudget {
             .work_used
             .checked_add(1)
             .ok_or(OrsError::ProjectionLimitExceeded)?;
-        let elapsed = now_ms.saturating_sub(self.started_ms).max(0);
-        if self.work_used > self.work_cap
-            || u64::try_from(elapsed).unwrap_or(u64::MAX) > self.duration_cap_ms
-        {
+        self.check_deadline(now_ms)?;
+        if self.work_used > self.work_cap {
             return Err(OrsError::ProjectionLimitExceeded);
         }
         Ok(())
@@ -896,8 +911,11 @@ fn problem_kind_name(record: &RecoveryProblem) -> String {
 ///
 /// The capture point is established once from durable state, the census is read
 /// and dispositioned family by family under that same point, and the point is
-/// re-verified at close against a second observation. Nothing is written and no
-/// table is created.
+/// re-verified at close against a second observation. The work and byte budgets
+/// are charged as the census is read, and the duration budget is a wall-clock
+/// deadline checked at every family boundary, at close, and before the snapshot
+/// is returned, so a slow read and a capture that observes no row at all are
+/// both refused. Nothing is written and no table is created.
 #[allow(
     clippy::too_many_lines,
     reason = "the capture is one ordered consistency point: bind, census, read, page, re-verify"
@@ -921,6 +939,12 @@ fn capture(database: &Database, request: &OrsBackupRequest) -> Result<OrsBackupS
     let mut members: Vec<CapturedMember> = Vec::new();
     let mut denominator: Vec<RowFamilyCensus> = Vec::new();
     for family in row_family_census() {
+        // A live reading per family, never the frozen `started_ms`: the
+        // per-row duration charge can only fire against a clock that moved.
+        // Bounded at one read per declared family, and a capture that observes
+        // no row at all still hits the deadline here.
+        let family_ms = super::current_unix_ms()?;
+        budget.check_deadline(family_ms)?;
         let census = capture_family(
             &read,
             &observed,
@@ -928,7 +952,7 @@ fn capture(database: &Database, request: &OrsBackupRequest) -> Result<OrsBackupS
             &point,
             &mut budget,
             &mut members,
-            started_ms,
+            family_ms,
         )?;
         denominator.push(census);
     }
@@ -948,7 +972,12 @@ fn capture(database: &Database, request: &OrsBackupRequest) -> Result<OrsBackupS
     let pages = build_pages(request, &entries, started_ms)?;
     point.work_units = budget.work_used;
     point.total_bytes = total_bytes;
-    point.closed_at_ms = super::current_unix_ms()?;
+    // The deadline is re-checked at close on the clock reading that closes the
+    // capture point, so a read that ran past its budget is refused even when it
+    // observed no row.
+    let closed_ms = super::current_unix_ms()?;
+    budget.check_deadline(closed_ms)?;
+    point.closed_at_ms = closed_ms;
     drop(read);
     // Drift witness: the store must not have moved while the capture ran.
     let frozen_post = canonical_state_digest(database)?;
@@ -957,6 +986,7 @@ fn capture(database: &Database, request: &OrsBackupRequest) -> Result<OrsBackupS
     if post_point.binding_digest != point.binding_digest {
         return Err(OrsError::OrderingHeadMismatch);
     }
+    budget.check_deadline(super::current_unix_ms()?)?;
     let unavailable = denominator
         .iter()
         .fold(0_u64, |total, row| total.saturating_add(row.unavailable));
@@ -996,6 +1026,12 @@ fn capture(database: &Database, request: &OrsBackupRequest) -> Result<OrsBackupS
 /// aggregate byte budget across the whole snapshot rather than per page, and
 /// rewrites each family census so the member denominator is exact.
 ///
+/// The byte ceiling is re-clamped here, at the point of use, exactly as
+/// [`CaptureBudget::new`] re-clamps the work and duration budgets:
+/// `OrsBackupRequest` has public fields and no `#[non_exhaustive]`, so a struct
+/// literal bypasses `OrsBackupRequest::new` and the aggregate total must still
+/// be refused against `MAX_BACKUP_BYTES` however the request was built.
+///
 /// The census is closed here rather than in the row reader: capture order is
 /// the sorted `(family, record id)` order, so a family that mixes members above
 /// and below the cursor cannot be split without knowing that order.
@@ -1004,6 +1040,7 @@ fn paginate_members(
     members: Vec<CapturedMember>,
     denominator: &mut [RowFamilyCensus],
 ) -> Result<(Vec<OrsBackupEntry>, u64), OrsError> {
+    let byte_ceiling = request.max_bytes.min(MAX_BACKUP_BYTES);
     let mut entries: Vec<OrsBackupEntry> = Vec::with_capacity(members.len());
     let mut total_bytes: u64 = 0;
     let mut capture_order: u64 = 0;
@@ -1028,7 +1065,7 @@ fn paginate_members(
                     .map_err(|_| OrsError::ProjectionLimitExceeded)?,
             )
             .ok_or(OrsError::ProjectionLimitExceeded)?;
-        if total_bytes > request.max_bytes {
+        if total_bytes > byte_ceiling {
             return Err(OrsError::ProjectionLimitExceeded);
         }
         row.captured = row.captured.saturating_add(1);
@@ -1162,9 +1199,10 @@ pub(super) fn export_page(
 /// generation, order high-water, canonical dependency fence, and physical table
 /// census) is established once and re-verified at close. Every declared row
 /// family is read or given an explicit source-bound exclusion, the aggregate
-/// byte, page, work, and duration budgets are charged once across the whole
-/// capture, and completeness is never declared from a reference count: the
-/// shared member validator must pass before the snapshot is returned.
+/// byte, page, and work budgets are charged once across the whole capture, the
+/// duration budget is a wall-clock deadline over the whole capture, and
+/// completeness is never declared from a reference count: the shared member
+/// validator must pass before the snapshot is returned.
 ///
 /// Fail-closed preconditions, all owner-established: a store that has never
 /// established an authority snapshot has no installation identity and no ORS
@@ -1200,9 +1238,16 @@ pub(super) fn export_snapshot(
 struct ResurrectionGuard {
     schema_marker: String,
     current_epoch: u64,
+    /// Durable `RECOVERY_INBOX` keys (`item_id`) whose disposition is
+    /// `Rejected` or `DeadLetter`, in the recovery-inbox identity space.
     disposed: BTreeSet<String>,
+    /// Durable `RECOVERY_PROBLEMS` keys (`operation_or_checkpoint_id`) with no
+    /// terminal receipt, in the operation-identity space an entry's `record_id`
+    /// already uses for that family.
     unreconciled_problems: BTreeSet<String>,
+    /// Authority subjects under a durable `Fenced` revocation.
     revoked_subjects: BTreeSet<String>,
+    /// Durably revoked grant-closure operation ids.
     revoked_closures: BTreeSet<String>,
 }
 impl ResurrectionGuard {
@@ -1216,7 +1261,13 @@ impl ResurrectionGuard {
                 current: self.schema_marker.clone(),
             });
         }
-        if destination.destination_epoch < self.current_epoch {
+        // Exact equality, not `>=`: the destination epoch is a caller-asserted
+        // field whose only constructor bound is `!= 0`, so a "greater than
+        // current" assertion is unbound and must fail closed. Only the epoch the
+        // destination's own durable authority snapshot actually carries may
+        // admit an import; anything else would let a caller assert a lineage
+        // that never existed here.
+        if destination.destination_epoch != self.current_epoch {
             return Some(BackupBlockReason::DestinationEpochBelowCurrent {
                 declared: destination.destination_epoch,
                 current: self.current_epoch,
@@ -1227,10 +1278,23 @@ impl ResurrectionGuard {
     /// Per-entry resurrection verdicts, consulted after the family disposition
     /// and the cryptographic identity check.
     fn verdict(&self, entry: &OrsBackupEntry) -> Option<PerEntryOutcome> {
-        if self.disposed.contains(&entry.record_id) {
+        // Identity space: a durable inbox disposition is recorded against the
+        // `RECOVERY_INBOX` row's physical key, which `RedbRecoveryStore` writes
+        // as `record.item.item_id` -- the caller-supplied `OperationIdentity`
+        // passed to `RecoveryInboxItem::bind`, which is independent of the
+        // envelope's `operation_or_checkpoint_id` and routinely differs from it.
+        // A `RecoveryInbox` member's `member_key` is exactly that durable key
+        // ("the exact physical durable key this member was read from"), so it is
+        // the only entry identity in this guard's own namespace. The check is
+        // therefore scoped to that family: `RecoveryInboxHistory` rows are keyed
+        // by `"{order:020}:{item_id}"` and are dispositioned `Forensic` before
+        // this point, and every other family's member key belongs to a different
+        // physical table where the owner never disposed anything.
+        if entry.family == RowFamilyKind::RecoveryInbox && self.disposed.contains(&entry.member_key)
+        {
             return Some(PerEntryOutcome::Rejected {
                 reason: BackupRejectReason::DurablyDisposed {
-                    record_id: entry.record_id.clone(),
+                    record_id: entry.member_key.clone(),
                 },
             });
         }
@@ -1629,8 +1693,9 @@ pub(super) fn reconcile_import_receipt(
 /// Derives the current owner validation the receipt's zero claim rests on.
 ///
 /// The validation is computed from the canonical owner's own triaged outcome
-/// vector: it covers exactly the entries the owner dispositioned and names
-/// every unresolved effect identity. It is therefore never a fabricated zero.
+/// vector: it covers exactly the entries the owner dispositioned, names every
+/// unresolved effect identity, and reports `Partial` whenever an entry is
+/// unresolved. It is therefore never a fabricated zero.
 fn derive_owner_validation(
     import: &OrsBackupImportRequest,
     per_entry: &[(String, PerEntryOutcome)],
@@ -1662,7 +1727,18 @@ fn derive_owner_validation(
         validated_entry_count: dispositioned,
         unresolved_effect_identities,
         provider_digest: crate::model::sha256_hex(material.as_bytes()),
-        disposition: OwnerValidationDisposition::Complete,
+        // The owner could not validate an entry it could not resolve, so the
+        // validation is not `Complete` whenever an entry is unresolved. Stamping
+        // `Complete` there would make the gate's `disposition != Complete`
+        // refusal branch vacuous on the production path and would assert a
+        // coverage the receipt's own outcome vector contradicts. The gate still
+        // refuses either way, so the refusal set is unchanged; only the exact
+        // typed blocker moves to the honest one.
+        disposition: if unresolved_count == 0 {
+            OwnerValidationDisposition::Complete
+        } else {
+            OwnerValidationDisposition::Partial
+        },
     }
 }
 

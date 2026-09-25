@@ -43,7 +43,11 @@ pub const BACKUP_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 pub const MAX_BACKUP_PAGE_ENTRIES: u16 = 256;
 /// Hard ceiling for pages in one backup snapshot.
 pub const MAX_BACKUP_PAGES: u16 = 256;
-/// Hard ceiling for the declared aggregate byte budget of one backup request.
+/// Hard ceiling for the aggregate byte budget of one backup request.
+///
+/// Enforced at the point of use as well as in [`OrsBackupRequest::new`]: the
+/// aggregate digest-material total is refused against this ceiling however the
+/// request was constructed.
 pub const MAX_BACKUP_BYTES: u64 = 16 * 1024 * 1024;
 /// Hard ceiling for installation, admission, and marker identifier length.
 pub const MAX_BACKUP_ID_LEN: usize = 256;
@@ -822,7 +826,10 @@ pub struct OrsBackupEntry {
     /// The exact physical durable key this member was read from.
     ///
     /// Uniqueness inside a family is `(member_key)`, and a repeated
-    /// `(record_id, payload_digest)` pair is a duplicate member.
+    /// `(record_id, payload_digest)` pair is a duplicate member. For the
+    /// recovery-inbox family this is the item's `item_id` -- the identity the
+    /// destination durably dispositions an inbox row under -- which is why the
+    /// resurrection guard compares `member_key` and not `record_id` there.
     pub member_key: String,
     pub family: RowFamilyKind,
     /// Capture-order index of this member inside the snapshot.
@@ -840,7 +847,11 @@ pub struct OrsBackupEntry {
 /// Bounded logical backup export request.
 ///
 /// The byte, page, work, and duration budgets are aggregate: they bound the
-/// whole capture, not each page of it.
+/// whole capture, not each page of it. Every one of them is re-clamped against
+/// its `MAX_BACKUP_*` ceiling at the point of use in the store projection, not
+/// only in [`OrsBackupRequest::new`]: every field here is public and the struct
+/// is not `#[non_exhaustive]`, so a struct literal bypasses that constructor
+/// entirely.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OrsBackupRequest {
     pub source: OrsBackupSourceIdentity,
@@ -1714,8 +1725,12 @@ pub enum BackupBlockReason {
     OpaquePayloadUnavailable { cause: OpaqueUnavailableCause },
     /// The destination's current policy/schema marker does not match.
     CurrentPolicyMarkerMismatch { declared: String, current: String },
-    /// The destination's current authority epoch is above the declared one, so
-    /// the import would revive a fenced epoch.
+    /// The destination's declared authority epoch is not the one its own
+    /// current durable authority snapshot carries.
+    ///
+    /// A lower declared epoch would revive a fenced epoch; a higher one is an
+    /// unbound assertion about a lineage the destination never held. Both fail
+    /// closed, so `declared != current` is the whole condition.
     DestinationEpochBelowCurrent { declared: u64, current: u64 },
     /// The import carries no current canonical evidence for the admission.
     MissingCanonicalEvidence,
@@ -1748,6 +1763,13 @@ pub enum BackupRejectReason {
     /// The same key with different bytes is a durable identity conflict.
     IdentityConflict { record_id: String },
     /// The destination already durably disposed this identity.
+    ///
+    /// For a recovery-inbox member the identity is the durable `RECOVERY_INBOX`
+    /// key (`item_id`), which the entry carries as its
+    /// [`OrsBackupEntry::member_key`]. It is deliberately *not* the envelope's
+    /// `operation_or_checkpoint_id`: the inbox stores an item under the
+    /// caller-supplied `item_id` bound at `RecoveryInboxItem::bind`, and that
+    /// identity is independent of the envelope it carries.
     DurablyDisposed { record_id: String },
     /// The identity is under a durably revoked authority in the destination.
     RevokedAuthority { subject_id: String },
