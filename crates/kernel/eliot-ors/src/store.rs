@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use eliot_contracts::canonical_json_bytes;
 use eliot_platform::PlatformHandle;
 use eliot_receipts::{
     AuthorityBinding, GRANT_CLOSURE_SCHEMA, GRANT_CLOSURE_VERSION, GrantClosureOrsReceiptRef,
@@ -12,7 +13,7 @@ use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
     SignedSupervisionLease, VerifiedSupervisionLease, VerifiedSupervisionLeaseTerminalTransition,
 };
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -120,6 +121,308 @@ const UNKNOWN_COMMIT_RECOVERY: TableDefinition<&str, &str> =
 const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
     TableDefinition::new("ors_cutover_ownership_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
+/// Durable bridge-event rows (issue #2561): one staged durable/control event
+/// per `(stream_id, event_id)` identity with its bound canonical envelope
+/// bytes. Disjoint from `HOST_REQUESTS`; keyed by `stream::event`.
+const BRIDGE_EVENT_RECORDS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_bridge_event_records_v1");
+/// Per-stream bridge-event cursor rows (issue #2561): durable/acked cursors
+/// with staging provenance. Keyed by `stream_id`; never synthesized.
+const BRIDGE_EVENT_CURSORS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_bridge_event_cursors_v1");
+/// Durable bridge-event coverage gaps (issue #2561): forwarded gaps stay
+/// visible without moving any cursor. Keyed by `gap_id`.
+const BRIDGE_EVENT_GAPS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_bridge_event_gaps_v1");
+/// Maximum staged bridge-event rows. Mirrors the I14.2 canonical-writes pool
+/// (2048 items): breach fails with [`OrsError::ProjectionLimitExceeded`]
+/// (typed backpressure), never with silent loss.
+const MAX_BRIDGE_EVENT_RECORDS: usize = 2048;
+/// Maximum canonical envelope bytes staged per bridge event. Mirrors the I7.2
+/// hard MCP structured response ceiling (256 KiB): larger envelopes fail with
+/// [`OrsError::PayloadTooLarge`] instead of occupying unbounded durable
+/// space.
+const MAX_BRIDGE_EVENT_ENVELOPE_BYTES: usize = 256 * 1024;
+/// Maximum rows served by one bridge-event pending page. Restart enumeration
+/// walks pages with continuations; nothing materializes an unbounded page.
+const MAX_BRIDGE_EVENT_PAGE: usize = 128;
+/// Maximum recorded coverage gaps per stream. Breach fails with
+/// [`OrsError::ProjectionLimitExceeded`]; gaps never compact cursors.
+const MAX_BRIDGE_EVENT_GAPS_PER_STREAM: usize = 256;
+/// Committed-and-acknowledged bridge-event rows retained per stream for
+/// duplicate suppression. Compaction evicts only acked rows older than this
+/// window; cursors are never evicted.
+const RETAIN_BRIDGE_EVENT_ACKED_PER_STREAM: u64 = 512;
+/// Stored phase of a durably staged bridge event. The stage entry is the
+/// durable relation, so staging always persists `DURABLE`; `RECEIVED` is the
+/// pre-stage transport fact answered without a row.
+const BRIDGE_EVENT_PHASE_DURABLE: &str = "DURABLE";
+
+/// One durably staged bridge-forwarded event (issue #2561).
+///
+/// Private to the store: the public boundary exchanges validated JSON only,
+/// while the Kernel route owner holds the typed views. The row binds the
+/// event identity to its exact canonical envelope bytes and digest, the
+/// producer/generation/authority facts, the staging connection, and the
+/// phase. Same-identity replays compare against this row; changed bytes never
+/// overwrite it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeEventRow {
+    contract_version: u16,
+    stream_id: String,
+    event_id: String,
+    sequence: u64,
+    producer_id: String,
+    producer_generation: u64,
+    authority_epoch: u64,
+    envelope_sha256: String,
+    envelope_bytes: Vec<u8>,
+    staging_connection: String,
+    staged_at_ms: u64,
+    phase: String,
+}
+
+impl BridgeEventRow {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        bridge_identity_text(&self.stream_id, "stream_id")?;
+        bridge_identity_text(&self.event_id, "event_id")?;
+        if self.sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "sequence",
+                reason: "bridge event sequence must be nonzero",
+            });
+        }
+        crate::model::validate_text(&self.producer_id, "producer_id")?;
+        if self.producer_generation == 0 {
+            return Err(OrsError::InvalidField {
+                field: "producer_generation",
+                reason: "bridge event producer generation must be nonzero",
+            });
+        }
+        crate::model::validate_digest(&self.envelope_sha256, "envelope_sha256")?;
+        if self.envelope_bytes.is_empty()
+            || self.envelope_bytes.len() > MAX_BRIDGE_EVENT_ENVELOPE_BYTES
+        {
+            return Err(OrsError::PayloadTooLarge);
+        }
+        if crate::model::sha256_hex(&self.envelope_bytes) != self.envelope_sha256 {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        crate::model::validate_text(&self.staging_connection, "staging_connection")?;
+        if self.phase != BRIDGE_EVENT_PHASE_DURABLE {
+            return Err(OrsError::InvalidField {
+                field: "phase",
+                reason: "staged bridge events persist the DURABLE phase",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl persistence_codec::PersistedValue for BridgeEventRow {
+    const RECORD_TYPE: &'static str = "bridge_event_record";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+/// One per-stream bridge-event cursor row (issue #2561).
+///
+/// Carries the durable/acked cursors with the staging provenance used by the
+/// reconcile scope rule (presenting connection plus fenced old generations).
+/// Cursor rows are created on first stage and updated on cursor movement;
+/// they are never evicted, so no cursor resets and no unresolved stream is
+/// discarded.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeEventCursorRow {
+    contract_version: u16,
+    stream_id: String,
+    last_durable_sequence: u64,
+    last_acked_sequence: u64,
+    last_staging_connection: String,
+    last_producer_generation: u64,
+}
+
+impl BridgeEventCursorRow {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        bridge_identity_text(&self.stream_id, "stream_id")?;
+        if self.last_acked_sequence > self.last_durable_sequence {
+            return Err(OrsError::InvalidField {
+                field: "last_acked_sequence",
+                reason: "acked cursor must never pass the durable cursor",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl persistence_codec::PersistedValue for BridgeEventCursorRow {
+    const RECORD_TYPE: &'static str = "bridge_event_cursor";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+/// One durably recorded bridge-event coverage gap (issue #2561).
+///
+/// Gaps stay visible in coverage without moving any cursor: absent events are
+/// accounted for, never converted into applied events.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeEventGapRow {
+    contract_version: u16,
+    gap_id: String,
+    stream_id: String,
+    start_sequence: u64,
+    end_sequence: u64,
+    reason_ref: String,
+    staging_connection: String,
+    recorded_at_ms: u64,
+}
+
+impl BridgeEventGapRow {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        bridge_identity_text(&self.gap_id, "gap_id")?;
+        bridge_identity_text(&self.stream_id, "stream_id")?;
+        if self.start_sequence == 0 || self.end_sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "start_sequence",
+                reason: "gap interval sequences must be nonzero",
+            });
+        }
+        if self.end_sequence < self.start_sequence {
+            return Err(OrsError::InvalidField {
+                field: "end_sequence",
+                reason: "gap interval must not end before it starts",
+            });
+        }
+        crate::model::validate_text(&self.reason_ref, "reason_ref")?;
+        crate::model::validate_text(&self.staging_connection, "staging_connection")?;
+        Ok(())
+    }
+}
+
+impl persistence_codec::PersistedValue for BridgeEventGapRow {
+    const RECORD_TYPE: &'static str = "bridge_event_gap";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+/// Builds the stage/lookup outcome object for one bridge-event row.
+fn bridge_event_outcome(
+    row: &BridgeEventRow,
+    disposition: &str,
+    durable: u64,
+    acked: u64,
+    fresh: bool,
+) -> serde_json::Value {
+    json!({
+        "stream_id": row.stream_id,
+        "event_id": row.event_id,
+        "sequence": row.sequence,
+        "phase": row.phase,
+        "disposition": disposition,
+        "envelope_sha256": row.envelope_sha256,
+        "producer_id": row.producer_id,
+        "producer_generation": row.producer_generation,
+        "authority_epoch": row.authority_epoch,
+        "staging_connection": row.staging_connection,
+        "durable_cursor": durable,
+        "acked_cursor": acked,
+        "fresh": fresh,
+    })
+}
+
+/// Validates non-blank identity text shared by bridge-event fields.
+fn bridge_identity_text(value: &str, field: &'static str) -> Result<(), OrsError> {
+    crate::model::validate_text(value, field)?;
+    if value.contains("::") {
+        return Err(OrsError::InvalidField {
+            field,
+            reason: "bridge event identity must not contain the key separator",
+        });
+    }
+    Ok(())
+}
+
+/// Extracts validated general text from a bridge-event JSON object.
+fn bridge_text(value: &serde_json::Value, field: &'static str) -> Result<String, OrsError> {
+    let text =
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or(OrsError::InvalidField {
+                field,
+                reason: "bridge event field must be text",
+            })?;
+    crate::model::validate_text(text, field)?;
+    Ok(text.to_owned())
+}
+
+/// Extracts validated key text (no key separator) from a bridge-event object.
+fn bridge_key_text(value: &serde_json::Value, field: &'static str) -> Result<String, OrsError> {
+    let text = bridge_text(value, field)?;
+    if text.contains("::") {
+        return Err(OrsError::InvalidField {
+            field,
+            reason: "bridge event identity must not contain the key separator",
+        });
+    }
+    Ok(text)
+}
+
+/// Extracts a validated nonzero sequence from a bridge-event object.
+fn bridge_sequence(value: &serde_json::Value, field: &'static str) -> Result<u64, OrsError> {
+    let sequence =
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(OrsError::InvalidField {
+                field,
+                reason: "bridge event sequence must be a non-negative integer",
+            })?;
+    if sequence == 0 {
+        return Err(OrsError::InvalidField {
+            field,
+            reason: "bridge event sequence must be nonzero",
+        });
+    }
+    Ok(sequence)
+}
+
+/// Extracts a validated nonzero generation/epoch counter.
+fn bridge_generation(value: &serde_json::Value, field: &'static str) -> Result<u64, OrsError> {
+    let generation =
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(OrsError::InvalidField {
+                field,
+                reason: "bridge event generation must be a non-negative integer",
+            })?;
+    if generation == 0 {
+        return Err(OrsError::InvalidField {
+            field,
+            reason: "bridge event generation must be nonzero",
+        });
+    }
+    Ok(generation)
+}
 const ACTIVATION_RESULT_RETENTION: TableDefinition<&str, &str> =
     TableDefinition::new("ors_agent_activation_results_v1");
 const ACTIVATION_LIFECYCLES: TableDefinition<&str, &str> =
@@ -3348,6 +3651,586 @@ impl RedbRecoveryStore {
         }
         write.commit().map_err(storage)?;
         Ok(Some(next))
+    }
+
+    /// Durably stages one bridge-forwarded durable/control event before any
+    /// acknowledgement (issue #2561, I7.2/I7.23).
+    ///
+    /// Persist-before-ack: the `(stream_id, event_id)` row — canonical
+    /// envelope bytes with their bound digest, producer/generation/authority
+    /// facts, staging connection, and phase — is durably inserted before the
+    /// caller may answer `DURABLE`. An exact replay under the same identity
+    /// returns the existing outcome with `fresh: false` (no second record, no
+    /// duplicate normalization/application); changed bytes under the same
+    /// identity fail with [`OrsError::DuplicateConflict`] and never overwrite
+    /// the durable row. The per-stream durable cursor advances only over the
+    /// contiguous staged frontier, so a forwarded gap accounts for missing
+    /// coverage without converting absent events into applied ones. The table
+    /// is disjoint from `HOST_REQUESTS`: events never ride the host-request
+    /// envelope, and host-request reconciliation never reads this table.
+    ///
+    /// The boundary is intentionally narrow: inputs arrive as one validated
+    /// JSON object (`stream_id`, `event_id`, `sequence`, `producer_id`,
+    /// `producer_generation`, `authority_epoch`, `envelope` canonical JSON,
+    /// `envelope_sha256`, `staging_connection`) and the outcome leaves as one
+    /// JSON object (`phase`, `disposition`, cursors, `fresh`). Typed
+    /// bridge-event views live with the Kernel route owner, which validates
+    /// both directions; the store binds bytes and cursors only.
+    pub fn stage_bridge_event(
+        &self,
+        staged: &serde_json::Value,
+    ) -> Result<serde_json::Value, OrsError> {
+        let stream_id = bridge_key_text(staged, "stream_id")?;
+        let event_id = bridge_key_text(staged, "event_id")?;
+        let sequence = bridge_sequence(staged, "sequence")?;
+        let producer_id = bridge_text(staged, "producer_id")?;
+        let producer_generation = bridge_generation(staged, "producer_generation")?;
+        let authority_epoch = bridge_generation(staged, "authority_epoch")?;
+        let staging_connection = bridge_text(staged, "staging_connection")?;
+        let envelope_value = staged
+            .get("envelope")
+            .cloned()
+            .ok_or(OrsError::InvalidField {
+                field: "envelope",
+                reason: "bridge event must carry its canonical envelope JSON",
+            })?;
+        let envelope_bytes =
+            canonical_json_bytes(&envelope_value).map_err(|_| OrsError::InvalidField {
+                field: "envelope",
+                reason: "bridge event envelope is not canonicalizable",
+            })?;
+        if envelope_bytes.len() > MAX_BRIDGE_EVENT_ENVELOPE_BYTES {
+            return Err(OrsError::PayloadTooLarge);
+        }
+        let presented_sha = bridge_text(staged, "envelope_sha256")?;
+        crate::model::validate_digest(&presented_sha, "envelope_sha256")?;
+        if crate::model::sha256_hex(&envelope_bytes) != presented_sha {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        let key = format!("{stream_id}::{event_id}");
+        let now_ms = current_unix_ms_u64()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let outcome = {
+            let existing: Option<BridgeEventRow> = {
+                let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+                if records.len().map_err(storage)? >= MAX_BRIDGE_EVENT_RECORDS as u64
+                    && records.get(key.as_str()).map_err(storage)?.is_none()
+                {
+                    return Err(OrsError::ProjectionLimitExceeded);
+                }
+                records
+                    .get(key.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode(value.value()))
+                    .transpose()?
+            };
+            if let Some(row) = existing {
+                row.validate()?;
+                if row.envelope_sha256 != presented_sha
+                    || row.sequence != sequence
+                    || row.producer_id != producer_id
+                    || row.producer_generation != producer_generation
+                {
+                    return Err(OrsError::DuplicateConflict);
+                }
+                let (durable, acked) = Self::bridge_cursors_in(&write, &stream_id)?;
+                bridge_event_outcome(&row, "duplicate", durable, acked, false)
+            } else {
+                let row = BridgeEventRow {
+                    contract_version: crate::CONTRACT_VERSION,
+                    stream_id: stream_id.clone(),
+                    event_id: event_id.clone(),
+                    sequence,
+                    producer_id,
+                    producer_generation,
+                    authority_epoch,
+                    envelope_sha256: presented_sha,
+                    envelope_bytes,
+                    staging_connection,
+                    staged_at_ms: now_ms,
+                    phase: BRIDGE_EVENT_PHASE_DURABLE.to_owned(),
+                };
+                row.validate()?;
+                {
+                    let mut records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+                    records
+                        .insert(key.as_str(), encode(&row)?.as_str())
+                        .map_err(storage)?;
+                }
+                let (durable, acked) = Self::advance_bridge_cursor_in(&write, &stream_id)?;
+                bridge_event_outcome(&row, "accepted", durable, acked, true)
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(outcome)
+    }
+
+    /// Loads one staged bridge event by exact identity without mutating
+    /// anything.
+    ///
+    /// Read-only projection for ack recovery: after owner commit but before
+    /// acknowledgement, lookup returns the existing phase, disposition,
+    /// digest, and cursors, so a lost acknowledgement replays to the stored
+    /// facts instead of duplicating normalization or application. Unknown
+    /// identities return `Ok(None)`, never a synthesized event.
+    pub fn load_bridge_event(
+        &self,
+        stream_id: &str,
+        event_id: &str,
+    ) -> Result<Option<serde_json::Value>, OrsError> {
+        bridge_identity_text(stream_id, "stream_id")?;
+        bridge_identity_text(event_id, "event_id")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let key = format!("{stream_id}::{event_id}");
+        let row: Option<BridgeEventRow> = {
+            let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+            records
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        row.validate()?;
+        let (durable, acked) = Self::bridge_cursors_for(&self.database, stream_id)?;
+        Ok(Some(bridge_event_outcome(
+            &row, "accepted", durable, acked, false,
+        )))
+    }
+
+    /// Serves one bounded pending page for a stream in ascending sequence
+    /// order: committed-but-unacknowledged rows for acknowledgement recovery.
+    ///
+    /// `after_sequence` resumes after the previous page (the acked cursor for
+    /// the first page); `page_limit` must be within `1..=MAX_BRIDGE_EVENT_PAGE`
+    /// or [`OrsError::InvalidCursorLimit`] fails the call instead of
+    /// truncating silently. `continuation` resumes the walk, or is `None`
+    /// when the tail is fully served. Restart enumerates these pages with a
+    /// continuation; cursors are never reset and no generation's unresolved
+    /// rows are discarded here.
+    pub fn bridge_event_pending_page(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+        page_limit: usize,
+    ) -> Result<serde_json::Value, OrsError> {
+        bridge_identity_text(stream_id, "stream_id")?;
+        if page_limit == 0 || page_limit > MAX_BRIDGE_EVENT_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let mut rows: Vec<BridgeEventRow> = Vec::new();
+        {
+            let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+            for entry in records.iter().map_err(storage)? {
+                let (_, value) = entry.map_err(storage)?;
+                let row: BridgeEventRow = decode(value.value())?;
+                row.validate()?;
+                if row.stream_id == stream_id && row.sequence > after_sequence {
+                    rows.push(row);
+                }
+            }
+        }
+        rows.sort_by_key(|row| row.sequence);
+        let continuation = if rows.len() > page_limit {
+            rows.truncate(page_limit);
+            rows.last().map(|row| row.sequence)
+        } else {
+            None
+        };
+        let items: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "event_id": row.event_id,
+                    "sequence": row.sequence,
+                    "phase": row.phase,
+                    "disposition": "accepted",
+                    "envelope_sha256": row.envelope_sha256,
+                    "producer_id": row.producer_id,
+                    "producer_generation": row.producer_generation,
+                    "staging_connection": row.staging_connection,
+                })
+            })
+            .collect();
+        let (durable, acked) = Self::bridge_cursors_for(&self.database, stream_id)?;
+        Ok(json!({
+            "stream_id": stream_id,
+            "durable_cursor": durable,
+            "acked_cursor": acked,
+            "items": items,
+            "continuation": continuation,
+        }))
+    }
+
+    /// Advances the per-stream acked cursor monotonically, never past the
+    /// durable cursor, and compacts acknowledged rows past the retention
+    /// window in the same transaction.
+    ///
+    /// Only durable rows at or below the new acked frontier are eligible,
+    /// and only past `RETAIN_BRIDGE_EVENT_ACKED_PER_STREAM` newest acked rows
+    /// per stream: staged-but-uncommitted rows, unacknowledged rows, the
+    /// retention window (duplicate-suppression frontier), and the cursor facts
+    /// themselves are never touched. Re-presentation of a compacted sequence
+    /// at or below the acked cursor answers from the cursor frontier as a
+    /// duplicate instead of minting a second logical event. Returns the cursor
+    /// outcome plus the pruned row count.
+    pub fn acknowledge_bridge_events(
+        &self,
+        stream_id: &str,
+        sequence: u64,
+    ) -> Result<serde_json::Value, OrsError> {
+        bridge_identity_text(stream_id, "stream_id")?;
+        if sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "sequence",
+                reason: "acknowledgement sequence must be nonzero",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let (durable, mut acked) = Self::bridge_cursors_in(&write, stream_id)?;
+        if sequence > durable {
+            return Err(OrsError::InvalidTransition);
+        }
+        if sequence > acked {
+            acked = sequence;
+            Self::write_bridge_cursors_in(&write, stream_id, durable, acked)?;
+        }
+        let floor = acked.saturating_sub(RETAIN_BRIDGE_EVENT_ACKED_PER_STREAM);
+        let mut pruned = 0_u64;
+        if floor > 0 {
+            let victims: Vec<String> = {
+                let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+                let mut found = Vec::new();
+                for entry in records.iter().map_err(storage)? {
+                    let (key, value) = entry.map_err(storage)?;
+                    let row: BridgeEventRow = decode(value.value())?;
+                    row.validate()?;
+                    if row.stream_id == stream_id
+                        && row.sequence <= floor
+                        && row.phase == BRIDGE_EVENT_PHASE_DURABLE
+                    {
+                        found.push(key.value().to_owned());
+                    }
+                }
+                found
+            };
+            if !victims.is_empty() {
+                let mut records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+                for victim in &victims {
+                    records.remove(victim.as_str()).map_err(storage)?;
+                    pruned += 1;
+                }
+            }
+        }
+        write.commit().map_err(storage)?;
+        Ok(json!({
+            "stream_id": stream_id,
+            "durable_cursor": durable,
+            "acked_cursor": acked,
+            "pruned": pruned,
+        }))
+    }
+
+    /// Records one forwarded coverage gap without touching any cursor.
+    ///
+    /// A successfully forwarded gap accounts for missing coverage: the gap
+    /// row (identity, stream interval, reason, staging connection) stays
+    /// visible in coverage while the durable/acked cursors do not move, so
+    /// absent events are never converted into applied events. An exact replay
+    /// under the same gap identity returns the existing acceptance; changed
+    /// content under it fails with [`OrsError::DuplicateConflict`].
+    pub fn record_bridge_event_gap(
+        &self,
+        gap: &serde_json::Value,
+    ) -> Result<serde_json::Value, OrsError> {
+        let gap_id = bridge_key_text(gap, "gap_id")?;
+        let stream_id = bridge_key_text(gap, "stream_id")?;
+        let start_sequence = bridge_sequence(gap, "start_sequence")?;
+        let end_sequence = bridge_sequence(gap, "end_sequence")?;
+        if end_sequence < start_sequence {
+            return Err(OrsError::InvalidField {
+                field: "end_sequence",
+                reason: "gap interval must not end before it starts",
+            });
+        }
+        let reason_ref = bridge_text(gap, "reason_ref")?;
+        let staging_connection = bridge_text(gap, "staging_connection")?;
+        let now_ms = current_unix_ms_u64()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let gaps = write.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
+            if gaps.get(gap_id.as_str()).map_err(storage)?.is_none() {
+                let mut stream_gaps = 0_usize;
+                for entry in gaps.iter().map_err(storage)? {
+                    let (_, value) = entry.map_err(storage)?;
+                    let row: BridgeEventGapRow = decode(value.value())?;
+                    row.validate()?;
+                    if row.stream_id == stream_id {
+                        stream_gaps += 1;
+                    }
+                }
+                if stream_gaps >= MAX_BRIDGE_EVENT_GAPS_PER_STREAM {
+                    return Err(OrsError::ProjectionLimitExceeded);
+                }
+            }
+        }
+        if let Some(existing) = {
+            let gaps = write.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
+            gaps.get(gap_id.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        } {
+            let existing: BridgeEventGapRow = existing;
+            existing.validate()?;
+            if existing.stream_id != stream_id
+                || existing.start_sequence != start_sequence
+                || existing.end_sequence != end_sequence
+                || existing.reason_ref != reason_ref
+            {
+                return Err(OrsError::DuplicateConflict);
+            }
+            write.commit().map_err(storage)?;
+            return Ok(json!({ "gap_id": gap_id, "accepted": true, "fresh": false }));
+        }
+        let row = BridgeEventGapRow {
+            contract_version: crate::CONTRACT_VERSION,
+            gap_id: gap_id.clone(),
+            stream_id,
+            start_sequence,
+            end_sequence,
+            reason_ref,
+            staging_connection,
+            recorded_at_ms: now_ms,
+        };
+        row.validate()?;
+        {
+            let mut gaps = write.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
+            gaps.insert(gap_id.as_str(), encode(&row)?.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(json!({ "gap_id": gap_id, "accepted": true, "fresh": true }))
+    }
+
+    /// Reconciles event ownership and cursors for the presenting connection.
+    ///
+    /// Scope rule, enforced here and nowhere else: no stream listing exists.
+    /// The enumeration covers exactly the streams whose cursor row names the
+    /// presenting connection as the last stager, plus streams whose last
+    /// producer generation is older than `live_generation` (fenced
+    /// old-generation unresolved streams are never discarded). Each covered
+    /// stream reports its durable/acked cursors, its pending first page, and
+    /// its recorded gaps. The caller binds the reply digest as its
+    /// reconciliation key; host-request reconciliation never reads these
+    /// tables.
+    pub fn reconcile_bridge_events(
+        &self,
+        connection_id: &str,
+        live_generation: u64,
+    ) -> Result<serde_json::Value, OrsError> {
+        crate::model::validate_text(connection_id, "connection_id")?;
+        if live_generation == 0 {
+            return Err(OrsError::InvalidField {
+                field: "live_generation",
+                reason: "live producer generation must be nonzero",
+            });
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let mut streams: Vec<(String, u64, u64, String, u64)> = Vec::new();
+        {
+            let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+            for entry in cursors.iter().map_err(storage)? {
+                let (_, value) = entry.map_err(storage)?;
+                let row: BridgeEventCursorRow = decode(value.value())?;
+                row.validate()?;
+                if row.last_staging_connection == connection_id
+                    || row.last_producer_generation < live_generation
+                {
+                    streams.push((
+                        row.stream_id.clone(),
+                        row.last_durable_sequence,
+                        row.last_acked_sequence,
+                        row.last_staging_connection.clone(),
+                        row.last_producer_generation,
+                    ));
+                }
+            }
+        }
+        streams.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut covered = Vec::new();
+        for (stream_id, durable, acked, stager, generation) in &streams {
+            let page = self.bridge_event_pending_page(stream_id, *acked, MAX_BRIDGE_EVENT_PAGE)?;
+            let gaps = self.bridge_gaps_for(stream_id)?;
+            covered.push(json!({
+                "stream_id": stream_id,
+                "durable_cursor": durable,
+                "acked_cursor": acked,
+                "last_staging_connection": stager,
+                "last_producer_generation": generation,
+                "pending_first_page": page,
+                "gaps": gaps,
+            }));
+        }
+        Ok(json!({
+            "connection_id": connection_id,
+            "live_generation": live_generation,
+            "streams": covered,
+        }))
+    }
+
+    /// Reads the recorded gaps for one stream, oldest first.
+    fn bridge_gaps_for(&self, stream_id: &str) -> Result<Vec<serde_json::Value>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let gaps = read.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
+        let mut rows: Vec<BridgeEventGapRow> = Vec::new();
+        for entry in gaps.iter().map_err(storage)? {
+            let (_, value) = entry.map_err(storage)?;
+            let row: BridgeEventGapRow = decode(value.value())?;
+            row.validate()?;
+            if row.stream_id == stream_id {
+                rows.push(row);
+            }
+        }
+        rows.sort_by_key(|row| (row.start_sequence, row.gap_id.clone()));
+        Ok(rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "gap_id": row.gap_id,
+                    "start_sequence": row.start_sequence,
+                    "end_sequence": row.end_sequence,
+                    "reason_ref": row.reason_ref,
+                })
+            })
+            .collect())
+    }
+
+    /// Reads the per-stream durable/acked cursors inside a write transaction.
+    /// Unknown streams report zero cursors; cursor state is never synthesized
+    /// from turn, process, or host-request state.
+    fn bridge_cursors_in(
+        write: &redb::WriteTransaction,
+        stream_id: &str,
+    ) -> Result<(u64, u64), OrsError> {
+        let cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+        let row: Option<BridgeEventCursorRow> = cursors
+            .get(stream_id)
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()?;
+        match row {
+            Some(row) => {
+                row.validate()?;
+                Ok((row.last_durable_sequence, row.last_acked_sequence))
+            }
+            None => Ok((0, 0)),
+        }
+    }
+
+    /// Reads the per-stream durable/acked cursors under a read transaction
+    /// for mutation-free projections (lookup, pages, reconciliation).
+    fn bridge_cursors_for(database: &Database, stream_id: &str) -> Result<(u64, u64), OrsError> {
+        let read = database.begin_read().map_err(storage)?;
+        let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+        let row: Option<BridgeEventCursorRow> = cursors
+            .get(stream_id)
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()?;
+        match row {
+            Some(row) => {
+                row.validate()?;
+                Ok((row.last_durable_sequence, row.last_acked_sequence))
+            }
+            None => Ok((0, 0)),
+        }
+    }
+
+    /// Advances the durable cursor over the contiguous staged frontier and
+    /// persists the cursor row with its staging provenance.
+    fn advance_bridge_cursor_in(
+        write: &redb::WriteTransaction,
+        stream_id: &str,
+    ) -> Result<(u64, u64), OrsError> {
+        let (mut durable, acked) = Self::bridge_cursors_in(write, stream_id)?;
+        let mut stager: Option<(String, u64)> = None;
+        loop {
+            let wanted = durable + 1;
+            let found: Option<(String, u64)> = {
+                let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+                let mut hit = None;
+                for entry in records.iter().map_err(storage)? {
+                    let (_, value) = entry.map_err(storage)?;
+                    let row: BridgeEventRow = decode(value.value())?;
+                    if row.stream_id == stream_id && row.sequence == wanted {
+                        row.validate()?;
+                        hit = Some((row.staging_connection.clone(), row.producer_generation));
+                        break;
+                    }
+                }
+                hit
+            };
+            let Some((connection, generation)) = found else {
+                break;
+            };
+            durable = wanted;
+            stager = Some((connection, generation));
+        }
+        let cursor = BridgeEventCursorRow {
+            contract_version: crate::CONTRACT_VERSION,
+            stream_id: stream_id.to_owned(),
+            last_durable_sequence: durable,
+            last_acked_sequence: acked,
+            last_staging_connection: stager
+                .as_ref()
+                .map_or(String::new(), |(connection, _)| connection.clone()),
+            last_producer_generation: stager.map_or(0, |(_, generation)| generation),
+        };
+        cursor.validate()?;
+        {
+            let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+            cursors
+                .insert(stream_id, encode(&cursor)?.as_str())
+                .map_err(storage)?;
+        }
+        Ok((durable, acked))
+    }
+
+    /// Persists the per-stream cursor row with its staging provenance.
+    fn write_bridge_cursors_in(
+        write: &redb::WriteTransaction,
+        stream_id: &str,
+        durable: u64,
+        acked: u64,
+    ) -> Result<(), OrsError> {
+        let prior: Option<BridgeEventCursorRow> = {
+            let cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+            cursors
+                .get(stream_id)
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let cursor = BridgeEventCursorRow {
+            contract_version: crate::CONTRACT_VERSION,
+            stream_id: stream_id.to_owned(),
+            last_durable_sequence: durable,
+            last_acked_sequence: acked,
+            last_staging_connection: prior
+                .as_ref()
+                .map_or(String::new(), |row| row.last_staging_connection.clone()),
+            last_producer_generation: prior.map_or(0, |row| row.last_producer_generation),
+        };
+        cursor.validate()?;
+        let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+        cursors
+            .insert(stream_id, encode(&cursor)?.as_str())
+            .map_err(storage)?;
+        Ok(())
     }
 
     /// Stages one native-worker claim intent before any acknowledgement.
