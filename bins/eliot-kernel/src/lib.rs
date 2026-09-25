@@ -4069,6 +4069,15 @@ impl KernelComposition {
         // a live supervision lease, a live authenticated front-door Session,
         // or an outstanding host-request operation each keeps an obligation
         // that shutdown may not abandon.
+        //
+        // The census samples several owners independently, so a zero from one
+        // is not evidence that the others stood still. Take the admission
+        // coherence sample the census is taken under, and revalidate exactly
+        // that sample after the census: independently sampled zeros are not
+        // treated as atomic (issue #2625, I1.5 DrainCommitRecord).
+        let admission = self
+            .drain_admission_coherence(coordinator)
+            .map_err(DrainHalt::new)?;
         let census = self.idle_lease_census();
         health_view::observe_shutdown_observation(
             "kernel.shutdown.lease_census_observed",
@@ -4099,19 +4108,29 @@ impl KernelComposition {
             ),
         )?;
 
-        // DrainCommit linearization point.
-        let authority_epochs_fenced = match self.front_door_policy.lock() {
-            Ok(policy) => {
-                let fence = &policy.module_generation.state_fence;
-                vec![format!(
-                    "{}:{}@{}",
-                    fence.authority_epoch.lineage_id,
-                    fence.authority_epoch.sequence,
-                    fence.resource_generation.value()
-                )]
-            }
-            Err(_) => return Err(DrainHalt::new("authority-fence-unavailable")),
-        };
+        // Revalidate the admission frontier the final census was taken under
+        // before the linearization point consumes it. Work that raced the
+        // snapshot is refused here rather than left unaccounted: an admission
+        // still in flight, a fresh drain generation, a re-fenced State Fence,
+        // a reopened service admission, or a front-door session/operation that
+        // appeared after the census all block the commit. A poisoned owner
+        // guard blocks it too, because a fenced read is not a stable frontier.
+        let revalidated = self
+            .drain_admission_coherence(coordinator)
+            .map_err(|reason| {
+                DrainHalt::with_pending(reason, vec![census.observation_code().to_owned()])
+            })?;
+        if revalidated != admission {
+            return Err(DrainHalt::with_pending(
+                "drain-admission-raced-final-census",
+                vec![census.observation_code().to_owned()],
+            ));
+        }
+
+        // DrainCommit linearization point. The committed State Fence is the
+        // revalidated one, so the authority the commit fences is the same
+        // authority the final census was proven under.
+        let authority_epochs_fenced = vec![revalidated.state_fence];
         let decision = DrainCommitDecision {
             generation: generation.clone(),
             lease_and_pending_snapshot: Vec::new(),
@@ -4149,6 +4168,71 @@ impl KernelComposition {
         Ok(decision)
     }
 
+    /// Samples the exact drain/admission frontier the final lease census is
+    /// taken under and revalidated against.
+    ///
+    /// The census reads several independent owners, so each zero it observes
+    /// is only a statement about the instant that owner was sampled. This
+    /// sample is the cross-owner coherence check: the drain authorization is
+    /// consumed only when the drain generation, the front-door State Fence,
+    /// the service admission state, and both front-door indexes are identical
+    /// before and after the census.
+    ///
+    /// Every owner is read under its own guard, and each guard is released
+    /// before the next owner is touched: no global mutex is held across an
+    /// RPC, an ORS read, or an await point, and no two of these owners are
+    /// ever held at once. A poisoned guard is fenced state, so it is reported
+    /// as a reason rather than recovered with `into_inner` and treated as a
+    /// stable frontier.
+    fn drain_admission_coherence(
+        &self,
+        coordinator: &Arc<shutdown_drain::ShutdownDrainCoordinator>,
+    ) -> Result<DrainAdmissionCoherence, &'static str> {
+        let drain_generation = coordinator.drain_generation();
+        let state_fence = match self.front_door_policy.lock() {
+            Ok(policy) => {
+                let fence = &policy.module_generation.state_fence;
+                format!(
+                    "{}:{}@{}",
+                    fence.authority_epoch.lineage_id,
+                    fence.authority_epoch.sequence,
+                    fence.resource_generation.value()
+                )
+            }
+            Err(_) => return Err("authority-fence-unavailable"),
+        };
+        let service_state = self
+            .service_state()
+            .map_err(|_| "service-state-unavailable")?;
+        #[cfg(windows)]
+        let (bridge_sessions, host_request_operations) = {
+            let bridge_sessions = match self.agent_bridge_connections.lock() {
+                Ok(connections) => connections.len(),
+                Err(_) => return Err("bridge-session-index-unreadable"),
+            };
+            let host_request_operations = match self.host_request_connection_index.lock() {
+                Ok(index) => index
+                    .values()
+                    .map(|operations| operations.len())
+                    .sum::<usize>(),
+                Err(_) => return Err("host-request-index-unreadable"),
+            };
+            (bridge_sessions, host_request_operations)
+        };
+        // I1.7: the non-Windows Kernel has no authenticated front-door
+        // Session, so there is no front-door index to sample and nothing can
+        // race it.
+        #[cfg(not(windows))]
+        let (bridge_sessions, host_request_operations) = (0usize, 0usize);
+        Ok(DrainAdmissionCoherence {
+            drain_generation,
+            state_fence,
+            service_state,
+            bridge_sessions,
+            host_request_operations,
+        })
+    }
+
     /// Lists pending canonical-write receipts (ORS store-rebind rows) as
     /// drain-gate identities. Read-only: shutdown never mutates staged rows.
     fn pending_rebind_receipts(&self) -> Result<Vec<String>, String> {
@@ -4163,6 +4247,28 @@ impl KernelComposition {
             .map(|record| format!("store-rebind:{}", record.operation_id.as_str()))
             .collect())
     }
+}
+
+/// Bounded cross-owner drain/admission coherence sample.
+///
+/// Taken immediately before the final Kernel lease census and revalidated
+/// immediately after it: `DrainCommit` consumes the authorization only when
+/// both samples are identical. Every field is an existing owner's current
+/// value or a count of it — no lease identity, digest, or owner error text
+/// crosses this boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DrainAdmissionCoherence {
+    /// The drain generation the census is taken under and the commit is
+    /// consumed for.
+    drain_generation: String,
+    /// The front-door `StateFence` binding (`lineage:sequence@resource`).
+    state_fence: String,
+    /// The service admission state the census was taken under.
+    service_state: KernelServiceState,
+    /// Admitted front-door bridge Session count.
+    bridge_sessions: usize,
+    /// Admitted front-door host-request operation count.
+    host_request_operations: usize,
 }
 
 fn status_frame(
