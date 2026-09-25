@@ -392,7 +392,7 @@ pub enum AgentResultStatus {
 }
 
 /// Host invocation/result transport envelope (issue #370 disposition:
-/// RETAIN_DISTINCT). This is a legacy host-invocation result projection only:
+/// `RETAIN_DISTINCT`). This is a legacy host-invocation result projection only:
 /// `candidate_only` must hold for candidate transport, and neither a
 /// `Succeeded` status, the `candidate_only` flag itself, nor a supplied
 /// `canonical_receipt` (a host write-receipt reference, not Finish proof)
