@@ -4211,10 +4211,7 @@ impl KernelComposition {
                 Err(_) => return Err("bridge-session-index-unreadable"),
             };
             let host_request_operations = match self.host_request_connection_index.lock() {
-                Ok(index) => index
-                    .values()
-                    .map(|operations| operations.len())
-                    .sum::<usize>(),
+                Ok(index) => index.values().map(Vec::len).sum::<usize>(),
                 Err(_) => return Err("host-request-index-unreadable"),
             };
             (bridge_sessions, host_request_operations)
