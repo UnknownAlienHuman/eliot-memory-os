@@ -1213,6 +1213,48 @@ fn activation_deadline_expired(now: u64, deadline: u64) -> bool {
     now >= deadline
 }
 
+/// Closed shape of one live SCM Watchdog incarnation observation:
+/// `host-scm-watchdog:{pid}:{start_time_100ns}:{image_sha256}`.
+///
+/// I1.11 step 1 makes SCM the named channel for the independent Watchdog
+/// service state, so the digest that carries it is a live process identity plus
+/// the digest of the live Watchdog image bytes. A path string, a lease revision
+/// or a health flag is not this shape and is refused.
+#[cfg(windows)]
+const LIVE_SCM_WATCHDOG_OBSERVATION_PREFIX: &str = "host-scm-watchdog";
+
+/// Validates one live SCM Watchdog incarnation digest in the closed shape.
+///
+/// This is the single owner of that shape so the supervision producer and the
+/// readiness gate can never drift into accepting different observations.
+///
+/// # Errors
+///
+/// Returns a platform error when the digest does not name a live Watchdog
+/// process identity with a non-empty image digest and nothing else.
+#[cfg(windows)]
+fn verify_live_scm_watchdog_observation(
+    digest: &eliot_platform::PlatformHandle,
+) -> Result<(), KernelServiceError> {
+    let malformed =
+        || KernelServiceError::Platform("Host SCM Watchdog observation is malformed".to_owned());
+    let mut parts = digest.as_str().split(':');
+    if parts.next() != Some(LIVE_SCM_WATCHDOG_OBSERVATION_PREFIX) {
+        return Err(malformed());
+    }
+    let Ok(process_id) = parts.next().ok_or_else(malformed)?.parse::<u32>() else {
+        return Err(malformed());
+    };
+    let Ok(process_start) = parts.next().ok_or_else(malformed)?.parse::<u64>() else {
+        return Err(malformed());
+    };
+    let image_sha256 = parts.next().ok_or_else(malformed)?;
+    if parts.next().is_some() || process_id == 0 || process_start == 0 || image_sha256.is_empty() {
+        return Err(malformed());
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn load_agent_bridge_declaration(
     admission: &AgentBridgeAdmissionDescriptor,
@@ -2572,9 +2614,6 @@ impl KernelComposition {
         candidate: &eliot_kernel_service::HostKernelCandidateBinding,
         target: &StateFence,
     ) -> Result<(), KernelServiceError> {
-        let malformed = || {
-            KernelServiceError::Platform("Host SCM Watchdog observation is malformed".to_owned())
-        };
         let candidate_digest = candidate.compute_digest().map_err(|_| {
             KernelServiceError::Platform(
                 "Watchdog branch observation candidate has no computable digest".to_owned(),
@@ -2595,25 +2634,63 @@ impl KernelComposition {
                 "Host Watchdog branch observation has no non-zero Watchdog epoch".to_owned(),
             ));
         }
-        let mut parts = evidence.scm_watchdog_observation_digest.as_str().split(':');
-        if parts.next() != Some("host-scm-watchdog") {
-            return Err(malformed());
-        }
-        let Ok(process_id) = parts.next().ok_or_else(malformed)?.parse::<u32>() else {
-            return Err(malformed());
-        };
-        let Ok(process_start) = parts.next().ok_or_else(malformed)?.parse::<u64>() else {
-            return Err(malformed());
-        };
-        let image_sha256 = parts.next().ok_or_else(malformed)?;
-        if parts.next().is_some()
-            || process_id == 0
-            || process_start == 0
-            || image_sha256.is_empty()
-        {
-            return Err(malformed());
-        }
-        self.record_host_observed_supervision_evidence()
+        verify_live_scm_watchdog_observation(&evidence.scm_watchdog_observation_digest)?;
+        self.record_host_observed_supervision_evidence(&evidence.scm_watchdog_observation_digest)
+    }
+
+    /// Probe/readiness admission for the independent Watchdog branch.
+    ///
+    /// I1.5 (#1750) and I1.11 steps 1/11: Host validates the independent
+    /// Watchdog service state through SCM and Watchdog independently confirms
+    /// coverage, so a readiness receipt may only be authored for a contour whose
+    /// branch Kernel can currently prove. The proof is a conjunction:
+    ///
+    /// 1. the live SCM Watchdog incarnation digest Host observed for THIS
+    ///    contour is recorded with the revocable I1.11 supervision step, and is
+    ///    re-validated here in the same closed shape — a live process identity
+    ///    plus the digest of the live Watchdog image bytes, not a number copied
+    ///    out of a lease;
+    /// 2. that supervision step is still present, so a new activation contour
+    ///    that has not been observed again is unproven; and
+    /// 3. the whole supervised-branch verification
+    ///    ([`Self::verify_watchdog_supervision_branch`]) succeeds for the exact
+    ///    presented candidate and target fence.
+    ///
+    /// This is deliberately NOT a lease-derived watchdog-epoch equality. Two
+    /// `u64`s compared on a renewed ORS head are bookkeeping, not observation:
+    /// they stay equal while Watchdog is stopped, replaced or wedged. The
+    /// conjunction above refuses in every one of those cases, so it is strictly
+    /// stronger than the epoch equality it replaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns a platform error naming the missing live SCM observation or the
+    /// exact supervision fact that failed to verify.
+    #[cfg(windows)]
+    pub(crate) fn admit_probe_watchdog_branch(
+        &self,
+        candidate: &eliot_kernel_service::HostKernelCandidateBinding,
+        target: &StateFence,
+    ) -> Result<(), KernelServiceError> {
+        let observed = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?
+            .live_watchdog_incarnation()
+            .cloned()
+            .ok_or_else(|| {
+                KernelServiceError::Platform(
+                    "readiness refused: no live SCM Watchdog incarnation is observed for the current contour"
+                        .to_owned(),
+                )
+            })?;
+        verify_live_scm_watchdog_observation(&observed)?;
+        self.verify_watchdog_supervision_branch(candidate, target)
+            .map_err(|reason| {
+                KernelServiceError::Platform(format!(
+                    "readiness refused: {reason}; supervised readiness is withheld and the contour stays degraded"
+                ))
+            })
     }
 
     /// Revokes the recorded independent-supervision evidence at the one
@@ -2684,14 +2761,27 @@ impl KernelComposition {
     ///
     /// This is the sole production producer of [`STARTUP_FINAL_STEP`]. The
     /// caller must have just accepted a live SCM Watchdog incarnation bound to
-    /// the presented candidate contour. The step is revocable, so a later
-    /// contour change keeps Material/Critical admission closed until Host
-    /// observes the branch again.
+    /// the presented candidate contour; the incarnation digest is retained
+    /// with the step so a later admission can prove the claim came from that
+    /// observation. The step is revocable, so a later contour change keeps
+    /// Material/Critical admission closed until Host observes the branch again.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lock-poison platform error, or the coordinator's fixed-shape
+    /// range error for a step outside I1.11.
     #[cfg(windows)]
     pub(crate) fn record_host_observed_supervision_evidence(
         &self,
+        incarnation: &eliot_platform::PlatformHandle,
     ) -> Result<(), KernelServiceError> {
-        self.record_startup_evidence_inner(STARTUP_FINAL_STEP)
+        let mut coordinator = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        coordinator
+            .record_live_supervision_evidence(incarnation.clone())
+            .map_err(KernelServiceError::Platform)
     }
 
     /// Ordered I1.11 cursor update shared by the general and

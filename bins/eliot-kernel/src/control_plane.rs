@@ -475,10 +475,41 @@ impl KernelComposition {
             .map(|(snapshot, _)| snapshot.clone());
         #[cfg(not(windows))]
         let supervision_lease = None;
-        // The renewed supervision head proves lease continuity only.  It does
-        // not prove an independent Watchdog response, so ProbeReady may publish
-        // only the low-impact readiness projection; Material admission remains
-        // closed by the explicit coverage refusal in `admit_material_authority`.
+        #[cfg(windows)]
+        if let Some((renewed_head, _)) = supervision_publication.as_ref() {
+            // I1.5 (#1750), I1.11 steps 1/11: this probe may not author a
+            // ready receipt — and therefore may not publish any
+            // supervised-readiness claim — unless the independent Watchdog
+            // branch currently verifies from a LIVE SCM incarnation.
+            //
+            // This is the production gate main had here and the branch dropped.
+            // The dropped predicate was a lease-derived watchdog-epoch
+            // equality: two bookkeeping `u64`s on the renewed ORS head, which
+            // stay equal while Watchdog is stopped, replaced or wedged, so it
+            // could admit a contour whose branch had never been observed. The
+            // replacement requires the recorded live SCM incarnation digest for
+            // THIS contour (only `HostStartupEvidence` can set it, and only
+            // after Host revalidated the PID/start pair against the live OS and
+            // the live image bytes against the approved Watchdog artifact)
+            // plus the whole supervised-branch conjunction. It therefore
+            // refuses strictly more, never less.
+            //
+            // The target fence is read from the freshly renewed,
+            // signature-verified head's own binding rather than rebuilt from
+            // the request, so this gate cannot manufacture authority out of a
+            // request field; the join clauses then bind that head back to the
+            // presented candidate. A refusal surfaces as degraded readiness
+            // instead of supervised health.
+            self.admit_probe_watchdog_branch(
+                &request.candidate,
+                &renewed_head.record.binding.state_fence,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
+        }
+        // The renewed supervision head above proves lease continuity only. It
+        // does not by itself prove an independent Watchdog response, so no
+        // Material/Critical admission may be derived from it either; that path
+        // re-verifies the live branch in `admit_material_authority_for_fence`.
         let receipt = if is_probe {
             #[cfg(windows)]
             {
