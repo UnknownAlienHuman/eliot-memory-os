@@ -28,7 +28,9 @@
 //!
 //! Catalogue, quota, and liveness observations (issue #265) ride only as
 //! [`ProviderSelectionHealth`]: selection/health input, never admission. The
-//! verifier never reads that field.
+//! verifier never reads that field; route selection projects its refs into
+//! the selection lineage through
+//! [`ProviderVerifier::selection_health`](crate::core::ProviderVerifier).
 //!
 //! Binding M1/M2/M3 (issue #22): Kernel supplies, no signing or tokens, the
 //! verifier capability is built only in daemon composition from the
@@ -427,6 +429,10 @@ impl ProviderVerifier for KernelProviderVerifier {
 
     fn minimum_event_sequence(&self) -> u64 {
         self.capability.minimum_event_sequence
+    }
+
+    fn selection_health(&self) -> Option<&ProviderSelectionHealth> {
+        self.capability.health()
     }
 
     fn verify(

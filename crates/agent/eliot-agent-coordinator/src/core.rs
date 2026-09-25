@@ -32,7 +32,9 @@ use crate::model::{
     StaffingLaneCandidate, StaffingPlanCandidate, StaffingPlanRequest, SubmissionId,
     UnknownOutcomeFinalReceipt, WorkerId, validate_text,
 };
-use crate::provider_admission::{AdmittedProviderCapability, KernelProviderVerifier};
+use crate::provider_admission::{
+    AdmittedProviderCapability, KernelProviderVerifier, ProviderSelectionHealth,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ProviderProofKind {
@@ -60,6 +62,12 @@ pub(crate) enum ProviderProofKind {
 pub(crate) trait ProviderVerifier: Send + Sync {
     fn binding(&self) -> ProviderBindingSnapshot;
     fn minimum_event_sequence(&self) -> u64;
+    /// Input-only issue #265 selection/health observation bound at
+    /// admission, if any. Route selection reads this; the verifier never
+    /// does, and it never mints admission.
+    fn selection_health(&self) -> Option<&ProviderSelectionHealth> {
+        None
+    }
     fn verify(
         &self,
         kind: ProviderProofKind,
@@ -476,8 +484,13 @@ impl AgentCoordinator {
             if !lane_keys.insert((lane.work_unit_id.clone(), lane.role_id.clone())) {
                 return Err(CoordinatorError::DuplicateIdentity("work_unit_role"));
             }
-            let routing =
-                select_route(&self.config, &request, role, lane.route_candidates.clone())?;
+            let routing = select_route(
+                &self.config,
+                &request,
+                role,
+                lane.route_candidates.clone(),
+                self.provider.selection_health(),
+            )?;
             let selected_route = routing
                 .selected
                 .clone()
@@ -2304,6 +2317,7 @@ fn select_route(
     request: &StaffingPlanRequest,
     role: &RoleProfileManifest,
     mut candidates: Vec<RouteCandidateEvidence>,
+    health: Option<&ProviderSelectionHealth>,
 ) -> Result<RouteSelectionCandidate, CoordinatorError> {
     if candidates.is_empty() {
         return Err(CoordinatorError::RouteEvidence);
@@ -2370,6 +2384,25 @@ fn select_route(
         request.candidate_id.as_str(),
         role.role_id.as_str()
     );
+    // Issue #265 catalogue/quota/liveness observation rides the selection
+    // lineage only: the refs record which current-account observations
+    // informed this selection. Input-only — never read by the verifier,
+    // never minting admission, never gating selection.
+    let mut evidence_refs = selected.evidence_refs.clone();
+    if let Some(health) = health {
+        for observed in [
+            health.catalogue_revision(),
+            health.quota_knowledge_ref(),
+            health.liveness_observation_ref(),
+        ] {
+            if !evidence_refs
+                .iter()
+                .any(|existing| existing.as_str() == observed)
+            {
+                evidence_refs.push(observed.to_owned());
+            }
+        }
+    }
     let candidate = RouteSelectionCandidate {
         capability,
         query_intent,
@@ -2379,7 +2412,7 @@ fn select_route(
         selected: Some(selected.route.clone()),
         rejected,
         selection: CandidateSelectionDisposition::Selected,
-        evidence_refs: selected.evidence_refs.clone(),
+        evidence_refs,
     };
     candidate.validate().map_err(provider_contract)?;
     Ok(candidate)
