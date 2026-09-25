@@ -350,10 +350,12 @@ enum InstallationCommand {
         #[arg(long)]
         installation_key: Option<String>,
     },
-    /// Publish the per-user Notify fallback declaration and register the
-    /// signed Task Scheduler fallback. Runs in the interactive session
-    /// matching `--sid`/`--session-id`; normal launch stays User-Broker
-    /// owned (I11.6). No process is spawned by this command.
+    /// Run the Watchdog fallback key ceremony, publish the per-user Notify
+    /// fallback declaration derived from it, and register the signed Task
+    /// Scheduler fallback. The Watchdog verifying key is provisioned here from
+    /// the OS CSPRNG and is never supplied as an argument. Runs in the
+    /// interactive session; normal launch stays User-Broker owned (I11.6). No
+    /// process is spawned by this command.
     SetupNotifyFallback {
         /// Stable installation identity.
         #[arg(long)]
@@ -364,12 +366,10 @@ enum InstallationCommand {
         /// Non-zero authority epoch.
         #[arg(long)]
         authority_epoch: u64,
-        /// Watchdog signing key identifier.
+        /// Installer-bound Watchdog signing key identifier, recorded in both
+        /// the protected key binding and the declaration.
         #[arg(long)]
         key_id: String,
-        /// Lowercase hex Watchdog verifying key (public half only).
-        #[arg(long)]
-        public_key: String,
         /// Absolute installed `eliot-notify.exe` path. The image digest is
         /// always hashed from these exact bytes at setup time; no
         /// caller-supplied digest is accepted.
@@ -2005,7 +2005,6 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             audience,
             authority_epoch,
             key_id,
-            public_key,
             notify_exe,
             profile,
             profile_anchor_root,
@@ -2015,7 +2014,6 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             audience,
             authority_epoch,
             key_id,
-            public_key,
             notify_exe,
             profile,
             profile_anchor_root,
@@ -2377,7 +2375,6 @@ fn run_installation_setup_notify_fallback(
     audience: String,
     authority_epoch: u64,
     key_id: String,
-    public_key: String,
     notify_exe: PathBuf,
     profile: InstallationProfile,
     profile_anchor_root: PathBuf,
@@ -2392,12 +2389,14 @@ fn run_installation_setup_notify_fallback(
         ),
         InstallationProfile::SystemService | InstallationProfile::UserMode => None,
     };
+    // The Watchdog verifying key is deliberately absent: Host's setup ceremony
+    // provisions the protected secret and derives the public half, so the CLI
+    // cannot pin a key the producer's private half does not derive.
     let inputs = NotifyFallbackSetupInputs {
         installation_identity: cli_handle(installation.clone(), "installation")?,
         audience: cli_handle(audience.clone(), "audience")?,
         authority_epoch,
         key_id: cli_handle(key_id.clone(), "key_id")?,
-        public_key,
         notify_executable: notify_exe,
         profile,
         portable_root,
