@@ -112,6 +112,28 @@ const GRANT_CLOSURE_LINKS_KIND: &str = "grant_closure_canonical_receipts";
 /// read could not be served. A refusal is never an empty link set.
 const GRANT_CLOSURE_LINKS_REFUSAL_KIND: &str = "grant_closure_canonical_receipts_refused";
 
+/// Typed refusal kind answered by the four P-07 authority arms (`#1110`).
+///
+/// The set of kinds this dispatcher emits for a P-07 answer is closed: a
+/// refusal is a distinct application kind, never a receipt, never an absent
+/// frame, and never a transport failure. A caller that does not know this kind
+/// still fails closed on it, because a receipt kind comparison refuses it too.
+const P07_AUTHORITY_REFUSAL_KIND: &str = "authority_operation_refused";
+
+/// I7.20 closed `AgentResponseDisposition` control layer, spelled exactly as
+/// `docs/architecture/I07-20-agent-facing-error-contract.md` fixes it. Bridges
+/// switch on this stable disposition and may specialize the exact
+/// `reason_code` beside it; a refusal never carries display text in its place.
+/// These are the control-enum values, not reason codes, and they are listed
+/// here because `eliot-agent-bridge-core` (which exports the activation-scoped
+/// subset) is not a dependency of the Kernel composition root.
+/// I7.20: a stale fence or an identity conflict; retry needs a new ticket.
+const P07_DISPOSITION_STALE_OR_CONFLICT: &str = "STALE_OR_CONFLICT";
+/// I7.20: a possible commit whose acknowledgement was lost.
+const P07_DISPOSITION_RECOVERY_REQUIRED: &str = "RECOVERY_REQUIRED";
+/// I7.20: no admitted capability or capacity for this operation.
+const P07_DISPOSITION_UNAVAILABLE_OR_CAPACITY: &str = "UNAVAILABLE_OR_CAPACITY";
+
 const STARTUP_EVIDENCE_FIELDS: [&str; 8] = [
     "transport_binding",
     "state_fence",
@@ -686,22 +708,94 @@ fn p07_binding_agrees_with_session(
     Ok(())
 }
 
-/// Maps one retained-port refusal to the typed dispatch failure. Admission
-/// refusals and an unready production route fail closed as fenced without
-/// minting authority; a binding that disagrees with retained owner state under
-/// a known identity (changed payload, stale revision, disagreeing material)
-/// conflicts so the caller re-serves fresh state instead of retrying blindly —
-/// the same contract as the owner-bundle publish arm. Only a possible commit
-/// with a lost acknowledgement surfaces as an unknown outcome for exact
-/// reconciliation.
-fn map_p07_port_error(error: &eliot_authority::P07PortError) -> TransportError {
+/// One decided P-07 refusal, projected onto both surfaces it must reach.
+///
+/// `transport` is the typed dispatch failure the Kernel operator surface has
+/// always observed for this refusal (`daemon_identity_conflict`,
+/// `daemon_unknown_outcome`, `daemon_fenced`). `disposition` and `reason_code`
+/// are the I7.20 pair the caller switches on. Both are derived in exactly one
+/// place — [`map_p07_port_error`] — so the operator observation and the
+/// daemon's typed failure can never disagree about the same refusal.
+struct P07PortRefusal {
+    transport: TransportError,
+    disposition: &'static str,
+    reason_code: &'static str,
+}
+
+/// Maps one retained-port refusal to the typed dispatch failure and to the
+/// I7.20 agent-facing pair. Admission refusals and an unready production route
+/// fail closed without minting authority; a binding that disagrees with
+/// retained owner state under a known identity (changed payload, stale
+/// revision, disagreeing material) conflicts so the caller re-serves fresh
+/// state instead of retrying blindly — the same contract as the owner-bundle
+/// publish arm. Only a possible commit with a lost acknowledgement surfaces as
+/// an unknown outcome for exact reconciliation, and it is the only refusal
+/// that may report that a commit is possible.
+///
+/// This is the single P-07 refusal decision. A second mapping would let the
+/// Kernel observation and the answered frame disagree about one refusal, which
+/// is the collapse this function exists to prevent.
+fn map_p07_port_error(error: &eliot_authority::P07PortError) -> P07PortRefusal {
     match error {
-        eliot_authority::P07PortError::UnknownOutcome { .. } => TransportError::UnknownOutcome,
-        eliot_authority::P07PortError::InvalidBinding => TransportError::IdentityConflict,
-        eliot_authority::P07PortError::NotAdmitted | eliot_authority::P07PortError::Unavailable => {
-            TransportError::SessionFenced
-        }
+        eliot_authority::P07PortError::UnknownOutcome { .. } => P07PortRefusal {
+            transport: TransportError::UnknownOutcome,
+            disposition: P07_DISPOSITION_RECOVERY_REQUIRED,
+            reason_code: eliot_kernel_service::REASON_UNKNOWN_OUTCOME,
+        },
+        eliot_authority::P07PortError::InvalidBinding => P07PortRefusal {
+            transport: TransportError::IdentityConflict,
+            disposition: P07_DISPOSITION_STALE_OR_CONFLICT,
+            reason_code: eliot_kernel_service::REASON_IDENTITY_CONFLICT,
+        },
+        eliot_authority::P07PortError::NotAdmitted => P07PortRefusal {
+            transport: TransportError::SessionFenced,
+            disposition: P07_DISPOSITION_STALE_OR_CONFLICT,
+            reason_code: eliot_kernel_service::REASON_STALE_STATE_FENCE,
+        },
+        eliot_authority::P07PortError::Unavailable => P07PortRefusal {
+            transport: TransportError::SessionFenced,
+            disposition: P07_DISPOSITION_UNAVAILABLE_OR_CAPACITY,
+            reason_code: eliot_kernel_service::REASON_CAPABILITY_UNAVAILABLE,
+        },
     }
+}
+
+/// Answers one refused P-07 activation/revocation as a typed refusal frame.
+///
+/// The refusal is an answered request, so it travels inside a normal
+/// `status: "known"` response under its own closed `kind` — exactly the shape
+/// the canonical-closure-links arm already proves end to end — instead of an
+/// absent frame produced by propagating `Err` out of the dispatcher. An absent
+/// frame is not a refusal: the caller cannot read it, so the front door drops
+/// the transport session and the client sees a broken pipe, which the daemon
+/// then reports as a lost acknowledgement. That reports a refusal that
+/// certainly did not commit as a *possible* commit and pins the grant pending a
+/// reconciliation that can never succeed.
+///
+/// The Kernel operator surface still observes the decided terminal code, so a
+/// refusal that now answers normally is never recorded as a success on the
+/// Kernel side. I7.20 requires the disposition, the exact `reason_code`, and
+/// the same operation identity; no secret, provider detail, arbitrary payload,
+/// or free prose is emitted, and the caller is expected to switch on
+/// `disposition`/`reason_code` rather than on any text.
+fn p07_refusal_response(
+    operation: &'static str,
+    error: &eliot_authority::P07PortError,
+) -> serde_json::Value {
+    let refusal = map_p07_port_error(error);
+    super::kernel_diagnostics::observe_terminal_error(daemon_terminal_code(&refusal.transport));
+    serde_json::json!({
+        "status": "known",
+        "value": {
+            "kind": P07_AUTHORITY_REFUSAL_KIND,
+            "value": {
+                "disposition": refusal.disposition,
+                "reason_code": refusal.reason_code,
+                "operation": operation,
+            },
+        },
+        "recovery": null,
+    })
 }
 
 impl KernelComposition {
@@ -1626,15 +1720,19 @@ impl KernelComposition {
                 };
                 let owner = self.retained_p07_owner()?;
                 let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
-                let receipt =
-                    eliot_authority::P07AuthorityPort::activate_grant(bound.port(), &request)
-                        .map_err(|error| map_p07_port_error(&error))?;
-                let value =
-                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
-                Ok(serde_json::json!({
-                    "kind": "authority_activation_receipt",
-                    "value": value,
-                }))
+                // A decided refusal answers the request with its own typed
+                // frame; only an admitted activation answers with a receipt.
+                match eliot_authority::P07AuthorityPort::activate_grant(bound.port(), &request) {
+                    Ok(receipt) => {
+                        let value = serde_json::to_value(&receipt)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        Ok(serde_json::json!({
+                            "kind": "authority_activation_receipt",
+                            "value": value,
+                        }))
+                    }
+                    Err(refusal) => Ok(p07_refusal_response("activate_grant", &refusal)),
+                }
             }
             "revoke_grant" => {
                 let operation: GrantRevocationOperation =
@@ -1653,15 +1751,19 @@ impl KernelComposition {
                 };
                 let owner = self.retained_p07_owner()?;
                 let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
-                let receipt =
-                    eliot_authority::P07AuthorityPort::revoke_grant(bound.port(), &request)
-                        .map_err(|error| map_p07_port_error(&error))?;
-                let value =
-                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
-                Ok(serde_json::json!({
-                    "kind": "authority_revocation_receipt",
-                    "value": value,
-                }))
+                // A decided refusal answers the request with its own typed
+                // frame; only an admitted revocation answers with a receipt.
+                match eliot_authority::P07AuthorityPort::revoke_grant(bound.port(), &request) {
+                    Ok(receipt) => {
+                        let value = serde_json::to_value(&receipt)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        Ok(serde_json::json!({
+                            "kind": "authority_revocation_receipt",
+                            "value": value,
+                        }))
+                    }
+                    Err(refusal) => Ok(p07_refusal_response("revoke_grant", &refusal)),
+                }
             }
             "activate_introduction" => {
                 let operation: IntroductionActivationOperation =
@@ -1689,17 +1791,22 @@ impl KernelComposition {
                 };
                 let owner = self.retained_p07_owner()?;
                 let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
-                let receipt = eliot_authority::P07AuthorityPort::activate_introduction(
+                // A decided refusal answers the request with its own typed
+                // frame; only an admitted activation answers with a receipt.
+                match eliot_authority::P07AuthorityPort::activate_introduction(
                     bound.port(),
                     &request,
-                )
-                .map_err(|error| map_p07_port_error(&error))?;
-                let value =
-                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
-                Ok(serde_json::json!({
-                    "kind": "authority_activation_receipt",
-                    "value": value,
-                }))
+                ) {
+                    Ok(receipt) => {
+                        let value = serde_json::to_value(&receipt)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        Ok(serde_json::json!({
+                            "kind": "authority_activation_receipt",
+                            "value": value,
+                        }))
+                    }
+                    Err(refusal) => Ok(p07_refusal_response("activate_introduction", &refusal)),
+                }
             }
             "revoke_introduction" => {
                 let operation: IntroductionRevocationOperation =
@@ -1722,15 +1829,20 @@ impl KernelComposition {
                 };
                 let owner = self.retained_p07_owner()?;
                 let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
-                let receipt =
-                    eliot_authority::P07AuthorityPort::revoke_introduction(bound.port(), &request)
-                        .map_err(|error| map_p07_port_error(&error))?;
-                let value =
-                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
-                Ok(serde_json::json!({
-                    "kind": "authority_revocation_receipt",
-                    "value": value,
-                }))
+                // A decided refusal answers the request with its own typed
+                // frame; only an admitted revocation answers with a receipt.
+                match eliot_authority::P07AuthorityPort::revoke_introduction(bound.port(), &request)
+                {
+                    Ok(receipt) => {
+                        let value = serde_json::to_value(&receipt)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        Ok(serde_json::json!({
+                            "kind": "authority_revocation_receipt",
+                            "value": value,
+                        }))
+                    }
+                    Err(refusal) => Ok(p07_refusal_response("revoke_introduction", &refusal)),
+                }
             }
             "publish_wasm_dispatch_bundle" => {
                 self.wasm_dispatch_bundle_operation(session, payload.clone())
@@ -1749,6 +1861,13 @@ impl KernelComposition {
         // observation (`daemon_terminal_code`) or the agent-facing surface, so
         // a changed payload under one operation identity was indistinguishable
         // from a missing owner. Propagate the decided variant unchanged.
+        //
+        // A P-07 *port* refusal no longer arrives here at all: those four arms
+        // answer it themselves as a typed refusal frame
+        // (`p07_refusal_response`), which already recorded the same terminal
+        // code on the operator surface. What still propagates is a refusal
+        // about the session, the owner binding, or the front-door frame
+        // itself — none of which is a decided P-07 outcome.
         let value = result?;
         let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
         frame.request_id = Some(request_id);

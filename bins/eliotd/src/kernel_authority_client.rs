@@ -26,6 +26,15 @@
 //! transport is touched; neither carries a secret, provider detail,
 //! arbitrary payload, or free prose.
 //!
+//! A refusal the Kernel already decided is an answered request, not a
+//! transport failure: the Kernel answers it under its own closed
+//! [`P07_AUTHORITY_REFUSAL_KIND`] with the I7.20 `disposition` + exact
+//! `reason_code` pair, and this adapter reads that kind before it compares a
+//! receipt kind. The distinction is load-bearing: a refusal that certainly did
+//! not commit must stay distinguishable from `UnknownOutcome`, which reports a
+//! *possible* commit and makes the Governor retain the grant pending a
+//! reconciliation that only a receipt can resolve.
+//!
 //! `cfg(test)` doubles in the colocated test module are gating proofs only:
 //! they exercise the pure binding/decode/mapping logic, never a production
 //! success path.
@@ -38,6 +47,11 @@ use eliot_authority::{
 };
 use eliot_contracts::StateFence;
 use eliot_governor::{KernelGenerationSnapshotProvider, KernelPortError};
+use eliot_kernel_service::{
+    REASON_CAPABILITY_UNAVAILABLE, REASON_IDENTITY_CONFLICT, REASON_INVALID_ARGUMENT,
+    REASON_POLICY_DENIED, REASON_STALE_AUTHORITY_EPOCH, REASON_STALE_STATE_FENCE,
+    REASON_UNKNOWN_OUTCOME,
+};
 use eliot_receipts::{AuthorityBinding, AuthorityRequestSubject};
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
 
@@ -54,6 +68,14 @@ const REVOKE_INTRODUCTION_OPERATION: &str = "revoke_introduction";
 
 const ACTIVATION_RECEIPT_KIND: &str = "authority_activation_receipt";
 const REVOCATION_RECEIPT_KIND: &str = "authority_revocation_receipt";
+
+/// Closed refusal kind the Kernel answers a refused P-07 activation or
+/// revocation with, beside the receipt kinds above. The Kernel emits a refusal
+/// as an answered request inside a normal `status: "known"` frame under this
+/// distinct application kind, never as an absent frame and never as a receipt.
+/// A refusal kind this client does not know still fails closed: it is not a
+/// receipt kind, so the closed receipt comparison refuses it.
+const P07_AUTHORITY_REFUSAL_KIND: &str = "authority_operation_refused";
 
 /// The exact session capability this adapter presents as its authenticated
 /// scope. It is the same closed constant the daemon's authenticated
@@ -134,8 +156,7 @@ impl P07AuthorityPort for KernelAuthorityClient {
             .kernel
             .request_blocking(ACTIVATE_GRANT_OPERATION, payload)
             .map_err(|error| map_transport(error, &request.snapshot_id))?;
-        let value = kind_value(&value, ACTIVATION_RECEIPT_KIND)
-            .map_err(|_| P07PortError::InvalidBinding)?;
+        let value = p07_route_value(&value, ACTIVATION_RECEIPT_KIND, &request.snapshot_id)?;
         decode_activation_receipt(value, request)
     }
 
@@ -156,8 +177,7 @@ impl P07AuthorityPort for KernelAuthorityClient {
             .kernel
             .request_blocking(REVOKE_GRANT_OPERATION, payload)
             .map_err(|error| map_transport(error, &request.snapshot_id))?;
-        let value = kind_value(&value, REVOCATION_RECEIPT_KIND)
-            .map_err(|_| P07PortError::InvalidBinding)?;
+        let value = p07_route_value(&value, REVOCATION_RECEIPT_KIND, &request.snapshot_id)?;
         decode_revocation_receipt(value, request.snapshot_id.as_str(), &fence)
     }
 
@@ -178,8 +198,7 @@ impl P07AuthorityPort for KernelAuthorityClient {
             .kernel
             .request_blocking(ACTIVATE_INTRODUCTION_OPERATION, payload)
             .map_err(|error| map_transport(error, &request.snapshot_id))?;
-        let value = kind_value(&value, ACTIVATION_RECEIPT_KIND)
-            .map_err(|_| P07PortError::InvalidBinding)?;
+        let value = p07_route_value(&value, ACTIVATION_RECEIPT_KIND, &request.snapshot_id)?;
         decode_activation_receipt_for(value, request.snapshot_id.as_str(), &request.binding)
     }
 
@@ -200,8 +219,7 @@ impl P07AuthorityPort for KernelAuthorityClient {
             .kernel
             .request_blocking(REVOKE_INTRODUCTION_OPERATION, payload)
             .map_err(|error| map_transport(error, &request.snapshot_id))?;
-        let value = kind_value(&value, REVOCATION_RECEIPT_KIND)
-            .map_err(|_| P07PortError::InvalidBinding)?;
+        let value = p07_route_value(&value, REVOCATION_RECEIPT_KIND, &request.snapshot_id)?;
         decode_revocation_receipt(value, request.snapshot_id.as_str(), &fence)
     }
 }
@@ -250,6 +268,99 @@ fn map_transport(error: KernelPortError, snapshot_id: &SnapshotId) -> P07PortErr
             snapshot_id: snapshot_id.clone(),
         },
     }
+}
+
+/// Reads one answered P-07 route, refusing a typed refusal before the receipt
+/// kind is compared.
+///
+/// The kind must be inspected BEFORE [`kind_value`]: a refusal kind compared
+/// against the receipt kind is a contract mismatch, and a contract mismatch is
+/// `InvalidBinding`. That is exactly the collapse this route must not have —
+/// it turns "your payload conflicts with the retained owner" and "the owner
+/// did not commit but the acknowledgement was lost" into one indistinguishable
+/// answer, and it makes the Governor pin a grant `PendingActivation` behind a
+/// reconciliation that can never succeed.
+///
+/// Ordering also matters for the transport: the Kernel answers a refusal as a
+/// normal completed frame, so a refusal is a typed application failure and
+/// never reaches [`map_transport`]. A genuine transport failure still does.
+fn p07_route_value(
+    value: &serde_json::Value,
+    receipt_kind: &str,
+    snapshot_id: &SnapshotId,
+) -> Result<serde_json::Value, P07PortError> {
+    if value.get("kind").and_then(serde_json::Value::as_str) == Some(P07_AUTHORITY_REFUSAL_KIND) {
+        return Err(p07_refusal_error(value, snapshot_id));
+    }
+    kind_value(value, receipt_kind).map_err(|_| P07PortError::InvalidBinding)
+}
+
+/// Maps one closed Kernel refusal onto the typed P-07 refusal the Governor
+/// admits, so "certainly did not commit" stays distinguishable from "possibly
+/// committed".
+///
+/// The decision is taken from the exact I7.20 `reason_code`, never from
+/// display text: `IDENTITY_CONFLICT` is the typed identity conflict a changed
+/// payload under one operation identity must surface as, and `UNKNOWN_OUTCOME`
+/// is the only reason code that may report a possible commit — every other
+/// refusal certainly did not commit, so it must never be filed as one. A
+/// refusal whose `disposition` is outside the closed I7.20 control enum, or
+/// that carries no exact reason code, is a wire shape this client does not
+/// admit: it fails closed and is never coerced into a receipt or a success.
+fn p07_refusal_error(value: &serde_json::Value, snapshot_id: &SnapshotId) -> P07PortError {
+    let refusal = value.get("value");
+    let disposition = refusal
+        .and_then(|body| body.get("disposition"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !matches!(
+        disposition,
+        "INVALID_REQUEST"
+            | "DENIED"
+            | "STALE_OR_CONFLICT"
+            | "NEEDS_EVIDENCE"
+            | "UNAVAILABLE_OR_CAPACITY"
+            | "RECOVERY_REQUIRED"
+            | "FAILED"
+    ) {
+        return P07PortError::InvalidBinding;
+    }
+    let reason_code = refusal
+        .and_then(|body| body.get("reason_code"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    // A typed identity conflict is the exact answer a changed payload under one
+    // operation identity must surface as, and a refused policy or a malformed
+    // presentation is a caller-visible binding failure of the same class: the
+    // presented authority was refused and nothing was committed.
+    if matches!(
+        reason_code,
+        REASON_IDENTITY_CONFLICT | REASON_POLICY_DENIED | REASON_INVALID_ARGUMENT
+    ) {
+        return P07PortError::InvalidBinding;
+    }
+    // A stale fence or a foreign Authority Epoch is a Kernel-side admission
+    // refusal: nothing was committed and this session may not present it.
+    if matches!(
+        reason_code,
+        REASON_STALE_STATE_FENCE | REASON_STALE_AUTHORITY_EPOCH
+    ) {
+        return P07PortError::NotAdmitted;
+    }
+    // The only refusal that may report a possible commit.
+    if reason_code == REASON_UNKNOWN_OUTCOME {
+        return P07PortError::UnknownOutcome {
+            snapshot_id: snapshot_id.clone(),
+        };
+    }
+    // No admitted owner or capability in this contour: reconnect and re-serve,
+    // never a refusal of the presented authority itself.
+    if reason_code == REASON_CAPABILITY_UNAVAILABLE {
+        return P07PortError::Unavailable;
+    }
+    // A reason code this client does not know, and a refusal carrying none, are
+    // never adopted as a different refusal: they fail closed here.
+    P07PortError::InvalidBinding
 }
 
 /// Decodes an activation response and binds it to the exact presented grant
