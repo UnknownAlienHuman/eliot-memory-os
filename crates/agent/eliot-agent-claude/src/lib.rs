@@ -556,6 +556,14 @@ impl ClaudeSidecarResponse {
 // ---------------------------------------------------------------------------
 // Candidate-only result (no task / finish / recovery authority)
 // ---------------------------------------------------------------------------
+// Issue #370 type-disposition (12th row, honest completion of the eleven-row
+// table): `ClaudeCandidateResult` / `ClaudeTerminalCandidate` are a
+// PRIVATE_PROJECTION — an adapter-local sidecar projection, never a fifth
+// public result/receipt owner. They convert only through
+// `execution::translate_candidate_result` into the A-01 candidate contract
+// (`CandidateReady` -> `CandidateSucceeded`, never completion), and
+// `try_promote_to_finish` always fails with `NotAuthority`, so no
+// candidate-to-Finish path exists in this crate.
 
 /// Candidate disposition.  No variant expresses `VERIFIED_COMPLETE` or task
 /// finish; the strongest positive is `CandidateReady` (local proof ceiling only).

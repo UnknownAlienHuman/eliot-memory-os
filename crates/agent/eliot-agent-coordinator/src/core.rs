@@ -1978,29 +1978,64 @@ impl AgentCoordinator {
         )
     }
 
-    pub fn restore_json(
-        json: &str,
-        live_config: CoordinatorConfig,
-        gap: PlanGap,
-    ) -> Result<Self, CoordinatorError> {
+    /// Shared snapshot-wire decode owned by the production restore boundary
+    /// (issue #370 W24/A2). Typed decode succeeds only for current-schema
+    /// snapshots; every failure classifies into a structured error instead of
+    /// a generic serialization string, loss-visibly:
+    /// - a version-mismatched wire maps to
+    ///   [`CoordinatorError::UnsupportedSnapshot`];
+    /// - completion-alias dispositions (`VERIFIED_COMPLETE` and legacy
+    ///   spellings) and provider-supplied authoritative `effect_receipts`
+    ///   classify to [`CoordinatorError::LegacyResultWire`], never migrated
+    ///   into candidate success;
+    /// - a well-formed current candidate result presented to the snapshot
+    ///   boundary is a misdirected wire, not a snapshot: it is rejected with
+    ///   [`CoordinatorError::UnsupportedSnapshot`] (screened through the live
+    ///   A-01 Serde boundary `eliot_agent_api::decode_agent_result_json`,
+    ///   which enforces the closed candidate schema), never ingested;
+    /// - genuinely malformed JSON keeps the generic serialization error.
+    fn decode_snapshot_wire(json: &str) -> Result<CoordinatorSnapshot, CoordinatorError> {
         match serde_json::from_str(json) {
-            Ok(snapshot) => Self::restore(snapshot, live_config, gap),
+            Ok(snapshot) => Ok(snapshot),
             Err(error) => {
-                // Legacy wires fail typed decode; classify them into
-                // structured errors instead of a generic serialization
-                // string (issue #370 W24). A version mismatch is an
-                // unsupported snapshot; completion-alias dispositions and
-                // authoritative effect receipts are rejected legacy wires
-                // that are never migrated into candidate success.
                 if snapshot_schema_unsupported(json) {
                     return Err(CoordinatorError::UnsupportedSnapshot);
                 }
                 if let Some(kind) = legacy_result_wire_kind(json) {
                     return Err(CoordinatorError::LegacyResultWire(kind));
                 }
+                if eliot_agent_api::decode_agent_result_json(json).is_ok() {
+                    return Err(CoordinatorError::UnsupportedSnapshot);
+                }
                 Err(CoordinatorError::Serialization(error.to_string()))
             }
         }
+    }
+
+    pub fn restore_json(
+        json: &str,
+        live_config: CoordinatorConfig,
+        gap: PlanGap,
+    ) -> Result<Self, CoordinatorError> {
+        let snapshot = Self::decode_snapshot_wire(json)?;
+        Self::restore(snapshot, live_config, gap)
+    }
+
+    /// Production JSON restore on freshly supplied Kernel admission (issue
+    /// #370 W24). This is the entry the daemon JSON-restore path migrates to:
+    /// unlike hand-decoding a snapshot and calling the typed restore (which
+    /// bypasses legacy-wire classification), this entry decodes through
+    /// [`Self::decode_snapshot_wire`], so pre-candidate-only wires and
+    /// misdirected result wires fail with structured errors before any replay.
+    /// Every replayed event then re-verifies through the admitted provider
+    /// exactly as [`Self::restore_with_admitted_provider`] does.
+    pub fn restore_snapshot_json(
+        json: &str,
+        live_config: CoordinatorConfig,
+        capability: AdmittedProviderCapability,
+    ) -> Result<Self, CoordinatorError> {
+        let snapshot = Self::decode_snapshot_wire(json)?;
+        Self::restore_with_admitted_provider(snapshot, live_config, capability)
     }
 
     #[allow(clippy::needless_pass_by_value)]

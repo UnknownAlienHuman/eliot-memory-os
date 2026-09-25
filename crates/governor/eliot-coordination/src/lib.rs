@@ -436,13 +436,32 @@ pub struct AgentResultDraft {
     pub authority_epoch: EpochId,
     pub state_fence: StateFence,
     pub result_ref: String,
+    /// Candidate-only admission marker (issue #370 W28/A25). The draft
+    /// declares candidate admission intent; pre-ceiling drafts without this
+    /// member fail deserialization instead of submitting. The single variant
+    /// keeps stronger ceilings unrepresentable on this wire.
+    pub ceiling: ResultAdmissionCeiling,
     pub now: u64,
+}
+/// Candidate ceiling for coordination result admission (issue #370 W28/A25).
+/// The only representable value is the candidate artifact ceiling: with
+/// `deny_unknown_fields` on the draft and receipt, any wire naming a
+/// stronger ceiling (finish, completion, closure) fails deserialization, so
+/// the ceiling is encoded in the type rather than trusted from the sender.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ResultAdmissionCeiling {
+    CandidateArtifact,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentResultReceipt {
     pub result_id: String,
     pub work_item_id: String,
+    /// Always [`ResultAdmissionCeiling::CandidateArtifact`], stamped by
+    /// [`CoordinationOwner::submit_result`]: the receipt proves a candidate
+    /// reference was admitted, never task completion or Finish authority.
+    pub ceiling: ResultAdmissionCeiling,
     pub event: CoordinationEvent,
 }
 
@@ -1609,8 +1628,39 @@ impl CoordinationOwner {
         Ok(AgentResultReceipt {
             result_id: req.result_id,
             work_item_id: req.work_item_id,
+            ceiling: ResultAdmissionCeiling::CandidateArtifact,
             event,
         })
+    }
+
+    /// Session-driver entry for candidate result admission (issue #370 W8).
+    /// This is the production seam the session/work-item driver calls to
+    /// record a candidate result reference: it pre-reads the target work
+    /// item and fails closed with [`CoordinationError::InvalidState`] unless
+    /// the item is currently in a submittable state
+    /// (`Claimed`/`Running`/`Checkpointed`/`Reassigned`), without evaluating
+    /// epoch/lease machinery for already-terminal items, then delegates to
+    /// [`Self::submit_result`], which remains the single enforcement owner
+    /// (lease/session/epoch/fence checks, idempotent commit, ceiling stamp).
+    /// The admitted reference stays a candidate event: see
+    /// [`ResultAdmissionCeiling`].
+    pub fn admit_candidate_result(
+        &mut self,
+        draft: AgentResultDraft,
+    ) -> Result<AgentResultReceipt, CoordinationError> {
+        let submittable = self.work.get(&draft.work_item_id).is_some_and(|item| {
+            matches!(
+                item.state,
+                WorkState::Claimed
+                    | WorkState::Running
+                    | WorkState::Checkpointed
+                    | WorkState::Reassigned
+            )
+        });
+        if !submittable {
+            return Err(CoordinationError::InvalidState);
+        }
+        self.submit_result(draft)
     }
 
     fn reassignment_retry(

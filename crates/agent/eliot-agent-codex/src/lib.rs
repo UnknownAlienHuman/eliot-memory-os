@@ -1822,6 +1822,38 @@ pub fn translate_result(
     Ok(result)
 }
 
+/// Production terminal assembly for Codex provider output (issue #370
+/// W29/A22): the in-crate production driver that turns one assembled
+/// [`CodexResultInput`] into a provider-neutral candidate [`AgentResult`].
+///
+/// The input contract requires assembly from a *complete* event stream — the
+/// terminal observation is the exact bound envelope from the validated
+/// stream, never a boolean completion claim — but [`translate_result`] cannot
+/// verify that: it sees only the input. This driver closes the gap by forcing
+/// the assembler to attest stream completeness explicitly: `stream_complete`
+/// must hold exactly when the input was drained from a complete stream, and a
+/// `false` attestation fails closed with [`CodexAdapterError::MalformedWire`]
+/// before any translation, so an incomplete stream can never yield even an
+/// unknown-outcome candidate through this entry. Success still maps to
+/// candidate-only `Partial`, cancellation keeps its typed meaning, and every
+/// other outcome stays unknown with its recovery handle, exactly as
+/// [`translate_result`] defines; this entry adds the attestation gate and
+/// changes no mapping.
+pub fn assemble_candidate_result(
+    input: CodexResultInput,
+    stream_complete: bool,
+    binding: &ProviderExecutionBinding,
+    admission: &AdmittedRouteReceipt,
+    authority: &EffectCeiling,
+) -> Result<AgentResult, CodexAdapterError> {
+    if !stream_complete {
+        return Err(CodexAdapterError::MalformedWire(
+            "codex result stream incomplete; terminal observation unattested",
+        ));
+    }
+    translate_result(input, binding, admission, authority)
+}
+
 /// Checked interrupt construction: targets the exact bound turn on the exact
 /// bound thread. A sessionless binding cannot address a Codex turn and fails
 /// closed; the request ID follows the validated wire-ID shape so the later
