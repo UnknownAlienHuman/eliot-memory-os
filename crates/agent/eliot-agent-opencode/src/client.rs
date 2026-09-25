@@ -1439,6 +1439,19 @@ impl OpenCodeClient {
         actual_route
             .workspace_id
             .clone_from(&prepared.session.workspace_id);
+        // Production mint validation (issue #369 W13/W38): the emitted wire
+        // receipt is validated before it leaves the adapter. A mint that
+        // fails validation never emits a fabricated observed identity: it
+        // degrades to an explicit `unavailable` record carrying the reason,
+        // which converts to typed `UNOBSERVED` (never
+        // `requested == observed`) via `to_physical_observation`.
+        let actual_route = match actual_route.validate() {
+            Ok(()) => actual_route,
+            Err(error) => OpenCodeWireRouteReceipt::unavailable(
+                request.model.clone(),
+                format!("opencode success attestation invalid: {error}"),
+            ),
+        };
         let usage = projection.usage.map_or_else(
             || UsageAvailability::unavailable("OpenCode message contained no complete usage"),
             UsageAvailability::available,

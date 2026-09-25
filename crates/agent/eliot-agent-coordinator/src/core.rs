@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_api::{
-    AgentAttempt, AgentResult, AttemptId, AttemptState, AuthorityEnvelope, CancellationState,
-    CandidateSelectionDisposition, ContinuityKind, ContractError, EffectCeiling, EffectKind,
-    HostEventNormalizationReceipt, HostEventQuarantineReason, HostEventReplayDisposition,
-    NormalizedHostEventEnvelope, ProviderExecutionBinding, ProviderObservationLineage,
-    RejectedRouteCandidate, ResultDisposition, RouteSelectionCandidate, WorkLeaseId,
-    candidate_digest_for, validate_execution_binding,
+    AdmittedRouteReceipt, AgentAttempt, AgentResult, AttemptId, AttemptState, AuthorityEnvelope,
+    CancellationState, CandidateSelectionDisposition, ContinuityKind, ContractError, EffectCeiling,
+    EffectKind, HostEventNormalizationReceipt, HostEventQuarantineReason,
+    HostEventReplayDisposition, NormalizedHostEventEnvelope, PhysicalRouteObservationReceipt,
+    ProviderExecutionBinding, ProviderObservationLineage, RejectedRouteCandidate,
+    ResultDisposition, RouteSelectionCandidate, WorkLeaseId, candidate_digest_for,
+    validate_execution_binding,
 };
 use eliot_agent_contracts::{
     AgentAttemptId, CoordinationEntry, CoordinationMapView, DescendantTerminalState,
@@ -158,9 +159,63 @@ fn validate_result_intake_binding(
         .admitted_route
         .as_ref()
         .ok_or(CoordinatorError::IdentityConflict("admitted_route"))?;
+    validate_intake_observation(actual, &actual.binding, stored_admission)?;
     result
         .validate_for_binding(&actual.binding, stored_admission, effect_ceiling)
         .map_err(binding_contract)?;
+    Ok(())
+}
+
+/// Classifies a duplicate result intake against the accepted observation
+/// boundary for one attempt (issue #369 W15/W16/A14/A19). The accepted
+/// [`PhysicalRouteObservationReceipt`] stored with the first intake is the
+/// boundary: [`PhysicalRouteObservationReceipt::validate_replay_against`]
+/// compares the incoming observation against it, so a replay with changed
+/// wall-clock text cannot create a new causal event. Identical replays and
+/// different-identity observations fall through to the duplicate path; a
+/// conflicting observation under the same receipt/execution identity fails
+/// closed with `IdempotencyConflict` for quarantine, never overwriting the
+/// accepted record.
+fn classify_route_replay(
+    coordinator: &AgentCoordinator,
+    attempt_id: &AttemptId,
+    incoming: &PhysicalRouteObservationReceipt,
+) -> Result<(), CoordinatorError> {
+    let accepted = coordinator
+        .result_by_attempt
+        .get(attempt_id)
+        .and_then(|submission_id| coordinator.submissions.get(submission_id))
+        .map(|record| record.receipt.actual_route());
+    let Some(accepted) = accepted else {
+        return Ok(());
+    };
+    match incoming.validate_replay_against(accepted) {
+        Err(ContractError::ConflictingObservation) => Err(CoordinatorError::IdempotencyConflict),
+        Ok(()) | Err(_) => Ok(()),
+    }
+}
+
+/// Production observation-intake gate for one candidate result (issue #369
+/// A31/W34): the embedded physical observation is validated against the
+/// stored admission and the exact stored execution binding via
+/// [`PhysicalRouteObservationReceipt::validate_against`], and its usable
+/// proof ceiling is pinned to [`ProofCeiling::Observation`] via
+/// `observation_ceiling()`. Requested/observed divergence, absence, and
+/// unknown outcome therefore enter intake as capped observation evidence,
+/// never as a stronger proof. The surrounding [`CandidateResultReceipt`]
+/// keeps its own `CandidateArtifact` ceiling (issue #370) for the candidate
+/// layer; that ceiling never describes the observation.
+fn validate_intake_observation(
+    observation: &PhysicalRouteObservationReceipt,
+    binding: &ProviderExecutionBinding,
+    admission: &AdmittedRouteReceipt,
+) -> Result<(), CoordinatorError> {
+    observation
+        .validate_against(binding, admission)
+        .map_err(binding_contract)?;
+    if observation.observation_ceiling() != ProofCeiling::Observation {
+        return Err(CoordinatorError::IdentityConflict("observation_ceiling"));
+    }
     Ok(())
 }
 
@@ -640,10 +695,7 @@ impl AgentCoordinator {
                 .ok_or(CoordinatorError::IdentityConflict("admitted_lane"))?;
             // Candidate itself must still validate: an invalid selection
             // (e.g. selected absent from set) rejects here, never at intake.
-            candidate_lane
-                .routing
-                .validate()
-                .map_err(provider_contract)?;
+            validate_staffing_lane_routing(candidate_lane)?;
             if lane.route != *selected_route
                 || lane.routing_receipt_digest != routing_digest
                 || lane.role_revision != candidate_lane.role_revision
@@ -1335,6 +1387,13 @@ impl AgentCoordinator {
             return Err(CoordinatorError::StaleResult);
         }
         if self.result_by_attempt.contains_key(&current.attempt_id) {
+            // Accepted-observation boundary (issue #369 W14-W16/A13/A14/A19):
+            // the stored accepted observation is the last-observation
+            // boundary for this attempt. An identical replay under the same
+            // identity stays a duplicate; a conflicting observation under the
+            // same receipt/execution identity is quarantined as an
+            // idempotency conflict, never last-write-wins.
+            classify_route_replay(self, &current.attempt_id, &submission.result.actual_route)?;
             return Err(CoordinatorError::DuplicateResult);
         }
         // Cancellation authority gate (issue #370 A12): `CancelledObserved`
@@ -2519,6 +2578,21 @@ fn validate_admitted_lane(lane: &crate::AdmittedLaneReceipt) -> Result<(), Coord
         validate_text(scope, "mutation_scope")?;
     }
     Ok(())
+}
+
+/// Validates the routing projection embedded in one staffing lane candidate
+/// (issue #369 W7/A3). The coordinator imports the owner schema
+/// ([`RouteSelectionCandidate`]) and embeds it as
+/// [`StaffingLaneCandidate::routing`]; there is no second shared routing
+/// receipt. This is the single production validator over the
+/// `StaffingLaneCandidate` symbol: the admit path invokes it for every
+/// admitted lane before any digest or admission linkage is compared, so the
+/// candidate digest and the admission binding below always describe a valid
+/// candidate.
+fn validate_staffing_lane_routing(
+    candidate: &StaffingLaneCandidate,
+) -> Result<(), CoordinatorError> {
+    candidate.routing.validate().map_err(provider_contract)
 }
 
 /// Validates the externally-issued admitted route decision carried by one

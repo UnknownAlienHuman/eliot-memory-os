@@ -37,7 +37,7 @@ use eliot_agent_api::{
     NormalizedHostEventPayload, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
     ProviderObservationLineage, QuotaKnowledge, RestrictedRawSourceHandle, ResultDisposition,
     RouteFingerprint, RouteObservationState, TaskId, UnsupportedDisposition,
-    UnsupportedEventObservation, UnsupportedEventReason, UsageReceipt,
+    UnsupportedEventObservation, UnsupportedEventReason, UsageReceipt, sanitize_adapter_error,
 };
 use eliot_process::{
     ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest,
@@ -1475,6 +1475,12 @@ impl AcpResultEnvelope {
     ) -> Result<AgentResult, AcpAdapterError> {
         Self::check_acp_result_binding(&route, binding, self.session_id.as_ref())?;
         let (disposition, unknown_reason) = Self::acp_result_disposition(outcome);
+        // Adapter-boundary sanitization (issue #369 W20/A21): the provider
+        // failure reason is untrusted text. It is sanitized once here so the
+        // unknown reason, the quarantine/recovery handle, and the public
+        // error below never carry secrets or credentials. Plain operational
+        // reasons pass through verbatim.
+        let unknown_reason = unknown_reason.map(|reason| sanitize_adapter_error(&reason));
         let usage = UsageReceipt {
             input_tokens: None,
             output_tokens: None,

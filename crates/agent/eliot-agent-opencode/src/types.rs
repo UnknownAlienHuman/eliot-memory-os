@@ -931,8 +931,10 @@ impl OpenCodeWireRouteReceipt {
     /// Total versioned loss-visible conversion into the shared canonical
     /// [`PhysicalRouteObservationReceipt`].
     ///
-    /// - Unknown wire fields are never dropped: a non-empty `extra` map is
-    ///   hashed into `raw_evidence_digest`/`raw_evidence_ref` (loss handle).
+    /// - Unknown wire fields are never dropped: every explicit observation
+    ///   field (endpoint, session, directory, server, workspace, route
+    ///   fingerprint, provider) plus a non-empty `extra` map is hashed into
+    ///   `raw_evidence_digest`/`raw_evidence_ref` (loss handle).
     /// - Missing observed identity never synthesizes `observed = requested`:
     ///   `Unavailable` becomes `UNOBSERVED` with an explicit reason plus
     ///   `UNKNOWN_OUTCOME` quarantine (`recovery_ref`).
@@ -994,15 +996,33 @@ impl OpenCodeWireRouteReceipt {
         }
     }
 
-    /// Loss handle for unknown wire fields: a non-empty `extra` map stays
-    /// addressable by digest, never dropped silently.
+    /// Loss handle for wire observations (issue #369 W19/W28): every
+    /// explicit observation field (endpoint, session, directory, server
+    /// version, workspace, route fingerprint, provider) plus every unknown
+    /// `extra` field stays addressable by digest, never dropped silently.
+    /// Explicit attested fields take precedence over a colliding unknown key
+    /// under the same `wire.`-prefixed name.
     fn wire_extra_evidence(
         &self,
     ) -> Result<(Option<LowercaseSha256>, Option<String>), OpenCodeObservationConversionError> {
-        if self.extra.is_empty() {
+        let mut bound = self.extra.clone();
+        for (name, value) in [
+            ("wire.endpoint", self.endpoint.as_deref()),
+            ("wire.session_id", self.session_id.as_deref()),
+            ("wire.directory", self.directory.as_deref()),
+            ("wire.server_version", self.server_version.as_deref()),
+            ("wire.workspace_id", self.workspace_id.as_deref()),
+            ("wire.route_fingerprint", self.route_fingerprint.as_deref()),
+            ("wire.provider", self.provider.as_deref()),
+        ] {
+            if let Some(value) = value {
+                bound.insert(name.to_owned(), Value::String(value.to_owned()));
+            }
+        }
+        if bound.is_empty() {
             return Ok((None, None));
         }
-        let bytes = canonical_json_bytes(&self.extra).map_err(|error| {
+        let bytes = canonical_json_bytes(&bound).map_err(|error| {
             OpenCodeObservationConversionError::Serialization(error.to_string())
         })?;
         let hex = sha256_hex(&bytes);
