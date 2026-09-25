@@ -13,16 +13,18 @@ use eliot_agent_api::{
     AssistantDeltaObservation, AttemptId, AttemptState, AuthorityEnvelope, CONTRACT_VERSION,
     CancelReason, CancellationState, ClockReading, ContinuityKind, EffectCeiling, ErrorObservation,
     EventCursor, EventId, ExecutionOutcome, ExecutionStartedObservation, ExecutionUnit,
-    HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
-    HostEventNormalizationReceipt, HostEventPrivacyClass, LowercaseSha256, NativeSession,
-    NormalizationCoverage, NormalizedHostEventEnvelope, NormalizedHostEventPayload,
-    PhysicalRouteObservationReceipt, ProviderExecutionBinding, ProviderObservationLineage,
-    ProviderTerminalObservation, ProviderTerminalStatus, QualifiedSourceDigest, QuotaKnowledge,
-    RawSourceRecord, ReasoningSummaryObservation, RestrictedRawSourceHandle, ResultDisposition,
+    ExecutionUnitObservation, HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM,
+    HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
+    HostEventNormalizationReceipt, HostEventPrivacyClass, LowercaseSha256,
+    MAX_HOST_EVENT_SAFE_TEXT_CHARS, NativeSession, NormalizationCoverage,
+    NormalizedHostEventEnvelope, NormalizedHostEventPayload, PhysicalRouteObservationReceipt,
+    ProviderExecutionBinding, ProviderObservationLineage, ProviderTerminalObservation,
+    ProviderTerminalStatus, QualifiedSourceDigest, QuotaKnowledge, RawSourceRecord,
+    ReasoningSummaryObservation, RestrictedRawSourceHandle, ResultDisposition,
     RouteContinuationLocator, RouteFingerprint, RouteObservationState, SessionId,
     SessionLifecycleObservation, SessionLifecycleTransition, ToolInvocationObservation,
     ToolOutcomeClass, ToolOutcomeObservation, UnsupportedDisposition, UnsupportedEventObservation,
-    UnsupportedEventReason, UsageReceipt, WorkLeaseId,
+    UnsupportedEventReason, UsageReceipt, WorkLeaseId, contains_restricted_source_token,
 };
 use eliot_process::{
     CancellationReceipt, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
@@ -801,6 +803,76 @@ fn delta_chars_from(params: &Value, keys: &[&str]) -> u64 {
         .unwrap_or(0)
 }
 
+/// Omitted-manifest entry naming the decoded wire message body withheld
+/// behind the restricted handle. Every decoded normalization seals a typed
+/// summary projection, never the message itself, so the canonical body is
+/// always partially omitted; the normalizer declares it instead of sealing
+/// an empty claim.
+pub const CODEX_MESSAGE_BODY_ENTRY: &str = "codex.message_body";
+/// Omitted-manifest entry naming wire bytes that could not be decoded into a
+/// typed observation.
+pub const CODEX_UNDECODABLE_SOURCE_ENTRY: &str = "codex.source_bytes";
+/// Warning carried when a delta/reasoning summary exceeds the bounded
+/// public-summary capacity: the count stays exact, the over-cap remainder is
+/// recorded as truncated normalization coverage, never silently dropped.
+pub const CODEX_DELTA_TRUNCATED_WARNING: &str = "codex.delta-summary-truncated";
+
+/// Splits a delta/reasoning character count into the exact count plus whether
+/// the source text exceeds the bounded public-summary capacity
+/// ([`MAX_HOST_EVENT_SAFE_TEXT_CHARS`]). Over-cap text is recorded with
+/// [`NormalizationCoverage::TruncatedSource`]: the count stays exact, the
+/// full text stays behind the restricted handle, and the over-cap remainder
+/// is never silently dropped (I10.8.5). The observation `truncated` flag is
+/// left untouched: it reports truncation before the restricted source
+/// record, while the coverage reports the normalization's bounded summary
+/// of a complete record.
+fn bounded_delta_chars(params: &Value, keys: &[&str]) -> (u64, bool) {
+    let chars = delta_chars_from(params, keys);
+    let truncated = chars > MAX_HOST_EVENT_SAFE_TEXT_CHARS as u64;
+    (chars, truncated)
+}
+
+/// Merges the decoded-message discovery into a classified payload: the
+/// withheld canonical body joins the loss manifest (sorted, deduplicated)
+/// and the coverage degrades from `Complete` to lossy omission. Quarantine
+/// and already-lossy classifications keep their coverage; only an empty
+/// `Complete` claim degrades.
+fn merge_codex_discovery(
+    mut omitted_fields: Vec<String>,
+    coverage: NormalizationCoverage,
+) -> (Vec<String>, NormalizationCoverage) {
+    if !omitted_fields
+        .iter()
+        .any(|entry| entry == CODEX_MESSAGE_BODY_ENTRY)
+    {
+        omitted_fields.push(CODEX_MESSAGE_BODY_ENTRY.to_owned());
+    }
+    omitted_fields.sort();
+    omitted_fields.dedup();
+    let coverage = if coverage == NormalizationCoverage::Complete {
+        NormalizationCoverage::LossyOmission
+    } else {
+        coverage
+    };
+    (omitted_fields, coverage)
+}
+
+/// Scans every wire-derived public string for restricted source content
+/// before sealing. Raw provider text stays behind the restricted handle
+/// (I7.23); a derived summary that smuggles it fails closed here.
+fn check_codex_public_strings(
+    payload: &NormalizedHostEventPayload,
+) -> Result<(), CodexAdapterError> {
+    for text in payload.public_strings() {
+        if contains_restricted_source_token(text) {
+            return Err(CodexAdapterError::InvalidInput(
+                "payload/restricted-content",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Extract an opaque tool name from the wire without publishing arguments.
 /// Falls back to the wire method family (real wire evidence, never a canned
 /// universal name) when no explicit name is present.
@@ -831,9 +903,11 @@ fn digest_value(value: &Value) -> Result<LowercaseSha256, CodexAdapterError> {
 }
 
 /// Classify the provider terminal status from `params.turn.status`.
-/// Only exact `"completed"`/`"failed"` become observed terminal success/failure;
-/// every other status (interrupted, unknown, in-progress, numeric, missing)
-/// stays quarantine and never upgrades to success.
+/// Exact `"completed"`/`"success"`/`"done"` become observed terminal
+/// success and `"failed"` becomes observed terminal failure, always under
+/// the exact execution-unit lineage enforced by the caller. Every other
+/// status (interrupted, unknown, in-progress, numeric, missing) stays
+/// quarantine and never upgrades to success.
 fn terminal_status_from(params: &Value) -> Option<ProviderTerminalStatus> {
     match params
         .get("turn")
@@ -841,7 +915,7 @@ fn terminal_status_from(params: &Value) -> Option<ProviderTerminalStatus> {
         .and_then(|turn| turn.get("status"))
         .and_then(Value::as_str)
     {
-        Some("completed") => Some(ProviderTerminalStatus::CompletedObserved),
+        Some("completed" | "success" | "done") => Some(ProviderTerminalStatus::CompletedObserved),
         Some("failed") => Some(ProviderTerminalStatus::FailedObserved),
         _ => None,
     }
@@ -911,6 +985,214 @@ fn unsupported_quarantine(
     }
 }
 
+/// Validate an opaque tool name from the wire (nonblank, no control chars,
+/// bounded length) before it enters a typed observation.
+fn validated_tool_name(params: &Value, method: &str) -> Result<String, CodexAdapterError> {
+    let tool_name = tool_name_from(params, method);
+    if tool_name.trim().is_empty()
+        || tool_name.chars().any(char::is_control)
+        || tool_name.chars().count() > 1024
+    {
+        return Err(CodexAdapterError::MalformedWire("tool name"));
+    }
+    Ok(tool_name)
+}
+
+/// Classify `turn/started` / `turn/created` under the exact bound unit.
+fn classify_turn_started(
+    params: &Value,
+    bound_turn: &str,
+    bound_unit: &ExecutionUnit,
+) -> ClassifiedCodexPayload {
+    let omitted = omitted_top_level_keys(params, &["threadId", "thread_id", "turn", "turnId"]);
+    let coverage = if omitted.is_empty() {
+        NormalizationCoverage::Complete
+    } else {
+        NormalizationCoverage::LossyOmission
+    };
+    ClassifiedCodexPayload {
+        payload: NormalizedHostEventPayload::ExecutionStarted(ExecutionStartedObservation {
+            execution_unit: bound_unit.clone(),
+            start_ref: bound_turn.to_owned(),
+        }),
+        omitted_fields: omitted,
+        warnings: Vec::new(),
+        privacy_class: HostEventPrivacyClass::RedactedSummary,
+        coverage,
+    }
+}
+
+/// Classify assistant-message deltas as bounded character counts.
+fn classify_assistant_delta(params: &Value) -> ClassifiedCodexPayload {
+    let (delta_chars, over_summary_bound) =
+        bounded_delta_chars(params, &["delta", "text", "content", "message", "output"]);
+    ClassifiedCodexPayload {
+        payload: NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
+            delta_chars,
+            truncated: false,
+        }),
+        omitted_fields: vec!["raw_delta_text".to_owned()],
+        warnings: if over_summary_bound {
+            vec![CODEX_DELTA_TRUNCATED_WARNING.to_owned()]
+        } else {
+            Vec::new()
+        },
+        privacy_class: HostEventPrivacyClass::RedactedSummary,
+        coverage: if over_summary_bound {
+            NormalizationCoverage::TruncatedSource
+        } else {
+            NormalizationCoverage::LossyOmission
+        },
+    }
+}
+
+/// Classify reasoning-summary deltas as bounded character counts.
+fn classify_reasoning_delta(params: &Value) -> ClassifiedCodexPayload {
+    let (summary_chars, over_summary_bound) =
+        bounded_delta_chars(params, &["delta", "text", "summary", "content", "message"]);
+    ClassifiedCodexPayload {
+        payload: NormalizedHostEventPayload::ReasoningSummary(ReasoningSummaryObservation {
+            summary_chars,
+            truncated: false,
+        }),
+        omitted_fields: vec!["raw_reasoning_text".to_owned()],
+        warnings: if over_summary_bound {
+            vec![CODEX_DELTA_TRUNCATED_WARNING.to_owned()]
+        } else {
+            Vec::new()
+        },
+        privacy_class: HostEventPrivacyClass::RestrictedHandleOnly,
+        coverage: if over_summary_bound {
+            NormalizationCoverage::TruncatedSource
+        } else {
+            NormalizationCoverage::LossyOmission
+        },
+    }
+}
+
+/// Classify tool invocation requests (arguments stay behind the handle).
+fn classify_tool_invocation(
+    params: &Value,
+    method: &str,
+    bound_turn: &str,
+    sequence: u64,
+) -> Result<ClassifiedCodexPayload, CodexAdapterError> {
+    let tool_name = validated_tool_name(params, method)?;
+    Ok(ClassifiedCodexPayload {
+        payload: NormalizedHostEventPayload::ToolInvocation(ToolInvocationObservation {
+            tool_name,
+            invocation_ref: format!("{bound_turn}:{sequence}"),
+            arguments_digest: digest_value(params)?,
+        }),
+        omitted_fields: vec!["raw_arguments".to_owned()],
+        warnings: Vec::new(),
+        privacy_class: HostEventPrivacyClass::RestrictedHandleOnly,
+        coverage: NormalizationCoverage::LossyOmission,
+    })
+}
+
+/// Classify tool outcomes without inferring success.
+fn classify_tool_outcome(
+    params: &Value,
+    method: &str,
+    bound_turn: &str,
+    sequence: u64,
+) -> Result<ClassifiedCodexPayload, CodexAdapterError> {
+    let tool_name = validated_tool_name(params, method)?;
+    let result_source = params.get("result").unwrap_or(params);
+    Ok(ClassifiedCodexPayload {
+        payload: NormalizedHostEventPayload::ToolOutcome(ToolOutcomeObservation {
+            tool_name,
+            invocation_ref: format!("{bound_turn}:{sequence}"),
+            outcome: tool_outcome_from(params),
+            result_digest: digest_value(result_source)?,
+            safe_summary: None,
+        }),
+        omitted_fields: vec!["raw_result".to_owned()],
+        warnings: Vec::new(),
+        privacy_class: HostEventPrivacyClass::RestrictedHandleOnly,
+        coverage: NormalizationCoverage::LossyOmission,
+    })
+}
+
+/// Classify `turn/completed` as terminal-observed or quarantined.
+fn classify_turn_completed(
+    params: &Value,
+    method: &str,
+    bound_turn: &str,
+) -> ClassifiedCodexPayload {
+    if let Some(status) = terminal_status_from(params) {
+        let omitted = omitted_top_level_keys(params, &["threadId", "thread_id", "turn", "turnId"]);
+        let coverage = if omitted.is_empty() {
+            NormalizationCoverage::Complete
+        } else {
+            NormalizationCoverage::LossyOmission
+        };
+        ClassifiedCodexPayload {
+            payload: NormalizedHostEventPayload::ProviderTerminalObserved(
+                ProviderTerminalObservation {
+                    status,
+                    terminal_ref: bound_turn.to_owned(),
+                },
+            ),
+            omitted_fields: omitted,
+            warnings: Vec::new(),
+            privacy_class: HostEventPrivacyClass::RedactedSummary,
+            coverage,
+        }
+    } else {
+        unsupported_quarantine(
+            method,
+            UnsupportedEventReason::UnknownMethod,
+            vec!["non-terminal-turn-status".to_owned()],
+            omitted_top_level_keys(params, &["threadId", "thread_id", "turnId"]),
+        )
+    }
+}
+
+/// Classify usage notifications (absent quota stays `NotExposed`).
+fn classify_usage_payload(params: &Value) -> ClassifiedCodexPayload {
+    let (input_tokens, output_tokens, cost_microunits) = params
+        .get("usage")
+        .and_then(Value::as_object)
+        .map(|usage| {
+            (
+                usage.get("input_tokens").and_then(Value::as_u64),
+                usage.get("output_tokens").and_then(Value::as_u64),
+                usage.get("cost_microunits").and_then(Value::as_u64),
+            )
+        })
+        .unwrap_or((None, None, None));
+    // Absent native quota/replay evidence stays typed
+    // `NotExposed`, never a synthesized zero or string constant.
+    ClassifiedCodexPayload {
+        payload: NormalizedHostEventPayload::Usage(UsageReceipt {
+            input_tokens,
+            output_tokens,
+            cost_microunits,
+            quota: QuotaKnowledge::NotExposed,
+        }),
+        omitted_fields: Vec::new(),
+        warnings: Vec::new(),
+        privacy_class: HostEventPrivacyClass::RedactedSummary,
+        coverage: NormalizationCoverage::Complete,
+    }
+}
+
+/// Classify failure/error notifications as typed error observations.
+fn classify_error_payload(method: &str) -> ClassifiedCodexPayload {
+    ClassifiedCodexPayload {
+        payload: NormalizedHostEventPayload::Error(ErrorObservation {
+            code: method.to_owned(),
+            safe_summary: format!("codex {method} observed"),
+        }),
+        omitted_fields: vec!["raw_error".to_owned()],
+        warnings: Vec::new(),
+        privacy_class: HostEventPrivacyClass::RestrictedHandleOnly,
+        coverage: NormalizationCoverage::LossyOmission,
+    }
+}
+
 /// Map one Codex notification method + params to the closed typed payload.
 /// The bound turn/sequence supply correlation references minted by the adapter
 /// (never a provider-native cursor); raw content stays behind the handle.
@@ -922,168 +1204,24 @@ fn classify_codex_payload(
     bound_unit: &ExecutionUnit,
 ) -> Result<ClassifiedCodexPayload, CodexAdapterError> {
     match method {
-        "turn/started" | "turn/created" => Ok(ClassifiedCodexPayload {
-            payload: NormalizedHostEventPayload::ExecutionStarted(ExecutionStartedObservation {
-                execution_unit: bound_unit.clone(),
-                start_ref: bound_turn.to_owned(),
-            }),
-            omitted_fields: omitted_top_level_keys(
-                params,
-                &["threadId", "thread_id", "turn", "turnId"],
-            ),
-            warnings: Vec::new(),
-            privacy_class: HostEventPrivacyClass::RedactedSummary,
-            coverage: if omitted_top_level_keys(
-                params,
-                &["threadId", "thread_id", "turn", "turnId"],
-            )
-            .is_empty()
-            {
-                NormalizationCoverage::Complete
-            } else {
-                NormalizationCoverage::LossyOmission
-            },
-        }),
+        "turn/started" | "turn/created" => {
+            Ok(classify_turn_started(params, bound_turn, bound_unit))
+        }
         "item/agentMessage/delta" | "item/assistantMessage/delta" => {
-            let delta_chars =
-                delta_chars_from(params, &["delta", "text", "content", "message", "output"]);
-            Ok(ClassifiedCodexPayload {
-                payload: NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
-                    delta_chars,
-                    truncated: false,
-                }),
-                omitted_fields: vec!["raw_delta_text".to_owned()],
-                warnings: Vec::new(),
-                privacy_class: HostEventPrivacyClass::RedactedSummary,
-                coverage: NormalizationCoverage::LossyOmission,
-            })
+            Ok(classify_assistant_delta(params))
         }
         "item/reasoningSummary/delta" | "item/reasoning/delta" => {
-            let summary_chars =
-                delta_chars_from(params, &["delta", "text", "summary", "content", "message"]);
-            Ok(ClassifiedCodexPayload {
-                payload: NormalizedHostEventPayload::ReasoningSummary(
-                    ReasoningSummaryObservation {
-                        summary_chars,
-                        truncated: false,
-                    },
-                ),
-                omitted_fields: vec!["raw_reasoning_text".to_owned()],
-                warnings: Vec::new(),
-                privacy_class: HostEventPrivacyClass::RestrictedHandleOnly,
-                coverage: NormalizationCoverage::LossyOmission,
-            })
+            Ok(classify_reasoning_delta(params))
         }
         "item/commandExecution/requestApproval" | "item/toolCall" => {
-            let tool_name = tool_name_from(params, method);
-            if tool_name.trim().is_empty()
-                || tool_name.chars().any(char::is_control)
-                || tool_name.chars().count() > 1024
-            {
-                return Err(CodexAdapterError::MalformedWire("tool name"));
-            }
-            Ok(ClassifiedCodexPayload {
-                payload: NormalizedHostEventPayload::ToolInvocation(ToolInvocationObservation {
-                    tool_name,
-                    invocation_ref: format!("{bound_turn}:{sequence}"),
-                    arguments_digest: digest_value(params)?,
-                }),
-                omitted_fields: vec!["raw_arguments".to_owned()],
-                warnings: Vec::new(),
-                privacy_class: HostEventPrivacyClass::RestrictedHandleOnly,
-                coverage: NormalizationCoverage::LossyOmission,
-            })
+            classify_tool_invocation(params, method, bound_turn, sequence)
         }
         "item/commandExecution/finished" | "item/toolResult" => {
-            let tool_name = tool_name_from(params, method);
-            if tool_name.trim().is_empty()
-                || tool_name.chars().any(char::is_control)
-                || tool_name.chars().count() > 1024
-            {
-                return Err(CodexAdapterError::MalformedWire("tool name"));
-            }
-            let result_source = params.get("result").unwrap_or(params);
-            Ok(ClassifiedCodexPayload {
-                payload: NormalizedHostEventPayload::ToolOutcome(ToolOutcomeObservation {
-                    tool_name,
-                    invocation_ref: format!("{bound_turn}:{sequence}"),
-                    outcome: tool_outcome_from(params),
-                    result_digest: digest_value(result_source)?,
-                    safe_summary: None,
-                }),
-                omitted_fields: vec!["raw_result".to_owned()],
-                warnings: Vec::new(),
-                privacy_class: HostEventPrivacyClass::RestrictedHandleOnly,
-                coverage: NormalizationCoverage::LossyOmission,
-            })
+            classify_tool_outcome(params, method, bound_turn, sequence)
         }
-        "turn/completed" => {
-            if let Some(status) = terminal_status_from(params) {
-                let omitted =
-                    omitted_top_level_keys(params, &["threadId", "thread_id", "turn", "turnId"]);
-                let coverage = if omitted.is_empty() {
-                    NormalizationCoverage::Complete
-                } else {
-                    NormalizationCoverage::LossyOmission
-                };
-                Ok(ClassifiedCodexPayload {
-                    payload: NormalizedHostEventPayload::ProviderTerminalObserved(
-                        ProviderTerminalObservation {
-                            status,
-                            terminal_ref: bound_turn.to_owned(),
-                        },
-                    ),
-                    omitted_fields: omitted,
-                    warnings: Vec::new(),
-                    privacy_class: HostEventPrivacyClass::RedactedSummary,
-                    coverage,
-                })
-            } else {
-                Ok(unsupported_quarantine(
-                    method,
-                    UnsupportedEventReason::UnknownMethod,
-                    vec!["non-terminal-turn-status".to_owned()],
-                    omitted_top_level_keys(params, &["threadId", "thread_id", "turnId"]),
-                ))
-            }
-        }
-        "turn/usage" | "usage" => {
-            let (input_tokens, output_tokens, cost_microunits) = params
-                .get("usage")
-                .and_then(Value::as_object)
-                .map(|usage| {
-                    (
-                        usage.get("input_tokens").and_then(Value::as_u64),
-                        usage.get("output_tokens").and_then(Value::as_u64),
-                        usage.get("cost_microunits").and_then(Value::as_u64),
-                    )
-                })
-                .unwrap_or((None, None, None));
-            // Absent native quota/replay evidence stays typed
-            // `NotExposed`, never a synthesized zero or string constant.
-            Ok(ClassifiedCodexPayload {
-                payload: NormalizedHostEventPayload::Usage(UsageReceipt {
-                    input_tokens,
-                    output_tokens,
-                    cost_microunits,
-                    quota: QuotaKnowledge::NotExposed,
-                }),
-                omitted_fields: Vec::new(),
-                warnings: Vec::new(),
-                privacy_class: HostEventPrivacyClass::RedactedSummary,
-                coverage: NormalizationCoverage::Complete,
-            })
-        }
-        "turn/failed" | "error" => Ok(ClassifiedCodexPayload {
-            payload: NormalizedHostEventPayload::Error(ErrorObservation {
-                code: method.to_owned(),
-                safe_summary: format!("codex {method} observed"),
-            }),
-            omitted_fields: vec!["raw_error".to_owned()],
-            warnings: Vec::new(),
-            privacy_class: HostEventPrivacyClass::RestrictedHandleOnly,
-            coverage: NormalizationCoverage::LossyOmission,
-        }),
+        "turn/completed" => Ok(classify_turn_completed(params, method, bound_turn)),
+        "turn/usage" | "usage" => Ok(classify_usage_payload(params)),
+        "turn/failed" | "error" => Ok(classify_error_payload(method)),
         _ => Ok(unsupported_quarantine(
             method,
             UnsupportedEventReason::UnknownMethod,
@@ -1244,32 +1382,78 @@ pub struct CodexHostEventInput<'a> {
     pub admission: Option<&'a AdmittedRouteReceipt>,
 }
 
-/// Normalize one Codex wire notification into the closed v7 host-event schema
-/// (issue #371 S7).
-///
-/// The adapter identity/version (`eliot-agent-codex` /
-/// [`CODEX_WIRE_SCHEMA_VERSION`]) is bound by this function, never supplied by
-/// the caller; the input source digest is computed from `raw_source_bytes` via
-/// the canonical SHA-256 primitive (never `blake3`, never a new digest); and
-/// the sealed envelope is validated before return (execution-unit lineage
-/// against the exact binding plus the #369 admission via
-/// `validate_for_lineage`, session lineage on the session path via
-/// `validate_as_session_observation`). Raw bytes stay behind the restricted
-/// handle; the public payload holds the bounded typed summary only.
-///
-/// S1 binding checks are preserved: the recorded observation must agree with
-/// the claimed stream position, monotonicity is enforced by the owner-supplied
-/// `previous_sequence` (no hidden local cursor), the wire turn
-/// (`params.turn.id` via the real JSON parser) must exactly equal the bound
-/// unit (missing/foreign turn quarantines without advancing another attempt),
-/// and thread events stay session-only (never yield attempt output).
-/// The recorded `observation.cursor` is preserved end-to-end for cursor and
-/// event identity; no `codex:{sequence}` cursor is ever synthesized, and
-/// absent native replay/quota evidence maps to typed
-/// [`QuotaKnowledge::NotExposed`] (never a string constant or zero).
-pub fn normalize_codex_event(
-    input: CodexHostEventInput<'_>,
-) -> Result<(NormalizedHostEventEnvelope, HostEventNormalizationReceipt), CodexAdapterError> {
+/// Effective Codex normalization source: the qualified digest plus whether
+/// the raw bytes decoded to the supplied wire message.
+enum BoundCodexSource {
+    /// The raw bytes decoded to a wire message identical (canonically) to
+    /// the supplied message; the digest covers the decoded canonical bytes.
+    Decoded(QualifiedSourceDigest),
+    /// The raw bytes did not decode; the digest covers the exact bytes under
+    /// the raw-bytes qualifier and the supplied classification is replaced
+    /// by typed quarantine.
+    Undecodable(QualifiedSourceDigest),
+}
+
+/// Binds the Codex normalization source (P2 source-integrity repair): the
+/// raw bytes must decode to exactly one wire message whose canonical form
+/// equals the supplied message, or no receipt is issued. A completed-turn
+/// message paired with failed-turn bytes (or any other disagreeing pair)
+/// fails here as mismatched input, never sealed. Undecodable bytes never
+/// mint the supplied classification: they bind the exact bytes under the
+/// raw-bytes qualifier for the typed quarantine path.
+fn bind_codex_source(
+    message: &CodexWireMessage,
+    raw_source_bytes: &[u8],
+) -> Result<BoundCodexSource, CodexAdapterError> {
+    let Ok(decoded) = CodexWireMessage::parse_line(raw_source_bytes) else {
+        return Ok(BoundCodexSource::Undecodable(QualifiedSourceDigest {
+            algorithm: HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM.to_owned(),
+            digest: qualified_codex_digest(eliot_contracts::sha256_hex(raw_source_bytes))?,
+        }));
+    };
+    let decoded_canonical = eliot_contracts::canonical_json_bytes(&decoded)
+        .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?;
+    let supplied_canonical = eliot_contracts::canonical_json_bytes(message)
+        .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?;
+    if decoded_canonical != supplied_canonical {
+        return Err(CodexAdapterError::InvalidInput("raw_source_bytes/message"));
+    }
+    Ok(BoundCodexSource::Decoded(QualifiedSourceDigest {
+        algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
+        digest: qualified_codex_digest(eliot_contracts::sha256_hex(&decoded_canonical))?,
+    }))
+}
+
+/// Builds a typed codex digest from a hex string.
+fn qualified_codex_digest(hex: String) -> Result<LowercaseSha256, CodexAdapterError> {
+    serde_json::from_value(Value::String(hex))
+        .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))
+}
+
+/// Builds the typed quarantine for undecodable Codex bytes: the exact bytes
+/// stay behind the restricted handle under the raw-bytes digest, nothing is
+/// fabricated from them, and the actual omission is declared.
+fn undecodable_codex_quarantine() -> ClassifiedCodexPayload {
+    ClassifiedCodexPayload {
+        payload: NormalizedHostEventPayload::UnsupportedQuarantined(UnsupportedEventObservation {
+            source_namespace: CODEX_NORMALIZER_IDENTITY.to_owned(),
+            source_version: None,
+            reason: UnsupportedEventReason::SourceDecodeFailure,
+            detail_ref: None,
+        }),
+        omitted_fields: vec![CODEX_UNDECODABLE_SOURCE_ENTRY.to_owned()],
+        warnings: Vec::new(),
+        privacy_class: HostEventPrivacyClass::RestrictedHandleOnly,
+        coverage: NormalizationCoverage::LossyOmission,
+    }
+}
+
+/// Validated Codex input: the owned wire method plus cloned params.
+/// Bounds checks (sequence, raw-byte size, monotonicity, notification kind)
+/// run here before any receipt is issued.
+fn validate_codex_input(
+    input: &CodexHostEventInput<'_>,
+) -> Result<(String, Value), CodexAdapterError> {
     if input.sequence == 0 {
         return Err(CodexAdapterError::InvalidInput("sequence"));
     }
@@ -1292,14 +1476,27 @@ pub fn normalize_codex_event(
     let method = input
         .message
         .method
-        .as_deref()
+        .clone()
         .ok_or(CodexAdapterError::MalformedWire("event has no method"))?;
     let params = input.message.params.clone().unwrap_or(Value::Null);
+    Ok((method, params))
+}
 
-    // Lineage/admission pairing (mirrors ACP): execution-unit requires
-    // admission, session-only forbids it (no attempt authority, no route
-    // reference).
-    let execution_observation = match &input.lineage {
+/// Paired execution-unit lineage: the recorded observation, its admission,
+/// and the bound turn the wire params must corroborate.
+struct PairedCodexLineage<'a> {
+    observation: &'a ExecutionUnitObservation,
+    bound_turn: &'a str,
+}
+
+/// Pair lineage with admission (mirrors ACP): execution-unit requires
+/// admission, session-only forbids it (no attempt authority, no route
+/// reference).
+fn pair_codex_lineage<'a>(
+    input: &'a CodexHostEventInput<'a>,
+    params: &Value,
+) -> Result<Option<PairedCodexLineage<'a>>, CodexAdapterError> {
+    match &input.lineage {
         ProviderObservationLineage::ExecutionUnitObservation(observation) => {
             let admission = input
                 .admission
@@ -1322,111 +1519,158 @@ pub fn normalize_codex_event(
                     eliot_agent_api::ContractError::BindingMismatch,
                 ));
             }
-            validate_wire_session_against_binding(&params, &observation.binding)?;
+            validate_wire_session_against_binding(params, &observation.binding)?;
             let bound_turn = observation.binding.execution_unit.unit_id.as_str();
-            if wire_turn_id(&params) != Some(bound_turn) {
+            if wire_turn_id(params) != Some(bound_turn) {
                 // Missing or foreign turn: quarantine (caller retains raw);
                 // never attribute turn B output to attempt A.
                 return Err(CodexAdapterError::Contract(
                     eliot_agent_api::ContractError::BindingMismatch,
                 ));
             }
-            Some((observation, admission, bound_turn))
+            Ok(Some(PairedCodexLineage {
+                observation,
+                bound_turn,
+            }))
         }
         ProviderObservationLineage::SessionObservation(observation) => {
             if input.admission.is_some() {
                 return Err(CodexAdapterError::InvalidInput("admission/lineage"));
             }
             observation.validate()?;
-            None
+            Ok(None)
         }
-    };
+    }
+}
 
-    let (payload, omitted_fields, warnings, privacy_class, coverage) = match execution_observation {
-        Some((observation, _, bound_turn)) => {
-            let classified = classify_codex_payload(
+/// Shared classification tuple: payload plus loss/privacy/coverage facts.
+type CodexClassification = (
+    NormalizedHostEventPayload,
+    Vec<String>,
+    Vec<String>,
+    HostEventPrivacyClass,
+    NormalizationCoverage,
+);
+
+/// Classify the session-only path: thread lifecycle stays session-only.
+/// Turn/delta/tool/terminal methods require execution-unit lineage and fail
+/// closed here (no attempt authority invented); unknown methods quarantine
+/// as typed session evidence.
+fn classify_session_codex(
+    method: &str,
+    params: &Value,
+) -> Result<CodexClassification, CodexAdapterError> {
+    match method {
+        "thread/started" => Ok((
+            NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+                transition: SessionLifecycleTransition::Started,
+                detail_ref: None,
+            }),
+            Vec::new(),
+            Vec::new(),
+            HostEventPrivacyClass::RedactedSummary,
+            NormalizationCoverage::Complete,
+        )),
+        "thread/resumed" => Ok((
+            NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+                transition: SessionLifecycleTransition::Resumed,
+                detail_ref: None,
+            }),
+            Vec::new(),
+            Vec::new(),
+            HostEventPrivacyClass::RedactedSummary,
+            NormalizationCoverage::Complete,
+        )),
+        _ if classify_needs_execution_unit(method, params) => Err(CodexAdapterError::Contract(
+            eliot_agent_api::ContractError::BindingMismatch,
+        )),
+        _ => {
+            let classified = unsupported_quarantine(
                 method,
-                &params,
-                bound_turn,
-                input.sequence,
-                &observation.binding.execution_unit,
-            )?;
-            (
+                UnsupportedEventReason::UnknownMethod,
+                Vec::new(),
+                omitted_top_level_keys(params, &[]),
+            );
+            Ok((
                 classified.payload,
                 classified.omitted_fields,
                 classified.warnings,
                 classified.privacy_class,
                 classified.coverage,
+            ))
+        }
+    }
+}
+
+/// Apply the bound source to a classification: undecodable bytes replace the
+/// supplied classification with typed quarantine, and decodable bytes merge
+/// the withheld body into the loss manifest.
+fn apply_codex_source(
+    classified: CodexClassification,
+    bound_source: BoundCodexSource,
+) -> (
+    NormalizedHostEventPayload,
+    Vec<String>,
+    Vec<String>,
+    HostEventPrivacyClass,
+    NormalizationCoverage,
+    QualifiedSourceDigest,
+) {
+    let (payload, omitted_fields, warnings, privacy_class, coverage) = classified;
+    match bound_source {
+        BoundCodexSource::Undecodable(digest) => {
+            let quarantined = undecodable_codex_quarantine();
+            (
+                quarantined.payload,
+                quarantined.omitted_fields,
+                quarantined.warnings,
+                quarantined.privacy_class,
+                quarantined.coverage,
+                digest,
             )
         }
-        None => {
-            // Session-only path: thread lifecycle stays session-only.
-            // Turn/delta/tool/terminal methods require execution-unit
-            // lineage and fail closed here (no attempt authority invented);
-            // unknown methods quarantine as typed session evidence.
-            match method {
-                "thread/started" => (
-                    NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
-                        transition: SessionLifecycleTransition::Started,
-                        detail_ref: None,
-                    }),
-                    Vec::new(),
-                    Vec::new(),
-                    HostEventPrivacyClass::RedactedSummary,
-                    NormalizationCoverage::Complete,
-                ),
-                "thread/resumed" => (
-                    NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
-                        transition: SessionLifecycleTransition::Resumed,
-                        detail_ref: None,
-                    }),
-                    Vec::new(),
-                    Vec::new(),
-                    HostEventPrivacyClass::RedactedSummary,
-                    NormalizationCoverage::Complete,
-                ),
-                _ if classify_needs_execution_unit(method, &params) => {
-                    return Err(CodexAdapterError::Contract(
-                        eliot_agent_api::ContractError::BindingMismatch,
-                    ));
-                }
-                _ => {
-                    let classified = unsupported_quarantine(
-                        method,
-                        UnsupportedEventReason::UnknownMethod,
-                        Vec::new(),
-                        omitted_top_level_keys(&params, &[]),
-                    );
-                    (
-                        classified.payload,
-                        classified.omitted_fields,
-                        classified.warnings,
-                        classified.privacy_class,
-                        classified.coverage,
-                    )
-                }
-            }
+        BoundCodexSource::Decoded(digest) => {
+            let (omitted_fields, coverage) = merge_codex_discovery(omitted_fields, coverage);
+            (
+                payload,
+                omitted_fields,
+                warnings,
+                privacy_class,
+                coverage,
+                digest,
+            )
         }
-    };
+    }
+}
 
+/// Seal the envelope: sanitize public strings, build the receipt, and
+/// validate lineage before return.
+fn finish_codex_envelope(
+    input: CodexHostEventInput<'_>,
+    payload: NormalizedHostEventPayload,
+    omitted_fields: Vec<String>,
+    warnings: Vec<String>,
+    privacy_class: HostEventPrivacyClass,
+    coverage: NormalizationCoverage,
+    input_digest: QualifiedSourceDigest,
+) -> Result<(NormalizedHostEventEnvelope, HostEventNormalizationReceipt), CodexAdapterError> {
     let unsupported_disposition = match &payload {
+        NormalizedHostEventPayload::UnsupportedQuarantined(observation)
+            if observation.reason == UnsupportedEventReason::SourceDecodeFailure =>
+        {
+            UnsupportedDisposition::SourceDecodeFailure
+        }
         NormalizedHostEventPayload::UnsupportedQuarantined(_) => {
             UnsupportedDisposition::UnsupportedMethodQuarantined
         }
         _ => UnsupportedDisposition::None,
     };
-    let input_digest: LowercaseSha256 = serde_json::from_value(Value::String(
-        eliot_contracts::sha256_hex(input.raw_source_bytes),
-    ))
-    .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?;
+    check_codex_public_strings(&payload)?;
     let receipt = HostEventNormalizationReceipt {
         normalizer_identity: CODEX_NORMALIZER_IDENTITY.to_owned(),
         normalizer_version: CODEX_NORMALIZER_VERSION.to_owned(),
         input_handle: input.raw_source_handle.clone(),
-        input_digest: QualifiedSourceDigest {
-            algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
-            digest: input_digest,
-        },
+        input_digest,
         output_schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
         output_digest: serde_json::from_value(Value::String(
             "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
@@ -1481,6 +1725,85 @@ pub fn normalize_codex_event(
     }
     let receipt = envelope.normalization.clone();
     Ok((envelope, receipt))
+}
+
+/// Normalize one Codex wire notification into the closed v7 host-event schema
+/// (issue #371 S7).
+///
+/// The adapter identity/version (`eliot-agent-codex` /
+/// [`CODEX_WIRE_SCHEMA_VERSION`]) is bound by this function, never supplied by
+/// the caller; the input source digest names the single decoded wire message
+/// (canonical SHA-256 over the decoded bytes, never `blake3`, never a new
+/// digest), and the supplied message must equal the decoded bytes
+/// canonically before any receipt is issued; undecodable bytes bind the
+/// exact bytes under the raw-bytes qualifier and seal typed quarantine
+/// instead of the supplied classification. The sealed envelope is validated
+/// before return (execution-unit lineage against the exact binding plus the
+/// #369 admission via `validate_for_lineage`, session lineage on the session
+/// path via `validate_as_session_observation`). Raw bytes stay behind the
+/// restricted handle; the public payload holds the bounded typed summary
+/// only, with every public string sanitized and the withheld message body
+/// declared in the loss manifest.
+///
+/// S1 binding checks are preserved: the recorded observation must agree with
+/// the claimed stream position, monotonicity is enforced by the owner-supplied
+/// `previous_sequence` (no hidden local cursor), the wire turn
+/// (`params.turn.id` via the real JSON parser) must exactly equal the bound
+/// unit (missing/foreign turn quarantines without advancing another attempt),
+/// and thread events stay session-only (never yield attempt output).
+/// The recorded `observation.cursor` is preserved end-to-end for cursor and
+/// event identity; no `codex:{sequence}` cursor is ever synthesized, and
+/// absent native replay/quota evidence maps to typed
+/// [`QuotaKnowledge::NotExposed`] (never a string constant or zero).
+pub fn normalize_codex_event(
+    input: CodexHostEventInput<'_>,
+) -> Result<(NormalizedHostEventEnvelope, HostEventNormalizationReceipt), CodexAdapterError> {
+    let (method, params) = validate_codex_input(&input)?;
+
+    // Source binding before classification: the raw bytes must decode to the
+    // supplied wire message (canonical equality, so whitespace/key-order
+    // variants verify), or no receipt is issued. Undecodable bytes bind the
+    // exact bytes under the raw-bytes qualifier and replace the supplied
+    // classification with typed quarantine below.
+    let bound_source = bind_codex_source(input.message, input.raw_source_bytes)?;
+
+    let paired = pair_codex_lineage(&input, &params)?;
+
+    let classified: CodexClassification = match &paired {
+        Some(paired) => {
+            let classified = classify_codex_payload(
+                method.as_str(),
+                &params,
+                paired.bound_turn,
+                input.sequence,
+                &paired.observation.binding.execution_unit,
+            )?;
+            (
+                classified.payload,
+                classified.omitted_fields,
+                classified.warnings,
+                classified.privacy_class,
+                classified.coverage,
+            )
+        }
+        None => classify_session_codex(method.as_str(), &params)?,
+    };
+
+    // The sealed payload is the decoded source's projection: undecodable
+    // bytes replace the supplied classification with typed quarantine, and
+    // decodable bytes merge the withheld body into the loss manifest. Every
+    // public string is sanitized before sealing.
+    let (payload, omitted_fields, warnings, privacy_class, coverage, input_digest) =
+        apply_codex_source(classified, bound_source);
+    finish_codex_envelope(
+        input,
+        payload,
+        omitted_fields,
+        warnings,
+        privacy_class,
+        coverage,
+        input_digest,
+    )
 }
 
 /// Whether a wire method needs execution-unit lineage (i.e. its typed payload
