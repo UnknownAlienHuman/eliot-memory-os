@@ -45,7 +45,8 @@ pub use route_receipts::{
     LegacyQuarantineReason, LegacyRouteQuarantine, MAX_EVIDENCE_REFS, MAX_REJECTED_CANDIDATES,
     MAX_ROUTE_CANDIDATES, MAX_SAFE_ERROR_CHARS, MAX_TEXT_REF_CHARS, NoRouteDisposition,
     PhysicalRouteObservationReceipt, RejectedRouteCandidate, RouteObservationState,
-    RouteSelectionCandidate, candidate_digest_for, route_divergence_fields,
+    RouteSelectionCandidate, candidate_digest_for, route_divergence_fields, sanitize_adapter_error,
+    validate_safe_public_error,
 };
 
 /// Wire revision v7 hardens the #228 effect trio (T4 S-effect, Implements #228):
@@ -189,6 +190,8 @@ pub enum ContractError {
     OversizeField { field: &'static str },
     #[error("unknown route contract version")]
     UnknownContractVersion,
+    #[error("{field} carries forbidden secret or credential content")]
+    ForbiddenContent { field: &'static str },
 }
 
 /// Whether an admission may expose only safe observations or material work.
