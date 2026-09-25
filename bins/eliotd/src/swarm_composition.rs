@@ -193,9 +193,12 @@ pub struct AttachedPlan {
 /// never a silent relaunch under an existing one. The cancellation identity
 /// appends `-cancel` to the operation identity (issue #1126 How-to-do: one
 /// deterministic attempt and cancellation identity derived from the parent,
-/// child slot, plan revision and State Fence — the fence enters through the
-/// attached plan, whose fence digest the Governor owner validated at attach
-/// before any launch). The cancel path resolves the slot to this identity
+/// child slot, plan revision and State Fence). The fence is bound per child:
+/// [`SwarmComposition::launch_child`] copies the fence digest the Governor
+/// owner validated at attach into the intent, so the lineage survives restart
+/// in the ledger itself; rehydration refuses a persisted intent whose fence
+/// digest, operation derivation, or attempt derivation drifted from the
+/// sealed attachment. The cancel path resolves the slot to this identity
 /// from the ledger-persisted intent; rehydration refuses a persisted intent
 /// whose cancellation identity does not match the derivation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -212,6 +215,10 @@ pub struct ChildLaunchIntent {
     pub job_handle: String,
     /// Admitted plan revision the child derives from.
     pub plan_revision: String,
+    /// State-fence digest the Governor owner validated at attach, copied
+    /// per child at launch so rehydration verifies fence lineage without
+    /// trusting process memory.
+    pub fence_digest: String,
     /// Registry-admitted route class sealing the dispatch envelope.
     pub route_class: String,
     /// Generation pinned to this launch by the generation-permit owner.
@@ -435,9 +442,14 @@ fn pinned_generation(bindings: &[(String, u64)], route_class: &str) -> Option<u6
 /// folds its route binding into the rebuilt pins.
 ///
 /// Fail-closed, in order: an intent for another job or plan revision is
-/// [`SwarmCompositionError::StaleLineage`]; an intent whose cancellation
-/// identity does not match the derivation is
-/// [`SwarmCompositionError::InternalContract`]; intents disagreeing on one
+/// [`SwarmCompositionError::StaleLineage`]; an intent whose operation
+/// identity does not re-derive from its own `(job_handle, plan_revision,
+/// slot)` is `StaleLineage` (identity drift against the sealed attachment);
+/// an intent whose attempt or cancellation identity does not match the
+/// derivation is [`SwarmCompositionError::InternalContract`]; an intent
+/// whose fence digest differs from the sealed fence digest is `StaleLineage`
+/// (fence drift fails closed: a fence that moved under a persisted child is
+/// refused, never re-pinned); intents disagreeing on one
 /// class generation under the sealed attachment are `InternalContract`
 /// (the ledger cannot have drifted through
 /// [`SwarmComposition::launch_child`], so disagreement is refused rather
@@ -455,10 +467,38 @@ fn reconcile_persisted_intent(
             ),
         });
     }
+    let derived_operation = format!(
+        "{}:{}:{}",
+        intent.job_handle, intent.plan_revision, intent.slot
+    );
+    if intent.operation_id != derived_operation {
+        return Err(SwarmCompositionError::StaleLineage {
+            detail: format!(
+                "persisted intent for slot {} carries a drifted operation identity",
+                intent.slot
+            ),
+        });
+    }
+    if intent.attempt_id != format!("{}-attempt", intent.operation_id) {
+        return Err(SwarmCompositionError::InternalContract {
+            detail: format!(
+                "persisted intent for slot {} carries a drifted attempt identity",
+                intent.slot
+            ),
+        });
+    }
     if intent.cancellation_id != expected_cancellation_id(&intent.operation_id) {
         return Err(SwarmCompositionError::InternalContract {
             detail: format!(
                 "persisted intent for slot {} carries a drifted cancellation identity",
+                intent.slot
+            ),
+        });
+    }
+    if intent.fence_digest != sealed.fence_digest {
+        return Err(SwarmCompositionError::StaleLineage {
+            detail: format!(
+                "persisted intent for slot {} carries a drifted fence digest",
                 intent.slot
             ),
         });
@@ -798,7 +838,8 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
     /// [`SwarmCompositionError::RouteBlocked`] with no silent substitution
     /// (stale-route gate, item A8: provider/route replacement cannot revive
     /// stale child authority under the same plan); the launch intent,
-    /// carrying the deterministic cancellation identity, is appended to the
+    /// carrying the deterministic attempt and cancellation identities plus
+    /// the Governor-validated fence digest, is appended to the
     /// durable ledger BEFORE the runner is called; the runner call happens
     /// exactly once per appended intent. A runner failure after a persisted
     /// append propagates as [`SwarmCompositionError::OwnerFailure`] while
@@ -864,6 +905,7 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
             slot: slot.to_owned(),
             job_handle: plan.job_handle.clone(),
             plan_revision: plan.plan_revision.clone(),
+            fence_digest: plan.fence_digest.clone(),
             route_class: route_class.to_owned(),
             generation,
         };
@@ -983,9 +1025,10 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
         // is the source of truth, so no launched child is lost) and observe
         // each through the runner. Unknown stays unknown. Route-binding pins
         // rebuild from the same persisted intents, so a restart cannot revive
-        // stale route authority; a persisted intent whose cancellation
-        // identity does not match the derivation is refused rather than
-        // reconciled under a drifted binding.
+        // stale route authority; a persisted intent whose operation, attempt,
+        // cancellation, or fence lineage does not match the sealed
+        // attachment is refused rather than reconciled under drifted
+        // lineage.
         let persisted = self.ledger.intents();
         let mut children = Vec::with_capacity(persisted.len());
         let mut bindings: Vec<(String, u64)> = Vec::new();
