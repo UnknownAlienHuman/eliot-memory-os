@@ -72,6 +72,45 @@ fn snapshot_serialization_error(_error: serde_json::Error) -> StoreError {
     StoreError::Serialization(SNAPSHOT_SERIALIZATION_REASON.to_owned())
 }
 
+/// Redacts a store error so no record, query or credential prose crosses.
+///
+/// Follows the `crate::backup_restore::redact_store_error` pattern: the only
+/// variant that can carry foreign text is replaced with bounded static text,
+/// and every typed variant — whose fields are already static or bounded digests
+/// — passes through unchanged, so no typed failure is collapsed.
+fn redact_snapshot_error(error: StoreError) -> StoreError {
+    match error {
+        StoreError::Serialization(_) => {
+            StoreError::Serialization(SNAPSHOT_SERIALIZATION_REASON.to_owned())
+        }
+        other => other,
+    }
+}
+
+/// Runs the pinned statement for `operation` and redacts the failure it returns.
+///
+/// The statement is resolved from the closed registry and the operation is
+/// validated against it first, so an unlisted name never reaches the provider.
+async fn run_pinned_snapshot_query(
+    adapter: &SurrealStoreAdapter,
+    operation: &'static str,
+) -> Result<crate::client::RpcResults, StoreError> {
+    let statement = crate::client::fixed_snapshot_statement(operation)
+        .map_err(AdapterError::into_store_error)?;
+    crate::client::validate_snapshot_operation(operation)
+        .map_err(AdapterError::into_store_error)?;
+    let transport = crate::apply::client(adapter)
+        .await
+        .map_err(AdapterError::into_store_error)?;
+    crate::apply::ensure_ready(adapter, transport)
+        .await
+        .map_err(AdapterError::into_store_error)?;
+    crate::client::query(transport, &adapter.config, operation, statement, Map::new())
+        .await
+        .map_err(AdapterError::into_store_error)
+        .map_err(redact_snapshot_error)
+}
+
 /// Domain separator for the owner-issued consistency point.
 ///
 /// I5.27 binds canonical identity over a domain separator, so a capture handle
@@ -79,6 +118,24 @@ fn snapshot_serialization_error(_error: serde_json::Error) -> StoreError {
 /// the public capability this fixed registry implements, owned by
 /// `eliot-store-api` and surfaced by the registry.
 const SNAPSHOT_CONSISTENCY_POINT_DOMAIN: &str = crate::client::snapshot_capability();
+
+/// Canonical encoding version of the owner-issued consistency point.
+///
+/// I5.27: "Canonical encoding is deterministic and versioned; fields affecting
+/// authority, scope, ordering, privacy or effect cannot be omitted/defaulted
+/// silently." A bare `snapshot-point:<digest>` token carried no encoding
+/// version, so a reader could not tell which encoding produced it.
+const SNAPSHOT_CONSISTENCY_POINT_VERSION: &str = "eliot.snapshot.consistency-point.v1";
+
+/// Builds the versioned, domain-separated owner-issued consistency point.
+///
+/// The token binds the encoding version, the capability that owns the capture
+/// as its domain separator, and the exact begin-request digest.
+fn consistency_point(snapshot_digest: &str) -> String {
+    format!(
+        "{SNAPSHOT_CONSISTENCY_POINT_VERSION}:{SNAPSHOT_CONSISTENCY_POINT_DOMAIN}:{snapshot_digest}"
+    )
+}
 
 /// Versioned canonical encoding of the member identity and ordering shape.
 ///
@@ -530,20 +587,7 @@ async fn observe_capture_point(
     adapter: &SurrealStoreAdapter,
     operation: &'static str,
 ) -> Result<CapturePoint, StoreError> {
-    let statement = crate::client::fixed_snapshot_statement(operation)
-        .map_err(AdapterError::into_store_error)?;
-    crate::client::validate_snapshot_operation(operation)
-        .map_err(AdapterError::into_store_error)?;
-    let transport = crate::apply::client(adapter)
-        .await
-        .map_err(AdapterError::into_store_error)?;
-    crate::apply::ensure_ready(adapter, transport)
-        .await
-        .map_err(AdapterError::into_store_error)?;
-    let mut response =
-        crate::client::query(transport, &adapter.config, operation, statement, Map::new())
-            .await
-            .map_err(AdapterError::into_store_error)?;
+    let mut response = run_pinned_snapshot_query(adapter, operation).await?;
     let errors = response.take_errors();
     if !errors.is_empty() {
         if errors
@@ -558,8 +602,14 @@ async fn observe_capture_point(
     // schema-meta projection is index 1 and the canonical-fence projection
     // index 2 — the same offsets `apply::read_boundary` uses for the identical
     // batch shape.
-    let meta: Option<PointSchemaMeta> = response.take(1).map_err(AdapterError::into_store_error)?;
-    let fence: Option<PointFence> = response.take(2).map_err(AdapterError::into_store_error)?;
+    let meta: Option<PointSchemaMeta> = response
+        .take(1)
+        .map_err(AdapterError::into_store_error)
+        .map_err(redact_snapshot_error)?;
+    let fence: Option<PointFence> = response
+        .take(2)
+        .map_err(AdapterError::into_store_error)
+        .map_err(redact_snapshot_error)?;
     parse_capture_point(meta, fence)
 }
 
@@ -682,26 +732,8 @@ impl EnumerationEvidence {
 async fn read_enumeration(
     adapter: &SurrealStoreAdapter,
 ) -> Result<(CapturePoint, Vec<Vec<Map<String, Value>>>), StoreError> {
-    let statement =
-        crate::client::fixed_snapshot_statement(crate::client::SNAPSHOT_MEMBERS_OPERATION)
-            .map_err(AdapterError::into_store_error)?;
-    crate::client::validate_snapshot_operation(crate::client::SNAPSHOT_MEMBERS_OPERATION)
-        .map_err(AdapterError::into_store_error)?;
-    let transport = crate::apply::client(adapter)
-        .await
-        .map_err(AdapterError::into_store_error)?;
-    crate::apply::ensure_ready(adapter, transport)
-        .await
-        .map_err(AdapterError::into_store_error)?;
-    let mut response = crate::client::query(
-        transport,
-        &adapter.config,
-        crate::client::SNAPSHOT_MEMBERS_OPERATION,
-        statement,
-        Map::new(),
-    )
-    .await
-    .map_err(AdapterError::into_store_error)?;
+    let mut response =
+        run_pinned_snapshot_query(adapter, crate::client::SNAPSHOT_MEMBERS_OPERATION).await?;
     let errors = response.take_errors();
     if !errors.is_empty() {
         if errors
@@ -712,15 +744,22 @@ async fn read_enumeration(
         }
         return Err(StoreError::MissingReceiptEnvelope);
     }
-    let meta: Option<PointSchemaMeta> = response.take(1).map_err(AdapterError::into_store_error)?;
-    let fence: Option<PointFence> = response.take(2).map_err(AdapterError::into_store_error)?;
+    let meta: Option<PointSchemaMeta> = response
+        .take(1)
+        .map_err(AdapterError::into_store_error)
+        .map_err(redact_snapshot_error)?;
+    let fence: Option<PointFence> = response
+        .take(2)
+        .map_err(AdapterError::into_store_error)
+        .map_err(redact_snapshot_error)?;
     let point = parse_capture_point(meta, fence)?;
     let mut rows = Vec::new();
     for offset in 0..captured_member_classes().count() {
         let offset = offset + 3;
         let class_rows: Vec<Map<String, Value>> = response
             .take(offset)
-            .map_err(AdapterError::into_store_error)?;
+            .map_err(AdapterError::into_store_error)
+            .map_err(redact_snapshot_error)?;
         rows.push(class_rows);
     }
     Ok((point, rows))
@@ -1190,7 +1229,7 @@ pub(crate) async fn begin_snapshot(
     request: SnapshotBeginRequest,
 ) -> Result<SnapshotHandle, StoreError> {
     ctx.validate().map_err(StoreError::Foundation)?;
-    request.validate()?;
+    request.validate().map_err(redact_snapshot_error)?;
     if ctx.state_fence != request.scope.state_fence {
         return Err(StoreError::FenceMismatch);
     }
@@ -1217,7 +1256,7 @@ pub(crate) async fn begin_snapshot(
         });
     }
 
-    let snapshot_digest = request.compute_digest()?;
+    let snapshot_digest = request.compute_digest().map_err(redact_snapshot_error)?;
 
     let member_count = ordered_members.len() as u64;
     if member_count > request.bounds.max_members || member_count > MAX_SNAPSHOT_MEMBERS as u64 {
@@ -1240,7 +1279,7 @@ pub(crate) async fn begin_snapshot(
     }
 
     let handle = SnapshotHandle {
-        consistency_point: format!("{SNAPSHOT_CONSISTENCY_POINT_DOMAIN}:{snapshot_digest}"),
+        consistency_point: consistency_point(&snapshot_digest),
         snapshot_digest: snapshot_digest.clone(),
         operation_id: request.operation.operation_id.clone(),
         idempotency_key: request.operation.idempotency_key.clone(),
@@ -1357,7 +1396,8 @@ fn serve_next_page(
         next_cursor,
     };
     page.validate()?;
-    page.validate_for_begin(&state.begin)?;
+    page.validate_for_begin(&state.begin)
+        .map_err(redact_snapshot_error)?;
     let page_digest =
         sha256_hex(&canonical_json_bytes(&page).map_err(snapshot_serialization_error)?);
     state.pages_served = state.pages_served.saturating_add(1);
