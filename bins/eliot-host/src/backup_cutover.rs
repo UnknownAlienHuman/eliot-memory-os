@@ -210,7 +210,7 @@ pub struct CutoverRequest {
     pub target_generation: PlatformHandle,
     /// Owner-issued new authority fence for the destination generation.
     pub activation_fence: StateFence,
-    /// Owner-issued UserBroker identity for the destination generation.
+    /// Owner-issued `UserBroker` identity for the destination generation.
     pub user_broker_ref: PlatformHandle,
     /// Exact active predecessor generation expected at commit time.
     pub expected_predecessor: PlatformHandle,
@@ -230,6 +230,10 @@ pub struct CutoverRequest {
 ///
 /// `Deserialize` (M2 integration) mirrors the request: transport only, all
 /// gates re-checked by owner calls.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the #960 owner evidence denominator is a flat set of independent current-completeness facts; grouping them would hide a required gate"
+)]
 #[derive(Clone, Debug, Deserialize)]
 pub struct IsolatedRecoveryEvidence {
     /// All mandatory recovery phases completed with current receipts.
@@ -404,6 +408,10 @@ fn receipt_handle(digest: &str) -> Result<PlatformHandle, CutoverError> {
 /// # Errors
 ///
 /// Returns the exact failing gate. Nothing is activated here.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the ordered fail-closed cutover gate set stays in one boundary so no admission, receipt, or registry check can be skipped between neighbors"
+)]
 pub fn validate_cutover_request(
     request: &CutoverRequest,
     evidence: &IsolatedRecoveryEvidence,

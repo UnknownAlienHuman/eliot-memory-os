@@ -575,6 +575,18 @@ impl KernelService {
                 // observations and call `publish_ready` with its own receipt.
                 return Err(KernelServiceError::ReadinessNotProven);
             }
+            KernelControlCommand::ReadRuntimeLeaseCensus(_) => {
+                return Err(KernelServiceError::InvalidField {
+                    field: "runtime_lease_census",
+                    reason: "RuntimeLease census requires the authenticated Kernel composition boundary",
+                });
+            }
+            KernelControlCommand::ReadIntroductionRows(_) => {
+                return Err(KernelServiceError::InvalidField {
+                    field: "introduction_readback",
+                    reason: "Introduction readback requires the authenticated Kernel composition boundary",
+                });
+            }
             // Luna (startup consumer): replace this fail-closed placeholder
             // with validate plus record_startup_evidence steps 1/2/4 wiring.
             // It exists only so the shared carrier compiles before the

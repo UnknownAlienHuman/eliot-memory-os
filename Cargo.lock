@@ -1958,6 +1958,7 @@ dependencies = [
 name = "eliot-host"
 version = "0.1.0"
 dependencies = [
+ "eliot-backup",
  "eliot-contracts",
  "eliot-host-control-endpoint",
  "eliot-host-service",
@@ -1975,6 +1976,7 @@ dependencies = [
  "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime-contracts",
+ "eliot-store-api",
  "eliot-windows-ipc",
  "serde",
  "serde_json",
