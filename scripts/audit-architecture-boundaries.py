@@ -1642,9 +1642,16 @@ def audit_dependencies(
             chain = " -> ".join(
                 [package, *(edge.package for edge in runtime_path.edges)]
             )
+            # Mirror the direct-edge scope mapping: any conditional/optional
+            # hop leaves the runtime applicability unresolved (W4).
+            scope = (
+                "conditional-unresolved"
+                if runtime_path.conditional_hops
+                else "selected-source-runtime"
+            )
             witness = _dependency_witness(
                 rule=rule,
-                rule_scope="selected-source-runtime",
+                rule_scope=scope,
                 profile=PROFILE_SOURCE_RUNTIME,
                 path=runtime_path,
                 manifests=manifests,
