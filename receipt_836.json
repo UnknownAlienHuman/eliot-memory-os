@@ -1,0 +1,290 @@
+{
+  "attestation_required": true,
+  "bundle_bytes": 93704,
+  "bundle_sha256": "9992e481bcd6f0cb72afe09757600dce4f0406e05508a355376a05bc2f7a8e71",
+  "matched_routes": [
+    "workspace-governance"
+  ],
+  "pair_key": "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea",
+  "paths": [
+    "scripts/testdata/work-unit-gate/wave-d0/baseline.json",
+    "scripts/testdata/work-unit-gate/wave-d0/candidate.json",
+    "scripts/tests/test_wave_admission_d0.py"
+  ],
+  "read_receipt_id": "sha256:5a91bc90068cbe15f1f0c1f8c625af86373a2227e1888ce4be46ef7b43345151",
+  "required": [
+    {
+      "bytes": 2157,
+      "kind": "file",
+      "path": "AGENTS.md",
+      "sha256": "f53cfced00a959fb044ed257cecdab9fb993cd12a42ec19e8d2b1f5f45ba1026"
+    },
+    {
+      "bytes": 16436,
+      "kind": "file",
+      "path": "Cargo.toml",
+      "sha256": "059d695bb78b44b0dd8a5113336caa2d01e4f17e14ea468d9c51969efff8483f"
+    },
+    {
+      "bytes": 7991,
+      "kind": "file",
+      "path": "WORKFLOW.md",
+      "sha256": "ba1119920d47f33b99ee51332d8951b009fc04ebe8512fb64966c6afbd9ff070"
+    },
+    {
+      "bytes": 5523,
+      "kind": "file",
+      "path": "docs/ARCHITECTURE_CONTRACT.md",
+      "sha256": "d1e4c393cd7c953d8e41725eae404882236b13493ace74e4513c4cd894a9e846"
+    },
+    {
+      "bytes": 5163,
+      "kind": "file",
+      "path": "docs/DEPENDENCY_POLICY.md",
+      "sha256": "a69844d656e7cdac0b92fb4d1e6fbcd5d3e923c30ee706ec598acd3c3868933a"
+    },
+    {
+      "bytes": 2611,
+      "kind": "file",
+      "path": "docs/architecture/READING_PROTOCOL.md",
+      "sha256": "fc2ac357ecec293f7246a5ebc5c1e46f5407bb3574ffe39b6224e4d5aa6a3e25"
+    },
+    {
+      "bytes": 2625,
+      "kind": "file",
+      "path": "workstreams/ACTIVE.toml",
+      "sha256": "2bf61c09315add08bb0ec8fd2148f2f295b6abbf5e2e1e11b283204cada5b69b"
+    },
+    {
+      "anchors": [
+        "a01-purpose-of-the-architecture"
+      ],
+      "bytes": 1871,
+      "handles": [
+        "A0.1"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-01-purpose-of-the-architecture.md",
+      "sha256": "ee540ede56579ec388e26da2b290759e78ad3bb8a70ba57d56364800a1692750"
+    },
+    {
+      "anchors": [
+        "a02-hierarchy-of-architectural-decisions"
+      ],
+      "bytes": 1867,
+      "handles": [
+        "A0.2"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-02-hierarchy-of-architectural-decisions.md",
+      "sha256": "342c67f670714c83bb4c68693447fd7597bc4a662b87d4fa6bae09df3cbaf6e5"
+    },
+    {
+      "anchors": [
+        "a03-hard-boundaries"
+      ],
+      "bytes": 821,
+      "handles": [
+        "A0.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-03-hard-boundaries.md",
+      "sha256": "695fe5e156e0dde052556e23c34b008009348742d4fc4a1146393b8b13a48bc0"
+    },
+    {
+      "anchors": [
+        "a04-conflict-resolution"
+      ],
+      "bytes": 1318,
+      "handles": [
+        "A0.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-04-conflict-resolution.md",
+      "sha256": "732d3b9a63973398e07e48691ba56f6538d9168f3102e0702a5ca2e08910f556"
+    },
+    {
+      "anchors": [
+        "a06-changing-the-architecture"
+      ],
+      "bytes": 858,
+      "handles": [
+        "A0.6"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-06-changing-the-architecture.md",
+      "sha256": "c086ee01cc243b7d7dee465bc0ddfca0c36cc3a344b3b3e803a5eb94ff6f68a8"
+    },
+    {
+      "anchors": [
+        "a104-delegation"
+      ],
+      "bytes": 1980,
+      "handles": [
+        "A10.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A10-04-delegation.md",
+      "sha256": "fd9c93b5e66ea93a0a2bb171706449ca8d07d2d48caeb99d1acdc57360014cd9"
+    },
+    {
+      "anchors": [
+        "a148-development-doctrine"
+      ],
+      "bytes": 3740,
+      "handles": [
+        "A14.8"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A14-08-development-doctrine.md",
+      "sha256": "c7da919cd6112e97780407b7a7ae9806185994c2de6a275ed2449cb1b9ca78bb"
+    },
+    {
+      "anchors": [
+        "i03-decision-sources"
+      ],
+      "bytes": 1265,
+      "handles": [
+        "I0.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-03-decision-sources.md",
+      "sha256": "c5d7586399d8640484edaa3cb949495bc99a82b50dabddac029b2d08c2d716e8"
+    },
+    {
+      "anchors": [
+        "i04-change-classes"
+      ],
+      "bytes": 3252,
+      "handles": [
+        "I0.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-04-change-classes.md",
+      "sha256": "3c1fc91d692bee9494327b7f5375fbe45cddc00c27d5a0bf0dc3b40300a2ae45"
+    },
+    {
+      "anchors": [
+        "i05-conformance-support-and-evidence-status"
+      ],
+      "bytes": 6368,
+      "handles": [
+        "I0.5"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-05-conformance-support-and-evidence-status.md",
+      "sha256": "bfb599eb462ebfb904ec97ba199a8447371bce91ab73b7bad9e71f150cb837f9"
+    },
+    {
+      "anchors": [
+        "i013-current-support-conformance-and-product-status"
+      ],
+      "bytes": 996,
+      "handles": [
+        "I0.13"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-13-current-support-conformance-and-product-status.md",
+      "sha256": "2d691986e973b4c9191cf5718f32b5035a8470b8355c5d82489df48c18651d2e"
+    },
+    {
+      "anchors": [
+        "i014-documentation-and-evidence-build-integrity"
+      ],
+      "bytes": 3413,
+      "handles": [
+        "I0.14"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-14-documentation-and-evidence-build-integrity.md",
+      "sha256": "e645a72c291c89a4bc3e2eae99527aa2476dcfab0280e429df80405dbebe3fd9"
+    },
+    {
+      "anchors": [
+        "i217-parallel-agent-development-contract"
+      ],
+      "bytes": 1834,
+      "handles": [
+        "I2.17"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-17-parallel-agent-development-contract.md",
+      "sha256": "6c333908b112859dbffe00c04a9e942b38c5d369a85d89d78788ab576a1d7cb1"
+    },
+    {
+      "anchors": [
+        "i220-module-contract-kit-crate-context-capsule-and-module-test-capsule"
+      ],
+      "bytes": 5497,
+      "handles": [
+        "I2.20"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+      "sha256": "8a5d8276f2e1357eb58dd06acc7e5ac4017a4515048a5049c84e33849c381ef5"
+    },
+    {
+      "anchors": [
+        "i221-crate-and-boundary-validation"
+      ],
+      "bytes": 1549,
+      "handles": [
+        "I2.21"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-21-crate-and-boundary-validation.md",
+      "sha256": "f727b6627cf6151321e0b962c34f636b8b8df923abdf790c7b0cdeb84ef26002"
+    },
+    {
+      "anchors": [
+        "i222-parallel-build-cache-artifact-and-environment-lanes"
+      ],
+      "bytes": 2620,
+      "handles": [
+        "I2.22"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-22-parallel-build-cache-artifact-and-environment-lanes.md",
+      "sha256": "8cc78b566defb73be543c873648e0639694986510b32a25353c6e1cdebe92d4e"
+    },
+    {
+      "anchors": [
+        "i223-capability-family-topology-and-crate-extraction-decisions"
+      ],
+      "bytes": 6889,
+      "handles": [
+        "I2.23"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
+      "sha256": "e003d8e17b414ee0715028d7d3997d1b109c18df20ad0294ae2856d3e21e4e49"
+    },
+    {
+      "anchors": [
+        "i17-development-sequence"
+      ],
+      "bytes": 29,
+      "handles": [
+        "I17"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I17-development-sequence.md",
+      "sha256": "bce8bda02a5f57e7f1b11f4a037cc5481d6bc2615d1521e072f632f5b4c67b63"
+    },
+    {
+      "anchors": [
+        "i18-testing-and-instrumental-grounding-strategy"
+      ],
+      "bytes": 52,
+      "handles": [
+        "I18"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I18-testing-and-instrumental-grounding-strategy.md",
+      "sha256": "facd29dfe4a6fdb98a70f5a5decb7d960f8ca95419924828a44596c57940fb10"
+    }
+  ],
+  "route_receipt_id": "sha256:582e50501572bdfc456f8fc2884f5dcbb95f0321f603fed6ee1a6585e244c0f9",
+  "schema_version": "eliot-doc-read-v1",
+  "topic": "Wave D0 Admission #836"
+}
