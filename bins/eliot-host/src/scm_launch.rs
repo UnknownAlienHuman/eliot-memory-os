@@ -206,11 +206,13 @@ pub const HOST_SCM_TRANSIENT_MAX_INSPECTIONS: usize = 5;
 /// race rather than a real failure.
 ///
 /// Returns true only when `detail.win32_error() == 0` (the platform's own
-/// marker for "logic contour violation, no Win32 error"), `detail.stage() ==
-/// "query-status"`, and `detail.current_state() == Some(2)` (raw
-/// `SERVICE_START_PENDING`, see [`HOST_SCM_START_PENDING_STATE`]). That triple
-/// isolates the two-sample state/PID flap and process-identity race sites from
-/// real failures: a failed second status query carries a real Win32 code, and
+/// marker for "logic contour violation, no Win32 error"), `detail.stage()` is
+/// one of the two producer stages that can report the PID-zero handoff
+/// (`query-status` or `process-identity`), and `detail.current_state() ==
+/// Some(2)` (raw `SERVICE_START_PENDING`, see
+/// [`HOST_SCM_START_PENDING_STATE`]). That closed stage/state pair isolates
+/// the two-sample state/PID flap and process-identity race sites from real
+/// failures: a failed second status query carries a real Win32 code, and
 /// grant/config readback failures carry their own stage names. The process id
 /// is deliberately ignored: PID `0` (pre-assignment) and an assigned PID
 /// (mid-window) are both transient while the state is `START_PENDING`.
@@ -221,7 +223,7 @@ pub const HOST_SCM_TRANSIENT_MAX_INSPECTIONS: usize = 5;
 #[must_use]
 pub fn host_scm_unknown_is_transient_pending(detail: &ServiceInspectionUnknownDetail) -> bool {
     detail.win32_error() == 0
-        && detail.stage() == "query-status"
+        && matches!(detail.stage(), "query-status" | "process-identity")
         && detail.current_state() == Some(HOST_SCM_START_PENDING_STATE)
 }
 

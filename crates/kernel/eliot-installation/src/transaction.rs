@@ -9,15 +9,16 @@ use super::{
     ActivationCommitReceipt, ActiveVerifiedReceiptBinding, CandidateManifest, ContractVersion,
     HostPhaseBMaterializationReceipt, INSTALLATION_SECRET_CREATION_PROOF_VERSION,
     INSTALLATION_TRANSACTION_WIRE_VERSION, InstallationActivationApproval,
-    InstallationActivationProjectionIntent, InstallationEffectPrecondition, InstallationEpoch,
-    InstallationError, InstallationProfile, InstallationServiceBootstrap,
-    InstallationServiceStartProof, InstallationStepOutcome, InstallerEffectPlan,
-    InstallerServiceControlGrantReceipt, InstallerServiceRegistrationApproval,
-    InstallerServiceRole, ManagedEnvironmentChangeRequest, PlannedChange, PlatformHandle,
-    RuntimeStateRoots, StagingReceipt, StoreCredentialLifecycle, StoreCredentialProgress,
-    candidate_manifest_digest, handle, handles, ownership_secret_absence_evidence,
-    phase_b_scm_digest, sha256_handle, sha256_hex, validate_installer_effects,
-    validate_package_binding, validate_phase_b_effect_bindings,
+    InstallationActivationProjectionIntent, InstallationEffectAction,
+    InstallationEffectPrecondition, InstallationEpoch, InstallationError, InstallationProfile,
+    InstallationServiceBootstrap, InstallationServiceStartProof, InstallationStepOutcome,
+    InstallerEffectPlan, InstallerServiceControlGrantReceipt, InstallerServiceRegistrationApproval,
+    InstallerServiceRole, MAX_PENDING_EXTERNAL_CHANGES, ManagedEnvironmentChangeRequest,
+    PlannedChange, PlatformHandle, RuntimeStateRoots, StagingReceipt, StoreCredentialLifecycle,
+    StoreCredentialProgress, WindowsInstallationEffectPort, candidate_manifest_digest,
+    effect_request, handle, handles, is_service_stopped_reference_for_request,
+    ownership_secret_absence_evidence, phase_b_scm_digest, sha256_handle, sha256_hex,
+    validate_installer_effects, validate_package_binding, validate_phase_b_effect_bindings,
     validate_staging_receipt_for_observation, validate_staging_receipt_for_plan,
 };
 /// Store-volume observation used to evaluate the immutable free-space policy.
@@ -345,6 +346,22 @@ pub enum InstallationEffectProgressState {
         evidence: Vec<PlatformHandle>,
         /// Digest of the authoritative postcondition.
         postcondition_digest: PlatformHandle,
+    },
+    /// Authoritative readback proved the exact external postcondition absent.
+    ///
+    /// This is a recovery disposition, not a successful `Applied` effect. It
+    /// preserves the original intent and caller proof while allowing an exact
+    /// bounded rollback owner to continue only with the separately proven
+    /// cleanup work.
+    ReconciledAbsent {
+        /// Original committed attempt number bound to the absence observation.
+        attempt: u32,
+        /// Original committed intent bound to the absence observation.
+        intent_digest: PlatformHandle,
+        /// Provider evidence for the authoritative absence observation.
+        evidence_refs: Vec<PlatformHandle>,
+        /// Digest binding the absence evidence to this effect and request.
+        reconciliation_digest: PlatformHandle,
     },
     /// Authoritative classification was impossible or mismatched.
     Unknown {
@@ -757,6 +774,12 @@ impl InstallationTransaction {
                     .to_owned(),
             ));
         }
+        if !self.pending_external_changes.is_empty() {
+            return Err(InstallationError::IncompleteObservation(
+                "all installer effects applied is not sufficient while external recovery evidence remains pending"
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -805,6 +828,10 @@ impl InstallationTransaction {
         self.require_pre_activation_effects_ready()
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the signed activation contour is validated as one fail-closed boundary"
+    )]
     fn require_pre_activation_effects_at(
         &self,
         expected_stage: InstallationStage,
@@ -814,6 +841,12 @@ impl InstallationTransaction {
             return Err(InstallationError::IncompleteObservation(format!(
                 "signed pending activation requires the {expected_stage:?} transaction boundary"
             )));
+        }
+        if !self.pending_external_changes.is_empty() {
+            return Err(InstallationError::IncompleteObservation(
+                "signed activation cannot cross a boundary with unresolved external recovery evidence"
+                    .to_owned(),
+            ));
         }
 
         let first_start = self
@@ -948,7 +981,8 @@ impl InstallationTransaction {
                     external_identity, ..
                 } => external_identity.clone(),
                 InstallationEffectProgressState::Pending
-                | InstallationEffectProgressState::IntentCommitted { .. } => {
+                | InstallationEffectProgressState::IntentCommitted { .. }
+                | InstallationEffectProgressState::ReconciledAbsent { .. } => {
                     return Err(InstallationError::IncompleteObservation(
                         "service registration effect is pending authoritative readback".to_owned(),
                     ));
@@ -1146,6 +1180,10 @@ impl InstallationTransaction {
             "pending_external_changes",
             false,
         )?;
+        // The v25 wire may contain recovery sets created before the bounded
+        // merge guard was introduced. Preserve those records for exact
+        // reconciliation; the bound is enforced when new references are
+        // merged, rather than invalidating an existing durable record here.
         handles(
             &self.observed_postconditions,
             "observed_postconditions",
@@ -1194,11 +1232,62 @@ impl InstallationTransaction {
                 "active/completed transaction requires postcondition evidence".to_owned(),
             ));
         }
+        if matches!(
+            self.stage,
+            InstallationStage::ActiveVerified | InstallationStage::Completed
+        ) && !self.pending_external_changes.is_empty()
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "active/completed transaction cannot retain unresolved external recovery evidence"
+                    .to_owned(),
+            ));
+        }
         if matches!(self.stage, InstallationStage::RollbackRequired)
             && self.pending_external_changes.is_empty()
         {
+            let has_recoverable_applied_effect = self.effect_progress.iter().any(|progress| {
+                matches!(
+                    progress.state,
+                    InstallationEffectProgressState::Applied {
+                        disposition: InstallationEffectDisposition::CreatedByTransaction,
+                        ..
+                    }
+                )
+            });
+            let has_reconciled_absent = self.effect_progress.iter().any(|progress| {
+                matches!(
+                    progress.state,
+                    InstallationEffectProgressState::ReconciledAbsent { .. }
+                )
+            });
+            let has_unresolved_effect = self.effect_progress.iter().any(|progress| {
+                matches!(
+                    progress.state,
+                    InstallationEffectProgressState::Unknown { .. }
+                        | InstallationEffectProgressState::IntentCommitted { .. }
+                )
+            });
+            if (!has_recoverable_applied_effect && !has_reconciled_absent) || has_unresolved_effect
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "rollback-required transaction must name pending external changes".to_owned(),
+                ));
+            }
+        }
+        if self.stage == InstallationStage::RolledBack
+            && (!self.pending_external_changes.is_empty()
+                || self.effect_progress.iter().any(|progress| {
+                    matches!(
+                        progress.state,
+                        InstallationEffectProgressState::Pending
+                            | InstallationEffectProgressState::Unknown { .. }
+                            | InstallationEffectProgressState::IntentCommitted { .. }
+                    )
+                }))
+        {
             return Err(InstallationError::IncompleteObservation(
-                "rollback-required transaction must name pending external changes".to_owned(),
+                "rolled-back transaction cannot retain unresolved effects or pending recovery evidence"
+                    .to_owned(),
             ));
         }
         if matches!(
@@ -1224,7 +1313,12 @@ impl InstallationTransaction {
             return Err(InstallationError::IdentityConflict);
         }
         let mut unsettled_seen = false;
-        for (effect, progress) in self.installer_effects.iter().zip(&self.effect_progress) {
+        for (index, (effect, progress)) in self
+            .installer_effects
+            .iter()
+            .zip(&self.effect_progress)
+            .enumerate()
+        {
             if progress.effect_id != *effect.effect_id() {
                 return Err(InstallationError::IdentityConflict);
             }
@@ -1350,6 +1444,7 @@ impl InstallationTransaction {
                 &progress.state,
                 InstallationEffectProgressState::IntentCommitted { .. }
                     | InstallationEffectProgressState::Applied { .. }
+                    | InstallationEffectProgressState::ReconciledAbsent { .. }
             ) && matches!(
                 effect,
                 InstallerEffectPlan::RegisterService { .. }
@@ -1394,6 +1489,11 @@ impl InstallationTransaction {
                     InstallerEffectPlan::StartService { .. },
                     InstallationEffectProgressState::Applied { .. },
                     Some(deadline),
+                )
+                | (
+                    InstallerEffectPlan::StartService { .. },
+                    InstallationEffectProgressState::ReconciledAbsent { .. },
+                    Some(deadline),
                 ) if deadline != 0 => {}
                 (InstallerEffectPlan::StartService { .. }, _, Some(0)) => {
                     return Err(InstallationError::InvalidField {
@@ -1427,11 +1527,13 @@ impl InstallationTransaction {
                 }
                 match &progress.state {
                     InstallationEffectProgressState::IntentCommitted { intent_digest, .. }
+                    | InstallationEffectProgressState::ReconciledAbsent { intent_digest, .. }
                         if proof.intent_digest != *intent_digest =>
                     {
                         return Err(InstallationError::IdentityConflict);
                     }
                     InstallationEffectProgressState::IntentCommitted { .. }
+                    | InstallationEffectProgressState::ReconciledAbsent { .. }
                     | InstallationEffectProgressState::Unknown { .. }
                     | InstallationEffectProgressState::Applied {
                         disposition: InstallationEffectDisposition::CreatedByTransaction,
@@ -1662,6 +1764,7 @@ impl InstallationTransaction {
                 (
                     InstallationEffectProgressState::IntentCommitted { .. }
                     | InstallationEffectProgressState::Applied { .. }
+                    | InstallationEffectProgressState::ReconciledAbsent { .. }
                     | InstallationEffectProgressState::Unknown { .. },
                     InstallerEffectPlan::ApplyAcl { .. }
                     | InstallerEffectPlan::RegisterService { .. }
@@ -1762,6 +1865,96 @@ impl InstallationTransaction {
                         });
                     }
                 }
+                InstallationEffectProgressState::ReconciledAbsent {
+                    attempt,
+                    intent_digest,
+                    evidence_refs,
+                    reconciliation_digest,
+                } if !unsettled_seen => {
+                    if self.stage != InstallationStage::RollbackRequired {
+                        return Err(InstallationError::IllegalTransition {
+                            from: self.stage,
+                            to: InstallationStage::RollbackRequired,
+                        });
+                    }
+                    if !matches!(effect, InstallerEffectPlan::StartService { .. }) {
+                        return Err(InstallationError::IdentityConflict);
+                    }
+                    if *attempt == 0 {
+                        return Err(InstallationError::InvalidField {
+                            field: "effect_progress.reconciled_absent.attempt".to_owned(),
+                            reason: "must be non-zero".to_owned(),
+                        });
+                    }
+                    sha256_handle(intent_digest, "effect_progress.intent_digest")?;
+                    handles(
+                        evidence_refs,
+                        "effect_progress.reconciled_absent.evidence_refs",
+                        true,
+                    )?;
+                    sha256_handle(
+                        reconciliation_digest,
+                        "effect_progress.reconciled_absent.reconciliation_digest",
+                    )?;
+                    let Some(proof) = progress.service_start_proof.as_ref() else {
+                        return Err(InstallationError::IncompleteObservation(
+                            "reconciled service absence requires the original caller-start proof"
+                                .to_owned(),
+                        ));
+                    };
+                    if proof.intent_digest != *intent_digest {
+                        return Err(InstallationError::IdentityConflict);
+                    }
+                    let request = effect_request(
+                        self,
+                        index,
+                        *attempt,
+                        InstallationEffectAction::Apply,
+                        None,
+                    )?;
+                    if request.intent_digest()?.as_str() != intent_digest.as_str() {
+                        return Err(InstallationError::IdentityConflict);
+                    }
+                    if progress
+                        .admitted_precondition
+                        .as_ref()
+                        .is_none_or(|precondition| precondition.os_snapshot.is_none())
+                    {
+                        return Err(InstallationError::IncompleteObservation(
+                            "reconciled service absence requires the originally admitted OS snapshot"
+                                .to_owned(),
+                        ));
+                    }
+                    if evidence_refs.is_empty()
+                        || !evidence_refs.iter().all(|reference| {
+                            is_service_stopped_reference_for_request(reference.as_str(), &request)
+                        })
+                    {
+                        return Err(InstallationError::InvalidField {
+                            field: "effect_progress.reconciled_absent.evidence_refs".to_owned(),
+                            reason:
+                                "must contain only exact request-bound stopped readback evidence"
+                                    .to_owned(),
+                        });
+                    }
+                    let expected_reconciliation =
+                        WindowsInstallationEffectPort::service_start_reconciled_absent_digest(
+                            &self.transaction_id,
+                            &request.effect_id,
+                            &self.installer_plan_digest,
+                            intent_digest,
+                            request.registration_nonce.as_ref(),
+                            *attempt,
+                            evidence_refs,
+                        )?;
+                    if expected_reconciliation != *reconciliation_digest {
+                        return Err(InstallationError::IdentityConflict);
+                    }
+                    // This recovery disposition is terminal for the ordered
+                    // apply contour: later effects remain pending for bounded
+                    // rollback and cannot be reported as applied afterward.
+                    unsettled_seen = true;
+                }
                 InstallationEffectProgressState::Pending => unsettled_seen = true,
                 InstallationEffectProgressState::IntentCommitted {
                     attempt,
@@ -1781,6 +1974,7 @@ impl InstallationTransaction {
                     unsettled_seen = true;
                 }
                 InstallationEffectProgressState::Applied { .. }
+                | InstallationEffectProgressState::ReconciledAbsent { .. }
                 | InstallationEffectProgressState::IntentCommitted { .. }
                 | InstallationEffectProgressState::Unknown { .. } => {
                     return Err(InstallationError::InvalidField {
@@ -1893,9 +2087,9 @@ impl InstallationTransaction {
                 })
             }
             StoreFreeSpaceObservation::Unknown { evidence_refs } => {
-                self.mark_unknown(evidence_refs.clone())?;
+                self.mark_unknown(evidence_refs)?;
                 Ok(InstallationStepOutcome::RollbackRequired {
-                    pending_refs: evidence_refs,
+                    pending_refs: self.pending_external_changes.clone(),
                 })
             }
         }
@@ -2019,8 +2213,7 @@ impl InstallationTransaction {
         // credential or Phase-B receipt is available to roll back here.
         self.require_signed_pending_activation_effects()?;
         handle(&abort_evidence, "activation_projection.abort_evidence")?;
-        self.completed_stage_refs.push(abort_evidence.clone());
-        self.pending_external_changes = vec![abort_evidence];
+        self.completed_stage_refs.push(abort_evidence);
         self.activation_projection_intent = None;
         self.stage = InstallationStage::RollbackRequired;
         self.revision =
@@ -2045,7 +2238,7 @@ impl InstallationTransaction {
             });
         }
         handle(&pending_ref, "activation_projection.pending_ref")?;
-        self.pending_external_changes = vec![pending_ref];
+        self.merge_pending_references(vec![pending_ref])?;
         self.stage = InstallationStage::Quarantined;
         self.revision =
             self.revision
@@ -2077,9 +2270,12 @@ impl InstallationTransaction {
         if self.active_verified_receipt.is_some() {
             return Err(InstallationError::IdentityConflict);
         }
-        self.completed_stage_refs.extend(evidence);
-        self.observed_postconditions
-            .extend(self.completed_stage_refs.clone());
+        self.completed_stage_refs.extend(evidence.clone());
+        // Only the exact readback evidence admitted at this boundary is an
+        // observed postcondition.  Older recovery samples may be retained in
+        // completed_stage_refs for audit/reconciliation, but must never be
+        // promoted into the authoritative postcondition set.
+        self.observed_postconditions.extend(evidence);
         self.active_verified_receipt = Some(receipt.binding());
         self.stage = InstallationStage::ActiveVerified;
         self.revision =
@@ -2090,6 +2286,30 @@ impl InstallationTransaction {
                     reason: "overflow".to_owned(),
                 })?;
         self.validate()
+    }
+
+    pub(super) fn merge_pending_references(
+        &mut self,
+        pending: Vec<PlatformHandle>,
+    ) -> Result<(), InstallationError> {
+        let mut next = self.pending_external_changes.clone();
+        for reference in pending {
+            if next.contains(&reference) {
+                continue;
+            }
+            // Pending evidence is an append-only preservation set until the
+            // exact owner proves a resolution.  A second sample for the same
+            // request is not permission to evict the first sample: replacing
+            // it would turn unresolved external state into a completed fact.
+            if next.len() >= MAX_PENDING_EXTERNAL_CHANGES {
+                return Err(InstallationError::IncompleteObservation(
+                    "pending external-change reference bound reached".to_owned(),
+                ));
+            }
+            next.push(reference);
+        }
+        self.pending_external_changes = next;
+        Ok(())
     }
 
     /// Records an external effect whose outcome cannot yet be classified.
@@ -2113,16 +2333,22 @@ impl InstallationTransaction {
                 to: InstallationStage::RollbackRequired,
             });
         }
-        self.pending_external_changes = pending;
-        self.stage = InstallationStage::RollbackRequired;
-        self.revision =
-            self.revision
+        // Build the complete transition off to the side.  A failed merge or
+        // validation must not leave the caller's transaction partially
+        // mutated with a new stage and a partially displaced evidence set.
+        let mut next = self.clone();
+        next.merge_pending_references(pending)?;
+        next.stage = InstallationStage::RollbackRequired;
+        next.revision =
+            next.revision
                 .checked_add(1)
                 .ok_or_else(|| InstallationError::InvalidField {
                     field: "revision".to_owned(),
                     reason: "overflow".to_owned(),
                 })?;
-        self.validate()
+        next.validate()?;
+        *self = next;
+        Ok(())
     }
 
     /// Records a no-return activation boundary after explicit observation.
@@ -2215,9 +2441,9 @@ impl InstallationTransactionWire {
 }
 
 /// Validates the canonical transaction JSON without exposing a deserialized
-/// transaction authority object to another crate. Pre-v24 records are
-/// classified as an explicit migration requirement rather than synthesizing
-/// missing progress.
+/// transaction authority object to another crate. A v24 record is accepted only
+/// through the explicit discriminator migration helper; all effect progress and
+/// evidence fields are then validated under the current invariants.
 pub fn validate_installation_transaction_json(bytes: &[u8]) -> Result<(), InstallationError> {
     decode_installation_transaction_json_with_policy(bytes, false).map(|_| ())
 }
@@ -2245,6 +2471,10 @@ pub(super) fn decode_installation_transaction_json_from_store(
     decode_installation_transaction_json_with_policy(bytes, true)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "wire-shape validation keeps every mandatory progress member in one fail-closed audit"
+)]
 fn validate_current_transaction_progress(
     value: &serde_json::Value,
 ) -> Result<(), InstallationError> {
@@ -2275,6 +2505,22 @@ fn validate_current_transaction_progress(
                         "installation transaction effect progress entry {index} is missing mandatory {label} member"
                     ),
                 });
+            }
+        }
+        if progress.get("state").and_then(serde_json::Value::as_str) == Some("RECONCILED_ABSENT") {
+            for (field, label) in [
+                ("attempt", "reconciled-absence attempt"),
+                ("intent_digest", "reconciled-absence intent digest"),
+                ("evidence_refs", "reconciled-absence evidence"),
+                ("reconciliation_digest", "reconciled-absence digest"),
+            ] {
+                if !progress.contains_key(field) {
+                    return Err(InstallationError::CorruptRegistry {
+                        reason: format!(
+                            "installation transaction effect progress entry {index} is missing mandatory {label}"
+                        ),
+                    });
+                }
             }
         }
         if let Some(grant) = progress
@@ -2326,7 +2572,7 @@ fn validate_current_transaction_progress(
                 if !object.contains_key(field) {
                     return Err(InstallationError::MigrationRequired {
                         reason: format!(
-                            "installation transaction effect progress entry {index} is missing mandatory {label}; explicit migration to v24 is required"
+                            "installation transaction effect progress entry {index} is missing mandatory {label}; explicit migration to v25 is required"
                         ),
                     });
                 }
@@ -2355,17 +2601,19 @@ fn validate_current_transaction_progress(
     Ok(())
 }
 
-fn decode_installation_transaction_json_with_policy(
-    bytes: &[u8],
-    allow_advanced_state: bool,
-) -> Result<InstallationTransaction, InstallationError> {
-    let value: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
-            reason: error.to_string(),
-        })?;
+const LEGACY_INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion =
+    ContractVersion::new(24, 0, 0);
+
+/// Migrates the single v24 transaction discriminator in-place to the current
+/// v25 projection. The v24 shape already carried every member required by the
+/// `ReconciledAbsent` recovery state; this migration changes no effect state,
+/// evidence, or owner binding. A later store CAS writes the upgraded shape.
+pub(crate) fn migrate_installation_transaction_wire_value(
+    value: &mut serde_json::Value,
+) -> Result<(), InstallationError> {
     let version = value.get("transaction_wire_version").ok_or_else(|| {
         InstallationError::MigrationRequired {
-            reason: "installation transaction predates the required v24 discriminator".to_owned(),
+            reason: "installation transaction predates the required v25 discriminator".to_owned(),
         }
     })?;
     let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
@@ -2373,13 +2621,39 @@ fn decode_installation_transaction_json_with_policy(
             reason: "installation transaction has an unsupported wire discriminator".to_owned(),
         }
     })?;
-    if version != INSTALLATION_TRANSACTION_WIRE_VERSION {
+    if version == INSTALLATION_TRANSACTION_WIRE_VERSION {
+        return Ok(());
+    }
+    if version != LEGACY_INSTALLATION_TRANSACTION_WIRE_VERSION {
         return Err(InstallationError::MigrationRequired {
             reason: format!(
                 "installation transaction wire {version} requires explicit migration to {INSTALLATION_TRANSACTION_WIRE_VERSION}"
             ),
         });
     }
+    let current = serde_json::to_value(INSTALLATION_TRANSACTION_WIRE_VERSION).map_err(|error| {
+        InstallationError::CorruptRegistry {
+            reason: error.to_string(),
+        }
+    })?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| InstallationError::CorruptRegistry {
+            reason: "installation transaction is not a JSON object".to_owned(),
+        })?;
+    object.insert("transaction_wire_version".to_owned(), current);
+    Ok(())
+}
+
+fn decode_installation_transaction_json_with_policy(
+    bytes: &[u8],
+    allow_advanced_state: bool,
+) -> Result<InstallationTransaction, InstallationError> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
+            reason: error.to_string(),
+        })?;
+    migrate_installation_transaction_wire_value(&mut value)?;
     if !value
         .as_object()
         .is_some_and(|object| object.contains_key("activation_projection_intent"))

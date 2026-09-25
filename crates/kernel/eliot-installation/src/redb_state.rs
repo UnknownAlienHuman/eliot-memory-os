@@ -25,7 +25,7 @@ use super::{
     ActivationCommitReceipt, GenerationPackagePlanner, INSTALLATION_TRANSACTION_WIRE_VERSION,
     InstallationError, InstallationStage, InstallationStepOutcome, InstallationTransaction,
     InstallationTransactionStore, InstallerEffectPlan, PackageArtifactDigest,
-    decode_installation_transaction_json_from_store,
+    decode_installation_transaction_json_from_store, migrate_installation_transaction_wire_value,
     transaction_store_private::{self, TransactionVersion},
 };
 use eliot_contracts::ContractVersion;
@@ -2636,7 +2636,7 @@ fn encode(transaction: &InstallationTransaction) -> Result<Vec<u8>, Installation
 }
 
 fn decode(bytes: &[u8]) -> Result<InstallationTransaction, InstallationError> {
-    let value: serde_json::Value =
+    let mut value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
             reason: error.to_string(),
         })?;
@@ -2653,11 +2653,28 @@ fn decode(bytes: &[u8]) -> Result<InstallationTransaction, InstallationError> {
         }
     })?;
     if version != INSTALLATION_TRANSACTION_WIRE_VERSION {
-        return Err(InstallationError::MigrationRequired {
-            reason: format!(
-                "transaction envelope wire {version} requires explicit migration to {INSTALLATION_TRANSACTION_WIRE_VERSION}"
-            ),
-        });
+        let legacy = ContractVersion::new(24, 0, 0);
+        if version != legacy {
+            return Err(InstallationError::MigrationRequired {
+                reason: format!(
+                    "transaction envelope wire {version} requires explicit migration to {INSTALLATION_TRANSACTION_WIRE_VERSION}"
+                ),
+            });
+        }
+        let current =
+            serde_json::to_value(INSTALLATION_TRANSACTION_WIRE_VERSION).map_err(|error| {
+                InstallationError::CorruptRegistry {
+                    reason: error.to_string(),
+                }
+            })?;
+        value["wire_version"] = current;
+        let transaction_value =
+            value
+                .get_mut("transaction")
+                .ok_or_else(|| InstallationError::CorruptRegistry {
+                    reason: "transaction envelope is missing its transaction payload".to_owned(),
+                })?;
+        migrate_installation_transaction_wire_value(transaction_value)?;
     }
     let envelope: DecodedTransactionEnvelope =
         serde_json::from_value(value).map_err(|error| InstallationError::CorruptRegistry {

@@ -43,15 +43,15 @@ use eliot_platform_windows::{
     InstallerRootPrimitiveCreate, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
     InstallerRootProfile, InstallerRootStage, InstallerSecretCreateDisposition,
     InstallerSecretObservation, ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease,
-    ServiceAbsentProof, ServiceAccount, ServiceBootstrapArguments, ServiceRegistrationCurrent,
-    ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
-    ServiceRegistrationRuntimeReadback, ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome,
-    StagingReceipt, SupervisionAuthorityKeyError, SupervisionAuthorityKeyStoreRequest,
-    UserOwnedPathLease, WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider,
-    WindowsPlatform, WindowsStoreCredentialTargetGenerator, WindowsSupervisionAuthorityKeyStore,
-    current_user_local_app_data_root, fresh_service_registration_nonce,
-    observe_running_eliot_host_process, protected_program_data_root,
-    require_protected_program_data_path, resolve_service_sid,
+    ServiceAbsentProof, ServiceAccount, ServiceBootstrapArguments, ServiceInspectionUnknownDetail,
+    ServiceRegistrationCurrent, ServiceRegistrationOutcome, ServiceRegistrationRequest,
+    ServiceRegistrationRuntimeInspection, ServiceRegistrationRuntimeReadback, ServiceStartMode,
+    ServiceStartOutcome, ServiceStopOutcome, StagingReceipt, SupervisionAuthorityKeyError,
+    SupervisionAuthorityKeyStoreRequest, UserOwnedPathLease, WindowsInstallerRootPrimitive,
+    WindowsInstallerSecretProvider, WindowsPlatform, WindowsStoreCredentialTargetGenerator,
+    WindowsSupervisionAuthorityKeyStore, current_user_local_app_data_root,
+    fresh_service_registration_nonce, observe_running_eliot_host_process,
+    protected_program_data_root, require_protected_program_data_path, resolve_service_sid,
 };
 #[cfg(test)]
 use eliot_platform_windows::{
@@ -223,6 +223,7 @@ pub use scm_approval::{InstallerServiceControlGrantReceipt, InstallerServiceRegi
 #[cfg(test)]
 use transaction::decode_installation_transaction_json;
 use transaction::decode_installation_transaction_json_from_store;
+use transaction::migrate_installation_transaction_wire_value;
 pub use transaction::{
     InstallationCreateDisposition, InstallationEffectDisposition, InstallationEffectProgress,
     InstallationEffectProgressState, InstallationOsObjectSnapshot, InstallationOwnershipSecret,
@@ -303,9 +304,11 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(5, 0, 0);
 /// adds the optional, digest-bound agent-bridge source materialization plan.
 /// Version 24 binds the SCM grant OWNER|GROUP proof from the same live handle
 /// into the durable registration receipt and its canonical marker digest.
-/// Older wires cannot be interpreted as this effect set.
-/// Older wires require explicit migration and are never synthesized.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(24, 0, 0);
+/// Version 25 adds the request-bound `RECONCILED_ABSENT` `StartService`
+/// recovery state. A v24 record is upgraded only through the explicit
+/// discriminator migration in the transaction decoder; older wires are never
+/// synthesized.
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(25, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
@@ -4537,8 +4540,8 @@ impl WindowsInstallationEffectPort {
                 }
             }
             ServiceRegistrationRuntimeReadback::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationRuntimeReadback::Unknown { .. } => {
-                Ok(root_mismatch("service-readback"))
+            ServiceRegistrationRuntimeReadback::Unknown { detail } => {
+                Err(service_registration_unknown_port_error(request, detail)?)
             }
         }
     }
@@ -4580,43 +4583,17 @@ impl WindowsInstallationEffectPort {
                 {
                     return Ok(root_mismatch("service-config"));
                 }
-                let marker = if let Some(marker) = service_marker_read(
+                let Some((_, marker)) = service_marker_read(
                     &self.primitive,
                     &spec,
                     request,
                     &service_name,
                     &digest,
                     control_grant.as_ref(),
-                )? {
-                    marker
-                } else {
-                    let marker = WindowsServiceOwnershipMarker::new(
-                        request,
-                        &service_name,
-                        &digest,
-                        control_grant.as_ref(),
-                    )?;
-                    let marker_path = service_marker_path(request);
-                    match self
-                        .primitive
-                        .create_protected_file(&spec, &marker_path, |_| {
-                            serde_json::to_vec(&marker)
-                                .map_err(|_| InstallerRootError::Indeterminate)
-                        }) {
-                        Ok(_) | Err(InstallerRootError::ReceiptMismatch) => {}
-                        Err(error) => return Err(root_port_error(error)),
-                    }
-                    service_marker_read(
-                        &self.primitive,
-                        &spec,
-                        request,
-                        &service_name,
-                        &digest,
-                        control_grant.as_ref(),
-                    )?
-                    .ok_or(PortError::InvalidRequestMetadata)?
+                )?
+                else {
+                    return Ok(root_mismatch("service-marker-missing"));
                 };
-                let (_, marker) = marker;
                 let marker_digest = marker.digest()?;
                 service_matching_observation(
                     request,
@@ -4627,8 +4604,8 @@ impl WindowsInstallationEffectPort {
                 )
             }
             ServiceRegistrationRuntimeReadback::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationRuntimeReadback::Unknown { .. } => {
-                Ok(root_mismatch("service-readback"))
+            ServiceRegistrationRuntimeReadback::Unknown { detail } => {
+                Err(service_registration_unknown_port_error(request, detail)?)
             }
         }
     }
@@ -4706,12 +4683,64 @@ impl WindowsInstallationEffectPort {
         reason: &str,
         service_runtime_lineage: Option<InstallationServiceProcessLineage>,
     ) -> Result<InstallationEffectObservation, PortError> {
-        let evidence = PlatformHandle::new(format!("{reason}:{}", registration.service_name()))
-            .map_err(|_| PortError::InvalidRequestMetadata)?;
+        let evidence = if reason == "service-starting" {
+            service_starting_reference(request)?
+        } else if reason == "service-stopped" {
+            service_stopped_reference(request)?
+        } else {
+            PlatformHandle::new(format!("{reason}:{}", registration.service_name()))
+                .map_err(|_| PortError::InvalidRequestMetadata)?
+        };
         Ok(InstallationEffectObservation::Absent {
             observed_precondition: request.precondition.clone(),
             evidence: vec![evidence],
             service_runtime_lineage,
+        })
+    }
+
+    /// Computes the stable binding for one rollback-only `StartService`
+    /// absence observation.  The digest intentionally excludes the mutable
+    /// transaction revision: the state transition increments that revision
+    /// after constructing the receipt, while this binding must remain
+    /// replay-verifiable from the durable record itself.
+    pub(crate) fn service_start_reconciled_absent_digest(
+        transaction_id: &PlatformHandle,
+        effect_id: &PlatformHandle,
+        plan_digest: &PlatformHandle,
+        intent_digest: &PlatformHandle,
+        registration_nonce: Option<&PlatformHandle>,
+        attempt: u32,
+        evidence_refs: &[PlatformHandle],
+    ) -> Result<PlatformHandle, InstallationError> {
+        if evidence_refs.is_empty() {
+            return Err(InstallationError::IncompleteObservation(
+                "reconciled service absence requires evidence".to_owned(),
+            ));
+        }
+        let evidence_digest = sha256_hex(
+            evidence_refs
+                .iter()
+                .map(PlatformHandle::as_str)
+                .collect::<Vec<_>>()
+                .join("\0")
+                .as_bytes(),
+        );
+        PlatformHandle::new(sha256_hex(
+            format!(
+                "service-start-reconciled-absent-v3\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                transaction_id.as_str(),
+                effect_id.as_str(),
+                plan_digest.as_str(),
+                intent_digest.as_str(),
+                attempt,
+                registration_nonce.map_or("", PlatformHandle::as_str),
+                evidence_digest,
+            )
+            .as_bytes(),
+        ))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "effect_progress.reconciled_absent.reconciliation_digest".to_owned(),
+            reason: error.to_string(),
         })
     }
 
@@ -4800,13 +4829,89 @@ impl WindowsInstallationEffectPort {
                 return Ok(root_mismatch("service-root-readback"));
             }
         };
-        Self::service_start_absent_with_snapshot(
+        let observation = Self::service_start_absent_with_snapshot(
             request,
             registration,
             reason,
             service_runtime_lineage,
             snapshot,
-        )
+        )?;
+        // The observed snapshot is allowed to enrich the precondition, but
+        // the recovery reference must remain bound to the original committed
+        // operation request. Otherwise a Stopped readback would look like a
+        // different effect and could never become ReconciledAbsent.
+        match observation {
+            InstallationEffectObservation::Absent {
+                observed_precondition,
+                service_runtime_lineage,
+                ..
+            } if matches!(reason, "service-starting" | "service-stopped") => {
+                Ok(InstallationEffectObservation::Absent {
+                    observed_precondition,
+                    evidence: vec![if reason == "service-starting" {
+                        service_starting_reference(request)?
+                    } else {
+                        service_stopped_reference(request)?
+                    }],
+                    service_runtime_lineage,
+                })
+            }
+            observation => Ok(observation),
+        }
+    }
+
+    fn service_start_pending_unknown_observation(
+        &self,
+        request: &InstallationEffectRequest,
+        registration: &ServiceRegistrationRequest,
+        detail: ServiceInspectionUnknownDetail,
+        spec: &InstallerRootPrimitiveSpec,
+    ) -> Result<InstallationEffectObservation, PortError> {
+        if request.action != InstallationEffectAction::Apply {
+            return Err(PortError::InvalidRequestMetadata);
+        }
+        // PID-zero START_PENDING is an observed transition, not proof that the
+        // service is absent and not permission to issue another start. Return a
+        // durable, request-bound wait observation so the coordinator can apply
+        // its existing deadline and caller-issued-proof gates.
+        let reference = service_runtime_unknown_reference(request, detail)?;
+        let observed_precondition = if request.precondition.os_snapshot.is_some() {
+            request.precondition.clone()
+        } else {
+            let snapshot = match self.primitive.inspect(spec).map_err(root_port_error)? {
+                InstallerRootPrimitiveObservation::Absent(snapshot) => snapshot,
+                InstallerRootPrimitiveObservation::Matching(root) => InstallerRootAbsentSnapshot {
+                    target_path_digest: sha256_hex(
+                        format!(
+                            "service-start-pending-target-v2\0{}\0{}\0{:08x}\0{:08x}",
+                            registration.service_name(),
+                            registration.expected_configuration_digest(),
+                            detail.current_state().unwrap_or_default(),
+                            detail.process_id().unwrap_or_default(),
+                        )
+                        .as_bytes(),
+                    ),
+                    profile_anchor: root.clone(),
+                    ancestors: vec![root.clone()],
+                    parent: root,
+                    root_absent: true,
+                },
+                InstallerRootPrimitiveObservation::Mismatch => {
+                    return Ok(root_mismatch("service-root-readback"));
+                }
+            };
+            let snapshot = installation_absent_snapshot(snapshot)
+                .map_err(|_| PortError::InvalidRequestMetadata)?;
+            request
+                .precondition
+                .with_os_snapshot(snapshot)
+                .map_err(|_| PortError::InvalidRequestMetadata)?
+        };
+        Ok(InstallationEffectObservation::Absent {
+            observed_precondition,
+            evidence: vec![reference],
+            service_runtime_lineage: None,
+        })
     }
 
     fn service_runtime_identity_evidence(
@@ -4863,8 +4968,8 @@ impl WindowsInstallationEffectPort {
             }
             ServiceRegistrationRuntimeInspection::Absent => Ok(root_mismatch("service-missing")),
             ServiceRegistrationRuntimeInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationRuntimeInspection::Unknown { .. } => {
-                Ok(root_mismatch("service-readback"))
+            ServiceRegistrationRuntimeInspection::Unknown { detail } => {
+                Err(service_runtime_unknown_port_error(request, detail)?)
             }
         }
     }
@@ -4911,8 +5016,7 @@ impl WindowsInstallationEffectPort {
                 )
             }
             ServiceRegistrationRuntimeInspection::Matching { observation }
-                if observation.is_stopped()
-                    && request.action == InstallationEffectAction::Rollback =>
+                if observation.is_stopped() =>
             {
                 self.service_start_absent_from_live_inspection(
                     request,
@@ -4928,8 +5032,22 @@ impl WindowsInstallationEffectPort {
             }
             ServiceRegistrationRuntimeInspection::Absent => Ok(root_mismatch("service-missing")),
             ServiceRegistrationRuntimeInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationRuntimeInspection::Unknown { .. } => {
-                Ok(root_mismatch("service-readback"))
+            ServiceRegistrationRuntimeInspection::Unknown { detail }
+                if request.action == InstallationEffectAction::Apply
+                    && matches!(detail.stage(), "query-status" | "process-identity")
+                    && detail.win32_error() == 0
+                    && detail.current_state() == Some(2)
+                    && detail.process_id() == Some(0) =>
+            {
+                self.service_start_pending_unknown_observation(
+                    request,
+                    &registration,
+                    detail,
+                    &spec,
+                )
+            }
+            ServiceRegistrationRuntimeInspection::Unknown { detail } => {
+                Err(service_runtime_unknown_port_error(request, detail)?)
             }
         }
     }
@@ -4950,6 +5068,29 @@ impl WindowsInstallationEffectPort {
             .process()
             .map(InstallationServiceProcessLineage::from_provider)
             .transpose()
+    }
+
+    fn service_start_terminal_execution(
+        request: &InstallationEffectRequest,
+        classification: &str,
+    ) -> PortOutcome<InstallationEffectExecution> {
+        let evidence = match service_terminal_reference(
+            request,
+            SERVICE_RUNTIME_TERMINAL_REFERENCE_PREFIX,
+            classification,
+        ) {
+            Ok(evidence) => evidence,
+            Err(error) => return PortOutcome::Error(error),
+        };
+        PortOutcome::Known(InstallationEffectExecution {
+            evidence: vec![evidence],
+            create_disposition: None,
+            credential_receipt: None,
+            staging_receipt: None,
+            phase_b_receipt: None,
+            service_start_disposition: None,
+            service_runtime_lineage: None,
+        })
     }
 
     #[allow(
@@ -5024,18 +5165,67 @@ impl WindowsInstallationEffectPort {
                 ServiceRegistrationRuntimeInspection::Matching { observation }
                     if !observation.is_stopped() =>
                 {
-                    return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                    return service_runtime_uncertain(
+                        request,
+                        ProviderError {
+                            code: ProviderErrorCode::Failed,
+                            retryable: false,
+                        },
+                    );
+                }
+                ServiceRegistrationRuntimeInspection::Unknown { detail } => {
+                    return PortOutcome::Error(
+                        service_runtime_unknown_port_error(request, detail)
+                            .unwrap_or(PortError::InvalidRequestMetadata),
+                    );
+                }
+                ServiceRegistrationRuntimeInspection::Absent => {
+                    return Self::service_start_terminal_execution(request, "absent");
+                }
+                ServiceRegistrationRuntimeInspection::Mismatched => {
+                    return Self::service_start_terminal_execution(request, "mismatch");
                 }
                 ServiceRegistrationRuntimeInspection::Matching { .. } => {}
-                _ => return PortOutcome::Unknown(UnknownReason::Indeterminate),
             }
-            return match platform.start_service_registration(&registration) {
-                Ok(ServiceStartOutcome::Started { observation }) => {
-                    if observation.is_starting() {
-                        return PortOutcome::Known(InstallationEffectExecution {
+            return match platform.start_service_registration_with_call_outcome(&registration) {
+                Ok(call) => match call.disposition {
+                    ServiceStartOutcome::Started { observation } => {
+                        if observation.is_starting() {
+                            return PortOutcome::Known(InstallationEffectExecution {
+                                evidence: vec![
+                                    PlatformHandle::new("service-start-ack-starting")
+                                        .unwrap_or_else(|_| unreachable!()),
+                                ],
+                                create_disposition: None,
+                                credential_receipt: None,
+                                staging_receipt: None,
+                                phase_b_receipt: None,
+                                service_start_disposition: Some(
+                                    InstallationServiceStartDisposition::StartedByCaller,
+                                ),
+                                service_runtime_lineage:
+                                    match Self::service_process_lineage_if_available(&observation) {
+                                        Ok(lineage) => lineage,
+                                        Err(error) => return PortOutcome::Error(error),
+                                    },
+                            });
+                        }
+                        let identity = match Self::service_runtime_identity_evidence(
+                            &registration,
+                            &observation,
+                        ) {
+                            Ok(identity) => identity,
+                            Err(error) => return PortOutcome::Error(error),
+                        };
+                        let evidence = if observation.is_running() {
+                            "service-start-ack-running"
+                        } else {
+                            "service-start-ack-starting"
+                        };
+                        PortOutcome::Known(InstallationEffectExecution {
                             evidence: vec![
-                                PlatformHandle::new("service-start-ack-starting")
-                                    .unwrap_or_else(|_| unreachable!()),
+                                PlatformHandle::new(evidence).unwrap_or_else(|_| unreachable!()),
+                                identity,
                             ],
                             create_disposition: None,
                             credential_receipt: None,
@@ -5044,112 +5234,152 @@ impl WindowsInstallationEffectPort {
                             service_start_disposition: Some(
                                 InstallationServiceStartDisposition::StartedByCaller,
                             ),
-                            service_runtime_lineage:
-                                match Self::service_process_lineage_if_available(&observation) {
+                            service_runtime_lineage: if observation.is_running() {
+                                Some(match Self::service_process_lineage(&observation) {
+                                    Ok(lineage) => lineage,
+                                    Err(error) => return PortOutcome::Error(error),
+                                })
+                            } else {
+                                None
+                            },
+                        })
+                    }
+                    ServiceStartOutcome::AlreadyRunning { observation } => {
+                        let identity = match Self::service_runtime_identity_evidence(
+                            &registration,
+                            &observation,
+                        ) {
+                            Ok(identity) => identity,
+                            Err(error) => return PortOutcome::Error(error),
+                        };
+                        PortOutcome::Known(InstallationEffectExecution {
+                            evidence: vec![
+                                PlatformHandle::new("service-start-race-running")
+                                    .unwrap_or_else(|_| unreachable!()),
+                                identity,
+                            ],
+                            create_disposition: None,
+                            credential_receipt: None,
+                            staging_receipt: None,
+                            phase_b_receipt: None,
+                            service_start_disposition: Some(
+                                InstallationServiceStartDisposition::AlreadyRunning,
+                            ),
+                            service_runtime_lineage: Some(
+                                match Self::service_process_lineage(&observation) {
                                     Ok(lineage) => lineage,
                                     Err(error) => return PortOutcome::Error(error),
                                 },
-                        });
+                            ),
+                        })
                     }
-                    let identity = match Self::service_runtime_identity_evidence(
-                        &registration,
-                        &observation,
-                    ) {
-                        Ok(identity) => identity,
-                        Err(error) => return PortOutcome::Error(error),
-                    };
-                    let evidence = if observation.is_running() {
-                        "service-start-ack-running"
-                    } else {
-                        "service-start-ack-starting"
-                    };
-                    PortOutcome::Known(InstallationEffectExecution {
-                        evidence: vec![
-                            PlatformHandle::new(evidence).unwrap_or_else(|_| unreachable!()),
-                            identity,
-                        ],
-                        create_disposition: None,
-                        credential_receipt: None,
-                        staging_receipt: None,
-                        phase_b_receipt: None,
-                        service_start_disposition: Some(
-                            InstallationServiceStartDisposition::StartedByCaller,
-                        ),
-                        service_runtime_lineage: if observation.is_running() {
-                            Some(match Self::service_process_lineage(&observation) {
-                                Ok(lineage) => lineage,
-                                Err(error) => return PortOutcome::Error(error),
-                            })
-                        } else {
-                            None
-                        },
-                    })
-                }
-                Ok(ServiceStartOutcome::AlreadyRunning { observation }) => {
-                    let identity = match Self::service_runtime_identity_evidence(
-                        &registration,
-                        &observation,
-                    ) {
-                        Ok(identity) => identity,
-                        Err(error) => return PortOutcome::Error(error),
-                    };
-                    PortOutcome::Known(InstallationEffectExecution {
-                        evidence: vec![
-                            PlatformHandle::new("service-start-race-running")
-                                .unwrap_or_else(|_| unreachable!()),
-                            identity,
-                        ],
-                        create_disposition: None,
-                        credential_receipt: None,
-                        staging_receipt: None,
-                        phase_b_receipt: None,
-                        service_start_disposition: Some(
-                            InstallationServiceStartDisposition::AlreadyRunning,
-                        ),
-                        service_runtime_lineage: Some(
-                            match Self::service_process_lineage(&observation) {
-                                Ok(lineage) => lineage,
+                    ServiceStartOutcome::AlreadyStarting { .. } => {
+                        // A concurrent actor won the stopped->starting race and
+                        // this request issued no StartServiceW. Preserve the
+                        // typed provider disposition so the coordinator can
+                        // durably classify the foreign start as Unknown instead
+                        // of treating a generic provider response as a lost call.
+                        PortOutcome::Known(InstallationEffectExecution {
+                            evidence: vec![
+                                PlatformHandle::new("service-start-already-starting")
+                                    .unwrap_or_else(|_| unreachable!()),
+                            ],
+                            create_disposition: None,
+                            credential_receipt: None,
+                            staging_receipt: None,
+                            phase_b_receipt: None,
+                            service_start_disposition: Some(
+                                InstallationServiceStartDisposition::AlreadyStarting,
+                            ),
+                            service_runtime_lineage: None,
+                        })
+                    }
+                    ServiceStartOutcome::EffectUnknown if call.call_issued => {
+                        // A caller-issued call with an authoritative post-call
+                        // absence/mismatch/stopped observation is not a
+                        // terminal success. Preserve the call proof and the
+                        // exact post-call evidence; the coordinator routes it
+                        // through the request-bound recovery contour, which may
+                        // later prove `ReconciledAbsent` without a blind retry.
+                        // The provider reached StartServiceW, but its bounded
+                        // post-call readback was indeterminate.  Persist both
+                        // facts: the caller-issued proof is installed first by
+                        // the coordinator, then this exact typed reference (or
+                        // its request-bound redaction) becomes pending.  A later
+                        // Running readback still cannot be adopted until a
+                        // non-zero intent-bound lineage has been captured.
+                        let pending = match call.unknown_detail {
+                            Some(detail) => {
+                                match service_runtime_unknown_reference(request, detail) {
+                                    Ok(reference) => reference,
+                                    Err(PortError::InvalidRequestMetadata) => {
+                                        match service_runtime_redacted_reference(request) {
+                                            Ok(reference) => reference,
+                                            Err(error) => return PortOutcome::Error(error),
+                                        }
+                                    }
+                                    Err(error) => return PortOutcome::Error(error),
+                                }
+                            }
+                            None => match service_runtime_redacted_reference(request) {
+                                Ok(reference) => reference,
                                 Err(error) => return PortOutcome::Error(error),
                             },
-                        ),
-                    })
-                }
-                Ok(ServiceStartOutcome::AlreadyStarting { .. }) => {
-                    // A concurrent actor won the stopped->starting race and
-                    // this request issued no StartServiceW. Preserve the
-                    // typed provider disposition so the coordinator can
-                    // durably classify the foreign start as Unknown instead
-                    // of treating a generic provider response as a lost call.
-                    PortOutcome::Known(InstallationEffectExecution {
-                        evidence: vec![
-                            PlatformHandle::new("service-start-already-starting")
+                        };
+                        let mut evidence = vec![
+                            PlatformHandle::new("service-start-ack-unknown")
                                 .unwrap_or_else(|_| unreachable!()),
-                        ],
-                        create_disposition: None,
-                        credential_receipt: None,
-                        staging_receipt: None,
-                        phase_b_receipt: None,
-                        service_start_disposition: Some(
-                            InstallationServiceStartDisposition::AlreadyStarting,
-                        ),
-                        service_runtime_lineage: None,
-                    })
-                }
-                Ok(ServiceStartOutcome::EffectUnknown) => {
-                    PortOutcome::Unknown(UnknownReason::Indeterminate)
-                }
-                Err(error) => PortOutcome::Error(PortError::Provider(ProviderError {
-                    code: match error {
-                        eliot_platform_windows::WindowsAdapterError::PermissionDenied => {
-                            ProviderErrorCode::PermissionDenied
+                        ];
+                        if let Some(code) = call.call_error {
+                            match service_start_call_error_reference(request, code) {
+                                Ok(reference)
+                                    if is_service_start_call_error_reference_for_request(
+                                        reference.as_str(),
+                                        request,
+                                    ) =>
+                                {
+                                    evidence.push(reference);
+                                }
+                                Ok(_) => {
+                                    return PortOutcome::Error(PortError::InvalidRequestMetadata);
+                                }
+                                Err(error) => return PortOutcome::Error(error),
+                            }
                         }
-                        eliot_platform_windows::WindowsAdapterError::Timeout => {
-                            ProviderErrorCode::Timeout
+                        if let Some(post_call) = call.post_call_inspection.as_ref() {
+                            match service_start_post_call_reference(request, post_call) {
+                                Ok(reference) => evidence.push(reference),
+                                Err(error) => return PortOutcome::Error(error),
+                            }
                         }
-                        _ => ProviderErrorCode::Unavailable,
-                    },
-                    retryable: false,
-                })),
+                        evidence.push(pending);
+                        PortOutcome::Known(InstallationEffectExecution {
+                            evidence,
+                            create_disposition: None,
+                            credential_receipt: None,
+                            staging_receipt: None,
+                            phase_b_receipt: None,
+                            service_start_disposition: Some(
+                                InstallationServiceStartDisposition::StartedByCaller,
+                            ),
+                            service_runtime_lineage: None,
+                        })
+                    }
+                    ServiceStartOutcome::EffectUnknown => {
+                        let error = match call.unknown_detail {
+                            Some(detail) => service_runtime_unknown_port_error(request, detail),
+                            None => service_runtime_redacted_port_error(
+                                request,
+                                ProviderError {
+                                    code: ProviderErrorCode::Failed,
+                                    retryable: false,
+                                },
+                            ),
+                        };
+                        PortOutcome::Error(error.unwrap_or(PortError::InvalidRequestMetadata))
+                    }
+                },
+                Err(error) => service_runtime_uncertain(request, windows_provider_error(error)),
             };
         }
 
@@ -5173,11 +5403,33 @@ impl WindowsInstallationEffectPort {
             ServiceRegistrationRuntimeInspection::Matching { ref observation }
                 if observation.is_starting() || observation.is_stopping() =>
             {
-                return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                return service_runtime_uncertain(
+                    request,
+                    ProviderError {
+                        code: ProviderErrorCode::Failed,
+                        retryable: false,
+                    },
+                );
             }
             ServiceRegistrationRuntimeInspection::Matching { ref observation }
                 if observation.is_running() => {}
-            _ => return PortOutcome::Unknown(UnknownReason::Indeterminate),
+            ServiceRegistrationRuntimeInspection::Unknown { detail } => {
+                return PortOutcome::Error(
+                    service_runtime_unknown_port_error(request, detail)
+                        .unwrap_or(PortError::InvalidRequestMetadata),
+                );
+            }
+            ServiceRegistrationRuntimeInspection::Matching { .. }
+            | ServiceRegistrationRuntimeInspection::Absent
+            | ServiceRegistrationRuntimeInspection::Mismatched => {
+                return service_runtime_uncertain(
+                    request,
+                    ProviderError {
+                        code: ProviderErrorCode::Failed,
+                        retryable: false,
+                    },
+                );
+            }
         }
         match platform.stop_service_registration(&registration) {
             Ok(
@@ -5195,21 +5447,14 @@ impl WindowsInstallationEffectPort {
                 service_start_disposition: None,
                 service_runtime_lineage: None,
             }),
-            Ok(ServiceStopOutcome::EffectUnknown) => {
-                PortOutcome::Unknown(UnknownReason::Indeterminate)
-            }
-            Err(error) => PortOutcome::Error(PortError::Provider(ProviderError {
-                code: match error {
-                    eliot_platform_windows::WindowsAdapterError::PermissionDenied => {
-                        ProviderErrorCode::PermissionDenied
-                    }
-                    eliot_platform_windows::WindowsAdapterError::Timeout => {
-                        ProviderErrorCode::Timeout
-                    }
-                    _ => ProviderErrorCode::Unavailable,
+            Ok(ServiceStopOutcome::EffectUnknown) => service_runtime_uncertain(
+                request,
+                ProviderError {
+                    code: ProviderErrorCode::Failed,
+                    retryable: false,
                 },
-                retryable: false,
-            })),
+            ),
+            Err(error) => service_runtime_uncertain(request, windows_provider_error(error)),
         }
     }
 
@@ -5795,9 +6040,27 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                 };
             match platform.delete_service_registration(&registration) {
                 Ok(ServiceRegistrationOutcome::Deleted) => {}
+                Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation) => {
+                    let evidence = match service_terminal_reference(
+                        request,
+                        SERVICE_REGISTRATION_TERMINAL_REFERENCE_PREFIX,
+                        "mismatch",
+                    ) {
+                        Ok(evidence) => evidence,
+                        Err(error) => return PortOutcome::Error(error),
+                    };
+                    return PortOutcome::Known(InstallationEffectExecution {
+                        evidence: vec![evidence],
+                        create_disposition: None,
+                        credential_receipt: None,
+                        staging_receipt: None,
+                        phase_b_receipt: None,
+                        service_start_disposition: None,
+                        service_runtime_lineage: None,
+                    });
+                }
                 Ok(
                     ServiceRegistrationOutcome::AlreadyAbsent
-                    | ServiceRegistrationOutcome::ExistingRequiresReconciliation
                     | ServiceRegistrationOutcome::EffectUnknown
                     | ServiceRegistrationOutcome::CreatedNow { .. }
                     | ServiceRegistrationOutcome::PreexistingMatching { .. }
@@ -5805,9 +6068,17 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                     | ServiceRegistrationOutcome::Updated { .. }
                     | ServiceRegistrationOutcome::Unchanged { .. },
                 ) => {
-                    return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                    return service_registration_uncertain(
+                        request,
+                        ProviderError {
+                            code: ProviderErrorCode::Failed,
+                            retryable: false,
+                        },
+                    );
                 }
-                Err(_) => return PortOutcome::Unknown(UnknownReason::Indeterminate),
+                Err(error) => {
+                    return service_registration_uncertain(request, windows_provider_error(error));
+                }
             }
             if self
                 .primitive
@@ -5836,19 +6107,45 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                 .as_ref()
                 .map(InstallerServiceControlGrantReceipt::from_readback)
                 .transpose(),
+            Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation) => {
+                let evidence = match service_terminal_reference(
+                    request,
+                    SERVICE_REGISTRATION_TERMINAL_REFERENCE_PREFIX,
+                    "mismatch",
+                ) {
+                    Ok(evidence) => evidence,
+                    Err(error) => return PortOutcome::Error(error),
+                };
+                return PortOutcome::Known(InstallationEffectExecution {
+                    evidence: vec![evidence],
+                    create_disposition: None,
+                    credential_receipt: None,
+                    staging_receipt: None,
+                    phase_b_receipt: None,
+                    service_start_disposition: None,
+                    service_runtime_lineage: None,
+                });
+            }
             Ok(
                 ServiceRegistrationOutcome::PreexistingMatching { .. }
                 | ServiceRegistrationOutcome::Registered { .. }
-                | ServiceRegistrationOutcome::ExistingRequiresReconciliation
                 | ServiceRegistrationOutcome::EffectUnknown
                 | ServiceRegistrationOutcome::Updated { .. }
                 | ServiceRegistrationOutcome::Unchanged { .. }
                 | ServiceRegistrationOutcome::Deleted
                 | ServiceRegistrationOutcome::AlreadyAbsent,
             ) => {
-                return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                return service_registration_uncertain(
+                    request,
+                    ProviderError {
+                        code: ProviderErrorCode::Failed,
+                        retryable: false,
+                    },
+                );
             }
-            Err(_) => return PortOutcome::Unknown(UnknownReason::Indeterminate),
+            Err(error) => {
+                return service_registration_uncertain(request, windows_provider_error(error));
+            }
         };
         let Ok(control_grant) = control_grant else {
             return PortOutcome::Error(PortError::InvalidRequestMetadata);
@@ -5862,10 +6159,22 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
         // a missing Watchdog grant already took this `Unknown` path through
         // the flag comparison below.
         if control_grant.is_none() {
-            return PortOutcome::Unknown(UnknownReason::Indeterminate);
+            return service_registration_uncertain(
+                request,
+                ProviderError {
+                    code: ProviderErrorCode::Failed,
+                    retryable: false,
+                },
+            );
         }
         if registration.requires_host_service_control_grant() != control_grant.is_some() {
-            return PortOutcome::Unknown(UnknownReason::Indeterminate);
+            return service_registration_uncertain(
+                request,
+                ProviderError {
+                    code: ProviderErrorCode::Failed,
+                    retryable: false,
+                },
+            );
         }
         let marker = match WindowsServiceOwnershipMarker::new(
             request,
@@ -5894,7 +6203,13 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
             .read_protected_file(&spec, &marker_path, SERVICE_MARKER_LIMIT)
             .is_err()
         {
-            return PortOutcome::Unknown(UnknownReason::Indeterminate);
+            return service_registration_uncertain(
+                request,
+                ProviderError {
+                    code: ProviderErrorCode::Failed,
+                    retryable: false,
+                },
+            );
         }
         PortOutcome::Known(InstallationEffectExecution {
             evidence: vec![
@@ -6779,6 +7094,1145 @@ fn service_matching_observation(
         service_runtime_lineage: None,
     })
 }
+const SERVICE_REGISTRATION_UNKNOWN_REFERENCE_PREFIX: &str = "service-registration-unknown-v1:";
+const SERVICE_REGISTRATION_REDACTED_REFERENCE_PREFIX: &str = "service-registration-redacted-v1:";
+const SERVICE_REGISTRATION_TERMINAL_REFERENCE_PREFIX: &str = "service-registration-terminal-v1:";
+const SERVICE_RUNTIME_TERMINAL_REFERENCE_PREFIX: &str = "service-runtime-terminal-v1:";
+
+fn service_terminal_reference(
+    request: &InstallationEffectRequest,
+    prefix: &str,
+    classification: &str,
+) -> Result<PlatformHandle, PortError> {
+    let digest = request
+        .intent_digest()
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+    PlatformHandle::new(format!("{prefix}{}:{classification}", digest.as_str()))
+        .map_err(|_| PortError::InvalidRequestMetadata)
+}
+
+fn is_service_terminal_reference_for_request(
+    value: &str,
+    request: &InstallationEffectRequest,
+    prefix: &str,
+) -> bool {
+    let Some(rest) = value.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some((digest, classification)) = rest.split_once(':') else {
+        return false;
+    };
+    is_lower_hex(digest, 64)
+        && matches!(classification, "mismatch" | "absent")
+        && request
+            .intent_digest()
+            .is_ok_and(|expected| expected.as_str() == digest)
+}
+
+fn service_registration_redacted_reference(
+    request: &InstallationEffectRequest,
+) -> Result<PlatformHandle, PortError> {
+    let digest = request
+        .intent_digest()
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+    PlatformHandle::new(format!(
+        "{SERVICE_REGISTRATION_REDACTED_REFERENCE_PREFIX}{}",
+        digest.as_str()
+    ))
+    .map_err(|_| PortError::InvalidRequestMetadata)
+}
+
+fn is_typed_service_registration_redacted_reference_for_request(
+    value: &str,
+    request: &InstallationEffectRequest,
+) -> bool {
+    let Some(digest) = value.strip_prefix(SERVICE_REGISTRATION_REDACTED_REFERENCE_PREFIX) else {
+        return false;
+    };
+    let Ok(expected_digest) = request.intent_digest() else {
+        return false;
+    };
+    is_lower_hex(digest, 64) && digest == expected_digest.as_str()
+}
+
+fn is_service_registration_recovery_reference_for_request(
+    value: &str,
+    request: &InstallationEffectRequest,
+) -> bool {
+    is_typed_service_registration_unknown_reference_for_request(value, request)
+        || is_typed_service_registration_redacted_reference_for_request(value, request)
+}
+
+fn service_registration_unknown_port_error(
+    request: &InstallationEffectRequest,
+    detail: ServiceInspectionUnknownDetail,
+) -> Result<PortError, PortError> {
+    let reference = match service_registration_unknown_reference(request, detail) {
+        Ok(reference) => reference,
+        Err(PortError::InvalidRequestMetadata) => service_registration_redacted_reference(request)?,
+        Err(error) => return Err(error),
+    };
+    let code = if !service_registration_unknown_detail_is_valid(&detail) {
+        ProviderErrorCode::Failed
+    } else if detail.stage() == "unsupported-platform" {
+        ProviderErrorCode::Unavailable
+    } else if detail.win32_error() == 5 {
+        ProviderErrorCode::PermissionDenied
+    } else {
+        ProviderErrorCode::Failed
+    };
+    Ok(PortError::ProviderReference {
+        error: ProviderError {
+            code,
+            retryable: false,
+        },
+        reference,
+    })
+}
+
+fn service_registration_unknown_reference(
+    request: &InstallationEffectRequest,
+    detail: ServiceInspectionUnknownDetail,
+) -> Result<PlatformHandle, PortError> {
+    if !service_registration_unknown_detail_is_valid(&detail) {
+        return Err(PortError::InvalidRequestMetadata);
+    }
+    let intent_digest = request
+        .intent_digest()
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+    let state = detail
+        .current_state()
+        .map_or_else(|| "none".to_owned(), |value| format!("{value:08x}"));
+    let process_id = detail
+        .process_id()
+        .map_or_else(|| "none".to_owned(), |value| format!("{value:08x}"));
+    PlatformHandle::new(format!(
+        "{SERVICE_REGISTRATION_UNKNOWN_REFERENCE_PREFIX}{}:{}:{:08x}:{state}:{process_id}",
+        intent_digest.as_str(),
+        detail.stage(),
+        detail.win32_error(),
+    ))
+    .map_err(|_| PortError::InvalidRequestMetadata)
+}
+
+fn service_registration_unknown_reference_fields(
+    value: &str,
+) -> Option<(&str, &str, &str, &str, &str)> {
+    let rest = value.strip_prefix(SERVICE_REGISTRATION_UNKNOWN_REFERENCE_PREFIX)?;
+    let parts = rest.split(':').collect::<Vec<_>>();
+    let [
+        digest_hex,
+        failure_stage,
+        os_error_hex,
+        scm_state_hex,
+        process_hex,
+    ] = parts.as_slice()
+    else {
+        return None;
+    };
+    Some((
+        digest_hex,
+        failure_stage,
+        os_error_hex,
+        scm_state_hex,
+        process_hex,
+    ))
+}
+
+fn is_typed_service_registration_unknown_reference(value: &str) -> bool {
+    let Some((digest_hex, failure_stage, os_error_hex, scm_state_hex, process_hex)) =
+        service_registration_unknown_reference_fields(value)
+    else {
+        return false;
+    };
+    is_lower_hex(digest_hex, 64)
+        && is_service_registration_unknown_stage(failure_stage)
+        && is_lower_hex(os_error_hex, 8)
+        && valid_service_registration_unknown_sample(failure_stage, scm_state_hex, process_hex)
+        && valid_service_registration_unknown_code(failure_stage, os_error_hex)
+}
+
+fn service_registration_unknown_detail_is_valid(detail: &ServiceInspectionUnknownDetail) -> bool {
+    let stage = detail.stage();
+    is_service_registration_unknown_stage(stage)
+        && valid_service_registration_unknown_sample(
+            stage,
+            &detail
+                .current_state()
+                .map_or_else(|| "none".to_owned(), |value| format!("{value:08x}")),
+            &detail
+                .process_id()
+                .map_or_else(|| "none".to_owned(), |value| format!("{value:08x}")),
+        )
+        && valid_service_registration_unknown_code(stage, &format!("{:08x}", detail.win32_error()))
+}
+
+fn service_runtime_unknown_detail_is_valid(detail: &ServiceInspectionUnknownDetail) -> bool {
+    let stage = detail.stage();
+    is_service_runtime_unknown_stage(stage)
+        && valid_service_runtime_unknown_sample(
+            stage,
+            &detail
+                .current_state()
+                .map_or_else(|| "none".to_owned(), |value| format!("{value:08x}")),
+            &detail
+                .process_id()
+                .map_or_else(|| "none".to_owned(), |value| format!("{value:08x}")),
+        )
+        && valid_service_registration_unknown_code(stage, &format!("{:08x}", detail.win32_error()))
+}
+
+fn valid_service_registration_unknown_sample(
+    stage: &str,
+    state_hex: &str,
+    process_hex: &str,
+) -> bool {
+    // Registration reconciliation may cross the live runtime inspection seam.
+    // Its producer therefore uses the same closed stage/sample grammar as the
+    // runtime boundary; accepting only `none/none` would strand a genuine
+    // PID-zero START_PENDING observation as an un-correlated redaction.
+    valid_service_runtime_unknown_sample(stage, state_hex, process_hex)
+}
+
+fn valid_service_runtime_unknown_sample(stage: &str, state_hex: &str, process_hex: &str) -> bool {
+    if matches!(stage, "query-status" | "process-identity") {
+        (state_hex == "none" && process_hex == "none")
+            || (is_lower_hex(state_hex, 8) && is_lower_hex(process_hex, 8))
+    } else {
+        state_hex == "none" && process_hex == "none"
+    }
+}
+
+fn valid_service_registration_unknown_code(stage: &str, code_hex: &str) -> bool {
+    if !is_lower_hex(code_hex, 8) {
+        return false;
+    }
+    match stage {
+        "unsupported-platform" => code_hex == "00000032",
+        // Absence-proof construction is a logic contour, not a Win32 call.
+        // Never attach the old fabricated ERROR_INVALID_PARAMETER value.
+        "absent-proof" => code_hex == "00000000",
+        _ => true,
+    }
+}
+
+fn is_typed_service_registration_unknown_reference_for_request(
+    value: &str,
+    request: &InstallationEffectRequest,
+) -> bool {
+    if !is_typed_service_registration_unknown_reference(value) {
+        return false;
+    }
+    let Some((digest_hex, _, _, _, _)) = service_registration_unknown_reference_fields(value)
+    else {
+        return false;
+    };
+    let Ok(expected_digest) = request.intent_digest() else {
+        return false;
+    };
+    digest_hex == expected_digest.as_str()
+}
+
+struct ServicePendingEvidence {
+    correlated: PlatformHandle,
+    preserved: Vec<PlatformHandle>,
+    archived: Vec<PlatformHandle>,
+}
+
+fn rejected_service_reference(
+    reference: &PlatformHandle,
+) -> Result<PlatformHandle, InstallationError> {
+    PlatformHandle::new(format!(
+        "service-rejected-reference-v1:{}",
+        sha256_hex(reference.as_str().as_bytes())
+    ))
+    .map_err(|error| InstallationError::InvalidField {
+        field: "pending_external_changes".to_owned(),
+        reason: error.to_string(),
+    })
+}
+
+fn service_registration_pending_evidence_for_request<T>(
+    outcome: &PortOutcome<T>,
+    request: &InstallationEffectRequest,
+) -> Result<ServicePendingEvidence, InstallationError> {
+    match outcome {
+        PortOutcome::Error(PortError::ProviderReference { reference, .. }) => {
+            if is_typed_service_registration_unknown_reference_for_request(
+                reference.as_str(),
+                request,
+            ) || is_typed_service_registration_redacted_reference_for_request(
+                reference.as_str(),
+                request,
+            ) {
+                Ok(ServicePendingEvidence {
+                    correlated: reference.clone(),
+                    preserved: Vec::new(),
+                    archived: Vec::new(),
+                })
+            } else {
+                Ok(ServicePendingEvidence {
+                    correlated: service_registration_redacted_reference(request)
+                        .map_err(|error| platform_error(&error))?,
+                    preserved: vec![rejected_service_reference(reference)?],
+                    archived: Vec::new(),
+                })
+            }
+        }
+        PortOutcome::Error(PortError::Provider(_)) | PortOutcome::Unknown(_) => {
+            Ok(ServicePendingEvidence {
+                correlated: service_registration_redacted_reference(request)
+                    .map_err(|error| platform_error(&error))?,
+                preserved: Vec::new(),
+                archived: Vec::new(),
+            })
+        }
+        PortOutcome::Partial { missing, .. } => {
+            let correlated = missing
+                .iter()
+                .find(|reference| {
+                    is_typed_service_registration_unknown_reference_for_request(
+                        reference.as_str(),
+                        request,
+                    ) || is_typed_service_registration_redacted_reference_for_request(
+                        reference.as_str(),
+                        request,
+                    )
+                })
+                .cloned()
+                .map_or_else(
+                    || {
+                        service_registration_redacted_reference(request)
+                            .map_err(|error| platform_error(&error))
+                    },
+                    Ok,
+                )?;
+            let preserved = missing
+                .iter()
+                .filter(|reference| reference.as_str() != correlated.as_str())
+                .map(rejected_service_reference)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ServicePendingEvidence {
+                correlated,
+                preserved,
+                archived: Vec::new(),
+            })
+        }
+        PortOutcome::Error(
+            PortError::InvalidText { .. }
+            | PortError::Duplicate { .. }
+            | PortError::Ambiguous { .. }
+            | PortError::InvalidFence
+            | PortError::InvalidRequestMetadata
+            | PortError::IdentityConflict
+            | PortError::InvalidServiceProcessRecord
+            | PortError::InvalidPath,
+        )
+        | PortOutcome::Known(_) => Err(InstallationError::IdentityConflict),
+    }
+}
+
+fn service_registration_redacted_port_error(
+    request: &InstallationEffectRequest,
+    error: ProviderError,
+) -> Result<PortError, PortError> {
+    Ok(PortError::ProviderReference {
+        error,
+        reference: service_registration_redacted_reference(request)?,
+    })
+}
+
+fn service_runtime_redacted_port_error(
+    request: &InstallationEffectRequest,
+    error: ProviderError,
+) -> Result<PortError, PortError> {
+    Ok(PortError::ProviderReference {
+        error,
+        reference: service_runtime_redacted_reference(request)?,
+    })
+}
+
+fn service_registration_uncertain<T>(
+    request: &InstallationEffectRequest,
+    error: ProviderError,
+) -> PortOutcome<T> {
+    PortOutcome::Error(
+        service_registration_redacted_port_error(request, error)
+            .unwrap_or(PortError::InvalidRequestMetadata),
+    )
+}
+
+fn service_runtime_uncertain<T>(
+    request: &InstallationEffectRequest,
+    error: ProviderError,
+) -> PortOutcome<T> {
+    PortOutcome::Error(
+        service_runtime_redacted_port_error(request, error)
+            .unwrap_or(PortError::InvalidRequestMetadata),
+    )
+}
+
+const SERVICE_RUNTIME_UNKNOWN_REFERENCE_PREFIX: &str = "service-runtime-unknown-v1:";
+const SERVICE_RUNTIME_REDACTED_REFERENCE_PREFIX: &str = "service-runtime-redacted-v1:";
+const SERVICE_STARTING_REFERENCE_PREFIX: &str = "service-starting-v1:";
+const SERVICE_STOPPED_REFERENCE_PREFIX: &str = "service-stopped-v1:";
+
+fn service_runtime_unknown_reference(
+    request: &InstallationEffectRequest,
+    detail: ServiceInspectionUnknownDetail,
+) -> Result<PlatformHandle, PortError> {
+    if !service_runtime_unknown_detail_is_valid(&detail) {
+        return Err(PortError::InvalidRequestMetadata);
+    }
+    let intent_digest = request
+        .intent_digest()
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+    let state = detail
+        .current_state()
+        .map_or_else(|| "none".to_owned(), |value| format!("{value:08x}"));
+    let process_id = detail
+        .process_id()
+        .map_or_else(|| "none".to_owned(), |value| format!("{value:08x}"));
+    PlatformHandle::new(format!(
+        "{SERVICE_RUNTIME_UNKNOWN_REFERENCE_PREFIX}{}:{}:{:08x}:{state}:{process_id}",
+        intent_digest.as_str(),
+        detail.stage(),
+        detail.win32_error(),
+    ))
+    .map_err(|_| PortError::InvalidRequestMetadata)
+}
+
+fn service_runtime_unknown_reference_fields(value: &str) -> Option<(&str, &str, &str, &str, &str)> {
+    let rest = value.strip_prefix(SERVICE_RUNTIME_UNKNOWN_REFERENCE_PREFIX)?;
+    let parts = rest.split(':').collect::<Vec<_>>();
+    let [
+        digest_hex,
+        failure_stage,
+        os_error_hex,
+        scm_state_hex,
+        process_hex,
+    ] = parts.as_slice()
+    else {
+        return None;
+    };
+    Some((
+        digest_hex,
+        failure_stage,
+        os_error_hex,
+        scm_state_hex,
+        process_hex,
+    ))
+}
+
+fn is_typed_service_runtime_unknown_reference(value: &str) -> bool {
+    let Some((digest_hex, failure_stage, os_error_hex, scm_state_hex, process_hex)) =
+        service_runtime_unknown_reference_fields(value)
+    else {
+        return false;
+    };
+    is_lower_hex(digest_hex, 64)
+        && is_service_runtime_unknown_stage(failure_stage)
+        && is_lower_hex(os_error_hex, 8)
+        && valid_service_runtime_unknown_sample(failure_stage, scm_state_hex, process_hex)
+        && valid_service_registration_unknown_code(failure_stage, os_error_hex)
+}
+
+fn is_typed_service_runtime_unknown_reference_for_request(
+    value: &str,
+    request: &InstallationEffectRequest,
+) -> bool {
+    let Some((digest_hex, _, _, _, _)) = service_runtime_unknown_reference_fields(value) else {
+        return false;
+    };
+    is_typed_service_runtime_unknown_reference(value)
+        && request
+            .intent_digest()
+            .is_ok_and(|digest| digest.as_str() == digest_hex)
+}
+
+fn is_service_start_pending_unknown_reference_for_request(
+    value: &str,
+    request: &InstallationEffectRequest,
+) -> bool {
+    let Some((_, failure_stage, os_code, scm_state, process_id)) =
+        service_runtime_unknown_reference_fields(value)
+    else {
+        return false;
+    };
+    is_typed_service_runtime_unknown_reference_for_request(value, request)
+        && matches!(failure_stage, "query-status" | "process-identity")
+        && os_code == "00000000"
+        && scm_state == "00000002"
+        && process_id == "00000000"
+}
+
+fn service_runtime_unknown_port_error(
+    request: &InstallationEffectRequest,
+    detail: ServiceInspectionUnknownDetail,
+) -> Result<PortError, PortError> {
+    let reference = match service_runtime_unknown_reference(request, detail) {
+        Ok(reference) => reference,
+        Err(PortError::InvalidRequestMetadata) => service_runtime_redacted_reference(request)?,
+        Err(error) => return Err(error),
+    };
+    let code = if !service_runtime_unknown_detail_is_valid(&detail) {
+        ProviderErrorCode::Failed
+    } else if detail.stage() == "unsupported-platform" {
+        ProviderErrorCode::Unavailable
+    } else if detail.win32_error() == 5 {
+        ProviderErrorCode::PermissionDenied
+    } else {
+        ProviderErrorCode::Failed
+    };
+    Ok(PortError::ProviderReference {
+        error: ProviderError {
+            code,
+            retryable: false,
+        },
+        reference,
+    })
+}
+
+fn service_runtime_pending_evidence_for_request<T>(
+    outcome: &PortOutcome<T>,
+    request: &InstallationEffectRequest,
+) -> Result<ServicePendingEvidence, InstallationError> {
+    match outcome {
+        PortOutcome::Error(PortError::ProviderReference { reference, .. }) => {
+            if is_service_runtime_recovery_reference_for_request(reference.as_str(), request) {
+                Ok(ServicePendingEvidence {
+                    correlated: reference.clone(),
+                    preserved: Vec::new(),
+                    archived: Vec::new(),
+                })
+            } else {
+                Ok(ServicePendingEvidence {
+                    correlated: service_runtime_redacted_reference(request)
+                        .map_err(|error| platform_error(&error))?,
+                    preserved: vec![rejected_service_reference(reference)?],
+                    archived: Vec::new(),
+                })
+            }
+        }
+        PortOutcome::Error(PortError::Provider(_)) | PortOutcome::Unknown(_) => {
+            Ok(ServicePendingEvidence {
+                correlated: service_runtime_redacted_reference(request)
+                    .map_err(|error| platform_error(&error))?,
+                preserved: Vec::new(),
+                archived: Vec::new(),
+            })
+        }
+        PortOutcome::Partial { missing, .. } => {
+            let correlated = missing
+                .iter()
+                .find(|reference| {
+                    is_typed_service_runtime_unknown_reference_for_request(
+                        reference.as_str(),
+                        request,
+                    ) || is_service_runtime_recovery_reference_for_request(
+                        reference.as_str(),
+                        request,
+                    )
+                })
+                .cloned()
+                .map_or_else(
+                    || {
+                        service_runtime_redacted_reference(request)
+                            .map_err(|error| platform_error(&error))
+                    },
+                    Ok,
+                )?;
+            let preserved = missing
+                .iter()
+                .filter(|reference| reference.as_str() != correlated.as_str())
+                .map(rejected_service_reference)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ServicePendingEvidence {
+                correlated,
+                preserved,
+                archived: Vec::new(),
+            })
+        }
+        PortOutcome::Error(
+            PortError::InvalidText { .. }
+            | PortError::Duplicate { .. }
+            | PortError::Ambiguous { .. }
+            | PortError::InvalidFence
+            | PortError::InvalidRequestMetadata
+            | PortError::IdentityConflict
+            | PortError::InvalidServiceProcessRecord
+            | PortError::InvalidPath,
+        )
+        | PortOutcome::Known(_) => Err(InstallationError::IdentityConflict),
+    }
+}
+
+fn service_runtime_redacted_reference(
+    request: &InstallationEffectRequest,
+) -> Result<PlatformHandle, PortError> {
+    let digest = request
+        .intent_digest()
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+    PlatformHandle::new(format!(
+        "{SERVICE_RUNTIME_REDACTED_REFERENCE_PREFIX}{}",
+        digest.as_str()
+    ))
+    .map_err(|_| PortError::InvalidRequestMetadata)
+}
+
+fn service_start_call_error_reference(
+    request: &InstallationEffectRequest,
+    code: u32,
+) -> Result<PlatformHandle, PortError> {
+    let digest = request
+        .intent_digest()
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+    PlatformHandle::new(format!(
+        "service-start-call-error-v1:{}:{:08x}",
+        digest.as_str(),
+        code
+    ))
+    .map_err(|_| PortError::InvalidRequestMetadata)
+}
+
+fn is_service_start_call_error_reference_for_request(
+    value: &str,
+    request: &InstallationEffectRequest,
+) -> bool {
+    let Some(rest) = value.strip_prefix("service-start-call-error-v1:") else {
+        return false;
+    };
+    let Some((digest, code)) = rest.split_once(':') else {
+        return false;
+    };
+    is_lower_hex(digest, 64)
+        && is_lower_hex(code, 8)
+        && request
+            .intent_digest()
+            .is_ok_and(|expected| expected.as_str() == digest)
+}
+
+const SERVICE_START_POST_CALL_REFERENCE_PREFIX: &str = "service-start-post-call-v1:";
+
+fn service_start_post_call_reference(
+    request: &InstallationEffectRequest,
+    inspection: &ServiceRegistrationRuntimeInspection,
+) -> Result<PlatformHandle, PortError> {
+    let digest = request
+        .intent_digest()
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+    let classification = match inspection {
+        ServiceRegistrationRuntimeInspection::Absent => "absent".to_owned(),
+        ServiceRegistrationRuntimeInspection::Mismatched => "mismatched".to_owned(),
+        ServiceRegistrationRuntimeInspection::Unknown { detail } => {
+            if !service_runtime_unknown_detail_is_valid(detail) {
+                return Err(PortError::InvalidRequestMetadata);
+            }
+            format!(
+                "unknown:{}:{:08x}:{}:{}",
+                detail.stage(),
+                detail.win32_error(),
+                detail
+                    .current_state()
+                    .map_or_else(|| "none".to_owned(), |value| format!("{value:08x}")),
+                detail
+                    .process_id()
+                    .map_or_else(|| "none".to_owned(), |value| format!("{value:08x}")),
+            )
+        }
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_running() =>
+        {
+            "running".to_owned()
+        }
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_starting() =>
+        {
+            "starting".to_owned()
+        }
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_stopping() =>
+        {
+            "stopping".to_owned()
+        }
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_stopped() =>
+        {
+            "stopped".to_owned()
+        }
+        ServiceRegistrationRuntimeInspection::Matching { .. } => "indeterminate".to_owned(),
+    };
+    PlatformHandle::new(format!(
+        "{SERVICE_START_POST_CALL_REFERENCE_PREFIX}{}:{classification}",
+        digest.as_str()
+    ))
+    .map_err(|_| PortError::InvalidRequestMetadata)
+}
+
+fn service_start_post_call_classification_is_valid(classification: &str) -> bool {
+    if matches!(
+        classification,
+        "absent" | "mismatched" | "running" | "starting" | "stopping" | "stopped" | "indeterminate"
+    ) {
+        return true;
+    }
+    let Some(rest) = classification.strip_prefix("unknown:") else {
+        return false;
+    };
+    let parts = rest.split(':').collect::<Vec<_>>();
+    let [stage, code, sample_state, sample_process_id] = parts.as_slice() else {
+        return false;
+    };
+    is_service_runtime_unknown_stage(stage)
+        && valid_service_runtime_unknown_sample(stage, sample_state, sample_process_id)
+        && valid_service_registration_unknown_code(stage, code)
+}
+
+/// Returns whether a post-call reference is an exact request-bound recovery
+/// observation. Known running/starting observations are evidence, not a reason
+/// to reopen the caller-start proof path.
+fn is_service_start_post_call_recovery_reference_for_request(
+    value: &str,
+    request: &InstallationEffectRequest,
+) -> bool {
+    let Some(rest) = value.strip_prefix(SERVICE_START_POST_CALL_REFERENCE_PREFIX) else {
+        return false;
+    };
+    let Some((digest, classification)) = rest.split_once(':') else {
+        return false;
+    };
+    is_lower_hex(digest, 64)
+        && request
+            .intent_digest()
+            .is_ok_and(|expected| expected.as_str() == digest)
+        && service_start_post_call_classification_is_valid(classification)
+        && matches!(classification, "absent" | "mismatched" | "stopped")
+}
+
+fn service_starting_reference(
+    request: &InstallationEffectRequest,
+) -> Result<PlatformHandle, PortError> {
+    let digest = request
+        .intent_digest()
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+    PlatformHandle::new(format!(
+        "{SERVICE_STARTING_REFERENCE_PREFIX}{}",
+        digest.as_str()
+    ))
+    .map_err(|_| PortError::InvalidRequestMetadata)
+}
+
+fn is_service_starting_reference_for_request(
+    value: &str,
+    request: &InstallationEffectRequest,
+) -> bool {
+    value
+        .strip_prefix(SERVICE_STARTING_REFERENCE_PREFIX)
+        .is_some_and(|digest| {
+            is_lower_hex(digest, 64)
+                && request
+                    .intent_digest()
+                    .is_ok_and(|expected| expected.as_str() == digest)
+        })
+}
+
+fn service_stopped_reference(
+    request: &InstallationEffectRequest,
+) -> Result<PlatformHandle, PortError> {
+    let digest = request
+        .intent_digest()
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+    PlatformHandle::new(format!(
+        "{SERVICE_STOPPED_REFERENCE_PREFIX}{}",
+        digest.as_str()
+    ))
+    .map_err(|_| PortError::InvalidRequestMetadata)
+}
+
+fn is_service_stopped_reference_for_request(
+    value: &str,
+    request: &InstallationEffectRequest,
+) -> bool {
+    value
+        .strip_prefix(SERVICE_STOPPED_REFERENCE_PREFIX)
+        .is_some_and(|digest| {
+            is_lower_hex(digest, 64)
+                && request
+                    .intent_digest()
+                    .is_ok_and(|expected| expected.as_str() == digest)
+        })
+}
+
+const CLEANUP_UNKNOWN_REFERENCE_PREFIX: &str = "cleanup-unknown-v2:";
+const LEGACY_CLEANUP_UNKNOWN_REFERENCE_PREFIX: &str = "cleanup-unknown-v1:";
+
+fn cleanup_owner_digest(
+    request: &InstallationEffectRequest,
+) -> Result<PlatformHandle, InstallationError> {
+    let action = match request.action {
+        InstallationEffectAction::Apply => "apply",
+        InstallationEffectAction::Rollback => "rollback",
+    };
+    let identity = request
+        .expected_external_identity
+        .as_ref()
+        .map_or("", PlatformHandle::as_str);
+    PlatformHandle::new(sha256_hex(
+        format!(
+            "cleanup-owner-v1\0{}\0{}\0{}\0{}\0{}",
+            request.transaction_id.as_str(),
+            request.effect_id.as_str(),
+            request.plan_digest.as_str(),
+            action,
+            identity
+        )
+        .as_bytes(),
+    ))
+    .map_err(|error| InstallationError::InvalidField {
+        field: "pending_external_changes".to_owned(),
+        reason: error.to_string(),
+    })
+}
+
+fn cleanup_unknown_reference(
+    request: &InstallationEffectRequest,
+    pending: &PlatformHandle,
+) -> Result<PlatformHandle, InstallationError> {
+    let owner = cleanup_owner_digest(request)?;
+    let cause_digest = sha256_hex(pending.as_str().as_bytes());
+    PlatformHandle::new(format!(
+        "{CLEANUP_UNKNOWN_REFERENCE_PREFIX}{}:{cause_digest}",
+        owner.as_str()
+    ))
+    .map_err(|error| InstallationError::InvalidField {
+        field: "pending_external_changes".to_owned(),
+        reason: error.to_string(),
+    })
+}
+
+fn is_cleanup_unknown_reference_for_request(
+    value: &str,
+    request: &InstallationEffectRequest,
+) -> bool {
+    if let Some((owner, cause_digest)) = value
+        .strip_prefix(CLEANUP_UNKNOWN_REFERENCE_PREFIX)
+        .and_then(|rest| rest.split_once(':'))
+    {
+        return is_lower_hex(owner, 64)
+            && is_lower_hex(cause_digest, 64)
+            && cleanup_owner_digest(request).is_ok_and(|expected| expected.as_str() == owner);
+    }
+    let Some((request_digest, cause_digest)) = value
+        .strip_prefix(LEGACY_CLEANUP_UNKNOWN_REFERENCE_PREFIX)
+        .and_then(|rest| rest.split_once(':'))
+    else {
+        return false;
+    };
+    is_lower_hex(request_digest, 64)
+        && is_lower_hex(cause_digest, 64)
+        && request
+            .intent_digest()
+            .is_ok_and(|expected| expected.as_str() == request_digest)
+}
+
+fn is_service_runtime_recovery_reference_for_request(
+    value: &str,
+    request: &InstallationEffectRequest,
+) -> bool {
+    is_typed_service_runtime_unknown_reference_for_request(value, request)
+        || value
+            .strip_prefix(SERVICE_RUNTIME_REDACTED_REFERENCE_PREFIX)
+            .is_some_and(|digest| {
+                is_lower_hex(digest, 64)
+                    && request
+                        .intent_digest()
+                        .is_ok_and(|expected| expected.as_str() == digest)
+            })
+}
+
+fn service_effect_intent_index(transaction: &InstallationTransaction) -> Option<usize> {
+    let index = transaction.effect_progress.iter().position(|progress| {
+        !matches!(
+            progress.state,
+            InstallationEffectProgressState::Applied { .. }
+        )
+    })?;
+    if matches!(
+        transaction.installer_effects[index],
+        InstallerEffectPlan::RegisterService { .. } | InstallerEffectPlan::StartService { .. }
+    ) && matches!(
+        &transaction.effect_progress[index].state,
+        InstallationEffectProgressState::IntentCommitted { .. }
+    ) {
+        Some(index)
+    } else {
+        None
+    }
+}
+
+fn service_effect_intent_request(
+    transaction: &InstallationTransaction,
+    index: usize,
+) -> Result<(InstallationEffectRequest, PlatformHandle), InstallationError> {
+    let InstallationEffectProgressState::IntentCommitted {
+        attempt,
+        intent_digest,
+    } = &transaction.effect_progress[index].state
+    else {
+        return Err(InstallationError::IdentityConflict);
+    };
+    let request = effect_request(
+        transaction,
+        index,
+        *attempt,
+        InstallationEffectAction::Apply,
+        None,
+    )?;
+    if request.intent_digest()?.as_str() != intent_digest.as_str() {
+        return Err(InstallationError::IdentityConflict);
+    }
+    Ok((request, intent_digest.clone()))
+}
+
+fn is_legacy_service_intent_reference_for_request(
+    value: &str,
+    request: &InstallationEffectRequest,
+) -> bool {
+    is_lower_hex(value, 64)
+        && request
+            .intent_digest()
+            .is_ok_and(|digest| digest.as_str() == value)
+}
+
+fn service_registration_recovery_reference(
+    request: &InstallationEffectRequest,
+) -> Result<PlatformHandle, InstallationError> {
+    // Recovery is triggered by a durable intent, not by a new SCM read. Keep
+    // that fact distinct from an observed ServiceInspectionUnknownDetail.
+    service_registration_redacted_reference(request).map_err(|error| platform_error(&error))
+}
+
+fn service_runtime_recovery_reference(
+    request: &InstallationEffectRequest,
+) -> Result<PlatformHandle, InstallationError> {
+    // StartService recovery uses a separate request-bound namespace so a
+    // registration readback can never satisfy a start-effect obligation.
+    service_runtime_redacted_reference(request).map_err(|error| platform_error(&error))
+}
+
+fn is_transaction_scoped_pending_reference(
+    transaction: &InstallationTransaction,
+    pending: &PlatformHandle,
+) -> bool {
+    // `completed_stage_refs` is an evidence set, not an ownership index. A
+    // handle appearing in both vectors does not prove that an unresolved
+    // external effect belongs to this transaction.  The registry owner must
+    // first record an explicit absence receipt for this exact transaction.
+    let absence_evidence = format!(
+        "registry-projection-absence:{}",
+        transaction.transaction_id.as_str()
+    );
+    registry_projection_pending_ref(&transaction.transaction_id).is_ok_and(|reference| {
+        reference == *pending
+            && transaction
+                .completed_stage_refs
+                .iter()
+                .any(|evidence| evidence.as_str() == absence_evidence)
+    })
+}
+
+fn is_legacy_interrupted_rollback_reference(value: &str) -> bool {
+    // These two literals are the v24 compatibility markers emitted by the
+    // interrupted-rollback proofs before request-correlated recovery handles
+    // existed. They are deliberately allow-listed rather than treated as a
+    // wildcard prefix: an arbitrary provider or caller string must remain
+    // unresolved and block terminal rollback.
+    matches!(
+        value,
+        "pending:interrupted-service-rollback" | "pending:interrupted-all-kinds-rollback"
+    )
+}
+
+fn remove_resolved_legacy_rollback_references(transaction: &mut InstallationTransaction) -> bool {
+    if transaction.pending_external_changes.is_empty()
+        || !transaction
+            .pending_external_changes
+            .iter()
+            .all(|pending| is_legacy_interrupted_rollback_reference(pending.as_str()))
+        || transaction.effect_progress.iter().any(|progress| {
+            !matches!(
+                progress.state,
+                InstallationEffectProgressState::Applied { .. }
+                    | InstallationEffectProgressState::ReconciledAbsent { .. }
+            )
+        })
+        || !transaction.completed_stage_refs.iter().any(|evidence| {
+            evidence.as_str()
+                == format!(
+                    "legacy-interrupted-rollback-absence:{}",
+                    transaction.transaction_id.as_str()
+                )
+        })
+    {
+        return false;
+    }
+    let legacy = std::mem::take(&mut transaction.pending_external_changes);
+    for reference in legacy {
+        if !transaction.completed_stage_refs.contains(&reference) {
+            transaction.completed_stage_refs.push(reference);
+        }
+    }
+    true
+}
+
+fn remove_transaction_scoped_pending_references(transaction: &mut InstallationTransaction) -> bool {
+    let before = transaction.pending_external_changes.len();
+    let owned = transaction
+        .pending_external_changes
+        .iter()
+        .filter(|pending| is_transaction_scoped_pending_reference(transaction, pending))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    transaction
+        .pending_external_changes
+        .retain(|pending| !owned.contains(pending));
+    before != transaction.pending_external_changes.len()
+}
+
+fn pending_external_changes_have_unmatched_reference(
+    transaction: &InstallationTransaction,
+) -> bool {
+    // The flat durable set is a preservation boundary, not a disposable
+    // error list. A reference is resolved only when it is still owned by the
+    // exact effect state that recorded it; unrelated or superseded evidence
+    // must remain visible and block terminal rollback.
+    transaction.pending_external_changes.iter().any(|pending| {
+        if is_transaction_scoped_pending_reference(transaction, pending) {
+            return false;
+        }
+        !transaction
+            .effect_progress
+            .iter()
+            .enumerate()
+            .any(|(index, progress)| {
+                let effect = &transaction.installer_effects[index];
+                match &progress.state {
+                    InstallationEffectProgressState::Unknown { pending_ref } => {
+                        pending_ref == pending
+                    }
+                    InstallationEffectProgressState::IntentCommitted { intent_digest, .. } => {
+                        if intent_digest == pending {
+                            return true;
+                        }
+                        match effect {
+                            InstallerEffectPlan::RegisterService { .. } => {
+                                service_effect_intent_request(transaction, index).is_ok_and(
+                                    |(request, _)| {
+                                        is_service_registration_recovery_reference_for_request(
+                                            pending.as_str(),
+                                            &request,
+                                        )
+                                    },
+                                )
+                            }
+                            InstallerEffectPlan::StartService { .. } => {
+                                service_effect_intent_request(transaction, index).is_ok_and(
+                                    |(request, _)| {
+                                        is_service_runtime_recovery_reference_for_request(
+                                            pending.as_str(),
+                                            &request,
+                                        )
+                                    },
+                                )
+                            }
+                            _ => false,
+                        }
+                    }
+                    InstallationEffectProgressState::Applied {
+                        disposition: InstallationEffectDisposition::CreatedByTransaction,
+                        external_identity,
+                        ..
+                    } => {
+                        let cleanup_owned =
+                            progress.ownership_secret.as_ref().is_some_and(|ownership| {
+                                ownership.lifecycle
+                                    == InstallationSecretLifecycle::DeleteIntentCommitted
+                            }) || progress
+                                .store_credential
+                                .as_ref()
+                                .is_some_and(|credential| {
+                                    matches!(
+                                        credential.lifecycle,
+                                        StoreCredentialLifecycle::DeleteIntentCommitted
+                                            | StoreCredentialLifecycle::DeleteExecuted
+                                    )
+                                });
+                        cleanup_owned
+                            && effect_request(
+                                transaction,
+                                index,
+                                1,
+                                InstallationEffectAction::Rollback,
+                                Some(external_identity.clone()),
+                            )
+                            .is_ok_and(|request| {
+                                is_cleanup_unknown_reference_for_request(pending.as_str(), &request)
+                            })
+                    }
+                    InstallationEffectProgressState::Applied {
+                        disposition: InstallationEffectDisposition::PreexistingMatching,
+                        ..
+                    }
+                    | InstallationEffectProgressState::ReconciledAbsent { .. }
+                    | InstallationEffectProgressState::Pending => false,
+                }
+            })
+    })
+}
+
+fn is_service_registration_unknown_stage(value: &str) -> bool {
+    matches!(
+        value,
+        "open-scm"
+            | "open-service"
+            | "query-config"
+            | "query-sid-type"
+            | "read-grant"
+            | "query-owner"
+            | "query-group"
+            | "resolve-expected-group"
+            | "query-status"
+            | "process-identity"
+            | "absent-proof"
+            | "unsupported-platform"
+    )
+}
+
+fn is_service_runtime_unknown_stage(value: &str) -> bool {
+    matches!(
+        value,
+        "open-scm"
+            | "open-service"
+            | "query-config"
+            | "query-sid-type"
+            | "read-grant"
+            | "query-owner"
+            | "query-group"
+            | "resolve-expected-group"
+            | "query-status"
+            | "process-identity"
+            | "absent-proof"
+            | "unsupported-platform"
+    )
+}
+
+fn is_lower_hex(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn root_port_error(error: InstallerRootError) -> PortError {
     match error {
         InstallerRootError::InvalidPath | InstallerRootError::MissingParent => {
@@ -6810,8 +8264,8 @@ fn installer_root_reference(stage: InstallerRootStage, code: u32) -> PlatformHan
     .unwrap_or_else(|_| unreachable!())
 }
 
-fn secret_port_error(error: eliot_platform_windows::WindowsAdapterError) -> PortError {
-    PortError::Provider(ProviderError {
+fn windows_provider_error(error: eliot_platform_windows::WindowsAdapterError) -> ProviderError {
+    ProviderError {
         code: match error {
             eliot_platform_windows::WindowsAdapterError::InvalidInput => {
                 ProviderErrorCode::InvalidRequest
@@ -6830,7 +8284,11 @@ fn secret_port_error(error: eliot_platform_windows::WindowsAdapterError) -> Port
             }
         },
         retryable: false,
-    })
+    }
+}
+
+fn secret_port_error(error: eliot_platform_windows::WindowsAdapterError) -> PortError {
+    PortError::Provider(windows_provider_error(error))
 }
 
 fn supervision_key_port_error(error: SupervisionAuthorityKeyError) -> PortError {
@@ -7162,18 +8620,42 @@ where
         transaction_id: &PlatformHandle,
         now_ms: u64,
     ) -> Result<InstallationStepOutcome, InstallationError> {
+        self.drive_effect_at_mode(transaction_id, now_ms, false)
+    }
+
+    #[allow(
+        clippy::collapsible_if,
+        clippy::too_many_lines,
+        reason = "ordered crash-window transitions remain in one auditable coordinator boundary"
+    )]
+    fn drive_effect_at_mode(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        now_ms: u64,
+        allow_rollback_recovery: bool,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
         let mut transaction = self.store.load(transaction_id)?.ok_or_else(|| {
             InstallationError::TransactionNotFound {
                 transaction_id: transaction_id.as_str().to_owned(),
             }
         })?;
         transaction.validate()?;
+        if transaction.stage == InstallationStage::RollbackRequired && !allow_rollback_recovery {
+            return Ok(InstallationStepOutcome::RollbackRequired {
+                pending_refs: transaction.pending_external_changes.clone(),
+            });
+        }
         let Some(index) = transaction.effect_progress.iter().position(|progress| {
             !matches!(
                 progress.state,
                 InstallationEffectProgressState::Applied { .. }
             )
         }) else {
+            if !transaction.pending_external_changes.is_empty() {
+                return Ok(InstallationStepOutcome::RollbackRequired {
+                    pending_refs: transaction.pending_external_changes.clone(),
+                });
+            }
             return Ok(InstallationStepOutcome::Applied {
                 stage: transaction.stage,
                 evidence_refs: transaction.observed_postconditions.clone(),
@@ -7182,12 +8664,13 @@ where
         let attempt = match transaction.effect_progress[index].state {
             InstallationEffectProgressState::Pending => 1,
             InstallationEffectProgressState::IntentCommitted { attempt, .. } => attempt,
-            InstallationEffectProgressState::Unknown { ref pending_ref } => {
+            InstallationEffectProgressState::Unknown { .. }
+            | InstallationEffectProgressState::Applied { .. }
+            | InstallationEffectProgressState::ReconciledAbsent { .. } => {
                 return Ok(InstallationStepOutcome::RollbackRequired {
-                    pending_refs: vec![pending_ref.clone()],
+                    pending_refs: transaction.pending_external_changes.clone(),
                 });
             }
-            InstallationEffectProgressState::Applied { .. } => unreachable!(),
         };
         if matches!(
             transaction.installer_effects[index],
@@ -7299,8 +8782,8 @@ where
                 InstallerEffectPlan::RegisterService { .. } => {
                     match self.port.fresh_service_registration_nonce(&provisional) {
                         PortOutcome::Known(nonce) => nonce,
-                        other => {
-                            return self.persist_unknown(transaction, index, port_pending(other));
+                        _ => {
+                            return Ok(InstallationStepOutcome::Rejected);
                         }
                     }
                 }
@@ -7324,14 +8807,7 @@ where
                     match registration_nonce {
                         Some(nonce) => nonce,
                         None => {
-                            return self.persist_unknown(
-                                transaction,
-                                index,
-                                PlatformHandle::new(
-                                    "mismatch:missing-registration-nonce-for-start",
-                                )
-                                .map_err(|error| platform_error(&error))?,
-                            );
+                            return Ok(InstallationStepOutcome::Rejected);
                         }
                     }
                 }
@@ -7377,20 +8853,12 @@ where
         {
             let Some(deadline) = transaction.effect_progress[index].service_start_deadline_ms
             else {
-                return self.persist_unknown(
-                    transaction,
-                    index,
-                    PlatformHandle::new("mismatch:missing-service-start-deadline")
-                        .map_err(|error| platform_error(&error))?,
-                );
+                let recovery_reference = service_runtime_recovery_reference(&request)?;
+                return self.persist_service_effect_unknown(transaction, index, recovery_reference);
             };
-            if now_ms >= deadline {
-                return self.persist_unknown(
-                    transaction,
-                    index,
-                    PlatformHandle::new("timeout:service-start-convergence")
-                        .map_err(|error| platform_error(&error))?,
-                );
+            if !allow_rollback_recovery && now_ms >= deadline {
+                let recovery_reference = service_runtime_recovery_reference(&request)?;
+                return self.persist_service_effect_unknown(transaction, index, recovery_reference);
             }
         }
         if was_intent
@@ -7440,20 +8908,63 @@ where
         let observation = match state {
             InstallationEffectProgressState::Pending => match self.port.inspect(&request) {
                 PortOutcome::Known(observation) => observation,
-                other => return self.persist_unknown(transaction, index, port_pending(other)),
+                other => {
+                    if matches!(
+                        &transaction.installer_effects[index],
+                        InstallerEffectPlan::RegisterService { .. }
+                    ) {
+                        return self.persist_service_registration_unknown_outcome(
+                            transaction,
+                            index,
+                            &other,
+                            &request,
+                        );
+                    }
+                    if matches!(
+                        &transaction.installer_effects[index],
+                        InstallerEffectPlan::StartService { .. }
+                    ) {
+                        return self.persist_service_runtime_unknown_outcome(
+                            transaction,
+                            index,
+                            &other,
+                            &request,
+                        );
+                    }
+                    return self.persist_unknown(transaction, index, port_pending(other));
+                }
             },
             InstallationEffectProgressState::IntentCommitted { intent_digest, .. } => {
                 if request.intent_digest()? != intent_digest {
-                    return self.persist_unknown(
-                        transaction,
-                        index,
-                        PlatformHandle::new("mismatch:intent-digest")
-                            .map_err(|error| platform_error(&error))?,
-                    );
+                    return Err(InstallationError::IdentityConflict);
                 }
                 match self.port.reconcile(&request) {
                     PortOutcome::Known(observation) => observation,
-                    other => return self.persist_unknown(transaction, index, port_pending(other)),
+                    other => {
+                        if matches!(
+                            &transaction.installer_effects[index],
+                            InstallerEffectPlan::RegisterService { .. }
+                        ) {
+                            return self.persist_service_registration_unknown_outcome(
+                                transaction,
+                                index,
+                                &other,
+                                &request,
+                            );
+                        }
+                        if matches!(
+                            &transaction.installer_effects[index],
+                            InstallerEffectPlan::StartService { .. }
+                        ) {
+                            return self.persist_service_runtime_unknown_outcome(
+                                transaction,
+                                index,
+                                &other,
+                                &request,
+                            );
+                        }
+                        return self.persist_unknown(transaction, index, port_pending(other));
+                    }
                 }
             }
             _ => unreachable!(),
@@ -7491,12 +9002,8 @@ where
                     // This is a restart/readback path without the durable
                     // proof that the exact caller issued StartServiceW.
                     // Running alone cannot prove who started SCM.
-                    return self.persist_unknown(
-                        transaction,
-                        index,
-                        PlatformHandle::new("mismatch:service-start-provider-disposition-missing")
-                            .map_err(|error| platform_error(&error))?,
-                    );
+                    let recovery = service_runtime_recovery_reference(&request)?;
+                    return self.persist_service_effect_unknown(transaction, index, recovery);
                 }
                 if was_intent
                     && matches!(
@@ -7509,18 +9016,29 @@ where
                         .is_some_and(|proof| proof.process_lineage.is_none())
                 {
                     let Some(lineage) = service_runtime_lineage.clone() else {
-                        return self.persist_unknown(
-                            transaction,
-                            index,
-                            PlatformHandle::new("mismatch:service-start-provider-lineage-missing")
-                                .map_err(|error| platform_error(&error))?,
-                        );
+                        let recovery = service_runtime_recovery_reference(&request)?;
+                        return self.persist_service_effect_unknown(transaction, index, recovery);
                     };
                     transaction.effect_progress[index]
                         .service_start_proof
                         .as_mut()
                         .ok_or(InstallationError::IdentityConflict)?
                         .process_lineage = Some(lineage);
+                }
+                if matches!(
+                    &transaction.installer_effects[index],
+                    InstallerEffectPlan::RegisterService { .. }
+                ) && ((!was_intent
+                    && disposition != InstallationEffectDisposition::PreexistingMatching)
+                    || (was_intent
+                        && disposition != InstallationEffectDisposition::CreatedByTransaction))
+                {
+                    return self.persist_service_registration_terminal(
+                        transaction,
+                        index,
+                        PlatformHandle::new("mismatch:service-registration-disposition")
+                            .map_err(|error| platform_error(&error))?,
+                    );
                 }
                 if !was_intent {
                     if disposition != InstallationEffectDisposition::PreexistingMatching {
@@ -7582,7 +9100,14 @@ where
                 )
             }
             InstallationEffectObservation::Mismatch { pending_ref } => {
-                self.persist_unknown(transaction, index, pending_ref)
+                if matches!(
+                    transaction.installer_effects[index],
+                    InstallerEffectPlan::RegisterService { .. }
+                ) {
+                    self.persist_service_registration_terminal(transaction, index, pending_ref)
+                } else {
+                    self.persist_unknown(transaction, index, pending_ref)
+                }
             }
             InstallationEffectObservation::Absent {
                 observed_precondition,
@@ -7602,6 +9127,28 @@ where
                 // loop, so the strict gate never applies to it. Snapshots are
                 // mutually exclusive, so each arm also requires the other two
                 // to be absent.
+                if was_intent
+                    && matches!(
+                        transaction.installer_effects[index],
+                        InstallerEffectPlan::RegisterService { .. }
+                    )
+                {
+                    // An authoritative post-intent SCM absence is a terminal
+                    // fact for this registration attempt.  It must not be
+                    // converted into Unknown merely because the live absence
+                    // observation enriched the OS precondition snapshot.
+                    let terminal_ref = service_terminal_reference(
+                        &request,
+                        SERVICE_REGISTRATION_TERMINAL_REFERENCE_PREFIX,
+                        "absent",
+                    )
+                    .map_err(|error| platform_error(&error))?;
+                    return self.persist_service_registration_terminal(
+                        transaction,
+                        index,
+                        terminal_ref,
+                    );
+                }
                 let snapshot_matches_effect = match &transaction.installer_effects[index] {
                     InstallerEffectPlan::ProvisionStoreCredential { .. } => {
                         observed_precondition.credential_snapshot.is_some()
@@ -7625,10 +9172,35 @@ where
                             && observed_precondition.package_snapshot.is_none()
                     }
                 };
+                // The committed intent digest is derived from the admitted
+                // precondition, so that precondition is authoritative and is
+                // never rewritten after `IntentCommitted`. A recovery readback
+                // may legitimately be the first to observe the live OS
+                // snapshot; for a `StartService` absence that is an expected
+                // enrichment, not a contradiction, so compare the fields that
+                // must stay equal instead of rewriting committed history.
+                let recovered_start_without_os = was_intent
+                    && matches!(
+                        transaction.installer_effects[index],
+                        InstallerEffectPlan::StartService { .. }
+                    )
+                    && request.precondition.os_snapshot.is_none()
+                    && observed_precondition.os_snapshot.is_some();
                 if observed_precondition.evidence_refs != request.precondition.evidence_refs
                     || !snapshot_matches_effect
-                    || (was_intent && observed_precondition != request.precondition)
+                    || (was_intent
+                        && observed_precondition != request.precondition
+                        && !recovered_start_without_os)
                 {
+                    if was_intent
+                        && matches!(
+                            transaction.installer_effects[index],
+                            InstallerEffectPlan::StartService { .. }
+                        )
+                    {
+                        let recovery = service_runtime_recovery_reference(&request)?;
+                        return self.persist_service_effect_unknown(transaction, index, recovery);
+                    }
                     return self.persist_unknown(
                         transaction,
                         index,
@@ -7637,30 +9209,61 @@ where
                     );
                 }
                 if was_intent
+                    && allow_rollback_recovery
+                    && matches!(
+                        transaction.installer_effects[index],
+                        InstallerEffectPlan::StartService { .. }
+                    )
+                    && evidence.iter().any(|evidence| {
+                        is_service_stopped_reference_for_request(evidence.as_str(), &request)
+                    })
+                {
+                    // An authoritative Stopped readback proves absence of the
+                    // requested Running postcondition. Keep the original
+                    // caller-issued intent/proof and record a distinct
+                    // ReconciledAbsent recovery disposition; it is not an
+                    // Applied or PreexistingMatching start.
+                    return self.persist_service_start_reconciled_absent(
+                        transaction,
+                        index,
+                        &request,
+                        evidence,
+                    );
+                }
+                if was_intent
                     && matches!(
                         transaction.installer_effects[index],
                         InstallerEffectPlan::StartService { .. }
                     )
                 {
-                    let starting = evidence
-                        .iter()
-                        .any(|evidence| evidence.as_str().starts_with("service-starting:"));
+                    let starting = evidence.iter().any(|evidence| {
+                        is_service_starting_reference_for_request(evidence.as_str(), &request)
+                            || is_service_start_pending_unknown_reference_for_request(
+                                evidence.as_str(),
+                                &request,
+                            )
+                    });
                     if starting
                         && transaction.effect_progress[index]
                             .service_start_deadline_ms
                             .is_some_and(|deadline| now_ms < deadline)
                     {
-                        if let Some(lineage) = service_runtime_lineage
-                            && self
-                                .bind_service_start_lineage(&mut transaction, index, lineage)
-                                .is_err()
-                        {
-                            return self.persist_unknown(
-                                transaction,
-                                index,
-                                PlatformHandle::new("mismatch:service-runtime-lineage-substituted")
-                                    .map_err(|error| platform_error(&error))?,
-                            );
+                        if let Some(lineage) = service_runtime_lineage {
+                            match self.bind_service_start_lineage(&mut transaction, index, lineage)
+                            {
+                                Ok(()) => {}
+                                Err(error @ InstallationError::CompareAndSaveConflict { .. }) => {
+                                    return Err(error);
+                                }
+                                Err(_) => {
+                                    let recovery = service_runtime_recovery_reference(&request)?;
+                                    return self.persist_service_effect_unknown(
+                                        transaction,
+                                        index,
+                                        recovery,
+                                    );
+                                }
+                            }
                         }
                         // SCM is still transitioning.  Preserve the exact
                         // intent and return without another external call. A
@@ -7669,11 +9272,28 @@ where
                         // non-owning.
                         return Ok(InstallationStepOutcome::Rejected);
                     }
-                    return self.persist_unknown(
+                    let recovery_reference = service_runtime_recovery_reference(&request)?;
+                    return self.persist_service_effect_unknown(
                         transaction,
                         index,
-                        PlatformHandle::new("mismatch:service-start-not-running")
+                        recovery_reference,
+                    );
+                }
+                if was_intent
+                    && matches!(
+                        transaction.installer_effects[index],
+                        InstallerEffectPlan::RegisterService { .. }
+                    )
+                {
+                    let terminal_ref = match evidence.first() {
+                        Some(evidence) => evidence.clone(),
+                        None => service_registration_redacted_reference(&request)
                             .map_err(|error| platform_error(&error))?,
+                    };
+                    return self.persist_service_registration_terminal(
+                        transaction,
+                        index,
+                        terminal_ref,
                     );
                 }
                 let preserves_secret_attempt = matches!(
@@ -7709,25 +9329,15 @@ where
                             | InstallerEffectPlan::ProvisionStoreCredential { .. }
                             | InstallerEffectPlan::StagePackage { .. }
                     ) {
-                        let reference = match self.port.fresh_ownership_secret_reference(&request) {
-                            PortOutcome::Known(reference) => reference,
-                            other => {
-                                return self.persist_unknown(
-                                    transaction,
-                                    index,
-                                    port_pending(other),
-                                );
-                            }
+                        let PortOutcome::Known(reference) =
+                            self.port.fresh_ownership_secret_reference(&request)
+                        else {
+                            return Ok(InstallationStepOutcome::Rejected);
                         };
-                        let proof = match self.port.prepare_ownership_secret(&request, &reference) {
-                            PortOutcome::Known(proof) => proof,
-                            other => {
-                                return self.persist_unknown(
-                                    transaction,
-                                    index,
-                                    port_pending(other),
-                                );
-                            }
+                        let PortOutcome::Known(proof) =
+                            self.port.prepare_ownership_secret(&request, &reference)
+                        else {
+                            return Ok(InstallationStepOutcome::Rejected);
                         };
                         transaction.effect_progress[index].ownership_secret =
                             Some(InstallationOwnershipSecret {
@@ -7862,6 +9472,32 @@ where
                 }
                 let execution = match self.port.execute(&request) {
                     PortOutcome::Known(execution) => execution,
+                    other
+                        if matches!(
+                            &transaction.installer_effects[index],
+                            InstallerEffectPlan::RegisterService { .. }
+                                | InstallerEffectPlan::StartService { .. }
+                        ) && request.action == InstallationEffectAction::Apply =>
+                    {
+                        return if matches!(
+                            &transaction.installer_effects[index],
+                            InstallerEffectPlan::RegisterService { .. }
+                        ) {
+                            self.persist_service_registration_unknown_outcome(
+                                transaction,
+                                index,
+                                &other,
+                                &request,
+                            )
+                        } else {
+                            self.persist_service_runtime_unknown_outcome(
+                                transaction,
+                                index,
+                                &other,
+                                &request,
+                            )
+                        };
+                    }
                     PortOutcome::Partial { value, missing }
                         if matches!(
                             transaction.installer_effects[index],
@@ -7938,6 +9574,46 @@ where
                 let phase_b_execution_receipt = execution.phase_b_receipt.clone();
                 if matches!(
                     transaction.installer_effects[index],
+                    InstallerEffectPlan::RegisterService { .. }
+                ) && let Some(terminal) = execution.evidence.iter().find(|evidence| {
+                    is_service_terminal_reference_for_request(
+                        evidence.as_str(),
+                        &request,
+                        SERVICE_REGISTRATION_TERMINAL_REFERENCE_PREFIX,
+                    )
+                }) {
+                    return self.persist_service_registration_terminal(
+                        transaction,
+                        index,
+                        terminal.clone(),
+                    );
+                }
+                if matches!(
+                    transaction.installer_effects[index],
+                    InstallerEffectPlan::StartService { .. }
+                ) && let Some(terminal) = execution.evidence.iter().find(|evidence| {
+                    is_service_terminal_reference_for_request(
+                        evidence.as_str(),
+                        &request,
+                        SERVICE_RUNTIME_TERMINAL_REFERENCE_PREFIX,
+                    )
+                }) {
+                    // A durable start intent plus an authoritative terminal
+                    // readback is still an owner-controlled recovery case. Do
+                    // not quarantine the whole transaction and strand earlier
+                    // created effects; retain the terminal proof and enter the
+                    // normal bounded rollback contour.
+                    let recovery = service_runtime_recovery_reference(&request)?;
+                    return self.persist_service_effect_unknown_with_archive(
+                        transaction,
+                        index,
+                        recovery,
+                        Vec::new(),
+                        vec![terminal.clone()],
+                    );
+                }
+                if matches!(
+                    transaction.installer_effects[index],
                     InstallerEffectPlan::MaterializePhaseB { .. }
                 ) {
                     let Some(receipt) = phase_b_execution_receipt.as_ref() else {
@@ -7970,6 +9646,43 @@ where
                     );
                 }
                 if is_start_apply
+                    && execution.evidence.iter().any(|evidence| {
+                        is_service_start_post_call_recovery_reference_for_request(
+                            evidence.as_str(),
+                            &request,
+                        )
+                    })
+                {
+                    let recovery = service_runtime_recovery_reference(&request)?;
+                    return self.persist_service_start_uncertain_with_proof(
+                        transaction,
+                        index,
+                        &request,
+                        service_runtime_lineage.clone(),
+                        recovery,
+                        execution.evidence.clone(),
+                    );
+                }
+                let service_start_unknown_reference = if is_start_apply
+                    && service_start_disposition
+                        == Some(InstallationServiceStartDisposition::StartedByCaller)
+                {
+                    execution.evidence.iter().find_map(|evidence| {
+                        if is_typed_service_runtime_unknown_reference_for_request(
+                            evidence.as_str(),
+                            &request,
+                        ) {
+                            Some(evidence.clone())
+                        } else if evidence.as_str() == "service-start-ack-unknown" {
+                            service_runtime_redacted_reference(&request).ok()
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                };
+                if is_start_apply
                     && service_start_disposition
                         == Some(InstallationServiceStartDisposition::StartedByCaller)
                     && transaction.effect_progress[index]
@@ -7984,11 +9697,16 @@ where
                         } if *intent_digest == request_intent_digest
                     );
                     if !exact_intent {
-                        return self.persist_unknown(
+                        return Err(InstallationError::IdentityConflict);
+                    }
+                    if let Some(reference) = service_start_unknown_reference.as_ref() {
+                        return self.persist_service_start_uncertain_with_proof(
                             transaction,
                             index,
-                            PlatformHandle::new("mismatch:service-start-proof-intent")
-                                .map_err(|error| platform_error(&error))?,
+                            &request,
+                            service_runtime_lineage.clone(),
+                            reference.clone(),
+                            execution.evidence.clone(),
                         );
                     }
                     let expected = TransactionVersion::of(&transaction)?;
@@ -8010,23 +9728,24 @@ where
                         Some(InstallationServiceStartDisposition::AlreadyStarting) => {
                             // A foreign actor won the stopped -> starting race.
                             // No later readback may turn that actor into
-                            // transaction ownership.
-                            return self.persist_unknown(
+                            // transaction ownership. Keep the original
+                            // intent and request-correlated recovery slot.
+                            let recovery = service_runtime_recovery_reference(&request)?;
+                            return self.persist_service_effect_unknown(
                                 transaction,
                                 index,
-                                PlatformHandle::new("mismatch:service-start-already-starting")
-                                    .map_err(|error| platform_error(&error))?,
+                                recovery,
                             );
                         }
                         None => {
                             // The provider disposition is the only proof that
-                            // the caller issued StartServiceW.  Evidence or a
+                            // the caller issued StartServiceW. Evidence or a
                             // later Running readback cannot supply ownership.
-                            return self.persist_unknown(
+                            let recovery = service_runtime_recovery_reference(&request)?;
+                            return self.persist_service_effect_unknown(
                                 transaction,
                                 index,
-                                PlatformHandle::new("mismatch:missing-service-start-disposition")
-                                    .map_err(|error| platform_error(&error))?,
+                                recovery,
                             );
                         }
                     }
@@ -8046,6 +9765,16 @@ where
                     );
                 }
                 handles(&execution.evidence, "effect.execution.evidence", false)?;
+                if let Some(reference) = service_start_unknown_reference {
+                    return self.persist_service_start_uncertain_with_proof(
+                        transaction,
+                        index,
+                        &request,
+                        service_runtime_lineage.clone(),
+                        reference,
+                        execution.evidence.clone(),
+                    );
+                }
                 let expected_service_runtime_identity = if matches!(
                     transaction.installer_effects[index],
                     InstallerEffectPlan::StartService { .. }
@@ -8241,7 +9970,34 @@ where
                 }
                 let reconciled = match self.port.reconcile(&request) {
                     PortOutcome::Known(observation) => observation,
-                    other => return self.persist_unknown(transaction, index, port_pending(other)),
+                    other => {
+                        if matches!(
+                            &transaction.installer_effects[index],
+                            InstallerEffectPlan::RegisterService { .. }
+                                | InstallerEffectPlan::StartService { .. }
+                        ) && request.action == InstallationEffectAction::Apply
+                        {
+                            return if matches!(
+                                &transaction.installer_effects[index],
+                                InstallerEffectPlan::RegisterService { .. }
+                            ) {
+                                self.persist_service_registration_unknown_outcome(
+                                    transaction,
+                                    index,
+                                    &other,
+                                    &request,
+                                )
+                            } else {
+                                self.persist_service_runtime_unknown_outcome(
+                                    transaction,
+                                    index,
+                                    &other,
+                                    &request,
+                                )
+                            };
+                        }
+                        return self.persist_unknown(transaction, index, port_pending(other));
+                    }
                 };
                 reconciled.validate_for_effect(&transaction.installer_effects[index])?;
                 match reconciled {
@@ -8260,11 +10016,11 @@ where
                             expected_service_runtime_identity.as_deref()
                             && expected_identity != external_identity.as_str()
                         {
-                            return self.persist_unknown(
+                            let recovery = service_runtime_recovery_reference(&request)?;
+                            return self.persist_service_effect_unknown(
                                 transaction,
                                 index,
-                                PlatformHandle::new("mismatch:service-pid-substituted")
-                                    .map_err(|error| platform_error(&error))?,
+                                recovery,
                             );
                         }
                         if is_start_apply
@@ -8278,18 +10034,17 @@ where
                                 None => false,
                             };
                             if !lineage_matches {
-                                return self.persist_unknown(
+                                let recovery = service_runtime_recovery_reference(&request)?;
+                                return self.persist_service_effect_unknown(
                                     transaction,
                                     index,
-                                    PlatformHandle::new(
-                                        "mismatch:service-runtime-lineage-substituted",
-                                    )
-                                    .map_err(|error| platform_error(&error))?,
+                                    recovery,
                                 );
                             }
                         }
-                        let disposition = if is_start_apply {
-                            match service_start_disposition {
+                        let disposition =
+                            if is_start_apply {
+                                match service_start_disposition {
                                 Some(InstallationServiceStartDisposition::AlreadyRunning) => {
                                     InstallationEffectDisposition::PreexistingMatching
                                 }
@@ -8304,19 +10059,27 @@ where
                                     | InstallationServiceStartDisposition::AlreadyStarting,
                                 )
                                 | None => {
-                                    return self.persist_unknown(
-                                        transaction,
-                                        index,
-                                        PlatformHandle::new(
-                                            "mismatch:service-start-ownership-disposition",
-                                        )
-                                        .map_err(|error| platform_error(&error))?,
+                                    let recovery = service_runtime_recovery_reference(&request)?;
+                                    return self.persist_service_effect_unknown(
+                                        transaction, index, recovery,
                                     );
                                 }
                             }
-                        } else {
-                            disposition
-                        };
+                            } else {
+                                disposition
+                            };
+                        if matches!(
+                            &transaction.installer_effects[index],
+                            InstallerEffectPlan::RegisterService { .. }
+                        ) && disposition != InstallationEffectDisposition::CreatedByTransaction
+                        {
+                            return self.persist_service_registration_terminal(
+                                transaction,
+                                index,
+                                PlatformHandle::new("mismatch:service-registration-disposition")
+                                    .map_err(|error| platform_error(&error))?,
+                            );
+                        }
                         let ownership =
                             transaction.effect_progress[index].ownership_secret.as_ref();
                         let authorized = match disposition {
@@ -8376,25 +10139,70 @@ where
                         if is_start_apply
                             && service_start_disposition
                                 == Some(InstallationServiceStartDisposition::StartedByCaller)
-                            && evidence
-                                .iter()
-                                .any(|evidence| evidence.as_str().starts_with("service-starting:"))
-                            && let Some(lineage) = service_runtime_lineage
-                            && self
-                                .bind_service_start_lineage(&mut transaction, index, lineage)
-                                .is_err()
+                            && evidence.iter().any(|evidence| {
+                                is_service_starting_reference_for_request(
+                                    evidence.as_str(),
+                                    &request,
+                                ) || is_service_start_pending_unknown_reference_for_request(
+                                    evidence.as_str(),
+                                    &request,
+                                )
+                            })
                         {
-                            return self.persist_unknown(
+                            if let Some(lineage) = service_runtime_lineage {
+                                match self.bind_service_start_lineage(
+                                    &mut transaction,
+                                    index,
+                                    lineage,
+                                ) {
+                                    Ok(()) => {}
+                                    Err(
+                                        error @ InstallationError::CompareAndSaveConflict { .. },
+                                    ) => {
+                                        return Err(error);
+                                    }
+                                    Err(_) => {
+                                        let recovery =
+                                            service_runtime_recovery_reference(&request)?;
+                                        return self.persist_service_effect_unknown(
+                                            transaction,
+                                            index,
+                                            recovery,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if was_intent
+                            && matches!(
+                                transaction.installer_effects[index],
+                                InstallerEffectPlan::RegisterService { .. }
+                            )
+                        {
+                            let terminal_ref = match evidence.first() {
+                                Some(evidence) => evidence.clone(),
+                                None => service_registration_redacted_reference(&request)
+                                    .map_err(|error| platform_error(&error))?,
+                            };
+                            return self.persist_service_registration_terminal(
                                 transaction,
                                 index,
-                                PlatformHandle::new("mismatch:service-runtime-lineage-substituted")
-                                    .map_err(|error| platform_error(&error))?,
+                                terminal_ref,
                             );
                         }
                         // The durable intent remains authoritative. A later
                         // drive must reconcile it again and may retry only
                         // after proving the same absence and precondition.
                         Ok(InstallationStepOutcome::Rejected)
+                    }
+                    InstallationEffectObservation::Absent { .. } if is_start_apply => {
+                        let terminal = service_terminal_reference(
+                            &request,
+                            SERVICE_RUNTIME_TERMINAL_REFERENCE_PREFIX,
+                            "absent",
+                        )
+                        .map_err(|error| platform_error(&error))?;
+                        self.persist_quarantined(transaction, terminal)
                     }
                     InstallationEffectObservation::Absent { .. } => self.persist_unknown(
                         transaction,
@@ -8403,7 +10211,23 @@ where
                             .map_err(|error| platform_error(&error))?,
                     ),
                     InstallationEffectObservation::Mismatch { pending_ref } => {
-                        self.persist_unknown(transaction, index, pending_ref)
+                        if matches!(
+                            transaction.installer_effects[index],
+                            InstallerEffectPlan::RegisterService { .. }
+                        ) {
+                            self.persist_service_registration_terminal(
+                                transaction,
+                                index,
+                                pending_ref,
+                            )
+                        } else if matches!(
+                            transaction.installer_effects[index],
+                            InstallerEffectPlan::StartService { .. }
+                        ) {
+                            self.persist_quarantined(transaction, pending_ref)
+                        } else {
+                            self.persist_unknown(transaction, index, pending_ref)
+                        }
                     }
                 }
             }
@@ -8524,23 +10348,59 @@ where
                 });
             }
             let expected = TransactionVersion::of(&transaction)?;
-            let pending = if transaction.pending_external_changes.is_empty() {
-                transaction
-                    .effect_progress
-                    .iter()
-                    .filter_map(|progress| match &progress.state {
+            let mut pending = transaction.pending_external_changes.clone();
+            if pending.is_empty() {
+                for (index, progress) in transaction.effect_progress.iter().enumerate() {
+                    match &progress.state {
                         InstallationEffectProgressState::Unknown { pending_ref } => {
-                            Some(pending_ref.clone())
+                            merge_pending_external_changes(
+                                &mut pending,
+                                &mut transaction.completed_stage_refs,
+                                pending_ref.clone(),
+                            )?;
                         }
-                        InstallationEffectProgressState::IntentCommitted {
-                            intent_digest, ..
-                        } => Some(intent_digest.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                transaction.pending_external_changes.clone()
-            };
+                        InstallationEffectProgressState::IntentCommitted { .. } => {
+                            if matches!(
+                                transaction.installer_effects[index],
+                                InstallerEffectPlan::RegisterService { .. }
+                                    | InstallerEffectPlan::StartService { .. }
+                            ) {
+                                let (request, _) =
+                                    service_effect_intent_request(&transaction, index)?;
+                                let reference = if matches!(
+                                    transaction.installer_effects[index],
+                                    InstallerEffectPlan::StartService { .. }
+                                ) {
+                                    service_runtime_recovery_reference(&request)?
+                                } else {
+                                    service_registration_recovery_reference(&request)?
+                                };
+                                merge_pending_external_changes(
+                                    &mut pending,
+                                    &mut transaction.completed_stage_refs,
+                                    reference,
+                                )?;
+                            } else {
+                                let InstallationEffectProgressState::IntentCommitted {
+                                    intent_digest,
+                                    ..
+                                } = &progress.state
+                                else {
+                                    return Err(InstallationError::IdentityConflict);
+                                };
+                                merge_pending_external_changes(
+                                    &mut pending,
+                                    &mut transaction.completed_stage_refs,
+                                    intent_digest.clone(),
+                                )?;
+                            }
+                        }
+                        InstallationEffectProgressState::Pending
+                        | InstallationEffectProgressState::Applied { .. }
+                        | InstallationEffectProgressState::ReconciledAbsent { .. } => {}
+                    }
+                }
+            }
             if pending.is_empty() {
                 return Err(InstallationError::IllegalTransition {
                     from: transaction.stage,
@@ -8553,21 +10413,123 @@ where
             transaction.validate()?;
             self.store.compare_and_save(expected, &transaction)?;
         }
-        let unreconciled = transaction
+        let transaction_id = transaction.transaction_id.clone();
+        let max_reconcile_passes = transaction
+            .installer_effects
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| InstallationError::InvalidField {
+                field: "installer_effects".to_owned(),
+                reason: "service effect recovery bound overflow".to_owned(),
+            })?;
+        for _ in 0..max_reconcile_passes {
+            let Some(index) = service_effect_intent_index(&transaction) else {
+                break;
+            };
+            let (request, _) = service_effect_intent_request(&transaction, index)?;
+            let is_start = matches!(
+                transaction.installer_effects[index],
+                InstallerEffectPlan::StartService { .. }
+            );
+            let has_correlated_reference =
+                transaction.pending_external_changes.iter().any(|pending| {
+                    is_legacy_service_intent_reference_for_request(pending.as_str(), &request)
+                        || if is_start {
+                            is_service_runtime_recovery_reference_for_request(
+                                pending.as_str(),
+                                &request,
+                            )
+                        } else {
+                            is_service_registration_recovery_reference_for_request(
+                                pending.as_str(),
+                                &request,
+                            )
+                        }
+                });
+            if !has_correlated_reference {
+                let recovery_reference = if is_start {
+                    service_runtime_recovery_reference(&request)?
+                } else {
+                    service_registration_recovery_reference(&request)?
+                };
+                let expected = TransactionVersion::of(&transaction)?;
+                transaction.merge_pending_references(vec![recovery_reference])?;
+                increment_revision(&mut transaction)?;
+                transaction.validate()?;
+                self.store.compare_and_save(expected, &transaction)?;
+            }
+            let outcome = self.drive_effect_at_mode(&transaction_id, wall_clock_millis(), true)?;
+            if !matches!(outcome, InstallationStepOutcome::Applied { .. }) {
+                return Ok(outcome);
+            }
+            transaction = self.store.load(&transaction_id)?.ok_or_else(|| {
+                InstallationError::TransactionNotFound {
+                    transaction_id: transaction_id.as_str().to_owned(),
+                }
+            })?;
+            transaction.validate()?;
+            let recovered_effect_is_exact =
+                transaction
+                    .installer_effects
+                    .get(index)
+                    .is_some_and(|effect| {
+                        matches!(
+                            effect,
+                            InstallerEffectPlan::RegisterService { .. }
+                                | InstallerEffectPlan::StartService { .. }
+                        )
+                    })
+                    && transaction
+                        .effect_progress
+                        .get(index)
+                        .is_some_and(|progress| {
+                            matches!(
+                                progress.state,
+                                InstallationEffectProgressState::Applied {
+                                    disposition:
+                                        InstallationEffectDisposition::CreatedByTransaction,
+                                    ..
+                                }
+                            ) || (is_start
+                                && matches!(
+                                    progress.state,
+                                    InstallationEffectProgressState::ReconciledAbsent { .. }
+                                ))
+                        });
+            if !recovered_effect_is_exact {
+                return Ok(InstallationStepOutcome::RollbackRequired {
+                    pending_refs: transaction.pending_external_changes.clone(),
+                });
+            }
+            let expected = TransactionVersion::of(&transaction)?;
+            let previous_pending_len = transaction.pending_external_changes.len();
+            Self::remove_service_effect_recovery_references(&mut transaction, &request)?;
+            if transaction.pending_external_changes.len() != previous_pending_len {
+                increment_revision(&mut transaction)?;
+                transaction.validate()?;
+                self.store.compare_and_save(expected, &transaction)?;
+            }
+        }
+        if service_effect_intent_index(&transaction).is_some() {
+            return Ok(InstallationStepOutcome::RollbackRequired {
+                pending_refs: transaction.pending_external_changes.clone(),
+            });
+        }
+        if transaction
             .effect_progress
             .iter()
-            .find_map(|progress| match &progress.state {
-                InstallationEffectProgressState::Unknown { pending_ref } => {
-                    Some(pending_ref.clone())
-                }
-                InstallationEffectProgressState::IntentCommitted { intent_digest, .. } => {
-                    Some(intent_digest.clone())
-                }
-                InstallationEffectProgressState::Pending
-                | InstallationEffectProgressState::Applied { .. } => None,
-            });
-        if let Some(pending_ref) = unreconciled {
-            return self.persist_quarantined(transaction, pending_ref);
+            .any(|progress| matches!(progress.state, InstallationEffectProgressState::Pending))
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "rollback cannot finalize while an ordered effect suffix remains pending"
+                    .to_owned(),
+            ));
+        }
+        let expected = TransactionVersion::of(&transaction)?;
+        if remove_transaction_scoped_pending_references(&mut transaction) {
+            increment_revision(&mut transaction)?;
+            transaction.validate()?;
+            self.store.compare_and_save(expected, &transaction)?;
         }
         let retained_phase_b_effect = transaction
             .installer_effects
@@ -8594,6 +10556,66 @@ where
                 .map_err(|error| platform_error(&error))?,
             );
         }
+        if pending_external_changes_have_unmatched_reference(&transaction) {
+            let Some(pending_ref) = transaction.pending_external_changes.first().cloned() else {
+                return Err(InstallationError::IdentityConflict);
+            };
+            return self.persist_quarantined(transaction, pending_ref);
+        }
+        let unreconciled = transaction
+            .effect_progress
+            .iter()
+            .find_map(|progress| match &progress.state {
+                InstallationEffectProgressState::Unknown { pending_ref } => {
+                    Some(pending_ref.clone())
+                }
+                InstallationEffectProgressState::IntentCommitted { intent_digest, .. } => {
+                    Some(intent_digest.clone())
+                }
+                InstallationEffectProgressState::Pending
+                | InstallationEffectProgressState::Applied { .. }
+                | InstallationEffectProgressState::ReconciledAbsent { .. } => None,
+            });
+        if let Some(pending_ref) = unreconciled {
+            let first_unresolved = transaction
+                .effect_progress
+                .iter()
+                .position(|progress| {
+                    !matches!(
+                        progress.state,
+                        InstallationEffectProgressState::Applied { .. }
+                            | InstallationEffectProgressState::ReconciledAbsent { .. }
+                    )
+                })
+                .unwrap_or(transaction.effect_progress.len());
+            if transaction
+                .installer_effects
+                .get(first_unresolved)
+                .is_some_and(|effect| matches!(effect, InstallerEffectPlan::RegisterService { .. }))
+                && transaction
+                    .effect_progress
+                    .get(first_unresolved)
+                    .is_some_and(|progress| {
+                        matches!(
+                            progress.state,
+                            InstallationEffectProgressState::IntentCommitted { .. }
+                        )
+                    })
+            {
+                let (request, _) = service_effect_intent_request(&transaction, first_unresolved)?;
+                let recovery_ref = service_registration_recovery_reference(&request)?;
+                let expected = TransactionVersion::of(&transaction)?;
+                transaction.merge_pending_references(vec![recovery_ref])?;
+                transaction.stage = InstallationStage::RollbackRequired;
+                increment_revision(&mut transaction)?;
+                transaction.validate()?;
+                self.store.compare_and_save(expected, &transaction)?;
+                return Ok(InstallationStepOutcome::RollbackRequired {
+                    pending_refs: transaction.pending_external_changes.clone(),
+                });
+            }
+            return self.persist_quarantined(transaction, pending_ref);
+        }
         let mut credential_absence_refs = Vec::new();
         for index in (0..transaction.effect_progress.len()).rev() {
             let InstallationEffectProgressState::Applied {
@@ -8616,7 +10638,35 @@ where
                     observed.validate()?;
                     observed
                 }
-                other => return self.persist_quarantined(transaction, port_pending(other)),
+                other => {
+                    return if matches!(
+                        &transaction.installer_effects[index],
+                        InstallerEffectPlan::RegisterService { .. }
+                    ) {
+                        let evidence =
+                            service_registration_pending_evidence_for_request(&other, &request)?;
+                        self.persist_quarantined_with_evidence(
+                            transaction,
+                            evidence.correlated,
+                            evidence.preserved,
+                            evidence.archived,
+                        )
+                    } else if matches!(
+                        &transaction.installer_effects[index],
+                        InstallerEffectPlan::StartService { .. }
+                    ) {
+                        let evidence =
+                            service_runtime_pending_evidence_for_request(&other, &request)?;
+                        self.persist_quarantined_with_evidence(
+                            transaction,
+                            evidence.correlated,
+                            evidence.preserved,
+                            evidence.archived,
+                        )
+                    } else {
+                        self.persist_quarantined(transaction, port_pending(other))
+                    };
+                }
             };
             match observed {
                 InstallationEffectObservation::Absent { evidence, .. } => {
@@ -8632,17 +10682,34 @@ where
                                     == StoreCredentialLifecycle::DeleteIntentCommitted
                             })
                         {
+                            let old_request = request.clone();
                             let expected = TransactionVersion::of(&transaction)?;
                             transaction.effect_progress[index]
                                 .store_credential
                                 .as_mut()
                                 .ok_or(InstallationError::IdentityConflict)?
                                 .lifecycle = StoreCredentialLifecycle::DeleteExecuted;
+                            request = effect_request(
+                                &transaction,
+                                index,
+                                1,
+                                InstallationEffectAction::Rollback,
+                                request.expected_external_identity.clone(),
+                            )?;
+                            Self::rebind_legacy_cleanup_recovery_references(
+                                &mut transaction,
+                                &old_request,
+                                &request,
+                            )?;
                             increment_revision(&mut transaction)?;
                             transaction.validate()?;
                             self.store.compare_and_save(expected, &transaction)?;
                         }
                         credential_absence_refs.extend(evidence);
+                        self.persist_cleanup_recovery_reference_removal(
+                            &mut transaction,
+                            &request,
+                        )?;
                     }
                     continue;
                 }
@@ -8655,6 +10722,7 @@ where
                         transaction.installer_effects[index],
                         InstallerEffectPlan::ProvisionStoreCredential { .. }
                     ) {
+                        let old_request = request.clone();
                         let expected = TransactionVersion::of(&transaction)?;
                         let credential = transaction.effect_progress[index]
                             .store_credential
@@ -8670,9 +10738,6 @@ where
                                 }
                                 credential.lifecycle =
                                     StoreCredentialLifecycle::DeleteIntentCommitted;
-                                increment_revision(&mut transaction)?;
-                                transaction.validate()?;
-                                self.store.compare_and_save(expected, &transaction)?;
                                 request = effect_request(
                                     &transaction,
                                     index,
@@ -8680,6 +10745,14 @@ where
                                     InstallationEffectAction::Rollback,
                                     Some(external_identity.clone()),
                                 )?;
+                                Self::rebind_legacy_cleanup_recovery_references(
+                                    &mut transaction,
+                                    &old_request,
+                                    &request,
+                                )?;
+                                increment_revision(&mut transaction)?;
+                                transaction.validate()?;
+                                self.store.compare_and_save(expected, &transaction)?;
                             }
                             StoreCredentialLifecycle::DeleteIntentCommitted => {}
                             StoreCredentialLifecycle::DeleteExecuted
@@ -8702,20 +10775,45 @@ where
                             ..
                         }) => {}
                         PortOutcome::Unknown(reason) if credential_effect => {
-                            return Ok(InstallationStepOutcome::RollbackRequired {
-                                pending_refs: vec![port_pending(PortOutcome::<()>::Unknown(
-                                    reason,
-                                ))],
-                            });
+                            let pending = port_pending(PortOutcome::<()>::Unknown(reason));
+                            return self.persist_rollback_required(transaction, &request, &pending);
                         }
                         other => {
-                            return self.persist_quarantined(transaction, port_pending(other));
+                            return if matches!(
+                                &transaction.installer_effects[index],
+                                InstallerEffectPlan::RegisterService { .. }
+                            ) {
+                                let evidence = service_registration_pending_evidence_for_request(
+                                    &other, &request,
+                                )?;
+                                self.persist_quarantined_with_evidence(
+                                    transaction,
+                                    evidence.correlated,
+                                    evidence.preserved,
+                                    evidence.archived,
+                                )
+                            } else if matches!(
+                                &transaction.installer_effects[index],
+                                InstallerEffectPlan::StartService { .. }
+                            ) {
+                                let evidence =
+                                    service_runtime_pending_evidence_for_request(&other, &request)?;
+                                self.persist_quarantined_with_evidence(
+                                    transaction,
+                                    evidence.correlated,
+                                    evidence.preserved,
+                                    evidence.archived,
+                                )
+                            } else {
+                                self.persist_quarantined(transaction, port_pending(other))
+                            };
                         }
                     }
                     if matches!(
                         transaction.installer_effects[index],
                         InstallerEffectPlan::ProvisionStoreCredential { .. }
                     ) {
+                        let old_request = request.clone();
                         let expected = TransactionVersion::of(&transaction)?;
                         let credential = transaction.effect_progress[index]
                             .store_credential
@@ -8728,9 +10826,6 @@ where
                             return Err(InstallationError::IdentityConflict);
                         }
                         credential.lifecycle = StoreCredentialLifecycle::DeleteExecuted;
-                        increment_revision(&mut transaction)?;
-                        transaction.validate()?;
-                        self.store.compare_and_save(expected, &transaction)?;
                         request = effect_request(
                             &transaction,
                             index,
@@ -8738,13 +10833,50 @@ where
                             InstallationEffectAction::Rollback,
                             Some(external_identity.clone()),
                         )?;
+                        Self::rebind_legacy_cleanup_recovery_references(
+                            &mut transaction,
+                            &old_request,
+                            &request,
+                        )?;
+                        increment_revision(&mut transaction)?;
+                        transaction.validate()?;
+                        self.store.compare_and_save(expected, &transaction)?;
                     }
                     let reconciled = match self.port.reconcile(&request) {
                         PortOutcome::Known(reconciled) => {
                             reconciled.validate()?;
                             reconciled
                         }
-                        other => return self.persist_quarantined(transaction, port_pending(other)),
+                        other => {
+                            return if matches!(
+                                &transaction.installer_effects[index],
+                                InstallerEffectPlan::RegisterService { .. }
+                            ) {
+                                let evidence = service_registration_pending_evidence_for_request(
+                                    &other, &request,
+                                )?;
+                                self.persist_quarantined_with_evidence(
+                                    transaction,
+                                    evidence.correlated,
+                                    evidence.preserved,
+                                    evidence.archived,
+                                )
+                            } else if matches!(
+                                &transaction.installer_effects[index],
+                                InstallerEffectPlan::StartService { .. }
+                            ) {
+                                let evidence =
+                                    service_runtime_pending_evidence_for_request(&other, &request)?;
+                                self.persist_quarantined_with_evidence(
+                                    transaction,
+                                    evidence.correlated,
+                                    evidence.preserved,
+                                    evidence.archived,
+                                )
+                            } else {
+                                self.persist_quarantined(transaction, port_pending(other))
+                            };
+                        }
                     };
                     match reconciled {
                         InstallationEffectObservation::Absent { evidence, .. } => {
@@ -8754,6 +10886,10 @@ where
                             ) {
                                 credential_absence_refs.extend(evidence);
                             }
+                            self.persist_cleanup_recovery_reference_removal(
+                                &mut transaction,
+                                &request,
+                            )?;
                             continue;
                         }
                         other => {
@@ -8774,17 +10910,7 @@ where
                 continue;
             };
             let secret_reference = ownership.reference.clone();
-            if ownership.lifecycle == InstallationSecretLifecycle::Active {
-                let expected = TransactionVersion::of(&transaction)?;
-                transaction.effect_progress[index]
-                    .ownership_secret
-                    .as_mut()
-                    .ok_or(InstallationError::IdentityConflict)?
-                    .lifecycle = InstallationSecretLifecycle::DeleteIntentCommitted;
-                increment_revision(&mut transaction)?;
-                transaction.validate()?;
-                self.store.compare_and_save(expected, &transaction)?;
-            }
+            let ownership_lifecycle = ownership.lifecycle;
             let external_identity = match &transaction.effect_progress[index].state {
                 InstallationEffectProgressState::Applied {
                     disposition: InstallationEffectDisposition::CreatedByTransaction,
@@ -8799,43 +10925,83 @@ where
                     );
                 }
             };
-            let request = effect_request(
-                &transaction,
-                index,
-                1,
-                InstallationEffectAction::Rollback,
-                Some(external_identity),
-            )?;
+            let request = if ownership_lifecycle == InstallationSecretLifecycle::Active {
+                let old_request = effect_request(
+                    &transaction,
+                    index,
+                    1,
+                    InstallationEffectAction::Rollback,
+                    Some(external_identity.clone()),
+                )?;
+                let expected = TransactionVersion::of(&transaction)?;
+                transaction.effect_progress[index]
+                    .ownership_secret
+                    .as_mut()
+                    .ok_or(InstallationError::IdentityConflict)?
+                    .lifecycle = InstallationSecretLifecycle::DeleteIntentCommitted;
+                let new_request = effect_request(
+                    &transaction,
+                    index,
+                    1,
+                    InstallationEffectAction::Rollback,
+                    Some(external_identity),
+                )?;
+                Self::rebind_legacy_cleanup_recovery_references(
+                    &mut transaction,
+                    &old_request,
+                    &new_request,
+                )?;
+                increment_revision(&mut transaction)?;
+                transaction.validate()?;
+                self.store.compare_and_save(expected, &transaction)?;
+                new_request
+            } else {
+                effect_request(
+                    &transaction,
+                    index,
+                    1,
+                    InstallationEffectAction::Rollback,
+                    Some(external_identity),
+                )?
+            };
             let absent = match self.port.ownership_secret_absent(&request) {
                 PortOutcome::Known(absent) => absent,
                 other => {
-                    return Ok(InstallationStepOutcome::RollbackRequired {
-                        pending_refs: vec![port_pending(other)],
-                    });
+                    let pending = port_pending(other);
+                    return self.persist_rollback_required(transaction, &request, &pending);
                 }
             };
             if !absent {
                 match self.port.delete_ownership_secret(&request) {
                     PortOutcome::Known(()) => {}
                     other => {
-                        return Ok(InstallationStepOutcome::RollbackRequired {
-                            pending_refs: vec![port_pending(other)],
-                        });
+                        let pending = port_pending(other);
+                        return self.persist_rollback_required(transaction, &request, &pending);
                     }
                 }
                 match self.port.ownership_secret_absent(&request) {
                     PortOutcome::Known(true) => {}
                     other => {
-                        return Ok(InstallationStepOutcome::RollbackRequired {
-                            pending_refs: vec![port_pending(other)],
-                        });
+                        let pending = port_pending(other);
+                        return self.persist_rollback_required(transaction, &request, &pending);
                     }
                 }
             }
+            self.persist_cleanup_recovery_reference_removal(&mut transaction, &request)?;
             secret_absence_refs.push(ownership_secret_absence_evidence(&secret_reference));
         }
+        let legacy_expected = TransactionVersion::of(&transaction)?;
+        if remove_resolved_legacy_rollback_references(&mut transaction) {
+            increment_revision(&mut transaction)?;
+            transaction.validate()?;
+            self.store.compare_and_save(legacy_expected, &transaction)?;
+        }
+        if !transaction.pending_external_changes.is_empty() {
+            return Ok(InstallationStepOutcome::RollbackRequired {
+                pending_refs: transaction.pending_external_changes.clone(),
+            });
+        }
         let expected = TransactionVersion::of(&transaction)?;
-        transaction.pending_external_changes.clear();
         transaction.stage = InstallationStage::RolledBack;
         for progress in &mut transaction.effect_progress {
             if let Some(ownership) = &mut progress.ownership_secret {
@@ -8868,8 +11034,111 @@ where
         })
     }
 
+    fn persist_service_start_reconciled_absent(
+        &mut self,
+        mut transaction: InstallationTransaction,
+        index: usize,
+        request: &InstallationEffectRequest,
+        evidence: Vec<PlatformHandle>,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        if transaction.stage != InstallationStage::RollbackRequired
+            || !matches!(
+                transaction.installer_effects[index],
+                InstallerEffectPlan::StartService { .. }
+            )
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let InstallationEffectProgressState::IntentCommitted {
+            attempt,
+            intent_digest,
+        } = &transaction.effect_progress[index].state
+        else {
+            return Err(InstallationError::IdentityConflict);
+        };
+        let attempt = *attempt;
+        let intent_digest = intent_digest.clone();
+        let request_digest = request.intent_digest()?;
+        if request_digest != intent_digest {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let Some(proof) = transaction.effect_progress[index]
+            .service_start_proof
+            .as_ref()
+        else {
+            return Err(InstallationError::IncompleteObservation(
+                "stopped service reconciliation requires the original caller-start proof"
+                    .to_owned(),
+            ));
+        };
+        if proof.intent_digest != request_digest {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if transaction.effect_progress[index]
+            .admitted_precondition
+            .as_ref()
+            .is_none_or(|precondition| precondition.os_snapshot.is_none())
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "reconciled service absence requires the originally admitted OS snapshot"
+                    .to_owned(),
+            ));
+        }
+        if transaction.effect_progress[index + 1..]
+            .iter()
+            .any(|progress| {
+                !matches!(
+                    progress.state,
+                    InstallationEffectProgressState::Applied { .. }
+                )
+            })
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "reconciled service absence cannot terminalize an unresolved effect suffix"
+                    .to_owned(),
+            ));
+        }
+        handles(&evidence, "reconciled_absent.evidence_refs", true)?;
+        if evidence.is_empty()
+            || evidence.iter().any(|reference| {
+                !is_service_stopped_reference_for_request(reference.as_str(), request)
+            })
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let reconciliation_digest =
+            WindowsInstallationEffectPort::service_start_reconciled_absent_digest(
+                &transaction.transaction_id,
+                &request.effect_id,
+                &transaction.installer_plan_digest,
+                &request_digest,
+                request.registration_nonce.as_ref(),
+                attempt,
+                &evidence,
+            )?;
+        let expected = TransactionVersion::of(&transaction)?;
+        transaction.effect_progress[index].state =
+            InstallationEffectProgressState::ReconciledAbsent {
+                attempt,
+                intent_digest: request_digest,
+                evidence_refs: evidence.clone(),
+                reconciliation_digest,
+            };
+        Self::remove_service_effect_recovery_references(&mut transaction, request)?;
+        transaction
+            .observed_postconditions
+            .extend(evidence.iter().cloned());
+        increment_revision(&mut transaction)?;
+        transaction.validate()?;
+        self.store.compare_and_save(expected, &transaction)?;
+        Ok(InstallationStepOutcome::Applied {
+            stage: transaction.stage,
+            evidence_refs: evidence,
+        })
+    }
+
     /// Captures the first non-zero provider-authenticated lineage observed
-    /// while an exact caller-issued start is still `START_PENDING`.  A later
+    /// while an exact caller-issued start is still `START_PENDING`. A later
     /// `Running` readback may only use this persisted lineage; coordinator
     /// memory or registration identity cannot substitute for it.
     fn bind_service_start_lineage(
@@ -8881,7 +11150,7 @@ where
         let expected = TransactionVersion::of(transaction)?;
         let Some(proof) = transaction.effect_progress[index]
             .service_start_proof
-            .as_mut()
+            .as_ref()
         else {
             return Err(InstallationError::IdentityConflict);
         };
@@ -8891,7 +11160,147 @@ where
             }
             return Ok(());
         }
+        let mut next = transaction.clone();
+        let Some(proof) = next.effect_progress[index].service_start_proof.as_mut() else {
+            return Err(InstallationError::IdentityConflict);
+        };
         proof.process_lineage = Some(lineage);
+        increment_revision(&mut next)?;
+        next.validate()?;
+        self.store.compare_and_save(expected, &next)?;
+        *transaction = next;
+        Ok(())
+    }
+
+    fn remove_service_effect_recovery_references(
+        transaction: &mut InstallationTransaction,
+        request: &InstallationEffectRequest,
+    ) -> Result<(), InstallationError> {
+        if request.transaction_id != transaction.transaction_id
+            || request.plan_digest != transaction.installer_plan_digest
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let request_digest = request.intent_digest()?;
+        let (owns_effect, is_start) = transaction
+            .installer_effects
+            .iter()
+            .enumerate()
+            .find_map(|(index, effect)| {
+                (transaction.effect_progress[index].effect_id == request.effect_id).then_some((
+                    matches!(
+                        effect,
+                        InstallerEffectPlan::RegisterService { .. }
+                            | InstallerEffectPlan::StartService { .. }
+                    ),
+                    matches!(effect, InstallerEffectPlan::StartService { .. }),
+                ))
+            })
+            .ok_or(InstallationError::IdentityConflict)?;
+        if !owns_effect {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let owned = transaction
+            .pending_external_changes
+            .iter()
+            .filter(|pending| {
+                pending.as_str() == request_digest.as_str()
+                    || if is_start {
+                        is_service_runtime_recovery_reference_for_request(pending.as_str(), request)
+                    } else {
+                        is_service_registration_recovery_reference_for_request(
+                            pending.as_str(),
+                            request,
+                        )
+                    }
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        transaction
+            .pending_external_changes
+            .retain(|pending| !owned.contains(pending));
+        for reference in owned {
+            if !transaction.completed_stage_refs.contains(&reference) {
+                transaction.completed_stage_refs.push(reference);
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_cleanup_recovery_reference(
+        transaction: &mut InstallationTransaction,
+        request: &InstallationEffectRequest,
+    ) -> bool {
+        let owned = transaction
+            .pending_external_changes
+            .iter()
+            .filter(|pending| is_cleanup_unknown_reference_for_request(pending.as_str(), request))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let before = transaction.pending_external_changes.len();
+        transaction
+            .pending_external_changes
+            .retain(|pending| !owned.contains(pending));
+        for reference in owned {
+            if !transaction.completed_stage_refs.contains(&reference) {
+                transaction.completed_stage_refs.push(reference);
+            }
+        }
+        before != transaction.pending_external_changes.len()
+    }
+
+    fn rebind_legacy_cleanup_recovery_references(
+        transaction: &mut InstallationTransaction,
+        old_request: &InstallationEffectRequest,
+        new_request: &InstallationEffectRequest,
+    ) -> Result<bool, InstallationError> {
+        let old_digest = old_request.intent_digest()?;
+        let new_owner = cleanup_owner_digest(new_request)?;
+        let old_prefix = format!("{LEGACY_CLEANUP_UNKNOWN_REFERENCE_PREFIX}{old_digest}:");
+        let mut rebound = Vec::new();
+        for pending in &transaction.pending_external_changes {
+            let Some(rest) = pending.as_str().strip_prefix(&old_prefix) else {
+                continue;
+            };
+            if !is_lower_hex(rest, 64) {
+                continue;
+            }
+            let replacement = PlatformHandle::new(format!(
+                "{CLEANUP_UNKNOWN_REFERENCE_PREFIX}{}:{rest}",
+                new_owner.as_str()
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "pending_external_changes".to_owned(),
+                reason: error.to_string(),
+            })?;
+            rebound.push((pending.clone(), replacement));
+        }
+        if rebound.is_empty() {
+            return Ok(false);
+        }
+        for (old, replacement) in rebound {
+            transaction
+                .pending_external_changes
+                .retain(|pending| pending != &old);
+            if !transaction.pending_external_changes.contains(&replacement) {
+                transaction.pending_external_changes.push(replacement);
+            }
+            if !transaction.completed_stage_refs.contains(&old) {
+                transaction.completed_stage_refs.push(old);
+            }
+        }
+        Ok(true)
+    }
+
+    fn persist_cleanup_recovery_reference_removal(
+        &mut self,
+        transaction: &mut InstallationTransaction,
+        request: &InstallationEffectRequest,
+    ) -> Result<(), InstallationError> {
+        let expected = TransactionVersion::of(transaction)?;
+        if !Self::remove_cleanup_recovery_reference(transaction, request) {
+            return Ok(());
+        }
         increment_revision(transaction)?;
         transaction.validate()?;
         self.store.compare_and_save(expected, transaction)
@@ -8919,6 +11328,40 @@ where
         phase_b_receipt: Option<HostPhaseBMaterializationReceipt>,
     ) -> Result<InstallationStepOutcome, InstallationError> {
         let expected = TransactionVersion::of(&transaction)?;
+        let service_request = if matches!(
+            &transaction.installer_effects[index],
+            InstallerEffectPlan::RegisterService { .. } | InstallerEffectPlan::StartService { .. }
+        ) {
+            let attempt = match &transaction.effect_progress[index].state {
+                InstallationEffectProgressState::Pending => 1,
+                InstallationEffectProgressState::IntentCommitted {
+                    attempt,
+                    intent_digest,
+                } => {
+                    let request = effect_request(
+                        &transaction,
+                        index,
+                        *attempt,
+                        InstallationEffectAction::Apply,
+                        None,
+                    )?;
+                    if request.intent_digest()?.as_str() != intent_digest.as_str() {
+                        return Err(InstallationError::IdentityConflict);
+                    }
+                    *attempt
+                }
+                _ => return Err(InstallationError::IdentityConflict),
+            };
+            Some(effect_request(
+                &transaction,
+                index,
+                attempt,
+                InstallationEffectAction::Apply,
+                None,
+            )?)
+        } else {
+            None
+        };
         match (
             &transaction.installer_effects[index],
             &service_control_grant,
@@ -8993,6 +11436,9 @@ where
             evidence: evidence.clone(),
             postcondition_digest,
         };
+        if let Some(request) = service_request.as_ref() {
+            Self::remove_service_effect_recovery_references(&mut transaction, request)?;
+        }
         transaction.observed_postconditions.extend(evidence.clone());
         if matches!(
             transaction.installer_effects[index],
@@ -9026,6 +11472,246 @@ where
         })
     }
 
+    fn persist_service_registration_terminal(
+        &mut self,
+        transaction: InstallationTransaction,
+        index: usize,
+        terminal_ref: PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        if !matches!(
+            &transaction.installer_effects[index],
+            InstallerEffectPlan::RegisterService { .. }
+        ) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        match &transaction.effect_progress[index].state {
+            InstallationEffectProgressState::Pending => {
+                // No caller intent exists yet, so quarantine is the only
+                // truthful terminal disposition for this bounded attempt.
+                self.persist_quarantined(transaction, terminal_ref)
+            }
+            InstallationEffectProgressState::IntentCommitted {
+                attempt,
+                intent_digest,
+            } => {
+                let request = effect_request(
+                    &transaction,
+                    index,
+                    *attempt,
+                    InstallationEffectAction::Apply,
+                    None,
+                )?;
+                let request_digest = request.intent_digest()?;
+                if request_digest.as_str() != intent_digest.as_str() {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                // The intent is already durable. Preserve the authoritative
+                // terminal observation as pending evidence and leave the
+                // original IntentCommitted state intact so the exact bounded
+                // rollback owner can reconcile it. Quarantining here would
+                // strand earlier CreatedByTransaction effects.
+                let recovery = service_registration_recovery_reference(&request)?;
+                self.persist_service_effect_unknown_with_archive(
+                    transaction,
+                    index,
+                    recovery,
+                    Vec::new(),
+                    vec![terminal_ref],
+                )
+            }
+            _ => Err(InstallationError::IdentityConflict),
+        }
+    }
+
+    fn persist_service_start_uncertain_with_proof(
+        &mut self,
+        mut transaction: InstallationTransaction,
+        index: usize,
+        request: &InstallationEffectRequest,
+        process_lineage: Option<InstallationServiceProcessLineage>,
+        pending_ref: PlatformHandle,
+        evidence: Vec<PlatformHandle>,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        if !matches!(
+            transaction.installer_effects.get(index),
+            Some(InstallerEffectPlan::StartService { .. })
+        ) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let request_digest = request.intent_digest()?;
+        let stored_digest = match &transaction.effect_progress[index].state {
+            InstallationEffectProgressState::IntentCommitted { intent_digest, .. }
+                if intent_digest == &request_digest =>
+            {
+                intent_digest.clone()
+            }
+            _ => return Err(InstallationError::IdentityConflict),
+        };
+        if !is_service_runtime_recovery_reference_for_request(pending_ref.as_str(), request) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        handles(&evidence, "effect.execution.evidence", false)?;
+        let expected = TransactionVersion::of(&transaction)?;
+        let proof = transaction.effect_progress[index]
+            .service_start_proof
+            .get_or_insert(InstallationServiceStartProof {
+                intent_digest: stored_digest,
+                process_lineage: None,
+            });
+        if proof.intent_digest != request_digest {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if let Some(lineage) = process_lineage {
+            if proof
+                .process_lineage
+                .as_ref()
+                .is_some_and(|existing| existing != &lineage)
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            proof.process_lineage = Some(lineage);
+        }
+        for reference in evidence {
+            if !transaction.completed_stage_refs.contains(&reference) {
+                transaction.completed_stage_refs.push(reference);
+            }
+        }
+        transaction.merge_pending_references(vec![pending_ref])?;
+        transaction.stage = InstallationStage::RollbackRequired;
+        increment_revision(&mut transaction)?;
+        transaction.validate()?;
+        self.store.compare_and_save(expected, &transaction)?;
+        Ok(InstallationStepOutcome::RollbackRequired {
+            pending_refs: transaction.pending_external_changes.clone(),
+        })
+    }
+
+    fn persist_service_registration_unknown_outcome<T>(
+        &mut self,
+        transaction: InstallationTransaction,
+        index: usize,
+        outcome: &PortOutcome<T>,
+        request: &InstallationEffectRequest,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let evidence = service_registration_pending_evidence_for_request(outcome, request)?;
+        self.persist_service_effect_unknown_with_archive(
+            transaction,
+            index,
+            evidence.correlated,
+            evidence.preserved,
+            evidence.archived,
+        )
+    }
+
+    fn persist_service_runtime_unknown_outcome<T>(
+        &mut self,
+        transaction: InstallationTransaction,
+        index: usize,
+        outcome: &PortOutcome<T>,
+        request: &InstallationEffectRequest,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let evidence = service_runtime_pending_evidence_for_request(outcome, request)?;
+        self.persist_service_effect_unknown_with_archive(
+            transaction,
+            index,
+            evidence.correlated,
+            evidence.preserved,
+            evidence.archived,
+        )
+    }
+
+    fn persist_service_effect_unknown(
+        &mut self,
+        transaction: InstallationTransaction,
+        index: usize,
+        pending_ref: PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        self.persist_service_effect_unknown_with_archive(
+            transaction,
+            index,
+            pending_ref,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn persist_service_effect_unknown_with_archive(
+        &mut self,
+        mut transaction: InstallationTransaction,
+        index: usize,
+        pending_ref: PlatformHandle,
+        preserved: Vec<PlatformHandle>,
+        archived: Vec<PlatformHandle>,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        if !matches!(
+            &transaction.installer_effects[index],
+            InstallerEffectPlan::RegisterService { .. } | InstallerEffectPlan::StartService { .. }
+        ) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let (attempt, intent_digest, service_intent) =
+            match &transaction.effect_progress[index].state {
+                InstallationEffectProgressState::Pending => (1, None, false),
+                InstallationEffectProgressState::IntentCommitted {
+                    attempt,
+                    intent_digest,
+                } => (*attempt, Some(intent_digest), true),
+                _ => return Err(InstallationError::IdentityConflict),
+            };
+        let request = effect_request(
+            &transaction,
+            index,
+            attempt,
+            InstallationEffectAction::Apply,
+            None,
+        )?;
+        let request_digest = request.intent_digest()?;
+        let is_start = matches!(
+            &transaction.installer_effects[index],
+            InstallerEffectPlan::StartService { .. }
+        );
+        let correlated_reference = if is_start {
+            is_service_runtime_recovery_reference_for_request(pending_ref.as_str(), &request)
+        } else {
+            is_service_registration_recovery_reference_for_request(pending_ref.as_str(), &request)
+        };
+        if !correlated_reference
+            || intent_digest
+                .as_ref()
+                .is_some_and(|digest| request_digest.as_str() != digest.as_str())
+        {
+            // A provider reference that is neither the exact request-correlated
+            // grammar nor the approved redaction marker cannot enter durable
+            // recovery state. Leave the intent untouched rather than replacing
+            // it with an untrusted reference.
+            return Err(InstallationError::IdentityConflict);
+        }
+        let expected = TransactionVersion::of(&transaction)?;
+        handles(&preserved, "effect.execution.evidence", false)?;
+        handles(&archived, "effect.execution.evidence", false)?;
+        transaction.merge_pending_references(preserved)?;
+        for reference in archived {
+            if !transaction.completed_stage_refs.contains(&reference) {
+                transaction.completed_stage_refs.push(reference);
+            }
+        }
+        if service_intent {
+            transaction.merge_pending_references(vec![pending_ref])?;
+        } else {
+            transaction.effect_progress[index].state = InstallationEffectProgressState::Unknown {
+                pending_ref: pending_ref.clone(),
+            };
+            transaction.merge_pending_references(vec![pending_ref])?;
+        }
+        transaction.stage = InstallationStage::RollbackRequired;
+        increment_revision(&mut transaction)?;
+        transaction.validate()?;
+        self.store.compare_and_save(expected, &transaction)?;
+        Ok(InstallationStepOutcome::RollbackRequired {
+            pending_refs: transaction.pending_external_changes.clone(),
+        })
+    }
+
     fn persist_unknown(
         &mut self,
         mut transaction: InstallationTransaction,
@@ -9033,16 +11719,26 @@ where
         pending_ref: PlatformHandle,
     ) -> Result<InstallationStepOutcome, InstallationError> {
         let expected = TransactionVersion::of(&transaction)?;
-        transaction.effect_progress[index].state = InstallationEffectProgressState::Unknown {
-            pending_ref: pending_ref.clone(),
-        };
-        transaction.pending_external_changes = vec![pending_ref.clone()];
+        // Once an intent is durably committed, an execution/reconciliation
+        // failure is a post-effect uncertainty, not permission to forget the
+        // operation identity. Keep the canonical IntentCommitted state so the
+        // next bounded drive can reconcile that exact request. Only a failure
+        // observed before the intent boundary may collapse to Unknown.
+        if !matches!(
+            transaction.effect_progress[index].state,
+            InstallationEffectProgressState::IntentCommitted { .. }
+        ) {
+            transaction.effect_progress[index].state = InstallationEffectProgressState::Unknown {
+                pending_ref: pending_ref.clone(),
+            };
+        }
+        transaction.merge_pending_references(vec![pending_ref])?;
         transaction.stage = InstallationStage::RollbackRequired;
         increment_revision(&mut transaction)?;
         transaction.validate()?;
         self.store.compare_and_save(expected, &transaction)?;
         Ok(InstallationStepOutcome::RollbackRequired {
-            pending_refs: vec![pending_ref],
+            pending_refs: transaction.pending_external_changes.clone(),
         })
     }
 
@@ -9068,10 +11764,54 @@ where
         })?;
         transaction.validate()?;
         let expected = TransactionVersion::of(&transaction)?;
-        transaction.mark_unknown(vec![pending_ref.clone()])?;
+        transaction.mark_unknown(vec![pending_ref])?;
         self.store.compare_and_save(expected, &transaction)?;
         Ok(InstallationStepOutcome::RollbackRequired {
-            pending_refs: vec![pending_ref],
+            pending_refs: transaction.pending_external_changes.clone(),
+        })
+    }
+
+    fn persist_rollback_required(
+        &mut self,
+        mut transaction: InstallationTransaction,
+        request: &InstallationEffectRequest,
+        pending_ref: &PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let expected = TransactionVersion::of(&transaction)?;
+        let pending_ref = cleanup_unknown_reference(request, pending_ref)?;
+        transaction.merge_pending_references(vec![pending_ref])?;
+        transaction.stage = InstallationStage::RollbackRequired;
+        increment_revision(&mut transaction)?;
+        transaction.validate()?;
+        self.store.compare_and_save(expected, &transaction)?;
+        Ok(InstallationStepOutcome::RollbackRequired {
+            pending_refs: transaction.pending_external_changes.clone(),
+        })
+    }
+
+    fn persist_quarantined_with_evidence(
+        &mut self,
+        mut transaction: InstallationTransaction,
+        pending_ref: PlatformHandle,
+        preserved: Vec<PlatformHandle>,
+        archived: Vec<PlatformHandle>,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        handles(&preserved, "effect.execution.evidence", false)?;
+        handles(&archived, "effect.execution.evidence", false)?;
+        let expected = TransactionVersion::of(&transaction)?;
+        transaction.merge_pending_references(preserved)?;
+        for reference in archived {
+            if !transaction.completed_stage_refs.contains(&reference) {
+                transaction.completed_stage_refs.push(reference);
+            }
+        }
+        transaction.merge_pending_references(vec![pending_ref])?;
+        transaction.stage = InstallationStage::Quarantined;
+        increment_revision(&mut transaction)?;
+        transaction.validate()?;
+        self.store.compare_and_save(expected, &transaction)?;
+        Ok(InstallationStepOutcome::Quarantined {
+            pending_refs: transaction.pending_external_changes.clone(),
         })
     }
 
@@ -9081,13 +11821,13 @@ where
         pending_ref: PlatformHandle,
     ) -> Result<InstallationStepOutcome, InstallationError> {
         let expected = TransactionVersion::of(&transaction)?;
-        transaction.pending_external_changes = vec![pending_ref.clone()];
+        transaction.merge_pending_references(vec![pending_ref])?;
         transaction.stage = InstallationStage::Quarantined;
         increment_revision(&mut transaction)?;
         transaction.validate()?;
         self.store.compare_and_save(expected, &transaction)?;
         Ok(InstallationStepOutcome::Quarantined {
-            pending_refs: vec![pending_ref],
+            pending_refs: transaction.pending_external_changes.clone(),
         })
     }
 }
@@ -9189,6 +11929,11 @@ where
                     InstallationEffectProgressState::Applied { .. }
                 )
             }) else {
+                if !current.pending_external_changes.is_empty() {
+                    return Ok(InstallationStepOutcome::RollbackRequired {
+                        pending_refs: current.pending_external_changes,
+                    });
+                }
                 return Ok(InstallationStepOutcome::Applied {
                     stage: current.stage,
                     evidence_refs: current.observed_postconditions,
@@ -9198,6 +11943,19 @@ where
                 current.installer_effects[index],
                 InstallerEffectPlan::StartService { .. }
             ) {
+                if matches!(
+                    current.effect_progress[index].state,
+                    InstallationEffectProgressState::ReconciledAbsent { .. }
+                ) {
+                    return Ok(InstallationStepOutcome::RollbackRequired {
+                        pending_refs: current.pending_external_changes,
+                    });
+                }
+                if !current.pending_external_changes.is_empty() {
+                    return Ok(InstallationStepOutcome::RollbackRequired {
+                        pending_refs: current.pending_external_changes,
+                    });
+                }
                 return Ok(InstallationStepOutcome::Applied {
                     stage: current.stage,
                     evidence_refs: current.observed_postconditions,
@@ -9532,6 +12290,27 @@ fn effect_request(
 }
 
 const REDACTED_PROVIDER_REFERENCE_PENDING: &str = "pending:provider-reference-redacted";
+pub(crate) const MAX_PENDING_EXTERNAL_CHANGES: usize = 32;
+
+fn merge_pending_external_changes(
+    pending: &mut Vec<PlatformHandle>,
+    _completed: &mut Vec<PlatformHandle>,
+    reference: PlatformHandle,
+) -> Result<(), InstallationError> {
+    if pending.contains(&reference) {
+        return Ok(());
+    }
+    // Never displace an unresolved sample merely because a later sample has
+    // the same owner prefix.  The durable set is an evidence-preservation
+    // boundary; exact owner cleanup removes only references it can prove.
+    if pending.len() >= MAX_PENDING_EXTERNAL_CHANGES {
+        return Err(InstallationError::IncompleteObservation(
+            "pending external-change reference bound reached".to_owned(),
+        ));
+    }
+    pending.push(reference);
+    Ok(())
+}
 
 fn port_pending<T>(outcome: PortOutcome<T>) -> PlatformHandle {
     let value = match outcome {
@@ -9547,6 +12326,9 @@ fn port_pending<T>(outcome: PortOutcome<T>) -> PlatformHandle {
             {
                 return reference;
             }
+            // Service-registration references are accepted only by the
+            // request-correlated service boundary above. The generic pending
+            // projection has no request identity and must redact them.
             REDACTED_PROVIDER_REFERENCE_PENDING.to_owned()
         }
         PortOutcome::Error(error) => format!("error:{error}"),

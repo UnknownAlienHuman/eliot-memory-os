@@ -2859,17 +2859,25 @@ fn run_installation_effect(
         return Ok(installation_command_exit_code(status));
     }
 
-    let preflight_guard = match validate_installation_runtime_preflight(&preflight_transaction) {
-        Ok(guard) => guard,
-        Err(error) => {
-            let (code, detail, reference) = installation_preflight_error(recover, &error);
-            if let Some(reference) = reference {
-                write_installation_error_with_reference(&code, &detail, &reference);
-            } else {
-                write_installation_error(&code, &detail);
+    let preflight_guard = if recover {
+        // Recovery is authorized by the durable transaction, owner proofs,
+        // and exact CAS state. A missing or changed source bundle must not
+        // prevent the owner from reaching rollback/reconciliation.
+        None
+    } else {
+        let guard = match validate_installation_runtime_preflight(&preflight_transaction) {
+            Ok(guard) => guard,
+            Err(error) => {
+                let (code, detail, reference) = installation_preflight_error(false, &error);
+                if let Some(reference) = reference {
+                    write_installation_error_with_reference(&code, &detail, &reference);
+                } else {
+                    write_installation_error(&code, &detail);
+                }
+                return Ok(INVALID_REQUEST_EXIT);
             }
-            return Ok(INVALID_REQUEST_EXIT);
-        }
+        };
+        Some(guard)
     };
     let mut coordinator = WindowsInstallationCoordinator::new(store);
     let outcome = if recover {
@@ -2927,9 +2935,17 @@ fn run_installation_effect(
                         // E4: persist a durable typed rejection so a later
                         // recover/rollback reaches RolledBack and removes exactly
                         // the CreatedByTransaction service registrations.
-                        if let Ok(pending_ref) = registry_projection_pending_ref(&transaction_id) {
-                            let _ = coordinator
-                                .persist_non_effect_rejection(&transaction_id, pending_ref);
+                        if let Ok(pending_ref) = registry_projection_pending_ref(&transaction_id)
+                            && let Err(persistence_error) = coordinator
+                                .persist_non_effect_rejection(&transaction_id, pending_ref)
+                        {
+                            write_installation_error(
+                                "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                                &format!(
+                                    "durable pending rejection could not be persisted: {persistence_error}"
+                                ),
+                            );
+                            return Ok(INVALID_REQUEST_EXIT);
                         }
                         write_installation_error(
                             "INSTALLATION_APPLY_ERROR",
@@ -2943,9 +2959,17 @@ fn run_installation_effect(
                     Err(error) => {
                         // E5: same durable rejection as E4 (registry unreadable
                         // after open is UNKNOWN_OUTCOME/ROLLBACK_REQUIRED).
-                        if let Ok(pending_ref) = registry_projection_pending_ref(&transaction_id) {
-                            let _ = coordinator
-                                .persist_non_effect_rejection(&transaction_id, pending_ref);
+                        if let Ok(pending_ref) = registry_projection_pending_ref(&transaction_id)
+                            && let Err(persistence_error) = coordinator
+                                .persist_non_effect_rejection(&transaction_id, pending_ref)
+                        {
+                            write_installation_error(
+                                "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                                &format!(
+                                    "durable pending rejection could not be persisted: {persistence_error}"
+                                ),
+                            );
+                            return Ok(INVALID_REQUEST_EXIT);
                         }
                         write_installation_error(
                             "INSTALLATION_APPLY_ERROR",
@@ -2973,9 +2997,16 @@ fn run_installation_effect(
                     };
                     if still_registering
                         && let Ok(pending_ref) = registry_projection_pending_ref(&transaction_id)
+                        && let Err(persistence_error) =
+                            coordinator.persist_non_effect_rejection(&transaction_id, pending_ref)
                     {
-                        let _ =
-                            coordinator.persist_non_effect_rejection(&transaction_id, pending_ref);
+                        write_installation_error(
+                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                            &format!(
+                                "durable pending rejection could not be persisted: {persistence_error}"
+                            ),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
                     }
                     write_installation_error(
                         "INSTALLATION_APPLY_ERROR",
@@ -3022,7 +3053,9 @@ fn run_installation_effect(
         }
     };
     drop(coordinator);
-    if let Err(error) = preflight_guard.revalidate(&preflight_transaction) {
+    if let Some(guard) = preflight_guard
+        && let Err(error) = guard.revalidate(&preflight_transaction)
+    {
         write_installation_error(
             "POST_EFFECT_RUNTIME_GUARD_UNKNOWN",
             &format!("post-coordinator runtime lease revalidation failed: {error}"),
@@ -3105,12 +3138,13 @@ fn run_installation_effect(
         transaction
     };
     let effective_outcome = host_terminal_outcome.as_ref().unwrap_or(&outcome);
-    let all_effects_applied = transaction.effect_progress().iter().all(|progress| {
-        matches!(
-            progress.state,
-            eliot_installation::InstallationEffectProgressState::Applied { .. }
-        )
-    });
+    let all_effects_applied = transaction.pending_external_changes.is_empty()
+        && transaction.effect_progress().iter().all(|progress| {
+            matches!(
+                progress.state,
+                eliot_installation::InstallationEffectProgressState::Applied { .. }
+            )
+        });
     // Phase-B response loss is represented by a durable IntentCommitted
     // effect and a rejected drive step.  Keep the public command state honest:
     // activation is pending and the next invocation will query-reconcile the
@@ -3319,6 +3353,17 @@ fn installation_staging_disposition(
             "recovery does not stage activation; the recovery outcome is authoritative",
         );
     }
+    if matches!(
+        outcome,
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::RollbackRequired | InstallationStage::Quarantined,
+            ..
+        }
+    ) {
+        return InstallationStagingDisposition::not_attempted(
+            "the durable transaction is blocked in rollback/quarantine; activation remains unstaged",
+        );
+    }
     if !matches!(outcome, InstallationStepOutcome::Applied { .. }) {
         return InstallationStagingDisposition::not_attempted(
             "the effect outcome is not Applied; activation remains unstaged",
@@ -3396,6 +3441,10 @@ fn installation_command_status(
             ..
         }
         | InstallationStepOutcome::Rejected => "REJECTED",
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::RollbackRequired,
+            ..
+        } => "ROLLBACK_REQUIRED",
         InstallationStepOutcome::Applied {
             stage: InstallationStage::Quarantined,
             ..
@@ -3534,6 +3583,10 @@ fn installation_outcome_status(outcome: &InstallationStepOutcome) -> &'static st
             stage: InstallationStage::RolledBack,
             ..
         } => "ROLLED_BACK",
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::RollbackRequired,
+            ..
+        } => "ROLLBACK_REQUIRED",
         InstallationStepOutcome::Applied {
             stage: InstallationStage::Quarantined,
             ..
