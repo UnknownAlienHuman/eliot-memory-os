@@ -383,7 +383,71 @@ pub struct BridgeRunner {
     core: AgentBridgeCore,
     reactive_ledger: ReactiveInjectionLedger,
     bootstrap_session: BootstrapSession,
-    bootstrap_context: Option<BootstrapContext>,
+    bootstrap_snapshot: Option<BootstrapSnapshot>,
+}
+
+/// Owner-supplied bootstrap inputs sealed to the live attach binding.
+///
+/// The snapshot carries exactly what the owner produced through the
+/// bootstrap operation (context plus task inputs) together with the
+/// authenticated [`AttachBinding`] live at note time (`None` when noted
+/// while detached). Composition requires the live binding to still equal
+/// the noted seal: a different session after re-attach, a moved State
+/// Fence, or another scope/task binding refuses instead of projecting
+/// stale authority as current. Noting again under the current attach
+/// reseals the snapshot.
+#[derive(Clone, Debug)]
+struct BootstrapSnapshot {
+    context: BootstrapContext,
+    tasks: BootstrapTaskInputs,
+    binding: Option<AttachBinding>,
+}
+
+impl BootstrapSnapshot {
+    /// Returns the live binding when it still equals the noted seal.
+    ///
+    /// Strict option equality: a snapshot noted while detached (`None`
+    /// seal) composes only while still detached, and a snapshot noted
+    /// under a live attach composes only under that exact authenticated
+    /// binding — principal, session, connection, activation generation,
+    /// State Fence, and owner-resolved task binding. A wrong session after
+    /// re-attach, a stale fence, or a changed scope/task binding refuses
+    /// instead of projecting stale authority as current, so none of them
+    /// can ever compose to `READY`. Re-noting under the current attach
+    /// reseals the snapshot.
+    fn sealed_live_binding(&self, live: Option<AttachView>) -> Option<AttachBinding> {
+        let live_binding = live.map(|view| view.binding().clone());
+        if live_binding == self.binding {
+            live_binding
+        } else {
+            None
+        }
+    }
+
+    /// Binds noted context content to the sealed owner binding.
+    ///
+    /// The host supplies context text; the attach binding supplies truth.
+    /// A noted principal or `WorkScope` that disagrees with the sealed
+    /// binding is a wrong-principal/wrong-worktree packet and is refused
+    /// here, before any readiness can be projected from it.
+    fn content_matches_binding(
+        context: &BootstrapContext,
+        binding: &AttachBinding,
+    ) -> Result<(), BootstrapError> {
+        if context.principal_ref != binding.principal_id().as_str() {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_PRINCIPAL_MISMATCH",
+                detail: "noted principal disagrees with the live attach principal".to_owned(),
+            });
+        }
+        if context.workscope_ref != binding.task_binding().work_scope_id() {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_SCOPE_MISMATCH",
+                detail: "noted WorkScope disagrees with the live attach task binding".to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl BridgeRunner {
@@ -427,7 +491,7 @@ impl BridgeRunner {
             core: AgentBridgeCore::new(readiness, host_activation, mcp_forwarding, cursor_policy),
             reactive_ledger: ReactiveInjectionLedger::new(),
             bootstrap_session: BootstrapSession::default(),
-            bootstrap_context: None,
+            bootstrap_snapshot: None,
         })
     }
     #[must_use]
@@ -755,7 +819,11 @@ impl BridgeRunner {
     /// Validates fail-closed without composing authority: an invalid context
     /// is rejected and never stored. Noting context never delivers the
     /// once-per-session auto-boot; delivery happens only through
-    /// [`Self::take_first_response_bootstrap`].
+    /// [`Self::take_first_response_bootstrap`]. The noted snapshot is sealed
+    /// to the live attach binding when attached (principal/WorkScope content
+    /// is bound to the authenticated binding; a wrong-principal or
+    /// wrong-worktree packet is refused); a snapshot noted while detached
+    /// stays unsealed until it is noted again under the live attach.
     pub fn note_bootstrap_context(
         &mut self,
         context: BootstrapContext,
@@ -766,39 +834,100 @@ impl BridgeRunner {
             authoritative_selection: None,
         };
         get_understanding_bootstrap(&context, &empty_tasks, CurrentAssessment::NotOnboarded)?;
-        self.bootstrap_context = Some(context);
+        let binding = self.attach_view().map(|view| view.binding().clone());
+        if let Some(seal) = &binding {
+            BootstrapSnapshot::content_matches_binding(&context, seal)?;
+        }
+        self.bootstrap_snapshot = Some(BootstrapSnapshot {
+            context,
+            tasks: empty_tasks,
+            binding,
+        });
         Ok(())
+    }
+    /// Notes one owner-produced bootstrap snapshot: context plus the task
+    /// inputs supplied with it, sealed to the live attach binding.
+    ///
+    /// This is the auto-boot source of record: the once-per-session
+    /// auto-boot composes from exactly these retained task inputs rather
+    /// than a separate empty task set, so the agent can identify or
+    /// explicitly request the intended task without filesystem search. A
+    /// wrong-principal or wrong-worktree packet is refused at note time; a
+    /// later session, fence, or scope/task move refuses at compose time.
+    pub fn note_owner_snapshot(
+        &mut self,
+        context: BootstrapContext,
+        tasks: BootstrapTaskInputs,
+    ) -> Result<(), BootstrapError> {
+        get_understanding_bootstrap(&context, &tasks, CurrentAssessment::NotOnboarded)?;
+        let binding = self.attach_view().map(|view| view.binding().clone());
+        if let Some(seal) = &binding {
+            BootstrapSnapshot::content_matches_binding(&context, seal)?;
+        }
+        self.bootstrap_snapshot = Some(BootstrapSnapshot {
+            context,
+            tasks,
+            binding,
+        });
+        Ok(())
+    }
+    /// Task inputs retained by the noted owner snapshot for auto-boot.
+    ///
+    /// Returns exactly what the owner supplied with the snapshot, or an
+    /// empty session-level task set when nothing was ever noted (in which
+    /// case composition below still yields `None`). The auto-boot path
+    /// never invents its own candidate set.
+    #[must_use]
+    pub fn retained_auto_boot_tasks(&self) -> BootstrapTaskInputs {
+        self.bootstrap_snapshot.as_ref().map_or_else(
+            || BootstrapTaskInputs {
+                scope_level: ScopeLevel::Session,
+                candidates: Vec::new(),
+                authoritative_selection: None,
+            },
+            |snapshot| snapshot.tasks.clone(),
+        )
     }
     /// Bounded explicit retrieval of the canonical `UnderstandingBootstrap`.
     ///
     /// Always available, including after the once-per-session auto-boot was
-    /// delivered. Requires a noted context; fails closed otherwise.
+    /// delivered. Requires a noted snapshot and a live attach still equal
+    /// to the noted seal; a wrong session, stale fence, or changed
+    /// scope/task binding fails closed instead of projecting `READY`.
     pub fn get_understanding_bootstrap(
         &self,
         tasks: &BootstrapTaskInputs,
         requested_assessment: CurrentAssessment,
     ) -> Result<UnderstandingBootstrap, BootstrapError> {
-        let Some(context) = &self.bootstrap_context else {
+        let Some(snapshot) = &self.bootstrap_snapshot else {
             return Err(BootstrapError {
                 code: "BOOTSTRAP_CONTEXT_MISSING",
                 detail: "no bootstrap context noted for this session".to_owned(),
             });
         };
-        get_understanding_bootstrap(context, tasks, requested_assessment)
+        if snapshot.sealed_live_binding(self.attach_view()).is_none() {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_SEAL_MISMATCH",
+                detail: "noted bootstrap seal disagrees with the live attach binding".to_owned(),
+            });
+        }
+        get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment)
     }
     /// Takes the once-per-session auto-boot for the first successful response.
     ///
-    /// Returns `None` after the first delivery or when no valid context is
-    /// noted; composition failures also yield `None` without marking delivery
+    /// Returns `None` after the first delivery, when no valid snapshot is
+    /// noted, or when the live attach moved away from the noted seal;
+    /// composition failures also yield `None` without marking delivery
     /// so a later response with complete inputs can still carry the bootstrap.
     pub fn take_first_response_bootstrap(
         &mut self,
         tasks: &BootstrapTaskInputs,
         requested_assessment: CurrentAssessment,
     ) -> Option<UnderstandingBootstrap> {
-        let context = self.bootstrap_context.clone()?;
+        let snapshot = self.bootstrap_snapshot.clone()?;
+        snapshot.sealed_live_binding(self.attach_view())?;
         self.bootstrap_session
-            .take_auto_boot(&context, tasks, requested_assessment)
+            .take_auto_boot(&snapshot.context, tasks, requested_assessment)
     }
     /// Read-only view of durable in-flight deliveries for bounded Stop accounting.
     ///
