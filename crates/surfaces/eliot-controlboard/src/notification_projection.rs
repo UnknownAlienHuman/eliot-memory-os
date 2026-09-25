@@ -1,4 +1,4 @@
-//! Canonical notification projection for the ControlBoard (issue #1780).
+//! Canonical notification projection for the `ControlBoard` (issue #1780).
 //!
 //! Pure read-model projection over the Kernel-owned canonical record. This
 //! module owns no state, authority, or delivery decisions: it only derives
@@ -123,7 +123,7 @@ pub struct CanonicalNotificationMetrics {
     pub resolved_total: u64,
 }
 
-/// Rebuildable ControlBoard notification projection returned by the canonical
+/// Rebuildable `ControlBoard` notification projection returned by the canonical
 /// read consumer.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -198,14 +198,14 @@ pub struct NotificationMetrics {
 /// Returns every unresolved row. Acknowledged and failed-delivery rows stay
 /// in the inbox until the owner reports an authorized disposition.
 #[must_use]
-pub fn inbox<'a>(rows: &'a [NotificationRow]) -> Vec<&'a NotificationRow> {
+pub fn inbox(rows: &[NotificationRow]) -> Vec<&NotificationRow> {
     rows.iter().filter(|row| row.is_unresolved()).collect()
 }
 
 /// Returns unresolved critical rows. Critical records persist here until
 /// the authorized evidence-backed disposition arrives.
 #[must_use]
-pub fn unresolved_critical<'a>(rows: &'a [NotificationRow]) -> Vec<&'a NotificationRow> {
+pub fn unresolved_critical(rows: &[NotificationRow]) -> Vec<&NotificationRow> {
     rows.iter()
         .filter(|row| row.is_unresolved() && row.severity == ProjectedSeverity::Critical)
         .collect()
@@ -214,7 +214,7 @@ pub fn unresolved_critical<'a>(rows: &'a [NotificationRow]) -> Vec<&'a Notificat
 /// Returns unresolved rows whose latest delivery failed, with the failure
 /// state preserved for board visibility.
 #[must_use]
-pub fn failed_delivery<'a>(rows: &'a [NotificationRow]) -> Vec<&'a NotificationRow> {
+pub fn failed_delivery(rows: &[NotificationRow]) -> Vec<&NotificationRow> {
     rows.iter()
         .filter(|row| row.is_unresolved() && row.delivery_failed)
         .collect()
