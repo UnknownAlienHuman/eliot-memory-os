@@ -433,18 +433,33 @@ fn check_candidate_id(value: &ArtifactId) -> Result<(), RevisionError> {
     Ok(())
 }
 
-/// Propose one advisory extinction candidate over validated intake.
+/// The advisory outcome [`propose`] reaches over an intake that validated.
 ///
-/// The freeze binding is verified first, so a crate not bound to the exact
-/// revision it pins fails closed before any intake is read. Intake contract
-/// violations (invalid shapes, scope/fence mismatch, stale citations, digest
-/// drift) fail closed as [`RevisionError`]. Valid intake with insufficient
-/// evidence yields `Ok` with state `Inconclusive` or `Unsupported` and the
-/// exact missing evidence named.
-pub fn propose(
-    intake: &RevisionIntake<'_>,
-) -> Result<NegativeMemoryExtinctionCandidate, RevisionError> {
-    verify_freeze_binding()?;
+/// It is the classification half of [`propose`], deliberately separate from
+/// intake validation so a refusal is always a decision about *adequacy* and
+/// never about shape. No field here is owner-supplied: every value is derived
+/// from the validated intake by [`classify`].
+struct ProposalOutcome {
+    /// Disposition the emitted candidate carries.
+    disposition: CandidateDisposition,
+    /// Terminal candidate state.
+    state: CandidateState,
+    /// Exact missing-evidence entries; empty when the intake is complete.
+    missing: Vec<String>,
+    /// Reversible advisory narrowing. Never irreversible.
+    narrowing: AdvisoryNarrowing,
+}
+
+/// Validate the whole intake and return the rechecked self-query digest.
+///
+/// Every owner shape is revalidated here and then the cross-owner bindings are
+/// checked against each other: evidence against the observation, both
+/// projections against the task scope, every fence against the task's
+/// governing fence, the posed digest against the recomputed query digest, and
+/// every cited source triple against the accepted-source projection. A
+/// violation is a [`RevisionError`] naming the exact field. Nothing is
+/// classified from an intake that did not pass.
+fn validate_intake(intake: &RevisionIntake<'_>) -> Result<String, RevisionError> {
     intake.observation.validate()?;
     if intake.evidence.len() > MAX_REVISION_EVIDENCE {
         return Err(RevisionError::Bounds {
@@ -520,43 +535,51 @@ pub fn propose(
             field: "intake.sources_fence",
         });
     }
+    Ok(query_digest)
+}
 
+/// Classify a validated intake into the advisory outcome it earns.
+///
+/// Two refusals precede any coverage scoring, and each names the exact reason:
+/// a safety negative-memory trigger makes the candidate `Unsupported`, and a
+/// same-hypothesis recurrence routes to Governor Mechanism Review instead of
+/// another equivalent retry. Otherwise coverage completeness decides the
+/// state, and only a fully covered intake may propose suppressing advisory
+/// activation — an incomplete one names every missing evidence entry and
+/// suppresses nothing.
+fn classify(intake: &RevisionIntake<'_>) -> ProposalOutcome {
     if intake
         .safety
         .negative_memory_triggers
         .iter()
         .any(|trigger| trigger == &intake.observation.trigger)
     {
-        return finish(
-            intake,
-            query_digest,
-            CandidateDisposition::AdvisoryNarrow,
-            CandidateState::Unsupported,
-            vec!["safety.negative_memory_triggers".to_owned()],
-            AdvisoryNarrowing {
+        return ProposalOutcome {
+            disposition: CandidateDisposition::AdvisoryNarrow,
+            state: CandidateState::Unsupported,
+            missing: vec!["safety.negative_memory_triggers".to_owned()],
+            narrowing: AdvisoryNarrowing {
                 suppress_activation: false,
                 quarantine: false,
                 archive: false,
             },
-        );
+        };
     }
     if intake
         .evidence
         .iter()
         .any(|evidence| evidence.same_hypothesis_recurrence)
     {
-        return finish(
-            intake,
-            query_digest,
-            CandidateDisposition::MechanismReview,
-            CandidateState::Inconclusive,
-            vec!["mechanism-review-required".to_owned()],
-            AdvisoryNarrowing {
+        return ProposalOutcome {
+            disposition: CandidateDisposition::MechanismReview,
+            state: CandidateState::Inconclusive,
+            missing: vec!["mechanism-review-required".to_owned()],
+            narrowing: AdvisoryNarrowing {
                 suppress_activation: false,
                 quarantine: false,
                 archive: false,
             },
-        );
+        };
     }
 
     let mut missing = Vec::new();
@@ -572,21 +595,48 @@ pub fn propose(
         missing.push("revision.evidence_refs".to_owned());
     }
     let complete = missing.is_empty();
-    finish(
-        intake,
-        query_digest,
-        CandidateDisposition::AdvisoryNarrow,
-        if complete {
+    ProposalOutcome {
+        disposition: CandidateDisposition::AdvisoryNarrow,
+        state: if complete {
             CandidateState::Complete
         } else {
             CandidateState::Inconclusive
         },
         missing,
-        AdvisoryNarrowing {
+        narrowing: AdvisoryNarrowing {
             suppress_activation: complete,
             quarantine: false,
             archive: false,
         },
+    }
+}
+
+/// Propose one advisory extinction candidate over validated intake.
+///
+/// The freeze binding is verified first, so a crate not bound to the exact
+/// revision it pins fails closed before any intake is read. Intake contract
+/// violations (invalid shapes, scope/fence mismatch, stale citations, digest
+/// drift) fail closed as [`RevisionError`]. Valid intake with insufficient
+/// evidence yields `Ok` with state `Inconclusive` or `Unsupported` and the
+/// exact missing evidence named.
+///
+/// Validation ([`validate_intake`]) is kept separate from classification
+/// ([`classify`]) so that every contract violation is still refused before any
+/// adequacy decision is taken, and so neither half can grow to obscure the
+/// order in which they run.
+pub fn propose(
+    intake: &RevisionIntake<'_>,
+) -> Result<NegativeMemoryExtinctionCandidate, RevisionError> {
+    verify_freeze_binding()?;
+    let query_digest = validate_intake(intake)?;
+    let outcome = classify(intake);
+    finish(
+        intake,
+        query_digest,
+        outcome.disposition,
+        outcome.state,
+        outcome.missing,
+        outcome.narrowing,
     )
 }
 
