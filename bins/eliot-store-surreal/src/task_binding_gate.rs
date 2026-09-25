@@ -13,6 +13,15 @@
 //!   evidence and the digest evidence, whose values were verified upstream).
 //!   Absence rejects with `TASK_SELECTION_REQUIRED`; a different/incompatible
 //!   scope rejects with `TASK_SCOPE_INCOMPATIBLE`.
+//! - Every Governor finish write (`RecordFinishDecision`,
+//!   `RecordFinishEvidence`) is task-bearing by construction and requires the
+//!   finish binding: the context and transition task identities agree, the
+//!   fences agree, and at least one exact Governor finish-authority handle is
+//!   present (finish envelopes carry exactly one such handle, not the
+//!   revision/digest pair). A task-bearing finish that names no task, names a
+//!   different task than the admitted context, or carries no exact handle
+//!   rejects with the same stable codes instead of passing as
+//!   `NotTaskRelative`.
 //! - There is no latest-task, open-task, or resolver-guess fallback: ambiguity
 //!   stays cold, mismatch fails closed.
 //!
@@ -129,15 +138,18 @@ fn operations_of(transition: &PreparedTransition) -> Vec<NamedMutationOperation>
 /// canonical text rules, so a bare `task_id` can never promote by itself.
 /// Role verification stays upstream; presence, exactness, and task/fence
 /// agreement are enforced here before any provider I/O.
+/// One exact evidence handle: non-blank, trimmed, and control-free, so a bare
+/// `task_id` or a padded handle can never promote by itself.
+fn exact_handle(handle: &str) -> bool {
+    !handle.trim().is_empty()
+        && handle.trim().len() == handle.len()
+        && !handle.chars().any(char::is_control)
+}
+
 fn has_exact_binding_refs(transition: &PreparedTransition) -> bool {
-    fn exact(handle: &str) -> bool {
-        !handle.trim().is_empty()
-            && handle.trim().len() == handle.len()
-            && !handle.chars().any(char::is_control)
-    }
     let mut seen: Vec<&str> = Vec::new();
     for handle in &transition.required_proof_and_approval_refs {
-        if !exact(handle) {
+        if !exact_handle(handle) {
             return false;
         }
         if !seen.contains(&handle.as_str()) {
@@ -145,6 +157,23 @@ fn has_exact_binding_refs(transition: &PreparedTransition) -> bool {
         }
     }
     seen.len() >= 2
+}
+
+/// Requires at least one exact Governor finish-authority handle.
+///
+/// Finish envelopes carry exactly one finish-authority handle (not the
+/// revision/digest pair of capture/control writes), so the pair rule of
+/// [`has_exact_binding_refs`] cannot apply here: one exact handle plus task
+/// and fence agreement is the finish binding. Every carried handle must still
+/// be exact; a blank, untrimmed, or control-bearing handle fails the binding.
+fn has_finish_authority_ref(transition: &PreparedTransition) -> bool {
+    if transition.required_proof_and_approval_refs.is_empty() {
+        return false;
+    }
+    transition
+        .required_proof_and_approval_refs
+        .iter()
+        .all(|handle| exact_handle(handle))
 }
 
 /// Gates one prepared transition before any provider I/O.
@@ -159,7 +188,18 @@ fn has_exact_binding_refs(transition: &PreparedTransition) -> bool {
 ///   the revision and digest evidence verified upstream. Missing binding
 ///   rejects with `TASK_SELECTION_REQUIRED`; a task/scope mismatch rejects
 ///   with `TASK_SCOPE_INCOMPATIBLE`.
+/// - `RecordFinishDecision` and `RecordFinishEvidence` are task-bearing
+///   Governor finish writes and require the finish binding: context/transition
+///   task identities present and equal, fences equal, and at least one exact
+///   Governor finish-authority handle present. A finish that names no task,
+///   names a different task than the admitted context, or carries no exact
+///   handle rejects with the same stable codes; it never passes as
+///   `NotTaskRelative`.
 /// - All other operations are [`GateDisposition::NotTaskRelative`].
+///
+/// A transition that mixes operation families answers the strictest
+/// applicable rule: a finish piggybacked on a control or task-bound capture
+/// still has to satisfy that family's pair rule.
 pub fn gate_apply(
     context: &RequestMeta,
     transition: &PreparedTransition,
@@ -210,6 +250,29 @@ pub fn gate_apply(
         return Ok(GateDisposition::TaskBound);
     }
 
+    let finishes = operations.contains(&NamedMutationOperation::RecordFinishDecision)
+        || operations.contains(&NamedMutationOperation::RecordFinishEvidence);
+    if finishes {
+        let transition_task = transition.task_id.as_deref();
+        let context_task = context.task_id.as_ref().map(TaskId::as_str);
+        match (transition_task, context_task) {
+            (Some(task), Some(ctx)) if task == ctx => {
+                require_finish_binding(context, transition, task)?;
+                return Ok(GateDisposition::TaskBound);
+            }
+            (Some(_), Some(_)) => {
+                return Err(TaskBindingRejection::scope_incompatible(
+                    "finish write task identity does not match the admitted context task",
+                ));
+            }
+            _ => {
+                return Err(TaskBindingRejection::selection_required(
+                    "finish write requires current TaskSelectionEvidence",
+                ));
+            }
+        }
+    }
+
     Ok(GateDisposition::NotTaskRelative)
 }
 
@@ -231,6 +294,40 @@ fn require_exact_binding(
     if !has_exact_binding_refs(transition) {
         return Err(TaskBindingRejection::selection_required(
             "task-bound transition requires exact revision and digest evidence handles",
+        ));
+    }
+    Ok(())
+}
+
+/// Requires the exact binding for one Governor finish write.
+///
+/// The Governor finish legs always name the finished task and carry exactly
+/// one finish-authority evidence handle; the admitted identity metadata task
+/// must equal the finished task or the Governor fails closed before commit.
+/// The gate requires the same agreement here — context/transition task
+/// identities present and equal, fences equal (also enforced by the
+/// pre-provider admission immediately before this gate), and at least one
+/// exact handle — so a wrong or ambiguous task can never receive the
+/// task-bound finish write. Handle *values* stay verified upstream, as for
+/// capture/control evidence.
+fn require_finish_binding(
+    context: &RequestMeta,
+    transition: &PreparedTransition,
+    task_id: &str,
+) -> Result<(), TaskBindingRejection> {
+    if context.state_fence != transition.state_fence {
+        return Err(TaskBindingRejection::selection_required(
+            "finish binding fence is not the current State Fence",
+        ));
+    }
+    if task_id.trim().is_empty() {
+        return Err(TaskBindingRejection::selection_required(
+            "finish binding handle is blank",
+        ));
+    }
+    if !has_finish_authority_ref(transition) {
+        return Err(TaskBindingRejection::selection_required(
+            "finish write requires the exact Governor finish-authority evidence handle",
         ));
     }
     Ok(())

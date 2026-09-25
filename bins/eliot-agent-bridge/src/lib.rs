@@ -448,6 +448,47 @@ impl BootstrapSnapshot {
         }
         Ok(())
     }
+
+    /// Requires a composed task selection to agree with the sealed activation task.
+    ///
+    /// The sealed attach binding carries the activation-resolved task; a
+    /// `BOUND`/`UNIQUE` selection that names any other task is a forged or
+    /// stale packet (host-authored readiness naming a task the activation
+    /// never resolved) and is refused here, so it can never compose to
+    /// `READY`. A selection that claims a bound task but carries none is
+    /// refused the same way. `AMBIGUOUS`/`NONE` selections never project
+    /// readiness and need no agreement: they stay available as honest typed
+    /// non-ready outcomes.
+    fn selection_matches_sealed_task(
+        bootstrap: &UnderstandingBootstrap,
+        seal: &AttachBinding,
+    ) -> Result<(), BootstrapError> {
+        let selected = match bootstrap.task_selection.disposition {
+            TaskSelectionDisposition::Bound | TaskSelectionDisposition::Unique => {
+                match &bootstrap.task_selection.selected_task_and_revision {
+                    Some(selected) => selected,
+                    None => {
+                        return Err(BootstrapError {
+                            code: "BOOTSTRAP_TASK_MISMATCH",
+                            detail:
+                                "bound task selection carries no selected task; refusing to project"
+                                    .to_owned(),
+                        });
+                    }
+                }
+            }
+            TaskSelectionDisposition::Ambiguous | TaskSelectionDisposition::None => return Ok(()),
+        };
+        if selected.task_ref != seal.task_binding().task_id().as_str() {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_TASK_MISMATCH",
+                detail:
+                    "composed task selection disagrees with the sealed attach task binding; refusing to project"
+                        .to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl BridgeRunner {
@@ -893,7 +934,10 @@ impl BridgeRunner {
     /// Always available, including after the once-per-session auto-boot was
     /// delivered. Requires a noted snapshot and a live attach still equal
     /// to the noted seal; a wrong session, stale fence, or changed
-    /// scope/task binding fails closed instead of projecting `READY`.
+    /// scope/task binding fails closed instead of projecting `READY`. A
+    /// composed selection that names any task other than the sealed
+    /// activation task is refused the same way, so a forged or stale packet
+    /// can never retrieve `READY` through this path either.
     pub fn get_understanding_bootstrap(
         &self,
         tasks: &BootstrapTaskInputs,
@@ -905,13 +949,16 @@ impl BridgeRunner {
                 detail: "no bootstrap context noted for this session".to_owned(),
             });
         };
-        if snapshot.sealed_live_binding(self.attach_view()).is_none() {
+        let Some(sealed) = snapshot.sealed_live_binding(self.attach_view()) else {
             return Err(BootstrapError {
                 code: "BOOTSTRAP_SEAL_MISMATCH",
                 detail: "noted bootstrap seal disagrees with the live attach binding".to_owned(),
             });
-        }
-        get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment)
+        };
+        let bootstrap =
+            get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment)?;
+        BootstrapSnapshot::selection_matches_sealed_task(&bootstrap, &sealed)?;
+        Ok(bootstrap)
     }
     /// Takes the once-per-session auto-boot for the first successful response.
     ///
@@ -919,13 +966,20 @@ impl BridgeRunner {
     /// noted, or when the live attach moved away from the noted seal;
     /// composition failures also yield `None` without marking delivery
     /// so a later response with complete inputs can still carry the bootstrap.
+    /// A composed selection that names any task other than the sealed
+    /// activation task yields `None` the same way, without consuming the
+    /// once-per-session slot, so a forged or stale packet can never
+    /// auto-boot `READY` and a later coherent response can still deliver.
     pub fn take_first_response_bootstrap(
         &mut self,
         tasks: &BootstrapTaskInputs,
         requested_assessment: CurrentAssessment,
     ) -> Option<UnderstandingBootstrap> {
         let snapshot = self.bootstrap_snapshot.clone()?;
-        snapshot.sealed_live_binding(self.attach_view())?;
+        let sealed = snapshot.sealed_live_binding(self.attach_view())?;
+        let preview =
+            get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment).ok()?;
+        BootstrapSnapshot::selection_matches_sealed_task(&preview, &sealed).ok()?;
         self.bootstrap_session
             .take_auto_boot(&snapshot.context, tasks, requested_assessment)
     }
