@@ -1,0 +1,89 @@
+# Immutable gate-owned assignment catalogue lock (#852).
+# Generated outside read-only validation; see the #852 REPORT for
+# acquisition bindings, classifications and evidence. Do not hand-edit.
+schema_version = "eliot-work-unit-cohort-v1"
+
+[repository]
+owner = "UnknownAlienHuman"
+name = "eliot-memory-os"
+
+[[row]]
+issue = 728
+unit = "F-UNSAFE"
+body_sha256 = "96f3530f1edeb1de2a7b1e4c1497298cfdc6843ae17b02ce2a1bb03b0463fc0c"
+disposition = "accepted-historical"
+prerequisites = []
+
+[[row]]
+issue = 748
+unit = "D-CLIPPY-POLICY"
+body_sha256 = "e711ae25aadf8cb025fbc0960c330e5b7d67665b29488eebfb5599995be74134"
+disposition = "blocked"
+prerequisites = []
+
+[[row]]
+issue = 750
+unit = "D-CI"
+body_sha256 = "5165dc1e592dfaf8665850c42a5173f32b5a6f67b5382655a1f77ee700e1d9f3"
+disposition = "accepted-historical"
+prerequisites = []
+
+[[row]]
+issue = 818
+unit = "D-ASSIGN-0"
+body_sha256 = "38d17677337162ce5f226f9e4622557646a64810cdb6d701a95c5f3699031580"
+disposition = "nonexecutable"
+prerequisites = []
+
+[[row]]
+issue = 838
+unit = "D-CLIPPY-BASELINE"
+body_sha256 = "0d311c044e551fb6a75c682102b0e31ffe7dc63749a736ec3ad8e967409305c7"
+disposition = "blocked"
+prerequisites = []
+
+[[row]]
+issue = 839
+unit = "B-ACTIVATION-PROJECTION"
+body_sha256 = "d511962dc0c6aba56493c58bd4f2d255819c0217427f55962ffa89d017f51844"
+disposition = "blocked"
+prerequisites = []
+
+[[row]]
+issue = 846
+unit = "D-TEST-WINDOWS-STAGING"
+body_sha256 = "966da099e32a0a47cf91bd8b64718b8686a63144728e792f0f166972296b99b7"
+disposition = "blocked"
+prerequisites = []
+
+[[row]]
+issue = 974
+unit = "B-BACKUP-LINK"
+body_sha256 = "b6983f2fa0aa44af9db34bccac95963d640b4a732a45f9400395ffb9b518fe57"
+disposition = "blocked"
+prerequisites = []
+
+[[row]]
+issue = 994
+unit = "S-CONC-ACCEPT"
+body_sha256 = "d868a87120b97688b35cfa4dac14267bbaf2e67c24f45476cd8ccad196246452"
+disposition = "nonexecutable"
+prerequisites = []
+
+[aggregate]
+issues = [728, 748, 750, 818, 838, 839, 846, 974, 994]
+numeric_descriptors = []
+matrix_cases = 0
+assigned = 0
+blocked = 5
+planned = 0
+nonexecutable = 2
+superseded = 0
+accepted_historical = 2
+sha256 = "034089026c858af9a81a68883e30255e9283d8c9122f70e137bd6dc44d23254c"
+
+[provenance]
+base_commit = "f8e48263f5bceadc43cd02f7664d17eda84ad660"
+acquired_at = "2026-09-25T20:30:18Z"
+acquisition = "gh api repos/UnknownAlienHuman/eliot-memory-os/issues/{number}+timeline+pulls (read-only, 2026-09-25)"
+note = "Provenance is observed context only; it is not part of the hashed aggregate payload."
