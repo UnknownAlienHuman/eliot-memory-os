@@ -24,11 +24,13 @@ pub use crate::core::AgentCoordinator;
 pub use crate::model::*;
 pub use crate::model_control::*;
 pub use crate::model_registry::{
-    CheckDisposition, CostCeiling, CoverageState, EvidenceState, HardCheck,
-    MODEL_REGISTRY_SCHEMA_VERSION, MODEL_SEARCH_SCHEMA_VERSION, ModelRegistryError,
-    ModelRegistrySnapshot, ModelSearchResult, RankingDimension, RankingDisposition, RankingPolicy,
-    RankingPolicyInput, RegistryEvidence, RegistryRoute, RouteExplanation, RouteRequirements,
-    find_models, find_models_with_provider_accounts,
+    COMPILED_ROUTE_CANDIDATES_VERSION, CheckDisposition, CompiledRouteCandidates, CostCeiling,
+    CoverageState, EvidenceState, HardCheck, MODEL_REGISTRY_SCHEMA_VERSION,
+    MODEL_SEARCH_SCHEMA_VERSION, ModelRegistryError, ModelRegistrySnapshot, ModelSearchResult,
+    RankingDimension, RankingDisposition, RankingPolicy, RankingPolicyInput, RegistryEvidence,
+    RegistryRoute, RejectedRouteResolution, RouteExplanation, RouteRequirements,
+    RouteResolutionInput, RouteResolutionRejection, compile_route_candidates, find_models,
+    find_models_with_provider_accounts,
 };
 pub use crate::provider_account_catalogue::{
     AuthDisposition, AuthObservation, ConcurrencyDisposition, ConcurrencyObservation,
