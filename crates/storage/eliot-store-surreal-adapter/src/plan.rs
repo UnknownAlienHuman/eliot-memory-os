@@ -16,7 +16,7 @@ use eliot_store_api::{
     ProjectionStatus, RequestMeta, Resubmission, RevisionDelta, RevisionHead,
     RevisionHeadExpectation, RevisionKey, SplitView, StoreError, WriteReceipt, WriteReceiptStatus,
     canonical_json_bytes, canonical_request_hash, issue_store_receipt_envelope, sha256_hex,
-    validate_store_receipt_envelope, verify_canonical_request_hash,
+    validate_store_receipt_envelope, verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use serde_json::Value;
 
@@ -558,7 +558,10 @@ pub(crate) fn recomputed_canonical_request_hash(
 /// Verifies the supplied claim against the recomputed digest and returns the
 /// recomputed value for receipt binding.
 ///
-/// Supplied != recomputed is [`StoreError::TransitionDigestMismatch`] with no
+/// The carried ordering scopes must also still equal the hashed expected
+/// ordering heads (a post-admission scope edit leaves the shared digest
+/// unchanged but changes head advancement). Supplied != recomputed, or a
+/// scope/head divergence, is [`StoreError::TransitionDigestMismatch`] with no
 /// transaction and no lookup success. Callers must invoke this BEFORE any
 /// idempotency-lookup success is returned and BEFORE any transaction/receipt.
 pub(crate) fn verify_apply_canonical_hash(
@@ -567,6 +570,7 @@ pub(crate) fn verify_apply_canonical_hash(
     expected_revision_heads: &[RevisionHeadExpectation],
     expected_ordering_heads: &[OrderingHeadExpectation],
 ) -> Result<String, StoreError> {
+    verify_ordering_scope_binding(transition, expected_ordering_heads)?;
     let view = CanonicalRequestView::from_apply(
         ctx,
         transition,

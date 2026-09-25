@@ -28,7 +28,7 @@ use eliot_store_api::{
     SnapshotPage, StoreBackupStatus, StoreError, StoreGenesisRequest, StoreHealth,
     StoreRecoveryRequest, StoreRecoverySnapshot, StoreRequest, StoreResponse, StoreWireError,
     WriteReceipt, dreamer_job_capability, map_durable_error, validate_genesis_receipt_envelope,
-    verify_canonical_request_hash,
+    verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -462,8 +462,12 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
         // exact values about to be sent (context + transition + expected
         // heads) and reject divergence before the Apply frame is built. The
         // view borrows these references — not re-forwarded copies — so a
-        // mutation after admission fails here with the typed mismatch.
+        // mutation after admission fails here with the typed mismatch. The
+        // carried ordering scopes must also still equal the hashed expected
+        // ordering heads: a post-admission scope edit leaves the shared
+        // digest unchanged but changes head advancement.
         {
+            verify_ordering_scope_binding(&transition, &expected_ordering_heads)?;
             let view = CanonicalRequestView::from_apply(
                 ctx,
                 &transition,

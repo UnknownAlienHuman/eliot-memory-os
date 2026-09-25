@@ -14,7 +14,7 @@ use crate::schema;
 use eliot_store_api::{
     CanonicalRequestView, OperationId, OrderingHeadExpectation, RevisionHeadExpectation,
     WriteReceipt, canonical_request_hash, validate_store_receipt_envelope,
-    verify_canonical_request_hash,
+    verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 
 use super::{FenceRecord, Idempotency, take_optional, take_vec};
@@ -60,7 +60,9 @@ pub(super) async fn read_receipt_by_operation(
 /// executed (`ctx` + `transition` + expected heads) via the ONE shared
 /// helper BEFORE any provider read: supplied != recomputed is
 /// `TransitionDigestMismatch` (mapped to `TRANSITION_DIGEST_MISMATCH`) with
-/// no lookup success, no transaction and no receipt. Replay/conflict is
+/// no lookup success, no transaction and no receipt. The carried ordering
+/// scopes must also still equal the hashed expected ordering heads, so a
+/// post-admission scope edit fails here too. Replay/conflict is
 /// then decided stored-vs-recomputed (never stored-vs-supplied), so a
 /// mutated executable payload cannot replay an earlier receipt even when
 /// the transported claim is stale.
@@ -78,6 +80,8 @@ pub(super) async fn read_idempotency(
         expected_revision_heads,
         expected_ordering_heads,
     );
+    verify_ordering_scope_binding(transition, expected_ordering_heads)
+        .map_err(AdapterError::Store)?;
     verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)
         .map_err(AdapterError::Store)?;
     let mut bindings = Map::new();
@@ -142,6 +146,8 @@ pub(super) fn classify_idempotency_with_expected_heads(
         expected_revision_heads,
         expected_ordering_heads,
     );
+    verify_ordering_scope_binding(transition, expected_ordering_heads)
+        .map_err(AdapterError::Store)?;
     verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)
         .map_err(AdapterError::Store)?;
     let recomputed = canonical_request_hash(&view).map_err(AdapterError::Store)?;

@@ -45,7 +45,7 @@ use eliot_store_api::{
     named_mutation_operation_name, sha256_hex, validate_automation_read_params,
     validate_genesis_receipt_envelope, validate_reactive_ledger_read_params,
     validate_resource_snapshot_read_params, validate_store_receipt_envelope,
-    verify_canonical_request_hash,
+    verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use schemars::JsonSchema;
 use serde::de::Error as _;
@@ -268,6 +268,11 @@ impl MemoryStore {
         validate_transaction(ctx, &transition)?;
         // Recompute before any lookup or effect: supplied != recomputed is a
         // typed digest mismatch with no transaction and no lookup success.
+        // The carried ordering scopes must also still equal the hashed
+        // expected ordering heads: a post-admission scope edit leaves the
+        // shared digest unchanged but changes head advancement, so it fails
+        // here with the same typed mismatch.
+        verify_ordering_scope_binding(&transition, expected_ordering_heads)?;
         let view = CanonicalRequestView::from_apply(
             ctx,
             &transition,

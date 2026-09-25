@@ -44,7 +44,7 @@ use eliot_store_api::{
     OperationIdentity, OrderingHeadExpectation, PreparedTransition, ReadConsistency,
     RecoveryRecord, RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError,
     StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
-    verify_canonical_request_hash,
+    verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2940,8 +2940,21 @@ impl KernelComposition {
         // heads) and reject divergence before the gateway call. The view is
         // built from these references — not re-forwarded copies — so a
         // mutation after admission fails here with the typed mismatch,
-        // rendered through the existing store-error response shape.
+        // rendered through the existing store-error response shape. The
+        // carried ordering scopes must also still equal the hashed expected
+        // ordering heads: a post-admission scope edit leaves the shared
+        // digest unchanged but changes head advancement, so it fails here
+        // with the same typed mismatch.
         {
+            if let Err(error) = verify_ordering_scope_binding(
+                &operation.transition,
+                &operation.expected_ordering_heads,
+            ) {
+                return Ok(Self::store_error_response_text(
+                    "write_receipt",
+                    &error.to_string(),
+                ));
+            }
             let view = CanonicalRequestView::from_apply(
                 &operation.context,
                 &operation.transition,
