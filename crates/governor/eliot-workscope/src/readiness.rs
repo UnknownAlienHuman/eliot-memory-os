@@ -733,6 +733,7 @@ mod tests {
             lease_ref: "onboarding:one".into(),
             lineage_candidate_ref: "lineage:one".into(),
             workspace_instance_candidate_ref: "instance:a".into(),
+            privacy_class: PrivacyClass::Internal,
             governing_source_generation: 1,
             compiler_epoch: 1,
             state: OnboardingLeaseState::Compiling,
