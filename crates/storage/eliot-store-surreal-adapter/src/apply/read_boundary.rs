@@ -467,9 +467,10 @@ struct ErasureOutcomeRow {
 
 /// Evidence-backed erased `(scope_id, subject)` pairs for `GetEvidencePack`.
 ///
-/// `Known` carries the sealed suppression set. `Unknown` means the lookup is
-/// unavailable or unparsable; the pack returns an exact empty payload so an
-/// undecidable lookup never serves rows that could include erased records.
+/// `Known` carries the sealed suppression set. `Unknown` means the two-table
+/// join is only half-present and therefore cannot prove complete suppression
+/// or complete absence. Transport, query, and decoding failures are returned
+/// as typed errors before this state is constructed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ErasureSuppression {
     Known(std::collections::BTreeSet<(String, String)>),
@@ -479,9 +480,10 @@ enum ErasureSuppression {
 impl ErasureSuppression {
     /// Returns the fail-closed suppression verdict for one exact pair.
     ///
-    /// `Unknown` suppresses the whole pack: an undecidable lookup must never
-    /// admit a possibly-erased row, and it must not turn a read into a
-    /// provider-availability error.
+    /// `Unknown` suppresses the whole pack. The production named-read path
+    /// rejects that state before calling this predicate, so an undecidable
+    /// lookup can neither admit a possibly-erased row nor masquerade as a
+    /// complete zero-match result.
     fn check(&self, scope_id: &str, subject: &str) -> bool {
         match self {
             Self::Known(erased) => erased.contains(&(scope_id.to_owned(), subject.to_owned())),
@@ -551,9 +553,16 @@ enum ErasureTable<T> {
     /// The table was never defined on this pre-erasure store: the exact
     /// absent-table signal, an empty side of the join.
     Absent,
-    /// Any other provider error or malformed envelope: the pack must refuse
-    /// fail-closed.
-    Unknown,
+}
+
+/// Returns true only for the provider's absent-table statement naming this
+/// exact table identifier. Delimiter matching is deliberate: a substring such
+/// as `erasure_intent_extra` must never prove that `erasure_intent` is absent.
+fn is_exact_absent_table_error(error: &str, table: &str) -> bool {
+    client::is_absent_table(error)
+        && error
+            .split(['\'', '"', '`'])
+            .any(|identifier| identifier == table)
 }
 
 /// Reads one sealed erasure table through its closed single-statement SELECT,
@@ -566,12 +575,11 @@ enum ErasureTable<T> {
 /// the cancelled remainder — which the old `all(is_absent_table)` check
 /// (correctly, but fatally) refused to call absent.
 ///
-/// Only the exact absent-table signal naming `table` maps to `Absent`;
-/// every other error class — including those transaction-cancellation
-/// artifacts — maps to `Unknown` so the pack returns an exact empty payload
-/// instead of silently including erased records. Transport and other query
-/// failures likewise map to `Unknown` on this optional suppression lookup;
-/// they must not surface as `StoreError::Unavailable` from the pack read.
+/// Only the exact absent-table signal naming `table` maps to `Absent`.
+/// Transport failures retain their existing typed adapter cause, other
+/// provider query failures are unavailable, and malformed row envelopes are a
+/// serialization failure. None of those failures is converted into an
+/// authoritative empty suppression set.
 async fn read_erasure_table<T: serde::de::DeserializeOwned>(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
@@ -579,23 +587,23 @@ async fn read_erasure_table<T: serde::de::DeserializeOwned>(
     sql: &str,
     table: &str,
 ) -> Result<ErasureTable<T>, AdapterError> {
-    let Ok(mut response) = client::query(db, config, operation, sql, Map::new()).await else {
-        return Ok(ErasureTable::Unknown);
-    };
+    let mut response = client::query(db, config, operation, sql, Map::new()).await?;
     let errors = response.take_errors();
     if !errors.is_empty() {
         if errors
             .iter()
-            .all(|error| client::is_absent_table(error) && error.contains(table))
+            .all(|error| is_exact_absent_table_error(error, table))
         {
             return Ok(ErasureTable::Absent);
         }
-        return Ok(ErasureTable::Unknown);
+        return Err(StoreError::Unavailable.into());
     }
-    match response.take::<Vec<T>>(0) {
-        Ok(rows) => Ok(ErasureTable::Rows(rows)),
-        Err(_) => Ok(ErasureTable::Unknown),
-    }
+    response
+        .take::<Vec<T>>(0)
+        .map(ErasureTable::Rows)
+        .map_err(|_| {
+            AdapterError::Serialization("erasure suppression rows are malformed".to_owned())
+        })
 }
 
 /// Reads the sealed erasure-suppression set for `GetEvidencePack`.
@@ -607,42 +615,44 @@ async fn read_erasure_table<T: serde::de::DeserializeOwned>(
 /// rule. Never-defined erasure tables on a pre-erasure store observe the
 /// exact absent-table signal and read as the empty side of the join,
 /// matching the reference handler's empty suppression on a fresh store.
-/// Any other provider error or malformed envelope returns `Unknown` so the
-/// pack read returns exact empty fail-closed instead of silently including
-/// erased records.
+/// Any other provider error or malformed envelope is returned as a typed
+/// failure. A half-present intent/outcome join is retained as `Unknown`, then
+/// rejected by the named-read boundary; neither case can report authoritative
+/// zero-match coverage while withholding potentially erased bytes.
 async fn read_erasure_suppression(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
 ) -> Result<ErasureSuppression, AdapterError> {
-    let intents = match read_erasure_table::<ErasureIntentRow>(
+    let intents = read_erasure_table::<ErasureIntentRow>(
         db,
         config,
         "read.erasure_suppression_intents",
         READ_ERASURE_INTENTS,
         "erasure_intent",
     )
-    .await?
-    {
-        ErasureTable::Rows(intents) => intents,
-        ErasureTable::Absent => Vec::new(),
-        ErasureTable::Unknown => return Ok(ErasureSuppression::Unknown),
-    };
-    let outcomes = match read_erasure_table::<ErasureOutcomeRow>(
+    .await?;
+    let outcomes = read_erasure_table::<ErasureOutcomeRow>(
         db,
         config,
         "read.erasure_suppression_outcomes",
         READ_ALL_ERASURE_OUTCOMES,
         "erasure_outcome",
     )
-    .await?
-    {
-        ErasureTable::Rows(outcomes) => outcomes,
-        ErasureTable::Absent => Vec::new(),
-        ErasureTable::Unknown => return Ok(ErasureSuppression::Unknown),
-    };
-    Ok(ErasureSuppression::Known(suppressed_pairs(
-        &intents, &outcomes,
-    )))
+    .await?;
+    match (intents, outcomes) {
+        (ErasureTable::Absent, ErasureTable::Absent) => {
+            Ok(ErasureSuppression::Known(std::collections::BTreeSet::new()))
+        }
+        (ErasureTable::Rows(intents), ErasureTable::Rows(outcomes)) => Ok(
+            ErasureSuppression::Known(suppressed_pairs(&intents, &outcomes)),
+        ),
+        // A half-present join cannot prove either complete suppression or
+        // complete absence. Keep it indeterminate; the named-read boundary
+        // converts that state to a typed unavailable result before payload
+        // construction and never serves potentially erased records.
+        (ErasureTable::Absent, ErasureTable::Rows(_))
+        | (ErasureTable::Rows(_), ErasureTable::Absent) => Ok(ErasureSuppression::Unknown),
+    }
 }
 
 /// Reads all persisted capture-evidence rows through the closed SELECT.
@@ -768,10 +778,9 @@ fn validate_evidence_record(
 ///
 /// 688-STORE-2: an evidence-backed erased `(scope_id, subject)` pair
 /// suppresses its records — the pack returns exact empty with
-/// `matched_total = 0` — even if rows remain in the log. `Unknown` lookup
-/// state returns the same exact empty payload fail-closed instead of
-/// surfacing `StoreError::Unavailable` or serving rows that may include
-/// erased records.
+/// `matched_total = 0` — even if rows remain in the log. Indeterminate
+/// suppression coverage is a typed failure, never a complete zero-match
+/// response and never a reason to serve rows that may include erased bytes.
 #[allow(
     clippy::too_many_lines,
     reason = "the pack payload validates shape, bound, suppression, fence, walk, and provenance in one closed unit"
@@ -830,8 +839,11 @@ fn evidence_pack_payload(
     }
     // Evidence-backed suppression (688-STORE-2, memory parity): a sealed
     // erased pair returns exact empty even when capture rows remain.
-    // `Unknown` lookup state takes the same fail-closed empty path, so the
-    // pack never silently includes erased records or emits Unavailable.
+    // Defence in depth for any internally constructed indeterminate state:
+    // it is unavailable, not a proved empty search, and no record is served.
+    if suppression == &ErasureSuppression::Unknown {
+        return Err(StoreError::Unavailable);
+    }
     if suppression.check(scope_id.as_str(), subject) {
         return Ok(json!({
             "version": EVIDENCE_PACK_PAYLOAD_VERSION,
