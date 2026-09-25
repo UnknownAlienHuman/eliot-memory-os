@@ -3463,6 +3463,7 @@ dependencies = [
  "eliot-self-quality",
  "eliot-skill",
  "eliot-store-api",
+ "eliot-swarm",
  "eliot-testd-core",
  "eliot-understanding-assessment",
  "eliot-watchdog-core",
