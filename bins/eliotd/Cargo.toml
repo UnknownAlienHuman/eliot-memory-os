@@ -63,6 +63,7 @@ eliot-skill.workspace = true
 eliot-store-api.workspace = true
 eliot-understanding-assessment.workspace = true
 eliot-watchdog-core.workspace = true
+eliot-workscope.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

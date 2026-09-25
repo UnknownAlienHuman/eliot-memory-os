@@ -3452,6 +3452,7 @@ dependencies = [
  "eliot-testd-core",
  "eliot-understanding-assessment",
  "eliot-watchdog-core",
+ "eliot-workscope",
  "serde",
  "serde_json",
  "thiserror",
