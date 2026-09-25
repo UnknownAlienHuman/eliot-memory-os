@@ -45,7 +45,14 @@ pub enum TaskExecutionClassSource {
     Fallback,
 }
 
+/// Derived execution classification. `Default` is Rust-side construction only:
+/// no field carries `#[serde(default)]`, so all five members stay required on
+/// the wire and no Serde default can fabricate a class.
+///
+/// Decoder: derived, no `flatten`, no tagging; the four member enums are
+/// externally tagged and already refuse an unknown variant.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskExecutionClass {
     pub domain: TaskExecutionDomain,
     pub action: TaskExecutionAction,
