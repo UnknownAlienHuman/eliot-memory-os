@@ -13,6 +13,22 @@ use serde::{Deserialize, Serialize};
 use crate::revocation_history::derive_suppressions;
 use crate::{AuthorityError, GrantRestoreOutcome, RevocationHistoryError, validate_text};
 
+const REVOCATION_PAGE_EDGE_LIMIT: u64 = 256;
+const REVOCATION_PAGE_WORK_LIMIT: u64 = 513;
+
+fn map_bounded_revocation_error(error: eliot_influence::InfluenceError) -> AuthorityError {
+    AuthorityError::BoundedRevocation(error)
+}
+
+fn map_bounded_history_error(error: AuthorityError) -> RevocationHistoryError {
+    match error {
+        AuthorityError::BoundedRevocation(error) => {
+            RevocationHistoryError::BoundedRevocation(error)
+        }
+        _ => RevocationHistoryError::UnknownHistory,
+    }
+}
+
 macro_rules! text_id {
     ($name:ident, $field:literal) => {
         #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -615,7 +631,18 @@ impl GrantGraph {
                         &evidence.state_fence,
                         &eliot_influence::RevocationBounds::default_bounds(),
                     )
-                    .map_err(|_| RevocationHistoryError::UnknownHistory)?;
+                    .map_err(map_bounded_history_error)?;
+                if !outcome.complete
+                    || !outcome.frontier.is_empty()
+                    || outcome.omissions.iter().any(|omission| {
+                        matches!(
+                            omission.cause,
+                            eliot_influence::OmissionCause::BoundsExhausted
+                        )
+                    })
+                {
+                    return Err(RevocationHistoryError::UnknownHistory);
+                }
                 for engine_ref in &outcome.affected_refs {
                     if graph.grant(engine_ref.as_str()).is_some()
                         && !suppressed_ids.contains(engine_ref.as_str())
@@ -731,11 +758,17 @@ impl GrantGraph {
     /// that crosses authority roots is never followed, mirroring
     /// [`delegated_closure`](Self::delegated_closure).
     ///
+    /// The production recheck runs the evaluator in bounded pages and resumes
+    /// only from the exact returned continuation. Per-page limits may end a
+    /// call early, but the caller-supplied operation-global bounds, graph/fence
+    /// binding, cumulative work, and pending source-edge position remain
+    /// unchanged across every page. A global-bound refusal remains incomplete
+    /// and is never converted to a clear traversal.
+    ///
     /// Historical grants and lineage are preserved: this method takes
     /// `&self` and deletes nothing. The graph crate never mutates
-    /// authority; this crate calls the pure evaluator only, and any engine
-    /// error maps to [`AuthorityError::InvalidField`] without adding a
-    /// variant (a new variant would break exhaustive downstream matches).
+    /// authority; this crate calls the pure evaluator only and preserves its
+    /// typed refusal through [`AuthorityError::BoundedRevocation`].
     pub fn transitive_revocation_closure(
         &self,
         origin: &GrantId,
@@ -772,8 +805,58 @@ impl GrantGraph {
             completeness: ClosureCompleteness::Complete,
             resumed_visited: Vec::new(),
         };
-        eliot_influence::revoke_bounded(&request, bounds)
-            .map_err(|_| AuthorityError::InvalidField("transitive_revocation_closure"))
+        let page_limits = eliot_influence::BoundedRevocationPageLimits {
+            max_page_edges: bounds.max_edges.min(REVOCATION_PAGE_EDGE_LIMIT),
+            max_page_work: bounds.max_work.min(REVOCATION_PAGE_WORK_LIMIT),
+        };
+        let mut outcome = eliot_influence::revoke_bounded_page(&request, bounds, page_limits)
+            .map_err(map_bounded_revocation_error)?;
+        while !outcome.complete {
+            if outcome.omissions.iter().any(|omission| {
+                matches!(
+                    omission.cause,
+                    eliot_influence::OmissionCause::BoundsExhausted
+                )
+            }) {
+                break;
+            }
+            let continuation = outcome
+                .continuation
+                .clone()
+                .ok_or(AuthorityError::InvalidField(
+                    "transitive_revocation_closure",
+                ))?;
+            let continuation_token =
+                outcome
+                    .continuation_token()
+                    .cloned()
+                    .ok_or(AuthorityError::InvalidField(
+                        "transitive_revocation_closure",
+                    ))?;
+            let previous_work = outcome.work_spent;
+            outcome = eliot_influence::resume_bounded_revocation(
+                &request,
+                &continuation,
+                &continuation_token,
+                bounds,
+                page_limits,
+            )
+            .map_err(map_bounded_revocation_error)?;
+            if !outcome.complete
+                && outcome.work_spent == previous_work
+                && !outcome.omissions.iter().any(|omission| {
+                    matches!(
+                        omission.cause,
+                        eliot_influence::OmissionCause::BoundsExhausted
+                    )
+                })
+            {
+                return Err(AuthorityError::InvalidField(
+                    "transitive_revocation_closure",
+                ));
+            }
+        }
+        Ok(outcome)
     }
 
     pub fn snapshot(
