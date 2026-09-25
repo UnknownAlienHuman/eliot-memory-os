@@ -1756,15 +1756,29 @@ impl RedbRecoveryStore {
 
     /// Durably stages one pending activation ticket before it is published in
     /// memory or returned to a daemon claim.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one ORS write transaction keeps lifecycle identity, successor binding, and capacity pruning atomic"
-    )]
     pub fn stage_activation_ticket(
         &self,
         record: &ActivationLifecycleRecord,
         now_unix_ms: u64,
     ) -> Result<ActivationLifecycleRecord, OrsError> {
+        self.stage_activation_ticket_with_protection(record, now_unix_ms, &BTreeSet::new())
+            .map(|(staged, _)| staged)
+    }
+
+    /// Stages one ticket while protecting live Kernel waiters from bounded
+    /// retention pruning and returns every durable identity evicted by the
+    /// same transaction. The returned list is the only safe way for a cache
+    /// to mirror the ORS projection; it is never an authority decision.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ORS write transaction keeps lifecycle identity, successor binding, and capacity pruning atomic"
+    )]
+    pub fn stage_activation_ticket_with_protection(
+        &self,
+        record: &ActivationLifecycleRecord,
+        now_unix_ms: u64,
+        protected_ticket_ids: &BTreeSet<String>,
+    ) -> Result<(ActivationLifecycleRecord, Vec<String>), OrsError> {
         record.validate()?;
         if record.state != ActivationLifecycleState::Pending
             || record.lifecycle_order != 0
@@ -1800,9 +1814,10 @@ impl RedbRecoveryStore {
                 });
             }
             write.commit().map_err(storage)?;
-            return Ok(existing);
+            return Ok((existing, Vec::new()));
         }
 
+        let mut evicted_ticket_ids = Vec::new();
         let mut lifecycle_rows = Vec::new();
         {
             let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
@@ -1815,15 +1830,36 @@ impl RedbRecoveryStore {
                         reason: "table key does not match ticket identity".to_owned(),
                     });
                 }
+                existing.validate()?;
                 lifecycle_rows.push(existing);
             }
+        }
+        if lifecycle_rows.iter().any(|existing| {
+            existing.activation_request_id == record.activation_request_id
+                || existing.successor_of.as_ref().is_some_and(|successor| {
+                    record.successor_of.as_ref().is_some_and(|candidate| {
+                        successor.predecessor_ticket_id == candidate.predecessor_ticket_id
+                            && successor.predecessor_result_sha256
+                                == candidate.predecessor_result_sha256
+                    })
+                })
+        }) {
+            return Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: key,
+            });
         }
         if lifecycle_rows.len() >= crate::MAX_ACTIVATION_LIFECYCLE_RECORDS {
             let removable = lifecycle_rows
                 .iter()
                 .filter(|existing| {
-                    existing.state == ActivationLifecycleState::ResultAccepted
+                    !protected_ticket_ids.contains(&existing.ticket_id)
                         && existing.successor_ticket_id.is_none()
+                        && matches!(
+                            existing.state,
+                            ActivationLifecycleState::ResultAccepted
+                                | ActivationLifecycleState::Cancelled
+                                | ActivationLifecycleState::Expired
+                        )
                 })
                 .min_by_key(|existing| existing.lifecycle_order)
                 .cloned();
@@ -1840,23 +1876,9 @@ impl RedbRecoveryStore {
                     .map_err(storage)?;
                 table.remove(removable.record_key()).map_err(storage)?;
             }
+            evicted_ticket_ids.push(removable.ticket_id.clone());
             lifecycle_rows.retain(|existing| existing.ticket_id != removable.ticket_id);
         }
-        if lifecycle_rows.iter().any(|existing| {
-            existing.activation_request_id == record.activation_request_id
-                || existing.successor_of.as_ref().is_some_and(|successor| {
-                    record.successor_of.as_ref().is_some_and(|candidate| {
-                        successor.predecessor_ticket_id == candidate.predecessor_ticket_id
-                            && successor.predecessor_result_sha256
-                                == candidate.predecessor_result_sha256
-                    })
-                })
-        }) {
-            return Err(OrsError::ActivationLifecycleIdentityConflict {
-                ticket_id: key,
-            });
-        }
-
         let order = Self::next_operational_order(&write)?;
         let mut next = record.clone();
         next.lifecycle_order = order;
@@ -1895,7 +1917,7 @@ impl RedbRecoveryStore {
         table.insert(key.as_str(), payload.as_str()).map_err(storage)?;
         drop(table);
         write.commit().map_err(storage)?;
-        Ok(next)
+        Ok((next, evicted_ticket_ids))
     }
 
     /// Claims one pending ticket for the authenticated daemon. An expired
@@ -1936,9 +1958,24 @@ impl RedbRecoveryStore {
                 write.commit().map_err(storage)?;
                 return Ok(Some(existing));
             }
+            let mut reconciling = existing;
+            reconciling.state = ActivationLifecycleState::Reconciling;
+            reconciling.claim_owner = None;
+            reconciling.claim_expires_at_unix_ms = None;
+            reconciling.lifecycle_order = Self::next_operational_order(&write)?;
+            reconciling.terminal_reason =
+                Some("claim lease elapsed or ownership changed before result admission".to_owned());
+            reconciling.validate()?;
+            let payload = encode(&reconciling)?;
+            let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            table
+                .insert(reconciling.record_key(), payload.as_str())
+                .map_err(storage)?;
+            drop(table);
+            write.commit().map_err(storage)?;
             return Err(OrsError::ActivationLifecycleStateConflict {
                 ticket_id: ticket_id.to_owned(),
-                state: existing.state,
+                state: ActivationLifecycleState::Reconciling,
                 expected: ActivationLifecycleState::Pending,
             });
         }
@@ -1982,10 +2019,6 @@ impl RedbRecoveryStore {
 
     /// Atomically inserts one result and advances the exact claimed lifecycle
     /// row. Result retention cannot exist without its lifecycle binding.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one ORS write transaction keeps result admission, deadline CAS, and lifecycle publication atomic"
-    )]
     pub fn commit_activation_result(
         &self,
         record: &ActivationResultRetentionRecord,
@@ -1993,6 +2026,30 @@ impl RedbRecoveryStore {
         dependency_observation: Option<(&str, &str)>,
         now_unix_ms: u64,
     ) -> Result<ActivationResultRetentionRecord, OrsError> {
+        self.commit_activation_result_with_protection(
+            record,
+            claim_owner,
+            dependency_observation,
+            now_unix_ms,
+            &BTreeSet::new(),
+        )
+        .map(|(retained, _)| retained)
+    }
+
+    /// Commits one result while protecting live Kernel waiters and returns
+    /// any bounded-retention identities evicted in the same transaction.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ORS write transaction keeps result admission, deadline CAS, and lifecycle publication atomic"
+    )]
+    pub fn commit_activation_result_with_protection(
+        &self,
+        record: &ActivationResultRetentionRecord,
+        claim_owner: &str,
+        dependency_observation: Option<(&str, &str)>,
+        now_unix_ms: u64,
+        protected_ticket_ids: &BTreeSet<String>,
+    ) -> Result<(ActivationResultRetentionRecord, Vec<String>), OrsError> {
         record.validate()?;
         crate::model::validate_text(claim_owner, "activation_result_claim_owner")?;
         if record.retention_order != 0 {
@@ -2021,6 +2078,7 @@ impl RedbRecoveryStore {
                 }
             })?;
             let lifecycle: ActivationLifecycleRecord = decode(bytes.value())?;
+            lifecycle.validate()?;
             drop(bytes);
             lifecycle
         };
@@ -2042,7 +2100,33 @@ impl RedbRecoveryStore {
                 });
             }
             write.commit().map_err(storage)?;
-            return Ok(existing_result);
+            return Ok((existing_result, Vec::new()));
+        }
+        if lifecycle.state == ActivationLifecycleState::Claimed
+            && lifecycle
+                .claim_expires_at_unix_ms
+                .is_some_and(|expiry| expiry <= now_unix_ms)
+        {
+            let mut reconciling = lifecycle;
+            reconciling.state = ActivationLifecycleState::Reconciling;
+            reconciling.claim_owner = None;
+            reconciling.claim_expires_at_unix_ms = None;
+            reconciling.lifecycle_order = Self::next_operational_order(&write)?;
+            reconciling.terminal_reason =
+                Some("claim lease elapsed before durable result admission".to_owned());
+            reconciling.validate()?;
+            let payload = encode(&reconciling)?;
+            let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            table
+                .insert(reconciling.record_key(), payload.as_str())
+                .map_err(storage)?;
+            drop(table);
+            write.commit().map_err(storage)?;
+            return Err(OrsError::ActivationLifecycleStateConflict {
+                ticket_id: key,
+                state: ActivationLifecycleState::Reconciling,
+                expected: ActivationLifecycleState::Claimed,
+            });
         }
         if now_unix_ms >= lifecycle.kernel_deadline_unix_ms {
             if lifecycle.result_sha256.is_none()
@@ -2099,6 +2183,85 @@ impl RedbRecoveryStore {
                 });
             }
         }
+        let mut retained_rows = Vec::new();
+        {
+            let table = write
+                .open_table(ACTIVATION_RESULT_RETENTION)
+                .map_err(storage)?;
+            for entry in table.iter().map_err(storage)? {
+                let (existing_key, value) = entry.map_err(storage)?;
+                let existing: ActivationResultRetentionRecord = decode(value.value())?;
+                if existing_key.value() != existing.record_key() {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "activation_result_retention",
+                        reason: "table key does not match ticket identity".to_owned(),
+                    });
+                }
+                retained_rows.push(existing);
+            }
+        }
+        let mut total_payload_bytes = retained_rows.iter().try_fold(0usize, |total, row| {
+            total.checked_add(row.payload_bytes()).ok_or_else(|| {
+                OrsError::IntegrityProblem {
+                    record_type: "activation_result_retention",
+                    reason: "retention payload size overflow".to_owned(),
+                }
+            })
+        })?;
+        let mut lifecycle_rows: Vec<ActivationLifecycleRecord> = Vec::new();
+        {
+            let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            for entry in table.iter().map_err(storage)? {
+                let (_, value) = entry.map_err(storage)?;
+                let lifecycle: ActivationLifecycleRecord = decode(value.value())?;
+                lifecycle.validate()?;
+                lifecycle_rows.push(lifecycle);
+            }
+        }
+        let mut evicted_ticket_ids = Vec::new();
+        while retained_rows.len() >= crate::MAX_ACTIVATION_RESULT_RETENTION_RECORDS
+            || total_payload_bytes
+                .checked_add(record.payload_bytes())
+                .is_none_or(|total| total > crate::MAX_ACTIVATION_RESULT_TOTAL_PAYLOAD_BYTES)
+        {
+            let removable = lifecycle_rows
+                .iter()
+                .filter(|row| {
+                    row.ticket_id != key
+                        && !protected_ticket_ids.contains(&row.ticket_id)
+                        && row.state == ActivationLifecycleState::ResultAccepted
+                        && row.successor_ticket_id.is_none()
+                })
+                .min_by_key(|row| row.lifecycle_order)
+                .map(|row| row.ticket_id.clone());
+            let Some(removable_ticket_id) = removable else {
+                return Err(OrsError::ProjectionLimitExceeded);
+            };
+            let Some(victim) = retained_rows
+                .iter()
+                .find(|row| row.ticket_id == removable_ticket_id)
+            else {
+                return Err(OrsError::ProjectionLimitExceeded);
+            };
+            total_payload_bytes = total_payload_bytes.saturating_sub(victim.payload_bytes());
+            retained_rows.retain(|row| row.ticket_id != removable_ticket_id);
+            lifecycle_rows.retain(|row| row.ticket_id != removable_ticket_id);
+            {
+                let mut table = write
+                    .open_table(ACTIVATION_RESULT_RETENTION)
+                    .map_err(storage)?;
+                table
+                    .remove(removable_ticket_id.as_str())
+                    .map_err(storage)?;
+            }
+            {
+                let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+                table
+                    .remove(removable_ticket_id.as_str())
+                    .map_err(storage)?;
+            }
+            evicted_ticket_ids.push(removable_ticket_id);
+        }
         let order = Self::next_operational_order(&write)?;
         let mut retained = record.clone();
         retained.retention_order = order;
@@ -2135,7 +2298,7 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
-        Ok(retained)
+        Ok((retained, evicted_ticket_ids))
     }
 
     /// Terminalizes one result-less ticket without erasing accepted results.
@@ -2229,6 +2392,36 @@ impl RedbRecoveryStore {
         Ok(Some(existing))
     }
 
+    /// Cancels a result-less ticket only when the caller proves the exact
+    /// cancellation identity carried by its immutable activation request.
+    /// The identity check is a prerequisite to the state CAS; a mismatched
+    /// caller can never turn a pending row into `Cancelled`.
+    pub fn cancel_activation_without_result(
+        &self,
+        ticket_id: &str,
+        cancellation_id: &str,
+        reason: &str,
+        now_unix_ms: u64,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        crate::model::validate_text(cancellation_id, "activation_cancellation_id")?;
+        let existing = self
+            .load_activation_lifecycle(ticket_id)?
+            .ok_or_else(|| OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: ticket_id.to_owned(),
+            })?;
+        if existing.cancellation_id != cancellation_id {
+            return Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: ticket_id.to_owned(),
+            });
+        }
+        self.terminate_activation_without_result(
+            ticket_id,
+            ActivationLifecycleState::Cancelled,
+            reason,
+            now_unix_ms,
+        )
+    }
+
     /// Loads one activation lifecycle row by exact ticket identity.
     pub fn load_activation_lifecycle(
         &self,
@@ -2257,6 +2450,12 @@ impl RedbRecoveryStore {
         crate::model::validate_text(ticket_id, "activation_result_ticket_id")?;
         crate::model::validate_digest(result_sha256, "activation_result_result_sha256")?;
         let read = self.database.begin_read().map_err(storage)?;
+        let lifecycle_table = read.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        let lifecycle: Option<ActivationLifecycleRecord> = lifecycle_table
+            .get(ticket_id)
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()?;
         let table = read
             .open_table(ACTIVATION_RESULT_RETENTION)
             .map_err(storage)?;
@@ -2268,7 +2467,24 @@ impl RedbRecoveryStore {
         let Some(retained) = retained else {
             return Ok(None);
         };
-        if retained.result_sha256 != result_sha256 {
+        retained.validate()?;
+        let Some(lifecycle) = lifecycle else {
+            return Err(OrsError::ActivationResultRetentionIdentityConflict {
+                ticket_id: ticket_id.to_owned(),
+            });
+        };
+        lifecycle.validate()?;
+        if retained.result_sha256 != result_sha256
+            || retained.ticket_sha256 != lifecycle.ticket_sha256
+            || retained.connection_id != lifecycle.connection_id
+            || retained.state_fence != lifecycle.state_fence
+            || lifecycle.result_sha256.as_deref() != Some(retained.result_sha256.as_str())
+            || !matches!(
+                lifecycle.state,
+                ActivationLifecycleState::ResultAccepted
+                    | ActivationLifecycleState::DeferredNotReady
+            )
+        {
             return Err(OrsError::ActivationResultRetentionIdentityConflict {
                 ticket_id: ticket_id.to_owned(),
             });
@@ -2284,6 +2500,7 @@ impl RedbRecoveryStore {
         &self,
     ) -> Result<Vec<ActivationResultRetentionRecord>, OrsError> {
         let read = self.database.begin_read().map_err(storage)?;
+        let lifecycle_table = read.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
         let table = read
             .open_table(ACTIVATION_RESULT_RETENTION)
             .map_err(storage)?;
@@ -2295,6 +2512,29 @@ impl RedbRecoveryStore {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "activation_result_retention",
                     reason: "table key does not match ticket identity".to_owned(),
+                });
+            }
+            record.validate()?;
+            let lifecycle = lifecycle_table
+                .get(key.value())
+                .map_err(storage)?
+                .ok_or_else(|| OrsError::ActivationResultRetentionIdentityConflict {
+                    ticket_id: record.ticket_id.clone(),
+                })?;
+            let lifecycle: ActivationLifecycleRecord = decode(lifecycle.value())?;
+            lifecycle.validate()?;
+            if lifecycle.ticket_sha256 != record.ticket_sha256
+                || lifecycle.connection_id != record.connection_id
+                || lifecycle.state_fence != record.state_fence
+                || lifecycle.result_sha256.as_deref() != Some(record.result_sha256.as_str())
+                || !matches!(
+                    lifecycle.state,
+                    ActivationLifecycleState::ResultAccepted
+                        | ActivationLifecycleState::DeferredNotReady
+                )
+            {
+                return Err(OrsError::ActivationResultRetentionIdentityConflict {
+                    ticket_id: record.ticket_id.clone(),
                 });
             }
             records.push(record);
@@ -2419,8 +2659,13 @@ impl RedbRecoveryStore {
             let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
             let mut protected = BTreeSet::new();
             for entry in table.iter().map_err(storage)? {
-                let (key, _) = entry.map_err(storage)?;
-                protected.insert(key.value().to_owned());
+                let (key, value) = entry.map_err(storage)?;
+                let lifecycle: ActivationLifecycleRecord = decode(value.value())?;
+                if lifecycle.state != ActivationLifecycleState::ResultAccepted
+                    || lifecycle.successor_ticket_id.is_some()
+                {
+                    protected.insert(key.value().to_owned());
+                }
             }
             protected
         };
@@ -2479,6 +2724,11 @@ impl RedbRecoveryStore {
             .map_err(storage)?;
         for key in &remove_keys {
             table.remove(key.as_str()).map_err(storage)?;
+        }
+        drop(table);
+        let mut lifecycle_table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        for key in &remove_keys {
+            lifecycle_table.remove(key.as_str()).map_err(storage)?;
         }
         u64::try_from(remove_keys.len()).map_err(|_| OrsError::IntegrityProblem {
             record_type: "activation_result_retention",
@@ -5547,11 +5797,29 @@ impl RedbRecoveryStore {
                 reason: "lifecycle record bound exceeded".to_owned(),
             });
         }
+        let mut lifecycle_orders = rows
+            .iter()
+            .map(|record| record.lifecycle_order)
+            .collect::<Vec<_>>();
+        lifecycle_orders.sort_unstable();
+        if lifecycle_orders.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "activation_lifecycle",
+                reason: "lifecycle order is not unique".to_owned(),
+            });
+        }
+        let mut successor_ticket_ids = BTreeSet::new();
         for successor_row in rows
             .iter()
             .filter_map(|record| record.successor_of.as_ref().map(|binding| (record, binding)))
         {
             let (successor_row, successor) = successor_row;
+            if !successor_ticket_ids.insert(successor_row.ticket_id.clone()) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_lifecycle",
+                    reason: "successor ticket identity is duplicated".to_owned(),
+                });
+            }
             let predecessor = rows
                 .iter()
                 .find(|record| record.ticket_id == successor.predecessor_ticket_id)

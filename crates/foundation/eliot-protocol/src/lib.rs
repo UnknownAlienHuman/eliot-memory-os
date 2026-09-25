@@ -1847,12 +1847,20 @@ pub struct AgentActivationResolutionTicket {
     pub ticket_id: String,
     /// Exact activation request identity.
     pub activation_request_id: RequestId,
+    /// Opaque demand identity carried by the exact activation request. It is
+    /// used only to bind a fresh successor to the same bridge demand; it grants
+    /// no semantic task, scope, or Session authority.
+    pub demand_id: String,
     /// Digest of the exact activation request.
     pub activation_request_sha256: String,
     /// Digest of the exact Kernel peer-admission receipt.
     pub peer_admission_receipt_sha256: String,
     /// Kernel-created transport connection identity.
     pub connection_id: String,
+    /// Exact cancellation identity from the original activation request.
+    /// It is inert semantic data, but remains part of the immutable ticket
+    /// join so a result cannot outlive a cancelled request identity.
+    pub cancellation_id: String,
     /// Exact transport fence retained for semantic resolution.
     pub state_fence: StateFence,
     /// Kernel-owned absolute resolution deadline.
@@ -1910,6 +1918,11 @@ impl AgentActivationResolutionTicket {
                 reason: "exceeds the bounded wire length",
             });
         }
+        bounded_text(
+            &self.demand_id,
+            "agent_activation_resolution_ticket.demand_id",
+            512,
+        )?;
         lowercase_sha256(
             &self.activation_request_sha256,
             "agent_activation_resolution_ticket.activation_request_sha256",
@@ -1921,6 +1934,11 @@ impl AgentActivationResolutionTicket {
         bounded_text(
             &self.connection_id,
             "agent_activation_resolution_ticket.connection_id",
+            512,
+        )?;
+        bounded_text(
+            &self.cancellation_id,
+            "agent_activation_resolution_ticket.cancellation_id",
             512,
         )?;
         self.state_fence
@@ -1964,9 +1982,11 @@ impl AgentActivationResolutionTicket {
         request.validate_admission(receipt)?;
         receipt.validate()?;
         if self.activation_request_id != request.request_identity.request.metadata.request_id
+            || self.demand_id != request.demand_id
             || self.activation_request_sha256 != request.request_sha256
             || self.peer_admission_receipt_sha256 != receipt.receipt_sha256
             || self.connection_id != receipt.connection_id
+            || self.cancellation_id != request.request_identity.cancellation_id
             || self.state_fence != receipt.state_fence
             || self.kernel_deadline_unix_ms != receipt.activation_deadline_unix_ms
         {
@@ -2213,6 +2233,21 @@ impl AgentBridgeActivationResponse {
             response_sha256: String::new(),
         }
         .with_computed_digest()
+    }
+
+    /// Constructs a result-bearing denial only after the result has been
+    /// validated against the exact Kernel ticket. This is the strict
+    /// constructor for production callers; the compatibility constructor
+    /// below remains available to import/test adapters that already hold a
+    /// separately validated ticket.
+    pub fn denied_with_resolution_for_ticket(
+        request: &AgentBridgeActivationRequest,
+        ticket: &AgentActivationResolutionTicket,
+        reason_code: AgentBridgeActivationDenialCode,
+        resolution: AgentActivationResolutionResult,
+    ) -> Result<Self, ProtocolError> {
+        resolution.validate_against(ticket)?;
+        Self::denied_with_resolution(request, reason_code, resolution)
     }
 
     /// Constructs a result-bearing denial while retaining the exact typed
@@ -4056,9 +4091,11 @@ mod tests {
             wire_version: AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
             ticket_id: "activation-ticket-1".to_owned(),
             activation_request_id: request.request_identity.request.metadata.request_id.clone(),
+            demand_id: request.demand_id.clone(),
             activation_request_sha256: request.request_sha256.clone(),
             peer_admission_receipt_sha256: receipt.receipt_sha256.clone(),
             connection_id: receipt.connection_id.clone(),
+            cancellation_id: request.request_identity.cancellation_id.clone(),
             state_fence: receipt.state_fence.clone(),
             kernel_deadline_unix_ms: receipt.activation_deadline_unix_ms,
             successor_of: None,

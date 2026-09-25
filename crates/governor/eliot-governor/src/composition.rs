@@ -42,7 +42,9 @@ use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId,
     ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
 };
-use eliot_coordination::CoordinationOwner;
+use eliot_coordination::{
+    ActiveWorkLeaseSelection, CoordinationError, CoordinationOwner,
+};
 use eliot_diagnostic::{
     CONTRACT_NAME as DIAGNOSTIC_CONTRACT, DiagnosticClassifier, DiagnosticEvent, DiagnosticInput,
     DiagnosticSeverity, DiagnosticStatus,
@@ -76,7 +78,7 @@ use eliot_testd_core::{
     JobState, RawArtifactStream, ReceiptBinding, TestJob, TestdSourceObservation,
     TestdSourceObservationRange, TestdStore, TestdTerminalCompletionEvidence, VerificationReceipt,
 };
-use eliot_workscope::{WorkScopeBindingOwner, WorkScopeBindingSnapshot};
+use eliot_workscope::{WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -784,6 +786,18 @@ pub enum CompositionError {
     /// The composition is not ready for semantic work.
     #[error("Governor is not ready")]
     NotReady,
+    /// No exact active task binding is available for activation.
+    #[error("activation task selection is required")]
+    ActivationTaskSelectionRequired,
+    /// More than one exact active task binding was observed.
+    #[error("activation scope is ambiguous")]
+    ActivationScopeAmbiguous { candidate_handles: Vec<String> },
+    /// The exact `WorkScope` binding is not currently selected.
+    #[error("activation scope selection is required")]
+    ActivationScopeSelectionRequired,
+    /// The semantic owner read was fenced or no longer current.
+    #[error("activation owner fence is stale")]
+    ActivationStaleFence,
     /// Canonical admission rejected the envelope.
     #[error("canonical admission: {0}")]
     Canonical(#[from] CanonicalError),
@@ -2351,6 +2365,31 @@ impl CanonicalAdmissionOwner {
                 "canonical current plan is absent; semantic activation is unavailable".to_owned(),
             )
         })
+    }
+
+    /// Reads the current plan for activation through typed failure classes.
+    /// Unlike the general finish/recovery reader, this boundary never exposes
+    /// human error text as a semantic classifier.
+    pub(crate) fn read_current_activation_plan(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<CanonicalPlanBinding, CompositionError> {
+        state_fence
+            .validate()
+            .map_err(|_| CompositionError::ActivationStaleFence)?;
+        if self.state_fence != *state_fence
+            || self.scope.state_fence != *state_fence
+            || self.snapshot.state_fence != *state_fence
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        self.snapshot
+            .validate()
+            .map_err(|_| CompositionError::ActivationStaleFence)?;
+        self.snapshot
+            .current_plan
+            .clone()
+            .ok_or(CompositionError::ActivationScopeSelectionRequired)
     }
 
     /// Returns the durable canonical owner revision used by a finish-evidence
@@ -4607,87 +4646,92 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(CompositionError::NotReady);
         }
         let state_fence = self.snapshot.state_fence();
-        let work = self
-            .owners
-            .coordination
-            .read_unique_active_work_lease(now, state_fence.authority_epoch.clone(), &state_fence)
-            .map_err(|error| {
-                CompositionError::Recovery(format!(
-                    "unique coordination activation read failed: {error}"
-                ))
-            })?;
+        let work = match self.owners.coordination.read_active_work_lease_selection(
+            now,
+            state_fence.authority_epoch.clone(),
+            &state_fence,
+        ) {
+            Ok(ActiveWorkLeaseSelection::None) => {
+                return Err(CompositionError::ActivationTaskSelectionRequired);
+            }
+            Ok(ActiveWorkLeaseSelection::Unique { projection }) => *projection,
+            Ok(ActiveWorkLeaseSelection::Ambiguous { projections }) => {
+                return Err(CompositionError::ActivationScopeAmbiguous {
+                    candidate_handles: projections
+                        .into_iter()
+                        .map(|projection| projection.work_item.work_item_id)
+                        .collect(),
+                });
+            }
+            Err(error) => return Err(map_activation_coordination_error(error)),
+        };
         let task_id = TaskId::new(work.work_item.task_id.clone())
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            .map_err(|_| CompositionError::ActivationTaskSelectionRequired)?;
         let lifecycle_session_id = SessionId::new(work.session.session_id.clone())
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            .map_err(|_| CompositionError::ActivationTaskSelectionRequired)?;
         let lifecycle_session = self
             .owners
             .session
             .session(&lifecycle_session_id)
-            .ok_or_else(|| {
-                CompositionError::Recovery(format!(
-                    "missing session lifecycle record for {lifecycle_session_id}"
-                ))
-            })?;
+            .ok_or(CompositionError::ActivationTaskSelectionRequired)?;
         if lifecycle_session.session_id != lifecycle_session_id
             || lifecycle_session.status != SessionState::Active
             || !lifecycle_session
                 .authority_epoch
                 .is_same_authority(&state_fence.authority_epoch)
             || lifecycle_session.state_fence != state_fence
-            || lifecycle_session.started_at == 0
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        if lifecycle_session.started_at == 0
             || lifecycle_session.heartbeat_at < lifecycle_session.started_at
             || lifecycle_session.expires_at == 0
             || lifecycle_session.expires_at < lifecycle_session.heartbeat_at
             || lifecycle_session.heartbeat_at > now
             || now > lifecycle_session.expires_at
         {
-            return Err(CompositionError::Recovery(
-                "session lifecycle record is not an exact active activation match".to_owned(),
-            ));
+            return Err(CompositionError::NotReady);
         }
         if let Some(scoped_task_id) = &lifecycle_session.task_scope
             && scoped_task_id != task_id.as_str()
         {
-            return Err(CompositionError::Recovery(
-                "session lifecycle task scope disagrees with the selected task".to_owned(),
-            ));
+            return Err(CompositionError::ActivationTaskSelectionRequired);
         }
-        let task = self.owners.task.task(&task_id).ok_or_else(|| {
-            CompositionError::Recovery(format!("missing task owner record for {task_id}"))
-        })?;
-        if task.task_id != task_id
-            || task.state_fence != state_fence
-            || task.revision == 0
+        let task = self
+            .owners
+            .task
+            .task(&task_id)
+            .ok_or(CompositionError::ActivationTaskSelectionRequired)?;
+        if task.task_id != task_id || task.state_fence != state_fence {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        if task.revision == 0
             || !matches!(
                 task.state,
                 TaskState::ActionAuthorized | TaskState::Executing | TaskState::Verifying
             )
         {
-            return Err(CompositionError::Recovery(
-                "task owner record is not an exact actionable activation match".to_owned(),
-            ));
+            return Err(CompositionError::ActivationTaskSelectionRequired);
         }
         if let Some(expected_revision) = state_fence.task_revision
             && expected_revision.value() != task.revision
         {
-            return Err(CompositionError::Recovery(
-                "task revision does not match the activation fence".to_owned(),
-            ));
+            return Err(CompositionError::ActivationStaleFence);
         }
-        let scope_owner = self.owners.work_scope.as_ref().ok_or_else(|| {
-            CompositionError::Recovery(
-                "WorkScope binding is unbound; semantic activation is unavailable".to_owned(),
-            )
+        let scope_owner = self
+            .owners
+            .work_scope
+            .as_ref()
+            .ok_or(CompositionError::ActivationScopeSelectionRequired)?;
+        let scope = scope_owner.read_current(&state_fence).map_err(|error| {
+            map_activation_scope_error(error)
         })?;
-        let scope = scope_owner
-            .read_current(&state_fence)
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        let plan = self.owners.canonical.read_current_plan(&state_fence)?;
+        let plan = self
+            .owners
+            .canonical
+            .read_current_activation_plan(&state_fence)?;
         if plan.task_id != task_id || plan.work_scope_id != scope.binding.scope.scope_ref {
-            return Err(CompositionError::Recovery(
-                "canonical active plan does not match the selected task and WorkScope".to_owned(),
-            ));
+            return Err(CompositionError::ActivationScopeSelectionRequired);
         }
         Ok(GovernorActivationSnapshot {
             state_fence,
@@ -4716,10 +4760,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// elapsed time alone.
     #[must_use]
     pub fn activation_dependency_revision(&self) -> String {
+        let readiness_revision = match self.readiness {
+            CompositionReadiness::Constructing => "constructing",
+            CompositionReadiness::Ready => "ready",
+            CompositionReadiness::Stopped => "stopped",
+        };
         format!(
-            "{}:{:?}",
+            "{}:{}",
             self.owners.canonical.owner_revision(),
-            self.readiness
+            readiness_revision
         )
     }
 
@@ -4906,77 +4955,89 @@ fn validate_service_observations(
     Ok(())
 }
 
+fn map_activation_coordination_error(error: CoordinationError) -> CompositionError {
+    match error {
+        CoordinationError::NoActiveBinding => CompositionError::ActivationTaskSelectionRequired,
+        CoordinationError::AmbiguousActiveBinding => CompositionError::ActivationScopeAmbiguous {
+            candidate_handles: Vec::new(),
+        },
+        CoordinationError::FenceMismatch
+        | CoordinationError::EpochMismatch
+        | CoordinationError::LeaseOwnerMismatch { .. } => CompositionError::ActivationStaleFence,
+        CoordinationError::SessionExpired
+        | CoordinationError::LeaseExpired
+        | CoordinationError::LeaseNotYetValid => CompositionError::NotReady,
+        other => CompositionError::Recovery(format!(
+            "coordination activation read failed: {other}"
+        )),
+    }
+}
+
+fn map_activation_scope_error(error: WorkScopeError) -> CompositionError {
+    match error {
+        WorkScopeError::StateFenceMismatch => CompositionError::ActivationStaleFence,
+        WorkScopeError::BindingReceiptNotMatched
+        | WorkScopeError::BindingReceiptMismatch
+        | WorkScopeError::InvalidStateFence => CompositionError::ActivationScopeSelectionRequired,
+        other => CompositionError::Recovery(format!(
+            "WorkScope activation read failed: {other}"
+        )),
+    }
+}
+
 fn classify_activation_error(
     error: &CompositionError,
     now: u64,
     dependency_revision: &str,
 ) -> GovernorActivationOutcome {
-    let message = error.to_string();
-    // NotReady is the only transient retry signal.
-    if matches!(error, CompositionError::NotReady)
-        || message.contains("not ready")
-        || message.contains("NotReady")
-    {
-        return GovernorActivationOutcome::NotReady {
+    match error {
+        CompositionError::NotReady => GovernorActivationOutcome::NotReady {
             recovery_handle: "governor.readiness:not-ready".to_owned(),
             retry: GovernorRetryDirective::new(
                 "governor.readiness",
                 dependency_revision.to_owned(),
                 now.saturating_add(1).max(1),
             ),
-        };
-    }
-    if message.contains("NoActiveBinding")
-        || message.contains("no active work binding")
-        || message.contains("missing task owner record")
-        || message.contains("canonical current plan is absent")
-    {
-        return GovernorActivationOutcome::TaskSelectionRequired {
-            selection: GovernorSelectionDirective::new(
-                Vec::new(),
-                GovernorCandidateCoverage::Unknown,
-                "governor.task-selection:recovery",
-            ),
-        };
-    }
-    if message.contains("AmbiguousActiveBinding")
-        || message.contains("multiple active work bindings")
-    {
-        return GovernorActivationOutcome::ScopeAmbiguous {
-            selection: GovernorSelectionDirective::new(
-                vec![
-                    "scope:candidate:a".to_owned(),
-                    "scope:candidate:b".to_owned(),
-                ],
-                GovernorCandidateCoverage::Complete,
-                "governor.scope-ambiguous:recovery",
-            ),
-        };
-    }
-    if message.contains("WorkScope binding is unbound")
-        || message.contains("scope") && message.contains("unbound")
-    {
-        return GovernorActivationOutcome::ScopeSelectionRequired {
-            selection: GovernorSelectionDirective::new(
-                Vec::new(),
-                GovernorCandidateCoverage::Unknown,
-                "governor.scope-selection:recovery",
-            ),
-        };
-    }
-    if message.contains("stale")
-        || message.contains("StateFence")
-        || message.contains("state_fence")
-        || message.contains("fence")
-        || message.contains("FenceMismatch")
-    {
-        return GovernorActivationOutcome::StaleFence {
+        },
+        CompositionError::ActivationTaskSelectionRequired => {
+            GovernorActivationOutcome::TaskSelectionRequired {
+                selection: GovernorSelectionDirective::new(
+                    Vec::new(),
+                    GovernorCandidateCoverage::Unknown,
+                    "governor.task-selection:recovery",
+                ),
+            }
+        }
+        CompositionError::ActivationScopeAmbiguous { candidate_handles } => {
+            let coverage = if candidate_handles.is_empty() {
+                GovernorCandidateCoverage::Unknown
+            } else {
+                GovernorCandidateCoverage::Complete
+            };
+            GovernorActivationOutcome::ScopeAmbiguous {
+                selection: GovernorSelectionDirective::new(
+                    candidate_handles.clone(),
+                    coverage,
+                    "governor.scope-ambiguous:recovery",
+                ),
+            }
+        }
+        CompositionError::ActivationScopeSelectionRequired => {
+            GovernorActivationOutcome::ScopeSelectionRequired {
+                selection: GovernorSelectionDirective::new(
+                    Vec::new(),
+                    GovernorCandidateCoverage::Unknown,
+                    "governor.scope-selection:recovery",
+                ),
+            }
+        }
+        CompositionError::ActivationStaleFence => GovernorActivationOutcome::StaleFence {
             recovery_handle: "governor.stale-fence:recovery".to_owned(),
             observed_state_fence: None,
-        };
-    }
-    GovernorActivationOutcome::FailedInternal {
-        failure_handle: format!("governor.internal:{message}"),
+        },
+        _ => GovernorActivationOutcome::FailedInternal {
+            failure_handle: "governor.internal:activation-resolution-failed".to_owned(),
+        },
     }
 }
 

@@ -19,7 +19,7 @@ use eliot_mcp::{
     HostInvocationRequest, HostInvocationResult, HostRequestGateway, KernelHostRequestPort,
     ToolRequest,
 };
-use eliot_protocol::EventEnvelope;
+use eliot_protocol::{AgentActivationResolutionResult, EventEnvelope};
 use request_input::{
     REQUEST_INPUT_LIMIT_TABLE, REQUEST_INPUT_PROFILE, REQUEST_INPUT_PROFILE_ID, ReadOutcome,
     check_profile_id, check_request_envelope, classify_serde_error, prevalidate_record,
@@ -280,6 +280,17 @@ enum Response {
     },
     Error {
         code: &'static str,
+        detail: String,
+    },
+    /// Lossless activation denial projection. The detailed disposition,
+    /// directive, reason code, and exact v2 result remain structured instead
+    /// of being collapsed into a generic human error string.
+    ActivationDenied {
+        code: &'static str,
+        reason_code: String,
+        disposition: String,
+        directive_kind: String,
+        resolution: Option<Box<AgentActivationResolutionResult>>,
         detail: String,
     },
 }
@@ -762,7 +773,10 @@ fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
         | Response::Forwarded { bootstrap, .. }
         | Response::Reconciled { bootstrap }
         | Response::Stopped { bootstrap, .. } => bootstrap,
-        Response::Bootstrap { .. } | Response::Error { .. } | Response::DryRun { .. } => {
+        Response::Bootstrap { .. }
+        | Response::Error { .. }
+        | Response::ActivationDenied { .. }
+        | Response::DryRun { .. } => {
             return;
         }
     };
@@ -1461,6 +1475,21 @@ fn bridge_error(error: &BridgeError) -> Response {
         Response::Error {
             code: "KERNEL_ACTIVATION_PORT_REJECTED",
             detail: "Kernel-owned HostActivationPort rejected or fenced the request".to_owned(),
+        }
+    } else if let BridgeError::ActivationDeniedDetailed {
+        reason_code,
+        disposition,
+        directive_kind,
+        resolution,
+    } = error
+    {
+        Response::ActivationDenied {
+            code: "BRIDGE_REQUEST_REJECTED",
+            reason_code: reason_code.clone(),
+            disposition: disposition.clone(),
+            directive_kind: directive_kind.clone(),
+            resolution: resolution.as_deref().cloned().map(Box::new),
+            detail: error.to_string(),
         }
     } else {
         Response::Error {

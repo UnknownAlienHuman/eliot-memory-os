@@ -131,6 +131,10 @@ pub struct AgentActivationOwnerEvidence {
     pub owner_revision: u64,
     /// State Fence at which the owner observed the binding.
     pub state_fence: StateFence,
+    /// Exact resolved binding observed by the authenticated owner. The full
+    /// value is retained so Kernel can compare every semantic identity field,
+    /// not only an opaque digest, before creating a transport Session.
+    pub binding: Box<AgentActivationResolvedBinding>,
     /// Digest of the exact resolved binding carried by the result.
     pub binding_sha256: String,
     /// Digest over all preceding evidence fields.
@@ -155,6 +159,7 @@ impl AgentActivationOwnerEvidence {
             owner_id: AGENT_ACTIVATION_OWNER_ID.to_owned(),
             owner_revision,
             state_fence,
+            binding: Box::new(binding.clone()),
             binding_sha256,
             evidence_sha256: String::new(),
         }
@@ -211,10 +216,17 @@ impl AgentActivationOwnerEvidence {
         self.state_fence
             .validate()
             .map_err(ProtocolError::Foundation)?;
+        self.binding.validate()?;
         lowercase_sha256(
             &self.binding_sha256,
             "agent_activation_owner_evidence.binding_sha256",
         )?;
+        if self.binding_sha256 != binding_digest(&self.binding)? {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_owner_evidence.binding_sha256",
+                reason: "must bind the exact owner-observed binding",
+            });
+        }
         lowercase_sha256(
             &self.evidence_sha256,
             "agent_activation_owner_evidence.evidence_sha256",
@@ -237,11 +249,12 @@ impl AgentActivationOwnerEvidence {
     ) -> Result<(), ProtocolError> {
         self.validate()?;
         if self.state_fence != *state_fence
+            || self.binding.as_ref() != binding
             || self.binding_sha256 != binding_digest(binding)?
         {
             return Err(ProtocolError::InvalidField {
                 field: "agent_activation_owner_evidence.binding",
-                reason: "must bind the exact resolved binding and owner fence",
+                reason: "must bind every exact resolved identity field and owner fence",
             });
         }
         Ok(())
@@ -607,6 +620,8 @@ pub struct AgentActivationResolutionResult {
     pub ticket_id: String,
     pub ticket_sha256: String,
     pub ticket_state_fence: StateFence,
+    /// Exact cancellation identity inherited from the immutable ticket.
+    pub cancellation_id: String,
     pub resolved_at_unix_ms: u64,
     pub disposition: AgentActivationResolutionDisposition,
     /// Fresh authenticated owner observation required for a successor ticket.
@@ -679,6 +694,7 @@ impl AgentActivationResolutionResult {
             ticket_id: ticket.ticket_id.clone(),
             ticket_sha256: ticket.ticket_sha256.clone(),
             ticket_state_fence: ticket.state_fence.clone(),
+            cancellation_id: ticket.cancellation_id.clone(),
             resolved_at_unix_ms,
             disposition,
             dependency_observation: None,
@@ -772,6 +788,10 @@ impl AgentActivationResolutionResult {
         self.ticket_state_fence
             .validate()
             .map_err(ProtocolError::Foundation)?;
+        bounded_text(
+            &self.cancellation_id,
+            "agent_activation_resolution_result.cancellation_id",
+        )?;
         if self.resolved_at_unix_ms == 0 {
             return Err(ProtocolError::InvalidField {
                 field: "agent_activation_resolution_result.resolved_at_unix_ms",
@@ -822,10 +842,11 @@ impl AgentActivationResolutionResult {
         if self.ticket_id != ticket.ticket_id
             || self.ticket_sha256 != ticket.ticket_sha256
             || self.ticket_state_fence != ticket.state_fence
+            || self.cancellation_id != ticket.cancellation_id
         {
             return Err(ProtocolError::InvalidField {
                 field: "agent_activation_resolution_result.binding",
-                reason: "must bind the exact ticket identity, digest, and fence",
+                reason: "must bind the exact ticket identity, digest, fence, and cancellation identity",
             });
         }
         if self.resolved_at_unix_ms >= ticket.kernel_deadline_unix_ms {
@@ -917,6 +938,73 @@ pub const AGENT_ACTIVATION_RESULT_ACK_WIRE_ID: &str = "eliot.protocol.agent-acti
 /// Current acknowledgement contract version.
 pub const AGENT_ACTIVATION_RESULT_ACK_WIRE_VERSION: u16 = 2;
 
+/// Wire identity of the authenticated pre-claim dependency observation.
+pub const AGENT_ACTIVATION_CLAIM_WIRE_ID: &str =
+    "eliot.protocol.agent-activation-claim";
+/// Current pre-claim observation contract version.
+pub const AGENT_ACTIVATION_CLAIM_WIRE_VERSION: u16 = 2;
+
+/// Fresh owner observation carried with one daemon claim request.
+///
+/// The observation is deliberately opaque to Kernel: the daemon owns the
+/// semantic dependency read, while Kernel only compares the named revision
+/// discriminator mechanically before a successor ticket can become `Claimed`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentActivationClaimRequest {
+    pub wire_id: String,
+    pub wire_version: u16,
+    pub dependency_ref: String,
+    pub dependency_revision: String,
+    pub observed_at_unix_ms: u64,
+}
+
+impl AgentActivationClaimRequest {
+    pub fn new(
+        dependency_ref: String,
+        dependency_revision: String,
+        observed_at_unix_ms: u64,
+    ) -> Result<Self, ProtocolError> {
+        let request = Self {
+            wire_id: AGENT_ACTIVATION_CLAIM_WIRE_ID.to_owned(),
+            wire_version: Self::CONTRACT_VERSION,
+            dependency_ref,
+            dependency_revision,
+            observed_at_unix_ms,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub const CONTRACT_VERSION: u16 = AGENT_ACTIVATION_CLAIM_WIRE_VERSION;
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != AGENT_ACTIVATION_CLAIM_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_claim_request.wire",
+                reason: "unsupported activation claim observation",
+            });
+        }
+        bounded_text(
+            &self.dependency_ref,
+            "agent_activation_claim_request.dependency_ref",
+        )?;
+        bounded_text(
+            &self.dependency_revision,
+            "agent_activation_claim_request.dependency_revision",
+        )?;
+        if self.observed_at_unix_ms == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_claim_request.observed_at_unix_ms",
+                reason: "must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Closed v2 submission carrying exactly one semantic result for one ticket.
 ///
 /// The retired v1 decision shape used a different wire identity, a different
@@ -932,6 +1020,10 @@ pub struct AgentActivationResultSubmit {
     pub wire_version: u16,
     /// The exact semantic result being submitted.
     pub result: AgentActivationResolutionResult,
+    /// Fresh authenticated owner readback captured by the daemon's current
+    /// semantic read. Kernel stores this as its current owner join before a
+    /// Resolved binding can become a transport Session.
+    pub owner_readback: Option<AgentActivationOwnerEvidence>,
 }
 
 impl AgentActivationResultSubmit {
@@ -940,10 +1032,22 @@ impl AgentActivationResultSubmit {
 
     /// Wraps an exact semantic result in a versioned submission envelope.
     pub fn new(result: AgentActivationResolutionResult) -> Result<Self, ProtocolError> {
+        let owner_readback = result.owner_evidence.clone();
+        Self::new_with_owner_readback(result, owner_readback)
+    }
+
+    /// Wraps a result with a separately captured current owner readback.
+    /// The readback is mechanically compared with the result binding by
+    /// [`Self::validate`]; it is not a second semantic resolver.
+    pub fn new_with_owner_readback(
+        result: AgentActivationResolutionResult,
+        owner_readback: Option<AgentActivationOwnerEvidence>,
+    ) -> Result<Self, ProtocolError> {
         let submit = Self {
             wire_id: AGENT_ACTIVATION_RESULT_SUBMIT_WIRE_ID.to_owned(),
             wire_version: Self::CONTRACT_VERSION,
             result,
+            owner_readback,
         };
         submit.validate()?;
         Ok(submit)
@@ -962,7 +1066,26 @@ impl AgentActivationResultSubmit {
                 reason: "unsupported semantic result submission",
             });
         }
-        self.result.validate()
+        self.result.validate()?;
+        match (&self.result.disposition, &self.owner_readback) {
+            (AgentActivationResolutionDisposition::Resolved { binding }, Some(readback)) => {
+                readback.validate_against_binding(binding, &self.result.ticket_state_fence)?;
+            }
+            (AgentActivationResolutionDisposition::Resolved { .. }, None) => {
+                return Err(ProtocolError::InvalidField {
+                    field: "agent_activation_result_submit.owner_readback",
+                    reason: "Resolved requires a current owner readback",
+                });
+            }
+            (_, None) => {}
+            (_, Some(_)) => {
+                return Err(ProtocolError::InvalidField {
+                    field: "agent_activation_result_submit.owner_readback",
+                    reason: "negative dispositions must not carry owner readback",
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Validates the envelope and binds its result to the exact Kernel ticket.
@@ -986,10 +1109,11 @@ pub fn decode_agent_activation_result_submit(
         field: "agent_activation_result_submit",
         reason: "must be a closed JSON object",
     })?;
-    if object.len() != 3
+    if object.len() != 4
         || !object.contains_key("wire_id")
         || !object.contains_key("wire_version")
         || !object.contains_key("result")
+        || !object.contains_key("owner_readback")
     {
         return Err(ProtocolError::InvalidField {
             field: "agent_activation_result_submit",
@@ -1035,6 +1159,19 @@ pub fn decode_agent_activation_result_submit(
         field: "agent_activation_result_submit.result",
         reason: "does not decode as the closed v2 result",
     })?;
+    let owner_readback: Option<AgentActivationOwnerEvidence> = serde_json::from_value(
+        object
+            .get("owner_readback")
+            .cloned()
+            .ok_or(ProtocolError::InvalidField {
+                field: "agent_activation_result_submit.owner_readback",
+                reason: "is required",
+            })?,
+    )
+    .map_err(|_| ProtocolError::InvalidField {
+        field: "agent_activation_result_submit.owner_readback",
+        reason: "does not decode as authenticated owner evidence",
+    })?;
     let submit = AgentActivationResultSubmit {
         wire_id: wire_id.to_owned(),
         wire_version: u16::try_from(wire_version).map_err(|_| ProtocolError::InvalidField {
@@ -1042,6 +1179,7 @@ pub fn decode_agent_activation_result_submit(
             reason: "does not fit the contract version",
         })?,
         result,
+        owner_readback,
     };
     submit.validate()?;
     Ok(submit)

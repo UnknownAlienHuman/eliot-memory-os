@@ -36,9 +36,11 @@ fn ticket() -> Result<AgentActivationResolutionTicket, ProtocolError> {
         wire_version: AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
         ticket_id: "activation-ticket-v2-1".to_owned(),
         activation_request_id: RequestId::new("activation-request-v2-1")?,
+        demand_id: "activation-demand-v2-1".to_owned(),
         activation_request_sha256: "a".repeat(64),
         peer_admission_receipt_sha256: "b".repeat(64),
         connection_id: "activation-connection-v2-1".to_owned(),
+        cancellation_id: "activation-cancellation-v2-1".to_owned(),
         state_fence: StateFence::new(test_epoch(7), ResourceGeneration::new(11)?),
         kernel_deadline_unix_ms: 10_000,
         successor_of: None,
@@ -435,6 +437,7 @@ fn resolved_owner_evidence_binds_exact_binding_and_ticket_fence() -> Result<(), 
             reason: "Resolved must carry owner evidence",
         })?;
     evidence.validate_against_binding(&exact_binding, &ticket.state_fence)?;
+    assert_eq!(evidence.binding.as_ref(), &exact_binding);
     assert_eq!(evidence.owner_revision, 17);
 
     let mut changed_binding = exact_binding;

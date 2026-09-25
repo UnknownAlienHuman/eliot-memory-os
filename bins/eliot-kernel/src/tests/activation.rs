@@ -65,9 +65,11 @@ fn activation_test_entry(deadline: u64) -> (String, AgentActivationPending) {
         wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
         ticket_id: ticket_id.clone(),
         activation_request_id: request_id,
+        demand_id: request.demand_id.clone(),
         activation_request_sha256: request.request_sha256.clone(),
         peer_admission_receipt_sha256: request.peer_admission_receipt_sha256.clone(),
         connection_id: request.connection_id.clone(),
+        cancellation_id: request.request_identity.cancellation_id.clone(),
         state_fence,
         kernel_deadline_unix_ms: deadline,
         successor_of: None,
@@ -79,7 +81,10 @@ fn activation_test_entry(deadline: u64) -> (String, AgentActivationPending) {
             ticket,
             request,
             claim_lease_until_unix_ms: None,
+            claim_dependency_ref: None,
+            claim_dependency_revision: None,
             successor_of: None,
+            owner_readback: None,
         },
     )
 }
@@ -92,12 +97,18 @@ fn activation_claim_lease_expiry_never_requeues_the_ticket() {
     pending.fifo.push_back(ticket_id.clone());
     pending.entries.insert(ticket_id, entry);
 
-    let first = pending.claim_at(1).expect("first claim");
+    let first = pending
+        .claim_at(1, "governor.readiness", "revision-current")
+        .expect("first claim");
     assert_eq!(first.ticket_id, "activation-ticket-test");
-    assert!(pending.claim_at(AGENT_ACTIVATION_CLAIM_LEASE_MS).is_none());
     assert!(
         pending
-            .claim_at(AGENT_ACTIVATION_CLAIM_LEASE_MS + 1)
+            .claim_at(AGENT_ACTIVATION_CLAIM_LEASE_MS, "governor.readiness", "revision-current")
+            .is_none()
+    );
+    assert!(
+        pending
+            .claim_at(AGENT_ACTIVATION_CLAIM_LEASE_MS + 1, "governor.readiness", "revision-current")
             .is_none(),
         "claim expiry is reconciliation evidence, not a semantic retry"
     );
@@ -110,7 +121,12 @@ fn activation_claim_expires_at_deadline() {
     let mut pending = AgentActivationPendingState::default();
     pending.fifo.push_back(ticket_id.clone());
     pending.entries.insert(ticket_id.clone(), entry.clone());
-    assert!(pending.claim_at(2_000).is_none(), "deadline is inclusive");
+    assert!(
+        pending
+            .claim_at(2_000, "governor.readiness", "revision-current")
+            .is_none(),
+        "deadline is inclusive"
+    );
 }
 
 #[cfg(windows)]
@@ -221,9 +237,11 @@ fn activation_v2_ticket(ticket_id: &str, deadline: u64) -> AgentActivationResolu
         wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
         ticket_id: ticket_id.to_owned(),
         activation_request_id: RequestId::new("activation-request-test").expect("request id"),
+        demand_id: "activation-demand-test".to_owned(),
         activation_request_sha256: "a".repeat(64),
         peer_admission_receipt_sha256: "b".repeat(64),
         connection_id: "activation-connection-test".to_owned(),
+        cancellation_id: "activation-cancellation-test".to_owned(),
         state_fence: StateFence::new(
             test_epoch(1),
             ResourceGeneration::new(1).expect("resource generation"),
@@ -243,6 +261,8 @@ fn activation_v2_entry(ticket: &AgentActivationResolutionTicket) -> AgentActivat
         ticket: ticket.clone(),
         request: template.request,
         claim_lease_until_unix_ms: None,
+        claim_dependency_ref: None,
+        claim_dependency_revision: None,
         successor_of: ticket.successor_of.as_ref().map(|predecessor| {
             eliot_ors::ActivationSuccessorBinding {
                 predecessor_ticket_id: predecessor.predecessor_ticket_id.clone(),
@@ -253,6 +273,7 @@ fn activation_v2_entry(ticket: &AgentActivationResolutionTicket) -> AgentActivat
                 not_before_unix_ms: predecessor.not_before_unix_ms,
             }
         }),
+        owner_readback: None,
     }
 }
 

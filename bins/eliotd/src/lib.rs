@@ -250,6 +250,10 @@ pub enum DaemonError {
     /// Authenticated Kernel B1 transport or admission failed.
     #[error("Kernel B1 transport: {0}")]
     Kernel(String),
+    /// The Kernel durably linearized deadline expiry before result admission.
+    /// This is a settled result-less outcome, not a lost acknowledgement.
+    #[error("Kernel activation result deadline expired before admission")]
+    ActivationExpired,
     /// A second daemon owner cannot be admitted in this process.
     #[error("daemon lifecycle: {0}")]
     Lifecycle(String),
@@ -818,6 +822,14 @@ impl DaemonComposition {
                 || self.view_stale
                 || self.readiness() != CompositionReadiness::Ready,
         }
+    }
+
+    /// Returns the current named activation dependency discriminator used by
+    /// the pre-claim successor gate. The Governor remains the sole semantic
+    /// owner; this is a bounded readback for the authenticated claim request.
+    #[must_use]
+    pub fn activation_dependency_revision(&self) -> String {
+        self.governor.activation_dependency_revision()
     }
 
     /// Single production resolver spine: resolves one Kernel-issued semantic

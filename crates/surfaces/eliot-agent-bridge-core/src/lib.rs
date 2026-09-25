@@ -525,6 +525,31 @@ pub const ACTIVATION_DIRECTIVE_FENCE_CLOSED: &str = "stale-fence-fail-closed";
 /// I7.20 directive kind for failures: carry the typed failure capsule.
 pub const ACTIVATION_DIRECTIVE_FAILURE_CAPSULE: &str = "failure-capsule";
 
+fn validate_activation_denial_projection(
+    disposition: &'static str,
+    directive_kind: &'static str,
+) -> Result<(), BridgeError> {
+    if !matches!(
+        disposition,
+        ACTIVATION_DISPOSITION_INVALID_REQUEST
+            | ACTIVATION_DISPOSITION_STALE_OR_CONFLICT
+            | ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY
+            | ACTIVATION_DISPOSITION_FAILED
+    ) || !matches!(
+        directive_kind,
+        ACTIVATION_DIRECTIVE_CANDIDATE_RECOVERY
+            | ACTIVATION_DIRECTIVE_RETRY_NEW_TICKET
+            | ACTIVATION_DIRECTIVE_FENCE_CLOSED
+            | ACTIVATION_DIRECTIVE_FAILURE_CAPSULE
+    ) {
+        return Err(BridgeError::InvalidContract {
+            field: "activation_denial.projection",
+            reason: "disposition and directive must use the closed I7.20 registry",
+        });
+    }
+    Ok(())
+}
+
 /// I7.20 activation-denial triple: disposition + exact `reason_code` + directive.
 ///
 /// Every non-success response includes the disposition, the exact `reason_code`,
@@ -1029,6 +1054,7 @@ impl AgentBridgeCore {
                 validate_text(reason_code, "activation_denial.reason_code")?;
                 validate_text(disposition, "activation_denial.disposition")?;
                 validate_text(directive_kind, "activation_denial.directive_kind")?;
+                validate_activation_denial_projection(disposition, directive_kind)?;
                 if let Some(result) = resolution.as_deref() {
                     result
                         .validate()

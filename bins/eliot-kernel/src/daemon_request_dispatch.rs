@@ -31,8 +31,8 @@ use eliot_process::{
     ProcessExecutionView, ProcessLifecycle,
 };
 use eliot_protocol::{
-    HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt, RequestIdentity,
-    host_request_operation_id,
+    AgentActivationClaimRequest, HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
+    RequestIdentity, host_request_operation_id,
 };
 use eliot_store_api::{
     CanonicalRequestView, NamedReadOperation, NamedReadRequest, NamedReadResponse,
@@ -958,10 +958,27 @@ impl KernelComposition {
             "agent_activation_claim" => {
                 #[cfg(windows)]
                 {
-                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                    let object = payload
+                        .as_object()
+                        .ok_or(TransportError::SessionFenced)?;
+                    if object.len() != 1 || !object.contains_key("claim") {
                         return Err(TransportError::SessionFenced);
                     }
-                    self.claim_agent_activation_ticket().map(|ticket| {
+                    let claim: AgentActivationClaimRequest = serde_json::from_value(
+                        object
+                            .get("claim")
+                            .cloned()
+                            .ok_or(TransportError::SessionFenced)?,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+                    claim
+                        .validate()
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    self.claim_agent_activation_ticket(
+                        &claim.dependency_ref,
+                        &claim.dependency_revision,
+                    )
+                        .map(|ticket| {
                         serde_json::json!({
                             "status": "known",
                             "value": { "ticket": ticket },

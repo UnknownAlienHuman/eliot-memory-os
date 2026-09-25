@@ -26,9 +26,9 @@ use eliot_protocol::{
 };
 use eliotd::testd_terminal_completion::TestdOwnerDrainOutcome;
 use eliotd::{
-    ActivationClaim, DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus,
-    LocalReadSubmitOutcome, PROTOCOL_VERSION, SERVICE_NAME, forward_admitted_local_read,
-    terminal_for_invalid_ticket,
+    ActivationClaim, DaemonComposition, DaemonConfig, DaemonError, DaemonKernelClient,
+    DaemonStatus, LocalReadSubmitOutcome, PROTOCOL_VERSION, SERVICE_NAME,
+    forward_admitted_local_read, terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -73,6 +73,9 @@ enum RunLoopExit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ActivationDispatchError {
     Hard(String),
+    /// Kernel linearized a result-less deadline expiry. The daemon retires
+    /// this ticket without retrying or attempting reconciliation.
+    Expired,
     Unknown {
         ticket_id: String,
         result_sha256: String,
@@ -125,13 +128,24 @@ fn decide_activation_tick(flight: &ActivationFlight) -> ActivationTickDecision {
 }
 
 /// Starts one activation ticket claim step on the shared tick.
+///
+/// The daemon reads its current named dependency discriminator before the
+/// claim request. Kernel uses that authenticated observation to keep a
+/// `NotReady` successor in Pending until due time and a changed discriminator
+/// are both present; lease expiry alone cannot cross this gate.
 fn start_activation_claim(
     kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
 ) -> Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>> {
     let kernel_clone = Arc::clone(kernel);
+    let composition_clone = Arc::clone(composition);
     Box::pin(async move {
+        let dependency_revision = {
+            let guard = composition_clone.lock().await;
+            guard.activation_dependency_revision()
+        };
         let outcome: Result<ActivationClaim, String> = kernel_clone
-            .claim_agent_activation_ticket()
+            .claim_agent_activation_ticket(&dependency_revision)
             .await
             .map_err(|error| format!("Kernel activation ticket claim: {error}"));
         ActivationCompletion::Claim(outcome)
@@ -696,7 +710,7 @@ async fn run_loop(
                 maybe_start_testd_owner_drain(&kernel, &composition, &mut testd_owner_flight);
                 if decide_activation_tick(&flight) == ActivationTickDecision::StartClaim {
                     flight = ActivationFlight::InFlight(ActivationFlightState {
-                        future: start_activation_claim(&kernel),
+                        future: start_activation_claim(&kernel, &composition),
                         retained: None,
                     });
                 }
@@ -748,7 +762,7 @@ async fn run_loop(
                         }
                     }
                     ActivationCompletion::Dispatch(dispatch_outcome) => match dispatch_outcome {
-                        Ok(()) => {
+                        Ok(()) | Err(ActivationDispatchError::Expired) => {
                             flight = ActivationFlight::Idle;
                         }
                         Err(ActivationDispatchError::Hard(error)) => return Err(error),
@@ -850,7 +864,7 @@ async fn drain_activation_on_shutdown(
             Err(error) => Err(error),
         },
         Ok(ActivationCompletion::Dispatch(dispatch_outcome)) => match dispatch_outcome {
-            Ok(()) => Ok(RunLoopExit::Shutdown),
+            Ok(()) | Err(ActivationDispatchError::Expired) => Ok(RunLoopExit::Shutdown),
             Err(ActivationDispatchError::Hard(error)) => Err(error),
             Err(ActivationDispatchError::Unknown {
                 ticket_id,
@@ -1226,6 +1240,7 @@ async fn dispatch_agent_activation_result(
     observe_transient_deferral(&result);
     match kernel.submit_agent_activation_result(&result).await {
         Ok(ack) => classify_submit_ack(ticket, &result, &ack),
+        Err(DaemonError::ActivationExpired) => Err(ActivationDispatchError::Expired),
         Err(submit_error) => {
             // The submit may have committed before the acknowledgement was
             // lost. Retain the exact ticket/result identity and reconcile
@@ -2270,9 +2285,11 @@ mod tests {
             wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
             ticket_id: "ticket-1".to_owned(),
             activation_request_id: RequestId::new("activation-request-1").expect("request id"),
+            demand_id: "demand-1".to_owned(),
             activation_request_sha256: "a".repeat(64),
             peer_admission_receipt_sha256: "b".repeat(64),
             connection_id: "connection-1".to_owned(),
+            cancellation_id: "cancellation-1".to_owned(),
             state_fence: fence,
             kernel_deadline_unix_ms: 100,
             successor_of: None,
@@ -2345,9 +2362,11 @@ mod tests {
             wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
             ticket_id: "ticket-23".to_owned(),
             activation_request_id: RequestId::new("activation-request-23").expect("request id"),
+            demand_id: "demand-23".to_owned(),
             activation_request_sha256: "a".repeat(64),
             peer_admission_receipt_sha256: "b".repeat(64),
             connection_id: "connection-23".to_owned(),
+            cancellation_id: "cancellation-23".to_owned(),
             state_fence: fence,
             kernel_deadline_unix_ms: 100,
             successor_of: None,
@@ -2430,9 +2449,11 @@ mod tests {
             wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
             ticket_id: "ticket-24".to_owned(),
             activation_request_id: RequestId::new("activation-request-24").expect("request id"),
+            demand_id: "demand-24".to_owned(),
             activation_request_sha256: "a".repeat(64),
             peer_admission_receipt_sha256: "b".repeat(64),
             connection_id: "connection-24".to_owned(),
+            cancellation_id: "cancellation-24".to_owned(),
             state_fence: fence,
             kernel_deadline_unix_ms: 100,
             successor_of: None,
@@ -2528,9 +2549,11 @@ mod tests {
             wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
             ticket_id: "ticket-25".to_owned(),
             activation_request_id: RequestId::new("activation-request-25").expect("request id"),
+            demand_id: "demand-25".to_owned(),
             activation_request_sha256: "a".repeat(64),
             peer_admission_receipt_sha256: "b".repeat(64),
             connection_id: "connection-25".to_owned(),
+            cancellation_id: "cancellation-25".to_owned(),
             state_fence: fence,
             kernel_deadline_unix_ms: 100,
             successor_of: None,

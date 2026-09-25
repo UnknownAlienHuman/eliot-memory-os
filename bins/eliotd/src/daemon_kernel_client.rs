@@ -17,7 +17,8 @@ use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, Sourc
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 use eliot_protocol::{
-    AgentActivationResolutionResult, AgentActivationResultAck, AgentActivationResultReconcile,
+    AgentActivationClaimRequest, AgentActivationResolutionResult,
+    AgentActivationResultAck, AgentActivationResultReconcile,
     AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
     HostRequestResultBody, LocalReadAttempt, MessageType, ProtocolPayload, ProtocolVersion,
@@ -48,6 +49,24 @@ use super::{
     KERNEL_OPERATION_TIMEOUT, KernelLaunchBinding, PRE_ADMISSION_RETRY_DELAY, SERVICE_NAME,
     unix_ms, unix_ms_i64,
 };
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivationSubmitResponse {
+    accepted: bool,
+    #[serde(default)]
+    expired: bool,
+    #[serde(default)]
+    ack: Option<AgentActivationResultAck>,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivationReconcileResponse {
+    ack: AgentActivationResultAck,
+}
 
 pub struct DaemonKernelClient {
     launch: GovernorLaunchConfig,
@@ -239,9 +258,16 @@ impl DaemonKernelClient {
     #[cfg(windows)]
     pub async fn claim_agent_activation_ticket(
         &self,
+        dependency_revision: &str,
     ) -> Result<super::ActivationClaim, super::DaemonError> {
+        let claim = AgentActivationClaimRequest::new(
+            "governor.readiness".to_owned(),
+            dependency_revision.to_owned(),
+            unix_ms(),
+        )
+        .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         let value = self
-            .transact_async("agent_activation_claim", serde_json::json!({}))
+            .transact_async("agent_activation_claim", serde_json::json!({ "claim": claim }))
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         let ticket = value.get("ticket").cloned().ok_or_else(|| {
@@ -262,8 +288,11 @@ impl DaemonKernelClient {
         &self,
         result: &AgentActivationResolutionResult,
     ) -> Result<AgentActivationResultAck, super::DaemonError> {
-        let submit = AgentActivationResultSubmit::new(result.clone())
-            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let submit = AgentActivationResultSubmit::new_with_owner_readback(
+            result.clone(),
+            result.owner_evidence.clone(),
+        )
+        .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         let value = self
             .transact_async(
                 "agent_activation_submit",
@@ -271,24 +300,22 @@ impl DaemonKernelClient {
             )
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct ActivationSubmitResponse {
-            accepted: bool,
-            ack: AgentActivationResultAck,
-        }
         let response: ActivationSubmitResponse = serde_json::from_value(value)
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        if response.expired {
+            return Err(super::DaemonError::ActivationExpired);
+        }
         if !response.accepted {
             return Err(super::DaemonError::Kernel(
                 "Kernel submit response was not accepted".to_owned(),
             ));
         }
-        response
-            .ack
-            .validate_against_result(result)
+        let ack = response.ack.ok_or_else(|| {
+            super::DaemonError::Kernel("Kernel submit response omitted acknowledgement".to_owned())
+        })?;
+        ack.validate_against_result(result)
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        Ok(response.ack)
+        Ok(ack)
     }
 
     #[cfg(windows)]
@@ -306,20 +333,13 @@ impl DaemonKernelClient {
             )
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct ActivationReconcileResponse {
-            ack: AgentActivationResultAck,
-        }
         let response: ActivationReconcileResponse = serde_json::from_value(value)
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         response
             .ack
             .validate()
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        if response.ack.replay_key()
-            != (query.ticket_id.as_str(), query.result_sha256.as_str())
-        {
+        if response.ack.replay_key() != (query.ticket_id.as_str(), query.result_sha256.as_str()) {
             return Err(super::DaemonError::Kernel(
                 "Kernel reconcile response identity mismatch".to_owned(),
             ));

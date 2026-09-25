@@ -351,8 +351,8 @@ use eliot_process::{
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::{
     AGENT_BRIDGE_ACTIVATION_OPERATION, AGENT_BRIDGE_MODULE_ID, AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID,
-    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationResolutionDisposition,
-    AgentActivationResolutionResult,
+    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationOwnerEvidence,
+    AgentActivationResolutionDisposition, AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultReconcile,
     AgentBridgeActivationDenialCode, AgentBridgeActivationDisposition,
     AgentBridgeActivationFence, AgentBridgeActivationRequest, AgentBridgeActivationResponse,
@@ -660,6 +660,10 @@ struct AgentActivationPendingState {
     /// separate from the result payload: a cancellation/expiry terminal can
     /// never be confused with a semantic `FailedInternal` result.
     lifecycle: BTreeMap<String, AgentActivationLifecycle>,
+    /// Predecessor tickets that already minted a durable successor. This
+    /// mirrors the ORS `successor_ticket_id` fence so a later request cannot
+    /// repeatedly select the same immutable `NotReady` result.
+    successor_consumed: BTreeSet<String>,
 }
 
 #[cfg(windows)]
@@ -670,9 +674,17 @@ struct AgentActivationPending {
     /// Private Kernel claim lease; it is deliberately absent from the wire
     /// ticket so retries cannot mint or select a caller-owned identity.
     claim_lease_until_unix_ms: Option<u64>,
+    /// Fresh dependency discriminator supplied by the authenticated daemon
+    /// claim. It is checked before a successor enters `Claimed`.
+    claim_dependency_ref: Option<String>,
+    claim_dependency_revision: Option<String>,
     /// A fresh ticket may be linked to one retained `NotReady` predecessor;
     /// the predecessor result itself is immutable and is never replaced.
     successor_of: Option<AgentActivationSuccessorBinding>,
+    /// Authenticated current owner readback stored by Kernel when the exact
+    /// result is durably accepted. It is a readback join, not a second
+    /// semantic resolver.
+    owner_readback: Option<AgentActivationOwnerEvidence>,
 }
 
 /// Closed Kernel lifecycle fence for one activation ticket.
@@ -711,10 +723,10 @@ type AgentActivationSuccessorBinding = eliot_ors::ActivationSuccessorBinding;
 /// Submission phase of one retained v2 semantic result.
 ///
 /// Absence of a record means the ticket is still awaiting its result. A
-/// retained record is never re-queued by claim-lease expiry: the lease only
-/// recycles result-less tickets for transient resolver failure. The sole
-/// re-queue path for a deferred ticket is a gated superseding submission on
-/// the submit path, never the lease clock.
+/// retained record is never re-queued by claim-lease expiry: an uncertain
+/// claim is durably marked `Reconciling` and removed from the live queue.
+/// The sole reconsideration path for a deferred result is a fresh,
+/// gated successor submission, never the lease clock.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AgentActivationResultPhase {
@@ -728,15 +740,16 @@ enum AgentActivationResultPhase {
 }
 
 /// Exact retained semantic result for one Kernel-issued ticket: result
-/// identity, payload digest, full typed disposition, submission phase, and
-/// the exact transport connection that owns the ticket. The connection is
-/// retained so a projected-then-retried host-request envelope still
-/// fail-closes on cross-connection replay after the pending entry is
-/// consumed.
+/// identity, payload digest, full typed disposition, and submission phase.
+/// The immutable ticket payload carries the connection identity; this cache
+/// never restores a live connection or Session after restart.
 #[cfg(windows)]
 #[derive(Clone)]
 struct AgentActivationResultRecord {
     result: AgentActivationResolutionResult,
+    /// Opaque bridge demand identity from the immutable ticket. It binds a
+    /// successor to the same demand without carrying semantic authority.
+    demand_id: String,
     phase: AgentActivationResultPhase,
     retention_order: u64,
 }
@@ -770,6 +783,7 @@ impl AgentActivationPendingState {
     pub(crate) fn from_rehydrated_results(
         results: BTreeMap<String, AgentActivationResultRecord>,
         lifecycle: BTreeMap<String, AgentActivationLifecycle>,
+        successor_consumed: BTreeSet<String>,
     ) -> Self {
         let mut state = Self::default();
         let mut result_order = results
@@ -783,6 +797,7 @@ impl AgentActivationPendingState {
         });
         state.result_order = result_order.into_iter().collect();
         state.lifecycle = lifecycle;
+        state.successor_consumed = successor_consumed;
         state.results = results;
         state
     }
@@ -811,18 +826,25 @@ impl AgentActivationPendingState {
             .unwrap_or(AgentActivationLifecycle::Pending)
     }
 
-    /// Finds the one retained `NotReady` predecessor that may authorize a
-    /// fresh successor ticket. A same-ticket replacement is never returned.
-    fn successor_binding_for(
+    /// Finds the one retained `NotReady` predecessor for this exact bridge
+    /// demand that may authorize a fresh successor ticket. The due-time check
+    /// only makes a candidate eligible for staging; `claim_at` still requires
+    /// the authenticated daemon's fresh changed-revision discriminator before
+    /// transitioning it to `Claimed`. A same-ticket replacement is never
+    /// returned, and an unrelated demand cannot inherit predecessor evidence.
+    fn successor_candidate_for(
         &self,
         now: u64,
+        demand_id: &str,
     ) -> Result<Option<AgentActivationSuccessorBinding>, TransportError> {
         let mut candidates = self
             .results
             .values()
             .filter(|record| {
-                self.lifecycle(&record.result.ticket_id)
-                    == AgentActivationLifecycle::DeferredNotReady
+                record.demand_id == demand_id
+                    && !self.successor_consumed.contains(&record.result.ticket_id)
+                    && self.lifecycle(&record.result.ticket_id)
+                        == AgentActivationLifecycle::DeferredNotReady
                     && matches!(
                         &record.result.disposition,
                         AgentActivationResolutionDisposition::NotReady { .. }
@@ -858,27 +880,63 @@ impl AgentActivationPendingState {
         }))
     }
 
-    fn claim_at(&mut self, now: u64) -> Option<AgentActivationResolutionTicket> {
+    fn claim_at(
+        &mut self,
+        now: u64,
+        dependency_ref: &str,
+        dependency_revision: &str,
+    ) -> Option<AgentActivationResolutionTicket> {
         let queue_len = self.fifo.len();
         for _ in 0..queue_len {
             let ticket_id = self.fifo.pop_front()?;
             // A retained semantic result (v2) is terminal-or-deferred
             // durable state: claim-lease expiry is not a semantic delta and
-            // never re-queues it. Only result-less tickets recycle through
-            // the lease for transient resolver failure.
+            // never re-queues it. A result-less lost claim is removed from
+            // the live queue and reconciled by the durable owner.
             if self.results.contains_key(&ticket_id) {
                 continue;
             }
-            let Some(entry) = self.entries.get_mut(&ticket_id) else {
+            let Some(entry) = self.entries.get(&ticket_id) else {
                 continue;
             };
             if activation_deadline_expired(now, entry.ticket.kernel_deadline_unix_ms) {
                 continue;
             }
+            let successor = entry.successor_of.clone();
+            if let Some(successor) = successor.as_ref() {
+                let Some(predecessor) = self.results.get(&successor.predecessor_ticket_id)
+                else {
+                    self.fifo.push_back(ticket_id);
+                    continue;
+                };
+                let AgentActivationResolutionDisposition::NotReady {
+                    retry: predecessor_retry,
+                    ..
+                } = &predecessor.result.disposition
+                else {
+                    self.fifo.push_back(ticket_id);
+                    continue;
+                };
+                if now < predecessor_retry.not_before_unix_ms
+                    || successor.dependency_ref != dependency_ref
+                    || dependency_revision == predecessor_retry.observed_dependency_revision
+                {
+                    // A due-time-only observation is not claimable. Keep the
+                    // successor staged and invisible to the daemon until the
+                    // authenticated owner supplies a changed discriminator.
+                    self.fifo.push_back(ticket_id);
+                    continue;
+                }
+            }
+            let Some(entry) = self.entries.get_mut(&ticket_id) else {
+                continue;
+            };
             entry.claim_lease_until_unix_ms = Some(
                 now.saturating_add(AGENT_ACTIVATION_CLAIM_LEASE_MS)
                     .min(entry.ticket.kernel_deadline_unix_ms),
             );
+            entry.claim_dependency_ref = Some(dependency_ref.to_owned());
+            entry.claim_dependency_revision = Some(dependency_revision.to_owned());
             let ticket = entry.ticket.clone();
             self.mark_lifecycle(&ticket_id, AgentActivationLifecycle::Claimed);
             return Some(ticket);
@@ -912,34 +970,21 @@ impl AgentActivationPendingState {
                 .all(|ticket_id| ordered.contains(ticket_id))
     }
 
-    /// Determines the only safe eviction plan for one incoming result. This
-    /// is deliberately pure: an impossible bound or order/map state returns
-    /// `None` before durable ORS publication can begin.
+    /// Validates the local ledger shape before publication. ORS, under the
+    /// same pending lock, is the sole authority for bounded eviction; the
+    /// cache never selects a victim independently.
     #[cfg(windows)]
-    fn result_retention_eviction_plan(&self, ticket_id: &str) -> Option<Vec<String>> {
+    fn result_retention_eviction_plan(&self, _ticket_id: &str) -> Option<Vec<String>> {
         if !self.result_ledger_is_consistent() {
             return None;
         }
-        if self.results.contains_key(ticket_id) {
-            return Some(Vec::new());
-        }
-        let max = eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS;
-        let required = self.results.len().saturating_add(1).saturating_sub(max);
-        let mut victims = Vec::with_capacity(required);
-        for candidate in &self.result_order {
-            if !self.entries.contains_key(candidate) {
-                victims.push(candidate.clone());
-                if victims.len() == required {
-                    break;
-                }
-            }
-        }
-        (victims.len() == required).then_some(victims)
+        Some(Vec::new())
     }
 
     /// Stages the canonical result map/order update before the durable write.
-    /// The returned copies are not published until ORS has committed, so an
-    /// impossible capacity or order state leaves the live ledger untouched.
+    /// ORS performs bounded eviction under the same pending lock and returns
+    /// the exact victim identities; this cache never chooses a different
+    /// victim independently.
     #[cfg(windows)]
     fn stage_result_retention(
         &self,
@@ -980,8 +1025,13 @@ impl AgentActivationPendingState {
         ),
         ticket_id: &str,
         retention_order: u64,
+        evicted_ticket_ids: &[String],
     ) {
         debug_assert!(staged.0.contains_key(ticket_id));
+        for evicted_ticket_id in evicted_ticket_ids {
+            staged.0.remove(evicted_ticket_id);
+            staged.1.retain(|candidate| candidate != evicted_ticket_id);
+        }
         if let Some(record) = staged.0.get_mut(ticket_id) {
             record.retention_order = retention_order;
         }
@@ -989,15 +1039,6 @@ impl AgentActivationPendingState {
         self.result_order = staged.1;
     }
 
-    #[cfg(test)]
-    fn retain_activation_result(&mut self, record: AgentActivationResultRecord) {
-        let ticket_id = record.result.ticket_id.clone();
-        let retention_order = record.retention_order;
-        let staged = self
-            .stage_result_retention(record)
-            .expect("test result ledger must have a safe retention state");
-        self.publish_staged_result_retention(staged, &ticket_id, retention_order);
-    }
 }
 
 /// Server-first bridge handshake material returned by Kernel composition.
