@@ -351,8 +351,9 @@ use eliot_process::{
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::{
     AGENT_BRIDGE_ACTIVATION_OPERATION, AGENT_BRIDGE_MODULE_ID, AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID,
-    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationOwnerEvidence,
-    AgentActivationResolutionDisposition, AgentActivationResolutionResult,
+    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationOwnerReadback,
+    AgentActivationResolutionDisposition,
+    AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultReconcile,
     AgentBridgeActivationDenialCode, AgentBridgeActivationDisposition,
     AgentBridgeActivationFence, AgentBridgeActivationRequest, AgentBridgeActivationResponse,
@@ -684,7 +685,7 @@ struct AgentActivationPending {
     /// Authenticated current owner readback stored by Kernel when the exact
     /// result is durably accepted. It is a readback join, not a second
     /// semantic resolver.
-    owner_readback: Option<AgentActivationOwnerEvidence>,
+    owner_readback: Option<AgentActivationOwnerReadback>,
 }
 
 /// Closed Kernel lifecycle fence for one activation ticket.

@@ -620,7 +620,8 @@ fn required_activation_functions_are_production_reachable() -> TestResult {
         "async fn dispatch_agent_activation_result(",
         "/// Builds the lost-acknowledgement reconcile query",
     )?;
-    assert!(dispatch.contains("kernel.submit_agent_activation_result(&result)"));
+    assert!(dispatch.contains("submit_agent_activation_result"));
+    assert!(dispatch.contains("owner_readback"));
     assert!(dispatch.contains("reconcile_agent_activation_result(&query)"));
     Ok(())
 }

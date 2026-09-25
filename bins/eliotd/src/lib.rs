@@ -23,7 +23,10 @@ use eliot_governor::{
 };
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
-use eliot_protocol::{AgentActivationResolutionResult, AgentActivationResolutionTicket};
+use eliot_protocol::{
+    AgentActivationOwnerEvidence, AgentActivationOwnerReadback, AgentActivationResolvedBinding,
+    AgentActivationResolutionResult, AgentActivationResolutionTicket,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -830,6 +833,38 @@ impl DaemonComposition {
     #[must_use]
     pub fn activation_dependency_revision(&self) -> String {
         self.governor.activation_dependency_revision()
+    }
+
+    /// Reads the current semantic owner projection for the exact owner
+    /// readback carried with a Resolved result submission. This is a bounded
+    /// readback of the same Governor owner, not a second Kernel resolver and
+    /// not a replacement result computation.
+    pub fn current_activation_owner_readback(
+        &self,
+        now: u64,
+    ) -> Result<AgentActivationOwnerReadback, DaemonError> {
+        let snapshot = self
+            .governor
+            .read_unique_agent_activation(now)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        let binding = AgentActivationResolvedBinding {
+            principal_id: snapshot.principal_id,
+            session_id: snapshot.session_id,
+            task_id: snapshot.task_id.to_string(),
+            work_unit_id: snapshot.work_unit_id,
+            work_scope_id: snapshot.work_scope_id,
+            task_revision: snapshot.task_revision.to_string(),
+            plan_id: snapshot.plan_id,
+            plan_revision: snapshot.plan_revision,
+        };
+        let evidence = AgentActivationOwnerEvidence::for_binding(
+            &binding,
+            snapshot.owner_revision,
+            snapshot.state_fence,
+        )
+        .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        AgentActivationOwnerReadback::from_evidence(evidence, now.max(1))
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
     /// Single production resolver spine: resolves one Kernel-issued semantic

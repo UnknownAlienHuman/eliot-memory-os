@@ -810,10 +810,11 @@ fn start_valid_claim_step(
         // expired ticket.
         return Ok(None);
     }
-    // Single v2 resolution per newly admitted ticket.  The v2 resolver maps
-    // all seven Governor outcomes to typed results; any Err is a real
-    // validation/readiness failure and must fail closed rather than silently
-    // discarding a disposition.
+    // Single v2 result resolution per newly admitted ticket. The v2 resolver
+    // maps all seven Governor outcomes to typed results; the Resolved arm
+    // then obtains one independent current-owner readback below. Any Err is a
+    // real validation/readiness failure and must fail closed rather than
+    // silently discarding a disposition.
     let result = composition
         .resolve_agent_activation_v2(&ticket, now)
         .map_err(|error| {
@@ -822,6 +823,22 @@ fn start_valid_claim_step(
                 ticket.ticket_id
             )
         })?;
+    // A Resolved result is submitted only with a separate current-owner
+    // readback. This is a read of the same Governor owner, not a second
+    // result resolver; it is intentionally absent for every negative arm.
+    let owner_readback = if matches!(
+        &result.disposition,
+        AgentActivationResolutionDisposition::Resolved { .. }
+    ) {
+        Some(composition.current_activation_owner_readback(now).map_err(|error| {
+            format!(
+                "daemon activation owner readback ticket {}: {error}",
+                ticket.ticket_id
+            )
+        })?)
+    } else {
+        None
+    };
     let retained = RetainedActivationIdentity {
         ticket_id: ticket.ticket_id.clone(),
         result_sha256: result.result_sha256.clone(),
@@ -829,7 +846,13 @@ fn start_valid_claim_step(
     let kernel_clone = Arc::clone(kernel);
     let future: Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>> =
         Box::pin(async move {
-            let outcome = dispatch_agent_activation_result(&kernel_clone, &ticket, result).await;
+            let outcome = dispatch_agent_activation_result(
+                &kernel_clone,
+                &ticket,
+                result,
+                owner_readback,
+            )
+            .await;
             ActivationCompletion::Dispatch(outcome)
         });
     Ok(Some(ActivationFlightState {
@@ -1229,6 +1252,7 @@ async fn dispatch_agent_activation_result(
     kernel: &DaemonKernelClient,
     ticket: &AgentActivationResolutionTicket,
     result: AgentActivationResolutionResult,
+    owner_readback: Option<eliot_protocol::AgentActivationOwnerReadback>,
 ) -> Result<(), ActivationDispatchError> {
     // #740: dispatch span over the submit-then-reconcile path. The retained
     // result is reused verbatim; only bounded ticket identity is carried.
@@ -1238,7 +1262,10 @@ async fn dispatch_agent_activation_result(
     )
     .entered();
     observe_transient_deferral(&result);
-    match kernel.submit_agent_activation_result(&result).await {
+    match kernel
+        .submit_agent_activation_result(&result, owner_readback)
+        .await
+    {
         Ok(ack) => classify_submit_ack(ticket, &result, &ack),
         Err(DaemonError::ActivationExpired) => Err(ActivationDispatchError::Expired),
         Err(submit_error) => {

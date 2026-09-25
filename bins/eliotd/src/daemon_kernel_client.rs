@@ -17,7 +17,8 @@ use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, Sourc
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 use eliot_protocol::{
-    AgentActivationClaimRequest, AgentActivationResolutionResult,
+    AgentActivationClaimRequest, AgentActivationOwnerReadback,
+    AgentActivationResolutionResult,
     AgentActivationResultAck, AgentActivationResultReconcile,
     AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
@@ -287,10 +288,11 @@ impl DaemonKernelClient {
     pub async fn submit_agent_activation_result(
         &self,
         result: &AgentActivationResolutionResult,
+        owner_readback: Option<AgentActivationOwnerReadback>,
     ) -> Result<AgentActivationResultAck, super::DaemonError> {
         let submit = AgentActivationResultSubmit::new_with_owner_readback(
             result.clone(),
-            result.owner_evidence.clone(),
+            owner_readback,
         )
         .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         let value = self

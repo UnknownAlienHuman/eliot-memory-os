@@ -261,6 +261,93 @@ impl AgentActivationOwnerEvidence {
     }
 }
 
+/// Independent current-owner readback captured immediately before result
+/// submission. It is distinct from the result's semantic evidence: the owner
+/// supplies a fresh, timestamped readback of the same binding so Kernel can
+/// detect a semantic-owner change without resolving task meaning itself.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentActivationOwnerReadback {
+    pub evidence: AgentActivationOwnerEvidence,
+    pub observed_at_unix_ms: u64,
+    pub readback_sha256: String,
+}
+
+impl AgentActivationOwnerReadback {
+    pub fn from_evidence(
+        evidence: AgentActivationOwnerEvidence,
+        observed_at_unix_ms: u64,
+    ) -> Result<Self, ProtocolError> {
+        if observed_at_unix_ms == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_owner_readback.observed_at_unix_ms",
+                reason: "must be greater than zero",
+            });
+        }
+        let mut readback = Self {
+            evidence,
+            observed_at_unix_ms,
+            readback_sha256: String::new(),
+        };
+        readback.readback_sha256 = readback.compute_digest()?;
+        readback.validate()?;
+        Ok(readback)
+    }
+
+    fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut unsigned = self.clone();
+        unsigned.readback_sha256.clear();
+        canonical_json_bytes(&unsigned).map_err(|error| ProtocolError::Json(error.to_string()))
+    }
+
+    pub fn compute_digest(&self) -> Result<String, ProtocolError> {
+        Ok(eliot_contracts::sha256_hex(
+            &self.canonical_unsigned_bytes()?,
+        ))
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.evidence.validate()?;
+        if self.observed_at_unix_ms == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_owner_readback.observed_at_unix_ms",
+                reason: "must be greater than zero",
+            });
+        }
+        lowercase_sha256(
+            &self.readback_sha256,
+            "agent_activation_owner_readback.readback_sha256",
+        )?;
+        if self.readback_sha256 != self.compute_digest()? {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_owner_readback.readback_sha256",
+                reason: "owner readback digest mismatch",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn validate_against_binding(
+        &self,
+        binding: &AgentActivationResolvedBinding,
+        state_fence: &StateFence,
+    ) -> Result<(), ProtocolError> {
+        self.validate()?;
+        self.evidence.validate_against_binding(binding, state_fence)
+    }
+
+    /// Semantic equality for exact replay. Observation time and a monotonic
+    /// owner revision are readback metadata; the result identity remains the
+    /// exact owner/fence/binding projection, so a newer readback cannot turn
+    /// an otherwise exact result replay into a conflict.
+    #[must_use]
+    pub fn same_owner_projection(&self, other: &Self) -> bool {
+        self.evidence.owner_id == other.evidence.owner_id
+            && self.evidence.state_fence == other.evidence.state_fence
+            && self.evidence.binding == other.evidence.binding
+    }
+}
+
 /// Computes the canonical digest of the semantic fields in a resolved binding.
 pub fn binding_digest(binding: &AgentActivationResolvedBinding) -> Result<String, ProtocolError> {
     binding.validate()?;
@@ -1023,7 +1110,7 @@ pub struct AgentActivationResultSubmit {
     /// Fresh authenticated owner readback captured by the daemon's current
     /// semantic read. Kernel stores this as its current owner join before a
     /// Resolved binding can become a transport Session.
-    pub owner_readback: Option<AgentActivationOwnerEvidence>,
+    pub owner_readback: Option<AgentActivationOwnerReadback>,
 }
 
 impl AgentActivationResultSubmit {
@@ -1032,7 +1119,12 @@ impl AgentActivationResultSubmit {
 
     /// Wraps an exact semantic result in a versioned submission envelope.
     pub fn new(result: AgentActivationResolutionResult) -> Result<Self, ProtocolError> {
-        let owner_readback = result.owner_evidence.clone();
+        let readback_at = result.resolved_at_unix_ms;
+        let owner_readback = result
+            .owner_evidence
+            .clone()
+            .map(|evidence| AgentActivationOwnerReadback::from_evidence(evidence, readback_at))
+            .transpose()?;
         Self::new_with_owner_readback(result, owner_readback)
     }
 
@@ -1041,7 +1133,7 @@ impl AgentActivationResultSubmit {
     /// [`Self::validate`]; it is not a second semantic resolver.
     pub fn new_with_owner_readback(
         result: AgentActivationResolutionResult,
-        owner_readback: Option<AgentActivationOwnerEvidence>,
+        owner_readback: Option<AgentActivationOwnerReadback>,
     ) -> Result<Self, ProtocolError> {
         let submit = Self {
             wire_id: AGENT_ACTIVATION_RESULT_SUBMIT_WIRE_ID.to_owned(),
@@ -1070,6 +1162,15 @@ impl AgentActivationResultSubmit {
         match (&self.result.disposition, &self.owner_readback) {
             (AgentActivationResolutionDisposition::Resolved { binding }, Some(readback)) => {
                 readback.validate_against_binding(binding, &self.result.ticket_state_fence)?;
+                if self.result.owner_evidence.as_ref().is_some_and(|evidence| {
+                    readback.evidence.owner_id != evidence.owner_id
+                        || readback.evidence.owner_revision < evidence.owner_revision
+                }) {
+                    return Err(ProtocolError::InvalidField {
+                        field: "agent_activation_result_submit.owner_readback",
+                        reason: "must not be older than the result owner evidence",
+                    });
+                }
             }
             (AgentActivationResolutionDisposition::Resolved { .. }, None) => {
                 return Err(ProtocolError::InvalidField {
@@ -1159,7 +1260,7 @@ pub fn decode_agent_activation_result_submit(
         field: "agent_activation_result_submit.result",
         reason: "does not decode as the closed v2 result",
     })?;
-    let owner_readback: Option<AgentActivationOwnerEvidence> = serde_json::from_value(
+    let owner_readback: Option<AgentActivationOwnerReadback> = serde_json::from_value(
         object
             .get("owner_readback")
             .cloned()
@@ -1170,7 +1271,7 @@ pub fn decode_agent_activation_result_submit(
     )
     .map_err(|_| ProtocolError::InvalidField {
         field: "agent_activation_result_submit.owner_readback",
-        reason: "does not decode as authenticated owner evidence",
+        reason: "does not decode as authenticated owner readback",
     })?;
     let submit = AgentActivationResultSubmit {
         wire_id: wire_id.to_owned(),

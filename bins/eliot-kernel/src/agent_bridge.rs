@@ -23,8 +23,9 @@ use eliot_platform_windows::{
 };
 use eliot_protocol::{
     AGENT_BRIDGE_ACTIVATION_OPERATION, AGENT_BRIDGE_MODULE_ID, AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID,
-    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationOwnerEvidence,
-    AgentActivationResolutionDisposition, AgentActivationResolutionResult,
+    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationOwnerReadback,
+    AgentActivationResolutionDisposition,
+    AgentActivationResolutionResult,
     AgentActivationResolutionTicket,
     AgentActivationResolvedBinding, AgentActivationResultAck, AgentActivationResultReconcile,
     AgentActivationResultSubmit, AgentBridgeActivationDenialCode, AgentBridgeActivationFence,
@@ -1255,7 +1256,7 @@ impl KernelComposition {
         entry_ticket: Option<AgentActivationResolutionTicket>,
         retained: &AgentActivationResultRecord,
         incoming: AgentActivationResolutionResult,
-        owner_readback: Option<&AgentActivationOwnerEvidence>,
+        owner_readback: Option<&AgentActivationOwnerReadback>,
     ) -> Result<AgentActivationResultAck, TransportError> {
         if Self::result_phase_for_disposition(&retained.result.disposition) != retained.phase {
             return Err(TransportError::SessionFenced);
@@ -1267,7 +1268,12 @@ impl KernelComposition {
                         .entries
                         .get(&ticket.ticket_id)
                         .and_then(|entry| entry.owner_readback.as_ref());
-                    if stored_readback != owner_readback {
+                    let same_readback = match (stored_readback, owner_readback) {
+                        (Some(stored), Some(incoming)) => stored.same_owner_projection(incoming),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if !same_readback {
                         return Err(TransportError::IdentityConflict);
                     }
                     incoming
@@ -1594,8 +1600,9 @@ impl KernelComposition {
     /// path can mint a transport Session. The readback is a current Kernel-held
     /// projection, not a second semantic resolver: the daemon's single
     /// coherent owner read supplies it, and this method compares every binding
-    /// field, revision, and fence mechanically. The P-07 readback additionally
-    /// proves that a current owner binding is installed.
+    /// field, revision, and fence mechanically. The dedicated daemon-side
+    /// current-owner readback supplies the independent semantic join; the
+    /// P-07 readback additionally proves that an owner binding is installed.
     #[cfg(windows)]
     fn validate_current_activation_owner(
         &self,
@@ -1611,7 +1618,9 @@ impl KernelComposition {
             .owner_readback
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
-        if readback != evidence {
+        if readback.evidence.owner_id != evidence.owner_id
+            || readback.evidence.owner_revision < evidence.owner_revision
+        {
             return Err(TransportError::SessionFenced);
         }
         readback
@@ -1713,7 +1722,15 @@ impl KernelComposition {
             .get(ticket_id)
             .ok_or(TransportError::SessionFenced)?
             .clone();
-        pending_entry.owner_readback = result.owner_evidence.clone();
+        if let Some(evidence) = result.owner_evidence.clone() {
+            pending_entry.owner_readback = Some(
+                AgentActivationOwnerReadback::from_evidence(
+                    evidence,
+                    result.resolved_at_unix_ms,
+                )
+                .map_err(|_| TransportError::SessionFenced)?,
+            );
+        }
         // #203: reject a tampered, wrong-ticket, or wrong-fence retained
         // result before mutating any ledger. The submit path validates before
         // retaining, so this is defense-in-depth; a failure here preserves
