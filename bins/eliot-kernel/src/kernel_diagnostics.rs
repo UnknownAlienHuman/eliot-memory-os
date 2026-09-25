@@ -218,11 +218,27 @@ pub fn bound_detail(detail: &str) -> BoundedDetail {
 
 /// Frozen Kernel process-entry boundaries observed by `main`.
 ///
-/// One variant per actual startup funnel phase. Later leaves (#897 front
-/// door/requests, #899 Store/composition, #901 process/supervision, #903
-/// generation/control) own their library paths and extend observations
-/// through their own serialized turns; they never redefine these entry
-/// names, and no diagnostic name replaces an owner lifecycle type (I14.20).
+/// One variant per actual startup funnel phase, plus the front-door loop
+/// spans frozen by #895 W2. Later leaves (#897 front door/requests, #899
+/// Store/composition, #901 process/supervision, #903 generation/control)
+/// own their library paths and extend observations through their own
+/// serialized turns; they never redefine these entry names, and no
+/// diagnostic name replaces an owner lifecycle type (I14.20).
+///
+/// W2 freeze: every entrypoint span carries an event or an exact
+/// propagation/no-event reason —
+/// - permit admission: [`EntrypointStage::SessionPermitAdmission`] via
+///   `observe_entrypoint_with_detail` from the front-door driver; permit
+///   exhaustion emits `kernel.session.admission:deferred_capacity`,
+///   visible without a success claim and without a terminal record (T14).
+/// - session task outcome: [`EntrypointStage::SessionTaskOutcome`] via
+///   `observe_entrypoint_with_detail` from the front-door driver; the
+///   `JoinSet` evidence projects as `Ok(Ok) -> success`,
+///   `Ok(Err) -> failure`, `Err -> join_failure`, `None -> drained`
+///   (T15). Details carry no peer/session payload (I15.4).
+/// - terminal output: NO event. `write_error` writes stderr, the terminal
+///   sink itself, so a failed write is unobservable by design and must not
+///   fail the process (W5); see the binary `write_error` no-event note.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntrypointStage {
     /// Diagnostics installed; the launch funnel is entered.
@@ -245,6 +261,10 @@ pub enum EntrypointStage {
     SupervisionAuthority,
     /// Authenticated front-door loop entered.
     FrontDoorLoop,
+    /// Session permit admission decided inside the front-door loop.
+    SessionPermitAdmission,
+    /// One spawned session task joined (in-loop or final drain).
+    SessionTaskOutcome,
     /// Shutdown drained with no orphans.
     ShutdownDrain,
 }
@@ -265,6 +285,8 @@ impl EntrypointStage {
             Self::ProcessAuthority => "process_authority",
             Self::SupervisionAuthority => "supervision_authority",
             Self::FrontDoorLoop => "front_door_loop",
+            Self::SessionPermitAdmission => "session_permit_admission",
+            Self::SessionTaskOutcome => "session_task_outcome",
             Self::ShutdownDrain => "shutdown_drain",
         }
     }
