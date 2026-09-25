@@ -40,9 +40,9 @@ use eliotd::testd_terminal_completion::{
 };
 use eliotd::{
     ActivationClaim, DaemonComposition, DaemonConfig, DaemonError, DaemonKernelClient,
-    DaemonStatus, LocalReadSubmitOutcome, MaintenanceObservation, MaintenanceTriggerOrigin,
-    PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME, TaskControllerSubmitOutcome,
-    forward_admitted_local_read, terminal_for_invalid_ticket,
+    DaemonStatus, KernelContextReadClient, LocalReadSubmitOutcome, MaintenanceObservation,
+    MaintenanceTriggerOrigin, PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME,
+    TaskControllerSubmitOutcome, forward_admitted_local_read, terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -339,6 +339,42 @@ fn decide_local_read_tick(flight: &LocalReadFlight) -> LocalReadTickDecision {
     match flight {
         LocalReadFlight::Idle => LocalReadTickDecision::StartPoll,
         LocalReadFlight::InFlight(_) => LocalReadTickDecision::SkipInFlight,
+    }
+}
+
+/// Settled outcome of one campaign-packet poll step. The packet flight owns
+/// a distinct queue/attempt lifecycle and never shares a completion with the
+/// query flight.
+enum CampaignPacketPollOutcome {
+    IdleBackoff,
+    Accepted,
+    Expired,
+    StaleAttempt,
+}
+
+enum CampaignPacketCompletion {
+    Settled(Result<CampaignPacketPollOutcome, String>),
+}
+
+struct CampaignPacketFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = CampaignPacketCompletion>>>,
+}
+
+enum CampaignPacketFlight {
+    Idle,
+    InFlight(CampaignPacketFlightState),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CampaignPacketTickDecision {
+    StartPoll,
+    SkipInFlight,
+}
+
+fn decide_campaign_packet_tick(flight: &CampaignPacketFlight) -> CampaignPacketTickDecision {
+    match flight {
+        CampaignPacketFlight::Idle => CampaignPacketTickDecision::StartPoll,
+        CampaignPacketFlight::InFlight(_) => CampaignPacketTickDecision::SkipInFlight,
     }
 }
 
@@ -1033,6 +1069,9 @@ async fn run_loop(
     // off until the next tick, while a claimed pair forwards through the
     // Kernel `local_read` leg and submits its result body before idling.
     let mut local_read_flight = LocalReadFlight::Idle;
+    // Campaign packets have their own queue, claim, compile, and result
+    // flight. They are never consumed by the query poller.
+    let mut campaign_packet_flight = CampaignPacketFlight::Idle;
     // Task Controller claims ride the same bounded cadence. The owner path is
     // real and independent: one authenticated claim, one Governor transition,
     // and one fenced result submit per tick.
@@ -1084,9 +1123,11 @@ async fn run_loop(
                     &mut owner_feed,
                 )
                 .await?;
-                // #1862: the Task Controller flight keeps its own queue,
-                // attempt type and completion branch, so it drains on its own
-                // bounded budget after the shared flights settle.
+                // #1862: the campaign-packet flight keeps its own queue, claim,
+                // compile and result legs, and the Task Controller flight keeps
+                // its own queue and attempt type. Both drain on their own
+                // bounded budgets after the shared flights settle.
+                drain_campaign_packet_on_shutdown(&mut campaign_packet_flight).await?;
                 drain_task_controller_on_shutdown(&mut task_controller_flight).await?;
                 return Ok(exit);
             }
@@ -1104,6 +1145,9 @@ async fn run_loop(
                     &mut testd_owner_flight,
                     &mut flight,
                 );
+                // Campaign packets ride the same tick under their own gate and
+                // are never consumed by the query poller.
+                maybe_start_campaign_packet_poll(&kernel, &mut campaign_packet_flight);
                 // Task Controller uses a separate queue and attempt type;
                 // start it on the same cadence without sharing the local-read
                 // completion branch.
@@ -1134,6 +1178,14 @@ async fn run_loop(
                     local_read_completion,
                     &mut local_read_flight,
                     &mut startup_readiness,
+                )?;
+            }
+            campaign_packet_completion =
+                next_campaign_packet_completion(&mut campaign_packet_flight) =>
+            {
+                settle_campaign_packet_completion(
+                    campaign_packet_completion,
+                    &mut campaign_packet_flight,
                 )?;
             }
             task_controller_completion =
@@ -2018,22 +2070,10 @@ async fn run_local_read_poll(
     // polled flight; the loop keeps polling every other flight while it is
     // outstanding instead of queueing behind it in a branch body.
     //
-    // #1862: campaign packet compilation is a local daemon integration over
-    // authenticated named owner reads. It runs on the reachable poll path and
-    // settles through the same attempt-bound result leg as local Skill work.
-    if eliotd::campaign_packet::is_campaign_packet_tool(&tool) {
-        let body = eliotd::campaign_packet::serve_campaign_packet_pair(
-            kernel, &envelope, &tool, &attempt,
-        )
-        .await
-        .map_err(|error| format!("daemon campaign packet compilation: {error}"))?;
-        let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
-            LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,
-            LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
-            LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
-        };
-        return Ok(step(outcome, startup_readiness));
-    }
+    // #1862: an admitted `eliot.packet` is deliberately NOT served here. It is
+    // claimed, compiled and settled by the dedicated campaign-packet flight, so
+    // this query-only Gateway leg can never reinterpret packet material as
+    // `GetEvidencePack` selectors.
     // #1882: Skill pairs serve locally through the composition Skill driver
     // instead of forwarding on the Kernel `local_read` leg (which serves
     // store reads only). Recognition is the shared Skill tool predicate over
@@ -2144,6 +2184,103 @@ async fn submit_local_read_result_idempotent(
     }
 }
 
+/// Starts one campaign-packet claim/compile/result step. The packet route is
+/// independent from both the query Gateway and Task Controller transitions.
+fn start_campaign_packet_poll(
+    kernel: &Arc<DaemonKernelClient>,
+) -> Pin<Box<dyn std::future::Future<Output = CampaignPacketCompletion>>> {
+    let kernel_clone = Arc::clone(kernel);
+    Box::pin(async move {
+        CampaignPacketCompletion::Settled(run_campaign_packet_poll(&kernel_clone).await)
+    })
+}
+
+fn maybe_start_campaign_packet_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    flight: &mut CampaignPacketFlight,
+) {
+    if decide_campaign_packet_tick(flight) == CampaignPacketTickDecision::StartPoll {
+        *flight = CampaignPacketFlight::InFlight(CampaignPacketFlightState {
+            future: start_campaign_packet_poll(kernel),
+        });
+    }
+}
+
+async fn next_campaign_packet_completion(
+    flight: &mut CampaignPacketFlight,
+) -> CampaignPacketCompletion {
+    match flight {
+        CampaignPacketFlight::Idle => std::future::pending::<CampaignPacketCompletion>().await,
+        CampaignPacketFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+fn settle_campaign_packet_completion(
+    completion: CampaignPacketCompletion,
+    flight: &mut CampaignPacketFlight,
+) -> Result<(), String> {
+    match completion {
+        CampaignPacketCompletion::Settled(Ok(_)) => {
+            *flight = CampaignPacketFlight::Idle;
+            Ok(())
+        }
+        CampaignPacketCompletion::Settled(Err(error)) => Err(error),
+    }
+}
+
+/// Claims one packet from the packet queue, compiles it from authenticated
+/// owner reads, and submits only through the packet result route. No branch in
+/// this function projects packet material as `GetEvidencePack` selectors.
+async fn run_campaign_packet_poll(
+    kernel: &DaemonKernelClient,
+) -> Result<CampaignPacketPollOutcome, String> {
+    let _span = tracing::info_span!("eliotd.campaign_packet_poll").entered();
+    let pair = kernel
+        .claim_campaign_packet_pair_async()
+        .await
+        .map_err(|error| format!("Kernel campaign-packet pair claim: {error}"))?;
+    let Some((envelope, tool, attempt)) = pair else {
+        return Ok(CampaignPacketPollOutcome::IdleBackoff);
+    };
+    let body =
+        eliotd::campaign_packet::serve_campaign_packet_pair(kernel, &envelope, &tool, &attempt)
+            .await
+            .map_err(|error| format!("daemon campaign packet compilation: {error}"))?;
+    match submit_campaign_packet_result_idempotent(kernel, &body).await? {
+        LocalReadSubmitOutcome::Accepted => Ok(CampaignPacketPollOutcome::Accepted),
+        LocalReadSubmitOutcome::Expired => Ok(CampaignPacketPollOutcome::Expired),
+        LocalReadSubmitOutcome::StaleAttempt => Ok(CampaignPacketPollOutcome::StaleAttempt),
+    }
+}
+
+async fn submit_campaign_packet_result_idempotent(
+    kernel: &DaemonKernelClient,
+    body: &eliot_protocol::HostRequestResultBody,
+) -> Result<LocalReadSubmitOutcome, String> {
+    match kernel.submit_campaign_packet_result_async(body).await {
+        Ok(outcome) => Ok(outcome),
+        Err(first_error) => kernel
+            .submit_campaign_packet_result_async(body)
+            .await
+            .map_err(|error| {
+                format!("Kernel campaign-packet result submit: {first_error}; retry: {error}")
+            }),
+    }
+}
+
+async fn drain_campaign_packet_on_shutdown(
+    flight: &mut CampaignPacketFlight,
+) -> Result<RunLoopExit, String> {
+    let previous = std::mem::replace(flight, CampaignPacketFlight::Idle);
+    let CampaignPacketFlight::InFlight(state) = previous else {
+        return Ok(RunLoopExit::Shutdown);
+    };
+    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
+        Ok(CampaignPacketCompletion::Settled(Err(error))) => Err(error),
+        _ => Ok(RunLoopExit::Shutdown),
+    }
+}
+
 /// Outcome of one production Task Controller poll step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskControllerPollOutcome {
@@ -2232,7 +2369,7 @@ fn settle_task_controller_completion(
 }
 
 async fn run_task_controller_poll(
-    kernel: &DaemonKernelClient,
+    kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
 ) -> Result<TaskControllerPollOutcome, String> {
     let _span = tracing::info_span!("eliotd.task_controller_poll").entered();
@@ -2244,7 +2381,8 @@ async fn run_task_controller_poll(
         return Ok(TaskControllerPollOutcome::IdleBackoff);
     };
     let guard = composition.lock().await;
-    let body = Box::pin(eliotd::serve_task_controller_claim(&guard, claimed))
+    let reads = KernelContextReadClient::new(Arc::clone(kernel));
+    let body = Box::pin(eliotd::serve_task_controller_claim(&guard, &reads, claimed))
         .await
         .map_err(|error| format!("daemon Task Controller dispatch: {error}"))?;
     drop(guard);

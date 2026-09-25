@@ -1351,17 +1351,6 @@ impl KernelComposition {
         Ok(())
     }
 
-    /// Queues one admitted `eliot.packet` pair for the dedicated packet
-    /// poller. It is intentionally not a local-read queue entry.
-    pub(crate) fn enqueue_campaign_packet_pair(
-        &self,
-        envelope: &HostRequestEnvelope,
-        tool: &serde_json::Value,
-    ) -> Result<(), TransportError> {
-        let _transition = self.agent_bridge_transition_read()?;
-        self.enqueue_campaign_packet_pair_under_transition(envelope, tool)
-    }
-
     fn enqueue_campaign_packet_pair_under_transition(
         &self,
         envelope: &HostRequestEnvelope,
@@ -1455,18 +1444,6 @@ impl KernelComposition {
             });
         }
         Ok(())
-    }
-
-    /// Queues one admitted Task Controller invocation for the daemon poller.
-    /// The invocation is kept in a separate queue slot from local reads so its
-    /// owner-native payload can never be decoded as an evidence query.
-    pub(crate) fn enqueue_task_controller_pair(
-        &self,
-        envelope: &HostRequestEnvelope,
-        tool: &serde_json::Value,
-    ) -> Result<(), TransportError> {
-        let _transition = self.agent_bridge_transition_read()?;
-        self.enqueue_task_controller_pair_under_transition(envelope, tool)
     }
 
     fn enqueue_task_controller_pair_under_transition(
@@ -1923,17 +1900,11 @@ impl KernelComposition {
             .filter(LocalReadAttemptState::is_live))
     }
 
-    /// Loads the live campaign-packet attempt without exposing query state.
-    pub(crate) fn live_campaign_packet_attempt(
+    fn live_campaign_packet_attempt_under_transition(
         &self,
         operation_id: &str,
         request_digest: &str,
     ) -> Result<Option<LocalReadAttemptState>, TransportError> {
-        let _transition = self.agent_bridge_transition_read()?;
-        let _admission_owner = self
-            .agent_activation_pending
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
         let index = self
             .host_request_connection_index
             .lock()
@@ -1980,14 +1951,11 @@ impl KernelComposition {
         }
     }
 
-    /// Retires one queued campaign packet without touching the query queue.
-    pub(crate) fn retire_campaign_packet_pair(&self, operation_id: &str, request_digest: &str) {
-        let Ok(_transition) = self.agent_bridge_transition_read() else {
-            return;
-        };
-        let Ok(_admission_owner) = self.agent_activation_pending.lock() else {
-            return;
-        };
+    fn retire_campaign_packet_pair_under_transition(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+    ) {
         let Ok(mut index) = self.host_request_connection_index.lock() else {
             return;
         };
@@ -2092,10 +2060,14 @@ impl KernelComposition {
         // Governed attempt currency: only the live (attempt_id, generation,
         // owner) triple completes.
         let live = match queue {
-            DaemonReadQueue::Query => self
-                .live_local_read_attempt_under_transition(&body.operation_id, &body.request_sha256)?,
-            DaemonReadQueue::CampaignPacket => self
-                .live_campaign_packet_attempt(&body.operation_id, &body.request_sha256)?,
+            DaemonReadQueue::Query => self.live_local_read_attempt_under_transition(
+                &body.operation_id,
+                &body.request_sha256,
+            )?,
+            DaemonReadQueue::CampaignPacket => self.live_campaign_packet_attempt_under_transition(
+                &body.operation_id,
+                &body.request_sha256,
+            )?,
         };
         match (&body.attempt, live) {
             (Some(attempt), Some(state))
@@ -2181,9 +2153,7 @@ impl KernelComposition {
                 })
                 .and_then(|candidate| match queue {
                     DaemonReadQueue::Query => candidate.local_read_envelope.clone(),
-                    DaemonReadQueue::CampaignPacket => {
-                        candidate.campaign_packet_envelope.clone()
-                    }
+                    DaemonReadQueue::CampaignPacket => candidate.campaign_packet_envelope.clone(),
                 })
         };
         validate_campaign_view_result(&stored, queued_envelope.as_ref(), &body.response)?;
@@ -2218,8 +2188,22 @@ impl KernelComposition {
             })?
             .ok_or(TransportError::UnknownRequest)?;
         // The single completion consumes the attempt use budget: retire the
-        // pair so no later claim or submit can reuse this generation.
-        self.retire_local_read_pair_under_transition(&body.operation_id, &body.request_sha256);
+        // pair in the same queue ledger that authorized it so no later claim
+        // or submit can reuse this generation.
+        match queue {
+            DaemonReadQueue::Query => {
+                self.retire_local_read_pair_under_transition(
+                    &body.operation_id,
+                    &body.request_sha256,
+                );
+            }
+            DaemonReadQueue::CampaignPacket => {
+                self.retire_campaign_packet_pair_under_transition(
+                    &body.operation_id,
+                    &body.request_sha256,
+                );
+            }
+        }
         Ok(LocalReadSubmitDisposition::Persisted(Box::new(persisted)))
     }
     /// Submits the result of one claimed Task Controller invocation. The
