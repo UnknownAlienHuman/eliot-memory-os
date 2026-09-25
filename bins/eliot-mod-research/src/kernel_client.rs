@@ -138,6 +138,7 @@ struct ResearchClientDeclaration {
 /// shape, so they are decoded and compared rather than ignored: a Kernel
 /// serving a different service or protocol line is not the owner this
 /// declaration admits.
+#[cfg(windows)]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServerConfigSnapshot {
@@ -149,8 +150,10 @@ struct ServerConfigSnapshot {
 }
 
 /// The service identity the Kernel front door must present.
+#[cfg(windows)]
 const KERNEL_SERVICE_NAME: &str = "eliot-kernel";
 /// The protocol identity the Kernel front door must present.
+#[cfg(windows)]
 const KERNEL_PROTOCOL_VERSION: &str = "eliot.kernel.v1";
 
 /// One short-lived authenticated session against the Kernel front door.
@@ -529,6 +532,7 @@ impl ResearchKernelClient {
 }
 
 /// Live server facts observed on one authenticated handshake.
+#[cfg(windows)]
 struct ServerBinding {
     authority_epoch: EpochId,
     generation: u64,
@@ -584,7 +588,7 @@ fn echo_reason_code(error: ResearchProviderError) -> &'static str {
 }
 
 /// Validates the protected installation declaration shape.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(windows)]
 fn validate_declaration(
     declaration: &ResearchClientDeclaration,
 ) -> Result<(), ResearchKernelClientError> {
@@ -621,7 +625,7 @@ fn validate_declaration(
 }
 
 /// Validates the live `ServerHello` against the protected declaration.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(windows)]
 fn validate_server_hello(
     declaration: &ResearchClientDeclaration,
     hello: &ServerHello,
@@ -677,7 +681,7 @@ fn validate_server_hello(
 }
 
 /// Validates the served Result frame and returns its JSON payload.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(windows)]
 fn validate_result_response(
     connection_id: &str,
     request_id: &RequestId,
@@ -711,7 +715,7 @@ fn validate_result_response(
 /// uncertainty boundary, so it is reported as an unknown outcome requiring
 /// reconciliation by the stable operation identity, never as a closed door
 /// that would invite a blind retry.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(windows)]
 fn require_delivery<T>(
     outcome: Result<T, eliot_ipc::TransportError>,
     stage: &'static str,
@@ -730,11 +734,13 @@ fn require_delivery<T>(
 }
 
 /// Returns true when the value is a hexadecimal SHA-256 digest of any case.
+#[cfg(windows)]
 fn is_hex_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Computes the lowercase SHA-256 hex digest of exact bytes.
+#[cfg(windows)]
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(bytes))
