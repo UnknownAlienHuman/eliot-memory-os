@@ -721,6 +721,14 @@ impl BridgeRunner {
     /// disclosure occurs here. Tokens rendered and route delivery stay unknowable at the
     /// bridge and are never estimated — completing a `ToolResultReceipt` remains the
     /// route owner's job (`project_tool_result_receipt`).
+    ///
+    /// Verify-before-handout (I7.18 explicit expansion): the full bytes behind
+    /// a hot handle are retrievable only through [`Self::expand_resource`].
+    /// The just-issued handle is expanded here, on the normal Invoke path,
+    /// and the expanded bytes must equal the published bytes before the view
+    /// reaches the response. A handle that does not resolve to the exact
+    /// bytes withholds the evidence slot (`None`) instead of emitting a
+    /// dangling reference; the gateway response itself is never rewritten.
     pub fn record_tool_result_delivery(
         &mut self,
         outcome: &HostInvocationOutcome,
@@ -736,7 +744,11 @@ impl BridgeRunner {
         if bytes.len() <= MAX_PREVIEW_BYTES {
             return None;
         }
-        self.core.publish_evidence(bytes).ok()
+        let view = self.core.publish_evidence(bytes.clone()).ok()?;
+        if self.expand_resource(view.handle()).ok()? != bytes {
+            return None;
+        }
+        Some(view)
     }
     /// Notes the owner-supplied bootstrap context for this session.
     ///
