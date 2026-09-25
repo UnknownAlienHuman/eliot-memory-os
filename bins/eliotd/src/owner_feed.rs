@@ -39,8 +39,18 @@ const PUBLISH_OWNER_BUNDLE_OPERATION: &str = "publish_owner_bundle";
 const INITIALIZE_OWNER_REVISION_OPERATION: &str = "initialize_owner_revision";
 /// Typed receipt kind answered by the revision initialization arm.
 const OWNER_REVISION_RECEIPT_KIND: &str = "owner_revision_receipt";
+/// Daemon->Kernel front-door read of the completed canonical second phases of
+/// one authority root (issue #2100, `R6`).
+const QUERY_GRANT_CLOSURE_LINKS_OPERATION: &str = "query_grant_closure_canonical_receipts";
 /// Typed receipt kind answered by the publish arm.
 const OWNER_BUNDLE_RECEIPT_KIND: &str = "owner_bundle_receipt";
+/// Typed receipt kind answered by the canonical second-phase read arm.
+const GRANT_CLOSURE_LINKS_KIND: &str = "grant_closure_canonical_receipts";
+/// Typed refusal kind answered by the same arm. A refusal is never read as an
+/// empty link set: the durable reason is surfaced and the pass degrades.
+const GRANT_CLOSURE_LINKS_REFUSAL_KIND: &str = "grant_closure_canonical_receipts_refused";
+/// The only canonical second-phase payload shape this daemon build accepts.
+const GRANT_CLOSURE_LINKS_VERSION: u32 = 1;
 /// Only an acknowledged `bound` receipt counts as published.
 const OWNER_BOUND_STATUS: &str = "bound";
 
