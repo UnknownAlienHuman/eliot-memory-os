@@ -44,7 +44,8 @@
 use std::path::{Path, PathBuf};
 
 use eliot_notify::{
-    NOTIFY_IMAGE_FILE_NAME, NotifyLaunchError, VerifiedNotifyLaunch, resolve_notify_launch_inputs,
+    NOTIFY_IMAGE_FILE_NAME, NOTIFY_REQUEST_ARGUMENT, NotifyLaunchError,
+    NotifyLaunchRequestReference, VerifiedNotifyLaunch, resolve_notify_launch_inputs,
 };
 
 /// Verified Notify launch inputs staged for one broker-bound grant.
@@ -115,6 +116,10 @@ pub enum BrokerNotifyError {
     /// The request does not name the canonical installed Notify image, so it
     /// cannot be admitted on the notify-specific launch path.
     NotNotifyImage,
+    /// The request's argv does not carry the notify-specific canonical request
+    /// reference, or that reference is not the self-consistent pair the child
+    /// would decode.
+    InvalidRequestReference,
 }
 
 impl BrokerNotifyError {
@@ -128,6 +133,7 @@ impl BrokerNotifyError {
             Self::InvalidDeclaration => "BROKER_NOTIFY_INVALID_DECLARATION",
             Self::BindingRejected => "BROKER_NOTIFY_BINDING_REJECTED",
             Self::NotNotifyImage => "BROKER_NOTIFY_IMAGE_REQUIRED",
+            Self::InvalidRequestReference => "BROKER_NOTIFY_REQUEST_REFERENCE_REJECTED",
         }
     }
 }
@@ -312,12 +318,16 @@ impl BrokerNotifyLaunchAuthority {
 /// is refused here and it can be spawned only through the notify-specific,
 /// broker-authorized path.
 ///
-/// Two independent bindings must both hold before a notify adapter may be
-/// spawned: the request must name the exact verified executable path, and its
+/// Four independent bindings must all hold before a notify adapter may be
+/// spawned: the request must name the exact verified executable path, its
 /// artifact digest must equal the digest of the bytes this broker observed when
-/// it resolved the installer-published declaration. A file swapped between
-/// staging and launch therefore fails the request-time comparison as well as
-/// the launch-time re-hash inside the process port.
+/// it resolved the installer-published declaration, and its argv must be exactly
+/// the two-argument notify-specific request channel that
+/// `admit_notify_request_reference` describes. A file swapped between staging
+/// and launch therefore fails the request-time comparison as well as the
+/// launch-time re-hash inside the process port, and a launch that names no
+/// request the child can authenticate is refused here instead of at the child's
+/// own boundary.
 ///
 /// The retained reference itself stays inside the composition: returning it
 /// would only re-expose the same verified bytes the request already names, and
@@ -328,9 +338,11 @@ impl BrokerNotifyLaunchAuthority {
 ///
 /// Returns [`BrokerNotifyError::NotAuthenticated`] when the broker retains no
 /// verified reference, [`BrokerNotifyError::NotNotifyImage`] when the request
-/// does not name the canonical installed Notify image, and
+/// does not name the canonical installed Notify image,
 /// [`BrokerNotifyError::BindingRejected`] when the executable path or artifact
-/// digest diverges from the retained verified bytes.
+/// digest diverges from the retained verified bytes, and
+/// [`BrokerNotifyError::InvalidRequestReference`] when the argv is not the
+/// notify-specific canonical request reference.
 pub fn admit_notify_request(
     authority: &BrokerNotifyLaunchAuthority,
     request: &eliot_user_broker_core::LaunchRequest,
@@ -352,7 +364,43 @@ pub fn admit_notify_request(
     {
         return Err(BrokerNotifyError::BindingRejected);
     }
-    Ok(())
+    admit_notify_request_reference(&approved.argv)
+}
+
+/// Admits the notify-specific argv request channel of one launch request.
+///
+/// I11.6:3 makes the authorized User Broker the only launcher of a normal
+/// `eliot-notify` delivery, and an inherited stdin stream is not a channel the
+/// child can authenticate, so the canonical request reference travels on the
+/// launch's own argv. The admitted shape is exactly two arguments: the
+/// notify-specific flag owned by the binding owner ([`NOTIFY_REQUEST_ARGUMENT`])
+/// followed by one canonical request reference — a single JSON object with
+/// exactly two keys, `request` (a `NotificationRequest`) and `envelope` (a
+/// `NotificationEnvelope`), and nothing else.
+///
+/// The reference is decoded with the same `deny_unknown_fields` type the child
+/// decodes and must satisfy the same self-consistency bindings, so a
+/// broker-authorized launch can never carry a request the child would not
+/// recognise, and no other broker request shape can reach the notification
+/// adapter. The reference names canonical notification state and nothing else:
+/// it is not a credential, and it is actionable only after the child proves it
+/// against canonical state through the authenticated Kernel read.
+fn admit_notify_request_reference(argv: &[String]) -> Result<(), BrokerNotifyError> {
+    let mut values = argv.iter();
+    let (Some(flag), Some(encoded), None) = (values.next(), values.next(), values.next()) else {
+        return Err(BrokerNotifyError::InvalidRequestReference);
+    };
+    if flag.as_str() != NOTIFY_REQUEST_ARGUMENT
+        || encoded.trim().is_empty()
+        || encoded.chars().any(char::is_control)
+    {
+        return Err(BrokerNotifyError::InvalidRequestReference);
+    }
+    let reference = serde_json::from_str::<NotifyLaunchRequestReference>(encoded)
+        .map_err(|_| BrokerNotifyError::InvalidRequestReference)?;
+    reference
+        .validate()
+        .map_err(|_| BrokerNotifyError::InvalidRequestReference)
 }
 
 /// Returns whether one generic broker request names the canonical Notify image.
@@ -422,5 +470,6 @@ fn stage_deferral_code(error: &BrokerNotifyError) -> &'static str {
         BrokerNotifyError::InvalidDeclaration => "INVALID_DECLARATION",
         BrokerNotifyError::BindingRejected => "BINDING_REJECTED",
         BrokerNotifyError::NotNotifyImage => "NOT_NOTIFY_IMAGE",
+        BrokerNotifyError::InvalidRequestReference => "INVALID_REQUEST_REFERENCE",
     }
 }

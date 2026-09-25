@@ -72,6 +72,70 @@ impl fmt::Display for NotifyBuildError {
 
 impl std::error::Error for NotifyBuildError {}
 
+/// The argv flag a broker-authorized normal launch carries its request
+/// reference on.
+///
+/// I11.6:3 makes the authorized User Broker the only launcher of a normal
+/// `eliot-notify` delivery, and the flag name is owned here so the broker and
+/// the child cannot drift: the broker admits exactly `--notify-request
+/// <canonical request reference>` and the child decodes exactly that.
+pub const NOTIFY_REQUEST_ARGUMENT: &str = "--notify-request";
+
+/// The broker-authorized normal notification request reference.
+///
+/// This is the request a broker-launched `eliot-notify` acts on, and it is a
+/// *reference*: it names one canonical notification request and the exact
+/// canonical envelope the G-08 owner verified for that request, at the launch's
+/// own state fence. It carries no secret, no repair authority, and no process
+/// authority — the authenticated canonical read proves it against live
+/// canonical notification state before the child delivers anything, so a value
+/// that is not live canonical state is refused.
+///
+/// The deliverable input arrives on the launch's argv rather than on an
+/// inherited stdin stream because the adapter cannot rebuild it locally:
+/// `eliot-notify-core` imports the canonical `NotificationDraft` privately and
+/// `eliot-notify` has no `eliot-kernel-core` edge, so the canonical draft cannot
+/// be reconstructed from the canonical record the read returns. What changes
+/// here is the channel, not the request: this is the same envelope and the same
+/// canonical request every other admitted caller supplies, and it is verified
+/// against the same G-08/A-08/ledger path.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotifyLaunchRequestReference {
+    /// The exact canonical notification request the launch names.
+    pub request: NotificationRequest,
+    /// The exact canonical notification envelope verified for that request.
+    pub envelope: NotificationEnvelope,
+}
+
+impl NotifyLaunchRequestReference {
+    /// Validates the reference as one self-consistent canonical request.
+    ///
+    /// These are the same three bindings the delivery core enforces before it
+    /// calls any adapter, so a reference that cannot satisfy them is refused
+    /// here — at the launch edge — instead of after a Kernel round trip. The
+    /// source receipt is only compared, never re-derived: its authenticity is
+    /// the G-08 owner's, proved again on the delivery path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the first binding that does not hold.
+    pub fn validate(&self) -> Result<(), String> {
+        self.request
+            .validate()
+            .map_err(|error| format!("notification request is invalid: {error}"))?;
+        if self.request.notification != self.envelope.notification_id {
+            return Err("notification request does not name the launch envelope".to_owned());
+        }
+        if self.request.canonical_request_hash.as_str()
+            != self.envelope.source_receipt.canonical_sha256()
+        {
+            return Err("launch envelope is not bound to the named canonical request".to_owned());
+        }
+        Ok(())
+    }
+}
+
 /// The complete A-10 composition. Verification and replay authority are
 /// supplied by the owning control plane; this process owns only the P-01
 /// adapter binding and the A-10 coordinator.
@@ -344,6 +408,38 @@ impl NotificationComposition {
             ports,
             quiet_hours,
         ))
+    }
+
+    /// Composes the production one-shot process for a broker-authorized normal
+    /// launch from the argv request reference (I11.6:3).
+    ///
+    /// This is the same composition as
+    /// [`Self::from_kernel_with_quiet_hours`] and the same authenticated Kernel
+    /// front door; the only addition is that the launch reference is proved
+    /// first. Ordering is the point: an unauthenticated, unknown, or already
+    /// resolved reference is refused before the quiet-hours projection is read,
+    /// before any adapter call, and before any canonical write, so it can never
+    /// be recorded as a delivery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotifyBuildError::Kernel`] when the Kernel front door cannot be
+    /// opened, when the reference is not proved against live canonical
+    /// notification state, or when the authenticated quiet-hours projection is
+    /// refused — the same typed refusal the quiet-hours read already uses.
+    pub fn from_kernel_with_launch_reference(
+        work_root: impl Into<PathBuf>,
+        reference: &NotifyLaunchRequestReference,
+    ) -> Result<Self, NotifyBuildError> {
+        reference.validate().map_err(NotifyBuildError::Kernel)?;
+        let mut client =
+            KernelClient::load().map_err(|error| NotifyBuildError::Kernel(error.to_string()))?;
+        let issuer: operation_identity::IssuerHandle =
+            Arc::new(Mutex::new(operation_identity::NotifyIdentityIssuer::new()));
+        read_authenticated_notification_reference(&mut client, &issuer, &reference.request)?;
+        let quiet_hours = read_authenticated_quiet_hours(&mut client, &issuer, &reference.request)?;
+        let ports = verification_ports_from_exchange_with_issuer(client, issuer);
+        Self::new_with_quiet_hours(work_root, ports, quiet_hours)
     }
 
     /// Composes the production one-shot process from the protected Kernel
@@ -879,6 +975,118 @@ where
         }
     };
     quiet_hours_from_projection(projection, parent)
+}
+
+/// Proves one broker-authorized normal launch reference against canonical
+/// notification state through the existing authenticated Kernel read route.
+///
+/// This is the same durable-record join the Kernel's own Notify launch grant
+/// performs before it binds a grant: the canonical `GetNotificationState`
+/// projection is read back under the exact fence the launch reference names,
+/// exactly one record carrying the referenced `notification_id` must be
+/// present, and that record must still be unresolved. Nothing is inferred from
+/// the reference itself — it is proved, so it is a reference and not a
+/// capability.
+///
+/// An unavailable owner, a partial, unknown or rejected read, a fence
+/// disagreement, a missing or ambiguous record, and an already-resolved record
+/// all fail closed through [`NotifyBuildError::Kernel`], the same typed refusal
+/// [`read_authenticated_quiet_hours`] uses, so an unauthenticated or stale
+/// reference has exactly one failure shape and no new error vocabulary.
+fn read_authenticated_notification_reference<E>(
+    exchange: &mut E,
+    issuer: &operation_identity::IssuerHandle,
+    request: &NotificationRequest,
+) -> Result<(), NotifyBuildError>
+where
+    E: NotifyKernelExchange,
+{
+    // The payload is the existing `GetNotificationState` read shape emitted by
+    // `KernelNotificationState::read`, so the same Kernel route serves both the
+    // owner inbox read and this launch-reference proof. `include_resolved` is
+    // true on purpose: a resolved record must be *visible* here and then
+    // refused, rather than silently missing from the page.
+    let payload = json!({
+        "operation": eliot_notify_core::NOTIFICATION_STATE_READ_OPERATION,
+        "context": &request.context,
+        "state_fence": &request.context.state_fence,
+        "scope": Value::Null,
+        "include_resolved": true,
+        "page_limit": eliot_notify_core::NOTIFICATION_OBLIGATION_PAGE_LIMIT,
+        "cursor": Value::Null,
+    });
+    let now = now_unix_ms().map_err(|error| {
+        NotifyBuildError::Kernel(format!(
+            "authenticated notification reference read clock rejected: {error}"
+        ))
+    })?;
+    let issued = issuer
+        .lock()
+        .map_err(|_| {
+            NotifyBuildError::Kernel(
+                "authenticated notification reference read identity mutex is poisoned".to_owned(),
+            )
+        })?
+        .issue_notification_state_read(request, &payload, now)
+        .map_err(|error| {
+            NotifyBuildError::Kernel(format!(
+                "authenticated notification reference read identity rejected: {error}"
+            ))
+        })?;
+    let result = exchange.transact_with_identity(
+        &issued.identity,
+        eliot_notify_core::NOTIFICATION_STATE_SELECTOR,
+        payload,
+    );
+    let response = match decode_kernel_outcome::<NotificationStateReadResponse>(result) {
+        PortOutcome::Known(value) => value,
+        PortOutcome::Partial { .. } => {
+            return Err(NotifyBuildError::Kernel(
+                "authenticated notification reference read was partial".to_owned(),
+            ));
+        }
+        PortOutcome::Unknown(_) => {
+            return Err(NotifyBuildError::Kernel(
+                "authenticated notification reference read was unknown".to_owned(),
+            ));
+        }
+        PortOutcome::Error(_) => {
+            return Err(NotifyBuildError::Kernel(
+                "authenticated notification reference read was rejected".to_owned(),
+            ));
+        }
+    };
+    let refuse = |detail: &str| NotifyBuildError::Kernel(detail.to_owned());
+    if response.state_fence != request.context.state_fence || response.revision == 0 {
+        return Err(refuse(
+            "authenticated notification reference read returned another fence",
+        ));
+    }
+    let mut matched = 0_usize;
+    for record in &response.records {
+        if record.state_fence != request.context.state_fence {
+            return Err(refuse(
+                "authenticated notification reference read returned another fence",
+            ));
+        }
+        if record.notification_id != request.notification {
+            continue;
+        }
+        matched += 1;
+        if !record.is_unresolved() {
+            return Err(refuse(
+                "notification launch reference names a resolved canonical record",
+            ));
+        }
+    }
+    if matched != 1 {
+        // Zero means the reference names nothing durable; several means this is
+        // not a projection. Refusing beats choosing one.
+        return Err(refuse(
+            "notification launch reference did not match exactly one canonical record",
+        ));
+    }
+    Ok(())
 }
 
 fn read_authenticated_user_automation_preflight<E>(
