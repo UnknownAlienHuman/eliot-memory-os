@@ -4787,6 +4787,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// expired admission and an admitted record without authority fail closed
     /// here instead of reaching readiness. The returned admission is the
     /// caller input for cold-start compilation of that scope generation.
+    /// Live status: owning thin entry for daemon/scanner ingress; no live
+    /// attach transport builds a `SourceAdmissionRequest` yet
+    /// (BLOCKED-BY attach-transport).
     pub fn admit_governing_sources_for_scope(
         request: SourceAdmissionRequest,
         now: u64,
@@ -4810,6 +4813,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// acceptance, owner, scope plus a complete example) and the bounded
     /// exploratory offer from [`eliot_workscope::task_selection_required`],
     /// so the emitted selection directive always has a backing intake shape.
+    /// Live status: owning thin entry for the activation path; the live
+    /// activation projection emits its own directive without calling this
+    /// entry yet (BLOCKED-BY activation/task-ingress).
     pub fn task_selection_intake_shape(
         scope_ref: &str,
     ) -> Result<TaskSelectionRequired, CompositionError> {
@@ -4825,6 +4831,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// task binding the delegation names (`parent`, read from live governor
     /// task state), so a `Current` binding input only ever arises from the
     /// required owner or a proven delegation, never from direct construction.
+    /// Live status: owning thin entry for task ingress; no live task ingress
+    /// builds a `TaskIntakeCandidate` yet (BLOCKED-BY task-ingress).
     pub fn promote_task_intake(
         candidate: &TaskIntakeCandidate,
         basis: &AuthorityBasis,
@@ -4842,7 +4850,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Owning thin entry for orientation ingress: runs
     /// [`eliot_workscope::TaskIntakeCandidate::admit_exploratory`], whose
     /// read-only binding can never authorize scope-sensitive Material
-    /// effects.
+    /// effects. Live status: owning thin entry for orientation ingress; no
+    /// live orientation ingress calls this entry yet (BLOCKED-BY task-ingress).
     pub fn admit_exploratory_task_intake(
         candidate: &TaskIntakeCandidate,
     ) -> Result<TaskBindingInput, CompositionError> {
