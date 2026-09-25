@@ -265,11 +265,29 @@ impl MemoryStore {
         expected_revision_heads: &[RevisionHeadExpectation],
         expected_ordering_heads: &[OrderingHeadExpectation],
     ) -> Result<WriteReceipt, StoreError> {
+        self.apply_transaction_with_mode(
+            ctx,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+            false,
+        )
+    }
+
+    fn apply_transaction_with_mode(
+        &self,
+        ctx: &RequestMeta,
+        transition: PreparedTransition,
+        expected_revision_heads: &[RevisionHeadExpectation],
+        expected_ordering_heads: &[OrderingHeadExpectation],
+        allow_learning: bool,
+    ) -> Result<WriteReceipt, StoreError> {
         validate_transaction(ctx, &transition)?;
-        if transition
-            .named_operations
-            .iter()
-            .any(|command| command.operation == NamedMutationOperation::RecordLearningRecord)
+        if !allow_learning
+            && transition
+                .named_operations
+                .iter()
+                .any(|command| command.operation == NamedMutationOperation::RecordLearningRecord)
         {
             return Err(StoreError::InvalidField {
                 field: "learning.operation",
@@ -3717,11 +3735,12 @@ impl CanonicalStoreClient for MemoryStore {
                 reason: "dedicated learning capability requires exactly one learning operation",
             });
         }
-        self.apply_transaction(
+        self.apply_transaction_with_mode(
             ctx,
             transition,
             &expected_revision_heads,
             &expected_ordering_heads,
+            true,
         )
     }
 
