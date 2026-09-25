@@ -26,8 +26,8 @@
 use std::collections::BTreeMap;
 
 use eliot_kernel_core::user_automation::{
-    UserAutomationExecutionProjection, UserAutomationInvocation, UserAutomationOperation,
-    UserAutomationRevision,
+    AutomationReconciliationReference, UserAutomationExecutionProjection, UserAutomationInvocation,
+    UserAutomationOperation, UserAutomationRevision,
 };
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, NamedReadOperation, NamedReadRequest,
@@ -525,7 +525,40 @@ const QUERY_CURRENT: &str = "current";
 /// Closed automation-state query kinds carried to the store read.
 const QUERY_HISTORY: &str = "history";
 /// Closed automation-state query kinds carried to the store read.
+const QUERY_INVOCATIONS: &str = "invocations";
+/// Closed automation-state query kinds carried to the store read.
 const QUERY_FAILURE: &str = "failure";
+
+/// Decodes one stored invocation row from the bounded invocation page.
+///
+/// A row that does not carry an invocation document is not an owner-issued
+/// invocation and is skipped by the caller; a row that carries a malformed or
+/// foreign document fails closed instead of being ignored.
+fn projected_invocation(entry: &Value) -> Result<Option<UserAutomationInvocation>, StoreError> {
+    let Some(document) = entry.get("invocation_json").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let invocation: UserAutomationInvocation = serde_json::from_str(document)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    invocation
+        .validate()
+        .map_err(|_| StoreError::InvalidField {
+            field: "automation.invocation",
+            reason: "stored invocation failed domain validation",
+        })?;
+    if entry.get("automation_id").and_then(Value::as_str) != Some(invocation.automation_id.as_str())
+        || entry.get("occurrence_id").and_then(Value::as_str)
+            != Some(
+                invocation
+                    .occurrence_identity()
+                    .map_err(|_| StoreError::IdentityConflict)?
+                    .as_str(),
+            )
+    {
+        return Err(StoreError::IdentityConflict);
+    }
+    Ok(Some(invocation))
+}
 
 /// Maps a service validation failure onto the closed store error set.
 ///
@@ -671,7 +704,9 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
         automation_id: &str,
     ) -> Result<UserAutomationStoreOutcome, StoreError> {
         let revision = self.read_current_revision(request, automation_id).await?;
-        let execution = Self::execution_projection(&revision)?;
+        let execution = self
+            .execution_projection(&request.context.state_fence, automation_id, &revision)
+            .await?;
         Ok(UserAutomationStoreOutcome::Read {
             result: UserAutomationReadResult::Status {
                 revision,
@@ -708,15 +743,20 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                 reason: "unknown automation",
             });
         }
-        let execution = UserAutomationExecutionProjection {
-            current_execution_refs: Vec::new(),
-            unresolved_reconciliation_refs: Vec::new(),
-            history_query_ref: format!("automation-history:{automation_id}"),
-        };
-        execution.validate().map_err(|_| StoreError::InvalidField {
-            field: "automation.execution",
-            reason: "execution projection invalid",
-        })?;
+        let revision_id = entries
+            .first()
+            .and_then(|entry| entry.get("revision"))
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "automation.revision",
+                reason: "store history projection malformed",
+            })?;
+        let revision = self
+            .read_revision_document(&request.context.state_fence, automation_id, revision_id)
+            .await?;
+        let execution = self
+            .execution_projection(&request.context.state_fence, automation_id, &revision)
+            .await?;
         Ok(UserAutomationStoreOutcome::Read {
             result: UserAutomationReadResult::History {
                 automation_id: automation_id.to_owned(),
@@ -843,18 +883,28 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
         Ok(parsed)
     }
 
-    /// Composes the execution projection from one validated revision.
+    /// Composes the execution projection from the stored revision plus the
+    /// real outstanding reconciliation obligations.
     ///
-    /// Typed Durable Job enrichment stays a future join: the stored
-    /// `current_execution_refs` strings are opaque without the job
-    /// owner, so the projection carries empty typed ref lists plus the
-    /// stored history handle, which the frozen service accepts.
-    fn execution_projection(
+    /// `current_execution_refs` stays the stored Durable Job reference
+    /// projection: the canonical Durable Job owner, not this Store adapter,
+    /// resolves those references to a job state. The unresolved
+    /// reconciliation set is derived from the persisted invocation rows: an
+    /// occurrence whose admitting canonical operation has no committed
+    /// receipt, or a receipt that still requires a reconciliation envelope, is
+    /// an outstanding I14.21 obligation and is preserved verbatim through
+    /// status, history, and retirement.
+    async fn execution_projection(
+        &self,
+        fence: &StateFence,
+        automation_id: &str,
         revision: &UserAutomationRevision,
     ) -> Result<UserAutomationExecutionProjection, StoreError> {
         let projection = UserAutomationExecutionProjection {
             current_execution_refs: Vec::new(),
-            unresolved_reconciliation_refs: Vec::new(),
+            unresolved_reconciliation_refs: self
+                .unresolved_reconciliation_refs(fence, automation_id)
+                .await?,
             history_query_ref: revision.execution_history_query_ref.clone(),
         };
         projection
@@ -864,6 +914,80 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                 reason: "execution projection invalid",
             })?;
         Ok(projection)
+    }
+
+    /// Reads the bounded invocation page and returns every occurrence whose
+    /// admitting canonical operation is still unresolved.
+    async fn unresolved_reconciliation_refs(
+        &self,
+        fence: &StateFence,
+        automation_id: &str,
+    ) -> Result<Vec<AutomationReconciliationReference>, StoreError> {
+        let query = automation_read_request(
+            QUERY_INVOCATIONS.to_owned(),
+            Some(automation_id.to_owned()),
+            false,
+            eliot_store_api::MAX_AUTOMATION_PAGE_RECORDS,
+            fence.clone(),
+        )?;
+        let payload = self.client.execute_named(query).await?.payload;
+        let entries = payload
+            .get(eliot_store_api::AUTOMATION_PAGE_INVOCATIONS)
+            .and_then(Value::as_array)
+            .ok_or(StoreError::InvalidField {
+                field: "automation.invocations",
+                reason: "store invocation projection malformed",
+            })?;
+        let mut references: Vec<AutomationReconciliationReference> = Vec::new();
+        for entry in entries {
+            if entry.get("automation_id").and_then(Value::as_str) != Some(automation_id) {
+                return Err(StoreError::IdentityConflict);
+            }
+            let Some(invocation) = projected_invocation(entry)? else {
+                continue;
+            };
+            let Some(provenance) = invocation.provenance.as_ref() else {
+                continue;
+            };
+            let operation_ref = provenance.operation_id.to_string();
+            let occurrence_id = invocation
+                .occurrence_identity()
+                .map_err(|_| StoreError::IdentityConflict)?;
+            let unresolved = match self.client.receipt(provenance.operation_id.clone()).await? {
+                None => true,
+                Some(receipt) => {
+                    receipt.validate()?;
+                    if receipt.idempotency_key != provenance.idempotency_key
+                        || receipt.canonical_request_hash != provenance.canonical_request_hash
+                        || receipt.state_fence != provenance.request_metadata.state_fence
+                    {
+                        return Err(StoreError::IdentityConflict);
+                    }
+                    receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+                        || receipt.require_reconciliation_envelope().is_err()
+                }
+            };
+            if unresolved {
+                let reference = AutomationReconciliationReference {
+                    occurrence_id,
+                    operation_ref,
+                };
+                reference.validate().map_err(|_| StoreError::InvalidField {
+                    field: "automation.reconciliation",
+                    reason: "reconciliation reference invalid",
+                })?;
+                references.push(reference);
+            }
+        }
+        references.sort_by(|left, right| {
+            left.occurrence_id
+                .cmp(&right.occurrence_id)
+                .then_with(|| left.operation_ref.cmp(&right.operation_ref))
+        });
+        references.dedup_by(|left, right| {
+            left.occurrence_id == right.occurrence_id && left.operation_ref == right.operation_ref
+        });
+        Ok(references)
     }
 
     /// Executes one authenticated mutation through one admitted

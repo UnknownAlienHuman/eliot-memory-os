@@ -1882,10 +1882,7 @@ static COMMANDS: &[CommandSpec] = &[
         argument_kind: ArgumentKind::UserAutomation,
         effect: EffectClass::ReversibleMutation,
         proof_ceiling: ProofCeiling::CandidateArtifact,
-        availability: CommandAvailability::PlanGap {
-            missing_work_id: "1779",
-            dependency: "authenticated Kernel selector eliot_user_automation is not registered",
-        },
+        availability: CommandAvailability::Admitted,
     },
 ];
 
@@ -2171,15 +2168,19 @@ fn validate_result_for(
         // is registered, but an authenticated provider may already expose the
         // exact typed route. Accept that provider projection only for the
         // commands whose authenticated provider route is registered in this
-        // surface: the UserAutomation narrow payload, and the three backup
-        // commands whose Kernel route refuses with a typed owner-admission
-        // outcome rather than a fake success. Local `execute` still returns
-        // PlanGap for every one of them.
+        // surface: the three backup commands whose Kernel route refuses with a
+        // typed owner-admission outcome rather than a fake success. Local
+        // `execute` still returns PlanGap for every one of them.
+        //
+        // `CommandId::UserAutomation` is deliberately absent: its authenticated
+        // `eliot_user_automation` selector is registered on the closed front
+        // door, so the catalogue entry is `Admitted` and the arm above is its
+        // only admission path. Leaving the weaker PlanGap hatch in place would
+        // re-admit the command through a projection the catalogue denies.
         (CommandAvailability::PlanGap { .. }, CommandResult::Forwarded { .. })
             if matches!(
                 command,
-                CommandId::UserAutomation
-                    | CommandId::BackupCreate
+                CommandId::BackupCreate
                     | CommandId::BackupVerify
                     | CommandId::BackupRestoreTest
             ) => {}
