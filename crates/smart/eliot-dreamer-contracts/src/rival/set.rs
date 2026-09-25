@@ -68,8 +68,14 @@ impl RivalObjectiveOmission {
         validation::preflight(self)?;
         for (value, field) in [
             (&self.model_id, "rival.probe_input_set.omission.model_id"),
-            (&self.prediction_id, "rival.probe_input_set.omission.prediction_id"),
-            (&self.peer_model_id, "rival.probe_input_set.omission.peer_model_id"),
+            (
+                &self.prediction_id,
+                "rival.probe_input_set.omission.prediction_id",
+            ),
+            (
+                &self.peer_model_id,
+                "rival.probe_input_set.omission.peer_model_id",
+            ),
             (
                 &self.peer_prediction_id,
                 "rival.probe_input_set.omission.peer_prediction_id",
@@ -283,7 +289,10 @@ impl RivalProbeInputSet {
                 &self.validated_input_digest,
                 "rival.probe_input_set.validated_input_digest",
             ),
-            (&self.source_set_digest, "rival.probe_input_set.source_set_digest"),
+            (
+                &self.source_set_digest,
+                "rival.probe_input_set.source_set_digest",
+            ),
             (&self.policy_digest, "rival.probe_input_set.policy_digest"),
             (
                 &self.model_coverage_digest,
@@ -299,7 +308,10 @@ impl RivalProbeInputSet {
         validation::artifact(&self.source_set_id, "rival.probe_input_set.source_set_id")?;
         validation::text(&self.policy_id, "rival.probe_input_set.policy_id")?;
         for (count, field) in [
-            (self.declared_model_count, "rival.probe_input_set.declared_model_count"),
+            (
+                self.declared_model_count,
+                "rival.probe_input_set.declared_model_count",
+            ),
             (
                 self.declared_source_count,
                 "rival.probe_input_set.declared_source_count",

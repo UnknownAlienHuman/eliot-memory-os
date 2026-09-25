@@ -12,9 +12,8 @@ use eliot_instrument_api::{
     VerificationOutcome, VerificationRun as CurrentVerificationRun,
 };
 use eliot_instrument_nextest::{
-    NEXTEST_INSTRUMENT, NEXTEST_STDERR_CONTENT_TYPE, NEXTEST_STDOUT_CONTENT_TYPE,
-    NextestTestEvent, NextestTestStatus, parse_jsonl, parse_test_events,
-    catalog_test_id,
+    NEXTEST_INSTRUMENT, NEXTEST_STDERR_CONTENT_TYPE, NEXTEST_STDOUT_CONTENT_TYPE, NextestTestEvent,
+    NextestTestStatus, catalog_test_id, parse_jsonl, parse_test_events,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

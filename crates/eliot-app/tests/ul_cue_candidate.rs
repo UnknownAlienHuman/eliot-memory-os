@@ -4,8 +4,8 @@ use eliot_engine::{
 use eliot_store::{CanonicalStore, ControlWal};
 use eliot_types::{
     AgentCandidateSubmitInput, AgentId, ClaimCardInput, ClaimId, CommandContext, ControlWalConfig,
-    CredentialProviderKind, CueBinding, LegacyCueKindV1, CueMatchMode, CueStrength, EpistemicStatus,
-    GovernorConfig, LifecycleStatus, ProjectId, SemanticCommand, TaintClass, TaskId, Visibility,
+    CredentialProviderKind, CueBinding, CueMatchMode, CueStrength, EpistemicStatus, GovernorConfig,
+    LegacyCueKindV1, LifecycleStatus, ProjectId, SemanticCommand, TaintClass, TaskId, Visibility,
     WriteId, normalize_bindings,
 };
 use serde_json::json;

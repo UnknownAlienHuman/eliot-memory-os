@@ -169,10 +169,8 @@ pub fn introduction_fence_input(
 ) -> Result<CapabilityIntroductionFence, KernelError> {
     let introduction_id = activation_input.subject_id.as_str().to_owned();
     let mut input = activation_input.clone();
-    input.record_id = OperationIdentity::new(introduction_fence_record_id(
-        operation_id,
-        &introduction_id,
-    ))
-    .map_err(KernelError::RecoveryState)?;
+    input.record_id =
+        OperationIdentity::new(introduction_fence_record_id(operation_id, &introduction_id))
+            .map_err(KernelError::RecoveryState)?;
     CapabilityIntroductionFence::new(input).map_err(KernelError::RecoveryState)
 }

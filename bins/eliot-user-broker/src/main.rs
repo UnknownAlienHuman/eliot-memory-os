@@ -288,10 +288,7 @@ fn dispatch(
                 .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
             if let Value::Object(map) = &mut readiness {
                 map.insert("notify_fallback".to_owned(), fallback_status.clone());
-                map.insert(
-                    "notify_launch".to_owned(),
-                    notify_launch_status.clone(),
-                );
+                map.insert("notify_launch".to_owned(), notify_launch_status.clone());
             }
             Message::Ready { readiness }
         }

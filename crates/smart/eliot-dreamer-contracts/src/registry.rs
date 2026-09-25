@@ -401,9 +401,11 @@ pub const fn canonical_handler_id(family: CurationFamily) -> &'static str {
 pub fn canonical_registry() -> Result<CurationHandlerRegistry, ContractViolation> {
     let mut registry = CurationHandlerRegistry::new();
     for spelling in CURATION_FAMILIES {
-        let family = parse_family(spelling).map_err(|err| ContractViolation::Registry(
-            std::format!("canonical family spelling is not closed: {spelling} ({err})"),
-        ))?;
+        let family = parse_family(spelling).map_err(|err| {
+            ContractViolation::Registry(std::format!(
+                "canonical family spelling is not closed: {spelling} ({err})"
+            ))
+        })?;
         registry.register(CurationHandlerDescriptor {
             family,
             handler_id: canonical_handler_id(family).to_owned(),
@@ -1151,7 +1153,9 @@ mod tests {
         assert_eq!(first_digest, second_digest, "digest stable across calls");
         assert_eq!(first_digest.len(), 64, "digest is sha256 hex");
         assert!(
-            first_digest.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            first_digest
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "digest is lowercase hex"
         );
         let fixture_digest = full_registry().digest().expect("fixture digests");
@@ -1195,9 +1199,7 @@ mod tests {
                 family_kinds(CurationFamily::Classification).to_vec(),
             ))
             .expect_err("unknown handler must fail");
-        assert!(
-            matches!(err, ContractViolation::Registry(m) if m.contains("already covered"))
-        );
+        assert!(matches!(err, ContractViolation::Registry(m) if m.contains("already covered")));
         // Duplicated canonical identity is rejected at registration.
         let mut duped = canonical.clone();
         let err = duped
@@ -1206,7 +1208,11 @@ mod tests {
         assert!(
             matches!(err, ContractViolation::Registry(m) if m.contains("duplicate handler_id"))
         );
-        assert_eq!(duped.handlers.len(), 10, "rejected registration adds nothing");
+        assert_eq!(
+            duped.handlers.len(),
+            10,
+            "rejected registration adds nothing"
+        );
     }
 
     fn assert_screened_dispatch_fails() {

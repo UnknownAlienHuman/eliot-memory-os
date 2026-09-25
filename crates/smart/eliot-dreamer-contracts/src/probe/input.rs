@@ -61,9 +61,7 @@ impl ProbeCapabilityAvailability {
     pub fn validate(&self) -> Result<(), ContractViolation> {
         validation::preflight(self)?;
         match self {
-            Self::Available { detail } => {
-                validation::text(detail, "probe.input.capability.detail")
-            }
+            Self::Available { detail } => validation::text(detail, "probe.input.capability.detail"),
             Self::Unavailable { reason }
             | Self::Unknown { reason }
             | Self::NotApplicable { reason } => {
@@ -85,9 +83,7 @@ impl ProbeCapabilityAvailability {
 }
 
 /// One typed bounded probe parameter in canonical `(name, value)` order.
-#[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProbeParam {
     /// Stable parameter name, non-blank and bounded.
@@ -106,9 +102,7 @@ impl ProbeParam {
 }
 
 /// Exact source identity bound by one probe input.
-#[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProbeSourceRef {
     /// Stable source handle.
@@ -124,14 +118,8 @@ impl ProbeSourceRef {
     pub fn validate(&self) -> Result<(), ContractViolation> {
         validation::preflight(self)?;
         validation::text(self.handle.as_str(), "probe.input.source.handle")?;
-        validation::digest(
-            &self.content_digest,
-            "probe.input.source.content_digest",
-        )?;
-        validation::text(
-            &self.source_revision,
-            "probe.input.source.source_revision",
-        )
+        validation::digest(&self.content_digest, "probe.input.source.content_digest")?;
+        validation::text(&self.source_revision, "probe.input.source.source_revision")
     }
 }
 
@@ -152,12 +140,13 @@ impl ProbeGroundingRef {
     pub fn from_candidate(
         candidate: &crate::validation::ValidatedGroundingCandidate,
     ) -> Result<Self, ContractViolation> {
-        let digest = candidate
-            .output_digest()
-            .map_err(|error| ContractViolation::BindingMismatch {
-                field: "probe.input.grounding.candidate_digest",
-                reason: error.to_string(),
-            })?;
+        let digest =
+            candidate
+                .output_digest()
+                .map_err(|error| ContractViolation::BindingMismatch {
+                    field: "probe.input.grounding.candidate_digest",
+                    reason: error.to_string(),
+                })?;
         let reference = Self {
             candidate_digest: digest,
         };
@@ -272,18 +261,12 @@ impl ProbeLifecycle {
     /// Validates the lifecycle declaration shape.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         validation::preflight(self)?;
-        validation::text(
-            &self.cancellation,
-            "probe.input.lifecycle.cancellation",
-        )?;
+        validation::text(&self.cancellation, "probe.input.lifecycle.cancellation")?;
         validation::text(
             &self.cleanup_rollback,
             "probe.input.lifecycle.cleanup_rollback",
         )?;
-        validation::text(
-            &self.reconciliation,
-            "probe.input.lifecycle.reconciliation",
-        )?;
+        validation::text(&self.reconciliation, "probe.input.lifecycle.reconciliation")?;
         self.repeat.validate()
     }
 }
@@ -310,9 +293,7 @@ impl ProbeInputRef {
 fn validate_owner_ref(owner: &ProbeOwnerRef, field: &'static str) -> Result<(), ContractViolation> {
     match owner {
         ProbeOwnerRef::Source { owner } => validation::text(owner.as_str(), field),
-        ProbeOwnerRef::Verifier { verifier_id } => {
-            validation::text(verifier_id.as_str(), field)
-        }
+        ProbeOwnerRef::Verifier { verifier_id } => validation::text(verifier_id.as_str(), field),
         ProbeOwnerRef::Unavailable { reason } => validation::text(reason, field),
     }
 }
@@ -623,12 +604,12 @@ impl ProbeInput {
         self.objective.validate()?;
         self.result_schema.validate()?;
         self.affordance.validate()?;
-        self.expected_observable
-            .validate()
-            .map_err(|error| ContractViolation::BindingMismatch {
+        self.expected_observable.validate().map_err(|error| {
+            ContractViolation::BindingMismatch {
                 field: "probe.input.expected_observable",
                 reason: error.to_string(),
-            })?;
+            }
+        })?;
         self.verifier
             .validate()
             .map_err(|error| ContractViolation::BindingMismatch {

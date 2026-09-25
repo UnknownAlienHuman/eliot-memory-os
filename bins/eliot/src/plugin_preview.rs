@@ -444,10 +444,12 @@ mod tests {
         assert_eq!(receipt["code"], "PLAN_GAP");
         assert_eq!(receipt["completed"], false);
         assert!(receipt.get("preview").is_some());
-        assert!(receipt
-            .get("rollback_copy")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|copy| copy == rollback_artifact.display().to_string()));
+        assert!(
+            receipt
+                .get("rollback_copy")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|copy| copy == rollback_artifact.display().to_string())
+        );
         let _ = std::fs::remove_dir_all(&rollback_dir);
     }
 

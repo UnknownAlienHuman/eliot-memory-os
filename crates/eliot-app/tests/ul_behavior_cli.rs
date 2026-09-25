@@ -3,10 +3,10 @@ mod support;
 
 use eliot_engine::{GitMiningService, ModuleCardService};
 use eliot_types::{
-    AgentId, CoChangeEdge, CommandContext, CueBinding, LegacyCueKindV1, CueMatchMode, CueStrength,
-    FailureRecordCommand, LifecycleStatus, ModuleCard, ProjectId, RelationInput, RelationType,
-    SemanticCommand, TaintClass, UlArtifact, UlArtifactBatchRecordCommand, Visibility, WriteId,
-    WriteStatus,
+    AgentId, CoChangeEdge, CommandContext, CueBinding, CueMatchMode, CueStrength,
+    FailureRecordCommand, LegacyCueKindV1, LifecycleStatus, ModuleCard, ProjectId, RelationInput,
+    RelationType, SemanticCommand, TaintClass, UlArtifact, UlArtifactBatchRecordCommand,
+    Visibility, WriteId, WriteStatus,
 };
 use serde_json::json;
 use std::collections::BTreeMap;

@@ -1182,13 +1182,12 @@ mod tests {
 
     #[test]
     fn missing_providers_are_typed_gaps_not_empty_views() {
-        let mut board =
-            controlboard_over_snapshot(
-                snapshot(),
-                &SharedOperatorReplay::new(),
-                Vec::new(),
-                Vec::new()
-            );
+        let mut board = controlboard_over_snapshot(
+            snapshot(),
+            &SharedOperatorReplay::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         assert_eq!(
             board.view(&request_for("session-a")),
             Err(ControlBoardError::PlanGap(RequiredProvider::AccessResolver))
@@ -1622,10 +1621,7 @@ mod tests {
                 )
                 .expect("admitted session"),
             )),
-            Some(Box::new(GovernorCanonicalState::new(
-                snapshot,
-                Vec::new(),
-            ))),
+            Some(Box::new(GovernorCanonicalState::new(snapshot, Vec::new()))),
             None,
         )
     }
@@ -1649,8 +1645,7 @@ mod tests {
         assert_eq!(binding.access_revision.get(), 7);
         assert_eq!(binding.access_fence, fence());
         // The same binding reads the real G-11/I-12 bindings from canonical state.
-        let mut reader =
-            GovernorCanonicalState::new(Arc::clone(&snapshot), Vec::new());
+        let mut reader = GovernorCanonicalState::new(Arc::clone(&snapshot), Vec::new());
         let canonical = reader
             .read(&request_for("session-a"), &binding)
             .expect("canonical");
@@ -1687,10 +1682,7 @@ mod tests {
         // Empty admission map: production behaviour is unchanged (unavailable).
         let mut bare = ControlBoard::new(
             Some(Box::new(GovernorAccessResolver::new(Arc::clone(&snapshot)))),
-            Some(Box::new(GovernorCanonicalState::new(
-                snapshot,
-                Vec::new(),
-            ))),
+            Some(Box::new(GovernorCanonicalState::new(snapshot, Vec::new()))),
             None,
         );
         assert_eq!(
@@ -1728,8 +1720,7 @@ mod tests {
         // Pre-fetched canonical records at the snapshot fence flow into the
         // board inbox section with metrics.
         let stored = daemon_notification("disk-critical", fence());
-        let mut reader =
-            GovernorCanonicalState::new(Arc::clone(&snapshot), vec![stored.clone()]);
+        let mut reader = GovernorCanonicalState::new(Arc::clone(&snapshot), vec![stored.clone()]);
         let canonical = reader
             .read(&request_for("session-a"), &access_for("session-a", &[]))
             .expect("canonical");
@@ -1846,13 +1837,12 @@ mod tests {
         assert_eq!(admitted.session_id, "0");
         assert_eq!(admitted.principal_id, "S-1-5-18");
         assert_eq!(admitted.role, Role::HumanSystemOwner);
-        let mut board =
-            controlboard_over_snapshot(
-                snapshot(),
-                &SharedOperatorReplay::new(),
-                vec![admitted],
-                Vec::new()
-            );
+        let mut board = controlboard_over_snapshot(
+            snapshot(),
+            &SharedOperatorReplay::new(),
+            vec![admitted],
+            Vec::new(),
+        );
         let view = board
             .view(&request_for("0"))
             .expect("live pinned owner view");
@@ -1876,13 +1866,12 @@ mod tests {
             "sid=S-1-5-18;session=0",
         ))
         .expect("owner admission from Kernel facts");
-        let mut board =
-            controlboard_over_snapshot(
-                snapshot(),
-                &SharedOperatorReplay::new(),
-                vec![admitted],
-                Vec::new()
-            );
+        let mut board = controlboard_over_snapshot(
+            snapshot(),
+            &SharedOperatorReplay::new(),
+            vec![admitted],
+            Vec::new(),
+        );
         assert_eq!(
             board.view(&request_for("1")),
             Err(ControlBoardError::PlanGap(RequiredProvider::AccessResolver))

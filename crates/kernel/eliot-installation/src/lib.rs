@@ -152,9 +152,8 @@ pub use approved_generation_registry::{
 use approved_generation_registry::{
     ActiveVerifiedReceiptBinding, PendingActivationAbortReceipt, PendingActivationTerminal,
     PendingActivationTerminalDisposition, activation_abort_receipt_digest,
-    activation_terminal_digest, candidate_manifest_digest, phase_b_scm_digest,
-    activation_projection_intent_digest,
-    registry_projection_identity, validate_phase_b_scm_digest,
+    activation_projection_intent_digest, activation_terminal_digest, candidate_manifest_digest,
+    phase_b_scm_digest, registry_projection_identity, validate_phase_b_scm_digest,
 };
 #[cfg(test)]
 use approved_generation_registry::{

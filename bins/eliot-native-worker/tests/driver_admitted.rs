@@ -1012,12 +1012,38 @@ fn admitted_drive_reaches_ready_and_serves_bounded_frame() {
 
 #[test]
 fn artifact_manifest_mismatch_refuses_before_start_without_deferral() {
-    let (mut worker, _, registration, claim_value, hello_value, process, _, _, _) = build_driver("drive-artifact-negative", "operation-artifact-negative-1", "tree-artifact-negative-1", "nonce-artifact-negative-1");
-    let mut mismatched = hello_value; mismatched.artifact_manifest_digest = "rewired-manifest-negative-1".to_owned();
+    let (mut worker, _, registration, claim_value, hello_value, process, _, _, _) = build_driver(
+        "drive-artifact-negative",
+        "operation-artifact-negative-1",
+        "tree-artifact-negative-1",
+        "nonce-artifact-negative-1",
+    );
+    let mut mismatched = hello_value;
+    mismatched.artifact_manifest_digest = "rewired-manifest-negative-1".to_owned();
     let mut lifecycle = FakeLifecycle::new();
-    let Err(error) = block_on(drive_admitted_claimed(&mut lifecycle, &mut worker, &registration, &claim_request(&registration, &claim_value), mismatched, process, &reconcile_for(&claim_value), &readiness_for(&claim_value))) else { panic!("artifact mismatch must refuse") };
+    let Err(error) = block_on(drive_admitted_claimed(
+        &mut lifecycle,
+        &mut worker,
+        &registration,
+        &claim_request(&registration, &claim_value),
+        mismatched,
+        process,
+        &reconcile_for(&claim_value),
+        &readiness_for(&claim_value),
+    )) else {
+        panic!("artifact mismatch must refuse")
+    };
     let detail = error.to_string();
-    assert!(matches!(&error, NativeWorkerError::KernelAdmissionRequired(_)) && detail.starts_with(eliot_native_worker::KERNEL_ADMISSION_REQUIRED) && (match &error { NativeWorkerError::KernelAdmissionRequired(_) => 78, _ => 1 } == 78) && !detail.contains("PROVIDER_RUNTIME_DEFERRED") && worker.lifecycle() != WorkerLifecycle::Ready);
+    assert!(
+        matches!(&error, NativeWorkerError::KernelAdmissionRequired(_))
+            && detail.starts_with(eliot_native_worker::KERNEL_ADMISSION_REQUIRED)
+            && (match &error {
+                NativeWorkerError::KernelAdmissionRequired(_) => 78,
+                _ => 1,
+            } == 78)
+            && !detail.contains("PROVIDER_RUNTIME_DEFERRED")
+            && worker.lifecycle() != WorkerLifecycle::Ready
+    );
     remove_bat("drive-artifact-negative");
 }
 

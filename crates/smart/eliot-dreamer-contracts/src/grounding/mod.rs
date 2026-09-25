@@ -481,7 +481,10 @@ fn check_digest(value: &str, field: &'static str) -> Result<(), ContractViolatio
     }
 }
 
-fn check_attempt(attempt: &AttemptIdentity, job: &DreamJobAdmission) -> Result<(), ContractViolation> {
+fn check_attempt(
+    attempt: &AttemptIdentity,
+    job: &DreamJobAdmission,
+) -> Result<(), ContractViolation> {
     check_text(&attempt.attempt_id, "attempt_id")?;
     if attempt.attempt_number == 0
         || attempt.attempt_number > attempt.maximum_attempts

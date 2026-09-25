@@ -10,6 +10,7 @@ use eliot_cli::{
     user_automation_route_payload,
 };
 use eliot_doctor::integration;
+use eliot_host::{NotifyFallbackSetupInputs, setup_notify_fallback_per_user};
 use eliot_installation::{
     ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest,
     GenerationPackagePlanInput, GenerationPackagePlanner, InstallationEpoch, InstallationError,
@@ -24,7 +25,6 @@ use eliot_live_canary::{
     CANARY_COMPLETION_SCHEMA, CanaryConfig, CanaryError, ProductionCanary,
     ProductionCanaryCompletionBinding, Pulse, publish_production_evidence,
 };
-use eliot_host::{NotifyFallbackSetupInputs, setup_notify_fallback_per_user};
 use eliot_platform_windows::{
     FileIdentity, HostOwnerLease, InstallerRootError, InstallerRootObjectSnapshot,
     InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
@@ -2034,8 +2034,9 @@ fn run_installation_setup_notify_fallback(
     use eliot_host::HostError;
     let portable_root = match profile {
         InstallationProfile::PortableDev => Some(
-            UserOwnedRootLease::open_existing(&profile_anchor_root)
-                .map_err(|error| anyhow::anyhow!("portable setup root is not provisioned: {error}"))?,
+            UserOwnedRootLease::open_existing(&profile_anchor_root).map_err(|error| {
+                anyhow::anyhow!("portable setup root is not provisioned: {error}")
+            })?,
         ),
         InstallationProfile::SystemService | InstallationProfile::UserMode => None,
     };
@@ -4129,7 +4130,8 @@ mod tests {
     fn plugin_install_without_admitted_port_exits_nonsuccess() {
         // End-to-end CLI honesty: a valid manifest still cannot produce an
         // installed-success result without an admitted mutation port.
-        let root = std::env::temp_dir().join(format!("eliot-plugin-install-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("eliot-plugin-install-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("create temp root");
         let target = root.join("config.json");
         std::fs::write(&target, b"{\"bridge\":\"demo\"}").expect("write target");
@@ -4163,10 +4165,9 @@ mod tests {
         .expect("install front door executes");
         assert_eq!(code, INVALID_REQUEST_EXIT);
         let receipt_path = rollback_dir.join("demo-bridge.installed.json");
-        let receipt: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(&receipt_path).expect("read install receipt"),
-        )
-        .expect("parse install receipt");
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&receipt_path).expect("read install receipt"))
+                .expect("parse install receipt");
         assert_eq!(receipt["status"], "INSTALL_NOT_ATTEMPTED");
         assert_eq!(receipt["code"], "PLAN_GAP");
         assert_eq!(receipt["completed"], false);

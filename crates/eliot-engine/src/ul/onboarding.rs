@@ -9,8 +9,8 @@ use crate::codecortex::run_process;
 use crate::{EngineError, WriteAdmissionService, WriterHandle};
 use eliot_store::CanonicalStore;
 use eliot_types::{
-    CoChangeEdge, ConceptKind, ConceptNode, CueBinding, LegacyCueKindV1, CueMatchMode, CueRecordSource,
-    CueStrength, HotspotScore, ManifestPackage, MiningRun, ModuleCard, OnboardingCheckpoint,
+    CoChangeEdge, ConceptKind, ConceptNode, CueBinding, CueMatchMode, CueRecordSource, CueStrength,
+    HotspotScore, LegacyCueKindV1, ManifestPackage, MiningRun, ModuleCard, OnboardingCheckpoint,
     OnboardingReport, OnboardingStage, OnboardingTestHook, ProjectId, UlArtifact,
     normalize_bindings, path_matches_boundary,
 };

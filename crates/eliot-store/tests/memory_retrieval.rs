@@ -1,12 +1,12 @@
 use eliot_store::{BlobStore, CanonicalStore};
 use eliot_types::{
-    AgentId, BlobStoreConfig, ClaimCardInput, ClaimId, CueBinding, LegacyCueKindV1, CueMatchMode,
-    CueStrength, EpistemicStatus, EvidenceAtomInput, EvidenceId, FailureFingerprintInput,
-    FetchAtomsL2Request, GovernorConfig, IdempotencyOptions, LifecycleStatus,
-    LifecycleWriteOptions, MemoryConfidence, MemoryWriteEnvelope, OperationId, ProjectId,
-    ProjectSequence, ReadConsistencyMode, RecallL0Request, RelationInput, RelationType,
-    SemanticCommandKind, SurrealServerConfig, TaintClass, TaskId, ToolObservationInput, Visibility,
-    WriteId, WriteStatus,
+    AgentId, BlobStoreConfig, ClaimCardInput, ClaimId, CueBinding, CueMatchMode, CueStrength,
+    EpistemicStatus, EvidenceAtomInput, EvidenceId, FailureFingerprintInput, FetchAtomsL2Request,
+    GovernorConfig, IdempotencyOptions, LegacyCueKindV1, LifecycleStatus, LifecycleWriteOptions,
+    MemoryConfidence, MemoryWriteEnvelope, OperationId, ProjectId, ProjectSequence,
+    ReadConsistencyMode, RecallL0Request, RelationInput, RelationType, SemanticCommandKind,
+    SurrealServerConfig, TaintClass, TaskId, ToolObservationInput, Visibility, WriteId,
+    WriteStatus,
 };
 use serde_json::json;
 use std::error::Error;

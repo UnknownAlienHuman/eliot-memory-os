@@ -1510,7 +1510,10 @@ mod durability_repair_tests {
         ordering::clear();
         store_write_fault::inject_write_fault();
         let result = persist_store_recovery_pending(&root, &request, &host);
-        assert!(result.is_err(), "injected file flush failure is not success");
+        assert!(
+            result.is_err(),
+            "injected file flush failure is not success"
+        );
         assert!(
             matches!(result, Err(crate::HostError::Platform(_))),
             "file flush failure must be a typed HostError"
@@ -1713,7 +1716,10 @@ mod durability_repair_tests {
         let t2_bytes = serde_json::to_vec(&t2)?;
         std::fs::write(store_recovery_termination_path(&root, &digest2), &t2_bytes)?;
         let result = persist_store_recovery_inner_binding(&root, &request2, &host, &handoff);
-        assert!(result.is_err(), "injected file flush failure is not success");
+        assert!(
+            result.is_err(),
+            "injected file flush failure is not success"
+        );
         assert!(
             matches!(result, Err(crate::HostError::Platform(_))),
             "file flush failure must be a typed HostError"
@@ -1751,7 +1757,10 @@ mod durability_repair_tests {
             r"Local\Eliot-Store-old",
         )?;
         let evidence_bytes = serde_json::to_vec(&evidence)?;
-        std::fs::write(store_recovery_termination_path(&root, &digest), &evidence_bytes)?;
+        std::fs::write(
+            store_recovery_termination_path(&root, &digest),
+            &evidence_bytes,
+        )?;
         // The durable termination publisher validates the exact live
         // predecessor contour, which stays covered by the inner-binding seam:
         // an injected directory-sync failure there must not report success
@@ -1861,7 +1870,10 @@ mod durability_repair_tests {
         ordering::clear();
         store_write_fault::inject_write_fault();
         let result = persist_store_recovery_receipt(&root, &receipt);
-        assert!(result.is_err(), "injected file flush failure is not success");
+        assert!(
+            result.is_err(),
+            "injected file flush failure is not success"
+        );
         assert!(
             matches!(result, Err(crate::HostError::Platform(_))),
             "file flush failure must be a typed HostError"
@@ -1971,11 +1983,8 @@ mod durability_repair_tests {
             handoff: handoff.clone(),
         };
         binding.validate_for_pending(
-            &read_store_recovery_pending_identity(&store_recovery_pending_path(
-                &root,
-                &digest,
-            ))?
-            .ok_or("pending must exist")?,
+            &read_store_recovery_pending_identity(&store_recovery_pending_path(&root, &digest))?
+                .ok_or("pending must exist")?,
             &termination,
         )?;
         std::fs::write(

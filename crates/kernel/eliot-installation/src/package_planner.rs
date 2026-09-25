@@ -821,7 +821,9 @@ pub(crate) fn validate_exact_candidate_package_binding(
     let mut manifest_names = BTreeSet::new();
     for spec in &manifest.files {
         if spec.relative_path == NOTIFY_STAGED_ROLE {
-            if spec.executable != NOTIFY_STAGED_EXECUTABLE || !manifest_names.insert(spec.relative_path.clone()) {
+            if spec.executable != NOTIFY_STAGED_EXECUTABLE
+                || !manifest_names.insert(spec.relative_path.clone())
+            {
                 return Err(InstallationError::IdentityConflict);
             }
             continue;
@@ -866,7 +868,8 @@ pub(crate) fn validate_exact_expected_file_digests(
     validate_exact_candidate_package_binding(candidate, manifest)?;
     if expected.len() != REQUIRED_PACKAGE_ROLES.len() {
         return Err(InstallationError::IncompleteObservation(
-            "expected package digest set must contain all fourteen Phase-A runtime files".to_owned(),
+            "expected package digest set must contain all fourteen Phase-A runtime files"
+                .to_owned(),
         ));
     }
     let bindings = strict_role_bindings(candidate);
@@ -2065,7 +2068,8 @@ fn validate_source_bundle_publication_binding(
         || manifest.files.len() != REQUIRED_PACKAGE_ROLES.len()
     {
         return Err(InstallationError::IncompleteObservation(
-            "source publication binding must contain the complete fourteen-role inventory".to_owned(),
+            "source publication binding must contain the complete fourteen-role inventory"
+                .to_owned(),
         ));
     }
     for (index, (role, executable)) in REQUIRED_PACKAGE_ROLES.iter().enumerate() {

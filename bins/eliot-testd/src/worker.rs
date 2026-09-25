@@ -71,9 +71,9 @@ use eliot_process::{
 };
 use eliot_testd_core::{
     EvidenceCollector, JobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
-    Lease, NormalizedEvidence, RawArtifactStream, TestJob, TestdError, TestdStore,
-    TestdSourceObservation, TestdSourceObservationRange, TestdToolObservation,
-    evaluate_testd_verification, issue_process_admission,
+    Lease, NormalizedEvidence, RawArtifactStream, TestJob, TestdError, TestdSourceObservation,
+    TestdSourceObservationRange, TestdStore, TestdToolObservation, evaluate_testd_verification,
+    issue_process_admission,
 };
 
 use crate::kernel_client::{
@@ -130,14 +130,7 @@ pub fn drive_admitted_one_shot<E: ProcessExecutor + 'static>(
     lease_ms: u64,
     now: u64,
 ) -> Result<TestReceipt, TestdError> {
-    drive_admitted_one_shot_from_store(
-        store,
-        presented,
-        executor,
-        owner,
-        lease_ms,
-        now,
-    )
+    drive_admitted_one_shot_from_store(store, presented, executor, owner, lease_ms, now)
 }
 
 /// Drives one admitted shot against the already-open canonical TestD store.
@@ -201,13 +194,7 @@ pub(crate) fn drive_admitted_one_shot_from_store<E: ProcessExecutor + 'static>(
         .clone()
         .ok_or_else(|| TestdError::Corrupt("claimed job carries no lease".to_owned()))?;
     drive_claimed(
-        store,
-        &job,
-        &mut lease,
-        presented,
-        executor,
-        owner,
-        lease_ms,
+        store, &job, &mut lease, presented, executor, owner, lease_ms,
     )
 }
 
@@ -235,19 +222,15 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
             &EvidenceCollector::default(),
             format!("refused foreign or stale presentation without executing: {binding}"),
         )?;
-        return Ok(crate::receipt(
-            &store
-                .get(&job.job_id)?
-                .ok_or_else(|| TestdError::Corrupt("job disappeared after refusal".to_owned()))?,
-        ));
+        return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
+            || TestdError::Corrupt("job disappeared after refusal".to_owned()),
+        )?));
     }
     if presented.cancelled {
         store.cancel(&job.job_id, Some(lease), owner, current_clock_ms())?;
-        return Ok(crate::receipt(
-            &store.get(&job.job_id)?.ok_or_else(|| {
-                TestdError::Corrupt("job disappeared after cancellation".to_owned())
-            })?,
-        ));
+        return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
+            || TestdError::Corrupt("job disappeared after cancellation".to_owned()),
+        )?));
     }
     // Fresh bound admission: rebuild the Kernel request from the CLAIMED
     // durable job and seal it with the single-use replay of the presented
@@ -284,11 +267,9 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
                 &EvidenceCollector::default(),
                 format!("fresh admission refused without executing: {error}"),
             )?;
-            return Ok(crate::receipt(
-                &store.get(&job.job_id)?.ok_or_else(|| {
-                    TestdError::Corrupt("job disappeared after admission refusal".to_owned())
-                })?,
-            ));
+            return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
+                || TestdError::Corrupt("job disappeared after admission refusal".to_owned()),
+            )?));
         }
     };
     let collector = Arc::new(EvidenceCollector::default());
@@ -305,11 +286,9 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
                         "productive tool identity was not owner-observed; no process started: {error}"
                     ),
                 )?;
-                return Ok(crate::receipt(
-                    &store.get(&job.job_id)?.ok_or_else(|| {
-                        TestdError::Corrupt("job disappeared after tool observation".to_owned())
-                    })?,
-                ));
+                return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
+                    || TestdError::Corrupt("job disappeared after tool observation".to_owned()),
+                )?));
             }
         };
         collector.record_tool_observation(observation)?;
@@ -349,20 +328,16 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
         started_at,
         lease_ms,
     )?;
-    Ok(crate::receipt(
-        &store
-            .get(&job.job_id)?
-            .ok_or_else(|| TestdError::Corrupt("job disappeared after finish".to_owned()))?,
-    ))
+    Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
+        || TestdError::Corrupt("job disappeared after finish".to_owned()),
+    )?))
 }
 
 /// Revalidates the exact tool identity carried by the admitted productive
 /// ProcessRequest immediately before the consuming start. The resolver has
 /// already selected cargo/rustc through rustup; this readback binds the
 /// resulting files and nextest executable into the durable receipt.
-fn observe_tool_identity(
-    request: &ProcessRequest,
-) -> Result<TestdToolObservation, TestdError> {
+fn observe_tool_identity(request: &ProcessRequest) -> Result<TestdToolObservation, TestdError> {
     let environment = request.environment().non_secret();
     let required = |key: &'static str| {
         environment.get(key).cloned().ok_or(TestdError::Invalid {
@@ -564,19 +539,21 @@ fn observe_and_finish<E: ProcessExecutor + 'static>(
         == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
     {
         match current.source_observation_before.as_ref() {
-            Some(before) => match TestdSourceObservation::capture(&current.target_roots.source_root) {
-                Ok(after) => Some(TestdSourceObservationRange {
-                    before: before.clone(),
-                    after,
-                }),
-                Err(error) => {
-                    execution = ExecutionStatus::Unknown;
-                    reason = format!(
-                        "terminal source state was not observed after verifier execution: {error}"
-                    );
-                    None
+            Some(before) => {
+                match TestdSourceObservation::capture(&current.target_roots.source_root) {
+                    Ok(after) => Some(TestdSourceObservationRange {
+                        before: before.clone(),
+                        after,
+                    }),
+                    Err(error) => {
+                        execution = ExecutionStatus::Unknown;
+                        reason = format!(
+                            "terminal source state was not observed after verifier execution: {error}"
+                        );
+                        None
+                    }
                 }
-            },
+            }
             None => {
                 execution = ExecutionStatus::Unknown;
                 reason = "productive verifier has no persisted pre-dispatch source observation"
@@ -1101,7 +1078,7 @@ mod tests {
             std::slice::from_ref(&evidence),
             observation_clock(current_clock_ms()),
         )
-            .expect("inline capture succeeds");
+        .expect("inline capture succeeds");
         assert_eq!(synthetic, vec!["testd-inline-stream-0-stdout".to_owned()]);
         assert!(
             !synthetic.iter().any(|handle| handle == "raw:legacy-stderr"),

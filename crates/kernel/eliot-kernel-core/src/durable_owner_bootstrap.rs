@@ -72,7 +72,8 @@ pub fn bind_canonical_owner(
     advance_revision_watermark(&store, &roots, expected_revision)?;
     let source_handle: GovernorClosureSourceHandle = Arc::new(source);
     let port = GrantActivationPort::with_durable_root_grant(
-        Arc::clone(&source_handle) as Arc<dyn crate::grant_activation_port::RootGrantHydrationSource>,
+        Arc::clone(&source_handle)
+            as Arc<dyn crate::grant_activation_port::RootGrantHydrationSource>,
         store,
     );
     Ok(BoundCanonicalOwner {

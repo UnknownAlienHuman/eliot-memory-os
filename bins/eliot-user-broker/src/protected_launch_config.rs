@@ -217,10 +217,8 @@ pub(super) fn fresh_registration_request(
     Ok(request)
 }
 
-pub(super) fn load_protected_launch_binding() -> Result<
-    (BrokerLaunchBinding, ProtectedPathLease),
-    CompositionError,
-> {
+pub(super) fn load_protected_launch_binding()
+-> Result<(BrokerLaunchBinding, ProtectedPathLease), CompositionError> {
     #[cfg(not(windows))]
     {
         Err(CompositionError::Kernel(

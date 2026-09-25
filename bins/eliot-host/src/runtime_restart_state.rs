@@ -593,11 +593,13 @@ mod durability_repair_tests {
         label: &str,
         digest: &str,
     ) -> Result<super::super::HostRuntimeControlRequest, Box<dyn std::error::Error>> {
-        Ok(super::super::HostRuntimeControlRequest::new_with_mutation_digest(
-            HostRuntimeControlOperation::RestartKernel,
-            PlatformHandle::new(label)?,
-            PlatformHandle::new(digest.to_owned())?,
-        )?)
+        Ok(
+            super::super::HostRuntimeControlRequest::new_with_mutation_digest(
+                HostRuntimeControlOperation::RestartKernel,
+                PlatformHandle::new(label)?,
+                PlatformHandle::new(digest.to_owned())?,
+            )?,
+        )
     }
 
     #[test]
@@ -611,7 +613,10 @@ mod durability_repair_tests {
         pending_write_fault::clear_write_fault();
         pending_write_fault::inject_write_fault();
         let result = persist_runtime_restart_pending(&root, &request, &host);
-        assert!(result.is_err(), "injected file flush failure is not success");
+        assert!(
+            result.is_err(),
+            "injected file flush failure is not success"
+        );
         let log = ordering::take_log();
         assert!(
             log.contains(&"pending_file_write_fault_injected".to_owned()),
@@ -644,7 +649,10 @@ mod durability_repair_tests {
         ordering::clear();
         pending_write_fault::inject_write_fault();
         let result = persist_runtime_restart_receipt(&root, &receipt);
-        assert!(result.is_err(), "injected file flush failure is not success");
+        assert!(
+            result.is_err(),
+            "injected file flush failure is not success"
+        );
         assert!(
             !runtime_restart_receipt_path(&root, &digest).exists(),
             "a failed temp-file write must not publish a receipt"

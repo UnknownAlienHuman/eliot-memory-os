@@ -57,7 +57,11 @@ fn text(value: &str, field: &'static str) -> Result<(), ObservationError> {
     Ok(())
 }
 
-fn bounded_text(value: &str, field: &'static str, max_chars: usize) -> Result<(), ObservationError> {
+fn bounded_text(
+    value: &str,
+    field: &'static str,
+    max_chars: usize,
+) -> Result<(), ObservationError> {
     text(value, field)?;
     if value.chars().count() > max_chars {
         return Err(ObservationError::InvalidField {
@@ -87,10 +91,12 @@ fn id(value: &ArtifactId, field: &'static str) -> Result<(), ObservationError> {
 }
 
 fn fence_shape(value: &StateFence, field: &'static str) -> Result<(), ObservationError> {
-    value.validate().map_err(|_| ObservationError::InvalidField {
-        field,
-        reason: "fence interval is invalid",
-    })
+    value
+        .validate()
+        .map_err(|_| ObservationError::InvalidField {
+            field,
+            reason: "fence interval is invalid",
+        })
 }
 
 /// Closed omission classes for failure-observation reads.
@@ -219,7 +225,11 @@ impl FailureObservation {
             });
         }
         id(&self.observation_id, "observation.observation_id")?;
-        bounded_text(&self.fingerprint, "observation.fingerprint", MAX_OBSERVATION_TEXT)?;
+        bounded_text(
+            &self.fingerprint,
+            "observation.fingerprint",
+            MAX_OBSERVATION_TEXT,
+        )?;
         bounded_text(&self.trigger, "observation.trigger", MAX_OBSERVATION_TEXT)?;
         bounded_text(
             &self.failed_action,

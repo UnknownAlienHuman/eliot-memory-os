@@ -36,18 +36,16 @@ use std::path::Path;
 
 use eliot_runtime_contracts::{HealthDimension, HealthVector};
 use eliot_security_contracts::PrivacyClass;
+use eliot_wasm_runtime::lifecycle::InFlightDisposition;
 use eliot_wasm_runtime::{
     ArtifactAccessLimits, CancellationPolicy, CapabilityId, EpochPolicy, ExecutionContour,
     InvocationDisposition, InvocationId, InvocationLimits, InvocationRequest, InvocationResult,
     OwnerId, Revision, RuntimeError, Sha256Digest, TrapClass, VerificationVerdict, WasmRuntime,
     WorkScopeRef, WorkUnitId,
 };
-use eliot_wasm_runtime::lifecycle::InFlightDisposition;
 
 use crate::cli_contract::Profile;
-use crate::dispatch_material::{
-    MaterialError, ValidatedDispatchMaterial, ValidatedGuestCeilings,
-};
+use crate::dispatch_material::{MaterialError, ValidatedDispatchMaterial, ValidatedGuestCeilings};
 use crate::installed_binary::InstalledBinaryError;
 
 /// Exact `--guest-exec` argv assembled for the reaped child. Spellings
@@ -430,10 +428,7 @@ pub fn guest_exec_argv(
 
 /// Pre-seating admission: the assembled invocation request plus the
 /// admitted generation the authority/permit join consumes.
-pub type DriveAdmission = (
-    InvocationRequest,
-    crate::contour::AdmittedGeneration,
-);
+pub type DriveAdmission = (InvocationRequest, crate::contour::AdmittedGeneration);
 
 /// Runs the pre-seating drive pipeline over validated material: invocation
 /// assembly, the contour-prior progression gate, and contour admission
@@ -547,7 +542,9 @@ fn map_health_dimension(value: &str) -> Result<HealthDimension, DriveError> {
 ///
 /// Returns [`DriveError::Admission`] when any identity, spelling,
 /// revision, or health vector fails shape checks.
-pub fn assemble_owner_records(material: &ValidatedDispatchMaterial) -> Result<OwnerRecords, DriveError> {
+pub fn assemble_owner_records(
+    material: &ValidatedDispatchMaterial,
+) -> Result<OwnerRecords, DriveError> {
     let owned = |field: &'static str| DriveError::Admission { field };
     let contour = match material.work.contour.as_str() {
         "SHADOW" => ExecutionContour::Shadow,
@@ -573,8 +570,14 @@ pub fn assemble_owner_records(material: &ValidatedDispatchMaterial) -> Result<Ow
         .iter()
         .map(|dimension| map_health_dimension(dimension))
         .collect::<Result<Vec<HealthDimension>, DriveError>>()?;
-    let [liveness, readiness, freshness, compatibility, integrity, capacity] =
-        health.try_into().map_err(|_| owned("health-vector"))?;
+    let [
+        liveness,
+        readiness,
+        freshness,
+        compatibility,
+        integrity,
+        capacity,
+    ] = health.try_into().map_err(|_| owned("health-vector"))?;
     Ok(OwnerRecords {
         owner: OwnerId::new(material.work.owner.clone()).map_err(|_| owned("owner"))?,
         work_unit: WorkUnitId::new(material.work.work_unit.clone())
@@ -721,8 +724,8 @@ mod tests {
     use super::*;
     use crate::dispatch_material::{
         DispatchMaterialInput, ValidatedAssuranceInput, ValidatedGuestCeilingsInput,
-        ValidatedManifestInput, ValidatedPromotionInput, ValidatedSnapshotInput, ValidatedWorkInput,
-        bind_dispatch_material,
+        ValidatedManifestInput, ValidatedPromotionInput, ValidatedSnapshotInput,
+        ValidatedWorkInput, bind_dispatch_material,
     };
 
     fn digest_of(bytes: &[u8]) -> String {
@@ -902,7 +905,10 @@ mod tests {
         let (request, admitted) = drive_admission(&material).expect("drive admits");
         assert_eq!(request.component_id.as_str(), "component-drive");
         assert_eq!(admitted.component_id(), "component-drive");
-        assert_eq!(admitted.artifact_digest().as_str(), digest_of(b"drive-artifact-bytes"));
+        assert_eq!(
+            admitted.artifact_digest().as_str(),
+            digest_of(b"drive-artifact-bytes")
+        );
         // Shadow without a prior conformance proof denies pre-seating.
         let mut shadow = test_material();
         shadow.work.contour = "SHADOW".to_owned();
@@ -1036,10 +1042,8 @@ mod tests {
     /// with recomputed digests, metering, and both verdict sets.
     #[test]
     fn result_mapping_projects_measured_success() {
-        use eliot_wasm_runtime::{
-            CancellationPolicy, EngineUsage, EpochPolicy, InvocationReceipt,
-        };
         use VerificationVerdict::Verified;
+        use eliot_wasm_runtime::{CancellationPolicy, EngineUsage, EpochPolicy, InvocationReceipt};
         let material = test_material();
         let request = assemble_request(&material).expect("request assembles");
         let result = InvocationResult {

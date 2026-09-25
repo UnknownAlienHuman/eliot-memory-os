@@ -657,7 +657,10 @@ pub fn trace_material_with_warnings(
         if !candidates.contains(&warning.atom_id) {
             return Err(ContextError::DenominatorMismatch);
         }
-        if bound.insert(&warning.atom_id, warning.text.as_str()).is_some() {
+        if bound
+            .insert(&warning.atom_id, warning.text.as_str())
+            .is_some()
+        {
             return Err(ContextError::Duplicate("admission.warning.atom_id"));
         }
     }

@@ -486,7 +486,8 @@ mod tests {
     }
 
     fn temp_root(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("eliot-watchdog-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("eliot-watchdog-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("intent test state dir");
         dir
@@ -495,56 +496,91 @@ mod tests {
     #[test]
     fn intent_rows_land_in_watchdog_redb_and_wait_for_governor_admission() {
         let dir = temp_root("intent-rows");
-        let spool = WatchdogSpool::open_test(&dir.join("watchdog.redb")).expect("open intent spool");
+        let spool =
+            WatchdogSpool::open_test(&dir.join("watchdog.redb")).expect("open intent spool");
         assert!(matches!(
-            spool.append(500, WatchdogSpoolPayload::Gap {
-                service: SERVICE_NAME.to_owned(),
-                reason: GapRecoveryReason::AdmissionUnavailable,
-                coverage_claimed: false,
-            }).expect("append leading gap"),
+            spool
+                .append(
+                    500,
+                    WatchdogSpoolPayload::Gap {
+                        service: SERVICE_NAME.to_owned(),
+                        reason: GapRecoveryReason::AdmissionUnavailable,
+                        coverage_claimed: false,
+                    }
+                )
+                .expect("append leading gap"),
             SpoolAppendOutcome::Stored
         ));
         let proof = test_proof();
         let observed_problem = 1_000;
         let problem = ProblemIntentRecord::new(
-            proof, SERVICE_NAME.to_owned(), vec![evidence_ref(0x0c), evidence_ref(0x0d)],
-            test_lineage(), observed_problem,
-        ).expect("problem intent");
+            proof,
+            SERVICE_NAME.to_owned(),
+            vec![evidence_ref(0x0c), evidence_ref(0x0d)],
+            test_lineage(),
+            observed_problem,
+        )
+        .expect("problem intent");
         assert!(matches!(
-            spool.append(observed_problem, problem.to_payload()).expect("append problem intent"),
+            spool
+                .append(observed_problem, problem.to_payload())
+                .expect("append problem intent"),
             SpoolAppendOutcome::Stored
         ));
         let observed_incident = 2_000;
         let incident = IncidentIntentRecord::new(
-            proof, SERVICE_NAME.to_owned(), vec![evidence_ref(0x0e)], test_lineage(), observed_incident,
-        ).expect("incident intent");
+            proof,
+            SERVICE_NAME.to_owned(),
+            vec![evidence_ref(0x0e)],
+            test_lineage(),
+            observed_incident,
+        )
+        .expect("incident intent");
         assert!(matches!(
-            spool.append(observed_incident, incident.to_payload()).expect("append incident intent"),
+            spool
+                .append(observed_incident, incident.to_payload())
+                .expect("append incident intent"),
             SpoolAppendOutcome::Stored
         ));
         let entries = spool.readback().expect("intent readback");
         assert_eq!(entries.len(), 3);
-        assert!(matches!(&entries[0].payload, WatchdogSpoolPayload::Gap { .. }));
-        assert!(matches!(&entries[1].payload, WatchdogSpoolPayload::ProblemIntent {
+        assert!(matches!(
+            &entries[0].payload,
+            WatchdogSpoolPayload::Gap { .. }
+        ));
+        assert!(
+            matches!(&entries[1].payload, WatchdogSpoolPayload::ProblemIntent {
             evidence_refs, lineage_installation_id, lineage_generation, lineage_epoch,
             governor_unavailable_reason, ..
         } if evidence_refs.len() == 2 && lineage_installation_id == "installation-test"
             && *lineage_generation == 7 && *lineage_epoch == 3
-            && *governor_unavailable_reason == GapRecoveryReason::LeaseInvalid));
+            && *governor_unavailable_reason == GapRecoveryReason::LeaseInvalid)
+        );
         assert_eq!(entries[1].observed_at_ms, observed_problem);
-        assert!(matches!(&entries[2].payload, WatchdogSpoolPayload::IncidentIntent { .. }));
+        assert!(matches!(
+            &entries[2].payload,
+            WatchdogSpoolPayload::IncidentIntent { .. }
+        ));
         assert_eq!(entries[2].observed_at_ms, observed_incident);
         // The export window stops before the first intent: only the leading
         // gap ships, and no Recovery-disposition path can touch an intent
         // before Governor reconciliation.
         let predecessor = WatchdogSpoolCursor {
-            schema_version: 1, acknowledged_sequence: 0, watchdog_generation: 7,
-            watchdog_epoch: 3, installation_id: "installation-test".to_owned(),
+            schema_version: 1,
+            acknowledged_sequence: 0,
+            watchdog_generation: 7,
+            watchdog_epoch: 3,
+            installation_id: "installation-test".to_owned(),
             sink_id: "sink-test".to_owned(),
         };
         let high_water = spool.high_water_sequence().expect("intent high-water");
         assert_eq!(high_water, 3);
-        let (batch, raws) = spool.export_batch(&predecessor, high_water, WatchdogSpoolExportLimits::default())
+        let (batch, raws) = spool
+            .export_batch(
+                &predecessor,
+                high_water,
+                WatchdogSpoolExportLimits::default(),
+            )
             .expect("export stops before intents");
         assert_eq!(batch.entries.len(), 1);
         assert_eq!(batch.first_sequence, 1);
@@ -558,24 +594,42 @@ mod tests {
     #[test]
     fn intent_head_parks_export_with_empty_batch() {
         let dir = temp_root("intent-parked");
-        let spool = WatchdogSpool::open_test(&dir.join("watchdog.redb")).expect("open parked spool");
+        let spool =
+            WatchdogSpool::open_test(&dir.join("watchdog.redb")).expect("open parked spool");
         let problem = ProblemIntentRecord::new(
-            test_proof(), SERVICE_NAME.to_owned(), vec![evidence_ref(0x0c)], test_lineage(), 1_000,
-        ).expect("parked problem intent");
+            test_proof(),
+            SERVICE_NAME.to_owned(),
+            vec![evidence_ref(0x0c)],
+            test_lineage(),
+            1_000,
+        )
+        .expect("parked problem intent");
         assert!(matches!(
-            spool.append(1_000, problem.to_payload()).expect("append parked problem intent"),
+            spool
+                .append(1_000, problem.to_payload())
+                .expect("append parked problem intent"),
             SpoolAppendOutcome::Stored
         ));
         let incident = IncidentIntentRecord::new(
-            test_proof(), SERVICE_NAME.to_owned(), vec![evidence_ref(0x0d)], test_lineage(), 2_000,
-        ).expect("parked incident intent");
+            test_proof(),
+            SERVICE_NAME.to_owned(),
+            vec![evidence_ref(0x0d)],
+            test_lineage(),
+            2_000,
+        )
+        .expect("parked incident intent");
         assert!(matches!(
-            spool.append(2_000, incident.to_payload()).expect("append parked incident intent"),
+            spool
+                .append(2_000, incident.to_payload())
+                .expect("append parked incident intent"),
             SpoolAppendOutcome::Stored
         ));
         let predecessor = WatchdogSpoolCursor {
-            schema_version: 1, acknowledged_sequence: 0, watchdog_generation: 7,
-            watchdog_epoch: 3, installation_id: "installation-test".to_owned(),
+            schema_version: 1,
+            acknowledged_sequence: 0,
+            watchdog_generation: 7,
+            watchdog_epoch: 3,
+            installation_id: "installation-test".to_owned(),
             sink_id: "sink-test".to_owned(),
         };
         let high_water = spool.high_water_sequence().expect("parked high-water");
@@ -583,7 +637,12 @@ mod tests {
         // Head of the window is an intent: no batch can form, so the spool
         // owner returns the parked empty batch and the sink is never
         // submitted to (`export_once` short-circuits on `is_empty_batch`).
-        let (batch, raws) = spool.export_batch(&predecessor, high_water, WatchdogSpoolExportLimits::default())
+        let (batch, raws) = spool
+            .export_batch(
+                &predecessor,
+                high_water,
+                WatchdogSpoolExportLimits::default(),
+            )
             .expect("parked export");
         assert!(batch.is_empty_batch);
         assert!(batch.entries.is_empty());
@@ -602,15 +661,27 @@ mod tests {
     fn governor_unavailability_binds_to_observed_admission_failure() {
         // Only exact lease rejections mint, each with its own reason.
         assert_eq!(
-            GovernorUnavailability::from_admission_error(&SpoolError::InvalidLease("test-lease".to_owned())).expect("admission invalid-lease proof").reason(),
+            GovernorUnavailability::from_admission_error(&SpoolError::InvalidLease(
+                "test-lease".to_owned()
+            ))
+            .expect("admission invalid-lease proof")
+            .reason(),
             GapRecoveryReason::LeaseInvalid
         );
         assert_eq!(
-            GovernorUnavailability::from_admission_error(&SpoolError::LeaseStale("test-stale".to_owned())).expect("admission stale proof").reason(),
+            GovernorUnavailability::from_admission_error(&SpoolError::LeaseStale(
+                "test-stale".to_owned()
+            ))
+            .expect("admission stale proof")
+            .reason(),
             GapRecoveryReason::LeaseStale
         );
         assert_eq!(
-            GovernorUnavailability::from_admission_error(&SpoolError::LeaseFenced("test-fenced".to_owned())).expect("admission fenced proof").reason(),
+            GovernorUnavailability::from_admission_error(&SpoolError::LeaseFenced(
+                "test-fenced".to_owned()
+            ))
+            .expect("admission fenced proof")
+            .reason(),
             GapRecoveryReason::LeaseFenced
         );
         // Any other spool error fails closed: it is not an observed
@@ -629,15 +700,21 @@ mod tests {
         }
         // Only exact kernel lease rejections mint, each with its own reason.
         assert_eq!(
-            GovernorUnavailability::from_kernel_error(&KernelWatchdogError::LeaseInvalid).expect("kernel invalid-lease proof").reason(),
+            GovernorUnavailability::from_kernel_error(&KernelWatchdogError::LeaseInvalid)
+                .expect("kernel invalid-lease proof")
+                .reason(),
             GapRecoveryReason::LeaseInvalid
         );
         assert_eq!(
-            GovernorUnavailability::from_kernel_error(&KernelWatchdogError::LeaseStale).expect("kernel stale proof").reason(),
+            GovernorUnavailability::from_kernel_error(&KernelWatchdogError::LeaseStale)
+                .expect("kernel stale proof")
+                .reason(),
             GapRecoveryReason::LeaseStale
         );
         assert_eq!(
-            GovernorUnavailability::from_kernel_error(&KernelWatchdogError::LeaseFenced).expect("kernel fenced proof").reason(),
+            GovernorUnavailability::from_kernel_error(&KernelWatchdogError::LeaseFenced)
+                .expect("kernel fenced proof")
+                .reason(),
             GapRecoveryReason::LeaseFenced
         );
         // Endpoint-unavailable, generic and detailed failures, and retention
@@ -672,7 +749,10 @@ mod tests {
                 lineage_epoch: 3,
                 governor_unavailable_reason: reason,
             };
-            assert!(check_stored_intent_payload(1_000, &forged).is_err(), "forged intent reason must fail: {reason:?}");
+            assert!(
+                check_stored_intent_payload(1_000, &forged).is_err(),
+                "forged intent reason must fail: {reason:?}"
+            );
         }
     }
 
@@ -689,19 +769,35 @@ mod tests {
         assert_ne!(spool_path, journal_path);
         let spool = WatchdogSpool::open_test(&spool_path).expect("open isolated spool");
         let intent = ProblemIntentRecord::new(
-            test_proof(), SERVICE_NAME.to_owned(), vec![evidence_ref(0x1c)], test_lineage(), 3_000,
-        ).expect("isolated intent");
+            test_proof(),
+            SERVICE_NAME.to_owned(),
+            vec![evidence_ref(0x1c)],
+            test_lineage(),
+            3_000,
+        )
+        .expect("isolated intent");
         assert!(matches!(
-            spool.append(3_000, intent.to_payload()).expect("append isolated intent"),
+            spool
+                .append(3_000, intent.to_payload())
+                .expect("append isolated intent"),
             SpoolAppendOutcome::Stored
         ));
         drop(spool);
-        assert_eq!(std::fs::read(&kernel_path).expect("kernel reread"), b"kernel-sentinel");
-        assert_eq!(std::fs::read(&journal_path).expect("journal reread"), b"journal-sentinel");
+        assert_eq!(
+            std::fs::read(&kernel_path).expect("kernel reread"),
+            b"kernel-sentinel"
+        );
+        assert_eq!(
+            std::fs::read(&journal_path).expect("journal reread"),
+            b"journal-sentinel"
+        );
         let probe = WatchdogSpool::open_test(&spool_path).expect("reopen isolated spool");
         let entries = probe.readback().expect("isolated readback");
         assert_eq!(entries.len(), 1);
-        assert!(matches!(entries[0].payload, WatchdogSpoolPayload::ProblemIntent { .. }));
+        assert!(matches!(
+            entries[0].payload,
+            WatchdogSpoolPayload::ProblemIntent { .. }
+        ));
         drop(probe);
         let _ = std::fs::remove_dir_all(&dir);
     }

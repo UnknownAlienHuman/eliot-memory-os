@@ -1,8 +1,8 @@
 use eliot_engine::{CueIndexService, ObservedCue};
 use eliot_store::CanonicalStore;
 use eliot_types::{
-    CognitiveProjectionReadState, CredentialProviderKind, CueIndexRow, LegacyCueKindV1, CueMatchMode,
-    CueStrength, GovernorConfig, MemoryRevision, ProjectId, cue_row_id, ul_token_estimate,
+    CognitiveProjectionReadState, CredentialProviderKind, CueIndexRow, CueMatchMode, CueStrength,
+    GovernorConfig, LegacyCueKindV1, MemoryRevision, ProjectId, cue_row_id, ul_token_estimate,
 };
 use std::fs;
 use std::path::{Path, PathBuf};

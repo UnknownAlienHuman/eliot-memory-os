@@ -134,31 +134,32 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub use eliot_experience_projection::ExperienceView;
 
-use eliot_contracts::{ArtifactId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_cognitive_quality::{
     ExperienceProjections, OwnerSnapshot, QualityAssessmentCandidate, QualityError,
     assess_self_quality, recheck_candidate,
 };
+use eliot_contracts::{ArtifactId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_epistemic_contracts::CurrentEpistemicPosition;
 use eliot_experience_projection::{revalidate_bank_refs, revalidate_feedback_refs};
 use eliot_learning_contracts::HarnessActivationReceiptCandidate;
-use eliot_memory_quality::{MemoryEcologyAssessment, QualityRequest, assess_quality};
 use eliot_memory_quality::QualityError as MemoryQualityError;
-use eliot_understanding_assessment::{
-    CommonGroundAssessment, CommonGroundInput, ScopedInput, ScopedUnderstandingAssessment,
-    assess_common_ground, assess_scoped,
-};
-use eliot_understanding_assessment::AssessmentError as UnderstandingError;
+use eliot_memory_quality::{MemoryEcologyAssessment, QualityRequest, assess_quality};
 use eliot_observation_contracts::{
-    AgentFeedbackRecord, BankProjection, CoverageDisposition, CoverageEvidence, ExperienceBankRecord,
-    ExperienceRetentionReadPosture, ExperienceSourceFamily, FeedbackProjection, JournalProjection,
-    ObservationError, ObservationRecordEnvelope, ObservationScope, ProjectionCoverage,
-    RetentionHold, RetentionSchedule, bank_record_ref, feedback_record_ref, resolve_retention_read,
+    AgentFeedbackRecord, BankProjection, CoverageDisposition, CoverageEvidence,
+    ExperienceBankRecord, ExperienceRetentionReadPosture, ExperienceSourceFamily,
+    FeedbackProjection, JournalProjection, ObservationError, ObservationRecordEnvelope,
+    ObservationScope, ProjectionCoverage, RetentionHold, RetentionSchedule, bank_record_ref,
+    feedback_record_ref, resolve_retention_read,
 };
 use eliot_receipts::WorkScopeId;
 use eliot_store_api::{
     CanonicalReadClient, NamedReadOperation, NamedReadRequest, NamedReadResponse, ReadConsistency,
     RevisionHead, RevisionKey, StoreError,
+};
+use eliot_understanding_assessment::AssessmentError as UnderstandingError;
+use eliot_understanding_assessment::{
+    CommonGroundAssessment, CommonGroundInput, ScopedInput, ScopedUnderstandingAssessment,
+    assess_common_ground, assess_scoped,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -341,11 +342,12 @@ pub fn shape_journal_read(
             reason: "shaping starts from an audit-range read only",
         });
     }
-    inputs
+    inputs.response.validate().map_err(ProviderError::Bridge)?;
+    if !inputs
         .response
-        .validate()
-        .map_err(ProviderError::Bridge)?;
-    if !inputs.response.state_fence.is_compatible_with(&inputs.fence) {
+        .state_fence
+        .is_compatible_with(&inputs.fence)
+    {
         return Err(ProviderError::Response {
             field: "response.state_fence",
             reason: "bridge fence is not compatible with the read fence",
@@ -387,11 +389,10 @@ pub fn shape_journal_read(
     // output for later re-proof.
     let mut canonical_heads = inputs.response.revision_heads.clone();
     canonical_heads.sort_by(|left, right| left.key.cmp(&right.key));
-    let payload: AuditRangeV1Payload =
-        serde_json::from_value(inputs.response.payload.clone())
-            .map_err(|error| ProviderError::Payload {
-                reason: error.to_string(),
-            })?;
+    let payload: AuditRangeV1Payload = serde_json::from_value(inputs.response.payload.clone())
+        .map_err(|error| ProviderError::Payload {
+            reason: error.to_string(),
+        })?;
     let mut carried: Vec<ObservationRecordEnvelope> = Vec::new();
     for record in &payload.records {
         record.validate()?;
@@ -401,7 +402,10 @@ pub fn shape_journal_read(
         }
     }
     for record in &carried {
-        if !inputs.admitted_record_ids.contains(record.record_id.as_str()) {
+        if !inputs
+            .admitted_record_ids
+            .contains(record.record_id.as_str())
+        {
             return Err(ProviderError::PresenceDrift);
         }
     }
@@ -418,8 +422,7 @@ pub fn shape_journal_read(
     } else {
         CoverageDisposition::Partial
     };
-    let denominator_source_ref =
-        format!("store-audit:GetAuditRange:{heads_digest}");
+    let denominator_source_ref = format!("store-audit:GetAuditRange:{heads_digest}");
     let evidence = CoverageEvidence {
         disposition,
         denominator_source_ref: denominator_source_ref.clone(),
@@ -604,10 +607,7 @@ fn resolve_bank_member(
         &record.fence,
         retention.holds.get(record.handle.as_str()),
     )?;
-    if !matches!(
-        posture,
-        ExperienceRetentionReadPosture::Readable { .. }
-    ) {
+    if !matches!(posture, ExperienceRetentionReadPosture::Readable { .. }) {
         return Ok(Err(WithheldMember {
             handle: record.handle.clone(),
             posture,
@@ -638,9 +638,7 @@ fn resolve_bank_member(
 /// [`revalidate_bank_refs`] against the live owner envelope: every
 /// carried ref must still resolve with identical revision cursor, scope,
 /// and fence, or live advancement fails the read closed.
-pub fn shape_bank_view(
-    inputs: &BankShapeInputs<'_>,
-) -> Result<BankShapeOutput, ProviderError> {
+pub fn shape_bank_view(inputs: &BankShapeInputs<'_>) -> Result<BankShapeOutput, ProviderError> {
     let mut refs = Vec::new();
     let mut withheld = Vec::new();
     for record in inputs.records {
@@ -741,10 +739,7 @@ fn resolve_feedback_member(
         &record.fence,
         retention.holds.get(record.handle.as_str()),
     )?;
-    if !matches!(
-        posture,
-        ExperienceRetentionReadPosture::Readable { .. }
-    ) {
+    if !matches!(posture, ExperienceRetentionReadPosture::Readable { .. }) {
         return Ok(Err(WithheldMember {
             handle: record.handle.clone(),
             posture,

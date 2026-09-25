@@ -292,10 +292,7 @@ impl VersionedArtifactRetirement {
         }
         validate_digest(&self.artifact_hash, "artifact_retirement_hash")?;
         validate_text(&self.artifact_path, "artifact_retirement_path")?;
-        validate_digest(
-            &self.cutover_record_sha256,
-            "artifact_retirement_cutover",
-        )?;
+        validate_digest(&self.cutover_record_sha256, "artifact_retirement_cutover")?;
         if !self.drained {
             return Err(OrsError::VersionedArtifactNotDrained);
         }
@@ -800,10 +797,7 @@ mod tests {
         );
     }
 
-    fn two_generation_registry() -> (
-        VersionedArtifactRegistry,
-        VersionedArtifactCutoverRecord,
-    ) {
+    fn two_generation_registry() -> (VersionedArtifactRegistry, VersionedArtifactCutoverRecord) {
         let hash_gen1 = "aa".repeat(32);
         let hash_gen2 = "bb".repeat(32);
         let mut registry = VersionedArtifactRegistry::new();
@@ -837,9 +831,7 @@ mod tests {
         let retirement = registry
             .retire_with_receipt("mod-sweeper", 1, &cutover)
             .expect("retire drained with receipt");
-        retirement
-            .validate()
-            .expect("retirement handoff validates");
+        retirement.validate().expect("retirement handoff validates");
         assert_eq!(retirement.generation, 1);
         assert_eq!(retirement.artifact_hash, "aa".repeat(32));
         assert_eq!(retirement.cutover_record_sha256, cutover.record_sha256);
@@ -879,16 +871,20 @@ mod tests {
                 .expect("activate gen2");
             (other, cutover)
         })();
-        assert!(registry
-            .retire_with_receipt("mod-sweeper", 1, &foreign_cutover)
-            .is_err());
+        assert!(
+            registry
+                .retire_with_receipt("mod-sweeper", 1, &foreign_cutover)
+                .is_err()
+        );
         assert!(registry.retained_state("mod-sweeper", 1).is_some());
         // Retiring the active generation itself is rejected (no cutover can
         // name an active generation as demoted) and the active entry survives.
         let (_, own_cutover) = two_generation_registry();
-        assert!(registry
-            .retire_with_receipt("mod-sweeper", 2, &own_cutover)
-            .is_err());
+        assert!(
+            registry
+                .retire_with_receipt("mod-sweeper", 2, &own_cutover)
+                .is_err()
+        );
         assert_eq!(
             registry
                 .active_status("mod-sweeper")

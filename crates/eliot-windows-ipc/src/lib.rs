@@ -35,8 +35,8 @@ use windows_sys::Win32::Security::Credentials::{
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce,
     GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
@@ -66,13 +66,12 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Pipes::{CreatePipe, GetNamedPipeClientProcessId};
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW,
-    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
-    GetCurrentProcess,
-    GetProcessTimes, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, OpenProcessToken,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SET_QUOTA, PROCESS_TERMINATE, QueryFullProcessImageNameW, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    GetExitCodeProcess, GetProcessTimes, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    QueryFullProcessImageNameW, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 const MAX_PROCESS_IMAGE_CHARS: usize = 32_768;
@@ -458,9 +457,8 @@ pub fn current_process_token_sid() -> io::Result<String> {
     // The query writes a TOKEN_USER (8-byte aligned), so the buffer is
     // 8-byte aligned u64 storage sized up from the reported byte count.
     let mut buffer = vec![0u64; (needed as usize).div_ceil(std::mem::size_of::<u64>())];
-    let capacity = u32::try_from(buffer.len() * std::mem::size_of::<u64>()).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidData, "process token size is invalid")
-    })?;
+    let capacity = u32::try_from(buffer.len() * std::mem::size_of::<u64>())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "process token size is invalid"))?;
     // SAFETY: the buffer is live for `capacity` bytes; the length
     // out-pointer is live for the call.
     if unsafe {
@@ -4012,8 +4010,8 @@ mod heartbeat_transport_file_tests {
     #[test]
     fn creation_ticks_name_the_calling_process() {
         let pid = std::process::id();
-        let by_pid = process_creation_ticks(pid)
-            .unwrap_or_else(|_| panic!("own creation ticks must query"));
+        let by_pid =
+            process_creation_ticks(pid).unwrap_or_else(|_| panic!("own creation ticks must query"));
         let current = current_process_creation_ticks()
             .unwrap_or_else(|_| panic!("current creation ticks must query"));
         assert_eq!(by_pid, current);
@@ -4032,8 +4030,7 @@ mod heartbeat_transport_file_tests {
         );
         restrict_file_to_current_user_and_system(&path)
             .unwrap_or_else(|_| panic!("restrict must succeed"));
-        verify_file_owner_and_dacl(&path)
-            .unwrap_or_else(|_| panic!("restricted file must verify"));
+        verify_file_owner_and_dacl(&path).unwrap_or_else(|_| panic!("restricted file must verify"));
         restrict_file_to_current_user_and_system(&path)
             .unwrap_or_else(|_| panic!("restrict must be idempotent"));
         verify_file_owner_and_dacl(&path)
@@ -4047,9 +4044,8 @@ mod heartbeat_transport_file_tests {
         // LocalSystem: owner SY plus two SY allow ACEs (the SDDL template
         // grants SY twice when the token user IS System). The verifier must
         // accept it: the System grant proves both peer halves at once.
-        let descriptor =
-            SecurityDescriptor::from_sddl("O:SYD:P(A;;GA;;;SY)(A;;GA;;;SY)")
-                .unwrap_or_else(|_| panic!("system contour descriptor must build"));
+        let descriptor = SecurityDescriptor::from_sddl("O:SYD:P(A;;GA;;;SY)(A;;GA;;;SY)")
+            .unwrap_or_else(|_| panic!("system contour descriptor must build"));
         let mut present = 0;
         let mut acl: *mut ACL = std::ptr::null_mut();
         let mut defaulted = 0;

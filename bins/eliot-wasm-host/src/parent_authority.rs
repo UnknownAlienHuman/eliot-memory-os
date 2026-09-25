@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use eliot_contracts::{sha256_hex, EpochId};
+use eliot_contracts::{EpochId, sha256_hex};
 use eliot_platform::ClockObservation;
 use eliot_process::{
     ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,

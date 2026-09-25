@@ -208,9 +208,11 @@ impl AcceptedSourceProjection {
         revision: &str,
         digest: &str,
     ) -> Result<(), SelfQueryContractError> {
-        let projected = self.find_source(handle).ok_or(SelfQueryContractError::BindingMismatch {
-            field: "cited.source_handle",
-        })?;
+        let projected =
+            self.find_source(handle)
+                .ok_or(SelfQueryContractError::BindingMismatch {
+                    field: "cited.source_handle",
+                })?;
         if projected.revision != revision || projected.digest != digest {
             return Err(SelfQueryContractError::BindingMismatch {
                 field: "cited.source_lineage",

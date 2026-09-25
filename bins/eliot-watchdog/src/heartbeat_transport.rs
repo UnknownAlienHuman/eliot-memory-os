@@ -410,7 +410,9 @@ impl HeartbeatTransport {
                     ));
                 }
             }
-            let path = self.host_state_root.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME);
+            let path = self
+                .host_state_root
+                .join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME);
             let bytes = match std::fs::read(&path) {
                 Ok(bytes) => bytes,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -419,7 +421,9 @@ impl HeartbeatTransport {
                     ));
                 }
                 Err(error) => {
-                    return Err(HeartbeatTransportError::InvalidDescriptor(error.to_string()));
+                    return Err(HeartbeatTransportError::InvalidDescriptor(
+                        error.to_string(),
+                    ));
                 }
             };
             if bytes.len() as u64 > DESCRIPTOR_FILE_LIMIT {
@@ -427,8 +431,11 @@ impl HeartbeatTransport {
                     "heartbeat descriptor exceeds its bounded size".to_owned(),
                 ));
             }
-            let descriptor =
-                parse_descriptor(&bytes, &self.installation_id, self.transaction_plan_generation)?;
+            let descriptor = parse_descriptor(
+                &bytes,
+                &self.installation_id,
+                self.transaction_plan_generation,
+            )?;
             // Incarnation self-check at arm time: a bound rendezvous names
             // exactly one verified process. A writer that is not that
             // process (stale incarnation after a rotation, or a substituted
@@ -480,7 +487,9 @@ impl HeartbeatTransport {
     /// Host never sees one sequence chain span two bindings.
     #[cfg(windows)]
     fn refresh_binding(&self) -> Result<(), HeartbeatTransportError> {
-        let path = self.host_state_root.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME);
+        let path = self
+            .host_state_root
+            .join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME);
         let Ok(bytes) = std::fs::read(&path) else {
             return Ok(());
         };
@@ -619,62 +628,65 @@ impl HeartbeatTransport {
         self.refresh_binding()?;
         let (pipe_name, guid, nonce, incarnation_pid, incarnation_start, sequence) =
             match self.state.lock() {
-            Ok(state) => match state.as_ref() {
-                Some(armed) => {
-                    // The emitted sequence is bound to the verified SCM
-                    // incarnation: an unbound rendezvous (the Host has not
-                    // completed the post-start bind) or a binding naming
-                    // another process emits no admitted state. Admitted
-                    // emissions additionally happen only after the Kernel
-                    // port accepted the heartbeat (caller gate in the
-                    // composition tick).
-                    #[cfg(windows)]
-                    {
-                        if !armed.descriptor.is_bound()
-                            || !Self::self_incarnation_matches(&armed.descriptor)
+                Ok(state) => match state.as_ref() {
+                    Some(armed) => {
+                        // The emitted sequence is bound to the verified SCM
+                        // incarnation: an unbound rendezvous (the Host has not
+                        // completed the post-start bind) or a binding naming
+                        // another process emits no admitted state. Admitted
+                        // emissions additionally happen only after the Kernel
+                        // port accepted the heartbeat (caller gate in the
+                        // composition tick).
+                        #[cfg(windows)]
                         {
-                            return Err(HeartbeatTransportError::Emit(
-                                "heartbeat transport is not bound to this watchdog incarnation"
-                                    .to_owned(),
-                            ));
+                            if !armed.descriptor.is_bound()
+                                || !Self::self_incarnation_matches(&armed.descriptor)
+                            {
+                                return Err(HeartbeatTransportError::Emit(
+                                    "heartbeat transport is not bound to this watchdog incarnation"
+                                        .to_owned(),
+                                ));
+                            }
+                        }
+                        if armed
+                            .last_emit
+                            .is_some_and(|at| at.elapsed() < self.tick_interval)
+                        {
+                            tracing::debug!(
+                                event = "watchdog.heartbeat.cadence_guarded",
+                                observation = "attempted",
+                                "admitted heartbeat inside the tick cadence guard; sequence held"
+                            );
+                            return Ok(armed.sequence);
+                        }
+                        match armed.sequence.checked_add(1) {
+                            Some(next) => (
+                                armed.descriptor.pipe_name.clone(),
+                                armed.descriptor.service_instance_guid.clone(),
+                                armed.descriptor.host_challenge_nonce.clone(),
+                                armed.descriptor.watchdog_incarnation_pid,
+                                armed.descriptor.watchdog_incarnation_start_100ns,
+                                next,
+                            ),
+                            None => {
+                                return Err(HeartbeatTransportError::Emit(
+                                    "heartbeat sequence exhausted".to_owned(),
+                                ));
+                            }
                         }
                     }
-                    if armed.last_emit.is_some_and(|at| at.elapsed() < self.tick_interval) {
-                        tracing::debug!(
-                            event = "watchdog.heartbeat.cadence_guarded",
-                            observation = "attempted",
-                            "admitted heartbeat inside the tick cadence guard; sequence held"
-                        );
-                        return Ok(armed.sequence);
+                    None => {
+                        return Err(HeartbeatTransportError::Unavailable(
+                            "heartbeat transport disarmed after arming".to_owned(),
+                        ));
                     }
-                    match armed.sequence.checked_add(1) {
-                        Some(next) => (
-                            armed.descriptor.pipe_name.clone(),
-                            armed.descriptor.service_instance_guid.clone(),
-                            armed.descriptor.host_challenge_nonce.clone(),
-                            armed.descriptor.watchdog_incarnation_pid,
-                            armed.descriptor.watchdog_incarnation_start_100ns,
-                            next,
-                        ),
-                        None => {
-                            return Err(HeartbeatTransportError::Emit(
-                                "heartbeat sequence exhausted".to_owned(),
-                            ));
-                        }
-                    }
-                }
-                None => {
-                    return Err(HeartbeatTransportError::Unavailable(
-                        "heartbeat transport disarmed after arming".to_owned(),
+                },
+                Err(_) => {
+                    return Err(HeartbeatTransportError::Emit(
+                        "heartbeat state is poisoned".to_owned(),
                     ));
                 }
-            },
-            Err(_) => {
-                return Err(HeartbeatTransportError::Emit(
-                    "heartbeat state is poisoned".to_owned(),
-                ));
-            }
-        };
+            };
         let message = HeartbeatWireMessage {
             service: SERVICE_NAME,
             protocol: PROTOCOL_VERSION,
@@ -825,12 +837,7 @@ mod tests {
             fixture_bytes(&fixture),
         )
         .unwrap_or_else(|_| panic!("fixture descriptor must write"));
-        HeartbeatTransport::for_bootstrap(
-            dir,
-            &fixture.installation_id,
-            fixture.generation,
-            tick,
-        )
+        HeartbeatTransport::for_bootstrap(dir, &fixture.installation_id, fixture.generation, tick)
     }
 
     fn self_incarnation() -> (u32, u64) {
@@ -891,12 +898,15 @@ mod tests {
     fn descriptor_rejects_each_fault() {
         let fixture = fixture();
         let good = fixture_bytes(&fixture);
-        let value: serde_json::Value = serde_json::from_slice(&good)
-            .unwrap_or_else(|_| panic!("fixture must be JSON"));
+        let value: serde_json::Value =
+            serde_json::from_slice(&good).unwrap_or_else(|_| panic!("fixture must be JSON"));
         let faults = [
             ("schema", "eliot.wrong.v9".to_owned()),
             ("pipe_name", "relative-pipe".to_owned()),
-            ("pipe_name", format!("{WATCHDOG_HEARTBEAT_PIPE_PREFIX}../escape")),
+            (
+                "pipe_name",
+                format!("{WATCHDOG_HEARTBEAT_PIPE_PREFIX}../escape"),
+            ),
             ("host_challenge_nonce", "ab".repeat(31)),
             ("host_challenge_nonce", "AB".repeat(32)),
             ("service_instance_guid", "cd".repeat(15)),
@@ -920,8 +930,8 @@ mod tests {
         let good = fixture_bytes(&fixture);
         assert!(parse_descriptor(&good, "other-installation", fixture.generation).is_err());
         assert!(parse_descriptor(&good, &fixture.installation_id, fixture.generation + 1).is_err());
-        let mut value: serde_json::Value = serde_json::from_slice(&good)
-            .unwrap_or_else(|_| panic!("fixture must be JSON"));
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&good).unwrap_or_else(|_| panic!("fixture must be JSON"));
         value["descriptor_digest"] = serde_json::Value::String("0".repeat(64));
         let bytes =
             serde_json::to_vec(&value).unwrap_or_else(|_| panic!("mutated fixture must encode"));
@@ -961,8 +971,16 @@ mod tests {
             .enable_all()
             .build()
             .unwrap_or_else(|_| panic!("test runtime must build"));
-        assert!(runtime.block_on(transport.emit_admitted(0, 11, 2000)).is_err());
-        assert!(runtime.block_on(transport.emit_admitted(7, 0, 2000)).is_err());
+        assert!(
+            runtime
+                .block_on(transport.emit_admitted(0, 11, 2000))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .block_on(transport.emit_admitted(7, 0, 2000))
+                .is_err()
+        );
         assert_eq!(transport.last_sequence(), FENCE_SEQUENCE);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -971,20 +989,20 @@ mod tests {
     #[test]
     fn non_windows_reports_disarmed_and_unavailable() {
         let dir = test_dir();
-        let loaded = HeartbeatTransport::load(
-            &dir,
-            "test-installation-1750",
-            7,
-            Duration::from_secs(2),
-        )
-        .unwrap_or_else(|_| panic!("containment load must succeed"));
+        let loaded =
+            HeartbeatTransport::load(&dir, "test-installation-1750", 7, Duration::from_secs(2))
+                .unwrap_or_else(|_| panic!("containment load must succeed"));
         assert!(loaded.is_none());
         let transport = armed_transport(&dir, Duration::from_secs(2));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap_or_else(|_| panic!("test runtime must build"));
-        assert!(runtime.block_on(transport.emit_admitted(7, 11, 2000)).is_err());
+        assert!(
+            runtime
+                .block_on(transport.emit_admitted(7, 11, 2000))
+                .is_err()
+        );
         assert_eq!(transport.last_sequence(), FENCE_SEQUENCE);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1053,19 +1071,40 @@ mod tests {
             1
         );
         let message = read_message_line(&mut server).await;
-        assert_eq!(message["service"], serde_json::Value::String("EliotWatchdog".to_owned()));
+        assert_eq!(
+            message["service"],
+            serde_json::Value::String("EliotWatchdog".to_owned())
+        );
         assert_eq!(
             message["protocol"],
             serde_json::Value::String("eliot.watchdog.v1".to_owned())
         );
-        assert_eq!(message["authority_state"], serde_json::Value::String("ADMITTED_HEARTBEAT".to_owned()));
+        assert_eq!(
+            message["authority_state"],
+            serde_json::Value::String("ADMITTED_HEARTBEAT".to_owned())
+        );
         assert_eq!(message["coverage_claimed"], serde_json::Value::Bool(true));
         assert_eq!(message["kernel_epoch"], serde_json::Value::Number(7.into()));
-        assert_eq!(message["watchdog_epoch"], serde_json::Value::Number(11.into()));
-        assert_eq!(message["tick_interval_ms"], serde_json::Value::Number(2000.into()));
-        assert_eq!(message["service_instance_guid"], serde_json::Value::String("ef".repeat(16)));
-        assert_eq!(message["host_challenge_nonce"], serde_json::Value::String("12".repeat(32)));
-        assert_eq!(message["watchdog_readiness_sequence"], serde_json::Value::Number(1.into()));
+        assert_eq!(
+            message["watchdog_epoch"],
+            serde_json::Value::Number(11.into())
+        );
+        assert_eq!(
+            message["tick_interval_ms"],
+            serde_json::Value::Number(2000.into())
+        );
+        assert_eq!(
+            message["service_instance_guid"],
+            serde_json::Value::String("ef".repeat(16))
+        );
+        assert_eq!(
+            message["host_challenge_nonce"],
+            serde_json::Value::String("12".repeat(32))
+        );
+        assert_eq!(
+            message["watchdog_readiness_sequence"],
+            serde_json::Value::Number(1.into())
+        );
         let (pid, start) = self_incarnation();
         assert_eq!(
             message["watchdog_incarnation_pid"],
@@ -1102,14 +1141,25 @@ mod tests {
             .first_pipe_instance(true)
             .create(&fence_pipe)
             .unwrap_or_else(|_| panic!("loopback server must bind"));
-        let (connected, ()) =
-            tokio::join!(server.connect(), fence_transport.emit_fence(&fence));
+        let (connected, ()) = tokio::join!(server.connect(), fence_transport.emit_fence(&fence));
         connected.unwrap_or_else(|_| panic!("loopback fence must connect"));
         let message = read_message_line(&mut server).await;
-        assert_eq!(message["watchdog_readiness_sequence"], serde_json::Value::Number(0.into()));
-        assert_eq!(message["authority_state"], serde_json::Value::String("RUNNING_NO_AUTHORITY".to_owned()));
-        assert_eq!(message["service_instance_guid"], serde_json::Value::String("ef".repeat(16)));
-        assert_eq!(message["host_challenge_nonce"], serde_json::Value::String("12".repeat(32)));
+        assert_eq!(
+            message["watchdog_readiness_sequence"],
+            serde_json::Value::Number(0.into())
+        );
+        assert_eq!(
+            message["authority_state"],
+            serde_json::Value::String("RUNNING_NO_AUTHORITY".to_owned())
+        );
+        assert_eq!(
+            message["service_instance_guid"],
+            serde_json::Value::String("ef".repeat(16))
+        );
+        assert_eq!(
+            message["host_challenge_nonce"],
+            serde_json::Value::String("12".repeat(32))
+        );
         assert_eq!(fence_transport.last_sequence(), FENCE_SEQUENCE);
         drop(server);
         let admitted = WatchdogReadiness {
@@ -1130,16 +1180,16 @@ mod tests {
             .first_pipe_instance(true)
             .create(&skip_pipe)
             .unwrap_or_else(|_| panic!("loopback server must bind"));
-        let skipped = tokio::time::timeout(
-            Duration::from_millis(300),
-            async {
-                let (connected, ()) =
-                    tokio::join!(guard_server.connect(), skip_transport.emit_fence(&admitted));
-                connected.unwrap_or_else(|_| panic!("no client may connect during a fence skip"));
-            },
-        )
+        let skipped = tokio::time::timeout(Duration::from_millis(300), async {
+            let (connected, ()) =
+                tokio::join!(guard_server.connect(), skip_transport.emit_fence(&admitted));
+            connected.unwrap_or_else(|_| panic!("no client may connect during a fence skip"));
+        })
         .await;
-        assert!(skipped.is_err(), "admitted state must never ride a fence announce");
+        assert!(
+            skipped.is_err(),
+            "admitted state must never ride a fence announce"
+        );
         assert_eq!(skip_transport.last_sequence(), FENCE_SEQUENCE);
     }
 
@@ -1165,9 +1215,7 @@ mod tests {
         value["watchdog_incarnation_start_100ns"] = serde_json::Value::Number(0.into());
         let bytes =
             serde_json::to_vec(&value).unwrap_or_else(|_| panic!("mutated fixture must encode"));
-        assert!(
-            parse_descriptor(&bytes, &fixture.installation_id, fixture.generation).is_err()
-        );
+        assert!(parse_descriptor(&bytes, &fixture.installation_id, fixture.generation).is_err());
     }
 
     #[cfg(windows)]
@@ -1220,7 +1268,11 @@ mod tests {
             .build()
             .unwrap_or_else(|_| panic!("test runtime must build"));
         // No verified incarnation: no admitted state, sequence unburned.
-        assert!(runtime.block_on(transport.emit_admitted(7, 11, 2000)).is_err());
+        assert!(
+            runtime
+                .block_on(transport.emit_admitted(7, 11, 2000))
+                .is_err()
+        );
         assert_eq!(transport.last_sequence(), FENCE_SEQUENCE);
         // An insane tick must never size the Host freshness window.
         assert!(runtime.block_on(transport.emit_admitted(7, 11, 1)).is_err());

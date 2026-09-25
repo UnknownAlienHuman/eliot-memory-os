@@ -496,8 +496,18 @@ fn terminal_inputs() -> AntigravityTerminalInputs {
             "cursor-9b-9",
             ProjectedAttemptState::Reconciling,
         ),
-        api: terminal_view(ViewOrigin::Api, 9, "cursor-9b-9", ProjectedAttemptState::Reconciling),
-        cli: terminal_view(ViewOrigin::Cli, 9, "cursor-9b-9", ProjectedAttemptState::Reconciling),
+        api: terminal_view(
+            ViewOrigin::Api,
+            9,
+            "cursor-9b-9",
+            ProjectedAttemptState::Reconciling,
+        ),
+        cli: terminal_view(
+            ViewOrigin::Cli,
+            9,
+            "cursor-9b-9",
+            ProjectedAttemptState::Reconciling,
+        ),
         stale_cli: terminal_view(
             ViewOrigin::Cli,
             4,
@@ -538,10 +548,7 @@ fn antigravity_terminal_projection_keeps_stale_error_and_canonical_independent()
     assert_eq!(receipt.reducer_handoff, "MGR02");
     assert_ne!(inputs.stale_cli.sequence, inputs.canonical.sequence);
     assert_ne!(inputs.error_event.sequence, inputs.canonical.sequence);
-    assert_ne!(
-        inputs.error_event.event_id,
-        inputs.canonical.terminal_ref
-    );
+    assert_ne!(inputs.error_event.event_id, inputs.canonical.terminal_ref);
     assert_eq!(inputs.supervisor.attempt_id, inputs.canonical.attempt_id);
     assert_eq!(inputs.api.attempt_id, inputs.canonical.attempt_id);
     assert_eq!(inputs.cli.attempt_id, inputs.canonical.attempt_id);

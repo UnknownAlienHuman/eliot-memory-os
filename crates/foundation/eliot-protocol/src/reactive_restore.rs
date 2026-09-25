@@ -288,7 +288,9 @@ mod tests {
         let reply = ReactiveRestoreReply {
             session_id: "session-live-1".to_owned(),
             state_fence: test_fence(),
-            ledger_json: Some("{\"contract\":\"eliot.agent-bridge.reactive-injection-receipts/v1\"}".to_owned()),
+            ledger_json: Some(
+                "{\"contract\":\"eliot.agent-bridge.reactive-injection-receipts/v1\"}".to_owned(),
+            ),
             snapshots: vec![RestoredSnapshot {
                 uri: "eliot://evidence/source-9".to_owned(),
                 content: vec![9, 9],
@@ -297,8 +299,7 @@ mod tests {
         };
         reply.validate().expect("valid reply");
         let bytes = serde_json::to_vec(&reply).expect("serializes");
-        let back: ReactiveRestoreReply =
-            serde_json::from_slice(&bytes).expect("deserializes");
+        let back: ReactiveRestoreReply = serde_json::from_slice(&bytes).expect("deserializes");
         assert_eq!(reply, back);
         let mut hostile = serde_json::to_value(&reply).expect("value");
         hostile["shadow"] = serde_json::Value::Bool(true);

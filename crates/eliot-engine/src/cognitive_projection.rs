@@ -910,13 +910,13 @@ mod tests {
     use eliot_store::{CanonicalStore, ControlWal, DbClientSet};
     use eliot_types::{
         AgentId, ClaimCardInput, ClaimId, CognitiveProjectionReadState, CommandContext,
-        ControlWalConfig, CredentialProviderKind, CueBinding, LegacyCueKindV1, CueMatchMode, CueStrength,
-        EpistemicStatus, FailureRecordCommand, GovernorConfig, IdempotencyOptions, LifecycleStatus,
-        LifecycleWriteOptions, MemoryRevision, MemoryWriteEnvelope, ModuleCard, ObservedCue,
-        OperationId, ProjectId, ReadConsistencyMode, RecallL0Request, RelationInput, RelationType,
-        SemanticCommand, SemanticCommandKind, SessionId, SurrealServerConfig, TaintClass, TaskId,
-        UlArtifact, UlArtifactBatchRecordCommand, UlInjectionMode, Visibility, WriteId,
-        WriteStatus,
+        ControlWalConfig, CredentialProviderKind, CueBinding, CueMatchMode, CueStrength,
+        EpistemicStatus, FailureRecordCommand, GovernorConfig, IdempotencyOptions, LegacyCueKindV1,
+        LifecycleStatus, LifecycleWriteOptions, MemoryRevision, MemoryWriteEnvelope, ModuleCard,
+        ObservedCue, OperationId, ProjectId, ReadConsistencyMode, RecallL0Request, RelationInput,
+        RelationType, SemanticCommand, SemanticCommandKind, SessionId, SurrealServerConfig,
+        TaintClass, TaskId, UlArtifact, UlArtifactBatchRecordCommand, UlInjectionMode, Visibility,
+        WriteId, WriteStatus,
     };
     use serde_json::{Value, json};
     use std::error::Error;

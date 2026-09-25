@@ -22,10 +22,8 @@
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::{
-    ArtifactId, ContractVersion, StateFence, canonical_json_bytes, sha256_hex,
-};
 use eliot_context_contracts::{ContextError, SafetyProjection, TaskProjection};
+use eliot_contracts::{ArtifactId, ContractVersion, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::self_query::{
     AcceptedSourceProjection, SelfQueryContractError, SelfQueryInput,
 };
@@ -314,11 +312,12 @@ pub fn propose(
         });
     }
     let governing = &intake.task.binding.state_fence;
-    if !intake
-        .observation
-        .state_fence
-        .is_compatible_with(governing)
-        || !intake.safety.binding.state_fence.is_compatible_with(governing)
+    if !intake.observation.state_fence.is_compatible_with(governing)
+        || !intake
+            .safety
+            .binding
+            .state_fence
+            .is_compatible_with(governing)
     {
         return Err(RevisionError::FenceMismatch {
             field: "intake.projection_fence",
@@ -348,11 +347,9 @@ pub fn propose(
     }
     intake.sources.validate()?;
     if let Some(source) = &intake.query.source {
-        intake.sources.check_cited(
-            &source.source_handle,
-            &source.revision,
-            &source.digest,
-        )?;
+        intake
+            .sources
+            .check_cited(&source.source_handle, &source.revision, &source.digest)?;
     }
     for anchor in &intake.query.anchors {
         intake.sources.check_cited(
@@ -488,7 +485,9 @@ fn finish(
     {
         candidate.state = CandidateState::Inconclusive;
         if candidate.missing.is_empty() {
-            candidate.missing.push("revision.enumerated_closure".to_owned());
+            candidate
+                .missing
+                .push("revision.enumerated_closure".to_owned());
         }
         candidate.narrowing.suppress_activation = false;
     }

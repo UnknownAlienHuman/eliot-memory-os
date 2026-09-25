@@ -671,9 +671,7 @@ impl ReactiveInjectionLedger {
     /// Covers every retained item regardless of attention visibility.
     #[must_use]
     pub fn item_session(&self, item_id: &str) -> Option<&str> {
-        self.items
-            .get(item_id)
-            .map(|item| item.session_id.as_str())
+        self.items.get(item_id).map(|item| item.session_id.as_str())
     }
 
     /// Bounded identities of pending (undelivered) injections for one

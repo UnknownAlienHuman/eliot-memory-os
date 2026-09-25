@@ -4272,7 +4272,7 @@ mod live_production_observer_tests {
                 doctor_artifact_digest: dh('b'),
                 testd_artifact_digest: dh('6'),
                 native_worker_artifact_digest: dh('d'),
-            wasm_host_artifact_digest: dh('7'),
+                wasm_host_artifact_digest: dh('7'),
                 kernel_executable_path: h(&format!("{portable}/kernel.exe")),
                 store_bridge_executable_path: h(&format!("{portable}/store.exe")),
                 canonical_store_executable_path: h(&format!("{portable}/surreal.exe")),
@@ -4280,7 +4280,7 @@ mod live_production_observer_tests {
                 doctor_executable_path: h(&format!("{portable}/eliot-doctor.exe")),
                 testd_executable_path: h(&format!("{portable}/eliot-testd.exe")),
                 native_worker_executable_path: h(&format!("{portable}/eliot-native-worker.exe")),
-            wasm_host_executable_path: h(&format!("{portable}/eliot-wasm-host.exe")),
+                wasm_host_executable_path: h(&format!("{portable}/eliot-wasm-host.exe")),
                 config_path: h(&format!("{portable}/generation.json")),
                 dependency_closure_refs: vec![],
                 license_refs: vec![],
@@ -4354,9 +4354,7 @@ mod live_production_observer_tests {
                     native_worker_executable_path: h(&format!(
                         "{portable}/eliot-native-worker.exe"
                     )),
-                    wasm_host_executable_path: h(&format!(
-                        "{portable}/eliot-wasm-host.exe"
-                    )),
+                    wasm_host_executable_path: h(&format!("{portable}/eliot-wasm-host.exe")),
                     descriptor_digest: dh('f'),
                 },
             }

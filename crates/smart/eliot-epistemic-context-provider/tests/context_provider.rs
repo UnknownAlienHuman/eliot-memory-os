@@ -108,8 +108,8 @@ fn from_contribution_attaches_the_provider() {
 #[test]
 fn superseded_position_contributes_nothing() {
     let admitted = position(Currentness::Superseded);
-    let error = EpistemicContextContribution::from_position(&admitted)
-        .expect_err("superseded must fail");
+    let error =
+        EpistemicContextContribution::from_position(&admitted).expect_err("superseded must fail");
     assert!(matches!(error, ContributionError::Upstream(_)));
 }
 

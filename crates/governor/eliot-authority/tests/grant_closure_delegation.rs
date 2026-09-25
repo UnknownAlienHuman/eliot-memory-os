@@ -71,8 +71,18 @@ fn chain_graph() -> Result<GrantGraph, Box<dyn Error>> {
                 "root-test",
                 binding.clone(),
             )?,
-            grant("grant-leaf", Some("grant-mid"), "root-test", binding.clone())?,
-            grant("grant-tip", Some("grant-leaf"), "root-test", binding.clone())?,
+            grant(
+                "grant-leaf",
+                Some("grant-mid"),
+                "root-test",
+                binding.clone(),
+            )?,
+            grant(
+                "grant-tip",
+                Some("grant-leaf"),
+                "root-test",
+                binding.clone(),
+            )?,
             grant("grant-other", None, "root-other", binding)?,
         ],
         7,
@@ -92,12 +102,18 @@ fn delegated_closure_covers_exact_descendants_in_parent_order() -> TestResult {
         .iter()
         .map(|member| member.grant_id.as_str())
         .collect();
-    assert_eq!(ids, ["grant-origin", "grant-mid", "grant-leaf", "grant-tip"]);
+    assert_eq!(
+        ids,
+        ["grant-origin", "grant-mid", "grant-leaf", "grant-tip"]
+    );
     // Every non-target member names an earlier parent.
     let mut seen = std::collections::BTreeSet::new();
     seen.insert("grant-origin");
     for member in closure.members.iter().skip(1) {
-        let parent = member.parent_grant_id.as_ref().expect("child names a parent");
+        let parent = member
+            .parent_grant_id
+            .as_ref()
+            .expect("child names a parent");
         assert!(seen.contains(parent.as_str()));
         seen.insert(member.grant_id.as_str());
     }
@@ -115,7 +131,11 @@ fn delegated_closure_roots_mid_chain_subtree() -> TestResult {
         .collect();
     assert_eq!(ids, ["grant-mid", "grant-leaf", "grant-tip"]);
     assert_eq!(
-        closure.members[0].parent_grant_id.as_ref().expect("mid keeps its parent").as_str(),
+        closure.members[0]
+            .parent_grant_id
+            .as_ref()
+            .expect("mid keeps its parent")
+            .as_str(),
         "grant-origin"
     );
     Ok(())

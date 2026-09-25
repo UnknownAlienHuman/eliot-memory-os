@@ -2,8 +2,8 @@ use super::{ActivationEngine, CueIndexService, TouchedSetRegistry, capsule_fresh
 use crate::{EngineError, WriterHandle};
 use eliot_store::CanonicalStore;
 use eliot_types::{
-    ActivationTrace, CapsuleFreshness, ConceptNode, LegacyCueKindV1, CueRecordSource, InjectionReceipt,
-    OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind, ObservabilityWriteEnvelope,
+    ActivationTrace, CapsuleFreshness, ConceptNode, CueRecordSource, InjectionReceipt,
+    LegacyCueKindV1, OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind, ObservabilityWriteEnvelope,
     ObservabilityWriteStatus, ObservedCue, PendingInjectionItem, ProjectCharter, ProjectId,
     SessionId, SubsystemCapsule, SystemMap, TaskId, UlFiredBlock, UlFiredItem, UlInjectionMode,
     WriteId, ul_token_estimate,
@@ -709,7 +709,9 @@ fn canonical_cue_ref(cue: &ObservedCue) -> Option<String> {
         LegacyCueKindV1::ApiSurface => Some(format!("api:{}", cue.value)),
         LegacyCueKindV1::Subsystem => Some(format!("subsystem:{}", cue.value)),
         LegacyCueKindV1::Concept => Some(format!("concept:{}", cue.value)),
-        LegacyCueKindV1::CommandPattern | LegacyCueKindV1::ErrorSignature | LegacyCueKindV1::TaskClass => None,
+        LegacyCueKindV1::CommandPattern
+        | LegacyCueKindV1::ErrorSignature
+        | LegacyCueKindV1::TaskClass => None,
     }
 }
 
