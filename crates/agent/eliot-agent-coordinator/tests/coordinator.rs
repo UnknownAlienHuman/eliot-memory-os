@@ -10,10 +10,11 @@ use eliot_agent_api::{
 use eliot_agent_contracts::RevisionId;
 use eliot_agent_coordinator::{
     AdmissionId, AdmittedLaneReceipt, AdmittedProviderCapability, AgentCoordinator, CandidateId,
-    CoordinatorConfig, CoordinatorError, CoordinatorEvent, ExecutionContext, PlanGap,
-    ProviderAdmissionReceipt, ProviderExecutionBindingSubmission, ProviderIdentity, RecipeId,
-    RecipeManifest, RoleProfileId, RoleProfileManifest, RouteCandidateEvidence,
-    StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest, WorkerId,
+    CoordinatorConfig, CoordinatorError, CoordinatorEvent, ExecutionContext, OwnerCurrentness,
+    PlanGap, PresentedClaimMaterial, ProviderAdmissionReceipt, ProviderExecutionBindingSubmission,
+    ProviderIdentity, RecipeId, RecipeManifest, RoleProfileId, RoleProfileManifest,
+    RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest,
+    WorkerId,
 };
 use eliot_contracts::{EpochLineageId, sha256_hex};
 use eliot_evaluation_contracts::BudgetEvidence;
@@ -394,8 +395,7 @@ fn integration_provider_identity() -> TestResult<ProviderIdentity> {
 /// verifier uses; no canned pass value is hardcoded.
 fn integration_capability(revoked: bool) -> TestResult<AdmittedProviderCapability> {
     let epoch = test_epoch(TEST_LINEAGE_A, 1);
-    Ok(AdmittedProviderCapability::new(
-        integration_provider_identity()?,
+    let presented = PresentedClaimMaterial::new(
         "claim-integration-1".to_owned(),
         "attempt-integration-1".to_owned(),
         "op-integration-1".to_owned(),
@@ -403,13 +403,24 @@ fn integration_capability(revoked: bool) -> TestResult<AdmittedProviderCapabilit
         sha256_hex(b"executable-material-integration-1"),
         "route-rev-7".to_owned(),
         "capacity-rev-3".to_owned(),
+        1,
+        fence(),
+    )?;
+    let currentness = OwnerCurrentness::new(
         ProviderCapabilityExpectation {
             current_route_revision: "route-rev-7".to_owned(),
             current_capacity_revision: "capacity-rev-3".to_owned(),
-            live_authority_epoch: epoch.clone(),
+            live_authority_epoch: epoch,
             revoked,
         },
-        epoch,
+        fence(),
+        "session-integration-binding".to_owned(),
+    )?;
+    Ok(AdmittedProviderCapability::new(
+        integration_provider_identity()?,
+        presented,
+        currentness,
+        None,
         0,
     )?)
 }

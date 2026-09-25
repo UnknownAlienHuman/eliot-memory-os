@@ -27,8 +27,9 @@ use eliot_agent_api::{AttemptId, RouteFingerprint};
 use eliot_agent_contracts::RevisionId;
 use eliot_agent_coordinator::{
     AdmissionId, AdmittedProviderCapability, AgentCoordinator, CandidateId, CoordinatorConfig,
-    CoordinatorError, CoordinatorSnapshot, PlanGap, ProviderIdentity, StaffingPlanCandidate,
-    StaffingPlanRequest, WorkClass,
+    CoordinatorError, CoordinatorSnapshot, OwnerCurrentness, PlanGap, PresentedClaimMaterial,
+    ProviderIdentity, ProviderSelectionHealth, StaffingPlanCandidate, StaffingPlanRequest,
+    WorkClass,
 };
 use eliot_contracts::{EpochId, StateFence, fences_match_exact};
 use eliot_kernel_service::ProviderCapabilityExpectation;
@@ -99,62 +100,94 @@ pub fn daemon_coordinator_config() -> Result<CoordinatorConfig, FabricError> {
 /// Authenticated Kernel claim material for one verified provider binding
 /// (issue #1108, W4/A1/A2).
 ///
-/// Resolved by the daemon composition from its authenticated Kernel session:
-/// the durable ORS claim row (exact `claim_id` key lookup plus the
-/// attempt/operation reverse projection yielding claim/attempt/operation
-/// identities and durable binding/executable digests), the Governor
-/// currentness it observed (presented route/capacity revisions plus the
-/// current [`ProviderCapabilityExpectation`]), the live authority epoch it
-/// holds, and the replay floor. M2 (#22): the supplier is Kernel over the
-/// authenticated front-door session plus ORS operation records bound to the
-/// exact attempt; no new signing or token service.
+/// Two halves, resolved by the daemon composition per construction, per
+/// restore, and per daemon operation resolution — never cached across live
+/// fence changes:
+///
+/// - presented: the claim material as claimed by the operation at hand
+///   (admission receipt refs, lane claim presentation), including the
+///   operation fence and the claimed worker generation;
+/// - owner: the currentness the daemon observed over its authenticated
+///   Kernel session — the Governor currentness it holds
+///   ([`ProviderCapabilityExpectation`]), the live fence it freshly
+///   re-queried ([`DaemonKernelClient::kernel_fence`](crate::DaemonKernelClient::kernel_fence)),
+///   and the Kernel-issued session binding it presented under
+///   ([`OwnerSessionFacts::session_binding`](crate::OwnerSessionFacts::session_binding),
+///   blank before the validated handshake, which fails closed).
+///
+/// M2 (#22): the supplier is Kernel over the authenticated front-door
+/// session plus ORS operation records bound to the exact attempt; no new
+/// signing or token service. Digest equality between the presented binding
+/// digests and the durable ORS row is enforced Kernel-side per effecting
+/// operation through the authenticated capability wire operation; the
+/// capability construction below enforces presented-versus-owner coherence
+/// (revisions, epoch, generation), and the sealed receipt from that wire
+/// operation is the per-operation owner proof the executor applies before
+/// touching the coordinator.
 ///
 /// Evidence only, never authority: only [`AdmittedProviderCapability::new`]
 /// plus [`AgentCoordinator::new_with_admitted_provider`] admit effects, and
 /// every proof re-runs the T9-04 pure Kernel verifier. Carries no secret
-/// material (identities, digests, revisions, epoch, sequence only).
+/// material (identities, digests, revisions, fences, epoch, sequence only).
+/// Catalogue, quota, and liveness observations (issue #265) ride only in
+/// `health`: selection/health input, never admission.
 #[derive(Clone, Debug)]
 pub struct VerifiedProviderMaterial {
     /// Provider identity the binding must match exactly.
     pub identity: ProviderIdentity,
-    /// Durable claim identity from the ORS claim row.
+    /// Durable claim identity as claimed by the operation at hand.
     pub claim_id: String,
-    /// Attempt identity from the claim row reverse projection.
+    /// Attempt identity as claimed by the operation at hand.
     pub attempt_id: String,
-    /// Exact external-effect operation identity from the claim row.
+    /// Exact external-effect operation identity as claimed by the operation
+    /// at hand.
     pub operation_id: String,
-    /// Durable claim binding digest (lowercase SHA-256).
+    /// Presented claim binding digest (lowercase SHA-256).
     pub binding_digest: String,
-    /// Durable executable binding digest (lowercase SHA-256).
+    /// Presented executable binding digest (lowercase SHA-256).
     pub executable_digest: String,
-    /// Governor-presented route revision observed by the daemon.
+    /// Presented route revision from the operation at hand.
     pub route_revision: String,
-    /// Governor-presented capacity revision observed by the daemon.
+    /// Presented capacity revision from the operation at hand.
     pub capacity_revision: String,
+    /// Claimed worker generation from the operation presentation (nonzero).
+    pub worker_generation: u64,
+    /// Operation fence from the operation at hand.
+    pub presented_fence: StateFence,
     /// Current Governor/Kernel expectation observed by the daemon.
     pub expectation: ProviderCapabilityExpectation,
-    /// Live authority epoch held by the daemon.
-    pub live_epoch: EpochId,
+    /// Live fence freshly re-queried by the daemon over its session.
+    pub live_fence: StateFence,
+    /// Kernel-issued session binding the daemon presented under.
+    pub session_binding: String,
+    /// Issue #265 selection/health observation, if any. Input only: never
+    /// read by the verifier, never mints admission.
+    pub health: Option<ProviderSelectionHealth>,
     /// Minimum replayed event sequence for restore.
     pub minimum_event_sequence: u64,
 }
 
 /// Builds the sealed admission capability from authenticated Kernel claim
-/// material (issue #1108).
+/// material (issue #1108, production composition caller for W4/A1/A2).
 ///
-/// Wiring only: forwards the daemon-resolved [`VerifiedProviderMaterial`]
-/// into [`AdmittedProviderCapability::new`], which validates every shape.
-/// Currency is re-checked on every coordinator `verify` call, never cached.
+/// Wiring plus coherence: forwards the daemon-resolved
+/// [`VerifiedProviderMaterial`] halves into the presented/owner capability
+/// boundary, which fails closed on any presented-versus-owner disagreement
+/// (route/capacity revision, authority epoch, resource generation) or owner
+/// rejection (revoked, malformed, stale). The caller must supply a freshly
+/// re-queried live fence and the validated session binding per call: a
+/// blank binding (no live session) or a stale fence fails here, never at
+/// first effect. Currency is re-checked on every coordinator `verify` call,
+/// never cached.
 ///
 /// # Errors
 ///
-/// Returns [`FabricError::Contract`] for blank or control-bearing text via
-/// the owner validation, or the coordinator owner rejection unchanged.
+/// Returns the coordinator owner rejection unchanged (shape, coherence, or
+/// stale/revoked binding).
 pub fn build_admitted_provider_capability(
     material: VerifiedProviderMaterial,
 ) -> Result<AdmittedProviderCapability, FabricError> {
-    Ok(AdmittedProviderCapability::new(
-        material.identity,
+    let presented = PresentedClaimMaterial::new(
         material.claim_id,
         material.attempt_id,
         material.operation_id,
@@ -162,8 +195,19 @@ pub fn build_admitted_provider_capability(
         material.executable_digest,
         material.route_revision,
         material.capacity_revision,
+        material.worker_generation,
+        material.presented_fence,
+    )?;
+    let currentness = OwnerCurrentness::new(
         material.expectation,
-        material.live_epoch,
+        material.live_fence,
+        material.session_binding,
+    )?;
+    Ok(AdmittedProviderCapability::new(
+        material.identity,
+        presented,
+        currentness,
+        material.health,
         material.minimum_event_sequence,
     )?)
 }
@@ -1642,6 +1686,31 @@ impl AgentFabric {
         };
         fabric.record("fabric_restored_verified", "fabric");
         Ok(fabric)
+    }
+
+    /// Restores the fabric on freshly resolved owner material in one call
+    /// (issue #1108, verified restore for A8).
+    ///
+    /// Builds a fresh capability from `material` — the daemon's per-restore
+    /// resolution over its authenticated session (fresh live fence, current
+    /// Governor expectation, validated session binding) — then restores
+    /// through [`AgentFabric::restore_with_admitted_provider`]. Callers pass
+    /// freshly resolved material on every restore: a stored capability is
+    /// never reused across restarts, so missing/stale/revoked evidence stays
+    /// plan-only/blocked instead of silently resuming effecting operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns the capability construction rejection, the coordinator owner
+    /// restore rejection, or a stale-config conflict unchanged.
+    pub fn restore_verified(
+        snapshot: FabricSnapshot,
+        config: CoordinatorConfig,
+        ports: FabricPorts,
+        material: VerifiedProviderMaterial,
+    ) -> Result<Self, FabricError> {
+        let capability = build_admitted_provider_capability(material)?;
+        Self::restore_with_admitted_provider(snapshot, config, ports, capability)
     }
 }
 

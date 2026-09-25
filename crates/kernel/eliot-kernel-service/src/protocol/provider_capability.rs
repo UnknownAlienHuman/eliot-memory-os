@@ -8,8 +8,9 @@
 //! `ProviderExecutionBinding`), with the Governor current route and capacity
 //! revisions carried only as presented inputs. No behavior, no stores, no IO:
 //! persistence, lookup, and daemon composition land outside this file. Kernel
-//! validates identity, epoch, presented revisions, and digest equality only;
-//! it never interprets task semantics, provider policy, payload meaning, or
+//! validates identity, epoch, presented worker generation, presented
+//! revisions, presented fence digest, and digest equality only; it never
+//! interprets task semantics, provider policy, payload meaning, or
 //! finish.
 //!
 //! There is no signing, no token minting, no trust service, and no user
@@ -48,7 +49,10 @@ use thiserror::Error;
 /// Versioned as a string so a future capability contour bump follows the
 /// explicit-reject precedent of the claim wire (v1 → v2) and the replay wire
 /// (new family starts at v1): an unknown contour is rejected, never promoted.
-pub const PROVIDER_CAPABILITY_WIRE_VERSION: &str = "eliot-kernel-provider-capability/v1";
+/// v2 carries the presented claiming-worker generation and the presented
+/// fence digest alongside the v1 material so generation and State Fence bind
+/// to the durable row instead of riding as static caller data.
+pub const PROVIDER_CAPABILITY_WIRE_VERSION: &str = "eliot-kernel-provider-capability/v2";
 
 /// Returns true when the value is a lowercase SHA-256 digest.
 fn is_lowercase_sha256(value: &str) -> bool {
@@ -126,6 +130,17 @@ pub struct ProviderCapabilityRequest {
     pub route_revision: String,
     /// Presented Governor current capacity revision, compared for equality.
     pub capacity_revision: String,
+    /// Presented claiming-worker generation, compared for equality against
+    /// the durable row. Zero is never a valid generation: it fails closed as
+    /// malformed before any owner comparison, mirroring the claim-route
+    /// `load_and_bind` generation gate.
+    pub worker_generation: u64,
+    /// Presented fence digest (lowercase SHA-256 over the canonical
+    /// presented-fence bytes, same recipe the service owner uses for the
+    /// durable `fence_digest`), compared for equality against the durable
+    /// row. A retained proof presented under a different fence fails even
+    /// when the epoch value alone still matches.
+    pub fence_digest: String,
 }
 
 impl ProviderCapabilityRequest {
@@ -135,7 +150,7 @@ impl ProviderCapabilityRequest {
     ///
     /// Returns [`ProviderCapabilityError::MalformedRequest`] for blank,
     /// control-bearing, or overlong text (including a malformed
-    /// binding/executable digest shape) and
+    /// binding/executable/fence digest shape or a zero worker generation) and
     /// [`ProviderCapabilityError::InvalidPayloadDigest`] for a malformed
     /// canonical payload digest.
     pub fn validate(&self) -> Result<(), ProviderCapabilityError> {
@@ -156,7 +171,11 @@ impl ProviderCapabilityRequest {
         }
         if !is_lowercase_sha256(&self.binding_digest)
             || !is_lowercase_sha256(&self.executable_binding_digest)
+            || !is_lowercase_sha256(&self.fence_digest)
         {
+            return Err(ProviderCapabilityError::MalformedRequest);
+        }
+        if self.worker_generation == 0 {
             return Err(ProviderCapabilityError::MalformedRequest);
         }
         Ok(())
@@ -228,6 +247,11 @@ pub enum ProviderCapabilityError {
     /// Presented capacity revision disagrees with the current Governor revision.
     #[error("stale capacity revision")]
     StaleCapacity,
+    /// Presented claiming-worker generation disagrees with the durable row,
+    /// or the durable row itself carries no valid generation. A stale
+    /// generation needs a new admission, never a local repair.
+    #[error("stale claiming-worker generation")]
+    StaleGeneration,
     /// Presented binding or executable digest disagrees with durable material.
     #[error("binding digest mismatch")]
     DigestMismatch,
@@ -264,7 +288,12 @@ pub enum ProviderCapabilityError {
 /// gate, checked in this order: presentation shape, revocation, exact
 /// attempt match, exact operation match, epoch currency (expectation epoch
 /// versus the live `live_epoch` parameter), route revision, capacity
-/// revision, then binding/executable digest equality.
+/// revision, binding/executable digest equality, worker-generation equality,
+/// then fence-digest equality.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the owner check is one flat tuple: presented request, current expectation, six loaded durable row fields, and the live epoch; grouping them would invent a second contract beside the wire request"
+)]
 pub fn verify_provider_capability(
     request: &ProviderCapabilityRequest,
     expectation: &ProviderCapabilityExpectation,
@@ -272,6 +301,8 @@ pub fn verify_provider_capability(
     loaded_claim_operation_id: &str,
     loaded_claim_binding_digest: &str,
     loaded_claim_executable_digest: &str,
+    loaded_claim_worker_generation: u64,
+    loaded_claim_fence_digest: &str,
     live_epoch: &EpochId,
 ) -> Result<(), ProviderCapabilityError> {
     request.validate()?;
@@ -302,6 +333,18 @@ pub fn verify_provider_capability(
     {
         return Err(ProviderCapabilityError::DigestMismatch);
     }
+    // Generation and fence bind the proof to the durable admission: a stale
+    // worker generation or a proof presented under a different fence fails
+    // closed here even when every digest above still matches. A durable row
+    // carrying no valid generation is incoherent and never verifies.
+    if loaded_claim_worker_generation == 0
+        || request.worker_generation != loaded_claim_worker_generation
+    {
+        return Err(ProviderCapabilityError::StaleGeneration);
+    }
+    if request.fence_digest != loaded_claim_fence_digest {
+        return Err(ProviderCapabilityError::DigestMismatch);
+    }
     Ok(())
 }
 
@@ -329,6 +372,8 @@ mod provider_capability_tests {
         operation_id: String,
         binding_digest: String,
         executable_digest: String,
+        worker_generation: u64,
+        fence_digest: String,
         live_epoch: EpochId,
     }
 
@@ -345,6 +390,8 @@ mod provider_capability_tests {
                 executable_binding_digest: "e".repeat(64),
                 route_revision: "route-rev-7".to_owned(),
                 capacity_revision: "capacity-rev-3".to_owned(),
+                worker_generation: 1,
+                fence_digest: "f".repeat(64),
             },
             expectation: ProviderCapabilityExpectation {
                 current_route_revision: "route-rev-7".to_owned(),
@@ -356,6 +403,8 @@ mod provider_capability_tests {
             operation_id: "op-t9-04-1".to_owned(),
             binding_digest: "b".repeat(64),
             executable_digest: "e".repeat(64),
+            worker_generation: 1,
+            fence_digest: "f".repeat(64),
             live_epoch: test_epoch(1),
         }
     }
@@ -368,6 +417,8 @@ mod provider_capability_tests {
             fixture.operation_id.as_str(),
             fixture.binding_digest.as_str(),
             fixture.executable_digest.as_str(),
+            fixture.worker_generation,
+            fixture.fence_digest.as_str(),
             &fixture.live_epoch,
         )
     }

@@ -30,12 +30,13 @@ use crate::{
     AdmissionId, AdmittedLaneReceipt, AdmittedProviderCapability, AgentCoordinator, CancelCommand,
     CancellationReconciliationId, CandidateId, CoordinatorConfig, CoordinatorError,
     CoordinatorEvent, DescendantClosureSubmission, ExecutionContext, ObservationId, OperationId,
-    OutcomeReconciliationId, PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot,
-    ProviderCancellationReconciliation, ProviderExecutionBindingSubmission, ProviderIdentity,
-    ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt,
-    ReassignmentId, RecipeId, RecipeManifest, ResultSubmission, RoleProfileId, RoleProfileManifest,
-    RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest,
-    SubmissionId, UnknownOutcomeResolution, WorkClass, WorkerId,
+    OutcomeReconciliationId, OwnerCurrentness, PlanGap, PresentedClaimMaterial,
+    ProviderAdmissionReceipt, ProviderBindingSnapshot, ProviderCancellationReconciliation,
+    ProviderExecutionBindingSubmission, ProviderIdentity, ProviderReassignmentReceipt,
+    ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReassignmentId, RecipeId,
+    RecipeManifest, ResultSubmission, RoleProfileId, RoleProfileManifest, RouteCandidateEvidence,
+    StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest, SubmissionId,
+    UnknownOutcomeResolution, WorkClass, WorkerId,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -175,8 +176,8 @@ fn admitted_capability_for(
     minimum_sequence: u64,
 ) -> TestResult<AdmittedProviderCapability> {
     let live_epoch = test_epoch(TEST_LINEAGE_A, live_sequence);
-    Ok(AdmittedProviderCapability::new(
-        identity,
+    let _ = live_epoch;
+    let presented = PresentedClaimMaterial::new(
         "claim-t9-05-1".to_owned(),
         "attempt-t9-05-1".to_owned(),
         "op-t9-05-1".to_owned(),
@@ -184,13 +185,24 @@ fn admitted_capability_for(
         sha256_hex(b"executable-material-t9-05-1"),
         route_revision.to_owned(),
         capacity_revision.to_owned(),
+        1,
+        fence(),
+    )?;
+    let currentness = OwnerCurrentness::new(
         ProviderCapabilityExpectation {
             current_route_revision: current_route_revision.to_owned(),
             current_capacity_revision: current_capacity_revision.to_owned(),
             live_authority_epoch: test_epoch(TEST_LINEAGE_A, expectation_sequence),
             revoked,
         },
-        live_epoch,
+        fence(),
+        "session-test-binding".to_owned(),
+    )?;
+    Ok(AdmittedProviderCapability::new(
+        identity,
+        presented,
+        currentness,
+        None,
         minimum_sequence,
     )?)
 }

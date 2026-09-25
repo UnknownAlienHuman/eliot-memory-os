@@ -37,7 +37,9 @@ pub use crate::provider_account_catalogue::{
     ProviderAccountReadiness, ProviderAccountRow, RateLimitDisposition, RateLimitObservation,
     ReplayDisposition, build_snapshot,
 };
-pub use crate::provider_admission::AdmittedProviderCapability;
+pub use crate::provider_admission::{
+    AdmittedProviderCapability, OwnerCurrentness, PresentedClaimMaterial, ProviderSelectionHealth,
+};
 pub use crate::swarm_command_candidate::*;
 pub use crate::swarm_controlboard::*;
 pub use crate::swarm_launch_bind::*;
