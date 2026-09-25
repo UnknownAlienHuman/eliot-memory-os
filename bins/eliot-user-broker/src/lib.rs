@@ -1237,9 +1237,7 @@ impl BrokerComposition {
         request: LaunchRequest,
     ) -> Result<eliot_user_broker_core::LaunchReceipt, CompositionError> {
         let _ = self.heartbeat()?;
-        self.broker
-            .launch(request)
-            .map_err(|error| Self::classify(error))
+        self.broker.launch(request).map_err(Self::classify)
     }
 
     /// Cancels a broker-owned operation selected by its admitted operation

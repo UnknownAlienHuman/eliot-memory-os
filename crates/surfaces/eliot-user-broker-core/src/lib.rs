@@ -569,18 +569,10 @@ impl ResourceIntroduction {
     /// a silently widened introduction).
     fn admits(&self, approved: &ApprovedLaunch, observed_at: u64) -> Result<(), BrokerError> {
         self.validate()?;
-        if !self
-            .introduced_operation_set
-            .iter()
-            .any(|operation| *operation == approved.tool)
-        {
+        if !self.introduced_operation_set.contains(&approved.tool) {
             return Err(BrokerError::IntroductionOperationNotGranted);
         }
-        if !self
-            .introduced_resource_set
-            .iter()
-            .any(|resource| *resource == approved.root)
-        {
+        if !self.introduced_resource_set.contains(&approved.root) {
             return Err(BrokerError::IntroductionResourceNotGranted);
         }
         if Self::effect_rank(approved.effect_ceiling) > Self::effect_rank(self.max_effect) {
