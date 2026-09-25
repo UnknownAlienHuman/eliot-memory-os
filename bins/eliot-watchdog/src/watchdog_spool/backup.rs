@@ -47,6 +47,16 @@
 //! zero-on-incomplete members) maps to [`SpoolError::Corrupt`] with an exact
 //! reason, never to a silent empty handle. No transport, SCM, restart,
 //! cutover, or authority logic exists here by construction.
+//!
+//! Fence integrity: the evidence a fence carries — its ordered redacted
+//! entries and its coverage denominator — is mutable only inside this module.
+//! Both are handed out as shared slices/references, and
+//! [`WatchdogSpoolFence::validate`] re-derives every counter, window, and
+//! digest from the entries the fence actually holds. Both page-read paths call
+//! it before serving, and each page's snapshot digest is derived from the
+//! entries that read served. A holder can therefore neither fabricate page
+//! members nor assert full coverage over a spool with gaps after capture, and a
+//! changed member is corrupt — never known-empty and never complete.
 
 use std::collections::BTreeMap;
 
@@ -60,8 +70,8 @@ use super::codec::{
 };
 use super::intent::check_stored_intent_payload;
 use super::{
-    EXPORT_BATCH_TTL_MS, EXPORT_MAX_BYTES, EXPORT_MAX_ITEMS, SPOOL_MAX_BYTES, SPOOL_MAX_RECORDS,
-    SPOOL_SCHEMA_VERSION,
+    EXPORT_BATCH_TTL_MS, EXPORT_MAX_BYTES, EXPORT_MAX_ITEMS, SPOOL_MAX_BYTES,
+    SPOOL_MAX_RECORD_BYTES, SPOOL_MAX_RECORDS, SPOOL_SCHEMA_VERSION,
 };
 
 /// Schema version of the fence shape itself.
@@ -127,6 +137,11 @@ fn is_lowercase_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+/// Builds the corrupt disposition every fence integrity check returns.
+fn fence_corrupt(message: &str) -> SpoolError {
+    SpoolError::Corrupt(message.to_owned())
+}
+
 /// Rejects a blank, control-carrying, or oversized identity or reason text.
 ///
 /// Mirrors the #954 `bounded_text` shape rule.
@@ -170,7 +185,10 @@ fn check_digest(value: &str, field: &str) -> Result<(), SpoolError> {
 /// project to the `Recovery` class at export) with the spool-local intent
 /// variants kept distinct so the denominator can mark them incomplete. The
 /// class carries no payload bytes by construction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The derived encoding is the fence's own digest representation (see the
+/// `derive_content_digest` docs), not a wire format: nothing decodes it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub enum SpoolFenceEntryKind {
     /// Ordinary liveness or lease observation; payload bytes redacted.
     Heartbeat,
@@ -232,7 +250,10 @@ impl SpoolFenceEntryKind {
 /// scopes, signatures, digests) are never carried here: heartbeats keep only
 /// their sequence, timestamp, kind, and entry digest. No service config,
 /// credentials, commands, or user payloads exist in this enum by construction.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// The derived encoding is the fence's own digest representation (see the
+/// `derive_content_digest` docs), not a wire format: nothing decodes it.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub enum SpoolMarkerDetail {
     /// Gap marker with its exact reason and coverage flag.
     Gap {
@@ -281,7 +302,10 @@ pub enum SpoolMarkerDetail {
 /// digest, encoded byte length) and, for coverage-invalidating markers, the
 /// verbatim [`SpoolMarkerDetail`]. Raw service config, credentials, commands,
 /// signatures, and user payload bytes are never stored here.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// The derived encoding is the fence's own digest representation (see the
+/// `derive_content_digest` docs), not a wire format: nothing decodes it.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct RedactedSpoolEntry {
     /// Spool sequence number.
     pub sequence: u64,
@@ -370,6 +394,14 @@ impl SpoolCoverageDenominator {
 /// credentials, commands, signatures, and user payload bytes stay redacted:
 /// heartbeats keep kind plus entry digest, and only `Gap`, `Recovery`, and
 /// intent markers keep their verbatim reason and digest material.
+///
+/// The evidence it carries — the ordered entries and the coverage denominator
+/// — is immutable outside this module: both are reachable only through
+/// [`entries`](Self::entries) and [`denominator`](Self::denominator), which
+/// hand out shared slices, so a holder cannot splice members into the page body
+/// or flip `complete` after the fact. [`validate`](Self::validate) re-derives
+/// every counter, digest, and window from the entries the fence actually holds
+/// and runs at the top of both page-read paths.
 #[derive(Clone, Debug)]
 pub struct WatchdogSpoolFence {
     /// Validated spool header (schema and counters only, no payloads).
@@ -379,9 +411,9 @@ pub struct WatchdogSpoolFence {
     /// Lowercase SHA-256 over the canonical high-water bytes.
     pub high_water_digest: String,
     /// Ordered redacted retained entries, sequence-consecutive.
-    pub entries: Vec<RedactedSpoolEntry>,
+    entries: Vec<RedactedSpoolEntry>,
     /// Exact retained member and marker denominator.
-    pub denominator: SpoolCoverageDenominator,
+    denominator: SpoolCoverageDenominator,
     /// Source installation the capture was taken from.
     pub source_installation: String,
     /// Watchdog generation bound at sensor construction.
@@ -398,19 +430,324 @@ pub struct WatchdogSpoolFence {
     /// This is the fence's capture anchor, taken from the owner's own retained
     /// record rather than from a caller-supplied or wall-clock instant, so it
     /// is never later than the newest evidence the fence actually carries.
-    /// A page or whole-snapshot lifetime window is measured from here: a
-    /// fence whose newest evidence is older than the admitted window is
-    /// expired, not current.
+    /// A page or whole-snapshot lifetime window is measured from here by the
+    /// owner-bound port against its own clock, and the same window is applied
+    /// at capture, so a capture that could never be paged is refused at
+    /// capture instead of being handed out.
     pub captured_at_ms: u64,
     /// Compatible canonical capture reference, when fence-matched.
     pub canonical_ref: Option<String>,
     /// Compatible ORS capture reference, when fence-matched.
     pub ors_ref: Option<String>,
-    /// Lowercase SHA-256 over the ordered canonical entry bytes.
+    /// Lowercase SHA-256 over the canonical encoding of the ordered redacted
+    /// entries this fence carries.
+    ///
+    /// What it covers, exactly: each entry's identity (sequence, observation
+    /// time, redacted kind, canonical encoded byte length), each entry's
+    /// canonical entry digest — and therefore, transitively, the retained
+    /// record bytes that digest commits to — and the verbatim marker detail of
+    /// every coverage-invalidating record. What it does not cover: anything
+    /// outside this fence, including the raw payload bytes themselves, which
+    /// stay redacted and are never carried here.
+    ///
+    /// It is derived from the representation the fence actually stores, not
+    /// from the raw records, so it is recomputable: [`validate`](Self::validate)
+    /// re-derives it and every page read derives its own snapshot digest from
+    /// the entries it serves. A fence whose entries changed after capture can
+    /// therefore no longer present the original digest.
     pub content_digest: String,
 }
 
 impl WatchdogSpoolFence {
+    /// Returns the ordered redacted retained entries this fence holds.
+    ///
+    /// A shared slice: callers observe the exact members the owner redacted and
+    /// cannot add, remove, or reorder them. Any change is a corrupt fence, not a
+    /// different view of the same evidence.
+    #[must_use]
+    pub fn entries(&self) -> &[RedactedSpoolEntry] {
+        &self.entries
+    }
+
+    /// Returns the exact coverage denominator of this fence.
+    ///
+    /// A shared reference to an immutable `Copy` value, so `complete` cannot be
+    /// flipped after capture; [`validate`](Self::validate) re-derives it from
+    /// the entries the fence holds.
+    #[must_use]
+    pub const fn denominator(&self) -> &SpoolCoverageDenominator {
+        &self.denominator
+    }
+
+    /// Re-validates this fence against the evidence it actually holds.
+    ///
+    /// Re-runs, over the entries in this fence rather than over any raw record:
+    ///
+    /// - the header shape and counters the codec validates — schema version,
+    ///   nonzero sequence window, `record_count` equal to the entries actually
+    ///   held, bounded record and byte ceilings, and a byte total equal to the
+    ///   sum of the entries' recorded canonical lengths;
+    /// - sequence consecutiveness — strictly increasing, first equal to
+    ///   `header.first_sequence`, last below `header.next_sequence`;
+    /// - the high-water binding — equal to `next_sequence - 1`, at or above the
+    ///   last entry, with a matching `high_water_digest`;
+    /// - the coverage denominator — retained count, marker count recomputed
+    ///   from the entries' own kinds, and `complete` only when no marker is in
+    ///   scope;
+    /// - per-entry evidence — nonzero observation timestamp, bounded nonzero
+    ///   canonical length, lowercase SHA-256 entry digest, and marker details
+    ///   re-checked against the rules that redacted them;
+    /// - the capture anchor (`captured_at_ms` is the newest observation held)
+    ///   and the content digest (re-derived from these entries);
+    /// - the bound identity shapes, and the fence schema version.
+    ///
+    /// What it deliberately cannot re-check: the exact cross-owner fence
+    /// protocol behind `canonical_ref` / `ors_ref`. The fence stores no
+    /// coherence flag, so this validates their digest shape only; coherence
+    /// itself belongs to the coordinator that supplied them, and
+    /// `WatchdogSpool::snapshot_backup` refuses any capture naming a
+    /// cross-owner reference at all.
+    ///
+    /// A changed member, a changed denominator, or a swapped digest is therefore
+    /// [`SpoolError::Corrupt`] — incomplete/corrupt, never a known-empty or
+    /// full-coverage page.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Corrupt`] when any re-derived counter, window,
+    /// digest, or identity above disagrees with the fence, and
+    /// [`SpoolError::Serialization`] when an entry cannot be canonically
+    /// encoded.
+    pub fn validate(&self) -> Result<(), SpoolError> {
+        self.check_header_shape()?;
+        self.validate_entries()?;
+        self.validate_windows()?;
+        self.validate_content()?;
+        Ok(())
+    }
+
+    /// Re-checks the fence shape, its header counters, and the retained count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Corrupt`] when the fence schema is unsupported, the
+    /// fence holds no entries, the header counters or ceilings are
+    /// inconsistent, or the header record count disagrees with the entries held.
+    fn check_header_shape(&self) -> Result<(), SpoolError> {
+        if self.schema_version != SPOOL_FENCE_SCHEMA_VERSION {
+            return Err(fence_corrupt(
+                "watchdog spool backup fence schema version is unsupported",
+            ));
+        }
+        if self.entries.is_empty() {
+            return Err(fence_corrupt(
+                "watchdog spool backup fence holds no retained entries; a bare record vector is not a fence",
+            ));
+        }
+        if self.header.schema_version != SPOOL_SCHEMA_VERSION
+            || self.header.first_sequence == 0
+            || self.header.next_sequence == 0
+            || self.header.record_count > SPOOL_MAX_RECORDS
+            || self.header.bytes > SPOOL_MAX_BYTES
+        {
+            return Err(fence_corrupt(
+                "watchdog spool backup fence header counters or schema are inconsistent",
+            ));
+        }
+        let retained_members = u64::try_from(self.entries.len()).map_err(|_| {
+            fence_corrupt("watchdog spool backup fence retained count exceeds the bounded counter")
+        })?;
+        if self.header.record_count != retained_members {
+            return Err(fence_corrupt(
+                "watchdog spool backup fence header record count does not match the entries it holds",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Re-checks every entry the fence holds, their order, and their window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Corrupt`] when an entry carries an uninitialized
+    /// timestamp, an out-of-frame length, a malformed digest, or a marker that
+    /// fails its own checks; when entries are duplicated, out of order, or
+    /// outside the header's sequence window; or when the summed canonical
+    /// lengths disagree with the header byte total.
+    fn validate_entries(&self) -> Result<(), SpoolError> {
+        let max_record_bytes = u64::try_from(SPOOL_MAX_RECORD_BYTES).map_err(|_| {
+            fence_corrupt("watchdog spool backup record frame exceeds the bounded counter")
+        })?;
+        let mut encoded_bytes = 0_u64;
+        let mut previous_sequence: Option<u64> = None;
+        for entry in &self.entries {
+            if entry.observed_at_ms == 0 {
+                return Err(fence_corrupt(
+                    "watchdog spool backup fence entry carries an expired or uninitialized timestamp",
+                ));
+            }
+            if entry.entry_bytes == 0 || entry.entry_bytes > max_record_bytes {
+                return Err(fence_corrupt(
+                    "watchdog spool backup fence entry length is outside the bounded record frame",
+                ));
+            }
+            check_digest(&entry.entry_digest, "fence entry_digest")?;
+            if let Some(marker) = &entry.marker {
+                check_marker_detail(marker)?;
+            }
+            if previous_sequence.is_some_and(|previous| entry.sequence <= previous) {
+                return Err(fence_corrupt(
+                    "watchdog spool backup fence entries are duplicated or out of order",
+                ));
+            }
+            previous_sequence = Some(entry.sequence);
+            encoded_bytes = encoded_bytes
+                .checked_add(entry.entry_bytes)
+                .ok_or_else(|| {
+                    fence_corrupt("watchdog spool backup fence byte counter overflow")
+                })?;
+        }
+        if encoded_bytes != self.header.bytes {
+            return Err(fence_corrupt(
+                "watchdog spool backup fence byte total does not match the entries it holds",
+            ));
+        }
+        let first_sequence = self.entries.first().map_or(0, |entry| entry.sequence);
+        let last_sequence = self.newest_entry()?.sequence;
+        if first_sequence != self.header.first_sequence
+            || last_sequence >= self.header.next_sequence
+        {
+            return Err(fence_corrupt(
+                "watchdog spool backup fence sequence window does not match its header",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Re-checks the high-water binding, the denominator, and the anchor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Corrupt`] when the high-water does not bind the
+    /// header window and the newest entry, when its digest disagrees, when the
+    /// denominator disagrees with the entries' own kinds, or when the capture
+    /// anchor is not the newest observation the fence holds.
+    fn validate_windows(&self) -> Result<(), SpoolError> {
+        let last_entry = self.newest_entry()?;
+        let expected_high_water = self.header.next_sequence.checked_sub(1).ok_or_else(|| {
+            fence_corrupt("watchdog spool backup fence header next sequence is invalid")
+        })?;
+        if self.high_water != expected_high_water || self.high_water < last_entry.sequence {
+            return Err(fence_corrupt(
+                "watchdog spool backup fence high-water does not bind the entries it holds",
+            ));
+        }
+        if self.high_water_digest != sha256_hex(&encode_high_water(self.high_water)?) {
+            return Err(fence_corrupt(
+                "watchdog spool backup fence high-water digest does not match its high water",
+            ));
+        }
+        let retained_members = self.retained_members()?;
+        let gap_members = self.observed_gap_members();
+        if self.denominator.retained_members != retained_members
+            || self.denominator.gap_members != gap_members
+            || self.denominator.complete != (gap_members == 0)
+        {
+            return Err(fence_corrupt(
+                "watchdog spool backup fence denominator does not match the entries it holds",
+            ));
+        }
+        if self.captured_at_ms != last_entry.observed_at_ms {
+            return Err(fence_corrupt(
+                "watchdog spool backup fence capture anchor is not the newest observation it holds",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Re-derives the content digest and re-checks the bound identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Corrupt`] when the content digest disagrees with
+    /// the entries held, the generation is uninitialized, or an identity shape
+    /// is unusable, and [`SpoolError::Serialization`] when an entry cannot be
+    /// canonically encoded.
+    fn validate_content(&self) -> Result<(), SpoolError> {
+        if self.content_digest != self.derived_content_digest()? {
+            return Err(fence_corrupt(
+                "watchdog spool backup fence content digest does not match the entries it holds",
+            ));
+        }
+        if self.watchdog_generation == 0 {
+            return Err(fence_corrupt(
+                "watchdog spool backup fence watchdog generation is uninitialized",
+            ));
+        }
+        check_text(
+            &self.source_installation,
+            "fence source_installation",
+            BACKUP_IDENTITY_MAX_BYTES,
+        )?;
+        check_text(
+            &self.requester_principal,
+            "fence requester_principal",
+            BACKUP_IDENTITY_MAX_BYTES,
+        )?;
+        check_digest(&self.snapshot_operation_id, "fence snapshot_operation_id")?;
+        if let Some(canonical_ref) = &self.canonical_ref {
+            check_digest(canonical_ref, "fence canonical_ref")?;
+        }
+        if let Some(ors_ref) = &self.ors_ref {
+            check_digest(ors_ref, "fence ors_ref")?;
+        }
+        Ok(())
+    }
+
+    /// Re-derives the content digest from exactly the entries this fence holds.
+    ///
+    /// The same derivation [`capture_fence`] used, so the digest is a function
+    /// of the served evidence rather than a value copied beside it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Serialization`] when an entry cannot be canonically
+    /// encoded.
+    fn derived_content_digest(&self) -> Result<String, SpoolError> {
+        derive_content_digest(&self.entries)
+    }
+
+    /// Returns the newest entry this fence holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Corrupt`] when the fence holds no entry.
+    fn newest_entry(&self) -> Result<&RedactedSpoolEntry, SpoolError> {
+        self.entries
+            .last()
+            .ok_or_else(|| fence_corrupt("watchdog spool backup fence holds no entries"))
+    }
+
+    /// Returns the exact retained count re-derived from the entries held.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Corrupt`] when the count exceeds the bounded
+    /// counter.
+    fn retained_members(&self) -> Result<u64, SpoolError> {
+        u64::try_from(self.entries.len()).map_err(|_| {
+            fence_corrupt("watchdog spool backup fence retained count exceeds the bounded counter")
+        })
+    }
+
+    /// Returns the marker count re-derived from the entries' own kinds.
+    fn observed_gap_members(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|entry| entry.kind.marks_incomplete())
+            .fold(0_u64, |count, _| count.saturating_add(1))
+    }
+
     /// Returns the validated header schema version.
     #[must_use]
     pub const fn header_schema_version(&self) -> u16 {
@@ -567,7 +904,11 @@ impl WatchdogSpoolBackupLimits {
 /// digest drifts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WatchdogSpoolSnapshotPage {
-    /// Snapshot digest this page was read from (the fence content digest).
+    /// Snapshot digest of the fence entries this page was read from.
+    ///
+    /// Derived from the entries the read actually served, never copied from a
+    /// value stored beside them, so a mutated fence cannot present the
+    /// original digest.
     pub snapshot_digest: String,
     /// Zero-based page index within the bounded snapshot.
     pub page_index: u64,
@@ -628,45 +969,105 @@ fn entry_service(payload: &WatchdogSpoolPayload) -> &str {
     }
 }
 
-/// Builds the verbatim marker detail for coverage-invalidating records.
+/// Re-checks one already-redacted marker against the rules that redacted it.
 ///
-/// Heartbeats carry no marker (`None`): their payload bytes stay redacted.
-/// `Gap` markers keep their exact reason and coverage flag; `Recovery`
-/// records keep their exact reason and corrupt-sequence evidence; intents
-/// keep their evidence digests and owner lineage.
+/// The rules are exactly the ones [`marker_detail`] applied at capture, so a
+/// marker that passes here carries the same shapes the retained record did.
+/// `Gap` markers hold a closed reason enum and `Intent` markers hold
+/// enum-scoped lineage, so the recovery arm is the only one with free-form text
+/// and a digest field to re-check.
 ///
 /// # Errors
 ///
 /// Returns [`SpoolError::Corrupt`] when a recovery reason is blank or
 /// oversized, or a corrupt digest is neither lowercase SHA-256 nor the
 /// preserved `"missing"` literal.
+fn check_marker_detail(marker: &SpoolMarkerDetail) -> Result<(), SpoolError> {
+    if let SpoolMarkerDetail::Recovery {
+        reason,
+        corrupt_digest,
+        ..
+    } = marker
+    {
+        check_text(reason, "recovery reason", BACKUP_REASON_MAX_BYTES)?;
+        if corrupt_digest != MISSING_DIGEST_LITERAL {
+            check_digest(corrupt_digest, "recovery corrupt_digest")?;
+        }
+    }
+    Ok(())
+}
+
+/// Canonical digest representation of one redacted entry.
+///
+/// The same JSON encoder the spool codec uses for a retained record, applied to
+/// the redacted view instead: it commits to the entry identity, the entry
+/// digest, the recorded canonical length, and the verbatim marker detail, and
+/// it carries no payload bytes. It exists so the fence content digest is
+/// re-derivable from what the fence stores; it is not a wire codec and nothing
+/// decodes it.
+///
+/// # Errors
+///
+/// Returns [`SpoolError::Serialization`] when the entry cannot be canonically
+/// encoded.
+fn encode_redacted_entry(entry: &RedactedSpoolEntry) -> Result<Vec<u8>, SpoolError> {
+    serde_json::to_vec(entry).map_err(|error| SpoolError::Serialization(error.to_string()))
+}
+
+/// Re-derives the content digest of exactly the ordered entries a fence holds.
+///
+/// Derived from the representation the fence actually stores rather than from
+/// the raw records, so the digest is recomputable on every read and a fence
+/// whose entries changed after capture can no longer present the original
+/// digest. Coverage of what the digest commits to is stated on
+/// [`WatchdogSpoolFence::content_digest`].
+///
+/// # Errors
+///
+/// Returns [`SpoolError::Serialization`] when an entry cannot be canonically
+/// encoded.
+fn derive_content_digest(entries: &[RedactedSpoolEntry]) -> Result<String, SpoolError> {
+    let mut material = Vec::new();
+    for entry in entries {
+        material.extend_from_slice(&encode_redacted_entry(entry)?);
+    }
+    Ok(sha256_hex(&material))
+}
+
+/// Builds the verbatim marker detail for coverage-invalidating records.
+///
+/// Heartbeats carry no marker (`None`): their payload bytes stay redacted.
+/// `Gap` markers keep their exact reason and coverage flag; `Recovery`
+/// records keep their exact reason and corrupt-sequence evidence; intents
+/// keep their evidence digests and owner lineage. The built marker is then
+/// re-checked through [`check_marker_detail`], the same check
+/// [`WatchdogSpoolFence::validate`] applies to an already-redacted marker.
+///
+/// # Errors
+///
+/// Returns [`SpoolError::Corrupt`] when a redacted marker detail fails the
+/// checks above.
 fn marker_detail(payload: &WatchdogSpoolPayload) -> Result<Option<SpoolMarkerDetail>, SpoolError> {
-    match payload {
-        WatchdogSpoolPayload::Heartbeat { .. } => Ok(None),
+    let detail = match payload {
+        WatchdogSpoolPayload::Heartbeat { .. } => None,
         WatchdogSpoolPayload::Gap {
             reason,
             coverage_claimed,
             ..
-        } => Ok(Some(SpoolMarkerDetail::Gap {
+        } => Some(SpoolMarkerDetail::Gap {
             reason: *reason,
             coverage_claimed: *coverage_claimed,
-        })),
+        }),
         WatchdogSpoolPayload::Recovery {
             reason,
             corrupt_sequence,
             corrupt_digest,
             ..
-        } => {
-            check_text(reason, "recovery reason", BACKUP_REASON_MAX_BYTES)?;
-            if corrupt_digest != MISSING_DIGEST_LITERAL {
-                check_digest(corrupt_digest, "recovery corrupt_digest")?;
-            }
-            Ok(Some(SpoolMarkerDetail::Recovery {
-                reason: reason.clone(),
-                corrupt_sequence: *corrupt_sequence,
-                corrupt_digest: corrupt_digest.clone(),
-            }))
-        }
+        } => Some(SpoolMarkerDetail::Recovery {
+            reason: reason.clone(),
+            corrupt_sequence: *corrupt_sequence,
+            corrupt_digest: corrupt_digest.clone(),
+        }),
         WatchdogSpoolPayload::ProblemIntent {
             evidence_refs,
             lineage_installation_id,
@@ -682,14 +1083,18 @@ fn marker_detail(payload: &WatchdogSpoolPayload) -> Result<Option<SpoolMarkerDet
             lineage_epoch,
             governor_unavailable_reason,
             ..
-        } => Ok(Some(SpoolMarkerDetail::Intent {
+        } => Some(SpoolMarkerDetail::Intent {
             evidence_refs: evidence_refs.clone(),
             lineage_installation_id: lineage_installation_id.clone(),
             lineage_generation: *lineage_generation,
             lineage_epoch: *lineage_epoch,
             governor_unavailable_reason: *governor_unavailable_reason,
-        })),
+        }),
+    };
+    if let Some(detail) = detail.as_ref() {
+        check_marker_detail(detail)?;
     }
+    Ok(detail)
 }
 
 /// Validates one retained entry against its expected sequence and redacts it.
@@ -812,6 +1217,13 @@ fn check_capture_params(params: &CaptureFenceParams) -> Result<(), SpoolError> {
 /// operation identity, fence schema, fence-matched canonical/ORS references,
 /// and the content digest.
 ///
+/// The content digest is derived from the redacted entries this fence stores —
+/// the same representation [`WatchdogSpoolFence::validate`] re-derives — so it
+/// is recomputable and cannot outlive the evidence it describes. This builder
+/// consults no clock and no caller-supplied instant: the capture anchor is the
+/// newest retained observation, and the owner-bound port applies the clock
+/// window to that anchor identically at capture and at every page read.
+///
 /// # Errors
 ///
 /// Returns [`SpoolError::Corrupt`] when the header or high-water fails
@@ -839,7 +1251,6 @@ pub fn capture_fence(
         SpoolError::Corrupt("watchdog spool backup header next sequence is invalid".to_owned())
     })?;
     let mut redacted = Vec::with_capacity(entries.len());
-    let mut content_bytes = Vec::new();
     let mut gap_members = 0_u64;
     for (index, entry) in entries.iter().enumerate() {
         let offset = u64::try_from(index).map_err(|_| {
@@ -854,7 +1265,6 @@ pub fn capture_fence(
         if view.kind.marks_incomplete() {
             gap_members = gap_members.saturating_add(1);
         }
-        content_bytes.extend_from_slice(&encode_entry(entry)?);
         redacted.push(view);
     }
     if redacted
@@ -871,7 +1281,10 @@ pub fn capture_fence(
         )
     })?;
     // The capture anchor is the newest retained observation, so the lifetime
-    // window can only ever understate freshness, never overstate it.
+    // window can only ever understate freshness, never overstate it. The
+    // content digest is derived from the redacted entries the fence stores, so
+    // it is recomputable at every later read and a changed member can no longer
+    // present the original digest.
     let captured_at_ms = entries
         .last()
         .map(|entry| entry.observed_at_ms)
@@ -881,6 +1294,7 @@ pub fn capture_fence(
                     .to_owned(),
             )
         })?;
+    let content_digest = derive_content_digest(&redacted)?;
     Ok(WatchdogSpoolFence {
         header: header.clone(),
         high_water,
@@ -899,7 +1313,7 @@ pub fn capture_fence(
         captured_at_ms,
         canonical_ref: params.canonical_ref.clone(),
         ors_ref: params.ors_ref.clone(),
-        content_digest: sha256_hex(&content_bytes),
+        content_digest,
     })
 }
 
@@ -915,48 +1329,62 @@ pub fn capture_fence(
 /// Continuation binds the one fence digest, so a page past the retained window
 /// or past the cumulative bound fails instead of drifting.
 ///
+/// The fence is re-validated first, through [`WatchdogSpoolFence::validate`],
+/// and the page's snapshot digest is derived from the entries this read actually
+/// serves rather than copied from a field beside them. A fence whose members,
+/// denominator, or digests changed after capture is therefore
+/// [`SpoolError::Corrupt`] here: no page can present the original digest over
+/// evidence it no longer holds.
+///
 /// The clock-dependent `page_ttl_ms` and `snapshot_lifetime_ms` bounds are not
 /// decidable from fence data alone; they are enforced by the owner-bound
 /// [`crate::WatchdogBackupPort::read_page`], which holds the owner clock and
-/// the fence's [`WatchdogSpoolFence::captured_at_ms`] anchor.
+/// the fence's [`WatchdogSpoolFence::captured_at_ms`] anchor — and which applies
+/// the identical window at [`crate::WatchdogBackupPort::snapshot`], so a capture
+/// that could never be paged is refused at capture.
 ///
 /// # Errors
 ///
-/// Returns [`SpoolError::Corrupt`] when the limits are unusable, the page
-/// index runs past the retained window or past a cumulative bound, or a
-/// bounded counter overflows.
+/// Returns [`SpoolError::Corrupt`] when the fence fails re-validation, the
+/// limits are unusable, the page index runs past the retained window or past a
+/// cumulative bound, or a bounded counter overflows.
 pub fn read_page(
     fence: &WatchdogSpoolFence,
     page_index: u64,
     limits: &WatchdogSpoolBackupLimits,
 ) -> Result<WatchdogSpoolSnapshotPage, SpoolError> {
-    fn corrupt(message: &str) -> SpoolError {
-        SpoolError::Corrupt(message.to_owned())
-    }
     limits.validate()?;
+    fence.validate()?;
+    // Derived from the entries this read serves, so the page cannot present a
+    // digest it did not derive from the evidence it is returning.
+    let snapshot_digest = fence.derived_content_digest()?;
     let page_cap = u64::from(limits.max_page_members);
-    let items_cap = u64::try_from(limits.max_items)
-        .map_err(|_| corrupt("watchdog spool backup item bound exceeds the bounded counter"))?;
+    let items_cap = u64::try_from(limits.max_items).map_err(|_| {
+        fence_corrupt("watchdog spool backup item bound exceeds the bounded counter")
+    })?;
     let per_page = items_cap.min(page_cap);
-    let total_members = u64::try_from(fence.entries.len())
-        .map_err(|_| corrupt("watchdog spool backup retained count exceeds the bounded counter"))?;
-    let start = page_index
-        .checked_mul(per_page)
-        .ok_or_else(|| corrupt("watchdog spool backup page index overflows the bounded window"))?;
+    let total_members = u64::try_from(fence.entries.len()).map_err(|_| {
+        fence_corrupt("watchdog spool backup retained count exceeds the bounded counter")
+    })?;
+    let start = page_index.checked_mul(per_page).ok_or_else(|| {
+        fence_corrupt("watchdog spool backup page index overflows the bounded window")
+    })?;
     if start >= total_members {
-        return Err(corrupt(
+        return Err(fence_corrupt(
             "watchdog spool backup page runs past the retained window; continuation drift",
         ));
     }
     if start >= items_cap {
-        return Err(corrupt(
+        return Err(fence_corrupt(
             "watchdog spool backup page exceeds the cumulative member bound",
         ));
     }
-    let start_idx = usize::try_from(start)
-        .map_err(|_| corrupt("watchdog spool backup page offset exceeds the bounded window"))?;
-    let page_cap_idx = usize::try_from(per_page)
-        .map_err(|_| corrupt("watchdog spool backup page width exceeds the bounded window"))?;
+    let start_idx = usize::try_from(start).map_err(|_| {
+        fence_corrupt("watchdog spool backup page offset exceeds the bounded window")
+    })?;
+    let page_cap_idx = usize::try_from(per_page).map_err(|_| {
+        fence_corrupt("watchdog spool backup page width exceeds the bounded window")
+    })?;
     let mut end_idx = start_idx;
     let mut page_bytes = 0_u64;
     for entry in fence.entries.iter().skip(start_idx).take(page_cap_idx) {
@@ -965,20 +1393,19 @@ pub fn read_page(
         }
         page_bytes = page_bytes
             .checked_add(entry.entry_bytes)
-            .ok_or_else(|| corrupt("watchdog spool backup page byte counter overflow"))?;
+            .ok_or_else(|| fence_corrupt("watchdog spool backup page byte counter overflow"))?;
         end_idx += 1;
     }
     let taken = end_idx
         .checked_sub(start_idx)
-        .ok_or_else(|| corrupt("watchdog spool backup page window underflow"))?;
-    let cumulative_members =
-        start
-            .checked_add(u64::try_from(taken).map_err(|_| {
-                corrupt("watchdog spool backup page count exceeds the bounded counter")
-            })?)
-            .ok_or_else(|| corrupt("watchdog spool backup cumulative member counter overflow"))?;
+        .ok_or_else(|| fence_corrupt("watchdog spool backup page window underflow"))?;
+    let cumulative_members = start
+        .checked_add(u64::try_from(taken).map_err(|_| {
+            fence_corrupt("watchdog spool backup page count exceeds the bounded counter")
+        })?)
+        .ok_or_else(|| fence_corrupt("watchdog spool backup cumulative member counter overflow"))?;
     if cumulative_members > items_cap {
-        return Err(corrupt(
+        return Err(fence_corrupt(
             "watchdog spool backup page exceeds the cumulative member bound",
         ));
     }
@@ -986,19 +1413,22 @@ pub fn read_page(
     for entry in fence.entries.iter().take(end_idx) {
         cumulative_bytes = cumulative_bytes
             .checked_add(entry.entry_bytes)
-            .ok_or_else(|| corrupt("watchdog spool backup cumulative byte counter overflow"))?;
+            .ok_or_else(|| {
+                fence_corrupt("watchdog spool backup cumulative byte counter overflow")
+            })?;
     }
     if cumulative_bytes > limits.max_bytes {
-        return Err(corrupt(
+        return Err(fence_corrupt(
             "watchdog spool backup page exceeds the cumulative byte bound",
         ));
     }
     // The work ceiling is consulted, not only shape-validated: the members this
     // page examined must fit the admitted bounded work window.
-    let examined = u64::try_from(end_idx)
-        .map_err(|_| corrupt("watchdog spool backup page width exceeds the bounded counter"))?;
+    let examined = u64::try_from(end_idx).map_err(|_| {
+        fence_corrupt("watchdog spool backup page width exceeds the bounded counter")
+    })?;
     if examined > limits.max_work_units {
-        return Err(corrupt(
+        return Err(fence_corrupt(
             "watchdog spool backup page exceeds the bounded work ceiling",
         ));
     }
@@ -1007,7 +1437,7 @@ pub fn read_page(
         digest_material.extend_from_slice(entry.entry_digest.as_bytes());
     }
     Ok(WatchdogSpoolSnapshotPage {
-        snapshot_digest: fence.content_digest.clone(),
+        snapshot_digest,
         page_index,
         page_digest: sha256_hex(&digest_material),
         entries: fence.entries[start_idx..end_idx].to_vec(),
@@ -1017,7 +1447,7 @@ pub fn read_page(
         total_bytes: fence.total_bytes(),
         complete: end_idx
             == usize::try_from(total_members).map_err(|_| {
-                corrupt("watchdog spool backup retained count exceeds the bounded window")
+                fence_corrupt("watchdog spool backup retained count exceeds the bounded window")
             })?,
     })
 }

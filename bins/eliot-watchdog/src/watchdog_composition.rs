@@ -19,6 +19,7 @@ use crate::SpoolError;
 use crate::WatchdogAdmissionSource;
 use crate::WatchdogConfig;
 use crate::admission_gap_reason;
+use crate::backup_control::BackupControlRegistration;
 use crate::heartbeat_transport::HeartbeatTransport;
 use crate::kernel_gap_reason;
 use crate::report_gap_nonfatal;
@@ -50,6 +51,14 @@ pub struct WatchdogComposition {
     task: eliot_runtime::SupervisedHandle,
     shutdown_requested: Arc<AtomicBool>,
     heartbeat: Option<Arc<HeartbeatTransport>>,
+    /// This composition's own bounded backup-control registration table.
+    ///
+    /// Opened once at composition start, so backup control is registrable for
+    /// this composition's whole supervised lifetime and only this
+    /// composition's own shutdown closes it. It is not a process global: a
+    /// second composition in the same process opens its own table, and
+    /// starting supervision never touches either one.
+    backup_control_registration: BackupControlRegistration,
 }
 
 impl WatchdogComposition {
@@ -276,6 +285,7 @@ impl WatchdogComposition {
             task,
             shutdown_requested,
             heartbeat,
+            backup_control_registration: BackupControlRegistration::open(),
         })
     }
 
@@ -316,6 +326,14 @@ impl WatchdogComposition {
 
     /// Waits for process termination and performs ordered runtime shutdown.
     ///
+    /// Supervision STARTING is not a lifecycle end for backup control: this
+    /// method only begins waiting, so it does not close, release, or otherwise
+    /// touch the composition's backup-control registration table. Registration
+    /// stays open for the whole supervised lifetime and is closed only by the
+    /// genuine shutdown path, [`request_shutdown`](Self::request_shutdown).
+    /// Backup control holds no supervised task, so bounded cleanup needs no
+    /// join here and supervision priority is preserved.
+    ///
     /// # Errors
     ///
     /// Returns an error if the supervised watchdog task, shutdown signal, or
@@ -327,9 +345,6 @@ impl WatchdogComposition {
             observation = "admitted",
             "watchdog supervision running until shutdown"
         );
-        // Backup control holds no supervised task: bounded cleanup needs no
-        // join here and supervision priority is preserved.
-        crate::backup_control::on_composition_shutdown();
         let WatchdogComposition {
             runtime,
             admission,
@@ -370,8 +385,15 @@ impl WatchdogComposition {
     ///
     /// Delegates to [`crate::backup_control::register_backup_control`], which
     /// binds the port to the owner-held spool reachable through
-    /// [`Self::owner_backup_port`]. Backup control holds no supervision task:
+    /// [`Self::owner_backup_port`] and reserves a slot in THIS composition's own
+    /// bounded registration table. Backup control holds no supervision task:
     /// it cannot stall supervision or exhaust the Control Reserve.
+    ///
+    /// Registration is refused only by this composition's own bounded table
+    /// (exhausted, or closed by this composition's own shutdown). Starting
+    /// supervision does not close it, and another composition's shutdown does
+    /// not affect it, so the port stays registrable for the whole supervised
+    /// lifetime.
     ///
     /// # Errors
     ///
@@ -382,6 +404,16 @@ impl WatchdogComposition {
         &self,
     ) -> Result<crate::backup_control::BackupControlHandle, CompositionError> {
         crate::backup_control::register_backup_control(self)
+    }
+
+    /// Returns this composition's own bounded backup-control registration
+    /// table, so registration is scoped to this lifecycle.
+    ///
+    /// Cloned into each registered handle, never into process-global state: a
+    /// fresh composition opens its own open table, and only
+    /// [`Self::request_shutdown`] closes this one.
+    pub(crate) fn backup_control_registration(&self) -> BackupControlRegistration {
+        self.backup_control_registration.clone()
     }
 
     /// Returns the owner-bound backup port exposed by this composition's
@@ -397,9 +429,11 @@ impl WatchdogComposition {
 
     /// Requests bounded shutdown from an SCM control path.
     pub fn request_shutdown(&self) {
-        // Backup control holds no task to join: shutdown stays bounded and
-        // supervision teardown never waits on backup wiring.
-        crate::backup_control::on_composition_shutdown();
+        // Genuine lifecycle end: this composition closes its OWN backup-control
+        // table, releasing exactly its registrations. Backup control holds no
+        // task to join: shutdown stays bounded and supervision teardown never
+        // waits on backup wiring.
+        self.backup_control_registration.close();
         self.shutdown_requested.store(true, Ordering::Release);
     }
 }
@@ -566,39 +600,99 @@ impl WatchdogBackupPort {
     /// request is bound against the owner-held installation identity and
     /// generation.
     ///
+    /// The captured fence is then put through the SAME age window
+    /// [`Self::read_page`] applies, by the same [`Self::check_capture_age`]
+    /// check against the same owner clock. That is what keeps the two halves
+    /// of this port from disagreeing: the freshness anchor is the fence's
+    /// capture anchor, which is the newest retained observation rather than a
+    /// wall-clock instant (this fence builder is clock-free and mints no
+    /// instant of its own), so a spool whose newest retained observation is
+    /// already older than the admitted window yields a fence that could never
+    /// be paged. Refusing it here, with the identical reason and verdict a
+    /// page read would give, is the honest outcome — the alternative is handing
+    /// out a capture that is born expired. Nothing is invented to avoid that
+    /// refusal: no second clock is read and no timestamp is stamped, so a
+    /// capture is still admitted exactly when the same fence would still pass
+    /// its own page read.
+    ///
     /// # Errors
     ///
-    /// Returns [`SpoolError`] when the admitted bindings, limits, or retained
-    /// evidence fail validation.
+    /// Returns [`SpoolError`] when the admitted bindings or limits fail
+    /// validation, the retained evidence fails capture validation, or the
+    /// captured fence is outside the admitted page-freshness and
+    /// whole-snapshot lifetime windows.
     pub fn snapshot(
         &self,
         params: CaptureFenceParams,
         limits: WatchdogSpoolBackupLimits,
     ) -> Result<WatchdogSpoolFence, SpoolError> {
         self.check_owner_bindings(&params)?;
-        self.spool.snapshot_backup(params, limits)
+        let fence = self.spool.snapshot_backup(params, limits)?;
+        self.check_capture_age(&fence)?;
+        Ok(fence)
+    }
+
+    /// Applies the owner clock's capture-age window to one fence.
+    ///
+    /// The anchor is [`WatchdogSpoolFence::captured_at_ms`] — the newest
+    /// retained observation the fence carries, which is never later than its own
+    /// evidence — measured against this owner's own clock with the bounds fixed
+    /// at [`Self::new`]. A future-dated anchor, or one older than either the
+    /// page-freshness window or the whole-snapshot lifetime window, is refused.
+    ///
+    /// Both [`Self::snapshot`] and [`Self::read_page`] call this one function, so
+    /// for the same fence and the same instant the two halves of this port give
+    /// the same verdict: capture admits exactly the fences a later page read
+    /// would still accept, and refuses a born-expired fence instead of issuing
+    /// one that can never be paged. The reasons below name both callers because
+    /// the check is one check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the owner clock is unavailable, the fence is
+    /// future-dated, or the fence is older than the admitted freshness or
+    /// lifetime window.
+    fn check_capture_age(&self, fence: &WatchdogSpoolFence) -> Result<(), SpoolError> {
+        let now_ms = crate::current_unix_ms()?;
+        if now_ms < fence.captured_at_ms {
+            return Err(SpoolError::Corrupt(
+                "watchdog backup port refuses a future-dated capture; a page read of it would be refused"
+                    .to_owned(),
+            ));
+        }
+        let age_ms = now_ms - fence.captured_at_ms;
+        if age_ms > self.limits.page_ttl_ms || age_ms > self.limits.snapshot_lifetime_ms {
+            return Err(SpoolError::Corrupt(
+                "watchdog backup port refuses an expired capture; a page read of it would be refused"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Reads one finite, unexpired page of a captured fence.
     ///
-    /// Thin delegation to `backup::read_page`, bounded by the limits fixed at
-    /// [`Self::new`]. The fence is bound against the owner-held installation
-    /// identity and generation, and the clock-dependent page-freshness and
+    /// The fence is re-validated against the evidence it holds, bound against
+    /// the owner-held installation identity and generation, and bounded by the
+    /// limits fixed at [`Self::new`]. The clock-dependent page-freshness and
     /// whole-snapshot lifetime windows are consulted here against the owner's
-    /// own clock: an expired fence is incomplete, never a current empty page.
-    /// Continuation binds the one fence digest, so drift fails closed instead
-    /// of returning partial coverage.
+    /// own clock, through the same [`Self::check_capture_age`] that
+    /// [`Self::snapshot`] applies: an expired fence is incomplete, never a
+    /// current empty page. Continuation binds the one fence digest, so drift
+    /// fails closed instead of returning partial coverage.
     ///
     /// # Errors
     ///
-    /// Returns [`SpoolError`] when the fence is not this owner's, the page is
-    /// older than the admitted freshness or lifetime window, the page runs
-    /// past the retained window, or the cumulative bound is exceeded.
+    /// Returns [`SpoolError`] when the fence fails re-validation, is not this
+    /// owner's, the page is older than the admitted freshness or lifetime
+    /// window, the page runs past the retained window, or the cumulative bound
+    /// is exceeded.
     pub fn read_page(
         &self,
         fence: &WatchdogSpoolFence,
         page_index: u64,
     ) -> Result<WatchdogSpoolSnapshotPage, SpoolError> {
+        fence.validate()?;
         if fence.source_installation != self.source_installation {
             return Err(SpoolError::Corrupt(
                 "watchdog backup port refuses a page read for a foreign source installation"
@@ -611,18 +705,7 @@ impl WatchdogBackupPort {
                     .to_owned(),
             ));
         }
-        let now_ms = crate::current_unix_ms()?;
-        if now_ms < fence.captured_at_ms {
-            return Err(SpoolError::Corrupt(
-                "watchdog backup port refuses a page read from a future-dated capture".to_owned(),
-            ));
-        }
-        let age_ms = now_ms - fence.captured_at_ms;
-        if age_ms > self.limits.page_ttl_ms || age_ms > self.limits.snapshot_lifetime_ms {
-            return Err(SpoolError::Corrupt(
-                "watchdog backup port refuses a page read from an expired capture".to_owned(),
-            ));
-        }
+        self.check_capture_age(fence)?;
         crate::watchdog_spool::backup::read_page(fence, page_index, &self.limits)
     }
 

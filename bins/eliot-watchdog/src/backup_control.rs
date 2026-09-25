@@ -33,8 +33,15 @@
 //! never stall the supervision tick loop or exhaust the Control Reserve. Every
 //! dispatched request is a finite, bounded owner read or a bounded owner write
 //! and runs outside the heartbeat tick.
+//!
+//! Lifecycle scope: the bounded registration table belongs to ONE composition
+//! lifecycle and is opened when that composition starts. Starting supervision
+//! never closes it, only that same composition's own shutdown does, and a
+//! second composition in the same process opens its own open table — so
+//! supervision start can never latch backup control closed for the remaining
+//! life of the process.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use thiserror::Error;
 
@@ -44,12 +51,16 @@ use crate::{
     WatchdogSpoolSnapshotPage,
 };
 
-/// Upper bound for concurrently registered backup control handles per process.
+/// Upper bound for concurrently registered backup control handles per
+/// composition lifecycle.
 ///
-/// Registration is a bounded process-local slot, not a listener and not a
-/// task: the Watchdog opens no backup listener and spawns no backup task, so
-/// the receipt names only the registration slot it occupies. Registration
-/// fails closed past this bound instead of growing an unbounded set.
+/// Registration is a bounded, composition-scoped slot table, not a listener
+/// and not a task: the Watchdog opens no backup listener and spawns no backup
+/// task, so the receipt names only the registration slot it occupies.
+/// Registration fails closed past this bound instead of growing an unbounded
+/// set. The bound is per composition lifecycle, not per process: each
+/// composition opens its own table, so a second composition in the same
+/// process is not refused by the first one's registrations.
 pub const MAX_BACKUP_CONTROL_HANDLES: u64 = 8;
 
 /// Number of bounded registration slots, derived from the declared ceiling.
@@ -61,18 +72,125 @@ const REGISTRATION_SLOT_COUNT: usize = 8;
 
 const _: () = assert!(REGISTRATION_SLOT_COUNT as u64 == MAX_BACKUP_CONTROL_HANDLES);
 
-/// Bounded process-local registration table.
+/// Bounded registration state of exactly one composition lifecycle.
 ///
-/// One `true` entry is one occupied slot. The table holds no authority, no
+/// One `true` entry is one occupied slot. The state holds no authority, no
 /// handle to a live resource, and no caller-supplied value: it exists only so
 /// a registration receipt names a real bounded allocation instead of a
 /// constant, and so `stop_backup_control` and composition shutdown release
 /// exactly what was taken.
-static REGISTRATION_SLOTS: Mutex<[bool; REGISTRATION_SLOT_COUNT]> =
-    Mutex::new([false; REGISTRATION_SLOT_COUNT]);
+#[derive(Debug)]
+struct BackupControlSlots {
+    /// Whether this composition lifecycle has closed backup control.
+    closed: bool,
+    /// Occupancy of this composition's bounded slot table.
+    occupied: [bool; REGISTRATION_SLOT_COUNT],
+}
 
-/// Whether the composition has already closed backup control.
-static REGISTRATION_CLOSED: Mutex<bool> = Mutex::new(false);
+/// Composition-scoped backup control registration table.
+///
+/// The table belongs to one composition lifecycle, not to the process: a
+/// composition opens exactly one of these at start, registration is therefore
+/// open for that composition's whole supervised lifetime, and only that same
+/// composition's [`close`](Self::close) closes it. Nothing on the
+/// supervision-**start** path touches this cell, so starting supervision can
+/// never latch backup control closed; one composition's shutdown cannot close
+/// another composition's table; and a fresh composition in the same process
+/// always starts open with an empty table instead of inheriting a latched
+/// refusal from an earlier lifecycle.
+///
+/// The cell is cloned into every [`BackupControlHandle`], so a handle checks
+/// and releases its own composition's bounded table and no other. It carries no
+/// registration identity of its own: the composition that created it is the
+/// only owner, which is what makes the scope exact rather than claimed.
+#[derive(Clone, Debug)]
+pub struct BackupControlRegistration {
+    /// Bounded occupancy and lifecycle flag of one composition.
+    slots: std::sync::Arc<Mutex<BackupControlSlots>>,
+}
+
+impl BackupControlRegistration {
+    /// Opens an empty, open registration table for one composition lifecycle.
+    #[must_use]
+    pub fn open() -> Self {
+        Self {
+            slots: std::sync::Arc::new(Mutex::new(BackupControlSlots {
+                closed: false,
+                occupied: [false; REGISTRATION_SLOT_COUNT],
+            })),
+        }
+    }
+
+    /// Closes backup control for this composition lifecycle.
+    ///
+    /// Every bounded slot of THIS table is released, so no registration
+    /// outlives the composition and any later registration against this
+    /// composition fails closed. Other compositions keep their own tables and
+    /// stay open. Shutdown stays bounded: there is no task to join and this
+    /// never blocks supervision teardown.
+    pub fn close(&self) {
+        if let Ok(mut slots) = self.slots.lock() {
+            slots.closed = true;
+            slots.occupied.fill(false);
+        }
+    }
+
+    /// Reserves the lowest free bounded slot of this table, or fails closed.
+    fn reserve(&self) -> Result<u64, CompositionError> {
+        let mut slots = self.lock()?;
+        if slots.closed {
+            return Err(CompositionError::InvalidConfiguration(
+                "watchdog backup control is closed for this composition lifecycle".to_owned(),
+            ));
+        }
+        for (index, occupied) in slots.occupied.iter_mut().enumerate() {
+            if !*occupied {
+                *occupied = true;
+                return u64::try_from(index + 1).map_err(|_| {
+                    CompositionError::InvalidConfiguration(
+                        "watchdog backup control slot index exceeds the bounded counter".to_owned(),
+                    )
+                });
+            }
+        }
+        Err(CompositionError::InvalidConfiguration(
+            "watchdog backup control exceeds its bounded registration table".to_owned(),
+        ))
+    }
+
+    /// Returns whether one bounded slot of this table is reserved.
+    fn is_registered(&self, slot: u64) -> bool {
+        if slot == 0 || slot > MAX_BACKUP_CONTROL_HANDLES {
+            return false;
+        }
+        let Ok(index) = usize::try_from(slot - 1) else {
+            return false;
+        };
+        self.lock()
+            .is_ok_and(|slots| slots.occupied.get(index).copied().unwrap_or(false))
+    }
+
+    /// Releases one bounded slot of this table; releasing a free slot is a no-op.
+    fn release(&self, slot: u64) {
+        let Ok(index) = usize::try_from(slot.saturating_sub(1)) else {
+            return;
+        };
+        if let Ok(mut slots) = self.slots.lock()
+            && let Some(occupied) = slots.occupied.get_mut(index)
+        {
+            *occupied = false;
+        }
+    }
+
+    /// Locks this table's bounded state, failing closed on a poisoned lock.
+    fn lock(&self) -> Result<MutexGuard<'_, BackupControlSlots>, CompositionError> {
+        self.slots.lock().map_err(|_| {
+            CompositionError::InvalidConfiguration(
+                "watchdog backup control cannot read its bounded registration table".to_owned(),
+            )
+        })
+    }
+}
 
 /// Closed backup operation vocabulary mirrored from the protocol wire
 /// (`crates/foundation/eliot-protocol/src/backup.rs`, `BackupOperationKind`).
@@ -240,14 +358,18 @@ pub enum BackupControlError {
 /// service-name targeting) and no listener or task identity: this process opens
 /// neither.
 ///
-/// The slot is released by [`stop_backup_control`] and by
-/// [`on_composition_shutdown`]. A handle dropped without either holds its slot
-/// until the composition shuts down, which is bounded and fails closed at
-/// [`MAX_BACKUP_CONTROL_HANDLES`] rather than growing an unbounded set.
+/// The slot is released by [`stop_backup_control`] and by its own
+/// composition's [`BackupControlRegistration::close`]. A handle dropped
+/// without either holds its slot until the composition shuts down, which is
+/// bounded and fails closed at [`MAX_BACKUP_CONTROL_HANDLES`] rather than
+/// growing an unbounded set.
 pub struct BackupControlHandle {
     slot: u64,
     active: bool,
     port: std::sync::Arc<WatchdogBackupPort>,
+    /// The registering composition's own bounded table. Kept per handle so a
+    /// handle is never evaluated against another lifecycle's slots.
+    registration: BackupControlRegistration,
 }
 
 impl std::fmt::Debug for BackupControlHandle {
@@ -308,7 +430,7 @@ impl BackupControlHandle {
                 "watchdog backup control cannot dispatch before it is started".to_owned(),
             ));
         }
-        if !slot_is_registered(self.slot) {
+        if !self.registration.is_registered(self.slot) {
             return Err(BackupControlError::Rejected(
                 "watchdog backup control cannot dispatch after its registration was released"
                     .to_owned(),
@@ -380,9 +502,15 @@ const fn request_operation_name(request: &WatchdogBackupRequest<'_>) -> &'static
 /// `PROTOCOL_VERSION`), takes the owner-bound backup port from the
 /// composition's own kernel port — the same owner that appends every heartbeat
 /// and gap record, so no second database handle is opened — and reserves one
-/// bounded registration slot. A composition whose kernel port owns no spool
-/// admits no backup control: there is exactly one construction path and no
-/// substitute.
+/// bounded slot in the registering composition's own
+/// [`BackupControlRegistration`] table. A composition whose kernel port owns no
+/// spool admits no backup control: there is exactly one construction path and
+/// no substitute.
+///
+/// The reservation is refused only by that composition's own table: its
+/// bounded bound, or a genuine close of that same lifecycle. Neither starting
+/// supervision nor another composition's shutdown closes it, so registration
+/// is available for the whole supervised lifetime.
 ///
 /// No listener is opened, no task is spawned, and no authority is minted; the
 /// owning [`crate::KernelWatchdogPort`] implementation keeps all effects.
@@ -390,8 +518,8 @@ const fn request_operation_name(request: &WatchdogBackupRequest<'_>) -> &'static
 /// # Errors
 ///
 /// Returns [`CompositionError`] when the composition identity is unexpected,
-/// when the composition exposes no owner-bound spool port, or when the bounded
-/// registration table is exhausted or already closed.
+/// when the composition exposes no owner-bound spool port, or when that
+/// composition's bounded registration table is exhausted or already closed.
 pub fn register_backup_control(
     composition: &WatchdogComposition,
 ) -> Result<BackupControlHandle, CompositionError> {
@@ -407,11 +535,13 @@ pub fn register_backup_control(
                 .to_owned(),
         )
     })?;
-    let slot = reserve_registration_slot()?;
+    let registration = composition.backup_control_registration();
+    let slot = registration.reserve()?;
     Ok(BackupControlHandle {
         slot,
         active: false,
         port,
+        registration,
     })
 }
 
@@ -432,7 +562,7 @@ pub fn start_backup_control(handle: &mut BackupControlHandle) -> Result<(), Comp
             "watchdog backup control is already started".to_owned(),
         ));
     }
-    if !slot_is_registered(handle.slot) {
+    if !handle.registration.is_registered(handle.slot) {
         return Err(CompositionError::InvalidConfiguration(
             "watchdog backup control handle does not hold a live bounded registration slot"
                 .to_owned(),
@@ -444,94 +574,17 @@ pub fn start_backup_control(handle: &mut BackupControlHandle) -> Result<(), Comp
 
 /// Stops backup control with bounded cleanup.
 ///
-/// Consumes the handle, releases its bounded registration slot, and returns
-/// the same receipt marked stopped. The returned receipt is already released
-/// and can no longer dispatch, so a later stop is a no-op rather than a double
-/// release. There is no background work to join because registration never
-/// spawned any.
+/// Consumes the handle, releases its bounded registration slot in the
+/// registering composition's table, and returns the same receipt marked
+/// stopped. The returned receipt is already released and can no longer
+/// dispatch, so a later stop is a no-op rather than a double release. There is
+/// no background work to join because registration never spawned any.
 pub fn stop_backup_control(handle: BackupControlHandle) -> BackupControlHandle {
-    release_registration_slot(handle.slot);
+    handle.registration.release(handle.slot);
     BackupControlHandle {
         slot: handle.slot,
         active: false,
         port: handle.port,
+        registration: handle.registration,
     }
-}
-
-/// Closes backup control during composition shutdown.
-///
-/// Every bounded registration slot is released, so no abandoned registration
-/// outlives the composition, and any later registration fails closed. Shutdown
-/// stays bounded: there is no task to join and this never blocks supervision
-/// teardown.
-pub fn on_composition_shutdown() {
-    if let Ok(mut closed) = REGISTRATION_CLOSED.lock() {
-        *closed = true;
-    }
-    if let Ok(mut slots) = REGISTRATION_SLOTS.lock() {
-        slots.fill(false);
-    }
-}
-
-/// Reserves the lowest free bounded registration slot, or fails closed.
-fn reserve_registration_slot() -> Result<u64, CompositionError> {
-    if *lock_closed()? {
-        return Err(CompositionError::InvalidConfiguration(
-            "watchdog backup control is closed for this composition lifecycle".to_owned(),
-        ));
-    }
-    let mut slots = lock_slots()?;
-    for (index, occupied) in slots.iter_mut().enumerate() {
-        if !*occupied {
-            *occupied = true;
-            return u64::try_from(index + 1).map_err(|_| {
-                CompositionError::InvalidConfiguration(
-                    "watchdog backup control slot index exceeds the bounded counter".to_owned(),
-                )
-            });
-        }
-    }
-    Err(CompositionError::InvalidConfiguration(
-        "watchdog backup control exceeds its bounded registration table".to_owned(),
-    ))
-}
-
-/// Returns whether one bounded slot is currently reserved.
-fn slot_is_registered(slot: u64) -> bool {
-    if slot == 0 || slot > MAX_BACKUP_CONTROL_HANDLES {
-        return false;
-    }
-    let Ok(index) = usize::try_from(slot - 1) else {
-        return false;
-    };
-    lock_slots().is_ok_and(|slots| slots.get(index).copied().unwrap_or(false))
-}
-
-/// Releases one bounded registration slot; releasing a free slot is a no-op.
-fn release_registration_slot(slot: u64) {
-    let Ok(index) = usize::try_from(slot.saturating_sub(1)) else {
-        return;
-    };
-    if let Ok(mut slots) = lock_slots()
-        && let Some(occupied) = slots.get_mut(index)
-    {
-        *occupied = false;
-    }
-}
-
-fn lock_slots()
--> Result<std::sync::MutexGuard<'static, [bool; REGISTRATION_SLOT_COUNT]>, CompositionError> {
-    REGISTRATION_SLOTS.lock().map_err(|_| {
-        CompositionError::InvalidConfiguration(
-            "watchdog backup control cannot read its bounded registration table".to_owned(),
-        )
-    })
-}
-
-fn lock_closed() -> Result<std::sync::MutexGuard<'static, bool>, CompositionError> {
-    REGISTRATION_CLOSED.lock().map_err(|_| {
-        CompositionError::InvalidConfiguration(
-            "watchdog backup control cannot read its lifecycle state".to_owned(),
-        )
-    })
 }

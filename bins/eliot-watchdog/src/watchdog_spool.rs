@@ -289,7 +289,10 @@ impl WatchdogSpool {
     ///   reference.
     /// - A capture whose bounded work would exceed `limits.max_work_units` is
     ///   refused, so the admitted work ceiling is consulted against the real
-    ///   retained member count instead of only being shape-validated.
+    ///   retained member count instead of only being shape-validated. For the
+    ///   admitted default window that ceiling equals the retention ceiling this
+    ///   owner already enforces, so it is a safety net against an over-limit or
+    ///   corrupt spool rather than a bound that binds an ordinary capture.
     ///
     /// The owner-held installation identity, generation, and admitted
     /// requester are bound by the composition's owner-bound
@@ -347,9 +350,14 @@ impl WatchdogSpool {
         let high_water = read_high_water(&high_water)?
             .ok_or_else(|| SpoolError::Corrupt("high-water metadata is missing".to_owned()))?;
         validate_high_water(&header, &entries, high_water)?;
-        // The bounded work ceiling is consulted against the real retained
-        // member count, so an admitted capture window can never be exceeded by
-        // the retained set it is applied to.
+        // The work ceiling is consulted against the real retained member count
+        // rather than only shape-validated, so a capture over an over-limit or
+        // corrupt spool fails closed here instead of reading an unbounded set.
+        // It is a safety net, not a binding production bound: the owner port
+        // admits `max_work_units == BACKUP_MAX_WORK_UNITS`, which equals the
+        // `SPOOL_MAX_RECORDS` retention ceiling this same spool enforces, so for
+        // an admitted capture the comparison can only trip when the retained
+        // set is itself over the ceiling.
         let capture_work = u64::try_from(entries.len()).map_err(|_| {
             SpoolError::Corrupt(
                 "watchdog spool backup capture work exceeds the bounded counter".to_owned(),
