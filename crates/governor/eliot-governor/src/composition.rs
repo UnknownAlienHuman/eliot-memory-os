@@ -19,7 +19,9 @@ use crate::controlboard_projection::{
 };
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
-use crate::owner_closure_feed::{OwnerPublishPort, synchronize_owner_feed};
+use crate::owner_closure_feed::{
+    OwnerPublishPort, synchronize_owner_feed, synchronize_owner_feed_with_canonical_receipts,
+};
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
 use crate::scope_identity_admission::{
     ensure_snapshot_fresh, guard_recovery_error, require_fresh_matched_binding,
@@ -67,7 +69,10 @@ use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
 use eliot_protocol::RequestIdentity;
-use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
+use eliot_receipts::{GrantClosureReceipt, ReceiptIdentity};
+use eliot_runtime_contracts::{
+    AuthorityActivationReceipt, AuthorityRevocationReceipt, AuthorityState,
+};
 use eliot_security_contracts::PrivacyClass;
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
@@ -106,8 +111,9 @@ pub use authority_recovery::{
 #[path = "authority_revocation.rs"]
 mod authority_revocation;
 pub use authority_revocation::{
-    authority_revocation_envelope, decode_revocation_history_evidence,
-    revocation_history_read_request,
+    AUTHORITY_REVOCATION_KERNEL_FIRST_REASON, authority_revocation_envelope,
+    authority_revocation_envelope_from_closure, canonical_receipt_identity,
+    decode_revocation_history_evidence, revocation_history_read_request,
 };
 #[path = "genesis_owner_packet.rs"]
 mod genesis_owner_packet;
@@ -164,6 +170,31 @@ pub enum KernelPortError {
     /// The authenticated Kernel generation is not currently admitted.
     #[error("Kernel generation is not admitted: {0}")]
     NotAdmitted(String),
+}
+
+/// Narrow durable boundary for the canonical second phase of a grant
+/// closure. The Kernel-side adapter must delegate this call to
+/// `eliot_ors::OperationalRecoveryStore::link_grant_closure_canonical_receipt`;
+/// Governor never edits the first-phase closure row.
+pub trait GrantClosureCanonicalLinkPort: Send + Sync {
+    /// Links the exact Store-issued `ReceiptIdentity` to the immutable
+    /// first-phase closure operation.
+    fn link_grant_closure_canonical_receipt(
+        &self,
+        operation_id: &eliot_ors::OperationIdentity,
+        canonical_receipt: &ReceiptIdentity,
+    ) -> Result<eliot_ors::GrantClosureProjection, KernelPortError>;
+}
+
+/// Readback boundary for the durable closure committed by the first P-07
+/// phase. A caller-provided closure is not accepted by the reconciliation
+/// method; the Kernel/ORS adapter must return the exact committed receipt.
+pub trait GrantClosureReceiptPort: Send + Sync {
+    /// Reads the committed closure for the exact revocation request.
+    fn grant_closure_receipt(
+        &self,
+        request: &GrantRevocationRequest,
+    ) -> Result<GrantClosureReceipt, KernelPortError>;
 }
 
 /// Explicit Kernel-owned recovery route used before Governor readiness.
@@ -3193,6 +3224,17 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
         .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let authority_snapshot: AuthorityOwnerSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Authority)?;
+        let authority_snapshot =
+            if let Some(owner_hydrations) = authority_snapshot.owner_hydrations.clone() {
+                AuthorityOwnerSnapshot::new_with_owner_hydrations(
+                    authority_snapshot.state_fence.clone(),
+                    authority_snapshot.grant_graph.clone(),
+                    authority_snapshot.effect_authorizer.clone(),
+                    owner_hydrations,
+                )?
+            } else {
+                authority_snapshot
+            };
         let authority = AuthorityOwner::from_snapshot(&authority_snapshot, state_fence)?;
         let budget_read_revision = recovery.owner_read(RecoveryOwner::Budget)?.revision;
         let budget_snapshot: BudgetOwnerSnapshot =
@@ -3716,6 +3758,27 @@ pub(crate) fn evaluate_testd_verification_current(
     })?;
     normalize_nextest_run(&mut run, job, plan, receipt, &raw, finished_at)?;
     Ok(run)
+}
+
+/// The typed terminal result of one production authority request dispatched
+/// through [`GovernorComposition::apply_authority_request`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthorityActionReceipt {
+    /// A validated Kernel activation receipt.
+    Activation(AuthorityActivationReceipt),
+    /// A validated Kernel revocation receipt.
+    Revocation(AuthorityRevocationReceipt),
+}
+
+/// The three durable phases of one grant revocation saga.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthorityRevocationReconciliation {
+    /// Kernel-issued first-phase revocation receipt.
+    pub authority_receipt: AuthorityRevocationReceipt,
+    /// Canonical write receipt proving the second phase committed.
+    pub canonical_receipt: WriteReceipt,
+    /// ORS projection carrying the exact second-phase link.
+    pub closure_projection: eliot_ors::GrantClosureProjection,
 }
 
 impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
@@ -5232,6 +5295,31 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         self.authority_activation.is_some()
     }
 
+    /// Dispatches one exact durable authority request through the retained
+    /// production P-07 port. The daemon composition root owns construction of
+    /// the request from its admitted canonical source; this method is the
+    /// single application seam that gives all four authority operations a
+    /// production caller without reimplementing receipt reconciliation.
+    pub fn apply_authority_request(
+        &mut self,
+        request: PresentedAuthorityRequest,
+    ) -> Result<AuthorityActionReceipt, CompositionError> {
+        match request {
+            PresentedAuthorityRequest::GrantActivation(request) => self
+                .activate_grant(&request)
+                .map(AuthorityActionReceipt::Activation),
+            PresentedAuthorityRequest::GrantRevocation(request) => self
+                .revoke_grant(&request)
+                .map(AuthorityActionReceipt::Revocation),
+            PresentedAuthorityRequest::IntroductionActivation(request) => self
+                .activate_introduction(&request)
+                .map(AuthorityActionReceipt::Activation),
+            PresentedAuthorityRequest::IntroductionRevocation(request) => self
+                .revoke_introduction(&request)
+                .map(AuthorityActionReceipt::Revocation),
+        }
+    }
+
     /// Presents one canonical grant activation to the retained P-07 port and
     /// records `PendingActivation -> Active` only after the exact
     /// Kernel-issued receipt validates `Active`.
@@ -5310,6 +5398,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .grants
             .revoke(&request.grant_id)
             .is_ok();
+        if graph_reconciled {
+            self.owners.authority.invalidate_owner_hydrations();
+        }
         let retained = self.retain_presentation(presented)?;
         if !graph_reconciled {
             // Kernel already fenced this grant (the receipt above validated),
@@ -5332,6 +5423,83 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             ));
         }
         Ok(receipt)
+    }
+
+    /// Runs the complete grant-revocation saga in its required order.
+    ///
+    /// The retained P-07 port first requests the exact graph revision and
+    /// durable descendant closure from Kernel/ORS. Only after that receipt is
+    /// validated does Governor compile the canonical declaration from the
+    /// durable [`GrantClosureReceipt`] and commit it. The Store-issued
+    /// canonical receipt identity is finally linked to the immutable ORS
+    /// first-phase row.
+    pub async fn revoke_grant_and_reconcile<
+        L: GrantClosureCanonicalLinkPort + ?Sized,
+        C: GrantClosureReceiptPort + ?Sized,
+    >(
+        &mut self,
+        request: &GrantRevocationRequest,
+        canonical_operation_id: &OperationId,
+        canonical_request_identity: &RequestIdentity,
+        durable_link: &L,
+        closure_source: &C,
+    ) -> Result<AuthorityRevocationReconciliation, CompositionError> {
+        // The first call is intentionally before the closure readback and
+        // before canonical envelope construction: Kernel/ORS must fence the
+        // exact graph revision first.
+        let authority_receipt = self.revoke_grant(request)?;
+        let closure = closure_source.grant_closure_receipt(request)?;
+        closure
+            .validate()
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        if closure.state != eliot_receipts::GrantClosureState::Revoked
+            || closure.declaration.target_grant_id != request.grant_id.as_str()
+            || closure.authority_receipt.snapshot_id != request.snapshot_id.as_str()
+            || closure.authority.state_fence != request.binding.state_fence
+            || canonical_request_identity.request.metadata.state_fence
+                != closure.authority.state_fence
+        {
+            return Err(CompositionError::Recovery(
+                "grant revocation closure does not bind the exact request, snapshot, and fence"
+                    .to_owned(),
+            ));
+        }
+        if authority_receipt.revocation_id != closure.authority_receipt.receipt_id
+            || authority_receipt.snapshot_id != closure.authority_receipt.snapshot_id
+            || !authority_receipt
+                .authority_epoch
+                .is_same_authority(&closure.authority.state_fence.authority_epoch)
+            || authority_receipt.state != AuthorityState::Revoked
+        {
+            return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+        }
+        let envelope = authority_revocation_envelope_from_closure(
+            canonical_request_identity,
+            canonical_operation_id,
+            &closure,
+        )?;
+        let canonical_receipt = self
+            .commit_canonical(canonical_request_identity, envelope)
+            .await?;
+        let receipt_identity = canonical_receipt_identity(&canonical_receipt)?;
+        let closure_operation_id = eliot_ors::OperationIdentity::new(closure.operation_id.as_str())
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let closure_projection = durable_link
+            .link_grant_closure_canonical_receipt(&closure_operation_id, &receipt_identity)?;
+        if closure_projection.commit().operation_id != closure.operation_id
+            || closure_projection.commit().declaration != closure.declaration
+            || closure_projection.second_phase() != Some(&receipt_identity)
+        {
+            return Err(CompositionError::Recovery(
+                "durable second-phase readback does not bind the canonical closure receipt"
+                    .to_owned(),
+            ));
+        }
+        Ok(AuthorityRevocationReconciliation {
+            authority_receipt,
+            canonical_receipt,
+            closure_projection,
+        })
     }
 
     /// Presents one canonical introduction activation to the retained P-07
@@ -5560,7 +5728,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self,
         reads: &R,
         kernel: &K,
-        origin_ref: &str,
+        origin_refs: &[String],
         max_records: u32,
         expected_revision: u64,
     ) -> Result<u64, CompositionError> {
@@ -5571,9 +5739,40 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             kernel,
             snapshot,
             &state_fence,
-            origin_ref,
+            origin_refs,
             max_records,
             expected_revision,
+        )
+        .await
+    }
+
+    /// Synchronizes the Kernel P-07 owner with canonical second-phase links
+    /// read from the durable ORS boundary. The legacy method above remains the
+    /// fail-closed empty-link entry point; a production caller that has read
+    /// completed links must use this method.
+    pub async fn synchronize_kernel_owner_with_canonical_receipts<
+        R: CanonicalReadClient + ?Sized,
+        K: OwnerPublishPort + ?Sized,
+    >(
+        &self,
+        reads: &R,
+        kernel: &K,
+        origin_refs: &[String],
+        max_records: u32,
+        expected_revision: u64,
+        canonical_receipts: BTreeMap<String, ReceiptIdentity>,
+    ) -> Result<u64, CompositionError> {
+        let snapshot = self.owners.authority.snapshot()?;
+        let state_fence = self.snapshot.state_fence();
+        synchronize_owner_feed_with_canonical_receipts(
+            reads,
+            kernel,
+            snapshot,
+            &state_fence,
+            origin_refs,
+            max_records,
+            expected_revision,
+            canonical_receipts,
         )
         .await
     }

@@ -333,7 +333,31 @@ impl KernelComposition {
             .map_err(&terminal)
     }
 
-    /// Binds the canonical Governor closure owner to the P-07 port (`#2100`).
+    /// Initializes one owner-lineage graph revision before the first
+    /// revocation-history read. The operation is idempotent for the same
+    /// revision and refuses a lower presentation; it does not bind an owner
+    /// or grant authority by itself.
+    pub fn initialize_p07_owner_revision(
+        &self,
+        authority_root_ref: &str,
+        expected_revision: u64,
+        state_fence: &StateFence,
+    ) -> Result<u64, KernelBuildError> {
+        if expected_revision == 0 || authority_root_ref.trim().is_empty() {
+            return Err(KernelBuildError::Core(
+                "owner revision initialization requires a root and nonzero revision".to_owned(),
+            ));
+        }
+        state_fence
+            .validate()
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        let label = eliot_ors::OpaqueLabel::new(authority_root_ref)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        self.p07_ors
+            .note_grant_graph_revision(&label, expected_revision)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))
+    }
+
     ///
     /// The Governor feed publishes the restore bundle plus the exact
     /// expected graph revision; this method binds the port through the
@@ -413,18 +437,47 @@ impl KernelComposition {
                 "P-07 owner refresh requires a bound owner".to_owned(),
             ));
         };
-        let digest = owner_bundle_digest(&restore)
-            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
-        self.check_owner_digest_agreement(expected_revision, &digest)?;
-        bound
-            .refresh(restore, expected_revision, &store)
-            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
-        let revision = bound.bound_revision();
-        self.p07_owner_digest
-            .lock()
-            .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
-            .replace(digest);
-        Ok(revision)
+        let result = (|| {
+            let digest = owner_bundle_digest(&restore)
+                .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+            let retained_digest = self
+                .p07_owner_digest
+                .lock()
+                .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
+                .clone();
+            if expected_revision == bound.bound_revision()
+                && retained_digest.as_deref() != Some(digest.as_str())
+            {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    "kernel.composition.p07_owner_digest_conflict",
+                );
+                return Err(KernelBuildError::Core(
+                    "same-revision owner bundle digest disagreement".to_owned(),
+                ));
+            }
+            bound
+                .refresh(restore, expected_revision, &store)
+                .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+            Ok((bound.bound_revision(), digest))
+        })();
+        match result {
+            Ok((revision, digest)) => {
+                let mut retained = self.p07_owner_digest.lock().map_err(|_| {
+                    KernelBuildError::Service("P-07 owner lock poisoned".to_owned())
+                })?;
+                *retained = Some(digest);
+                Ok(revision)
+            }
+            Err(error) => {
+                *guard = None;
+                drop(guard);
+                if let Ok(mut retained) = self.p07_owner_digest.lock() {
+                    *retained = None;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Rebinds the P-07 owner after a restart: binds when no owner is
@@ -473,30 +526,6 @@ impl KernelComposition {
             }
             _ => (false, None, None),
         }
-    }
-
-    /// Refuses a same-revision presentation carrying different bytes.
-    ///
-    /// Rotation is proven by revision advance or exact-digest equality;
-    /// a matching revision with a disagreeing digest is a conflicting
-    /// presentation, never a silent replacement. Unbound compositions
-    /// have nothing to disagree with and pass through to bind.
-    fn check_owner_digest_agreement(
-        &self,
-        expected_revision: u64,
-        digest: &str,
-    ) -> Result<(), KernelBuildError> {
-        let (bound, revision, retained) = self.p07_owner_readback();
-        if bound && revision == Some(expected_revision) && retained.as_deref() != Some(digest) {
-            observe_entrypoint_with_detail(
-                EntrypointStage::Composition,
-                "kernel.composition.p07_owner_digest_conflict",
-            );
-            return Err(KernelBuildError::Core(
-                "same-revision owner bundle digest disagreement".to_owned(),
-            ));
-        }
-        Ok(())
     }
 
     fn assemble_with_process_authority(

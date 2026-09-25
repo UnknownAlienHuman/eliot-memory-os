@@ -34,7 +34,8 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use eliot_authority::{GrantGraph, GrantGraphRecoverySnapshot, GrantId, RevocationHistoryEvidence};
+use eliot_authority::{GrantGraphRecoverySnapshot, RevocationHistoryEvidence};
+use eliot_receipts::{GrantClosureDeclaration, ReceiptIdentity};
 
 use crate::error::{KernelError, validate_id};
 use crate::grant_activation_port::{
@@ -61,9 +62,10 @@ use crate::introduction_lifecycle::IntroductionHydration;
 /// - `introductions` are the complete introduction hydrations the service
 ///   resolved, keyed by introduction identity on restore;
 /// - `preserved` are the owner-declared alternate-path survivors keyed by
-///   closure target grant identity.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+///   closure target grant identity;
+/// - `canonical_receipts` are completed canonical second-phase receipt
+///   identities keyed by the immutable ORS closure operation identity.
+#[derive(Clone, Debug)]
 pub struct GovernorClosureRestore {
     /// Durable grant-graph snapshot the closure is enumerated from.
     pub graph_snapshot: GrantGraphRecoverySnapshot,
@@ -82,19 +84,102 @@ pub struct GovernorClosureRestore {
     /// introduction activation from this material; absent material stays a
     /// typed refusal, never a fabricated introduction.
     pub introductions: Vec<IntroductionHydration>,
+    /// Complete versioned owner declarations keyed by target identity. The
+    /// Kernel indexes these declarations and never re-derives semantic graph
+    /// membership from process-local state.
+    pub declarations: Vec<GrantClosureDeclaration>,
     /// Owner-declared alternate-path survivors keyed by closure target
     /// grant identity.
     pub preserved: Vec<(String, Vec<GrantClosureSurvivor>)>,
+    /// Exact canonical store receipt identities whose second phase has
+    /// completed, keyed by ORS grant-closure operation identity.
+    ///
+    /// An absent entry leaves the committed first phase explicitly pending.
+    /// The Kernel never derives either value from a closure request or
+    /// fabricates a receipt when the owner has not completed canonical
+    /// reconciliation.
+    pub canonical_receipts: BTreeMap<String, ReceiptIdentity>,
+}
+
+/// Stable schema identity for the Governor-to-Kernel closure restore wire.
+pub const GOVERNOR_CLOSURE_RESTORE_SCHEMA: &str = "eliot.kernel.governor-closure-restore";
+/// Current Governor-to-Kernel closure restore wire version.
+pub const GOVERNOR_CLOSURE_RESTORE_VERSION: u16 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GovernorClosureRestoreWire {
+    schema: String,
+    version: u16,
+    graph_snapshot: GrantGraphRecoverySnapshot,
+    revocation_history: Option<RevocationHistoryEvidence>,
+    members: Vec<GrantClosureMember>,
+    roots: Vec<RootGrantHydration>,
+    introductions: Vec<IntroductionHydration>,
+    declarations: Vec<GrantClosureDeclaration>,
+    preserved: Vec<(String, Vec<GrantClosureSurvivor>)>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    canonical_receipts: BTreeMap<String, ReceiptIdentity>,
+}
+
+impl serde::Serialize for GovernorClosureRestore {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        GovernorClosureRestoreWire {
+            schema: GOVERNOR_CLOSURE_RESTORE_SCHEMA.to_owned(),
+            version: GOVERNOR_CLOSURE_RESTORE_VERSION,
+            graph_snapshot: self.graph_snapshot.clone(),
+            revocation_history: self.revocation_history.clone(),
+            members: self.members.clone(),
+            roots: self.roots.clone(),
+            introductions: self.introductions.clone(),
+            declarations: self.declarations.clone(),
+            preserved: self.preserved.clone(),
+            canonical_receipts: self.canonical_receipts.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for GovernorClosureRestore {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = GovernorClosureRestoreWire::deserialize(deserializer)?;
+        if wire.schema != GOVERNOR_CLOSURE_RESTORE_SCHEMA
+            || wire.version != GOVERNOR_CLOSURE_RESTORE_VERSION
+        {
+            return Err(serde::de::Error::custom(
+                "governor closure restore has an unsupported schema or version",
+            ));
+        }
+        Ok(Self {
+            graph_snapshot: wire.graph_snapshot,
+            revocation_history: wire.revocation_history,
+            members: wire.members,
+            roots: wire.roots,
+            introductions: wire.introductions,
+            declarations: wire.declarations,
+            preserved: wire.preserved,
+            canonical_receipts: wire.canonical_receipts,
+        })
+    }
 }
 
 /// Admitted material behind one [`GovernorClosureSource`].
 #[derive(Debug)]
 struct AdmittedClosureState {
-    graph: GrantGraph,
+    revision: u64,
+    authority_roots: Vec<String>,
+    revoked_grants: Vec<String>,
+    non_admissible: BTreeSet<String>,
+    declarations: BTreeMap<String, GrantClosureDeclaration>,
     members: BTreeMap<String, GrantClosureMember>,
     roots: BTreeMap<String, RootGrantHydration>,
     introductions: BTreeMap<String, IntroductionHydration>,
-    preserved: BTreeMap<String, Vec<GrantClosureSurvivor>>,
 }
 
 /// Production [`RootGrantHydrationSource`] reading the restored durable
@@ -152,20 +237,24 @@ impl GovernorClosureSource {
     /// closure from an unbound revision.
     #[must_use]
     pub fn revision(&self) -> u64 {
-        self.lock_state().graph.revision()
+        self.lock_state().revision
     }
 
     /// Returns the distinct lineage roots admitted in the current restore, in
     /// sorted order.
     ///
-    /// Roots are collected from the admitted member, root, and introduction
-    /// intents the Governor service resolved; the graph itself is never
-    /// re-derived here. The bootstrap advances the durable per-root revision
-    /// watermark for exactly these roots.
+    /// Roots are collected from the canonical graph snapshot plus admitted
+    /// member, root, and introduction intents. The graph is never traversed or
+    /// re-derived here; the snapshot only supplies closed lineage scope. The
+    /// bootstrap advances the durable per-root revision watermark for exactly
+    /// these roots.
     #[must_use]
     pub fn authority_roots(&self) -> Vec<String> {
         let state = self.lock_state();
         let mut roots = BTreeSet::new();
+        for root in &state.authority_roots {
+            roots.insert(root.clone());
+        }
         for member in state.members.values() {
             roots.insert(member.intent.authority_root_ref.clone());
         }
@@ -178,41 +267,82 @@ impl GovernorClosureSource {
         roots.into_iter().collect()
     }
 
+    /// Returns every grant suppressed by the exact restored graph revision
+    /// and current revocation history in sorted order.
+    ///
+    /// The Kernel bootstrap uses this closed set to require a matching durable
+    /// fence and closure receipt before it publishes the owner. A revoked
+    /// identity missing from ORS therefore remains recovery-required instead
+    /// of becoming admissible from process-local absence.
+    #[must_use]
+    pub fn revoked_grants(&self) -> Vec<String> {
+        self.lock_state().revoked_grants.clone()
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "restore validation keeps history, declarations, hydrations, and alternate paths in one fail-closed sequence"
+    )]
     fn admit(restore: GovernorClosureRestore) -> Result<AdmittedClosureState, KernelError> {
+        validate_canonical_receipt_links(&restore.canonical_receipts)?;
         let history = restore.revocation_history.as_ref().ok_or_else(|| {
             KernelError::RecoveryUnavailable(
                 "closure owner revocation history is unavailable; unavailable history is not absence of revocation".to_owned(),
             )
         })?;
-        // Preserved-survivor graph membership (C73-F1): every preserved
-        // entry must name known lineage in the restored snapshot — the
-        // target, the survivor, and the covering grant — mirroring the
-        // provider-side admission check. Coverage currency at the closure
-        // revision is proven port-side (see `prove_survivor_membership`
-        // in the P-07 port); this gate keeps unknown identities from
-        // ever becoming admitted survivor evidence.
-        for (target, survivors) in &restore.preserved {
-            for survivor in survivors {
-                check_preserved_membership(&restore.graph_snapshot, target, survivor)?;
-            }
-        }
-        let outcome = GrantGraph::from_recovery_snapshot_with_revocation_history(
-            restore.graph_snapshot,
-            Some(history),
-        )
-        .map_err(|error| KernelError::RecoveryUnavailable(error.to_string()))?;
+        let graph_snapshot = restore.graph_snapshot;
+        graph_snapshot
+            .validate()
+            .map_err(|error| KernelError::RecoveryUnavailable(error.to_string()))?;
+        let validated_history = history
+            .require_current()
+            .map_err(|error| KernelError::RecoveryUnavailable(error.to_string()))?;
+        let revision = graph_snapshot.revision;
+        let mut revoked_grants = validated_history
+            .into_iter()
+            .flat_map(|closure| closure.affected)
+            .collect::<Vec<_>>();
+        revoked_grants.extend(graph_snapshot.revoked.iter().cloned());
+        revoked_grants.extend(
+            graph_snapshot
+                .grants
+                .iter()
+                .filter(|grant| grant.status == eliot_authority::GrantStatus::Revoked)
+                .map(|grant| grant.grant_id.clone()),
+        );
+        revoked_grants.sort();
+        revoked_grants.dedup();
+        let mut non_admissible = revoked_grants.iter().cloned().collect::<BTreeSet<_>>();
+        non_admissible.extend(
+            graph_snapshot
+                .grants
+                .iter()
+                .filter(|grant| {
+                    matches!(
+                        grant.status,
+                        eliot_authority::GrantStatus::Revoked
+                            | eliot_authority::GrantStatus::Stale
+                            | eliot_authority::GrantStatus::Expired
+                    )
+                })
+                .map(|grant| grant.grant_id.clone()),
+        );
+
+        let mut hydration_operations = BTreeSet::new();
         let mut members = BTreeMap::new();
         for member in restore.members {
             validate_id(&member.intent.grant_id, "restore.member.grant_id")?;
-            // Opaque↔intent seal at the trust-anchor entry: contour plus
-            // shape/integrity reconstruction before the bytes become the
-            // enumeration authority. Epoch agreement re-runs port-side at
-            // every use.
             verify_admitted_grant_seal(
                 &member.intent.grant_id,
                 &member.intent.operation_id,
                 member.durable_record.record(),
             )?;
+            if !hydration_operations.insert(member.intent.operation_id.clone()) {
+                return Err(KernelError::InvalidField {
+                    field: "restore.member.operation_id",
+                    reason: "duplicate owner hydration operation identity",
+                });
+            }
             if members
                 .insert(member.intent.grant_id.clone(), member)
                 .is_some()
@@ -231,6 +361,12 @@ impl GovernorClosureSource {
                 &root.intent.operation_id,
                 root.durable_record.record(),
             )?;
+            if !hydration_operations.insert(root.intent.operation_id.clone()) {
+                return Err(KernelError::InvalidField {
+                    field: "restore.root.operation_id",
+                    reason: "duplicate owner hydration operation identity",
+                });
+            }
             if roots.insert(root.intent.grant_id.clone(), root).is_some() {
                 return Err(KernelError::InvalidField {
                     field: "restore.roots",
@@ -238,15 +374,11 @@ impl GovernorClosureSource {
                 });
             }
         }
-        let mut preserved = BTreeMap::new();
-        for (target, survivors) in restore.preserved {
-            validate_id(&target, "restore.preserved.target")?;
-            if preserved.insert(target.clone(), survivors).is_some() {
-                return Err(KernelError::InvalidField {
-                    field: "restore.preserved",
-                    reason: "duplicate preserved closure target",
-                });
-            }
+        if members.keys().any(|grant_id| roots.contains_key(grant_id)) {
+            return Err(KernelError::InvalidField {
+                field: "restore.hydration",
+                reason: "a grant identity cannot be both a member and a root hydration",
+            });
         }
         let mut introductions = BTreeMap::new();
         for hydration in restore.introductions {
@@ -260,6 +392,12 @@ impl GovernorClosureSource {
                 &hydration.intent.operation_id,
                 hydration.durable_record.record(),
             )?;
+            if !hydration_operations.insert(hydration.intent.operation_id.clone()) {
+                return Err(KernelError::InvalidField {
+                    field: "restore.introduction.operation_id",
+                    reason: "duplicate owner hydration operation identity",
+                });
+            }
             if introductions
                 .insert(hydration.intent.introduction_id.clone(), hydration)
                 .is_some()
@@ -270,12 +408,160 @@ impl GovernorClosureSource {
                 });
             }
         }
+        if members
+            .keys()
+            .chain(roots.keys())
+            .any(|identity| introductions.contains_key(identity))
+        {
+            return Err(KernelError::InvalidField {
+                field: "restore.hydration",
+                reason: "grant and introduction identities must be disjoint",
+            });
+        }
+        let mut preserved = BTreeMap::new();
+        for (target, survivors) in restore.preserved {
+            validate_id(&target, "restore.preserved.target")?;
+            for survivor in &survivors {
+                check_preserved_membership(&graph_snapshot, &target, survivor)?;
+            }
+            if preserved.insert(target, survivors).is_some() {
+                return Err(KernelError::InvalidField {
+                    field: "restore.preserved",
+                    reason: "duplicate preserved closure target",
+                });
+            }
+        }
+
+        let mut declarations = BTreeMap::new();
+        for declaration in restore.declarations {
+            if non_admissible.contains(declaration.target_grant_id.as_str()) {
+                return Err(KernelError::RecoveryUnavailable(
+                    "owner declaration names a non-admissible grant target".to_owned(),
+                ));
+            }
+            declaration
+                .validate()
+                .map_err(|error| KernelError::RecoveryUnavailable(error.to_string()))?;
+            if declaration.grant_graph_revision != revision {
+                return Err(KernelError::InvalidField {
+                    field: "restore.declaration.grant_graph_revision",
+                    reason: "declaration revision disagrees with the owner snapshot",
+                });
+            }
+            let declared_survivors =
+                preserved
+                    .get(&declaration.target_grant_id)
+                    .ok_or(KernelError::InvalidField {
+                        field: "restore.declaration.preserved",
+                        reason: "declaration requires an exact alternate-path projection",
+                    })?;
+            if &declaration.preserved != declared_survivors {
+                return Err(KernelError::InvalidField {
+                    field: "restore.declaration.preserved",
+                    reason: "declaration and alternate-path projection disagree",
+                });
+            }
+            for declared in &declaration.members {
+                let graph_member = graph_snapshot
+                    .grants
+                    .iter()
+                    .find(|grant| grant.grant_id == declared.grant_id)
+                    .ok_or_else(|| {
+                        KernelError::RecoveryUnavailable(
+                            "closure declaration names an unknown graph member".to_owned(),
+                        )
+                    })?;
+                if graph_member.parent_grant_id != declared.parent_grant_id
+                    || graph_member.authority_root_ref != declaration.authority_root_ref
+                {
+                    return Err(KernelError::InvalidField {
+                        field: "restore.declaration.members",
+                        reason: "declaration disagrees with canonical parent/root identity",
+                    });
+                }
+                let hydration = members
+                    .get(&declared.grant_id)
+                    .map(|member| &member.intent)
+                    .or_else(|| roots.get(&declared.grant_id).map(|root| &root.intent))
+                    .ok_or_else(|| {
+                        KernelError::RecoveryUnavailable(
+                            "closure declaration member has no admitted hydration".to_owned(),
+                        )
+                    })?;
+                if hydration.parent_grant_id != declared.parent_grant_id
+                    || hydration.authority_root_ref != declaration.authority_root_ref
+                    || hydration.grant_graph_revision != revision
+                    || declaration.proof_ceiling > hydration.proof_ceiling
+                    || declaration.proof_ceiling > hydration.binding.proof_ceiling
+                {
+                    return Err(KernelError::InvalidField {
+                        field: "restore.declaration.members",
+                        reason: "member hydration disagrees with the owner declaration",
+                    });
+                }
+            }
+            if declarations
+                .insert(declaration.target_grant_id.clone(), declaration)
+                .is_some()
+            {
+                return Err(KernelError::InvalidField {
+                    field: "restore.declarations",
+                    reason: "duplicate owner closure declaration",
+                });
+            }
+        }
+        let declared_member_ids = declarations
+            .values()
+            .flat_map(|declaration| {
+                declaration
+                    .members
+                    .iter()
+                    .map(|member| member.grant_id.as_str())
+            })
+            .collect::<BTreeSet<_>>();
+        for grant_id in members.keys().chain(roots.keys()) {
+            if !declared_member_ids.contains(grant_id.as_str())
+                && !non_admissible.contains(grant_id.as_str())
+            {
+                return Err(KernelError::RecoveryUnavailable(
+                    "owner hydration exists outside a complete closure declaration".to_owned(),
+                ));
+            }
+        }
+        for target in preserved.keys() {
+            if !declarations.contains_key(target) {
+                return Err(KernelError::InvalidField {
+                    field: "restore.preserved",
+                    reason: "alternate-path target has no owner declaration",
+                });
+            }
+        }
+        for grant in &graph_snapshot.grants {
+            if !non_admissible.contains(grant.grant_id.as_str())
+                && !declarations.contains_key(&grant.grant_id)
+            {
+                return Err(KernelError::RecoveryUnavailable(
+                    "current canonical grant has no complete owner closure declaration".to_owned(),
+                ));
+            }
+        }
+
+        let authority_roots = graph_snapshot
+            .grants
+            .iter()
+            .map(|grant| grant.authority_root_ref.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         Ok(AdmittedClosureState {
-            graph: outcome.graph,
+            revision,
+            authority_roots,
+            revoked_grants,
+            non_admissible,
+            declarations,
             members,
             roots,
             introductions,
-            preserved,
         })
     }
 
@@ -284,6 +570,34 @@ impl GovernorClosureSource {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Validates owner-presented canonical second-phase identities before the
+/// restore becomes a trust anchor. The owner supplies both the immutable ORS
+/// closure operation identity and the exact canonical receipt identity; this
+/// adapter validates their shape but never derives or synthesizes either.
+fn validate_canonical_receipt_links(
+    links: &BTreeMap<String, ReceiptIdentity>,
+) -> Result<(), KernelError> {
+    for (operation_id, receipt) in links {
+        validate_id(operation_id, "restore.canonical_receipt.operation_id")?;
+        validate_id(
+            receipt.receipt_id.as_str(),
+            "restore.canonical_receipt.receipt_id",
+        )?;
+        if receipt.canonical_sha256.len() != 64
+            || !receipt
+                .canonical_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(KernelError::InvalidField {
+                field: "restore.canonical_receipt.canonical_sha256",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Proves the opaque↔intent seal for one admitted grant record at the
@@ -374,6 +688,11 @@ impl RootGrantHydrationSource for GovernorClosureSource {
         request: &eliot_authority::GrantActivationRequest,
     ) -> Result<RootGrantHydration, KernelError> {
         let state = self.lock_state();
+        if state.non_admissible.contains(request.grant_id.as_str()) {
+            return Err(KernelError::RecoveryUnavailable(
+                "non-admissible root hydration cannot be restored".to_owned(),
+            ));
+        }
         state
             .roots
             .get(request.grant_id.as_str())
@@ -420,6 +739,16 @@ impl RootGrantHydrationSource for GovernorClosureSource {
                         .to_owned(),
                 )
             })?;
+        if hydration
+            .intent
+            .supporting_grant_ids
+            .iter()
+            .any(|grant_id| state.non_admissible.contains(grant_id))
+        {
+            return Err(KernelError::RecoveryUnavailable(
+                "introduction support includes a non-admissible grant".to_owned(),
+            ));
+        }
         // Exact-identity agreement, mirroring the root hydration gate: the
         // admitted hydration must name the requested introduction, snapshot,
         // and binding, or the request does not describe admitted authority.
@@ -435,39 +764,121 @@ impl RootGrantHydrationSource for GovernorClosureSource {
         Ok(hydration)
     }
 
+    fn hydrate_grant_member(&self, grant_id: &str) -> Result<GrantClosureMember, KernelError> {
+        validate_id(grant_id, "grant_id")?;
+        let state = self.lock_state();
+        if state.non_admissible.contains(grant_id) {
+            return Err(KernelError::RecoveryUnavailable(
+                "non-admissible grant hydration cannot be restored".to_owned(),
+            ));
+        }
+        if let Some(member) = state.members.get(grant_id) {
+            return Ok(member.clone());
+        }
+        state
+            .roots
+            .get(grant_id)
+            .map(|root| GrantClosureMember {
+                intent: root.intent.clone(),
+                durable_record: root.durable_record.clone(),
+                observed_at_ms: root.observed_at_ms,
+            })
+            .ok_or_else(|| {
+                KernelError::RecoveryUnavailable(
+                    "canonical member hydration is absent for the requested grant".to_owned(),
+                )
+            })
+    }
+
+    fn historical_grant_hydration(
+        &self,
+        grant_id: &str,
+    ) -> Result<Option<GrantClosureMember>, KernelError> {
+        validate_id(grant_id, "grant_id")?;
+        let state = self.lock_state();
+        Ok(state.members.get(grant_id).cloned().or_else(|| {
+            state.roots.get(grant_id).map(|root| GrantClosureMember {
+                intent: root.intent.clone(),
+                durable_record: root.durable_record.clone(),
+                observed_at_ms: root.observed_at_ms,
+            })
+        }))
+    }
+
+    fn admitted_grant_hydrations(&self) -> Result<Vec<GrantClosureMember>, KernelError> {
+        let state = self.lock_state();
+        let mut hydrations = state
+            .members
+            .values()
+            .cloned()
+            .collect::<Vec<GrantClosureMember>>();
+        hydrations.extend(state.roots.values().map(|root| GrantClosureMember {
+            intent: root.intent.clone(),
+            durable_record: root.durable_record.clone(),
+            observed_at_ms: root.observed_at_ms,
+        }));
+        hydrations.sort_by(|left, right| left.intent.grant_id.cmp(&right.intent.grant_id));
+        hydrations.dedup_by(|left, right| left.intent.grant_id == right.intent.grant_id);
+        hydrations.retain(|hydration| !state.non_admissible.contains(&hydration.intent.grant_id));
+        Ok(hydrations)
+    }
+
+    fn admitted_introductions(&self) -> Result<Vec<IntroductionHydration>, KernelError> {
+        let state = self.lock_state();
+        Ok(state
+            .introductions
+            .values()
+            .filter(|hydration| {
+                !hydration
+                    .intent
+                    .supporting_grant_ids
+                    .iter()
+                    .any(|grant_id| state.non_admissible.contains(grant_id))
+            })
+            .cloned()
+            .collect())
+    }
+
     fn enumerate_grant_closure(
         &self,
         grant_id: &str,
     ) -> Result<GrantClosureEnumeration, KernelError> {
         validate_id(grant_id, "grant_id")?;
-        let target = GrantId::new(grant_id).map_err(|_| KernelError::InvalidField {
-            field: "grant_id",
-            reason: "grant identity must validate",
-        })?;
         let state = self.lock_state();
-        let delegation = state
-            .graph
-            .delegated_closure(&target)
-            .map_err(|error| KernelError::RecoveryUnavailable(error.to_string()))?;
-        let mut members = Vec::with_capacity(delegation.members.len());
-        for member_ref in &delegation.members {
+        let declaration = state.declarations.get(grant_id).ok_or_else(|| {
+            KernelError::RecoveryUnavailable(
+                "no complete owner closure declaration is bound for the grant".to_owned(),
+            )
+        })?;
+        let mut members = Vec::with_capacity(declaration.members.len());
+        for declared in &declaration.members {
             let member = state
                 .members
-                .get(member_ref.grant_id.as_str())
+                .get(&declared.grant_id)
                 .cloned()
+                .or_else(|| {
+                    state
+                        .roots
+                        .get(&declared.grant_id)
+                        .map(|root| GrantClosureMember {
+                            intent: root.intent.clone(),
+                            durable_record: root.durable_record.clone(),
+                            observed_at_ms: root.observed_at_ms,
+                        })
+                })
                 .ok_or_else(|| {
                     KernelError::RecoveryUnavailable(
-                        "canonical member hydration is absent for an enumerated grant".to_owned(),
+                        "canonical member hydration is absent for an owner-declared member"
+                            .to_owned(),
                     )
                 })?;
             members.push(member);
         }
-        let preserved = state.preserved.get(grant_id).cloned().unwrap_or_default();
         Ok(GrantClosureEnumeration {
-            authority_root_ref: delegation.authority_root_ref,
-            grant_graph_revision: delegation.revision,
+            authority_root_ref: declaration.authority_root_ref.clone(),
+            grant_graph_revision: declaration.grant_graph_revision,
             members,
-            preserved,
+            preserved: declaration.preserved.clone(),
         })
     }
 }
@@ -477,7 +888,10 @@ mod tests {
     use super::*;
     use eliot_authority::{GrantGraphRecoverySnapshot, GrantRecoveryRecord, GrantStatus};
     use eliot_contracts::{ContractId, EpochLineageId, ResourceGeneration, StateFence};
-    use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling};
+    use eliot_receipts::{
+        AuthorityBinding, EffectClass, GRANT_CLOSURE_SCHEMA, GRANT_CLOSURE_VERSION,
+        GrantClosureMemberDeclaration, ProofCeiling,
+    };
     use std::num::NonZeroU64;
 
     use crate::grant_activation_port::GrantActivationIntent;
@@ -620,6 +1034,25 @@ mod tests {
             durable_record: hydration.durable_record.clone(),
             observed_at_ms: 1_000,
         };
+        // The one canonical owner declaration for the single restored graph
+        // grant. Every field is projected from the same durable material the
+        // restore carries: the snapshot revision/root/parent identity, the
+        // member intent's own ceiling, and the exact alternate-path set the
+        // owner declared (empty here, so the declaration and the projection
+        // agree byte for byte).
+        let declaration = GrantClosureDeclaration {
+            schema: GRANT_CLOSURE_SCHEMA.to_owned(),
+            version: GRANT_CLOSURE_VERSION,
+            target_grant_id: "grant-test-root".to_owned(),
+            authority_root_ref: "root-test".to_owned(),
+            grant_graph_revision: 5,
+            members: vec![GrantClosureMemberDeclaration {
+                grant_id: "grant-test-root".to_owned(),
+                parent_grant_id: None,
+            }],
+            preserved: Vec::new(),
+            proof_ceiling: ProofCeiling::ScopedVerification,
+        };
         Ok(GovernorClosureRestore {
             graph_snapshot: recovery_snapshot(&binding)?,
             revocation_history: Some(eliot_authority::RevocationHistoryEvidence {
@@ -627,10 +1060,18 @@ mod tests {
                 source_revision: 5,
                 closures: Vec::new(),
             }),
+            // One admitted grant identity cannot be both a closure member and a
+            // single-root hydration, so this grant is admitted as the closure
+            // member the enumeration test reads back.
             members: vec![member],
-            roots: vec![hydration],
+            roots: Vec::new(),
             introductions: Vec::new(),
-            preserved: Vec::new(),
+            declarations: vec![declaration],
+            preserved: vec![("grant-test-root".to_owned(), Vec::new())],
+            // No canonical second phase has completed for this fixture, which
+            // is the honest empty state: an absent entry leaves the committed
+            // first phase explicitly pending rather than fabricating a receipt.
+            canonical_receipts: BTreeMap::new(),
         })
     }
 

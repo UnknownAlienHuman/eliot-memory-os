@@ -118,7 +118,9 @@ impl ValidatedRevocationClosure {
         if closure.state_fence != evidence.state_fence {
             return Err(RevocationHistoryError::StaleHistory);
         }
-        if closure.revision != evidence.source_revision {
+        // CURRENT evidence may carry older committed closures, but never a
+        // zero or future revision.
+        if closure.revision == 0 || closure.revision > evidence.source_revision {
             return Err(RevocationHistoryError::StaleHistory);
         }
         if closure.current_influence != InfluenceState::Revoked {

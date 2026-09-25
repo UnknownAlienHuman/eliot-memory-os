@@ -113,8 +113,9 @@ pub use observation_reconciliation::{
 pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
 pub use owner_closure_feed::{OwnerPublishPort, publish_owner_feed, synchronize_owner_feed};
 pub use owner_closure_provider::{
-    GrantAdmissionParams, IntroductionAdmissionParams, OWNER_HYDRATION_SNAPSHOT_SCHEMA,
-    OWNER_HYDRATION_SNAPSHOT_VERSION, OwnerClosureProvider, PreservedAdmission,
+    AdmittedHydrationsSnapshot, GrantAdmissionParams, IntroductionAdmissionParams,
+    OWNER_HYDRATION_SNAPSHOT_SCHEMA, OWNER_HYDRATION_SNAPSHOT_VERSION, OwnerClosureProvider,
+    PreservedAdmission,
 };
 pub use reactive_admission::{
     AtomRiskBinding, ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier,

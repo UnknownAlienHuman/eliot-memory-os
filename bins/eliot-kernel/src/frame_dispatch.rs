@@ -933,6 +933,13 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "local_read"
             | "local_read_claim"
             | "local_read_result"
+            | "publish_owner_bundle"
+            | "query_owner_bundle"
+            | "initialize_owner_revision"
+            | "activate_grant"
+            | "revoke_grant"
+            | "activate_introduction"
+            | "revoke_introduction"
     )
 }
 

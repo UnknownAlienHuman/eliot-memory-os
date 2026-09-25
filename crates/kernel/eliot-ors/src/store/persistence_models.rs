@@ -9,6 +9,7 @@
 //! `RedbRecoveryStore`/ORS coordinator owns transactions, durability, reconciliation,
 //! lifecycle, and Kernel authority.
 
+use eliot_receipts::ReceiptIdentity;
 use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, SignedSupervisionLease,
 };
@@ -112,6 +113,54 @@ pub(super) struct DurableGrantClosureRecord {
     pub(super) commit: crate::GrantClosureCommit,
     pub(super) phase: OperationalPhase,
     pub(super) operation_order: u64,
+}
+
+/// Stable schema identity for the durable canonical second phase of a grant
+/// closure. The first-phase row remains immutable; this record is keyed by
+/// the same closure operation identity in a separate table.
+pub(super) const GRANT_CLOSURE_SECOND_PHASE_SCHEMA: &str = "eliot.ors.grant-closure-second-phase";
+/// Current durable second-phase record revision.
+pub(super) const GRANT_CLOSURE_SECOND_PHASE_VERSION: u16 = 1;
+
+/// Versioned second-phase link retained beside one committed first-phase
+/// closure row. The key is checked by the store against `operation_id`; the
+/// receipt identity is copied exactly and is never synthesized by ORS.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DurableGrantClosureSecondPhaseRecord {
+    pub(super) schema: String,
+    pub(super) version: u16,
+    pub(super) operation_id: String,
+    pub(super) operation_order: u64,
+    pub(super) canonical_receipt: ReceiptIdentity,
+}
+
+impl DurableGrantClosureSecondPhaseRecord {
+    pub(super) fn validate(&self) -> Result<(), crate::OrsError> {
+        if self.schema != GRANT_CLOSURE_SECOND_PHASE_SCHEMA {
+            return Err(crate::OrsError::InvalidField {
+                field: "grant_closure_second_phase_schema",
+                reason: "unsupported grant-closure second-phase schema",
+            });
+        }
+        if self.version != GRANT_CLOSURE_SECOND_PHASE_VERSION {
+            return Err(crate::OrsError::InvalidField {
+                field: "grant_closure_second_phase_version",
+                reason: "unsupported grant-closure second-phase version",
+            });
+        }
+        crate::model::validate_text(
+            &self.operation_id,
+            "grant_closure_second_phase_operation_id",
+        )?;
+        if self.operation_order == 0 {
+            return Err(crate::OrsError::InvalidField {
+                field: "grant_closure_second_phase_operation_order",
+                reason: "must be greater than zero",
+            });
+        }
+        crate::model::validate_grant_closure_canonical_receipt(&self.canonical_receipt)
+    }
 }
 
 /// Durable grant-graph revision watermark: the greatest graph revision
