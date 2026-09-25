@@ -44,6 +44,7 @@ pub enum AntigravityFingerprintStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityExecutableFingerprint {
     pub component: String,
     pub executable: String,
@@ -63,6 +64,7 @@ pub struct AntigravityExecutableFingerprint {
 
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityPersistentCapabilities {
     pub print_mode: bool,
     pub prompt_arg: bool,
@@ -73,6 +75,7 @@ pub struct AntigravityPersistentCapabilities {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityPersistentBounds {
     pub timeout_ms: u64,
     pub idle_timeout_ms: u64,
@@ -158,6 +161,7 @@ pub enum AntigravityStdoutMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityPersistentLaunchContract {
     pub contract_version: String,
     pub executable: String,
@@ -251,6 +255,7 @@ pub enum AntigravityFrameKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityPersistentFrame {
     pub frame_version: String,
     pub seq: u64,
@@ -274,9 +279,25 @@ impl AntigravityPersistentFrame {
                 max_frame_bytes
             ));
         }
-        // Payload must be object and must not contain unknown top-level envelope keys beyond allowed?
-        // Fail closed on unknown frame_version already checked; extra unknown fields in payload are allowed
-        // only if schema_version inside payload matches? We enforce payload has no "schema_drift" marker.
+        // Explicit per-kind payload disposition (#934): no owner-defined Eliot
+        // payload schema exists for any frame kind — the only producer is the
+        // fake runtime, which emits ad-hoc objects — so every kind retains its
+        // payload as inert bounded vendor data. The payload must be a JSON
+        // object (the documented wire shape); the payload is never interpreted
+        // as session/permission/terminal authority. The pre-existing drift-key
+        // rejection below is preserved byte-for-byte: existing behavior (pinned
+        // by the engine's schema_drift_fails_closed test) must not be weakened
+        // by this decoder-closure slice; redesigning that policy is out of scope.
+        match self.kind {
+            AntigravityFrameKind::Request
+            | AntigravityFrameKind::Response
+            | AntigravityFrameKind::Event
+            | AntigravityFrameKind::Error => {
+                if !self.payload.is_object() {
+                    return Err("frame payload must be a JSON object".to_owned());
+                }
+            }
+        }
         if let Some(obj) = self.payload.as_object()
             && (obj.contains_key("schema_drift") || obj.contains_key("unknown_field_that_drifts"))
         {
@@ -311,6 +332,7 @@ impl AntigravityPersistentFrame {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AntigravityPersistentLaunchReceipt {
     pub component: String,
     pub contract_version: String,
