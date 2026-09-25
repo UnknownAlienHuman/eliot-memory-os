@@ -2194,6 +2194,30 @@ async fn run_local_read_poll(
         };
         return Ok(step(outcome, delta));
     }
+    // #1187 W1/A1: a claimed pair naming the broker-owned operator read
+    // capability is served here, not forwarded on the Kernel `local_read` leg,
+    // because that leg serves store reads only. This is the one production
+    // caller of `DaemonComposition::controlboard`: it builds one board over
+    // one immutable Governor snapshot and performs exactly one authenticated
+    // role-filtered read on it, so the canonical role-filtered view — or the
+    // board's exact typed refusal, including a `PlanGap` naming the missing
+    // owner — is served from the live daemon path instead of being composed
+    // into a board nobody reads. Every claimed pair, refusal included, settles
+    // through the same idempotent submit leg below, so a ControlBoard read can
+    // never poison the poller or drop a pair. The composition guard is held
+    // only around the read; it never crosses the submit leg.
+    if eliotd::is_controlboard_read_tool(&tool) {
+        let body = {
+            let guard = composition.lock().await;
+            eliotd::serve_controlboard_view(&guard, &envelope, &attempt)
+        };
+        let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
+            LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,
+            LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
+            LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
+        };
+        return Ok(step(outcome, startup_readiness));
+    }
     let body = forward_admitted_local_read(kernel, envelope, tool, attempt)
         .await
         .map_err(|error| format!("daemon local-read forward: {error}"))?;
