@@ -45,12 +45,12 @@ use eliot_kernel_core::{
 };
 use eliot_ors::{
     CapabilityIntroductionActivation, EpochIdentity, EpochLineage, OpaqueLabel,
-    OperationalRecordContext, OperationalRecordInput, StateFenceSnapshot,
+    OperationalRecordContext, OperationalRecordInput, RecoveryPayload, StateFenceSnapshot,
 };
 use eliot_platform::SecretReference;
 use eliot_receipts::{
     AuthorityBinding, EffectClass, GRANT_CLOSURE_SCHEMA, GRANT_CLOSURE_VERSION,
-    GrantClosureDeclaration, GrantClosureMemberDeclaration, ProofCeiling,
+    GrantClosureDeclaration, GrantClosureMemberDeclaration, ProofCeiling, ReceiptIdentity,
 };
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +73,10 @@ pub struct OwnerClosureProvider {
     history: RevocationHistoryEvidence,
     owner: AuthorityOwner,
     registry: AdmittedHydrations,
+    /// Canonical second-phase identities read from durable ORS projections.
+    /// The map is data supplied by the durable boundary; the provider never
+    /// derives a receipt identity from a closure request.
+    canonical_receipts: BTreeMap<String, ReceiptIdentity>,
 }
 
 /// Governor-side admitted-hydration registry.
@@ -246,6 +250,19 @@ impl OwnerClosureProvider {
         history: Option<RevocationHistoryEvidence>,
         expected_fence: &StateFence,
     ) -> Result<Self, CompositionError> {
+        Self::restore_with_canonical_receipts(snapshot, history, expected_fence, BTreeMap::new())
+    }
+
+    /// Restores the provider with canonical second-phase links read from the
+    /// durable ORS boundary. The legacy [`Self::restore`] entry point remains
+    /// fail-closed with an empty link map because absence is not a receipt.
+    pub fn restore_with_canonical_receipts(
+        snapshot: AuthorityOwnerSnapshot,
+        history: Option<RevocationHistoryEvidence>,
+        expected_fence: &StateFence,
+        canonical_receipts: BTreeMap<String, ReceiptIdentity>,
+    ) -> Result<Self, CompositionError> {
+        validate_canonical_receipt_links(&canonical_receipts)?;
         snapshot.validate()?;
         if snapshot.state_fence != *expected_fence {
             return Err(CompositionError::Recovery(
@@ -264,6 +281,11 @@ impl OwnerClosureProvider {
             Some(&history),
         )?;
         let hydrations = outcome.owner.owner_hydrations.clone();
+        if outcome.owner.grants.revision() != snapshot.grant_graph.revision {
+            return Err(CompositionError::Recovery(
+                "owner restore changed the durable grant-graph revision".to_owned(),
+            ));
+        }
         let graph_snapshot = outcome
             .owner
             .grants
@@ -293,10 +315,13 @@ impl OwnerClosureProvider {
             history,
             owner: outcome.owner,
             registry: AdmittedHydrations::default(),
+            canonical_receipts,
         };
         if let Some(hydrations) = hydrations.as_ref() {
-            provider.import_hydration_snapshot(hydrations)?;
+            let durable_bytes = canonical_json_bytes(hydrations).map_err(recovery)?;
+            provider.import_registry(&durable_bytes)?;
         }
+        provider.validate_complete_registry()?;
         Ok(provider)
     }
 
@@ -379,7 +404,8 @@ impl OwnerClosureProvider {
             ));
         }
         let fence = self.state_fence.clone();
-        let candidate = Self::restore(snapshot, history, &fence)?;
+        let candidate =
+            Self::restore_with_canonical_receipts(snapshot, history, &fence, BTreeMap::new())?;
         if candidate.revision() != expected_revision {
             return Err(CompositionError::Recovery(
                 "restored owner revision disagrees with the expected revision".to_owned(),
@@ -605,6 +631,32 @@ impl OwnerClosureProvider {
         Ok(declarations)
     }
 
+    fn validate_complete_registry(&self) -> Result<(), CompositionError> {
+        let graph = self
+            .owner
+            .grants
+            .recovery_snapshot()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let revoked = graph.revoked.iter().cloned().collect::<BTreeSet<_>>();
+        for grant in &graph.grants {
+            if revoked.contains(&grant.grant_id)
+                || !matches!(
+                    grant.status,
+                    GrantStatus::Active | GrantStatus::PendingActivation
+                )
+            {
+                continue;
+            }
+            if registry_grant(&self.registry, grant.grant_id.as_str()).is_none() {
+                return Err(CompositionError::Recovery(
+                    "durable owner graph contains a live grant without its admitted hydration"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Serves the complete restore bundle the Kernel-side mirror binds at
     /// the provider revision: durable snapshot, CURRENT history, admitted
     /// members, roots, introductions, and preserved survivors.
@@ -636,6 +688,7 @@ impl OwnerClosureProvider {
             introductions: self.registry.introductions.values().cloned().collect(),
             declarations,
             preserved,
+            canonical_receipts: self.canonical_receipts.clone(),
         })
     }
 
@@ -688,73 +741,123 @@ impl OwnerClosureProvider {
                 "hydration snapshot disagrees with the provider fence or revision".to_owned(),
             ));
         }
-        let mut shadow = AdmittedHydrations::default();
+        if self.owner.owner_hydrations.is_none() {
+            return Err(CompositionError::Recovery(
+                "cannot import hydrations into an unavailable canonical owner registry".to_owned(),
+            ));
+        }
+
+        let previous = self.registry.clone();
+        self.registry = AdmittedHydrations::default();
+        let result = self.admit_durable_entries(snapshot);
+        if result.is_ok() {
+            if let Err(error) = self.sync_owner_hydrations() {
+                self.registry = previous.clone();
+                let _ = self.sync_owner_hydrations();
+                return Err(error);
+            }
+            let expected = match canonical_json_bytes(snapshot) {
+                Ok(expected) => expected,
+                Err(error) => {
+                    self.registry = previous.clone();
+                    let _ = self.sync_owner_hydrations();
+                    return Err(recovery(error));
+                }
+            };
+            let actual = match self.export_registry() {
+                Ok(actual) => actual,
+                Err(error) => {
+                    self.registry = previous.clone();
+                    let _ = self.sync_owner_hydrations();
+                    return Err(error);
+                }
+            };
+            if actual != expected {
+                self.registry = previous.clone();
+                let _ = self.sync_owner_hydrations();
+                return Err(CompositionError::Recovery(
+                    "durable hydration registry does not round-trip through production admission"
+                        .to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+
+        self.registry = previous;
+        self.sync_owner_hydrations()?;
+        result
+    }
+
+    /// Replays a durable registry through the same production admission API
+    /// used by live semantic hydration. The opaque record is accepted only
+    /// when recompilation from its real intent and secret reference is byte
+    /// identical; no replacement record is retained.
+    fn admit_durable_entries(
+        &mut self,
+        snapshot: &AdmittedHydrationsSnapshot,
+    ) -> Result<(), CompositionError> {
         for member in &snapshot.members {
-            self.check_restored_member_admission(
-                &member.intent.grant_id,
-                member.intent.parent_grant_id.as_deref(),
-                &member.intent.authority_root_ref,
-                &member.intent.binding,
-            )?;
-            verify_imported_grant_seal(
-                &member.intent.grant_id,
-                &member.intent.operation_id,
-                member.durable_record.record(),
-            )?;
-            if shadow
-                .members
-                .insert(member.intent.grant_id.clone(), member.clone())
-                .is_some()
+            if member.intent.parent_grant_id.is_none() {
+                return Err(CompositionError::Recovery(
+                    "durable member hydration carries a root identity".to_owned(),
+                ));
+            }
+            let secret = secret_reference_from_record(member.durable_record.record())?;
+            let params = grant_admission_params_from_member(member);
+            let admitted = if self
+                .snapshot_grant(member.intent.grant_id.as_str())
+                .is_some_and(|record| record.status == GrantStatus::Revoked)
+            {
+                self.admit_historical_member(member)?
+            } else {
+                self.admit_grant_member(&params, &secret, member.observed_at_ms)?
+            };
+            if admitted.intent != member.intent || admitted.durable_record != member.durable_record
             {
                 return Err(CompositionError::Recovery(
-                    "hydration snapshot carries a duplicate member identity".to_owned(),
+                    "durable member hydration is not the exact production admission result"
+                        .to_owned(),
                 ));
             }
         }
         for root in &snapshot.roots {
-            self.check_restored_member_admission(
-                &root.intent.grant_id,
-                root.intent.parent_grant_id.as_deref(),
-                &root.intent.authority_root_ref,
-                &root.intent.binding,
-            )?;
-            verify_imported_grant_seal(
-                &root.intent.grant_id,
-                &root.intent.operation_id,
-                root.durable_record.record(),
-            )?;
             if root.intent.parent_grant_id.is_some() {
                 return Err(CompositionError::Recovery(
-                    "hydration snapshot carries a non-root identity as a root".to_owned(),
+                    "durable root hydration carries a delegated identity".to_owned(),
                 ));
             }
-            if shadow
-                .roots
-                .insert(root.intent.grant_id.clone(), root.clone())
-                .is_some()
+            let secret = secret_reference_from_record(root.durable_record.record())?;
+            let params = grant_admission_params_from_root(root);
+            let admitted = if self
+                .snapshot_grant(root.intent.grant_id.as_str())
+                .is_some_and(|record| record.status == GrantStatus::Revoked)
             {
+                self.admit_historical_root(root)?
+            } else {
+                self.admit_grant_root(&params, &secret, root.observed_at_ms)?
+            };
+            if admitted.intent != root.intent || admitted.durable_record != root.durable_record {
                 return Err(CompositionError::Recovery(
-                    "hydration snapshot carries a duplicate root identity".to_owned(),
+                    "durable root hydration is not the exact production admission result"
+                        .to_owned(),
                 ));
             }
         }
         for hydration in &snapshot.introductions {
-            self.check_introduction_admission(
-                &hydration.intent.supporting_grant_ids,
-                &hydration.intent.authority_root_ref,
-            )?;
             verify_imported_introduction_seal(
                 &hydration.intent.introduction_id,
                 &hydration.intent.operation_id,
                 hydration.durable_record.record(),
             )?;
-            if shadow
-                .introductions
-                .insert(hydration.intent.introduction_id.clone(), hydration.clone())
-                .is_some()
+            let secret = secret_reference_from_record(hydration.durable_record.record())?;
+            let params = introduction_admission_params_from_hydration(hydration);
+            let admitted = self.admit_introduction(&params, &secret, hydration.observed_at_ms)?;
+            if admitted.intent != hydration.intent
+                || admitted.durable_record != hydration.durable_record
             {
                 return Err(CompositionError::Recovery(
-                    "hydration snapshot carries a duplicate introduction identity".to_owned(),
+                    "durable introduction hydration is not the exact production admission result"
+                        .to_owned(),
                 ));
             }
         }
@@ -770,16 +873,71 @@ impl OwnerClosureProvider {
                 ));
             }
             for survivor in survivors {
-                self.check_preserved_admission_with_registry(target, survivor, &shadow)?;
+                self.admit_preserved(preserved_admission_from_survivor(target, survivor))?;
             }
-            shadow
-                .preserved
-                .entry(target.clone())
-                .or_default()
-                .extend(survivors.clone());
         }
-        self.registry = shadow;
-        self.sync_owner_hydrations()
+        Ok(())
+    }
+
+    fn admit_historical_member(
+        &mut self,
+        hydration: &GrantClosureMember,
+    ) -> Result<GrantClosureMember, CompositionError> {
+        self.check_restored_member_admission(
+            &hydration.intent.grant_id,
+            hydration.intent.parent_grant_id.as_deref(),
+            &hydration.intent.authority_root_ref,
+            &hydration.intent.binding,
+        )?;
+        verify_imported_grant_seal(
+            &hydration.intent.grant_id,
+            &hydration.intent.operation_id,
+            hydration.durable_record.record(),
+        )?;
+        if self
+            .registry
+            .members
+            .insert(hydration.intent.grant_id.clone(), hydration.clone())
+            .is_some()
+        {
+            return Err(CompositionError::Recovery(
+                "durable hydration snapshot carries a duplicate member identity".to_owned(),
+            ));
+        }
+        Ok(hydration.clone())
+    }
+
+    fn admit_historical_root(
+        &mut self,
+        hydration: &RootGrantHydration,
+    ) -> Result<RootGrantHydration, CompositionError> {
+        if hydration.intent.parent_grant_id.is_some() {
+            return Err(CompositionError::Recovery(
+                "durable root hydration carries a delegated identity".to_owned(),
+            ));
+        }
+        self.check_restored_member_admission(
+            &hydration.intent.grant_id,
+            hydration.intent.parent_grant_id.as_deref(),
+            &hydration.intent.authority_root_ref,
+            &hydration.intent.binding,
+        )?;
+        verify_imported_grant_seal(
+            &hydration.intent.grant_id,
+            &hydration.intent.operation_id,
+            hydration.durable_record.record(),
+        )?;
+        if self
+            .registry
+            .roots
+            .insert(hydration.intent.grant_id.clone(), hydration.clone())
+            .is_some()
+        {
+            return Err(CompositionError::Recovery(
+                "durable hydration snapshot carries a duplicate root identity".to_owned(),
+            ));
+        }
+        Ok(hydration.clone())
     }
 
     fn sync_owner_hydrations(&mut self) -> Result<(), CompositionError> {
@@ -1221,6 +1379,120 @@ impl OwnerClosureProvider {
             cleanup_after_ms: None,
         };
         OperationalRecordInput::encrypted(context, secret.clone(), plaintext).map_err(recovery)
+    }
+}
+
+fn validate_canonical_receipt_links(
+    links: &BTreeMap<String, ReceiptIdentity>,
+) -> Result<(), CompositionError> {
+    for (operation_id, receipt) in links {
+        eliot_ors::OperationIdentity::new(operation_id)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if receipt.receipt_id.as_str().trim().is_empty()
+            || receipt.receipt_id.as_str().chars().any(char::is_control)
+            || receipt.canonical_sha256.len() != 64
+            || !receipt
+                .canonical_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(CompositionError::Recovery(
+                "canonical closure receipt link has an invalid identity or digest".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn secret_reference_from_record(
+    record: &OperationalRecordInput,
+) -> Result<SecretReference, CompositionError> {
+    match &record.payload {
+        RecoveryPayload::Encrypted { key, .. } => Ok(key.clone()),
+        RecoveryPayload::ImmutableLocator { .. } => Err(CompositionError::Recovery(
+            "durable hydration record has no admitting secret reference".to_owned(),
+        )),
+    }
+}
+
+fn grant_admission_params_from_member(hydration: &GrantClosureMember) -> GrantAdmissionParams {
+    GrantAdmissionParams {
+        operation_id: hydration.intent.operation_id.clone(),
+        grant_id: hydration.intent.grant_id.clone(),
+        parent_grant_id: hydration.intent.parent_grant_id.clone(),
+        authority_root_ref: hydration.intent.authority_root_ref.clone(),
+        snapshot_id: hydration.intent.snapshot_id.clone(),
+        holder_principal: hydration.intent.holder_principal.clone(),
+        session_id: hydration.intent.session_id.clone(),
+        scope_id: hydration.intent.scope_id.clone(),
+        binding: hydration.intent.binding.clone(),
+        allowed_effect: hydration.intent.allowed_effect,
+        proof_ceiling: hydration.intent.proof_ceiling,
+        issued_at_ms: hydration.intent.issued_at_ms,
+        expires_at_ms: hydration.intent.expires_at_ms,
+        receipt_obligations: hydration.intent.receipt_obligations.clone(),
+    }
+}
+
+fn grant_admission_params_from_root(hydration: &RootGrantHydration) -> GrantAdmissionParams {
+    GrantAdmissionParams {
+        operation_id: hydration.intent.operation_id.clone(),
+        grant_id: hydration.intent.grant_id.clone(),
+        parent_grant_id: hydration.intent.parent_grant_id.clone(),
+        authority_root_ref: hydration.intent.authority_root_ref.clone(),
+        snapshot_id: hydration.intent.snapshot_id.clone(),
+        holder_principal: hydration.intent.holder_principal.clone(),
+        session_id: hydration.intent.session_id.clone(),
+        scope_id: hydration.intent.scope_id.clone(),
+        binding: hydration.intent.binding.clone(),
+        allowed_effect: hydration.intent.allowed_effect,
+        proof_ceiling: hydration.intent.proof_ceiling,
+        issued_at_ms: hydration.intent.issued_at_ms,
+        expires_at_ms: hydration.intent.expires_at_ms,
+        receipt_obligations: hydration.intent.receipt_obligations.clone(),
+    }
+}
+
+fn introduction_admission_params_from_hydration(
+    hydration: &IntroductionHydration,
+) -> IntroductionAdmissionParams {
+    IntroductionAdmissionParams {
+        operation_id: hydration.intent.operation_id.clone(),
+        introduction_id: hydration.intent.introduction_id.clone(),
+        authority_root_ref: hydration.intent.authority_root_ref.clone(),
+        snapshot_id: hydration.intent.snapshot_id.clone(),
+        supporting_grant_ids: hydration.intent.supporting_grant_ids.clone(),
+        resource_handle: hydration.intent.resource_handle.clone(),
+        facet_manifest_ref: hydration.intent.facet_manifest_ref.clone(),
+        holder_principal: hydration.intent.holder_principal.clone(),
+        session_id: hydration.intent.session_id.clone(),
+        scope_id: hydration.intent.scope_id.clone(),
+        binding: hydration.intent.binding.clone(),
+        allowed_effect: hydration.intent.allowed_effect,
+        proof_ceiling: hydration.intent.proof_ceiling,
+        issued_at_ms: hydration.intent.issued_at_ms,
+        expires_at_ms: hydration.intent.expires_at_ms,
+        receipt_obligations: hydration.intent.receipt_obligations.clone(),
+    }
+}
+
+fn preserved_admission_from_survivor(
+    target_grant_id: &str,
+    survivor: &GrantClosureSurvivor,
+) -> PreservedAdmission {
+    PreservedAdmission {
+        target_grant_id: target_grant_id.to_owned(),
+        grant_id: survivor.grant_id.clone(),
+        covering_grant_id: survivor.covering_grant_id.clone(),
+        covering_root_ref: survivor.covering_root_ref.clone(),
+        operation_id: survivor.operation_id.clone(),
+        operation_name: survivor.operation_name.clone(),
+        resource_ref: survivor.resource_ref.clone(),
+        effect: survivor.effect,
+        holder_principal: survivor.holder_principal.clone(),
+        session_id: survivor.session_id.clone(),
+        scope_id: survivor.scope_id.clone(),
+        canonical_request_hash: survivor.canonical_request_hash.clone(),
     }
 }
 

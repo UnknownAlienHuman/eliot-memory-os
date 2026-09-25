@@ -35,7 +35,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use eliot_authority::{GrantGraphRecoverySnapshot, RevocationHistoryEvidence};
-use eliot_receipts::GrantClosureDeclaration;
+use eliot_receipts::{GrantClosureDeclaration, ReceiptIdentity};
 
 use crate::error::{KernelError, validate_id};
 use crate::grant_activation_port::{
@@ -62,7 +62,9 @@ use crate::introduction_lifecycle::IntroductionHydration;
 /// - `introductions` are the complete introduction hydrations the service
 ///   resolved, keyed by introduction identity on restore;
 /// - `preserved` are the owner-declared alternate-path survivors keyed by
-///   closure target grant identity.
+///   closure target grant identity;
+/// - `canonical_receipts` are completed canonical second-phase receipt
+///   identities keyed by the immutable ORS closure operation identity.
 #[derive(Clone, Debug)]
 pub struct GovernorClosureRestore {
     /// Durable grant-graph snapshot the closure is enumerated from.
@@ -89,6 +91,14 @@ pub struct GovernorClosureRestore {
     /// Owner-declared alternate-path survivors keyed by closure target
     /// grant identity.
     pub preserved: Vec<(String, Vec<GrantClosureSurvivor>)>,
+    /// Exact canonical store receipt identities whose second phase has
+    /// completed, keyed by ORS grant-closure operation identity.
+    ///
+    /// An absent entry leaves the committed first phase explicitly pending.
+    /// The Kernel never derives either value from a closure request or
+    /// fabricates a receipt when the owner has not completed canonical
+    /// reconciliation.
+    pub canonical_receipts: BTreeMap<String, ReceiptIdentity>,
 }
 
 /// Stable schema identity for the Governor-to-Kernel closure restore wire.
@@ -108,6 +118,8 @@ struct GovernorClosureRestoreWire {
     introductions: Vec<IntroductionHydration>,
     declarations: Vec<GrantClosureDeclaration>,
     preserved: Vec<(String, Vec<GrantClosureSurvivor>)>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    canonical_receipts: BTreeMap<String, ReceiptIdentity>,
 }
 
 impl serde::Serialize for GovernorClosureRestore {
@@ -125,6 +137,7 @@ impl serde::Serialize for GovernorClosureRestore {
             introductions: self.introductions.clone(),
             declarations: self.declarations.clone(),
             preserved: self.preserved.clone(),
+            canonical_receipts: self.canonical_receipts.clone(),
         }
         .serialize(serializer)
     }
@@ -151,6 +164,7 @@ impl<'de> serde::Deserialize<'de> for GovernorClosureRestore {
             introductions: wire.introductions,
             declarations: wire.declarations,
             preserved: wire.preserved,
+            canonical_receipts: wire.canonical_receipts,
         })
     }
 }
@@ -270,6 +284,7 @@ impl GovernorClosureSource {
         reason = "restore validation keeps history, declarations, hydrations, and alternate paths in one fail-closed sequence"
     )]
     fn admit(restore: GovernorClosureRestore) -> Result<AdmittedClosureState, KernelError> {
+        validate_canonical_receipt_links(&restore.canonical_receipts)?;
         let history = restore.revocation_history.as_ref().ok_or_else(|| {
             KernelError::RecoveryUnavailable(
                 "closure owner revocation history is unavailable; unavailable history is not absence of revocation".to_owned(),
@@ -555,6 +570,34 @@ impl GovernorClosureSource {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Validates owner-presented canonical second-phase identities before the
+/// restore becomes a trust anchor. The owner supplies both the immutable ORS
+/// closure operation identity and the exact canonical receipt identity; this
+/// adapter validates their shape but never derives or synthesizes either.
+fn validate_canonical_receipt_links(
+    links: &BTreeMap<String, ReceiptIdentity>,
+) -> Result<(), KernelError> {
+    for (operation_id, receipt) in links {
+        validate_id(operation_id, "restore.canonical_receipt.operation_id")?;
+        validate_id(
+            receipt.receipt_id.as_str(),
+            "restore.canonical_receipt.receipt_id",
+        )?;
+        if receipt.canonical_sha256.len() != 64
+            || !receipt
+                .canonical_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(KernelError::InvalidField {
+                field: "restore.canonical_receipt.canonical_sha256",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Proves the opaque↔intent seal for one admitted grant record at the

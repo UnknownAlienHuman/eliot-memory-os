@@ -998,19 +998,19 @@ impl GrantActivationPort {
             }
             IntentResolve::New => {}
         }
-        validate_introduction_activation(request, &ledger, &active_epoch, now_ms)?;
+        validate_introduction_activation(
+            request,
+            &ledger,
+            &active_epoch,
+            now_ms,
+            IntroductionActivationMode::Fresh,
+        )?;
         let mut supporting = BTreeSet::new();
         for id in &request.supporting_grant_ids {
             supporting.insert(id.clone());
         }
         let operation_id = request.operation_id.clone();
-        let receipt = AuthorityActivationReceipt {
-            activation_id: format!("activation-{operation_id}"),
-            snapshot_id: request.snapshot_id.clone(),
-            authority_epoch: active_epoch.clone(),
-            state: AuthorityState::Active,
-        };
-        receipt.validate()?;
+        let receipt = runtime_introduction_activation_receipt(request, active_epoch)?;
         ledger.introductions.insert(
             request.introduction_id.clone(),
             LiveIntroductionRecord {
@@ -1144,10 +1144,13 @@ impl GrantActivationPort {
     /// plus its opaque ORS record; the port validates both, commits the row
     /// verbatim, requires exact read-back, advances the durable revision
     /// watermark, and only then installs live state. Exact replay under one
-    /// operation identity returns the same receipt; a changed payload under
-    /// one identity, a duplicate introduction identity, or a `Fenced`
-    /// durable row fails before any mutation — restore never reactivates a
-    /// fenced introduction.
+    /// operation identity re-reads the durable row, revalidates the current
+    /// supporting-grant fences, graph revision, expiry, live target state, and
+    /// committed closure introduction-fence set, then returns the same receipt
+    /// without another ORS write. A changed payload under one identity, a
+    /// duplicate introduction identity, a moved revision/fence, revoked
+    /// support, expired support, or a `Fenced` durable row fails before any
+    /// mutation — restore never reactivates a fenced introduction.
     ///
     /// Supporting grants must already be recorded live (activation order:
     /// grants first, then introductions; after a restart the grants are
@@ -1185,15 +1188,29 @@ impl GrantActivationPort {
         // introduction identity is a conflict rather than a replay.
         let digest = hydrated_introduction_digest(hydration)?;
         let mut ledger = self.lock_ledger();
-        match ledger.resolve(&request.operation_id, &digest) {
+        let replay = match ledger.resolve(&request.operation_id, &digest) {
             IntentResolve::Conflict => return Err(KernelError::IdempotencyConflict),
-            IntentResolve::Replay(disposition) => {
-                return disposition.into_activation_receipt();
-            }
-            IntentResolve::New => {}
-        }
-        validate_introduction_activation(request, &ledger, active_epoch, now_ms)?;
+            IntentResolve::Replay(disposition) => Some(disposition),
+            IntentResolve::New => None,
+        };
         verify_introduction_seal(&hydration.durable_record, request, active_epoch)?;
+        if let Some(disposition) = replay {
+            return revalidate_committed_introduction_activation(
+                boundary,
+                &ledger,
+                hydration,
+                active_epoch,
+                now_ms,
+                disposition,
+            );
+        }
+        validate_introduction_activation(
+            request,
+            &ledger,
+            active_epoch,
+            now_ms,
+            IntroductionActivationMode::Fresh,
+        )?;
         // Durable row gate: only an absent row may be committed. An `Active`
         // row must carry the exact presented input (exact replay installs
         // through the idempotent ORS transition); a `Fenced` row is fence
@@ -1256,13 +1273,7 @@ impl GrantActivationPort {
             supporting.insert(id.clone());
         }
         let operation_id = request.operation_id.clone();
-        let receipt = AuthorityActivationReceipt {
-            activation_id: format!("activation-{operation_id}"),
-            snapshot_id: request.snapshot_id.clone(),
-            authority_epoch: active_epoch.clone(),
-            state: AuthorityState::Active,
-        };
-        receipt.validate()?;
+        let receipt = runtime_introduction_activation_receipt(request, active_epoch)?;
         ledger.introductions.insert(
             request.introduction_id.clone(),
             LiveIntroductionRecord {
@@ -1465,9 +1476,12 @@ impl GrantActivationPort {
     /// The caller re-presents the Governor hydration; the port requires the
     /// durable row to read back `Active` with exact record agreement and the
     /// presented revision to bind the durable watermark before reinstalling
-    /// live state. A missing row, a `Fenced` row, or a disagreeing row stays
-    /// fail-closed: absence of the durable introduction never restores
-    /// introduction authority, and a fence is never resurrected.
+    /// live state. Exact replay performs the same read-only fence, revision,
+    /// expiry, revoked-target, closure introduction-set, and stored-receipt
+    /// checks before returning. A missing row, a `Fenced` row, or a
+    /// disagreeing row stays fail-closed: absence of the durable introduction
+    /// never restores introduction authority, and a fence is never
+    /// resurrected.
     ///
     /// # Errors
     ///
@@ -1494,12 +1508,20 @@ impl GrantActivationPort {
         let request = &hydration.intent;
         let digest = hydrated_introduction_digest(hydration)?;
         let mut ledger = self.lock_ledger();
-        match ledger.resolve(&request.operation_id, &digest) {
+        let replay = match ledger.resolve(&request.operation_id, &digest) {
             IntentResolve::Conflict => return Err(KernelError::IdempotencyConflict),
-            IntentResolve::Replay(disposition) => {
-                return disposition.into_activation_receipt();
-            }
-            IntentResolve::New => {}
+            IntentResolve::Replay(disposition) => Some(disposition),
+            IntentResolve::New => None,
+        };
+        if let Some(disposition) = replay {
+            return revalidate_committed_introduction_activation(
+                boundary,
+                &ledger,
+                hydration,
+                active_epoch,
+                now_ms,
+                disposition,
+            );
         }
         // Restore agreement first: only an `Active` row carrying the exact
         // presented input may be reinstalled. A `Fenced` row refuses with
@@ -1531,7 +1553,13 @@ impl GrantActivationPort {
             }
             Some(_) => {}
         }
-        validate_introduction_activation(request, &ledger, active_epoch, now_ms)?;
+        validate_introduction_activation(
+            request,
+            &ledger,
+            active_epoch,
+            now_ms,
+            IntroductionActivationMode::Fresh,
+        )?;
         verify_introduction_seal(&hydration.durable_record, request, active_epoch)?;
         check_closure_watermark(
             boundary,
@@ -1543,13 +1571,7 @@ impl GrantActivationPort {
             supporting.insert(id.clone());
         }
         let operation_id = request.operation_id.clone();
-        let receipt = AuthorityActivationReceipt {
-            activation_id: format!("activation-{operation_id}"),
-            snapshot_id: request.snapshot_id.clone(),
-            authority_epoch: active_epoch.clone(),
-            state: AuthorityState::Active,
-        };
-        receipt.validate()?;
+        let receipt = runtime_introduction_activation_receipt(request, active_epoch)?;
         ledger.introductions.insert(
             request.introduction_id.clone(),
             LiveIntroductionRecord {
@@ -3398,6 +3420,14 @@ enum IntentKind {
     IntroductionRevocation,
 }
 
+/// Whether introduction validation is proving a fresh mutation or rechecking
+/// the exact committed identity before an idempotent return.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IntroductionActivationMode {
+    Fresh,
+    Replay,
+}
+
 /// Result of resolving an operation identity against its recorded digest.
 enum IntentResolve {
     /// The identity was never seen.
@@ -4819,6 +4849,7 @@ fn validate_introduction_activation(
     ledger: &PortLedger,
     active_epoch: &EpochId,
     now_ms: i64,
+    mode: IntroductionActivationMode,
 ) -> Result<(), KernelError> {
     validate_id(&request.introduction_id, "introduction_id")?;
     validate_id(&request.snapshot_id, "snapshot_id")?;
@@ -4852,7 +4883,9 @@ fn validate_introduction_activation(
         &request.binding,
     )?;
     check_expiry(request.issued_at_ms, request.expires_at_ms, now_ms)?;
-    if ledger.introductions.contains_key(&request.introduction_id) {
+    if mode == IntroductionActivationMode::Fresh
+        && ledger.introductions.contains_key(&request.introduction_id)
+    {
         return Err(KernelError::InvalidField {
             field: "introduction_id",
             reason: "introduction identity is already recorded",
@@ -4899,6 +4932,199 @@ fn validate_introduction_activation(
         }
     }
     Ok(())
+}
+
+/// Revalidates one exact committed introduction before an idempotent return.
+///
+/// This is deliberately read-only. It reuses the normal introduction
+/// validation gate for every authority field, supporting-grant fence,
+/// durable watermark, expiry, and ceiling; then it re-reads the ORS row,
+/// re-enumerates the relevant committed closure introduction-fence set, and
+/// proves the stored live projection and authority receipt are still the exact active
+/// disposition. No ORS transition, watermark advance, or live-state mutation
+/// occurs on this path.
+fn revalidate_committed_introduction_activation(
+    boundary: &DurableRootGrantBoundary,
+    ledger: &PortLedger,
+    hydration: &IntroductionHydration,
+    active_epoch: &EpochId,
+    now_ms: i64,
+    disposition: IntentDisposition,
+) -> Result<AuthorityActivationReceipt, KernelError> {
+    let request = &hydration.intent;
+    let support = request
+        .supporting_grant_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let revoked = revoked_support_in_ledger(ledger, &request.supporting_grant_ids);
+    if !revoked.is_disjoint(&support) {
+        return Err(KernelError::InvalidField {
+            field: "supporting_grant_ids",
+            reason: "supporting lineage is fenced",
+        });
+    }
+    validate_introduction_activation(
+        request,
+        ledger,
+        active_epoch,
+        now_ms,
+        IntroductionActivationMode::Replay,
+    )?;
+    verify_introduction_seal(&hydration.durable_record, request, active_epoch)?;
+
+    let live = ledger
+        .introductions
+        .get(&request.introduction_id)
+        .ok_or_else(|| {
+            KernelError::RecoveryUnavailable(
+                "committed introduction is absent from the live projection during replay"
+                    .to_owned(),
+            )
+        })?;
+    if live.authority_root_ref != request.authority_root_ref || live.supporting_grant_ids != support
+    {
+        return Err(KernelError::RecoveryUnavailable(
+            "committed introduction live projection disagrees with its stored operation".to_owned(),
+        ));
+    }
+    if live.status == LiveStatus::Revoked {
+        return Err(KernelError::IllegalTransition {
+            machine: "capability-introduction",
+            from: "Fenced".to_owned(),
+            to: "Active".to_owned(),
+        });
+    }
+
+    revalidate_committed_introduction_row(boundary, hydration)?;
+
+    revalidate_relevant_closure_introduction_fences(
+        boundary,
+        ledger,
+        &support,
+        &request.introduction_id,
+    )?;
+
+    check_committed_introduction_watermark(
+        boundary,
+        &request.authority_root_ref,
+        request.grant_graph_revision,
+    )?;
+    let stored = disposition.into_activation_receipt()?;
+    let expected = runtime_introduction_activation_receipt(request, active_epoch)?;
+    if stored != expected {
+        return Err(KernelError::IdempotencyConflict);
+    }
+    Ok(stored)
+}
+
+/// Re-enumerates the complete introduction-fence set of every committed
+/// closure that intersects this introduction or its current support. Each
+/// durable fence is re-derived through the atomic closure path and matched to
+/// the immutable ORS reference already stored in that closure receipt.
+fn revalidate_relevant_closure_introduction_fences(
+    boundary: &DurableRootGrantBoundary,
+    ledger: &PortLedger,
+    supporting_grants: &BTreeSet<String>,
+    introduction_id: &str,
+) -> Result<(), KernelError> {
+    for record in ledger.intents.values() {
+        let Some(commit) = &record.closure_receipt else {
+            continue;
+        };
+        let affects_support = commit
+            .declaration
+            .members
+            .iter()
+            .any(|member| supporting_grants.contains(member.grant_id.as_str()));
+        let fences_introduction = commit
+            .fenced_introductions
+            .iter()
+            .any(|fenced| fenced == introduction_id);
+        if !affects_support && !fences_introduction {
+            continue;
+        }
+        let fences = closure_introduction_fences(
+            boundary,
+            &commit.fenced_introductions,
+            &commit.operation_id,
+        )?;
+        if fences.len() != commit.fenced_introductions.len()
+            || fences
+                .iter()
+                .zip(&commit.ors_introduction_receipts)
+                .any(|(fence, expected)| {
+                    fence.record().record_id.as_str() != expected.record_id.as_str()
+                        || fence.record().subject_id.as_str() != expected.subject_id.as_str()
+                })
+        {
+            return Err(KernelError::RecoveryUnavailable(
+                "committed closure introduction-fence set is incomplete".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Re-reads the immutable introduction row and requires the exact active
+/// presentation that the stored activation receipt committed.
+fn revalidate_committed_introduction_row(
+    boundary: &DurableRootGrantBoundary,
+    hydration: &IntroductionHydration,
+) -> Result<(), KernelError> {
+    let subject = OperationIdentity::new(&hydration.intent.introduction_id)
+        .map_err(KernelError::RecoveryState)?;
+    let existing = boundary
+        .store
+        .load_capability_introduction(&subject)
+        .map_err(|error| map_ors_recovery_error(&error))?
+        .ok_or_else(|| {
+            KernelError::RecoveryUnavailable(
+                "committed introduction projection is absent during replay".to_owned(),
+            )
+        })?;
+    if existing.phase() == OperationalPhase::Fenced {
+        return Err(KernelError::IllegalTransition {
+            machine: "capability-introduction",
+            from: "Fenced".to_owned(),
+            to: "Active".to_owned(),
+        });
+    }
+    if existing.phase() != OperationalPhase::Active
+        || existing.record() != hydration.durable_record.record()
+    {
+        return Err(KernelError::RecoveryUnavailable(
+            "committed introduction row is not the exact active replay state".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Checks the durable graph head without advancing it. Exact replay is
+/// read-only, but it still refuses once any later root revision has won.
+fn check_committed_introduction_watermark(
+    boundary: &DurableRootGrantBoundary,
+    authority_root_ref: &str,
+    grant_graph_revision: u64,
+) -> Result<(), KernelError> {
+    let root = OpaqueLabel::new(authority_root_ref).map_err(KernelError::RecoveryState)?;
+    match boundary
+        .store
+        .load_grant_graph_revision(&root)
+        .map_err(|error| map_ors_recovery_error(&error))?
+    {
+        Some(current) if current == grant_graph_revision => Ok(()),
+        Some(current) if current > grant_graph_revision => Err(KernelError::InvalidField {
+            field: "grant_graph_revision",
+            reason: "stale grant-graph revision",
+        }),
+        Some(_) => Err(KernelError::RecoveryUnavailable(
+            "durable graph revision is behind the committed introduction".to_owned(),
+        )),
+        None => Err(KernelError::RecoveryUnavailable(
+            "durable graph revision is absent for a committed introduction".to_owned(),
+        )),
+    }
 }
 
 /// Canonical digest bytes for one grant-activation payload. Multi-value
@@ -5326,6 +5552,20 @@ fn thin_operation_id(kind: &str, target_id: &str, snapshot_id: &str, epoch: &Epo
 
 fn runtime_activation_receipt(
     intent: &GrantActivationIntent,
+    active_epoch: &EpochId,
+) -> Result<AuthorityActivationReceipt, KernelError> {
+    let receipt = AuthorityActivationReceipt {
+        activation_id: format!("activation-{}", intent.operation_id),
+        snapshot_id: intent.snapshot_id.clone(),
+        authority_epoch: active_epoch.clone(),
+        state: AuthorityState::Active,
+    };
+    receipt.validate()?;
+    Ok(receipt)
+}
+
+fn runtime_introduction_activation_receipt(
+    intent: &IntroductionActivationIntent,
     active_epoch: &EpochId,
 ) -> Result<AuthorityActivationReceipt, KernelError> {
     let receipt = AuthorityActivationReceipt {
@@ -5772,17 +6012,6 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
             // repairs caller material; the caller re-presents through a
             // current Governor snapshot.
             return Err(map_thin_error(&error));
-        }
-        {
-            let ledger = self.lock_ledger();
-            if ledger
-                .introductions
-                .contains_key(request.introduction_id.as_str())
-            {
-                // Caller lifecycle violation: a recorded introduction
-                // identity cannot activate again.
-                return Err(P07PortError::InvalidBinding);
-            }
         }
         // Owner-hydrated durable activation (`#2100`/`#1110`): the Governor
         // introduction-hydration owner resolves the thin request to the

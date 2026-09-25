@@ -2111,7 +2111,29 @@ pub(crate) const fn grant_closure_phase(state: GrantClosureState) -> Operational
 pub(crate) fn validate_grant_closure_contract(commit: &GrantClosureCommit) -> Result<(), OrsError> {
     commit
         .validate()
-        .map_err(|error| OrsError::Contract(error.to_string()))
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+    if let Some(receipt) = &commit.canonical_receipt {
+        validate_grant_closure_canonical_receipt(receipt)?;
+    }
+    Ok(())
+}
+
+/// Validates one complete canonical second-phase receipt identity.
+///
+/// A pending first phase legitimately has no identity. Once an identity is
+/// present, both the receipt id and its canonical digest must be complete and
+/// bounded before ORS can persist or return the link.
+pub(crate) fn validate_grant_closure_canonical_receipt(
+    receipt: &ReceiptIdentity,
+) -> Result<(), OrsError> {
+    validate_text(
+        receipt.receipt_id.as_str(),
+        "grant_closure_canonical_receipt_id",
+    )?;
+    validate_digest(
+        &receipt.canonical_sha256,
+        "grant_closure_canonical_receipt_sha256",
+    )
 }
 
 /// Validates an opaque ORS record against the exact authority/fence contour
@@ -2146,13 +2168,15 @@ pub(crate) fn validate_grant_closure_input(
 ///
 /// The commit bytes, phase, ordering, and store-issued receipt are
 /// operational evidence only; this projection grants no capability and does
-/// not interpret the closure.
+/// not interpret the closure. The second-phase receipt link is optional while
+/// canonical reconciliation is pending.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct GrantClosureProjection {
     commit: GrantClosureCommit,
     phase: OperationalPhase,
     operation_order: u64,
     receipt: GrantClosureCommitReceipt,
+    second_phase: Option<ReceiptIdentity>,
 }
 
 impl GrantClosureProjection {
@@ -2161,12 +2185,14 @@ impl GrantClosureProjection {
         phase: OperationalPhase,
         operation_order: u64,
         receipt: GrantClosureCommitReceipt,
+        second_phase: Option<ReceiptIdentity>,
     ) -> Self {
         Self {
             commit,
             phase,
             operation_order,
             receipt,
+            second_phase,
         }
     }
 
@@ -2188,6 +2214,16 @@ impl GrantClosureProjection {
     /// Returns the store-issued integrity receipt for this row.
     pub const fn receipt(&self) -> &GrantClosureCommitReceipt {
         &self.receipt
+    }
+
+    /// Returns the durable canonical second-phase receipt link, if the
+    /// immutable first-phase commit has already been linked.
+    ///
+    /// This is deliberately separate from [`Self::commit`]. The first-phase
+    /// `GrantClosureCommit` bytes are never rewritten when this link is
+    /// recorded.
+    pub const fn second_phase(&self) -> Option<&ReceiptIdentity> {
+        self.second_phase.as_ref()
     }
 }
 
@@ -2317,14 +2353,7 @@ impl GrantClosureFenceRequest {
             return Err(OrsError::FenceMismatch);
         }
         if let Some(receipt) = &self.canonical_receipt {
-            validate_text(
-                receipt.receipt_id.as_str(),
-                "grant_closure_canonical_receipt_id",
-            )?;
-            validate_digest(
-                &receipt.canonical_sha256,
-                "grant_closure_canonical_receipt_sha256",
-            )?;
+            validate_grant_closure_canonical_receipt(receipt)?;
         }
 
         let declared_members = self
