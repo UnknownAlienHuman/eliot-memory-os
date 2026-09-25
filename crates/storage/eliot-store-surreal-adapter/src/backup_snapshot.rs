@@ -37,13 +37,223 @@ pub(crate) const SNAPSHOT_PAGE_OPERATION: &str = "snapshot.page";
 /// Closed named-operation label for closing a capture with an end receipt.
 pub(crate) const SNAPSHOT_END_OPERATION: &str = "snapshot.end";
 
-/// Fixed adapter-owned point-observation statement: the schema-meta
-/// generation projection owned by [`crate::schema`]. Referenced, not
-/// restated, so the physical table name keeps its single owner.
-const SNAPSHOT_POINT_STATEMENT: &str = crate::schema::READ_SCHEMA_META;
-
 /// Members served per page: the closed per-page ceiling from `backup_io`.
 const SNAPSHOT_PAGE_CHUNK: u64 = MAX_SNAPSHOT_PAGE_MEMBERS as u64;
+
+/// Static error field for a canonical source class composition defect.
+const SNAPSHOT_CLASS_FIELD: &str = "snapshot.classes";
+
+/// Domain separator for the owner-issued consistency point.
+///
+/// I5.27 binds canonical identity over a domain separator, so a capture handle
+/// can never be confused with another capability's evidence. The separator is
+/// the public capability this fixed registry implements, owned by
+/// `eliot-store-api` and surfaced by the registry.
+const SNAPSHOT_CONSISTENCY_POINT_DOMAIN: &str = crate::client::snapshot_capability();
+
+/// One declared canonical source class and its single disposition in a capture.
+///
+/// The enumeration below is declared here, not in [`crate::schema`], because
+/// `schema.rs` is the single owner of the physical *names* and this module is
+/// the single owner of what a bounded backup capture *does* with each declared
+/// class. It only references `crate::schema::table::*` and
+/// `crate::schema::READ_SCHEMA_META` / `READ_FENCE`; it adds no name, no DDL
+/// and no migration.
+pub(crate) enum CanonicalSourceClass {
+    /// Read in the one member transaction and captured as a snapshot member.
+    Member {
+        /// Physical table name owned by [`crate::schema`].
+        table: &'static str,
+    },
+    /// Read as the capture point itself; never a member.
+    CapturePoint {
+        /// Physical table name owned by [`crate::schema`].
+        table: &'static str,
+        /// Fixed adapter-owned point read owned by [`crate::schema`].
+        statement: &'static str,
+    },
+    /// Declared by the single owner but not defined by the admitted
+    /// `SCHEMA_DDL_V2` generation.
+    ///
+    /// `SurrealAdapterConfig::validate` pins
+    /// `expected_schema_generation == GENERATION_V2`, and `SCHEMA_DDL_V2`
+    /// (`schema.rs`) defines exactly the eleven tables below the
+    /// [`CanonicalSourceClass::CapturePoint`] rows plus the nine
+    /// [`CanonicalSourceClass::Member`] rows. Every remaining table is added by
+    /// an additive delta DDL that no admitted migration path reaches: the
+    /// erasure delta is `#[allow(dead_code)]` (`schema.rs`
+    /// `MIGRATION_ID_V2_TO_V3`) and the notification/resource/automation/
+    /// experience deltas are the same shape. Reading an undefined table inside
+    /// one `BEGIN … COMMIT` batch aborts the whole transaction (see the
+    /// recorded provider observations in `apply/read_boundary.rs`), so
+    /// including these rows would make every capture fail on an admitted
+    /// store. Each therefore has exactly one disposition — declared, not
+    /// captured — instead of being silently omitted or reported as an
+    /// undeclared exclusion.
+    OutsideAdmittedGeneration {
+        /// Physical table name owned by [`crate::schema`].
+        table: &'static str,
+    },
+}
+
+/// Every canonical source class the single owner declares, in canonical order.
+pub(crate) const CANONICAL_SOURCE_CLASSES: &[CanonicalSourceClass] = &[
+    CanonicalSourceClass::CapturePoint {
+        table: crate::schema::table::SCHEMA_META,
+        statement: crate::schema::READ_SCHEMA_META,
+    },
+    CanonicalSourceClass::Member {
+        table: crate::schema::table::WRITE_RECEIPT,
+    },
+    CanonicalSourceClass::Member {
+        table: crate::schema::table::REVISION_HEAD,
+    },
+    CanonicalSourceClass::Member {
+        table: crate::schema::table::ORDERING_HEAD,
+    },
+    CanonicalSourceClass::Member {
+        table: crate::schema::table::CANONICAL_EVENT,
+    },
+    CanonicalSourceClass::Member {
+        table: crate::schema::table::PROJECTION_RECORD,
+    },
+    CanonicalSourceClass::Member {
+        table: crate::schema::table::RELATION_RECORD,
+    },
+    CanonicalSourceClass::Member {
+        table: crate::schema::table::OUTBOX_EVENT,
+    },
+    CanonicalSourceClass::Member {
+        table: crate::schema::table::RECOVERY_OWNER,
+    },
+    CanonicalSourceClass::Member {
+        table: crate::schema::table::RECOVERY_JOB,
+    },
+    CanonicalSourceClass::CapturePoint {
+        table: crate::schema::table::CANONICAL_FENCE,
+        statement: crate::schema::READ_FENCE,
+    },
+    CanonicalSourceClass::OutsideAdmittedGeneration {
+        table: crate::schema::table::ERASURE_INTENT,
+    },
+    CanonicalSourceClass::OutsideAdmittedGeneration {
+        table: crate::schema::table::ERASURE_OUTCOME,
+    },
+    CanonicalSourceClass::OutsideAdmittedGeneration {
+        table: crate::schema::table::NOTIFICATION_RECORD,
+    },
+    CanonicalSourceClass::OutsideAdmittedGeneration {
+        table: crate::schema::table::REACTIVE_SESSION,
+    },
+    CanonicalSourceClass::OutsideAdmittedGeneration {
+        table: crate::schema::table::RESOURCE_SNAPSHOT,
+    },
+    CanonicalSourceClass::OutsideAdmittedGeneration {
+        table: crate::schema::table::AUTOMATION_REVISION,
+    },
+    CanonicalSourceClass::OutsideAdmittedGeneration {
+        table: crate::schema::table::AUTOMATION_CURRENT,
+    },
+    CanonicalSourceClass::OutsideAdmittedGeneration {
+        table: crate::schema::table::AUTOMATION_INVOCATION,
+    },
+    CanonicalSourceClass::OutsideAdmittedGeneration {
+        table: crate::schema::table::AUTOMATION_FAILURE,
+    },
+    CanonicalSourceClass::OutsideAdmittedGeneration {
+        table: crate::schema::table::AUTOMATION_LAST_FAILURE,
+    },
+    CanonicalSourceClass::OutsideAdmittedGeneration {
+        table: crate::schema::table::EXPERIENCE_BANK,
+    },
+    CanonicalSourceClass::OutsideAdmittedGeneration {
+        table: crate::schema::table::EXPERIENCE_FEEDBACK,
+    },
+];
+
+/// The capture-point reads, in the exact order the pinned batches issue them:
+/// the schema generation first, then the canonical fence.
+pub(crate) fn capture_point_statements() -> impl Iterator<Item = &'static str> {
+    CANONICAL_SOURCE_CLASSES
+        .iter()
+        .filter_map(|class| match class {
+            CanonicalSourceClass::CapturePoint { statement, .. } => Some(*statement),
+            CanonicalSourceClass::Member { .. }
+            | CanonicalSourceClass::OutsideAdmittedGeneration { .. } => None,
+        })
+}
+
+/// The physical tables the pinned member batch reads, in order.
+pub(crate) fn captured_member_tables() -> impl Iterator<Item = &'static str> {
+    CANONICAL_SOURCE_CLASSES
+        .iter()
+        .filter_map(|class| match class {
+            CanonicalSourceClass::Member { table } => Some(*table),
+            CanonicalSourceClass::CapturePoint { .. }
+            | CanonicalSourceClass::OutsideAdmittedGeneration { .. } => None,
+        })
+}
+
+/// Reports whether the admitted baseline generations define `table` exactly.
+///
+/// Both single-owner baselines are consulted so a v1 store is never read as
+/// missing a table the v2 baseline added. The marker carries the trailing
+/// space, so `relation_record_extra` can never satisfy `relation_record`.
+fn defines_admitted_table(table: &str) -> bool {
+    let marker = format!("DEFINE TABLE {table} ");
+    crate::schema::SCHEMA_DDL_V2.contains(&marker) || crate::schema::SCHEMA_DDL.contains(&marker)
+}
+
+/// Walks every declared canonical source class and proves its one disposition.
+///
+/// Fails closed when the composition drifts from the single owner: a class
+/// declared outside the admitted generation that a baseline DDL actually
+/// defines would be silently dropped from the capture, and a capture point
+/// whose pinned read does not name its own table would bind the wrong point.
+/// Both are composition defects, not caller input, so both are refused before
+/// any provider I/O instead of being absorbed into a later error.
+fn verify_canonical_source_classes() -> Result<(), StoreError> {
+    let mut verified = 0_usize;
+    for class in CANONICAL_SOURCE_CLASSES {
+        match class {
+            CanonicalSourceClass::Member { table } => {
+                if !defines_admitted_table(table) {
+                    return Err(StoreError::InvalidField {
+                        field: SNAPSHOT_CLASS_FIELD,
+                        reason: "captured class is not defined by the admitted generation",
+                    });
+                }
+            }
+            CanonicalSourceClass::CapturePoint { table, statement } => {
+                if !statement.contains(*table) {
+                    return Err(StoreError::InvalidField {
+                        field: SNAPSHOT_CLASS_FIELD,
+                        reason: "capture point read does not name its own table",
+                    });
+                }
+            }
+            CanonicalSourceClass::OutsideAdmittedGeneration { table } => {
+                if defines_admitted_table(table) {
+                    return Err(StoreError::InvalidField {
+                        field: SNAPSHOT_CLASS_FIELD,
+                        reason: "declared class is defined by the admitted generation",
+                    });
+                }
+            }
+        }
+        verified += 1;
+    }
+    // Every declared class carries exactly one disposition, so the walk always
+    // covers the whole enumeration; the guard keeps that a checked property
+    // rather than an assumption.
+    if verified != CANONICAL_SOURCE_CLASSES.len() {
+        return Err(StoreError::InvalidField {
+            field: SNAPSHOT_CLASS_FIELD,
+            reason: "canonical source class enumeration is not total",
+        });
+    }
+    Ok(())
+}
 
 /// One shape of the point-probe projection used for generation binding.
 #[derive(Deserialize)]
@@ -109,32 +319,32 @@ fn purge_expired(states: &mut HashMap<String, SnapshotState>, now_ms: u64) {
 }
 
 /// Gates on readiness/generation (no fallback client, no ambient DB) and then
-/// observes the live schema generation through one fixed parameterized
-/// adapter-owned statement.
+/// observes the live schema generation through the fixed adapter-owned
+/// statement registered for `operation` in [`crate::client::backup_snapshot`].
 ///
-/// `operation` selects the closed `snapshot.*` label for this call. The
-/// statement takes no parameters; the binding map is empty so no caller value
-/// can reach the provider. Unlisted operation names stay on the facade
-/// session inside [`crate::client::query`]; only reads are issued here.
+/// `operation` must be a member of the closed `snapshot.*` vocabulary: the
+/// registry is validated first, so an unlisted name can never reach the
+/// provider, and the statement is resolved from the registry rather than
+/// restated here. The statement takes no parameters; the binding map is empty
+/// so no caller value can reach the provider.
 async fn observe_live_generation(
     adapter: &SurrealStoreAdapter,
     operation: &'static str,
 ) -> Result<String, StoreError> {
+    let statement = crate::client::fixed_snapshot_statement(operation)
+        .map_err(AdapterError::into_store_error)?;
+    crate::client::validate_snapshot_operation(operation)
+        .map_err(AdapterError::into_store_error)?;
     let transport = crate::apply::client(adapter)
         .await
         .map_err(AdapterError::into_store_error)?;
     crate::apply::ensure_ready(adapter, transport)
         .await
         .map_err(AdapterError::into_store_error)?;
-    let mut response = crate::client::query(
-        transport,
-        &adapter.config,
-        operation,
-        SNAPSHOT_POINT_STATEMENT,
-        Map::new(),
-    )
-    .await
-    .map_err(AdapterError::into_store_error)?;
+    let mut response =
+        crate::client::query(transport, &adapter.config, operation, statement, Map::new())
+            .await
+            .map_err(AdapterError::into_store_error)?;
     let errors = response.take_errors();
     if !errors.is_empty() {
         if errors
@@ -145,8 +355,12 @@ async fn observe_live_generation(
         }
         return Err(StoreError::MissingReceiptEnvelope);
     }
+    // `SurrealDB` 3 retains the `BEGIN TRANSACTION` result at index 0, so the
+    // schema-meta projection is index 1 and the canonical-fence projection
+    // index 2 — the same offsets `apply::read_boundary` uses for the identical
+    // batch shape.
     let probe: Option<GenerationProbe> =
-        response.take(0).map_err(AdapterError::into_store_error)?;
+        response.take(1).map_err(AdapterError::into_store_error)?;
     match probe {
         Some(probe)
             if !probe.generation.is_empty() && !probe.generation.chars().any(char::is_control) =>
@@ -179,6 +393,7 @@ pub(crate) async fn begin_snapshot(
             reason: "source is not this installation",
         });
     }
+    verify_canonical_source_classes()?;
     let observed = observe_live_generation(adapter, SNAPSHOT_BEGIN_OPERATION).await?;
     if observed != adapter.config.expected_schema_generation.as_str() {
         return Err(StoreError::Unavailable);
@@ -209,7 +424,7 @@ pub(crate) async fn begin_snapshot(
     }
 
     let handle = SnapshotHandle {
-        consistency_point: format!("snapshot-point:{snapshot_digest}"),
+        consistency_point: format!("{SNAPSHOT_CONSISTENCY_POINT_DOMAIN}:{snapshot_digest}"),
         snapshot_digest: snapshot_digest.clone(),
         operation_id: request.operation.operation_id.clone(),
         idempotency_key: request.operation.idempotency_key.clone(),
