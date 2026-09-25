@@ -608,12 +608,15 @@ impl KernelComposition {
                 ProtocolPayload::Json(payload) => payload.clone(),
                 _ => return Err(TransportError::SessionFenced),
             };
+            // The closed selector is owned here so the exact payload can still be
+            // moved into the dispatched frame action below.
             let operation = payload
                 .get("operation")
                 .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
                 .ok_or(TransportError::SessionFenced)?;
             if session.module_generation.module_id.as_str() == ACTIVE_DAEMON_CALLER
-                && is_daemon_operation(operation)
+                && is_daemon_operation(&operation)
             {
                 if !probe_ready_state_admitted(
                     self.service_state()
@@ -635,11 +638,11 @@ impl KernelComposition {
                 return Ok(KernelFrameAction::Daemon {
                     request_id,
                     identity: identity.clone(),
-                    operation: operation.to_owned(),
-                    payload: route_payload_for_daemon_operation(operation, payload, identity)?,
+                    operation: operation.clone(),
+                    payload: route_payload_for_daemon_operation(&operation, payload, identity)?,
                 });
             }
-            if is_user_automation_operator_operation(operation) {
+            if is_user_automation_operator_operation(&operation) {
                 // The authenticated `UserAutomation` operator selector is not a
                 // daemon-module operation: the closed
                 // create/list/status/history/pause/resume/edit/run-now/remove/
@@ -668,7 +671,8 @@ impl KernelComposition {
                 }
                 return Ok(KernelFrameAction::Daemon {
                     request_id,
-                    operation: operation.to_owned(),
+                    identity: identity.clone(),
+                    operation,
                     payload: with_user_automation_request_identity(payload, identity)?,
                 });
             }

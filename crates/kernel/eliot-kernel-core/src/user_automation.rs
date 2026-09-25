@@ -217,7 +217,7 @@ impl NormalizedSchedule {
         let canonical = zone == "UTC"
             || zone
                 .strip_prefix("Etc/GMT")
-                .is_some_and(|offset| offset_is_canonical(offset))
+                .is_some_and(offset_is_canonical)
             || (zone.split('/').count() == 2
                 && zone.split('/').all(|segment| {
                     !segment.is_empty()
@@ -887,11 +887,12 @@ impl UserAutomationRevision {
         let mut identities = Vec::with_capacity(self.schedule.next_occurrences.len());
         for occurrence_key in &self.schedule.next_occurrences {
             let trigger = self.scheduled_trigger(occurrence_key)?;
+            let occurrence_id = self.occurrence_identity_for(&trigger)?;
             identities.push(AutomationOccurrenceIdentity {
                 automation_id: self.automation_id.clone(),
                 revision: self.revision.clone(),
                 trigger,
-                occurrence_id: self.occurrence_identity_for(&trigger)?,
+                occurrence_id,
             });
         }
         Ok(identities)
