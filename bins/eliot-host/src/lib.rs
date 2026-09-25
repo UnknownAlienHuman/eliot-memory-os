@@ -53,8 +53,8 @@ mod reactive_context_delivery;
 mod scm_launch;
 mod store_kernel_launch_sequence;
 /// Host Windows Event Log sink seam (F-LOG-HOST-0, #889): thin bounded
-/// wrapper over #984's accepted safe port; explicitly unavailable until #984
-/// lands, never FFI inside Host.
+/// wrapper over #984's accepted safe port; typed delivery outcomes, fixed
+/// source/event/severity mapping only, never FFI inside Host.
 pub mod windows_event_log;
 
 // F-LOG-HOST-1 (#891) lifecycle/SCM observation helpers.
