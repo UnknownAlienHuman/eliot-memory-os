@@ -56,6 +56,7 @@ mod kernel_authority_client;
 mod kernel_context_read_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
+mod maintenance_trigger_evaluator;
 pub mod notification_board_attach;
 mod observation_adapters;
 mod owner_feed;
@@ -164,6 +165,9 @@ pub use governor_local_read::{
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
+pub use maintenance_trigger_evaluator::{
+    MaintenanceObservation, MaintenanceTriggerOrigin, SELF_OBSERVED_FAMILY, UNRESOLVED_AUTHORITIES,
+};
 pub use owner_feed::{KernelOwnerPublishPort, OwnerFeedTrigger, maintain_owner_feed};
 pub use process_origin::{
     CapabilityEvidenceSource, Generation, OperationDisposition, OriginChallenge,
@@ -265,6 +269,14 @@ pub enum DaemonError {
     /// retryable transport without collapsing the typed failure.
     #[error(transparent)]
     ProviderAdmission(#[from] FabricError),
+    /// Governor-owned maintenance trigger evaluation or Durable Job
+    /// admission (I14.22, issue #1688) failed fail-closed. The owner's own
+    /// [`eliot_maintenance::MaintenanceError`] is preserved unchanged and
+    /// never stringified, so a driver can still tell an unresolved trigger
+    /// identity from a stale fence, a missing evidence set, or an exhausted
+    /// attempt budget instead of collapsing them into one lifecycle message.
+    #[error("Governor maintenance: {0}")]
+    Maintenance(#[from] eliot_maintenance::MaintenanceError),
 }
 
 /// Typed revision-fence match failure for the daemon cache gate (issue #18

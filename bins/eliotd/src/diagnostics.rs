@@ -444,6 +444,69 @@ pub fn emit_daemon_readiness(ready: bool, degraded: bool) -> DiagnosticRecord {
     )
 }
 
+/// Emits one Governor maintenance trigger decision so it is inspectable.
+///
+/// I14.22 requires the single `AutomationTriggerDecision` to make maintenance
+/// start behaviour inspectable. One record carries every field of the
+/// decision (`trigger`, `family`, `scope`, `decision`, `reason`,
+/// `admits_job`, `durable_job_ref`) plus the exact observed gates that
+/// produced it, so a reader can enumerate the decision and re-derive it from
+/// the same minimal operational sink that already serves the rest of the
+/// daemon. Nothing here interprets the decision, retries it, or claims work
+/// was performed: a `START` decision is a decision, not an executed job, and
+/// this record never reads as a completion.
+#[must_use]
+pub fn emit_maintenance_trigger_decision(
+    input: &eliot_maintenance::MaintenanceTriggerInput,
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+) -> DiagnosticRecord {
+    let trigger = sanitize_identity(&input.trigger_id);
+    let scope = sanitize_identity(&input.scope_ref);
+    let durable_job_ref = match &decision.durable_job_ref {
+        Some(reference) => sanitize_identity(reference),
+        None => UNAVAILABLE.to_owned(),
+    };
+    let evidence = input
+        .evidence_refs
+        .iter()
+        .map(|reference| sanitize_identity(reference))
+        .collect::<Vec<_>>()
+        .join(",");
+    emit_line(
+        "eliotd.maintenance_trigger_decision",
+        &format!(
+            "service='{SERVICE_NAME}' trigger='{trigger}' family='{}' scope='{scope}' \
+             decision='{:?}' reason='{:?}' admits_job={} durable_job_ref='{durable_job_ref}' \
+             origin='{:?}' mode='{:?}' idle={} scheduled_window={} route_available={} \
+             budget_available={} user_session_available={} user_session_required={} \
+             explicit_request={} safety_required={} active_job='{}' expires_at_ms='{}' \
+             evidence='{evidence}'",
+            input.family,
+            decision.decision,
+            decision.reason,
+            decision.admits_job,
+            input.trigger,
+            input.mode,
+            input.idle,
+            input.scheduled_window,
+            input.route_available,
+            input.budget_available,
+            input.user_session_available,
+            input.user_session_required,
+            input.explicit_request,
+            input.safety_required,
+            match &input.active_job_id {
+                Some(active) => sanitize_identity(active),
+                None => UNAVAILABLE.to_owned(),
+            },
+            match input.expires_at_ms {
+                Some(expires) => expires.to_string(),
+                None => UNAVAILABLE.to_owned(),
+            },
+        ),
+    )
+}
+
 /// Request receipt: exact available request/operation identity, never
 /// payload content. The constructor takes no payload parameter by design.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -870,7 +933,9 @@ pub fn fabric_rejection_of(error: &FabricError) -> (RejectionReason, OwningCompo
 #[must_use]
 pub fn daemon_error_owner(error: &DaemonError) -> OwningComponent {
     match error {
-        DaemonError::Composition(_) | DaemonError::Finish(_) => OwningComponent::Governor,
+        DaemonError::Composition(_) | DaemonError::Finish(_) | DaemonError::Maintenance(_) => {
+            OwningComponent::Governor
+        }
         DaemonError::Kernel(_) => OwningComponent::Kernel,
         DaemonError::LaunchConfig(_) | DaemonError::Protected(_) => OwningComponent::DaemonConfig,
         DaemonError::Lifecycle(_) => OwningComponent::DaemonRuntime,
@@ -1164,6 +1229,7 @@ impl ErrorRecord {
             DaemonError::Protected(_) => ("protected-path", error.to_string()),
             DaemonError::Lifecycle(_) => ("lifecycle", error.to_string()),
             DaemonError::ProviderAdmission(_) => ("provider-admission", error.to_string()),
+            DaemonError::Maintenance(_) => ("maintenance-trigger", error.to_string()),
         };
         Self::of(owner, code, &detail)
     }
