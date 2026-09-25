@@ -881,6 +881,25 @@ pub struct CanonicalVerifierPlanBinding {
     pub input_artifacts: Vec<ArtifactId>,
     /// Required test ids selected by the canonical plan owner.
     pub required_test_ids: BTreeSet<String>,
+    /// Full `TaskContract` acceptance denominator bound by the canonical plan
+    /// owner (issue #325 P1, I7.9).
+    ///
+    /// The finish path enumerates exactly this set before joining executed
+    /// verifier evidence. The selected `required_test_ids` inventory alone is
+    /// never the acceptance denominator: an obligation omitted from the test
+    /// list must still surface as an uncovered acceptance row rather than
+    /// vanishing from the gate.
+    pub required_acceptance_item_ids: BTreeSet<String>,
+    /// Explicit join from each acceptance item to the nextest test ids that
+    /// establish it (issue #325 P1).
+    ///
+    /// Many-to-many mappings are supported without equating test ids with
+    /// acceptance ids. An item with no entry is unmapped and the verifier
+    /// path reports it uncovered; an entry with an empty test set declares a
+    /// non-test obligation that executed verifier runs alone cannot satisfy.
+    /// Neither form ever shrinks the task denominator to the selected test
+    /// list.
+    pub acceptance_verifier_map: BTreeMap<String, BTreeSet<String>>,
     /// Registered evaluator identity and version used for this plan.
     pub evaluator: ContractId,
     pub evaluator_version: ContractVersion,
@@ -952,6 +971,11 @@ impl CanonicalVerifierPlanBinding {
                 "canonical verifier plan has no required test ids".to_owned(),
             ));
         }
+        // I7.9 / issue #325 P1: the plan must bind the full TaskContract
+        // acceptance denominator, not just the selected test inventory. An
+        // empty denominator would let the finish path shrink the task to the
+        // test list, so admission fails closed here.
+        self.validate_acceptance_denominator()?;
         if self.input_artifacts.is_empty()
             || self
                 .input_artifacts
@@ -962,22 +986,63 @@ impl CanonicalVerifierPlanBinding {
                 "canonical verifier plan has no exact input artifact binding".to_owned(),
             ));
         }
-        let config_hash = verifier_invocation_config_digest(
-            &self.instrument,
-            self.kind,
-            &self.profile,
-            &self.target,
-            &self.arguments,
-            &self.declared_scope,
-            &self.input_artifacts,
-            &self.required_test_ids,
-            &self.evaluator,
-            self.evaluator_version,
-        )?;
+        let config_hash = verifier_invocation_config_digest(&VerifierInvocationConfig {
+            instrument: &self.instrument,
+            kind: self.kind,
+            profile: &self.profile,
+            target: &self.target,
+            arguments: &self.arguments,
+            declared_scope: &self.declared_scope,
+            input_artifacts: &self.input_artifacts,
+            required_test_ids: &self.required_test_ids,
+            required_acceptance_item_ids: &self.required_acceptance_item_ids,
+            acceptance_verifier_map: &self.acceptance_verifier_map,
+            evaluator: &self.evaluator,
+            evaluator_version: self.evaluator_version,
+        })?;
         if self.planned.verifier_config_hash != config_hash {
             return Err(CompositionError::Recovery(
                 "canonical verifier plan config hash does not bind its invocation shape".to_owned(),
             ));
+        }
+        Ok(())
+    }
+
+    /// Validates the plan-bound `TaskContract` acceptance denominator and its
+    /// explicit join to the selected test inventory (issue #325 P1, I7.9).
+    fn validate_acceptance_denominator(&self) -> Result<(), CompositionError> {
+        if self.required_acceptance_item_ids.is_empty()
+            || self
+                .required_acceptance_item_ids
+                .iter()
+                .any(|item_id| item_id.trim().is_empty() || item_id.chars().any(char::is_control))
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan has no required acceptance item ids".to_owned(),
+            ));
+        }
+        for (item_id, test_ids) in &self.acceptance_verifier_map {
+            if !self.required_acceptance_item_ids.contains(item_id) {
+                return Err(CompositionError::Recovery(
+                    "canonical verifier plan maps an unknown acceptance item".to_owned(),
+                ));
+            }
+            if item_id.trim().is_empty() || item_id.chars().any(char::is_control) {
+                return Err(CompositionError::Recovery(
+                    "canonical verifier plan has an invalid acceptance item id".to_owned(),
+                ));
+            }
+            for test_id in test_ids {
+                if test_id.trim().is_empty()
+                    || test_id.chars().any(char::is_control)
+                    || !self.required_test_ids.contains(test_id)
+                {
+                    return Err(CompositionError::Recovery(
+                        "canonical verifier plan maps an acceptance item outside its required test set"
+                            .to_owned(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -998,6 +1063,13 @@ pub struct CanonicalVerifierInvocationBinding {
     pub declared_scope: String,
     pub input_artifacts: Vec<ArtifactId>,
     pub required_test_ids: BTreeSet<String>,
+    /// `TaskContract` acceptance denominator observed with the admitted
+    /// invocation; copied from the canonical plan so a persisted fact keeps
+    /// the exact denominator its acceptance join used.
+    pub required_acceptance_item_ids: BTreeSet<String>,
+    /// Acceptance-to-test join observed with the admitted invocation; copied
+    /// from the canonical plan for the same reason.
+    pub acceptance_verifier_map: BTreeMap<String, BTreeSet<String>>,
     pub evaluator: ContractId,
     pub evaluator_version: ContractVersion,
     pub config_hash: String,
@@ -1011,18 +1083,20 @@ impl CanonicalVerifierInvocationBinding {
         invocation.validate().map_err(|error| {
             verifier_fact_error(format!("TestD invocation validation failed: {error}"))
         })?;
-        let config_hash = verifier_invocation_config_digest(
-            &invocation.instrument,
-            invocation.kind,
-            &invocation.profile,
-            &invocation.target,
-            &invocation.arguments,
-            &invocation.declared_scope,
-            &invocation.input_artifacts,
-            &plan.required_test_ids,
-            &plan.evaluator,
-            plan.evaluator_version,
-        )?;
+        let config_hash = verifier_invocation_config_digest(&VerifierInvocationConfig {
+            instrument: &invocation.instrument,
+            kind: invocation.kind,
+            profile: &invocation.profile,
+            target: &invocation.target,
+            arguments: &invocation.arguments,
+            declared_scope: &invocation.declared_scope,
+            input_artifacts: &invocation.input_artifacts,
+            required_test_ids: &plan.required_test_ids,
+            required_acceptance_item_ids: &plan.required_acceptance_item_ids,
+            acceptance_verifier_map: &plan.acceptance_verifier_map,
+            evaluator: &plan.evaluator,
+            evaluator_version: plan.evaluator_version,
+        })?;
         Ok(Self {
             instrument: invocation.instrument.clone(),
             kind: invocation.kind,
@@ -1032,6 +1106,8 @@ impl CanonicalVerifierInvocationBinding {
             declared_scope: invocation.declared_scope.clone(),
             input_artifacts: invocation.input_artifacts.clone(),
             required_test_ids: plan.required_test_ids.clone(),
+            required_acceptance_item_ids: plan.required_acceptance_item_ids.clone(),
+            acceptance_verifier_map: plan.acceptance_verifier_map.clone(),
             evaluator: plan.evaluator.clone(),
             evaluator_version: plan.evaluator_version,
             config_hash,
@@ -1047,6 +1123,7 @@ impl CanonicalVerifierInvocationBinding {
             || self.declared_scope.trim().is_empty()
             || self.input_artifacts.is_empty()
             || self.required_test_ids.is_empty()
+            || self.required_acceptance_item_ids.is_empty()
             || self.config_hash.len() != 64
             || self
                 .config_hash
@@ -1065,23 +1142,43 @@ impl CanonicalVerifierInvocationBinding {
                 .required_test_ids
                 .iter()
                 .any(|test_id| test_id.trim().is_empty() || test_id.chars().any(char::is_control))
+            || self
+                .required_acceptance_item_ids
+                .iter()
+                .any(|item_id| item_id.trim().is_empty() || item_id.chars().any(char::is_control))
+            || self.acceptance_verifier_map.keys().any(|item_id| {
+                item_id.trim().is_empty()
+                    || item_id.chars().any(char::is_control)
+                    || !self.required_acceptance_item_ids.contains(item_id)
+            })
+            || self
+                .acceptance_verifier_map
+                .values()
+                .flat_map(BTreeSet::iter)
+                .any(|test_id| {
+                    test_id.trim().is_empty()
+                        || test_id.chars().any(char::is_control)
+                        || !self.required_test_ids.contains(test_id)
+                })
         {
             return Err(verifier_fact_error(
                 "observed verifier invocation binding has invalid text",
             ));
         }
-        let recomputed = verifier_invocation_config_digest(
-            &self.instrument,
-            self.kind,
-            &self.profile,
-            &self.target,
-            &self.arguments,
-            &self.declared_scope,
-            &self.input_artifacts,
-            &self.required_test_ids,
-            &self.evaluator,
-            self.evaluator_version,
-        )?;
+        let recomputed = verifier_invocation_config_digest(&VerifierInvocationConfig {
+            instrument: &self.instrument,
+            kind: self.kind,
+            profile: &self.profile,
+            target: &self.target,
+            arguments: &self.arguments,
+            declared_scope: &self.declared_scope,
+            input_artifacts: &self.input_artifacts,
+            required_test_ids: &self.required_test_ids,
+            required_acceptance_item_ids: &self.required_acceptance_item_ids,
+            acceptance_verifier_map: &self.acceptance_verifier_map,
+            evaluator: &self.evaluator,
+            evaluator_version: self.evaluator_version,
+        })?;
         if recomputed != self.config_hash {
             return Err(verifier_fact_error(
                 "observed verifier invocation config hash is not exact",
@@ -1091,17 +1188,29 @@ impl CanonicalVerifierInvocationBinding {
     }
 }
 
-fn verifier_invocation_config_digest(
-    instrument: &ContractId,
+/// Exact verifier invocation shape bound by the canonical plan owner into
+/// `verifier_config_hash`.
+///
+/// Issue #325 P1: the `TaskContract` acceptance denominator and its explicit
+/// test join are part of the hashed shape, so a stale hash can never attest
+/// a substituted denominator.
+struct VerifierInvocationConfig<'a> {
+    instrument: &'a ContractId,
     kind: InstrumentKind,
-    profile: &str,
-    target: &str,
-    arguments: &[String],
-    declared_scope: &str,
-    input_artifacts: &[ArtifactId],
-    required_test_ids: &BTreeSet<String>,
-    evaluator: &ContractId,
+    profile: &'a str,
+    target: &'a str,
+    arguments: &'a [String],
+    declared_scope: &'a str,
+    input_artifacts: &'a [ArtifactId],
+    required_test_ids: &'a BTreeSet<String>,
+    required_acceptance_item_ids: &'a BTreeSet<String>,
+    acceptance_verifier_map: &'a BTreeMap<String, BTreeSet<String>>,
+    evaluator: &'a ContractId,
     evaluator_version: ContractVersion,
+}
+
+fn verifier_invocation_config_digest(
+    config: &VerifierInvocationConfig<'_>,
 ) -> Result<String, CompositionError> {
     #[derive(Serialize)]
     struct Config<'a> {
@@ -1113,20 +1222,24 @@ fn verifier_invocation_config_digest(
         declared_scope: &'a str,
         input_artifacts: &'a [ArtifactId],
         required_test_ids: &'a BTreeSet<String>,
+        required_acceptance_item_ids: &'a BTreeSet<String>,
+        acceptance_verifier_map: &'a BTreeMap<String, BTreeSet<String>>,
         evaluator: &'a ContractId,
         evaluator_version: ContractVersion,
     }
     let bytes = canonical_json_bytes(&Config {
-        instrument,
-        kind,
-        profile,
-        target,
-        arguments,
-        declared_scope,
-        input_artifacts,
-        required_test_ids,
-        evaluator,
-        evaluator_version,
+        instrument: config.instrument,
+        kind: config.kind,
+        profile: config.profile,
+        target: config.target,
+        arguments: config.arguments,
+        declared_scope: config.declared_scope,
+        input_artifacts: config.input_artifacts,
+        required_test_ids: config.required_test_ids,
+        required_acceptance_item_ids: config.required_acceptance_item_ids,
+        acceptance_verifier_map: config.acceptance_verifier_map,
+        evaluator: config.evaluator,
+        evaluator_version: config.evaluator_version,
     })
     .map_err(|error| {
         CompositionError::Recovery(format!("verifier config canonicalization failed: {error}"))
@@ -1423,6 +1536,8 @@ impl CanonicalVerifierExecutionFact {
             || invocation.declared_scope != verifier_plan.declared_scope
             || invocation.input_artifacts != verifier_plan.input_artifacts
             || invocation.required_test_ids != verifier_plan.required_test_ids
+            || invocation.required_acceptance_item_ids != verifier_plan.required_acceptance_item_ids
+            || invocation.acceptance_verifier_map != verifier_plan.acceptance_verifier_map
             || invocation.evaluator != verifier_plan.evaluator
             || invocation.evaluator_version != verifier_plan.evaluator_version
             || invocation.config_hash != verifier_plan.planned.verifier_config_hash
@@ -1616,6 +1731,9 @@ impl CanonicalVerifierExecutionFact {
             || self.invocation.declared_scope != verifier_plan.declared_scope
             || self.invocation.input_artifacts != verifier_plan.input_artifacts
             || self.invocation.required_test_ids != verifier_plan.required_test_ids
+            || self.invocation.required_acceptance_item_ids
+                != verifier_plan.required_acceptance_item_ids
+            || self.invocation.acceptance_verifier_map != verifier_plan.acceptance_verifier_map
             || self.invocation.evaluator != verifier_plan.evaluator
             || self.invocation.evaluator_version != verifier_plan.evaluator_version
             || self.invocation.config_hash != verifier_plan.planned.verifier_config_hash
@@ -1818,6 +1936,12 @@ impl CanonicalVerifierExecutionFact {
 /// Rebuilds acceptance dispositions from the terminal verifier evidence and
 /// canonical plan. Persisted `satisfied` flags are never an independent
 /// source of acceptance truth.
+///
+/// I7.9 / issue #325 P1: the denominator is the plan-bound `TaskContract`
+/// acceptance set (`required_acceptance_item_ids`), never the selected
+/// `required_test_ids` inventory. Every required item is enumerated before
+/// any verifier evidence is joined; unmapped items stay uncovered and can
+/// never yield `VERIFIED_COMPLETE` downstream.
 pub(crate) fn acceptance_coverage_from_verifier_fact(
     fact: &CanonicalVerifierExecutionFact,
 ) -> Result<Vec<AcceptanceCoverage>, CompositionError> {
@@ -1831,38 +1955,64 @@ pub(crate) fn acceptance_coverage_from_verifier_fact(
             | EvidenceFreshness::ExactCommit
             | EvidenceFreshness::ExactQuiescedWorktree
     );
-    let mut acceptance = Vec::with_capacity(verifier_plan.required_test_ids.len());
-    for item_id in &verifier_plan.required_test_ids {
-        let item_events = fact
-            .verification_run
-            .evidence
-            .iter()
-            .filter(|event| {
-                event
-                    .value
-                    .get("nextest_test_id")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(item_id.as_str())
-            })
-            .collect::<Vec<_>>();
+    let mut acceptance = Vec::with_capacity(verifier_plan.required_acceptance_item_ids.len());
+    for item_id in &verifier_plan.required_acceptance_item_ids {
+        // Explicit acceptance-to-test join owned by the canonical plan. A
+        // missing entry is an unmapped obligation; an empty test set declares
+        // a non-test obligation that executed verifier runs alone cannot
+        // satisfy. Neither form shrinks the denominator to the test list.
+        let mapped = verifier_plan
+            .acceptance_verifier_map
+            .get(item_id)
+            .cloned()
+            .unwrap_or_default();
         let mut evidence_refs = BTreeSet::new();
-        for event in &item_events {
-            evidence_refs.insert(event.evidence_id.to_string());
-            evidence_refs.insert(event.raw_artifact_id.to_string());
-            if let Some(handles) = event
-                .value
-                .get("raw_artifact_handles")
-                .and_then(serde_json::Value::as_array)
-            {
-                evidence_refs.extend(
-                    handles
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .map(str::to_owned),
-                );
+        let mut mapped_events = 0_usize;
+        let mut all_mapped_observed = true;
+        let mut all_pass = true;
+        for test_id in &mapped {
+            let test_events = fact
+                .verification_run
+                .evidence
+                .iter()
+                .filter(|event| {
+                    event
+                        .value
+                        .get("nextest_test_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(test_id.as_str())
+                })
+                .collect::<Vec<_>>();
+            if test_events.is_empty() {
+                all_mapped_observed = false;
+            }
+            for event in test_events {
+                mapped_events += 1;
+                evidence_refs.insert(event.evidence_id.to_string());
+                evidence_refs.insert(event.raw_artifact_id.to_string());
+                if let Some(handles) = event
+                    .value
+                    .get("raw_artifact_handles")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    evidence_refs.extend(
+                        handles
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                    );
+                }
+                if event
+                    .value
+                    .get("nextest_status")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("PASS")
+                {
+                    all_pass = false;
+                }
             }
         }
-        if item_events.is_empty() {
+        if mapped_events == 0 {
             // Keep the negative item disposition tied to the actual raw run
             // artifacts inspected; never mint a placeholder item receipt.
             evidence_refs.extend(
@@ -1872,26 +2022,30 @@ pub(crate) fn acceptance_coverage_from_verifier_fact(
                     .map(ToString::to_string),
             );
         }
-        let satisfied = run_is_current
-            && !item_events.is_empty()
-            && item_events.iter().all(|event| {
-                event
-                    .value
-                    .get("nextest_status")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("PASS")
-            });
-        let verifier_run_refs = if item_events.is_empty() {
+        // An item is satisfied only for a current run where every bound test
+        // executed and every bound execution passed. Failed, stale,
+        // not-executed, simulated (non-productive, hence non-certifying and
+        // stale-marked upstream), unmapped, and non-test obligations stay
+        // uncovered here and fail closed in `derive_finish_decision`.
+        let satisfied = run_is_current && !mapped.is_empty() && all_mapped_observed && all_pass;
+        let verifier_run_refs = if mapped_events == 0 {
             Vec::new()
         } else {
             vec![run_ref.clone()]
         };
+        // Only an explicit empty mapping declares a non-test obligation that
+        // does not require a verifier run. A missing mapping stays a
+        // verifier gap so absent coverage fails closed downstream.
+        let requires_verifier = !matches!(
+            verifier_plan.acceptance_verifier_map.get(item_id),
+            Some(tests) if tests.is_empty()
+        );
         acceptance.push(AcceptanceCoverage {
             item_id: item_id.clone(),
             satisfied,
             evidence_refs: evidence_refs.into_iter().collect(),
             verifier_run_refs,
-            requires_verifier: true,
+            requires_verifier,
         });
     }
     Ok(acceptance)
