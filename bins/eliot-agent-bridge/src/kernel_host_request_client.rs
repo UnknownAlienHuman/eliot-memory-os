@@ -614,23 +614,93 @@ fn host_request_user_automation_frame(
     Ok(frame)
 }
 
-/// Returns whether one invocation is a local read served with its canonical
-/// tool bytes (Implements #18: local read result).
+/// One finite dispatch row for every canonical tool (Implements #1739 item 1).
 ///
-/// `eliot.query` and `eliot.packet` ride the invoke-read entry so the kernel
-/// can check tool linkage before reading and serve the exact bounded result
-/// with its revision; skill carriers (`skill.inject`, `skill.display`) ride
-/// it so the daemon can claim and serve Hotset pairs through the same
-/// linkage-checked leg; every other tool keeps the admission-only submit
-/// entry. `eliot.packet` parity falls out of the same op because the tool
-/// bytes are opaque here: the kernel, not the pipe, owns their meaning.
+/// This is the single recorded dispatch map [`KernelHostRequestClient::invoke`]
+/// consults: exactly one row per [`ToolRequest`] variant, chosen by an
+/// exhaustive match, so adding a tool variant fails to compile until its row
+/// is recorded here. No ninth hot tool can slip through: non-hot carriers
+/// ([`ToolRequest::UserAutomation`], [`ToolRequest::SkillInject`],
+/// [`ToolRequest::SkillDisplay`]) keep their own explicitly non-hot rows and
+/// are never advertised on the canonical eight-tool surface (I7.6).
+///
+/// | tool | bridge entry | Kernel operation | completion boundary |
+/// |---|---|---|---|
+/// | `eliot.state` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; projection-owner readback join missing |
+/// | `eliot.packet` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded compiler result with revision via Governor read owner |
+/// | `eliot.observe` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; observation-owner execution join missing |
+/// | `eliot.query` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded read result with revision via Governor read owner |
+/// | `eliot.act` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; action-model/authority gate + effect dispatch missing (#1742) |
+/// | `eliot.verify` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; verifier-owner invocation + evidence preservation missing |
+/// | `eliot.coordinate` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; execution-fabric join missing (#1740) |
+/// | `eliot.finish` | refused | — | refused until the task-bound Finish route exists (#325); never an optimistic outcome |
+/// | `eliot_user_automation` (non-hot) | submit frame (tool bytes) | `agent_host_request_submit` | operator carrier on its own leg; never a hot tool |
+/// | `skill.inject` / `skill.display` (non-hot) | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | Hotset intake served through the linkage-checked leg; never advertised |
+///
+/// An `Accepted` submit reply is an operation handle, not completed work; only
+/// the row's named owner execution plus a retained result completes it. The
+/// `completion_join` / `missing_route` strings name that exact missing
+/// interface per unresolved row instead of claiming seven tools do not exist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CanonicalDispatchEntry {
+    /// Linkage-checked invoke-read: the Kernel checks capability and
+    /// payload-digest linkage before reading and serves the exact bounded
+    /// result with its revision.
+    InvokeRead,
+    /// Admission-only submit: the Accepted reply is an operation handle.
+    /// `completion_join` names the exact missing owner execution that must
+    /// complete the row before a completed response is legitimate.
+    SubmitAdmitOnly { completion_join: &'static str },
+    /// Non-hot operator carrier on the submit leg with tool bytes. Only
+    /// [`ToolRequest::UserAutomation`] rides here.
+    SubmitCarryingBytes,
+    /// Refused until the named task-bound route exists. `missing_route` names
+    /// it; the bridge never generates an optimistic outcome instead.
+    RefusedUntilRoute { missing_route: &'static str },
+}
+
+/// Returns the recorded dispatch row for one invocation (Implements #1739
+/// item 1: the finite dispatch map as code).
+///
+/// Exhaustive over [`ToolRequest`]: a new variant is a compile error here
+/// until its decoder, capability, owner, receipt and readback are recorded
+/// above. Behavior is byte-identical to the previous scattered predicates.
+fn canonical_dispatch_entry(tool: &ToolRequest) -> CanonicalDispatchEntry {
+    match tool {
+        ToolRequest::State(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
+            completion_join: "projection-owner readback: submit-record execution (Kernel pair + daemon flight + task/scope projection owner)",
+        },
+        ToolRequest::Packet(_)
+        | ToolRequest::Query(_)
+        | ToolRequest::SkillInject(_)
+        | ToolRequest::SkillDisplay(_) => CanonicalDispatchEntry::InvokeRead,
+        ToolRequest::Observe(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
+            completion_join: "observation-owner execution: submit-record pair (enqueue, fenced claim, submit result) + daemon flight + retained observation readback",
+        },
+        ToolRequest::Act(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
+            completion_join: "action-model/authority gate + effect dispatch (#1742 material-context gate)",
+        },
+        ToolRequest::Verify(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
+            completion_join: "verifier-owner invocation through the existing verifier owner with not-executed/partial/unknown evidence preserved",
+        },
+        ToolRequest::Coordinate(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
+            completion_join: "execution-fabric owner join with the same durable work/attempt identity (#1740)",
+        },
+        ToolRequest::Finish(_) => CanonicalDispatchEntry::RefusedUntilRoute {
+            missing_route: "task-bound Finish owner route: shared draft to the existing Finish service; only its validated result supplies the task outcome (#325)",
+        },
+        ToolRequest::UserAutomation(_) => CanonicalDispatchEntry::SubmitCarryingBytes,
+    }
+}
+
+/// Invoke-read membership for tests: true exactly when the recorded dispatch
+/// map ([`canonical_dispatch_entry`]) routes the request to the linkage-checked
+/// invoke-read entry (Implements #18: local read result).
+#[cfg(test)]
 fn invokes_local_read(request: &HostInvocationRequest) -> bool {
     matches!(
-        request.tool,
-        ToolRequest::Query(_)
-            | ToolRequest::Packet(_)
-            | ToolRequest::SkillInject(_)
-            | ToolRequest::SkillDisplay(_)
+        canonical_dispatch_entry(&request.tool),
+        CanonicalDispatchEntry::InvokeRead
     )
 }
 
@@ -954,9 +1024,6 @@ impl KernelHostRequestPort for KernelHostRequestClient {
         request
             .validate()
             .map_err(|error| plan_gap_bind(&error.to_string()))?;
-        if matches!(request.tool, ToolRequest::Finish(_)) {
-            return Err(unsupported_finish());
-        }
         let now_ms = unix_ms()?;
         let facts = self
             .shared
@@ -985,12 +1052,21 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             // record state maps to an owner timeout.
             return self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
         }
-        let frame = if invokes_local_read(request) {
-            host_request_invoke_read_frame(request, &envelope, &facts)?
-        } else if matches!(&request.tool, ToolRequest::UserAutomation(_)) {
-            host_request_user_automation_frame(request, &envelope, &facts)?
-        } else {
-            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, &envelope, &facts)?
+        let frame = match canonical_dispatch_entry(&request.tool) {
+            CanonicalDispatchEntry::InvokeRead => {
+                host_request_invoke_read_frame(request, &envelope, &facts)?
+            }
+            CanonicalDispatchEntry::SubmitAdmitOnly { .. } => host_request_frame_for_envelope(
+                AGENT_HOST_REQUEST_SUBMIT_OPERATION,
+                &envelope,
+                &facts,
+            )?,
+            CanonicalDispatchEntry::SubmitCarryingBytes => {
+                host_request_user_automation_frame(request, &envelope, &facts)?
+            }
+            CanonicalDispatchEntry::RefusedUntilRoute { .. } => {
+                return Err(unsupported_finish());
+            }
         };
         let Ok(reply) = self.exchange(&frame) else {
             return self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
