@@ -3,20 +3,21 @@
 #![forbid(unsafe_code)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_agent_bridge_core::{
     AgentBridgeCore, AttachBinding, AttachRequest, AttachView, AttemptState, BridgeError,
-    ConnectionId, CursorPolicy, DemandId, EventForwardStatus, EventPortOutcome, HostActivationPort,
-    HostEventEnvelope, McpForwardingPort, OutstandingDeliveryView, ProviderFailure,
-    ProviderReadiness, ReconciliationPortOutcome, ReconnectRequest, RecoveryDirective,
-    TerminalReductionInputs, TransportEdge,
+    ConnectionId, CoverageGap, CursorPolicy, DeliveryClass, DemandId, EventDisposition,
+    EventForwardAck, EventForwardStatus, EventPortOutcome, HostActivationPort, HostEventEnvelope,
+    McpForwardingPort, OutstandingDeliveryView, ProviderFailure, ProviderReadiness,
+    ReconciliationPortOutcome, ReconciliationPortResult, ReconciliationReceiptRef,
+    ReconnectRequest, RecoveryDirective, TerminalReductionInputs, TransportEdge,
 };
 /// I7.17 recall response projection: bounded handles-first agent output with
 /// a server-derived disposition, binding receipt, and rank-trace handle.
@@ -35,11 +36,17 @@ pub use eliot_agent_bridge_core::{
     DeliveryStatus, HotResourceView, MAX_CONTENT_BYTES, MAX_PREVIEW_BYTES, MAX_REGISTRY_ENTRIES,
     MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
 };
+use eliot_contracts::{
+    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
+    canonical_json_bytes, sha256_hex,
+};
 use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
     AckPhase, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
-    AgentBridgePeerChallenge, EventEnvelope,
+    AgentBridgePeerChallenge, EncodingProfile, EventEnvelope, Frame, FrameKind, MessageType,
+    ProtocolPayload, ProtocolVersion, RequestIdentity,
 };
+use eliot_receipts::RequestBinding;
 use eliot_runtime::{Runtime, RuntimeConfig};
 
 mod cli_contract;
@@ -134,12 +141,495 @@ struct KernelTransportOwner {
     limits: eliot_ipc::TransportLimits,
     activated_session: Option<String>,
     replay_cache: HashMap<String, ReplayCacheEntry>,
+    /// Bridge-owned delivered frontier per stream: the highest sequence the
+    /// owner answered with a durable phase on this connection. Carried as the
+    /// reconcile consumed frontier so the Kernel can advance its acked
+    /// cursors; process memory only, bounded at `MAX_DELIVERED_STREAMS`,
+    /// never a reconciliation log.
+    delivered_cursors: BTreeMap<String, u64>,
 }
 
 type SharedTransport = Rc<RefCell<KernelTransportOwner>>;
 
-/// Fail-closed event-route face: the Kernel front door admits activation
-/// and host-request envelopes, but no MCP/event forwarding route.
+impl KernelTransportOwner {
+    /// Exchanges one bridge-event frame over the admitted transport.
+    ///
+    /// Field-disjoint borrows of the single retained owner (runtime plus
+    /// transport plus limits), mirroring the host-request exchange: exactly
+    /// one send and one receive under the admitted limits, with a
+    /// non-delivered send or missing reply reported as an unknown outcome.
+    fn exchange_bridge_event_frame(&mut self, frame: &Frame) -> Result<Frame, ProviderFailure> {
+        let delivery = self.runtime.block_on(async {
+            self.admitted
+                .transport
+                .send_frame(frame, self.limits)
+                .await
+                .map_err(|_| event_transport_failure())
+        })?;
+        if !matches!(delivery, eliot_ipc::DeliveryOutcome::Delivered) {
+            return Err(event_transport_failure());
+        }
+        self.runtime.block_on(async {
+            self.admitted
+                .transport
+                .receive_frame(self.limits)
+                .await
+                .map_err(|_| event_transport_failure())
+        })
+    }
+}
+
+/// Closed Kernel entry that admits one durable/control event envelope.
+///
+/// Owned by `bins/eliot-kernel/src/host_request_route.rs` (event-route
+/// wiring); the literal is repeated here because the constant is `pub(crate)`
+/// to that binary and this crate takes no new dependencies.
+const AGENT_BRIDGE_EVENT_FORWARD_OPERATION: &str = "agent_bridge_event_forward";
+/// Closed Kernel entry that admits one hook observation.
+const AGENT_BRIDGE_HOOK_FORWARD_OPERATION: &str = "agent_bridge_hook_forward";
+/// Closed Kernel entry that admits one coverage gap.
+const AGENT_BRIDGE_EVENT_GAP_OPERATION: &str = "agent_bridge_event_gap";
+/// Closed Kernel entry that reconciles event ownership and cursors.
+const AGENT_BRIDGE_EVENT_RECONCILE_OPERATION: &str = "agent_bridge_event_reconcile";
+/// Bridge-proposed relative deadline when the caller states no preference.
+/// The Kernel owns the absolute deadline; this is a bounded preference only.
+const BRIDGE_EVENT_DEADLINE_PREFERENCE_MS: u64 = 60_000;
+/// Maximum bridge-owned delivered streams retained for the reconcile
+/// consumed frontier. Eviction only defers ack advancement; nothing is lost.
+const MAX_DELIVERED_STREAMS: usize = 1024;
+/// Bound on consumed-frontier entries carried by one reconcile frame.
+const MAX_RECONCILE_CONSUMED_ENTRIES: usize = 1024;
+
+/// Frozen four-operation dispatch map (Implements #2561 item 1).
+///
+/// Exactly one row per [`McpForwardingPort`] forwarding method, chosen by an
+/// exhaustive match, so adding a forwarding method fails to compile until
+/// its closed Kernel request is recorded here. No method reaches the
+/// transport except through its row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BridgeEventMethod {
+    Hook,
+    Event,
+    Gap,
+    Reconcile,
+}
+
+impl BridgeEventMethod {
+    /// Returns the closed Kernel request selected by this method.
+    const fn kernel_operation(self) -> &'static str {
+        match self {
+            Self::Hook => AGENT_BRIDGE_HOOK_FORWARD_OPERATION,
+            Self::Event => AGENT_BRIDGE_EVENT_FORWARD_OPERATION,
+            Self::Gap => AGENT_BRIDGE_EVENT_GAP_OPERATION,
+            Self::Reconcile => AGENT_BRIDGE_EVENT_RECONCILE_OPERATION,
+        }
+    }
+}
+
+/// Kernel-issued facts snapshotted from the shared owner for one event call.
+struct BridgeEventTransportFacts {
+    connection_id: String,
+    state_fence: StateFence,
+    session: Option<String>,
+}
+
+fn event_transport_failure() -> ProviderFailure {
+    ProviderFailure::new(
+        "eliot-kernel-front-door",
+        "authenticated Kernel event exchange was rejected or left an unknown outcome; \
+         no phase reached, nothing claimed; re-attach and reconcile before retrying",
+    )
+}
+
+fn event_shape_failure(detail: &'static str) -> ProviderFailure {
+    ProviderFailure::new("eliot-kernel-front-door", detail)
+}
+
+fn bridge_event_unix_ms() -> Result<u64, ProviderFailure> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().try_into().unwrap_or(u64::MAX))
+        .map_err(|_| event_transport_failure())
+}
+
+/// Builds the neutral frame identity for one bridge-event frame.
+///
+/// The fence carries only the authority epoch and resource generation (no
+/// task, policy, or integration revisions), the correlation identifies the
+/// presented event, and the deadline is the bridge-proposed preference the
+/// Kernel owns absolutely. The Kernel joins connection, correlation, and
+/// fence before any event entry runs.
+fn bridge_event_frame_identity(
+    correlation: &str,
+    facts: &BridgeEventTransportFacts,
+    now_ms: u64,
+) -> Result<RequestIdentity, ProviderFailure> {
+    let fence = &facts.state_fence;
+    if fence.task_revision.is_some()
+        || fence.policy_revision.is_some()
+        || fence.integration_revision.is_some()
+    {
+        return Err(event_transport_failure());
+    }
+    let frame_fence = StateFence::new(fence.authority_epoch.clone(), fence.resource_generation);
+    let deadline = now_ms.saturating_add(BRIDGE_EVENT_DEADLINE_PREFERENCE_MS);
+    if deadline == 0 {
+        return Err(event_transport_failure());
+    }
+    let metadata = RequestMetadata {
+        request_id: RequestId::new(correlation).map_err(|_| event_transport_failure())?,
+        session_id: None,
+        task_id: None,
+        product_id: ProductId::new("eliot-agent-bridge").map_err(|_| event_transport_failure())?,
+        source_id: SourceId::new("agent-bridge").map_err(|_| event_transport_failure())?,
+        state_fence: frame_fence.clone(),
+        clock: ClockReading {
+            valid_time_ms: None,
+            known_time_ms: None,
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+    };
+    let binding = RequestBinding {
+        metadata,
+        state_fence: frame_fence,
+    };
+    let frame_identity = RequestIdentity {
+        request: binding,
+        idempotency_key: format!("{correlation}:event"),
+        deadline_unix_ms: deadline,
+        cancellation_id: format!("{correlation}:event:cancel"),
+    };
+    frame_identity
+        .validate()
+        .map_err(|_| event_transport_failure())?;
+    Ok(frame_identity)
+}
+
+/// Builds one bridge-event frame carrying the closed operation plus its typed
+/// JSON payload over the admitted transport.
+///
+/// Reuses the neutral frame identity above. No session text rides the frame:
+/// the Kernel builds the sender binding itself from the retained Session,
+/// exactly like the host-request entries; the bridge verifies the reply
+/// echoes the presenting connection.
+fn bridge_event_frame_for_operation(
+    correlation: &str,
+    facts: &BridgeEventTransportFacts,
+    payload: serde_json::Value,
+    now_ms: u64,
+) -> Result<Frame, ProviderFailure> {
+    let frame_identity = bridge_event_frame_identity(correlation, facts, now_ms)?;
+    let frame = Frame {
+        protocol_version: ProtocolVersion::CURRENT,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: facts.connection_id.clone(),
+        request_id: Some(frame_identity.request.metadata.request_id.clone()),
+        kind: FrameKind::Request,
+        message_type: MessageType::Execute,
+        request_identity: Some(frame_identity),
+        payload: ProtocolPayload::Json(payload),
+        trace_context: BTreeMap::new(),
+    };
+    if frame.request_identity.is_none() || frame.request_id.is_none() {
+        return Err(event_transport_failure());
+    }
+    frame.validate().map_err(|_| event_transport_failure())?;
+    Ok(frame)
+}
+
+/// Strictly decodes one event-route reply: response/result shape, connection
+/// and correlation joins, and the closed `known` status. Any mismatch is an
+/// unknown delivery (`None`), never a guessed outcome or phase.
+fn decode_bridge_event_reply(reply: &Frame, frame: &Frame) -> Option<serde_json::Value> {
+    reply.validate().ok()?;
+    if reply.kind != FrameKind::Response || reply.message_type != MessageType::Result {
+        return None;
+    }
+    if reply.connection_id != frame.connection_id {
+        return None;
+    }
+    if reply.request_id != frame.request_id {
+        return None;
+    }
+    if reply.request_identity.is_some() {
+        return None;
+    }
+    let payload = match &reply.payload {
+        ProtocolPayload::Json(value) => value.clone(),
+        _ => return None,
+    };
+    if payload.get("status")?.as_str()? != "known" {
+        return None;
+    }
+    Some(payload.get("value")?.clone())
+}
+
+/// Parses one owner phase without inventing values: unknown phase strings
+/// refuse rather than mapping to a nearby phase.
+fn parse_owner_phase(text: &str) -> Option<AckPhase> {
+    match text {
+        "RECEIVED" => Some(AckPhase::Received),
+        "DURABLE" => Some(AckPhase::Durable),
+        "NORMALIZED" => Some(AckPhase::Normalized),
+        "APPLIED" => Some(AckPhase::Applied),
+        "REJECTED" => Some(AckPhase::Rejected),
+        "UNKNOWN" => Some(AckPhase::Unknown),
+        _ => None,
+    }
+}
+
+/// Parses one owner disposition without inventing values.
+fn parse_owner_disposition(text: &str) -> Option<EventDisposition> {
+    match text {
+        "accepted" => Some(EventDisposition::Accepted),
+        "duplicate" => Some(EventDisposition::Duplicate),
+        "rejected" => Some(EventDisposition::Rejected),
+        "conflict" => Some(EventDisposition::Conflict),
+        _ => None,
+    }
+}
+
+/// Decodes one event-route forward reply into the port outcome (Implements
+/// #2561 item 2).
+///
+/// Durable classes answer with the owner's phase: `Acknowledged` carrying
+/// the independently verifiable phase/disposition, with the reply digest
+/// bound to the presented envelope bytes and the identity echoed. A
+/// determined `REJECTED`/`conflict` rejection surfaces as the conflict ack
+/// so the core rejects it typed; anything else shaped is refused, never
+/// guessed. Best-effort answers with `BestEffortForwarded` or the typed
+/// `BestEffortDropped` gap reason. Class confusion (a durable phase on a
+/// best-effort event or vice versa) refuses. The bridge-owned delivered
+/// frontier advances only on digest-verified durable holdings — never on a
+/// conflict — so reconciliation acks exactly what the owner durably holds.
+fn decode_event_port_outcome(
+    event: &EventEnvelope,
+    value: &serde_json::Value,
+    envelope_sha: &str,
+    port: &mut KernelMcpForwardingPort,
+) -> Result<EventPortOutcome, ProviderFailure> {
+    let accepted = value
+        .get("accepted")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(event_transport_failure)?;
+    let reply_stream = value
+        .get("stream_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(event_transport_failure)?;
+    let reply_event = value
+        .get("event_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(event_transport_failure)?;
+    if reply_stream != event.stream_id || reply_event != event.event_id {
+        return Err(event_shape_failure(
+            "event reply refused: owner answer does not echo the presented stream/event identity",
+        ));
+    }
+    match event.delivery_class {
+        DeliveryClass::DurableControl | DeliveryClass::DurableObservation => {
+            decode_durable_outcome(event, value, envelope_sha, accepted, port)
+        }
+        DeliveryClass::BestEffortTelemetry => decode_best_effort_outcome(value),
+    }
+}
+
+/// Decodes the owner phase for one durable event: `Acknowledged` carrying
+/// the independently verifiable phase/disposition, with the reply digest
+/// bound to the presented envelope bytes. A determined `REJECTED`/`conflict`
+/// rejection surfaces as the conflict ack so the core rejects it typed;
+/// anything else shaped is refused, never guessed. The bridge-owned
+/// delivered frontier advances only on digest-verified durable holdings —
+/// never on a conflict — so reconciliation acks exactly what the owner
+/// durably holds.
+fn decode_durable_outcome(
+    event: &EventEnvelope,
+    value: &serde_json::Value,
+    envelope_sha: &str,
+    accepted: bool,
+    port: &mut KernelMcpForwardingPort,
+) -> Result<EventPortOutcome, ProviderFailure> {
+    if value.get("forwarded").is_some() {
+        return Err(event_shape_failure(
+            "event reply refused: durable event answered with a best-effort outcome",
+        ));
+    }
+    let phase = value
+        .get("phase")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_owner_phase)
+        .ok_or_else(event_transport_failure)?;
+    let disposition = value
+        .get("disposition")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_owner_disposition)
+        .ok_or_else(event_transport_failure)?;
+    if !accepted {
+        if phase != AckPhase::Rejected || disposition != EventDisposition::Conflict {
+            return Err(event_shape_failure(
+                "event reply refused: negative durable answer without the determined \
+                 REJECTED/conflict pair",
+            ));
+        }
+        return acknowledge_owner_phase(event, phase, disposition);
+    }
+    let reply_sha = value
+        .get("envelope_sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(event_transport_failure)?;
+    if reply_sha != envelope_sha {
+        return Err(event_shape_failure(
+            "event reply refused: owner digest does not bind the presented envelope bytes",
+        ));
+    }
+    if phase == AckPhase::Rejected && disposition != EventDisposition::Conflict {
+        return Err(event_shape_failure(
+            "event reply refused: REJECTED phase without the conflict disposition",
+        ));
+    }
+    let outcome = acknowledge_owner_phase(event, phase, disposition)?;
+    if disposition == EventDisposition::Accepted || disposition == EventDisposition::Duplicate {
+        port.note_delivered(&event.stream_id, event.sequence);
+    }
+    Ok(outcome)
+}
+
+/// Builds the `Acknowledged` outcome for one owner phase/disposition pair.
+/// The identity was echoed by the caller; the text was validated there.
+fn acknowledge_owner_phase(
+    event: &EventEnvelope,
+    phase: AckPhase,
+    disposition: EventDisposition,
+) -> Result<EventPortOutcome, ProviderFailure> {
+    let ack = EventForwardAck::new(
+        event.stream_id.clone(),
+        event.event_id.clone(),
+        phase,
+        disposition,
+    )
+    .map_err(|_| {
+        event_shape_failure(
+            "event ack refused: owner identity does not form a valid acknowledgement",
+        )
+    })?;
+    Ok(EventPortOutcome::Acknowledged(ack))
+}
+
+/// Decodes the owner answer for one best-effort event: `BestEffortForwarded`
+/// or the typed `BestEffortDropped` gap reason. A durable phase on a
+/// best-effort event (class confusion) refuses.
+fn decode_best_effort_outcome(
+    value: &serde_json::Value,
+) -> Result<EventPortOutcome, ProviderFailure> {
+    if value.get("phase").is_some() {
+        return Err(event_shape_failure(
+            "event reply refused: best-effort event answered with a durable phase",
+        ));
+    }
+    let forwarded = value
+        .get("forwarded")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(event_transport_failure)?;
+    if forwarded {
+        return Ok(EventPortOutcome::BestEffortForwarded);
+    }
+    let reason = value
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .filter(|reason| !reason.trim().is_empty())
+        .ok_or_else(event_transport_failure)?;
+    Ok(EventPortOutcome::BestEffortDropped {
+        reason_ref: reason.to_owned(),
+    })
+}
+
+/// Decodes one event-route reconcile reply into the port outcome (Implements
+/// #2561 item 2, reconciliation leg).
+///
+/// Reads event ownership and cursors from the owner's answer — never from
+/// the host-request ledger. The presenting connection echo and the
+/// reconciliation key bind the answer to this exchange; the key travels as
+/// the receipt reference while the core seals the authority match against
+/// the live attach binding. An empty fact set reconciles as an empty fact
+/// set (still keyed), not as a denial: foreign bindings are refused by the
+/// face continuity check and the core seal, not by inventing ownership.
+fn decode_reconciliation_outcome(
+    binding: &AttachBinding,
+    facts: &BridgeEventTransportFacts,
+    value: &serde_json::Value,
+) -> Result<ReconciliationPortOutcome, ProviderFailure> {
+    if value.get("accepted").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(event_transport_failure());
+    }
+    let reconciliation = value
+        .get("reconciliation")
+        .ok_or_else(event_transport_failure)?;
+    if reconciliation
+        .get("connection_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(facts.connection_id.as_str())
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: owner answer does not echo the presenting connection",
+        ));
+    }
+    let streams = reconciliation
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(event_transport_failure)?;
+    for stream in streams {
+        if stream
+            .get("stream_id")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|text| text.trim().is_empty())
+        {
+            return Err(event_shape_failure(
+                "reconciliation refused: owner stream fact without identity",
+            ));
+        }
+        for cursor in ["durable_cursor", "acked_cursor"] {
+            if stream
+                .get(cursor)
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
+            {
+                return Err(event_shape_failure(
+                    "reconciliation refused: owner stream fact without cursors",
+                ));
+            }
+        }
+        if stream.get("pending_first_page").is_none() || stream.get("gaps").is_none() {
+            return Err(event_shape_failure(
+                "reconciliation refused: owner stream fact without pending page or gaps",
+            ));
+        }
+    }
+    if reconciliation.get("unscoped_gaps").is_none() {
+        return Err(event_shape_failure(
+            "reconciliation refused: owner answer without unscoped gaps",
+        ));
+    }
+    let key = reconciliation
+        .get("reconcile_key")
+        .and_then(serde_json::Value::as_str)
+        .filter(|key| !key.trim().is_empty() && !key.chars().any(char::is_control))
+        .ok_or_else(event_transport_failure)?;
+    let receipt_ref = ReconciliationReceiptRef::new(format!("bridge-event-reconcile:{key}"))
+        .map_err(|_| {
+            event_shape_failure(
+                "reconciliation refused: owner key does not form a receipt reference",
+            )
+        })?;
+    let result = ReconciliationPortResult::reconciled(binding, receipt_ref).map_err(|_| {
+        event_shape_failure(
+            "reconciliation refused: live attach binding does not seal the owner answer",
+        )
+    })?;
+    Ok(ReconciliationPortOutcome::Reconciled(result))
+}
+
+/// Admitted event-route face: durable event delivery and acknowledgement
+/// recovery through the Kernel front-door event entries.
 ///
 /// The face holds the same retained transport owner as the activation and
 /// host-request faces (one admitted transport, one runtime, one lease —
@@ -148,28 +638,48 @@ type SharedTransport = Rc<RefCell<KernelTransportOwner>>;
 /// through the existing contract validators, then a validated
 /// continuity/recovery binding check of the presented attach binding against
 /// the retained kernel-issued session captured by the one-shot activation
-/// exchange. A foreign, stale, or pre-activation session is refused here
-/// with its own typed refusal and never reaches the event route; a
-/// reconnect may therefore deliver an old producer's unacknowledged event
-/// only while it still presents the same kernel-issued session. Producer
-/// generation fencing, operational staging, provider normalization,
-/// Governor ingest, and result readback belong to the Kernel
-/// observation/ORS event route, which has not admitted this bridge.
+/// exchange, plus (for durable/control events) the producer/generation/
+/// stream/event/sequence and `StateFence` binding. A foreign, stale, or
+/// pre-activation session is refused here with its own typed refusal and
+/// never reaches the event route; a reconnect may therefore deliver an old
+/// producer's unacknowledged event only while it still presents the same
+/// kernel-issued session under a live generation. A fenced (stale or future)
+/// producer generation is refused for forwarding and recovers through
+/// `reconcile_external`, which reads event ownership and cursors — never by
+/// relabeling history as produced by the new generation.
 ///
-/// Every method still fails closed while distinguishing the four
-/// acknowledgement phases honestly. Receipt is owned by the bridge: the core
-/// journals the host event (`observe_host_event`) before the port is called,
-/// so the receipt stands in the bridge journal even though forwarding is
-/// refused. Durability, normalization, and application are owned by the
-/// Kernel observation route, which has not admitted this bridge — so no
-/// Kernel ORS durable record is staged, nothing is normalized, and nothing
-/// is applied. The event-delivery capability is therefore exposed as
-/// unavailable with its owner/dependency reference (#77 req 4 allocates the
-/// bounded event-delivery/reconciliation child to the Kernel observation/ORS
-/// owner): neither `ReconcileExternal` (also unadmitted here) nor a retry
-/// can succeed until that route is admitted. Host-request
-/// submit/cancel/reconcile entries carry invocation intent and are not
-/// event delivery; never resubmit a refused event as a host request.
+/// Frozen four-operation map from each forwarding method to its closed Kernel
+/// request, authority check, operational staging, provider normalizer,
+/// Governor ingest, and result readback (Implements #2561 item 1; the match
+/// in [`BridgeEventMethod::kernel_operation`] is exhaustive, so a new method
+/// fails to compile until its row is recorded here):
+///
+/// | method | Kernel request | authority check | operational staging |
+/// |---|---|---|---|
+/// | `forward_hook` | `agent_bridge_hook_forward` | attach session continuity + hook digest bind | none (RECEIVED observation only; hook carries no ack) |
+/// | `forward_event` | `agent_bridge_event_forward` | attach session + producer/generation/fence coherence, live generation fencing | ORS bridge-event row before the DURABLE answer |
+/// | `forward_gap` | `agent_bridge_event_gap` | attach session continuity + gap identity/interval | durable gap row; never moves a cursor |
+/// | `reconcile_external` | `agent_bridge_event_reconcile` | attach session continuity + presenting-connection scope | reads ownership/cursors/pages; applies the consumed frontier |
+///
+/// | method | provider normalizer | Governor ingest | result readback |
+/// |---|---|---|---|
+/// | `forward_hook` | envelope already normalized bridge-side (`HostEventEnvelope::validate`) | none (transport observation) | RECEIVED echo bound to the hook digest |
+/// | `forward_event` | `normalize_acp_event` for raw producer bytes (ACP owner); forwarded `EventEnvelope` linkage re-validated Kernel-side | coordinator `observe_committed_intake` over `CommittedHostEventIntake` (ACP/commit path) | owner phase/disposition/cursors from the ORS row |
+/// | `forward_gap` | gap identity/interval validation (no normalization) | none (coverage accounting) | gap acceptance bound to the gap identity |
+/// | `reconcile_external` | none (read path) | none (read path) | ownership/cursor/page facts plus the bound reconciliation key |
+///
+/// Actual phase/disposition information returns through `McpForwardingPort`
+/// and its bridge-core callers: durable classes answer with the owner's
+/// `Acknowledged` phase (or the determined `REJECTED`/`conflict` rejection),
+/// best-effort answers with `BestEffortForwarded` (or the typed
+/// `BestEffortDropped` gap reason while degraded). A `Result<()>` (hook, gap)
+/// carries no phase and never implies durable/applied state. Receipt is owned
+/// by the bridge: the core journals the host event (`observe_host_event`)
+/// before the port is called, so the receipt stands in the bridge journal.
+/// Activation, request cancellation, and result correlation paths are
+/// untouched by this face. Host-request submit/cancel/reconcile entries carry
+/// invocation intent and are not event delivery; a refused event is never
+/// resubmitted as a host request.
 struct KernelMcpForwardingPort {
     shared: SharedTransport,
 }
@@ -183,9 +693,9 @@ impl KernelMcpForwardingPort {
     /// transport. Session identity is the continuity binding a reconnect
     /// preserves, so a foreign session, a stale pre-activation binding, or a
     /// call before any activation completes is refused here — before any
-    /// route refusal — with a typed continuity refusal. A matching session
-    /// returns `Ok(())` so the caller falls through to the unadmitted-route
-    /// refusal; it never implies durability, normalization, or application.
+    /// frame is exchanged — with a typed continuity refusal. A matching
+    /// session returns `Ok(())` so the caller proceeds to the admitted event
+    /// entry; it never implies durability, normalization, or application.
     fn check_continuity(&self, binding: &AttachBinding) -> Result<(), ProviderFailure> {
         let owner = self.shared.try_borrow().map_err(|_| {
             ProviderFailure::new(
@@ -201,10 +711,102 @@ impl KernelMcpForwardingPort {
             "eliot-kernel-front-door",
             "event continuity refused: presented attach session is not the retained kernel-issued \
              session for this admitted transport (foreign, stale, or pre-activation binding); no \
-             Kernel durable record staged, nothing normalized or applied; owner: Kernel \
-             observation route (#77 req 4 allocates the event-delivery/reconciliation child \
-             there); reconnect must present the validated continuity binding",
+             frame exchanged, no Kernel durable record staged; reconnect must present the \
+             validated continuity binding",
         ))
+    }
+
+    /// Binds the real producer, producer generation, stream/event/sequence,
+    /// and `StateFence` of one durable/control event to the presenting attach
+    /// binding (Implements #2561 item 1, second half).
+    ///
+    /// Mirrors the bridge-core authority join: the event and fence authority
+    /// epochs must match the attach fence authority, and the producer and
+    /// fence generations must equal the live attach generation. A mismatch
+    /// is a foreign or stale binding and is refused here — before any frame
+    /// is exchanged — with a typed refusal pointing at `reconcile_external`
+    /// recovery. Historical events are never relabeled as produced by the
+    /// new transport generation: only the live generation forwards, and only
+    /// under the validated continuity binding above.
+    fn check_event_binding(
+        binding: &AttachBinding,
+        event: &EventEnvelope,
+    ) -> Result<(), ProviderFailure> {
+        let fence = binding.state_fence();
+        if !event
+            .authority_epoch
+            .is_same_authority(fence.authority_epoch())
+            || !event
+                .state_fence
+                .authority_epoch
+                .is_same_authority(fence.authority_epoch())
+            || event.producer_generation.value() != fence.generation().get()
+            || event.state_fence.resource_generation.value() != fence.generation().get()
+        {
+            return Err(ProviderFailure::new(
+                "eliot-kernel-front-door",
+                "event binding refused: producer, producer generation, or StateFence does not \
+                 match the presenting attach authority (foreign producer/session/fence binding); \
+                 nothing staged, nothing forwarded; recover ownership and cursors through \
+                 reconcile_external, never by relabeling history",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Exchanges one bridge-event frame over the single retained transport
+    /// owner and returns the Kernel reply.
+    ///
+    /// Sends exactly one frame and receives exactly one reply under the
+    /// admitted transport limits. A non-delivered send or a missing reply is
+    /// an unknown outcome — never a phase — so the caller fails without
+    /// claiming anything and the producer's at-least-once retry stays sound.
+    fn exchange(&mut self, frame: &Frame) -> Result<Frame, ProviderFailure> {
+        self.shared
+            .try_borrow_mut()
+            .map_err(|_| event_transport_failure())?
+            .exchange_bridge_event_frame(frame)
+    }
+
+    /// Snapshots the Kernel-issued transport facts for one event frame.
+    fn transport_facts(&self) -> Result<BridgeEventTransportFacts, ProviderFailure> {
+        let owner = self
+            .shared
+            .try_borrow()
+            .map_err(|_| event_transport_failure())?;
+        Ok(BridgeEventTransportFacts {
+            connection_id: owner.admitted.receipt.connection_id.clone(),
+            state_fence: owner.admitted.receipt.state_fence.clone(),
+            session: owner.activated_session.clone(),
+        })
+    }
+
+    /// Records the bridge-owned delivered frontier for one stream after the    /// owner answers a durable phase.
+    ///
+    /// Process-local routing aid for the reconcile consumed frontier (like
+    /// the byte-identity replay cache): it dies with this connection, is
+    /// bounded, and is never a reconciliation log — reconciliation reads the
+    /// ORS-owned cursors. Eviction under the bound only defers ack
+    /// advancement (safe direction); nothing is lost and no cursor resets.
+    fn note_delivered(&mut self, stream_id: &str, sequence: u64) {
+        let Ok(mut owner) = self.shared.try_borrow_mut() else {
+            return;
+        };
+        let evict: Option<String> = if owner.delivered_cursors.len() >= MAX_DELIVERED_STREAMS
+            && !owner.delivered_cursors.contains_key(stream_id)
+        {
+            owner.delivered_cursors.keys().next().cloned()
+        } else {
+            None
+        };
+        if let Some(oldest) = evict {
+            owner.delivered_cursors.remove(&oldest);
+        }
+        owner
+            .delivered_cursors
+            .entry(stream_id.to_owned())
+            .and_modify(|frontier| *frontier = (*frontier).max(sequence))
+            .or_insert(sequence);
     }
 }
 
@@ -215,23 +817,44 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         event: &HostEventEnvelope,
     ) -> Result<(), ProviderFailure> {
         if event.validate().is_err() {
-            return Err(ProviderFailure::new(
-                "eliot-kernel-front-door",
+            return Err(event_shape_failure(
                 "hook envelope refused: host event envelope failed closed validation (identity, \
-                 sequence, or route); nothing staged, nothing forwarded; owner: Kernel observation \
-                 route (#77 req 4 allocates the event-delivery/reconciliation child there)",
+                 sequence, or route); nothing staged, nothing forwarded",
             ));
         }
         self.check_continuity(binding)?;
-        Err(ProviderFailure::new(
-            "eliot-kernel-front-door",
-            "hook forwarding unavailable: no admitted Kernel observation/ORS event route \
-             (front door admits activation and host-request envelopes only); receipt stands \
-             in the bridge journal, no Kernel durable record staged, nothing normalized or \
-             applied; owner: Kernel observation route (#77 req 4 allocates the \
-             event-delivery/reconciliation child there); retry cannot succeed until that \
-             route is admitted; host-request submit is not event delivery",
-        ))
+        let facts = self.transport_facts()?;
+        if facts.session.is_none() {
+            return Err(event_shape_failure(
+                "hook forwarding refused: no admitted Kernel session; attach and activate before \
+                 event delivery",
+            ));
+        }
+        let now_ms = bridge_event_unix_ms()?;
+        let hook_bytes = canonical_json_bytes(event).map_err(|_| event_transport_failure())?;
+        let hook_digest = sha256_hex(&hook_bytes);
+        let hook_value = serde_json::to_value(event).map_err(|_| event_transport_failure())?;
+        let correlation = format!("bridge-hook:{}", event.event_id.as_str());
+        let frame = bridge_event_frame_for_operation(
+            &correlation,
+            &facts,
+            serde_json::json!({
+                "operation": BridgeEventMethod::Hook.kernel_operation(),
+                "hook_envelope": hook_value,
+                "hook_digest": hook_digest,
+            }),
+            now_ms,
+        )?;
+        let reply = self.exchange(&frame)?;
+        let value =
+            decode_bridge_event_reply(&reply, &frame).ok_or_else(event_transport_failure)?;
+        if value.get("accepted").and_then(serde_json::Value::as_bool) != Some(true)
+            || value.get("received").and_then(serde_json::Value::as_bool) != Some(true)
+            || value.get("hook_digest").and_then(serde_json::Value::as_str) != Some(&hook_digest)
+        {
+            return Err(event_transport_failure());
+        }
+        Ok(())
     }
     fn forward_event(
         &mut self,
@@ -239,61 +862,121 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         event: &EventEnvelope,
     ) -> Result<EventPortOutcome, ProviderFailure> {
         if event.validate().is_err() {
-            return Err(ProviderFailure::new(
-                "eliot-kernel-front-door",
+            return Err(event_shape_failure(
                 "event envelope refused: durable/control event envelope failed closed validation \
                  (identity, sequence, or fence/authority coherence); nothing staged, nothing \
-                 forwarded; owner: Kernel observation route (#77 req 4 allocates the \
-                 event-delivery/reconciliation child there)",
+                 forwarded",
             ));
         }
         self.check_continuity(binding)?;
-        Err(ProviderFailure::new(
-            "eliot-kernel-front-door",
-            "event forwarding unavailable: no admitted Kernel observation/ORS event route \
-             (front door admits activation and host-request envelopes only); receipt stands \
-             in the bridge journal, no Kernel ORS durable record staged, nothing normalized \
-             or applied; owner: Kernel observation route (#77 req 4 allocates the \
-             event-delivery/reconciliation child there); retry cannot succeed until that \
-             route is admitted; host-request submit is not event delivery",
-        ))
+        Self::check_event_binding(binding, event)?;
+        let facts = self.transport_facts()?;
+        if facts.session.is_none() {
+            return Err(event_shape_failure(
+                "event forwarding refused: no admitted Kernel session; attach and activate before \
+                 event delivery",
+            ));
+        }
+        let now_ms = bridge_event_unix_ms()?;
+        let envelope_bytes = canonical_json_bytes(event).map_err(|_| event_transport_failure())?;
+        let envelope_sha = sha256_hex(&envelope_bytes);
+        let envelope_value = serde_json::to_value(event).map_err(|_| event_transport_failure())?;
+        let correlation = format!("bridge-event:{}:{}", event.stream_id, event.event_id);
+        let frame = bridge_event_frame_for_operation(
+            &correlation,
+            &facts,
+            serde_json::json!({
+                "operation": BridgeEventMethod::Event.kernel_operation(),
+                "envelope": envelope_value,
+                "envelope_sha256": envelope_sha,
+            }),
+            now_ms,
+        )?;
+        let reply = self.exchange(&frame)?;
+        let value =
+            decode_bridge_event_reply(&reply, &frame).ok_or_else(event_transport_failure)?;
+        decode_event_port_outcome(event, &value, &envelope_sha, self)
     }
     fn forward_gap(
         &mut self,
         binding: &AttachBinding,
-        gap: &eliot_agent_bridge_core::CoverageGap,
+        gap: &CoverageGap,
     ) -> Result<(), ProviderFailure> {
         if gap.validate().is_err() {
-            return Err(ProviderFailure::new(
-                "eliot-kernel-front-door",
+            return Err(event_shape_failure(
                 "gap refused: coverage gap failed closed validation (identity or interval); no \
-                 coverage advanced; owner: Kernel observation route (#77 req 4 allocates the \
-                 event-delivery/reconciliation child there)",
+                 coverage advanced",
             ));
         }
         self.check_continuity(binding)?;
-        Err(ProviderFailure::new(
-            "eliot-kernel-front-door",
-            "gap forwarding unavailable: no admitted Kernel observation/ORS event route, so \
-             no durable, normalized, or applied phase reached; owner: Kernel observation \
-             route (#77 req 4 allocates the event-delivery/reconciliation child there); \
-             retry cannot succeed until that route is admitted",
-        ))
+        let facts = self.transport_facts()?;
+        if facts.session.is_none() {
+            return Err(event_shape_failure(
+                "gap forwarding refused: no admitted Kernel session; attach and activate before \
+                 event delivery",
+            ));
+        }
+        let now_ms = bridge_event_unix_ms()?;
+        let gap_value = serde_json::to_value(gap).map_err(|_| event_transport_failure())?;
+        let correlation = format!("bridge-gap:{}", gap.gap_id);
+        let frame = bridge_event_frame_for_operation(
+            &correlation,
+            &facts,
+            serde_json::json!({
+                "operation": BridgeEventMethod::Gap.kernel_operation(),
+                "gap": gap_value,
+                "stream_id": "",
+            }),
+            now_ms,
+        )?;
+        let reply = self.exchange(&frame)?;
+        let value =
+            decode_bridge_event_reply(&reply, &frame).ok_or_else(event_transport_failure)?;
+        if value.get("accepted").and_then(serde_json::Value::as_bool) != Some(true)
+            || value.get("gap_id").and_then(serde_json::Value::as_str) != Some(gap.gap_id.as_str())
+        {
+            return Err(event_transport_failure());
+        }
+        Ok(())
     }
     fn reconcile_external(
         &mut self,
         binding: &AttachBinding,
     ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
         self.check_continuity(binding)?;
-        Err(ProviderFailure::new(
-            "eliot-kernel-front-door",
-            "event-route reconciliation unavailable: no admitted Kernel observation/ORS \
-             event route; durable idempotency and unknown-outcome belong to the Kernel ORS \
-             record once that route admits this bridge; owner: Kernel observation route \
-             (#77 req 4 allocates the event-delivery/reconciliation child there); the \
-             KernelHostRequestClient reconcile entry settles host-request operations only \
-             and is not event durability; host-request forwarding is not event delivery",
-        ))
+        let facts = self.transport_facts()?;
+        if facts.session.is_none() {
+            return Err(event_shape_failure(
+                "event-route reconciliation refused: no admitted Kernel session; attach and \
+                 activate before event delivery",
+            ));
+        }
+        let now_ms = bridge_event_unix_ms()?;
+        let consumed: Vec<serde_json::Value> = self
+            .shared
+            .try_borrow()
+            .map_err(|_| event_transport_failure())?
+            .delivered_cursors
+            .iter()
+            .take(MAX_RECONCILE_CONSUMED_ENTRIES)
+            .map(|(stream_id, sequence)| {
+                serde_json::json!({ "stream_id": stream_id, "sequence": sequence })
+            })
+            .collect();
+        let correlation = format!("bridge-reconcile:{}", facts.connection_id);
+        let frame = bridge_event_frame_for_operation(
+            &correlation,
+            &facts,
+            serde_json::json!({
+                "operation": BridgeEventMethod::Reconcile.kernel_operation(),
+                "consumed": consumed,
+            }),
+            now_ms,
+        )?;
+        let reply = self.exchange(&frame)?;
+        let value =
+            decode_bridge_event_reply(&reply, &frame).ok_or_else(event_transport_failure)?;
+        decode_reconciliation_outcome(binding, &facts, &value)
     }
 }
 
@@ -444,6 +1127,7 @@ pub fn kernel_ports_with_declaration(
         limits,
         activated_session: None,
         replay_cache: HashMap::new(),
+        delivered_cursors: BTreeMap::new(),
     }));
     let host: Box<dyn HostActivationPort> = Box::new(KernelHostActivationPort {
         shared: owner.clone(),
@@ -606,11 +1290,12 @@ impl BridgeRunner {
         // Cursor policy: durable-control cursors advance only on a Durable
         // (or later) ack, durable-observation cursors only on Normalized (or
         // later). The production forwarding face (`KernelMcpForwardingPort`)
-        // fails closed, so no ack ever arrives here: no cursor advances, no
-        // outstanding delivery is recorded, and recovery awaits the admitted
-        // Kernel observation route (#77 req 4). `ReconcileExternal` stays
-        // fail-closed on this face until that route is admitted. The policy still
-        // declares the honest requirement for any future admitted route.
+        // returns the owner's independently verifiable phase per event, so a
+        // DURABLE answer advances durable-control cursors while lower phases
+        // stay outstanding for acknowledgement recovery; `ReconcileExternal`
+        // reads event ownership and cursors through the admitted Kernel
+        // observation route (#2561). The policy still declares the honest
+        // requirement the owner answers must satisfy.
         let cursor_policy = CursorPolicy::new(AckPhase::Durable, AckPhase::Normalized)
             .map_err(RuntimeBuildError::BridgeContract)?;
         Ok(Self {
