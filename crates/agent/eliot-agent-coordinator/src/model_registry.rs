@@ -10,15 +10,18 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_api::{RouteFingerprint, StateFence};
+use eliot_agent_contracts::RevisionId;
+use eliot_evaluation_contracts::BudgetEvidence;
 use eliot_receipts::ProofCeiling;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::model::RouteCandidateEvidence;
 use crate::model_control::{
     BillingClass, HumanModelPreferencePolicy, ModelAvailability, ModelCatalogueEntry,
     ModelCatalogueSnapshot, ModelControlError, ModelQuery, ModelQueryHit, ModelQueryReceipt,
-    ModelRole, ModelSelectionReceipt, ModelSelector, QuotaDisposition, RouteAdmissionStatus,
-    RouteHealthStatus, SelectionRejection, ZeroModelExecutionCounters,
+    ModelRole, ModelSelectionReceipt, ModelSelector, QuotaDisposition, RoleModelPreference,
+    RouteAdmissionStatus, RouteHealthStatus, SelectionRejection, ZeroModelExecutionCounters,
 };
 use crate::provider_account_catalogue::{
     AuthDisposition, ConcurrencyDisposition, IncidentDisposition, ProviderAccountCatalogueSnapshot,
@@ -27,8 +30,14 @@ use crate::provider_account_catalogue::{
 
 pub const MODEL_REGISTRY_SCHEMA_VERSION: &str = "eliot.agent-model-registry/v1";
 pub const MODEL_SEARCH_SCHEMA_VERSION: &str = "eliot.agent-model-search/v1";
+/// Schema identity for [`CompiledRouteCandidates`].
+pub const COMPILED_ROUTE_CANDIDATES_VERSION: &str = "eliot.agent-route-candidates/v1";
 const MAX_EXPECTED_ROUTES: usize = 4096;
 const MAX_REQUIREMENTS: usize = 256;
+/// Maximum route-resolution inputs accepted by [`compile_route_candidates`].
+/// The bound keeps the candidate surface finite; every compiled rank fits
+/// `u16` with room to spare.
+const MAX_RESOLUTION_INPUTS: usize = 1024;
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ModelRegistryError {
@@ -1626,6 +1635,276 @@ pub(crate) fn query_model_catalogue(
         catalogue_snapshot_id: snapshot.snapshot_id.clone(),
         catalogue_digest: super::catalogue_digest(snapshot)?,
         hits,
+        execution: ZeroModelExecutionCounters::zero(),
+    })
+}
+
+/// Edge-supplied route-resolution input: exact route identity plus the
+/// capacity and budget evidence the capacity owner resolved for it.
+///
+/// The input carries no rank. Ranking is derived from the catalogue and the
+/// Human preference policy by [`compile_route_candidates`]; a caller rank is
+/// never trusted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteResolutionInput {
+    pub route: RouteFingerprint,
+    pub capacity_identity: String,
+    pub capacity_revision: RevisionId,
+    pub capacity_limit: usize,
+    pub budget_evidence: BudgetEvidence,
+    pub evidence_refs: Vec<String>,
+}
+
+/// Typed reason a route-resolution input did not compile to a candidate.
+///
+/// Catalogue absence stays explicit: an absent route is rejected, never
+/// represented by an empty complete set. Every other reason reuses the exact
+/// [`SelectionRejection`] vocabulary so the launch path and the staffing
+/// path classify one route one way.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind", content = "detail")]
+pub enum RouteResolutionRejection {
+    RouteAbsentFromCatalogue,
+    Selection(SelectionRejection),
+}
+
+/// One rejected route-resolution input with its exact route identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RejectedRouteResolution {
+    pub route: RouteFingerprint,
+    pub entry_id: Option<String>,
+    pub reasons: Vec<RouteResolutionRejection>,
+}
+
+/// Deterministic compilation of catalogue plus Human preference plus edge
+/// route-resolution inputs into the existing [`RouteCandidateEvidence`]
+/// surface.
+///
+/// Pure and zero-token: no provider or model call, no launch, no lease, no
+/// admission, no finish. Fail-closed: an input whose route is absent from
+/// the catalogue, denied by Human policy, paid without fallback, or blocked
+/// by a dispatch dimension is rejected, never ranked. Equivalent input
+/// permutations yield identical ordering; the compiled rank is the final
+/// position, so replaying the exact inputs reproduces the exact value.
+/// Compiled candidates satisfy the route-selection admission shape:
+/// validated route, non-empty capacity identity, non-zero capacity limit,
+/// validated budget evidence, and non-empty evidence refs carrying the
+/// catalogue and preference generation pins.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledRouteCandidates {
+    pub schema_version: String,
+    pub role: ModelRole,
+    pub account_scope: String,
+    pub catalogue_snapshot_id: String,
+    pub catalogue_digest: String,
+    pub preference_policy_id: String,
+    pub preference_revision: String,
+    pub preference_policy_digest: String,
+    pub candidates: Vec<RouteCandidateEvidence>,
+    pub rejected: Vec<RejectedRouteResolution>,
+    pub execution: ZeroModelExecutionCounters,
+}
+
+fn validate_resolution_input(input: &RouteResolutionInput) -> Result<(), ModelControlError> {
+    input
+        .route
+        .validate()
+        .map_err(|_| ModelControlError::InvalidField("route_candidates.route"))?;
+    if input.capacity_identity.trim().is_empty()
+        || input.capacity_identity.chars().any(char::is_control)
+    {
+        return Err(ModelControlError::InvalidField(
+            "route_candidates.capacity_identity",
+        ));
+    }
+    if input.capacity_limit == 0 {
+        return Err(ModelControlError::InvalidField(
+            "route_candidates.capacity_limit",
+        ));
+    }
+    input
+        .budget_evidence
+        .validate()
+        .map_err(|_| ModelControlError::InvalidField("route_candidates.budget_evidence"))?;
+    if input.evidence_refs.is_empty() {
+        return Err(ModelControlError::InvalidField(
+            "route_candidates.evidence_refs",
+        ));
+    }
+    for evidence in &input.evidence_refs {
+        if evidence.trim().is_empty() || evidence.chars().any(char::is_control) {
+            return Err(ModelControlError::InvalidField(
+                "route_candidates.evidence_refs",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Deterministic rank key for one dispatchable route. Mirrors the
+/// [`compile_model_selection`] ordering so the launch path and the staffing
+/// path rank one route one way: Human preferred-selector position first,
+/// then billing, health, availability, quota, cost, latency, catalogue
+/// identity, and finally the field-complete route identity as tie-break.
+#[allow(clippy::type_complexity)]
+fn resolution_rank_key<'entry>(
+    entry: &'entry ModelCatalogueEntry,
+    preference: &RoleModelPreference,
+    route_key: String,
+) -> (
+    usize,
+    BillingClass,
+    RouteHealthStatus,
+    ModelAvailability,
+    QuotaDisposition,
+    u16,
+    u16,
+    (
+        &'entry str,
+        &'entry str,
+        &'entry str,
+        &'entry str,
+        &'entry str,
+    ),
+    String,
+) {
+    (
+        preference_rank_selector(entry, &preference.preferred),
+        entry.billing.class,
+        entry.route_health,
+        entry.availability,
+        entry.quota.disposition,
+        entry.cost_class,
+        entry.latency_class,
+        entry.deterministic_key(),
+        route_key,
+    )
+}
+
+/// Pure deterministic compilation from catalogue plus Human preference plus
+/// route-resolution inputs into [`RouteCandidateEvidence`].
+///
+/// See [`CompiledRouteCandidates`] for the purity, fail-closed, and
+/// determinism contract. An empty compiled set is the typed
+/// [`ModelControlError::NoDispatchableRoute`] error, never an empty success.
+#[allow(clippy::too_many_lines)]
+pub fn compile_route_candidates(
+    snapshot: &ModelCatalogueSnapshot,
+    policy: &HumanModelPreferencePolicy,
+    role: ModelRole,
+    inputs: &[RouteResolutionInput],
+    now_unix_ms: u64,
+) -> Result<CompiledRouteCandidates, ModelControlError> {
+    snapshot.validate()?;
+    policy.validate()?;
+    if snapshot.account_scope != policy.account_scope {
+        return Err(ModelControlError::InvalidField(
+            "route_candidates.account_scope",
+        ));
+    }
+    if !snapshot.is_current(now_unix_ms) {
+        return Err(ModelControlError::StaleCatalogue);
+    }
+    let preference = policy
+        .roles
+        .iter()
+        .find(|preference| preference.role == role)
+        .ok_or(ModelControlError::MissingRolePolicy(role))?;
+    if inputs.is_empty() || inputs.len() > MAX_RESOLUTION_INPUTS {
+        return Err(ModelControlError::InvalidField("route_candidates.inputs"));
+    }
+    let mut entries = BTreeMap::new();
+    for entry in &snapshot.entries {
+        entries.insert(route_sort_key(&entry.route), entry);
+    }
+    let mut seen = BTreeSet::new();
+    for input in inputs {
+        validate_resolution_input(input)?;
+        if !seen.insert(route_sort_key(&input.route)) {
+            return Err(ModelControlError::DuplicateIdentity(
+                "route_candidates.route",
+            ));
+        }
+    }
+    let catalogue_digest = super::catalogue_digest(snapshot)?;
+    let preference_policy_digest = super::preference_policy_digest(policy)?;
+    let mut ranked = Vec::new();
+    let mut rejected = Vec::new();
+    for input in inputs {
+        let key = route_sort_key(&input.route);
+        let Some(entry) = entries.get(&key) else {
+            rejected.push(RejectedRouteResolution {
+                route: input.route.clone(),
+                entry_id: None,
+                reasons: vec![RouteResolutionRejection::RouteAbsentFromCatalogue],
+            });
+            continue;
+        };
+        let blockers = base_dispatch_blockers_for_catalogue(
+            snapshot,
+            entry,
+            &preference.required_capabilities,
+            preference.minimum_context_window,
+            preference.allow_degraded_routes,
+            now_unix_ms,
+        );
+        let reasons = super::selection_rejections_with_blockers(entry, preference, blockers);
+        if reasons.is_empty() {
+            ranked.push((input, *entry));
+        } else {
+            rejected.push(RejectedRouteResolution {
+                route: input.route.clone(),
+                entry_id: Some(entry.entry_id.clone()),
+                reasons: reasons
+                    .into_iter()
+                    .map(RouteResolutionRejection::Selection)
+                    .collect(),
+            });
+        }
+    }
+    ranked.sort_by(|(left_input, left_entry), (right_input, right_entry)| {
+        resolution_rank_key(left_entry, preference, route_sort_key(&left_input.route)).cmp(
+            &resolution_rank_key(right_entry, preference, route_sort_key(&right_input.route)),
+        )
+    });
+    rejected.sort_by_key(|rejected| route_sort_key(&rejected.route));
+    let mut candidates = Vec::with_capacity(ranked.len());
+    for (index, (input, _)) in ranked.iter().enumerate() {
+        let preference_rank = u16::try_from(index)
+            .map_err(|_| ModelControlError::InvalidField("route_candidates.rank"))?;
+        let mut evidence_refs = input.evidence_refs.clone();
+        for pin in [&catalogue_digest, &preference_policy_digest] {
+            if !evidence_refs.iter().any(|existing| existing == pin) {
+                evidence_refs.push(pin.clone());
+            }
+        }
+        candidates.push(RouteCandidateEvidence {
+            route: input.route.clone(),
+            preference_rank,
+            capacity_identity: input.capacity_identity.clone(),
+            capacity_revision: input.capacity_revision.clone(),
+            capacity_limit: input.capacity_limit,
+            budget_evidence: input.budget_evidence.clone(),
+            evidence_refs,
+        });
+    }
+    if candidates.is_empty() {
+        return Err(ModelControlError::NoDispatchableRoute(role));
+    }
+    Ok(CompiledRouteCandidates {
+        schema_version: COMPILED_ROUTE_CANDIDATES_VERSION.to_owned(),
+        role,
+        account_scope: snapshot.account_scope.clone(),
+        catalogue_snapshot_id: snapshot.snapshot_id.clone(),
+        catalogue_digest,
+        preference_policy_id: policy.policy_id.clone(),
+        preference_revision: policy.revision.clone(),
+        preference_policy_digest,
+        candidates,
+        rejected,
         execution: ZeroModelExecutionCounters::zero(),
     })
 }
