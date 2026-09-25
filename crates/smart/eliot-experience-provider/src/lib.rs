@@ -167,8 +167,30 @@ use thiserror::Error;
 
 /// Freeze identity this package builds against.
 ///
-/// See `crates/smart/cognitive-rev12-contract-schema-freeze.toml` (r6).
-pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r6";
+/// See `crates/smart/cognitive-rev12-contract-schema-freeze.toml`.
+///
+/// This stays at **r5** while the canonical freeze is r6, and that is a
+/// deliberate, recorded refusal to re-pin rather than an oversight. The
+/// package contract in `module.toml` declares, verbatim:
+///
+/// ```text
+/// [[donor]]
+/// path = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
+/// disposition = "wave authority: freeze r5 denominator doctrine; V1 envelope kept as declared, no r6 requested"
+/// ```
+///
+/// The contract also sets `proof_ceiling = "PACKAGE_PROOF_ONLY"` and
+/// `workspace_admission = "forbidden until implementation, package proof,
+/// affected Edge proof, current-main rebase and integration-owner review"`.
+/// Re-pinning this constant to r6 would assert a V1-envelope / r6-denial
+/// compatibility that no architecture fragment states and that the owning
+/// module contract explicitly declines, so the drift is reported here instead
+/// of being papered over in code.
+///
+/// Re-pinning requires an owner decision that first updates the `[[donor]]`
+/// disposition. Issue #223 open question 3 is exactly that decision and it
+/// remains unanswered.
+pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r5";
 
 /// Coordination kind of the consumed audit payload.
 ///
