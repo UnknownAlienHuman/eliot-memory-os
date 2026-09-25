@@ -61,6 +61,7 @@ use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestKind as OrsHostRequestKind,
     HostRequestRecord, HostRequestState, OpaqueLabel, OperationIdentity, OrsError,
+    RedbRecoveryStore,
 };
 use eliot_protocol::{
     AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID, AgentActivationResolutionResult,
@@ -2119,13 +2120,23 @@ impl KernelComposition {
 
     /// Admits one durable/control event envelope for bridge-event delivery.
     ///
-    /// Runs the mechanical authority, fence, generation, deadline, and
-    /// durability checks in order, stages the ORS bridge-event row before
-    /// answering, and returns the durable outcome. An exact replay returns
-    /// the existing outcome without advancing anything; a changed binding
-    /// under the same identity is an identity conflict. Durable delivery
-    /// classes stage; best-effort telemetry is received without a durability
-    /// claim (transport observation only).
+    /// Runs the mechanical authority, fence, generation, deadline, privacy,
+    /// and durability checks in order, stages the ORS bridge-event row before
+    /// answering, records the Governor-intake handoff, and returns the
+    /// durable outcome. An exact replay returns the existing outcome without
+    /// advancing anything; a changed binding under the same identity is an
+    /// identity conflict. Durable delivery classes stage; best-effort
+    /// telemetry is received without a durability claim (transport
+    /// observation only).
+    ///
+    /// Privacy (I7.23) is decided before persistence: the disclosure
+    /// decision over the canonical envelope bytes is computed through the
+    /// ORS persistence owner and carried into the staged row, so denied
+    /// content stages as the deterministic redacted projection plus its
+    /// redaction receipt — never as verbatim raw. The handoff (I5(i)) is the
+    /// persisted leg of the intake conversion the Governor/coordinator
+    /// intake consumes on recovery: it binds the staged envelope digest and
+    /// is later reconciled by [`Self::answer_bridge_event_reconcile`].
     fn admit_bridge_event_envelope(
         &self,
         session: &Session,
@@ -2155,6 +2166,11 @@ impl KernelComposition {
         let envelope_bytes = eliot_contracts::canonical_json_bytes(event)
             .map_err(|_| TransportError::SessionFenced)?;
         let envelope_sha = eliot_contracts::sha256_hex(&envelope_bytes);
+        // Privacy decision precedes persistence: the ORS owner decides the
+        // disclosure disposition over these exact bytes, and the stage entry
+        // re-verifies the presented decision before any durable write. The
+        // decision object travels into the durable stage below.
+        let privacy = RedbRecoveryStore::bridge_event_privacy_decision(&envelope_bytes);
         let now = unix_ms();
         let expired = activation_deadline_expired(now, deadline_unix_ms);
         // `Ready` admits delivery; `Degraded` keeps only recovery (gap and
@@ -2171,56 +2187,7 @@ impl KernelComposition {
                 if degraded {
                     return Err(TransportError::Backpressure);
                 }
-                let staged = serde_json::json!({
-                    "stream_id": event.stream_id,
-                    "event_id": event.event_id,
-                    "sequence": event.sequence,
-                    "producer_id": event.producer_id,
-                    "producer_generation": event.producer_generation.value(),
-                    "authority_epoch": bridge_epoch_text(&event.authority_epoch),
-                    "envelope": serde_json::to_value(event)
-                        .map_err(|_| TransportError::SessionFenced)?,
-                    "envelope_sha256": envelope_sha,
-                    "staging_connection": session.connection_id,
-                });
-                let outcome = self.generation_gateway.ors.stage_bridge_event(&staged);
-                let outcome = match outcome {
-                    Ok(outcome) => outcome,
-                    Err(OrsError::DuplicateConflict) => {
-                        // Changed bytes under a known identity are a
-                        // determined rejection, not an unknown outcome: answer
-                        // the conflict with its existing cursor facts so the
-                        // bridge surfaces the typed conflict instead of
-                        // guessing. The durable row is untouched.
-                        return self.bridge_event_conflict_response(event, &envelope_sha);
-                    }
-                    Err(error) => {
-                        return Err(match error {
-                            OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
-                                TransportError::Backpressure
-                            }
-                            _ => TransportError::SessionFenced,
-                        });
-                    }
-                };
-                // An elapsed absolute deadline is staged honestly, then
-                // reported as a timeout instead of an admission: the durable
-                // record preserves the late presentation for reconcile, while
-                // the caller observes the timeout. Exact replays ignore the
-                // deadline and return the stored outcome (lookup path).
-                if expired
-                    && outcome.get("fresh").and_then(serde_json::Value::as_bool) == Some(true)
-                {
-                    return Err(TransportError::Timeout);
-                }
-                let phase = outcome
-                    .get("phase")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or(TransportError::SessionFenced)?;
-                if phase != BRIDGE_EVENT_PHASE_DURABLE {
-                    return Err(TransportError::SessionFenced);
-                }
-                Ok(bridge_event_forward_response(&outcome, true))
+                self.stage_bridge_event_durable(session, event, &envelope_sha, &privacy, expired)
             }
             DeliveryClass::BestEffortTelemetry => {
                 if degraded {
@@ -2236,6 +2203,111 @@ impl KernelComposition {
                 Ok(bridge_event_best_effort_response(event, true, ""))
             }
         }
+    }
+
+    /// Stages one durable/control event with its pre-persistence privacy
+    /// decision and records the Governor-intake handoff (Implements #2561,
+    /// I7.23 + I5(i)).
+    ///
+    /// The caller ([`Self::admit_bridge_event_envelope`]) has already run the
+    /// authority, fence, generation, and deadline gates and decided the
+    /// disclosure disposition over the canonical envelope bytes; `privacy`
+    /// carries that decision object. This entry stages the ORS row (the
+    /// stage entry re-verifies the decision before any durable write),
+    /// answers the determined conflict on changed bytes under a known
+    /// identity, stages-then-times-out on an elapsed absolute deadline, and
+    /// records the idempotent intake handoff before answering `DURABLE`.
+    fn stage_bridge_event_durable(
+        &self,
+        session: &Session,
+        event: &EventEnvelope,
+        envelope_sha: &str,
+        privacy: &serde_json::Value,
+        expired: bool,
+    ) -> Result<serde_json::Value, TransportError> {
+        let privacy_disposition = privacy
+            .get("privacy_disposition")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        let redacted_classes = privacy
+            .get("redacted_classes")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let redaction_reason = privacy
+            .get("redaction_reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let staged = serde_json::json!({
+            "stream_id": event.stream_id,
+            "event_id": event.event_id,
+            "sequence": event.sequence,
+            "producer_id": event.producer_id,
+            "producer_generation": event.producer_generation.value(),
+            "authority_epoch": bridge_epoch_text(&event.authority_epoch),
+            "envelope": serde_json::to_value(event)
+                .map_err(|_| TransportError::SessionFenced)?,
+            "envelope_sha256": envelope_sha,
+            "staging_connection": session.connection_id,
+            "privacy_disposition": privacy_disposition,
+            "redacted_classes": redacted_classes,
+            "redaction_reason": redaction_reason,
+        });
+        let outcome = self.generation_gateway.ors.stage_bridge_event(&staged);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(OrsError::DuplicateConflict) => {
+                // Changed bytes under a known identity are a
+                // determined rejection, not an unknown outcome: answer
+                // the conflict with its existing cursor facts so the
+                // bridge surfaces the typed conflict instead of
+                // guessing. The durable row is untouched.
+                return self.bridge_event_conflict_response(event, envelope_sha);
+            }
+            Err(error) => {
+                return Err(match error {
+                    OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
+                        TransportError::Backpressure
+                    }
+                    _ => TransportError::SessionFenced,
+                });
+            }
+        };
+        // An elapsed absolute deadline is staged honestly, then
+        // reported as a timeout instead of an admission: the durable
+        // record preserves the late presentation for reconcile, while
+        // the caller observes the timeout. Exact replays ignore the
+        // deadline and return the stored outcome (lookup path).
+        if expired && outcome.get("fresh").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Err(TransportError::Timeout);
+        }
+        let phase = outcome
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        if phase != BRIDGE_EVENT_PHASE_DURABLE {
+            return Err(TransportError::SessionFenced);
+        }
+        // Handoff persist (I5(i)): the staged durable event is handed
+        // toward Governor/coordinator intake under its envelope
+        // digest. The handoff entry is idempotent, so a lost
+        // acknowledgement replays to the existing handoff instead of
+        // a second record; a handoff failure fails closed here while
+        // the durable row stays staged for reconcile recovery.
+        let handoff = serde_json::json!({
+            "stream_id": event.stream_id,
+            "event_id": event.event_id,
+            "sequence": event.sequence,
+            "envelope_sha256": envelope_sha,
+            "staging_connection": session.connection_id,
+        });
+        self.generation_gateway
+            .ors
+            .record_bridge_event_handoff(&handoff)
+            .map_err(|error| match error {
+                OrsError::DuplicateConflict => TransportError::IdentityConflict,
+                _ => TransportError::SessionFenced,
+            })?;
+        Ok(bridge_event_forward_response(&outcome, true))
     }
 
     /// Answers a same-identity content conflict with the existing cursor
@@ -2354,8 +2426,11 @@ impl KernelComposition {
     /// Applies the presented consumed frontier first (monotonic acks at or
     /// below the durable cursor; anything past it fails the whole scope),
     /// then enumerates the in-scope streams with their cursors, pending first
-    /// pages, and gaps, and binds the reply digest as the reconciliation key
-    /// the bridge carries as its receipt reference.
+    /// pages, and gaps, binds the reply digest as the reconciliation key
+    /// the bridge carries as its receipt reference, and finally reconciles
+    /// the Governor-intake handoffs covered by the consumed frontier under
+    /// that key (I5(i)). Handoff reconcile is idempotent, so a lost
+    /// reconciliation answer replays to the existing handoff states.
     fn answer_bridge_event_reconcile(
         &self,
         session: &Session,
@@ -2387,7 +2462,20 @@ impl KernelComposition {
         let key_bytes = eliot_contracts::canonical_json_bytes(&reconciliation)
             .map_err(|_| TransportError::SessionFenced)?;
         let reconcile_key = eliot_contracts::sha256_hex(&key_bytes);
-        reconciliation["reconcile_key"] = serde_json::Value::String(reconcile_key);
+        reconciliation["reconcile_key"] = serde_json::Value::String(reconcile_key.clone());
+        let mut handoffs_reconciled = 0_u64;
+        for (stream_id, sequence) in &scope.consumed {
+            let marked = self
+                .generation_gateway
+                .ors
+                .reconcile_bridge_event_handoffs(stream_id, *sequence, &reconcile_key)
+                .map_err(|_| TransportError::SessionFenced)?;
+            handoffs_reconciled += marked
+                .get("reconciled")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+        }
+        reconciliation["handoffs_reconciled"] = serde_json::Value::from(handoffs_reconciled);
         Ok(serde_json::json!({ "status": "known", "value": {
             "accepted": true,
             "reconciliation": reconciliation,

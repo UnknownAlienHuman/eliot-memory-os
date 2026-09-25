@@ -136,6 +136,14 @@ const BRIDGE_EVENT_CURSORS: TableDefinition<&str, &str> =
 /// visible without moving any cursor. Keyed by `gap_id`.
 const BRIDGE_EVENT_GAPS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_bridge_event_gaps_v1");
+/// Durable bridge-event Governor-handoff rows (issue #2561, I5(i)): one
+/// coordinator-intake handoff per `(stream_id, event_id)` identity, persisted
+/// at DURABLE stage time and marked reconciled by the event reconcile entry.
+/// Keyed by `stream::event`. Disjoint from `HOST_REQUESTS`; the handoff binds
+/// the staged envelope digest and the reconcile key, never a synthesized
+/// intake or application claim.
+const BRIDGE_EVENT_HANDOFFS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_bridge_event_handoffs_v1");
 /// Maximum staged bridge-event rows. Mirrors the I14.2 canonical-writes pool
 /// (2048 items): breach fails with [`OrsError::ProjectionLimitExceeded`]
 /// (typed backpressure), never with silent loss.
@@ -159,6 +167,58 @@ const RETAIN_BRIDGE_EVENT_ACKED_PER_STREAM: u64 = 512;
 /// durable relation, so staging always persists `DURABLE`; `RECEIVED` is the
 /// pre-stage transport fact answered without a row.
 const BRIDGE_EVENT_PHASE_DURABLE: &str = "DURABLE";
+/// Privacy disposition persisted on a staged bridge event (issue #2561, I7.23:
+/// secret values, provider-forbidden hidden reasoning, and data outside the
+/// `WorkScope` privacy boundary are never persisted merely to preserve
+/// "rawness" — the ingest path stores the exact transport hash plus either
+/// the allowed raw bytes or a deterministic redacted representation with a
+/// redaction receipt). The decision is computed over the canonical envelope
+/// bytes before any durable write and re-verified by the stage entry, so a
+/// denied payload is redacted with its receipt, never persisted raw.
+const BRIDGE_EVENT_PRIVACY_ALLOWED: &str = "allowed";
+/// Privacy disposition stored when the canonical envelope bytes carry denied
+/// content: only the deterministic redacted projection plus the redaction
+/// receipt facts are staged.
+const BRIDGE_EVENT_PRIVACY_REDACTED: &str = "redacted";
+/// Redaction reason stored when denied content forces the redacted path. Uses
+/// the closed wire reason vocabulary shared with the protocol redaction
+/// receipt (`FORBIDDEN_CONTENT_DETECTED` / `DECLARED_OUT_OF_SCOPE`); this
+/// owner only ever mints the detected reason.
+const BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN: &str = "FORBIDDEN_CONTENT_DETECTED";
+/// Marker prefix of every deterministic redacted projection minted by this
+/// owner. Distinct from the ACP journal marker: each minting owner names its
+/// own deterministic projection so a receipt always names the projection its
+/// owner actually stored.
+const BRIDGE_EVENT_REDACTED_PROJECTION_MARKER: &str = "redacted/bridge-event-v1";
+/// Byte patterns that must never persist as admissible staged bytes. Matched
+/// case-insensitively against the lossy UTF-8 decoding of the canonical
+/// envelope bytes: the operationalization, for this byte-only persistence
+/// owner, of the I7.23 denied classes (secret values, provider-forbidden
+/// hidden reasoning, data outside the `WorkScope` privacy boundary). The same
+/// denied vocabulary is enforced by the ACP durable journal on its own path;
+/// each owner scans the bytes it persists, so neither trusts the other.
+const BRIDGE_EVENT_DENIED_CONTENT_TOKENS: &[&str] = &[
+    "secret",
+    "passwd",
+    "password",
+    "bearer",
+    "hidden_reasoning",
+    "provider_hidden",
+    "api_key",
+];
+/// Maximum redacted classes carried by one bridge-event redaction.
+const MAX_BRIDGE_EVENT_REDACTED_CLASSES: usize = 16;
+/// Maximum staged bridge-event handoff rows. Mirrors the bridge-event record
+/// bound: breach fails with [`OrsError::ProjectionLimitExceeded`] (typed
+/// backpressure), never with silent loss of handoff state.
+const MAX_BRIDGE_EVENT_HANDOFFS: usize = 2048;
+/// Handoff state persisted at DURABLE stage time: the staged envelope is
+/// durably held and handed toward Governor/coordinator intake, not yet
+/// reconciled against a consumed frontier.
+const BRIDGE_EVENT_HANDOFF_HANDED_OFF: &str = "handed_off";
+/// Handoff state once the event reconcile entry binds the row to a
+/// reconciliation key at or past its sequence.
+const BRIDGE_EVENT_HANDOFF_RECONCILED: &str = "reconciled";
 
 /// One durably staged bridge-forwarded event (issue #2561).
 ///
@@ -168,6 +228,15 @@ const BRIDGE_EVENT_PHASE_DURABLE: &str = "DURABLE";
 /// producer/generation/authority facts, the staging connection, and the
 /// phase. Same-identity replays compare against this row; changed bytes never
 /// overwrite it.
+///
+/// Privacy (I7.23) is decided before persistence: `transport_hash` is the
+/// immutable hash of the original canonical envelope bytes; admissible rows
+/// store those bytes verbatim (`redacted == false`), while rows whose bytes
+/// carried denied content store only the deterministic redacted projection
+/// (`redacted == true`) plus the redaction receipt facts. Rows written before
+/// the privacy fields existed carry empty privacy facts and validate as
+/// legacy admissible rows; every row written by the current stage entry
+/// carries the full decision.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BridgeEventRow {
@@ -183,6 +252,18 @@ struct BridgeEventRow {
     staging_connection: String,
     staged_at_ms: u64,
     phase: String,
+    #[serde(default)]
+    transport_hash: String,
+    #[serde(default)]
+    redacted: bool,
+    #[serde(default)]
+    redaction_reason: String,
+    #[serde(default)]
+    redacted_classes: Vec<String>,
+    #[serde(default)]
+    redaction_marker: String,
+    #[serde(default)]
+    redaction_version: u16,
 }
 
 impl BridgeEventRow {
@@ -214,15 +295,94 @@ impl BridgeEventRow {
         {
             return Err(OrsError::PayloadTooLarge);
         }
-        if crate::model::sha256_hex(&self.envelope_bytes) != self.envelope_sha256 {
-            return Err(OrsError::PayloadIntegrityMismatch);
-        }
         crate::model::validate_text(&self.staging_connection, "staging_connection")?;
         if self.phase != BRIDGE_EVENT_PHASE_DURABLE {
             return Err(OrsError::InvalidField {
                 field: "phase",
                 reason: "staged bridge events persist the DURABLE phase",
             });
+        }
+        self.validate_privacy()
+    }
+
+    /// Validates the I7.23 disclosure/retention decision carried by this row.
+    ///
+    /// Admissible rows store the original bytes verbatim: the immutable
+    /// transport hash must then bind both the stored bytes and the envelope
+    /// identity digest. Redacted rows store only the deterministic projection
+    /// recomputed here from the transport hash and the receipt classes, so a
+    /// corrupted projection fails as an integrity mismatch instead of
+    /// reporting redacted facts over foreign bytes. Rows predating the
+    /// privacy fields (empty transport hash on an admissible row) validate as
+    /// legacy rows against the envelope identity digest.
+    fn validate_privacy(&self) -> Result<(), OrsError> {
+        if !self.redacted {
+            if !self.redaction_reason.is_empty()
+                || !self.redacted_classes.is_empty()
+                || !self.redaction_marker.is_empty()
+                || self.redaction_version != 0
+            {
+                return Err(OrsError::InvalidField {
+                    field: "redaction",
+                    reason: "admissible bridge events carry no redaction facts",
+                });
+            }
+            if self.transport_hash.is_empty() {
+                // Legacy row predating the privacy decision: the stored bytes
+                // are the verbatim envelope bound by the identity digest.
+                if crate::model::sha256_hex(&self.envelope_bytes) != self.envelope_sha256 {
+                    return Err(OrsError::PayloadIntegrityMismatch);
+                }
+                return Ok(());
+            }
+            crate::model::validate_digest(&self.transport_hash, "transport_hash")?;
+            if self.transport_hash != self.envelope_sha256 {
+                return Err(OrsError::PayloadIntegrityMismatch);
+            }
+            if crate::model::sha256_hex(&self.envelope_bytes) != self.transport_hash {
+                return Err(OrsError::PayloadIntegrityMismatch);
+            }
+            return Ok(());
+        }
+        crate::model::validate_digest(&self.transport_hash, "transport_hash")?;
+        if self.transport_hash != self.envelope_sha256 {
+            return Err(OrsError::InvalidField {
+                field: "transport_hash",
+                reason: "redacted bridge events bind the original transport hash",
+            });
+        }
+        if self.redaction_reason != BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN {
+            return Err(OrsError::InvalidField {
+                field: "redaction_reason",
+                reason: "bridge event redaction carries the detected-content reason",
+            });
+        }
+        if self.redacted_classes.is_empty()
+            || self.redacted_classes.len() > MAX_BRIDGE_EVENT_REDACTED_CLASSES
+        {
+            return Err(OrsError::InvalidField {
+                field: "redacted_classes",
+                reason: "bridge event redaction classes must be nonempty and bounded",
+            });
+        }
+        for class in &self.redacted_classes {
+            crate::model::validate_text(class, "redacted_classes")?;
+        }
+        if self.redaction_marker != BRIDGE_EVENT_REDACTED_PROJECTION_MARKER {
+            return Err(OrsError::InvalidField {
+                field: "redaction_marker",
+                reason: "bridge event redaction carries this owner's projection marker",
+            });
+        }
+        if self.redaction_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.redaction_version));
+        }
+        let expected = RedbRecoveryStore::bridge_event_redacted_projection_bytes(
+            &self.transport_hash,
+            &self.redacted_classes,
+        );
+        if self.envelope_bytes != expected {
+            return Err(OrsError::PayloadIntegrityMismatch);
         }
         Ok(())
     }
@@ -336,6 +496,99 @@ impl persistence_codec::PersistedValue for BridgeEventGapRow {
     }
 }
 
+/// One durable Governor-handoff record for a staged bridge event (issue
+/// #2561, I5(i)).
+///
+/// The handoff is the persisted leg of the intake conversion: the Kernel
+/// route owner records it once the ORS bridge-event row is durably staged
+/// (`handed_off`), and the event reconcile entry binds it to the
+/// reconciliation key once the consumed frontier covers its sequence
+/// (`reconciled`). The row carries the staged envelope digest and the
+/// reconcile key only — never a synthesized intake, normalization, or
+/// application claim. Those legs stay owned by the provider normalizer and
+/// the Governor/coordinator intake; this row only proves the durable event
+/// reached the handoff and whether reconcile has covered it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeEventHandoffRow {
+    contract_version: u16,
+    stream_id: String,
+    event_id: String,
+    sequence: u64,
+    envelope_sha256: String,
+    state: String,
+    staging_connection: String,
+    handed_off_at_ms: u64,
+    #[serde(default)]
+    reconcile_key: String,
+    #[serde(default)]
+    reconciled_at_ms: u64,
+}
+
+impl BridgeEventHandoffRow {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        bridge_identity_text(&self.stream_id, "stream_id")?;
+        bridge_identity_text(&self.event_id, "event_id")?;
+        if self.sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "sequence",
+                reason: "bridge event handoff sequence must be nonzero",
+            });
+        }
+        crate::model::validate_digest(&self.envelope_sha256, "envelope_sha256")?;
+        if self.state != BRIDGE_EVENT_HANDOFF_HANDED_OFF
+            && self.state != BRIDGE_EVENT_HANDOFF_RECONCILED
+        {
+            return Err(OrsError::InvalidField {
+                field: "state",
+                reason: "bridge event handoff is handed_off or reconciled",
+            });
+        }
+        crate::model::validate_text(&self.staging_connection, "staging_connection")?;
+        if self.state == BRIDGE_EVENT_HANDOFF_HANDED_OFF {
+            if !self.reconcile_key.is_empty() || self.reconciled_at_ms != 0 {
+                return Err(OrsError::InvalidField {
+                    field: "reconcile_key",
+                    reason: "an unreconciled handoff carries no reconcile key",
+                });
+            }
+        } else {
+            crate::model::validate_digest(&self.reconcile_key, "reconcile_key")?;
+            if self.reconciled_at_ms == 0 {
+                return Err(OrsError::InvalidField {
+                    field: "reconciled_at_ms",
+                    reason: "a reconciled handoff carries its reconcile time",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl persistence_codec::PersistedValue for BridgeEventHandoffRow {
+    const RECORD_TYPE: &'static str = "bridge_event_handoff";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+/// Resolved I7.23 disclosure staging for canonical envelope bytes.
+///
+/// Carries the enforced privacy decision (denied or admissible with its
+/// classes), the immutable transport hash of the original bytes, and the
+/// bytes to stage (verbatim originals or the deterministic redacted
+/// projection). Built only by the stage entry through the privacy resolver.
+struct BridgeEventPrivacyStaging {
+    denied: bool,
+    classes: Vec<String>,
+    transport_hash: String,
+    stored_bytes: Vec<u8>,
+}
+
 /// Builds the stage/lookup outcome object for one bridge-event row.
 fn bridge_event_outcome(
     row: &BridgeEventRow,
@@ -343,7 +596,24 @@ fn bridge_event_outcome(
     durable: u64,
     acked: u64,
     fresh: bool,
+    handoff: Option<&str>,
 ) -> serde_json::Value {
+    let privacy_disposition = if row.redacted {
+        BRIDGE_EVENT_PRIVACY_REDACTED
+    } else {
+        BRIDGE_EVENT_PRIVACY_ALLOWED
+    };
+    let redaction = if row.redacted {
+        json!({
+            "transport_hash": row.transport_hash,
+            "reason": row.redaction_reason,
+            "redacted_classes": row.redacted_classes,
+            "marker": row.redaction_marker,
+            "normalizer_version": format!("ors-bridge-ingest-v{}", row.redaction_version),
+        })
+    } else {
+        serde_json::Value::Null
+    };
     json!({
         "stream_id": row.stream_id,
         "event_id": row.event_id,
@@ -358,6 +628,10 @@ fn bridge_event_outcome(
         "durable_cursor": durable,
         "acked_cursor": acked,
         "fresh": fresh,
+        "privacy_disposition": privacy_disposition,
+        "transport_hash": row.transport_hash,
+        "redaction": redaction,
+        "handoff": handoff,
     })
 }
 
@@ -3685,6 +3959,206 @@ impl RedbRecoveryStore {
         Ok(Some(next))
     }
 
+    // Bridge-event privacy gate (I7.23 decision before persistence) and
+    // handoff reader used by the stage entry below.
+    /// Decides the I7.23 disclosure/retention disposition for one bridge
+    /// event over its canonical envelope bytes, before any durable write.
+    ///
+    /// This is the production privacy gate the Kernel route owner calls
+    /// before staging: it returns the exact decision object the stage entry
+    /// requires (`privacy_disposition` plus `redacted_classes` and
+    /// `redaction_reason`), computed from the same bytes the stage entry
+    /// re-verifies, so the decision provably precedes persistence. Denied
+    /// content (secret values, provider-forbidden hidden reasoning, data
+    /// outside the `WorkScope` privacy boundary, operationalized as the denied
+    /// token scan) selects the redacted path with the matched classes;
+    /// anything else stages verbatim. The boundary exchanges validated JSON
+    /// only, like every other bridge-event entry on this owner.
+    pub fn bridge_event_privacy_decision(envelope_bytes: &[u8]) -> serde_json::Value {
+        let (redacted, classes) = Self::privacy_decision_for(envelope_bytes);
+        json!({
+            "privacy_disposition": if redacted {
+                BRIDGE_EVENT_PRIVACY_REDACTED
+            } else {
+                BRIDGE_EVENT_PRIVACY_ALLOWED
+            },
+            "redacted_classes": classes,
+            "redaction_reason": if redacted {
+                BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN
+            } else {
+                ""
+            },
+        })
+    }
+
+    /// Builds the deterministic redacted projection for a transport hash and
+    /// a set of redacted classes. The output is a pure function of its
+    /// inputs: the same hash and class set always yields the same bytes, and
+    /// the bytes carry no source content beyond the hash itself. The row
+    /// validator recomputes this exact form, so a stored projection is
+    /// verified, not trusted.
+    fn bridge_event_redacted_projection_bytes(
+        transport_hash_hex: &str,
+        sorted_classes: &[String],
+    ) -> Vec<u8> {
+        format!(
+            "{BRIDGE_EVENT_REDACTED_PROJECTION_MARKER}:hash={transport_hash_hex}:classes={}",
+            sorted_classes.join(",")
+        )
+        .into_bytes()
+    }
+
+    /// Computes the raw disclosure decision over canonical envelope bytes:
+    /// whether denied content is present and, when so, the sorted matched
+    /// classes. Matched case-insensitively over the lossy UTF-8 decoding, so
+    /// binary frames decoding to denied tokens are caught the same way.
+    fn privacy_decision_for(envelope_bytes: &[u8]) -> (bool, Vec<String>) {
+        let decoded = String::from_utf8_lossy(envelope_bytes).to_lowercase();
+        let mut classes: Vec<String> = BRIDGE_EVENT_DENIED_CONTENT_TOKENS
+            .iter()
+            .filter(|token| decoded.contains(**token))
+            .map(|token| (*token).to_owned())
+            .collect();
+        classes.sort();
+        classes.dedup();
+        classes.truncate(MAX_BRIDGE_EVENT_REDACTED_CLASSES);
+        (!classes.is_empty(), classes)
+    }
+
+    /// Parses the presented pre-persistence privacy decision from a staged
+    /// object: the disposition plus, on the redacted path, the bounded class
+    /// list and the detected-content reason.
+    fn presented_privacy_decision(
+        staged: &serde_json::Value,
+    ) -> Result<(bool, Vec<String>, String), OrsError> {
+        let disposition = bridge_text(staged, "privacy_disposition")?;
+        let redacted = match disposition.as_str() {
+            x if x == BRIDGE_EVENT_PRIVACY_ALLOWED => false,
+            x if x == BRIDGE_EVENT_PRIVACY_REDACTED => true,
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "privacy_disposition",
+                    reason: "bridge event privacy disposition must be allowed or redacted",
+                });
+            }
+        };
+        let mut classes = Vec::new();
+        if let Some(list) = staged.get("redacted_classes") {
+            let items = list.as_array().ok_or(OrsError::InvalidField {
+                field: "redacted_classes",
+                reason: "bridge event redacted classes must be a bounded text list",
+            })?;
+            for item in items {
+                let class = item.as_str().ok_or(OrsError::InvalidField {
+                    field: "redacted_classes",
+                    reason: "bridge event redacted classes must be a bounded text list",
+                })?;
+                crate::model::validate_text(class, "redacted_classes")?;
+                classes.push(class.to_owned());
+            }
+        }
+        if classes.len() > MAX_BRIDGE_EVENT_REDACTED_CLASSES {
+            return Err(OrsError::InvalidField {
+                field: "redacted_classes",
+                reason: "bridge event redacted classes must be a bounded text list",
+            });
+        }
+        classes.sort();
+        classes.dedup();
+        let reason = staged
+            .get("redaction_reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if !reason.is_empty() {
+            crate::model::validate_text(&reason, "redaction_reason")?;
+        }
+        Ok((redacted, classes, reason))
+    }
+
+    /// Resolves the I7.23 disclosure staging for one stage call: the
+    /// presented pre-persistence decision must equal the decision this owner
+    /// recomputes over the canonical envelope bytes, and denied bytes resolve
+    /// to the deterministic redacted projection plus its receipt facts —
+    /// never to verbatim raw. A decision mismatch fails closed instead of
+    /// persisting a disputed form.
+    fn bridge_event_privacy_staging(
+        staged: &serde_json::Value,
+        envelope_bytes: &[u8],
+    ) -> Result<BridgeEventPrivacyStaging, OrsError> {
+        let (presented_redacted, presented_classes, presented_reason) =
+            Self::presented_privacy_decision(staged)?;
+        let (denied, decided_classes) = Self::privacy_decision_for(envelope_bytes);
+        if denied != presented_redacted
+            || (denied && decided_classes != presented_classes)
+            || (denied && presented_reason != BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN)
+            || (!denied && (!presented_classes.is_empty() || !presented_reason.is_empty()))
+        {
+            return Err(OrsError::InvalidField {
+                field: "privacy_disposition",
+                reason: "bridge event privacy decision does not match the staged bytes",
+            });
+        }
+        let transport_hash = crate::model::sha256_hex(envelope_bytes);
+        let stored_bytes = if denied {
+            Self::bridge_event_redacted_projection_bytes(&transport_hash, &decided_classes)
+        } else {
+            envelope_bytes.to_vec()
+        };
+        Ok(BridgeEventPrivacyStaging {
+            denied,
+            classes: decided_classes,
+            transport_hash,
+            stored_bytes,
+        })
+    }
+
+    /// Loads one staged bridge-event row inside a write transaction for the
+    /// idempotent-duplicate check. Enforces the record bound for fresh
+    /// identities: a full table fails new identities with
+    /// [`OrsError::ProjectionLimitExceeded`] while idempotent replays of
+    /// stored identities still succeed.
+    fn load_bridge_event_row_in(
+        write: &redb::WriteTransaction,
+        key: &str,
+    ) -> Result<Option<BridgeEventRow>, OrsError> {
+        let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+        if records.len().map_err(storage)? >= MAX_BRIDGE_EVENT_RECORDS as u64
+            && records.get(key).map_err(storage)?.is_none()
+        {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        records
+            .get(key)
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()
+    }
+
+    /// Reads the handoff state for one staged identity inside a transaction:
+    /// the persisted state, or `None` when no handoff was recorded yet. A
+    /// missing handoff is reported as absent, never synthesized.
+    fn bridge_handoff_state_in(
+        write: &redb::WriteTransaction,
+        stream_id: &str,
+        event_id: &str,
+    ) -> Result<Option<String>, OrsError> {
+        let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+        let key = format!("{stream_id}::{event_id}");
+        let row: Option<BridgeEventHandoffRow> = handoffs
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()?;
+        match row {
+            Some(row) => {
+                row.validate()?;
+                Ok(Some(row.state))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Durably stages one bridge-forwarded durable/control event before any
     /// acknowledgement (issue #2561, I7.2/I7.23).
     ///
@@ -3704,10 +4178,20 @@ impl RedbRecoveryStore {
     /// The boundary is intentionally narrow: inputs arrive as one validated
     /// JSON object (`stream_id`, `event_id`, `sequence`, `producer_id`,
     /// `producer_generation`, `authority_epoch`, `envelope` canonical JSON,
-    /// `envelope_sha256`, `staging_connection`) and the outcome leaves as one
-    /// JSON object (`phase`, `disposition`, cursors, `fresh`). Typed
-    /// bridge-event views live with the Kernel route owner, which validates
-    /// both directions; the store binds bytes and cursors only.
+    /// `envelope_sha256`, `staging_connection`, plus the pre-persistence
+    /// privacy decision `privacy_disposition` / `redacted_classes` /
+    /// `redaction_reason`) and the outcome leaves as one JSON object
+    /// (`phase`, `disposition`, cursors, `fresh`, privacy facts, handoff
+    /// state). Typed bridge-event views live with the Kernel route owner,
+    /// which validates both directions; the store binds bytes and cursors
+    /// only.
+    ///
+    /// Disclosure/retention (I7.23) is enforced here, at the persistence
+    /// site: the presented privacy decision must equal the decision this
+    /// owner recomputes over the canonical envelope bytes, and denied bytes
+    /// are staged as the deterministic redacted projection plus the redaction
+    /// receipt facts — never as verbatim raw. A decision mismatch fails the
+    /// stage instead of persisting a disputed form.
     pub fn stage_bridge_event(
         &self,
         staged: &serde_json::Value,
@@ -3739,23 +4223,12 @@ impl RedbRecoveryStore {
         if crate::model::sha256_hex(&envelope_bytes) != presented_sha {
             return Err(OrsError::PayloadIntegrityMismatch);
         }
+        let staging = Self::bridge_event_privacy_staging(staged, &envelope_bytes)?;
         let key = format!("{stream_id}::{event_id}");
         let now_ms = current_unix_ms_u64()?;
         let write = self.database.begin_write().map_err(storage)?;
         let outcome = {
-            let existing: Option<BridgeEventRow> = {
-                let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
-                if records.len().map_err(storage)? >= MAX_BRIDGE_EVENT_RECORDS as u64
-                    && records.get(key.as_str()).map_err(storage)?.is_none()
-                {
-                    return Err(OrsError::ProjectionLimitExceeded);
-                }
-                records
-                    .get(key.as_str())
-                    .map_err(storage)?
-                    .map(|value| decode(value.value()))
-                    .transpose()?
-            };
+            let existing: Option<BridgeEventRow> = Self::load_bridge_event_row_in(&write, &key)?;
             if let Some(row) = existing {
                 row.validate()?;
                 if row.envelope_sha256 != presented_sha
@@ -3763,11 +4236,14 @@ impl RedbRecoveryStore {
                     || row.producer_id != producer_id
                     || row.producer_generation != producer_generation
                     || row.authority_epoch != authority_epoch
+                    || row.redacted != staging.denied
+                    || row.transport_hash != staging.transport_hash
                 {
                     return Err(OrsError::DuplicateConflict);
                 }
                 let (durable, acked) = Self::bridge_cursors_in(&write, &stream_id)?;
-                bridge_event_outcome(&row, "duplicate", durable, acked, false)
+                let handoff = Self::bridge_handoff_state_in(&write, &stream_id, &event_id)?;
+                bridge_event_outcome(&row, "duplicate", durable, acked, false, handoff.as_deref())
             } else {
                 let row = BridgeEventRow {
                     contract_version: crate::CONTRACT_VERSION,
@@ -3778,10 +4254,28 @@ impl RedbRecoveryStore {
                     producer_generation,
                     authority_epoch,
                     envelope_sha256: presented_sha,
-                    envelope_bytes,
+                    envelope_bytes: staging.stored_bytes,
                     staging_connection,
                     staged_at_ms: now_ms,
                     phase: BRIDGE_EVENT_PHASE_DURABLE.to_owned(),
+                    transport_hash: staging.transport_hash,
+                    redacted: staging.denied,
+                    redaction_reason: if staging.denied {
+                        BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN.to_owned()
+                    } else {
+                        String::new()
+                    },
+                    redacted_classes: staging.classes,
+                    redaction_marker: if staging.denied {
+                        BRIDGE_EVENT_REDACTED_PROJECTION_MARKER.to_owned()
+                    } else {
+                        String::new()
+                    },
+                    redaction_version: if staging.denied {
+                        crate::CONTRACT_VERSION
+                    } else {
+                        0
+                    },
                 };
                 row.validate()?;
                 {
@@ -3791,7 +4285,8 @@ impl RedbRecoveryStore {
                         .map_err(storage)?;
                 }
                 let (durable, acked) = Self::advance_bridge_cursor_in(&write, &stream_id)?;
-                bridge_event_outcome(&row, "accepted", durable, acked, true)
+                let handoff = Self::bridge_handoff_state_in(&write, &stream_id, &event_id)?;
+                bridge_event_outcome(&row, "accepted", durable, acked, true, handoff.as_deref())
             }
         };
         write.commit().map_err(storage)?;
@@ -3803,9 +4298,10 @@ impl RedbRecoveryStore {
     ///
     /// Read-only projection for ack recovery: after owner commit but before
     /// acknowledgement, lookup returns the existing phase, disposition,
-    /// digest, and cursors, so a lost acknowledgement replays to the stored
-    /// facts instead of duplicating normalization or application. Unknown
-    /// identities return `Ok(None)`, never a synthesized event.
+    /// digest, privacy facts, handoff state, and cursors, so a lost
+    /// acknowledgement replays to the stored facts instead of duplicating
+    /// normalization or application. Unknown identities return `Ok(None)`,
+    /// never a synthesized event.
     pub fn load_bridge_event(
         &self,
         stream_id: &str,
@@ -3827,10 +4323,198 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         row.validate()?;
+        let handoff: Option<String> = {
+            let handoffs = read.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+            handoffs
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+                .map(|row: BridgeEventHandoffRow| {
+                    row.validate()?;
+                    Ok::<String, OrsError>(row.state)
+                })
+                .transpose()?
+        };
         let (durable, acked) = Self::bridge_cursors_for(&self.database, stream_id)?;
         Ok(Some(bridge_event_outcome(
-            &row, "accepted", durable, acked, false,
+            &row,
+            "accepted",
+            durable,
+            acked,
+            false,
+            handoff.as_deref(),
         )))
+    }
+
+    /// Records the Governor-handoff for one durably staged bridge event
+    /// (issue #2561, I5(i)).
+    ///
+    /// The Kernel route owner calls this after the ORS bridge-event row is
+    /// staged: the handoff persists the staged envelope digest with the
+    /// `handed_off` state, proving the durable event reached the intake
+    /// handoff. An exact replay under the same identity and digest returns
+    /// the existing handoff with `fresh: false`; changed bytes under the same
+    /// identity fail with [`OrsError::DuplicateConflict`]. The handoff never
+    /// synthesizes intake, normalization, or application: those legs stay
+    /// owned by the provider normalizer and the Governor/coordinator intake,
+    /// which consume this durable fact on recovery.
+    ///
+    /// The boundary is intentionally narrow: inputs arrive as one validated
+    /// JSON object (`stream_id`, `event_id`, `sequence`, `envelope_sha256`,
+    /// `staging_connection`) and the handoff receipt leaves as one JSON
+    /// object.
+    pub fn record_bridge_event_handoff(
+        &self,
+        handoff: &serde_json::Value,
+    ) -> Result<serde_json::Value, OrsError> {
+        let stream_id = bridge_key_text(handoff, "stream_id")?;
+        let event_id = bridge_key_text(handoff, "event_id")?;
+        let sequence = bridge_sequence(handoff, "sequence")?;
+        let envelope_sha256 = bridge_text(handoff, "envelope_sha256")?;
+        crate::model::validate_digest(&envelope_sha256, "envelope_sha256")?;
+        let staging_connection = bridge_text(handoff, "staging_connection")?;
+        let key = format!("{stream_id}::{event_id}");
+        let now_ms = current_unix_ms_u64()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let outcome = {
+            let existing: Option<BridgeEventHandoffRow> = {
+                let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+                if handoffs.len().map_err(storage)? >= MAX_BRIDGE_EVENT_HANDOFFS as u64
+                    && handoffs.get(key.as_str()).map_err(storage)?.is_none()
+                {
+                    return Err(OrsError::ProjectionLimitExceeded);
+                }
+                handoffs
+                    .get(key.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode(value.value()))
+                    .transpose()?
+            };
+            if let Some(row) = existing {
+                row.validate()?;
+                if row.envelope_sha256 != envelope_sha256 || row.sequence != sequence {
+                    return Err(OrsError::DuplicateConflict);
+                }
+                json!({
+                    "stream_id": row.stream_id,
+                    "event_id": row.event_id,
+                    "sequence": row.sequence,
+                    "envelope_sha256": row.envelope_sha256,
+                    "state": row.state,
+                    "staging_connection": row.staging_connection,
+                    "fresh": false,
+                })
+            } else {
+                let row = BridgeEventHandoffRow {
+                    contract_version: crate::CONTRACT_VERSION,
+                    stream_id: stream_id.clone(),
+                    event_id: event_id.clone(),
+                    sequence,
+                    envelope_sha256: envelope_sha256.clone(),
+                    state: BRIDGE_EVENT_HANDOFF_HANDED_OFF.to_owned(),
+                    staging_connection: staging_connection.clone(),
+                    handed_off_at_ms: now_ms,
+                    reconcile_key: String::new(),
+                    reconciled_at_ms: 0,
+                };
+                row.validate()?;
+                {
+                    let mut handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+                    handoffs
+                        .insert(key.as_str(), encode(&row)?.as_str())
+                        .map_err(storage)?;
+                }
+                json!({
+                    "stream_id": stream_id,
+                    "event_id": event_id,
+                    "sequence": sequence,
+                    "envelope_sha256": envelope_sha256,
+                    "state": BRIDGE_EVENT_HANDOFF_HANDED_OFF,
+                    "staging_connection": staging_connection,
+                    "fresh": true,
+                })
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(outcome)
+    }
+
+    /// Binds handed-off bridge events to one reconciliation key once the
+    /// consumed frontier covers their sequences (issue #2561, I5(i)).
+    ///
+    /// The Kernel event reconcile entry calls this after applying the
+    /// consumed frontier: every `handed_off` row on `stream_id` at or below
+    /// `acked_sequence` becomes `reconciled` under `reconcile_key`, so the
+    /// handoff durably records which reconciliation covered it. Rows already
+    /// reconciled, rows above the frontier, and other streams are untouched;
+    /// the bound is monotonic by construction of the acked frontier. Returns
+    /// the stream, the frontier, and the reconciled row count.
+    pub fn reconcile_bridge_event_handoffs(
+        &self,
+        stream_id: &str,
+        acked_sequence: u64,
+        reconcile_key: &str,
+    ) -> Result<serde_json::Value, OrsError> {
+        bridge_identity_text(stream_id, "stream_id")?;
+        if acked_sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "acked_sequence",
+                reason: "handoff reconcile sequence must be nonzero",
+            });
+        }
+        crate::model::validate_digest(reconcile_key, "reconcile_key")?;
+        let now_ms = current_unix_ms_u64()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut reconciled = 0_u64;
+        {
+            let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+            let mut due = Vec::new();
+            for entry in handoffs.iter().map_err(storage)? {
+                let (key, value) = entry.map_err(storage)?;
+                let row: BridgeEventHandoffRow = decode(value.value())?;
+                row.validate()?;
+                if row.stream_id == stream_id
+                    && row.sequence <= acked_sequence
+                    && row.state == BRIDGE_EVENT_HANDOFF_HANDED_OFF
+                {
+                    due.push(key.value().to_owned());
+                }
+            }
+            if !due.is_empty() {
+                drop(handoffs);
+                let mut handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+                for key in due {
+                    let mut row: BridgeEventHandoffRow = handoffs
+                        .get(key.as_str())
+                        .map_err(storage)?
+                        .map(|value| decode(value.value()))
+                        .transpose()?
+                        .ok_or(OrsError::InvalidField {
+                            field: "event_id",
+                            reason: "bridge event handoff disappeared during reconcile",
+                        })?;
+                    row.validate()?;
+                    if row.state != BRIDGE_EVENT_HANDOFF_HANDED_OFF {
+                        continue;
+                    }
+                    BRIDGE_EVENT_HANDOFF_RECONCILED.clone_into(&mut row.state);
+                    reconcile_key.clone_into(&mut row.reconcile_key);
+                    row.reconciled_at_ms = now_ms;
+                    row.validate()?;
+                    handoffs
+                        .insert(key.as_str(), encode(&row)?.as_str())
+                        .map_err(storage)?;
+                    reconciled += 1;
+                }
+            }
+        }
+        write.commit().map_err(storage)?;
+        Ok(json!({
+            "stream_id": stream_id,
+            "acked_sequence": acked_sequence,
+            "reconciled": reconciled,
+        }))
     }
 
     /// Serves one bounded pending page for a stream in ascending sequence

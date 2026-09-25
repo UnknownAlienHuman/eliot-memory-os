@@ -256,13 +256,16 @@ impl StoredPayload {
 ///            disposition durably related; per-stream durable cursor advanced
 ///            contiguously (commit), never past a gap.
 /// NORMALIZED committed with the linked normalized projection re-verified
-///            (envelope digest recomputed against the stored bytes and the
-///            declared output digest); failed re-verification reports DURABLE,
-///            never a higher phase.
-/// APPLIED    committed envelope applied to state exactly once
-///            (record_application) with the consumed envelope digest bound as
-///            the application receipt; duplicate replays return the existing
-///            receipt without a second application.
+///            live on every read (envelope digest recomputed against the
+///            stored bytes and the declared output digest); failed
+///            re-verification reports DURABLE, never a higher phase. The
+///            commit-time `normalized` memo is never trusted here.
+/// APPLIED    committed envelope applied to state exactly once with a
+///            canonical application receipt bound by the state-application
+///            owner (never self-minted by this journal); duplicate replays
+///            return the existing receipt without a second application.
+///            Until that owner binds its receipt the record reports
+///            NORMALIZED-with-application-counted, never APPLIED.
 /// ```
 ///
 /// Rejections and unknown outcomes are never fabricated into records: they are
@@ -284,24 +287,26 @@ pub enum RecordPhase {
 
 /// Durable disposition of one normalized `HostEventEnvelope`: whether the
 /// raw/hash, envelope, and disposition relation is committed, whether the
-/// linked normalized projection is verified, how many times the envelope was
-/// applied to state, the bound application receipt, and whether it was
-/// acknowledged.
+/// linked normalized projection verified at commit time, how many times the
+/// envelope was applied to state, the bound application receipt, and whether
+/// it was acknowledged.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordDisposition {
     /// True once the durable relation is committed and the cursor published.
     pub committed: bool,
-    /// True once the linked normalized projection is verified against the
-    /// commit (set by [`DurableHostEventJournal::commit`], which durably
-    /// relates the projection together with the raw/hash record).
+    /// Commit-time memo that the linked normalized projection verified when
+    /// the durable relation was committed. Never trusted by
+    /// [`DurableHostEventRecord::phase`], which re-verifies the linkage live
+    /// on every read; a corrupted projection still reports DURABLE.
     pub normalized: bool,
     /// Number of state applications (0 or 1; duplicates never re-apply).
     pub applied_count: u32,
-    /// Digest of the normalized envelope consumed by the single recorded
-    /// application. Bound on first application so a lost acknowledgement
-    /// after commit replays to the existing phase/receipt instead of a second
-    /// application. `None` until the first application.
+    /// Canonical application receipt bound by the state-application owner on
+    /// the single recorded application. This journal never mints it: a lost
+    /// acknowledgement after commit replays to the existing count/phase, and
+    /// only the owner's bound receipt advances the phase to APPLIED.
+    /// `None` until the owner binds its receipt.
     pub applied_receipt: Option<LowercaseSha256>,
     /// True once acknowledged at or past this sequence.
     pub acked: bool,
@@ -343,13 +348,16 @@ pub struct DurableHostEventRecord {
 impl DurableHostEventRecord {
     /// Returns the independently verifiable durable phase of this record.
     ///
-    /// APPLIED requires the single recorded application with its bound
-    /// receipt; NORMALIZED requires the commit plus a live re-verification of
-    /// the linked normalized projection (envelope digest recomputed against
-    /// the stored bytes and the declared output digest), so a corrupted
-    /// projection reports DURABLE and never a higher phase; anything staged
-    /// but uncommitted is RECEIVED. Failed normalization never creates a
-    /// record at all: it stays a typed [`IngestError`] with its exact reason.
+    /// APPLIED requires the single recorded application with the canonical
+    /// application receipt bound by the state-application owner; NORMALIZED
+    /// requires the commit plus a live re-verification of the linked
+    /// normalized projection on every read (envelope digest recomputed
+    /// against the stored bytes and the declared output digest), so a
+    /// corrupted projection reports DURABLE and never a higher phase — the
+    /// commit-time `normalized` memo is evidence of what verified at commit,
+    /// never a substitute for live verification. Anything staged but
+    /// uncommitted is RECEIVED. Failed normalization never creates a record
+    /// at all: it stays a typed [`IngestError`] with its exact reason.
     #[must_use]
     pub fn phase(&self) -> RecordPhase {
         if self.disposition.applied_count > 0 && self.disposition.applied_receipt.is_some() {
@@ -361,7 +369,7 @@ impl DurableHostEventRecord {
                 .compute_digest()
                 .is_ok_and(|digest| digest == self.envelope_digest)
                 && self.envelope_digest == self.envelope.normalization.output_digest;
-            if linked || self.disposition.normalized {
+            if linked {
                 return RecordPhase::Normalized;
             }
             return RecordPhase::Durable;
@@ -872,10 +880,17 @@ impl DurableHostEventJournal {
         if let Some(record) = self.records.get_mut(&(key.stream_id.clone(), key.sequence)) {
             record.disposition.committed = true;
             // The commit durably relates the raw/hash record, the normalized
-            // projection, and the disposition together, so the linked
-            // projection verifies from here on (see
-            // [`DurableHostEventRecord::phase`]).
-            record.disposition.normalized = true;
+            // projection, and the disposition together. The `normalized` memo
+            // is set only when the linkage verifies live right here
+            // (envelope digest recomputed against the stored bytes and the
+            // declared output digest); [`DurableHostEventRecord::phase`] still
+            // re-verifies live on every read and never trusts this memo.
+            let linked = record
+                .envelope
+                .compute_digest()
+                .is_ok_and(|digest| digest == record.envelope_digest)
+                && record.envelope_digest == record.envelope.normalization.output_digest;
+            record.disposition.normalized = linked;
         }
         Ok(self.cursor(&key.stream_id))
     }
@@ -1040,9 +1055,13 @@ impl DurableHostEventJournal {
     /// every later call for the same key returns `false` without a second
     /// application, so duplicate replays create no second state application.
     /// Staged-but-uncommitted records report [`IngestError::NotCommitted`].
-    /// The first application binds the consumed envelope digest as the
-    /// application receipt, so a lost acknowledgement after commit replays to
-    /// the existing phase/receipt instead of duplicating the application.
+    /// The first application records the application count only: this journal
+    /// never mints the canonical application receipt (a self-minted envelope
+    /// digest would claim application without performing any), so the phase
+    /// stays NORMALIZED-with-application-counted until the
+    /// state-application owner binds its canonical receipt, and a lost
+    /// acknowledgement after commit replays to the existing count/phase
+    /// instead of duplicating the application.
     pub fn record_application(&mut self, key: &EventKey) -> Result<bool, IngestError> {
         let record = self
             .records
@@ -1055,7 +1074,6 @@ impl DurableHostEventJournal {
             return Ok(false);
         }
         record.disposition.applied_count = 1;
-        record.disposition.applied_receipt = Some(record.envelope_digest.clone());
         Ok(true)
     }
 
