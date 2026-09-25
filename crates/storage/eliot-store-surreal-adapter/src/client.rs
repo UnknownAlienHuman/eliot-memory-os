@@ -26,9 +26,19 @@ pub(crate) mod session_pool;
 /// sole registration point: every fixed restore statement is an adapter-owned
 /// `&'static str` with bound parameters only, and caller text can never become
 /// a statement, table, connection, or credential override.
+///
+/// The registry also owns the durable restore namespace, its row-key families
+/// and payload schema tags, so the physical registry layout has exactly one
+/// owner: no restore caller can name a table, key prefix or payload schema of
+/// its own.
 pub(crate) use backup_restore::{
-    RESTORE_OPERATION_APPLY, RESTORE_OPERATION_PREPARE, RESTORE_OPERATION_RECONCILE,
-    RESTORE_OPERATION_VALIDATE, fixed_restore_statement, restore_capability,
+    RESTORE_KEY_DESTINATION_PREFIX, RESTORE_KEY_PLACEMENT_PREFIX, RESTORE_KEY_PURGE_MEMBER_PREFIX,
+    RESTORE_KEY_PURGE_SCOPE_PREFIX, RESTORE_KEY_RECORD_PREFIX, RESTORE_NAMESPACE,
+    RESTORE_OPERATION_APPLY, RESTORE_OPERATION_FENCE, RESTORE_OPERATION_PREPARE,
+    RESTORE_OPERATION_PURGE_LEDGER, RESTORE_OPERATION_RECONCILE, RESTORE_OPERATION_VALIDATE,
+    RESTORE_REGISTRY_TABLE, RESTORE_SCHEMA_DESTINATION, RESTORE_SCHEMA_PLACEMENT,
+    RESTORE_SCHEMA_PURGE, RESTORE_SCHEMA_RECORD, fixed_restore_statement,
+    is_restore_destination_absent, is_restore_duplicate, is_restore_fence_race, restore_capability,
     validate_restore_operation,
 };
 pub(crate) use provider_owner::ProviderOwner;
