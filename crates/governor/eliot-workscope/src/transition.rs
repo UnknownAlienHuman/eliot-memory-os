@@ -361,11 +361,16 @@ impl ScopeTransitionReceipt {
                 return Err(WorkScopeError::BindingReceiptMismatch);
             }
         }
-        collection(
-            &self.invalidated_session_refs,
-            "invalidated_session_refs",
-            128,
-        )?;
+        // A partial interrupted before step 6 carries no invalidated sessions
+        // yet; the completed step outcomes stay visible below. Committed
+        // receipts must name them (checked above).
+        if self.committed || !self.invalidated_session_refs.is_empty() {
+            collection(
+                &self.invalidated_session_refs,
+                "invalidated_session_refs",
+                128,
+            )?;
+        }
         for candidate in &self.staged_candidates {
             candidate.validate()?;
         }
@@ -1014,4 +1019,358 @@ pub fn observe_transition(
     };
     observation.validate()?;
     Ok(observation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{PrivacyClass, ScopeIdentity, ScopeKind};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch() -> EpochId {
+        let lineage = match EpochLineageId::new(TEST_LINEAGE) {
+            Ok(value) => value,
+            Err(error) => panic!("lineage fixture is invalid: {error}"),
+        };
+        let Some(sequence) = NonZeroU64::new(1) else {
+            panic!("epoch sequence fixture is invalid");
+        };
+        match EpochId::new(lineage, sequence) {
+            Ok(value) => value,
+            Err(error) => panic!("epoch fixture is invalid: {error}"),
+        }
+    }
+
+    fn fence_at(generation: u64) -> StateFence {
+        let resource = match ResourceGeneration::new(generation) {
+            Ok(value) => value,
+            Err(error) => panic!("generation fixture is invalid: {error}"),
+        };
+        StateFence::new(test_epoch(), resource)
+    }
+
+    fn matched_guard(generation: u64) -> ScopeBindingGuardReceipt {
+        ScopeBindingGuardReceipt {
+            expected_scope_ref: "scope:one".into(),
+            observed_scope_ref: "scope:one".into(),
+            expected_lineage_ref: Some("lineage:one".into()),
+            observed_lineage_ref: Some("lineage:one".into()),
+            expected_instance_ref: "instance:a".into(),
+            observed_instance_ref: "instance:a".into(),
+            disposition: ScopeBindingDisposition::Matched,
+            source_generation: generation,
+        }
+    }
+
+    fn staged(record: &str) -> StagedCandidateRecord {
+        StagedCandidateRecord {
+            record_ref: record.into(),
+            provenance_ref: "provenance:old".into(),
+            standing: CandidateRecordStanding::Candidate,
+        }
+    }
+
+    fn new_scope_binding(generation: u64) -> ScopeBinding {
+        ScopeBinding {
+            scope: ScopeIdentity {
+                scope_ref: "scope:one".into(),
+                kind: ScopeKind::GitRepo,
+                lineage_ref: Some("lineage:one".into()),
+                instance_ref: "instance:a".into(),
+                root_identity: "root:a".into(),
+                generation,
+            },
+            privacy_class: PrivacyClass::Internal,
+            governing_source_generation: generation,
+        }
+    }
+
+    fn propose_move() -> (ScopeTransition, TransitionStepOutcome) {
+        match propose_transition(
+            "transition:one",
+            ScopeTransitionKind::Move,
+            "scope:one",
+            vec!["scope:two".into()],
+            1,
+            2,
+            vec!["record:one".into()],
+            vec!["authority:one".into()],
+            &matched_guard(1),
+            &fence_at(1),
+        ) {
+            Ok(value) => value,
+            Err(error) => panic!("proposal fixture is invalid: {error}"),
+        }
+    }
+
+    fn evidence() -> TransitionStepEvidence {
+        TransitionStepEvidence {
+            affected_record_refs: vec!["record:one".into()],
+            authority_refs: vec!["authority:one".into()],
+            old_scope_provenance_refs: vec!["provenance:old".into()],
+            staged_candidates: vec![staged("record:one")],
+            new_binding: new_scope_binding(2),
+            invalidated_session_refs: vec!["session:old".into()],
+            boundary_evidence_refs: vec!["boundary:one".into()],
+            commit_fence: fence_at(2),
+        }
+    }
+
+    fn execute_receipt(receipt_ref: &str) -> ScopeTransitionReceipt {
+        let (proposal, outcome) = propose_move();
+        match execute_transition(&proposal, &outcome, receipt_ref, &evidence()) {
+            Ok(receipt) => receipt,
+            Err(failure) => panic!("transition execution failed: {:?}", failure.reason),
+        }
+    }
+
+    #[test]
+    fn eight_steps_cover_the_procedure_in_order() {
+        assert_eq!(TRANSITION_STEP_COUNT, 8);
+        let steps = [
+            ScopeTransitionStep::Propose,
+            ScopeTransitionStep::IdentifyAffected,
+            ScopeTransitionStep::PreserveOldScope,
+            ScopeTransitionStep::StageCandidates,
+            ScopeTransitionStep::IssueNewGeneration,
+            ScopeTransitionStep::InvalidateSessions,
+            ScopeTransitionStep::VerifyBoundaries,
+            ScopeTransitionStep::CommitReceipt,
+        ];
+        for (index, step) in steps.iter().enumerate() {
+            let number = index + 1;
+            assert_eq!(usize::from(step.number()), number);
+            assert!(!step.label().is_empty());
+            assert_eq!(ScopeTransitionStep::from_number(number), Some(*step));
+        }
+        assert_eq!(ScopeTransitionStep::from_number(0), None);
+        assert_eq!(ScopeTransitionStep::from_number(9), None);
+    }
+
+    #[test]
+    fn move_proposal_rejects_counterpart_and_guard_mismatch() {
+        assert!(matches!(
+            propose_transition(
+                "transition:bad",
+                ScopeTransitionKind::Expand,
+                "scope:one",
+                vec!["scope:two".into()],
+                1,
+                2,
+                vec!["record:one".into()],
+                vec!["authority:one".into()],
+                &matched_guard(1),
+                &fence_at(1),
+            ),
+            Err(WorkScopeError::BindingReceiptMismatch)
+        ));
+        assert!(matches!(
+            propose_transition(
+                "transition:bad",
+                ScopeTransitionKind::Move,
+                "scope:one",
+                Vec::new(),
+                1,
+                2,
+                vec!["record:one".into()],
+                vec!["authority:one".into()],
+                &matched_guard(1),
+                &fence_at(1),
+            ),
+            Err(WorkScopeError::EmptyCollection { .. })
+        ));
+        let mut stale_guard = matched_guard(1);
+        stale_guard.disposition = ScopeBindingDisposition::DifferentInstance;
+        assert!(matches!(
+            propose_transition(
+                "transition:bad",
+                ScopeTransitionKind::Move,
+                "scope:one",
+                vec!["scope:two".into()],
+                1,
+                2,
+                vec!["record:one".into()],
+                vec!["authority:one".into()],
+                &stale_guard,
+                &fence_at(1),
+            ),
+            Err(WorkScopeError::BindingReceiptNotMatched)
+        ));
+        assert!(matches!(
+            propose_transition(
+                "transition:bad",
+                ScopeTransitionKind::Move,
+                "scope:one",
+                vec!["scope:two".into()],
+                1,
+                2,
+                vec!["record:one".into()],
+                vec!["authority:one".into()],
+                &matched_guard(2),
+                &fence_at(1),
+            ),
+            Err(WorkScopeError::BindingReceiptMismatch)
+        ));
+    }
+
+    #[test]
+    fn execute_transition_commits_all_eight_steps() {
+        let (proposal, outcome) = propose_move();
+        let receipt = match execute_transition(&proposal, &outcome, "receipt:one", &evidence()) {
+            Ok(receipt) => receipt,
+            Err(failure) => panic!("transition execution failed: {:?}", failure.reason),
+        };
+        assert!(receipt.committed);
+        assert_eq!(receipt.revision, 1);
+        assert_eq!(receipt.step_outcomes.len(), 8);
+        for (index, step_outcome) in receipt.step_outcomes.iter().enumerate() {
+            assert!(step_outcome.completed);
+            assert_eq!(usize::from(step_outcome.step.number()), index + 1);
+        }
+        assert!(receipt.readiness_reevaluation_required);
+        assert_eq!(receipt.invalidated_session_refs, vec!["session:old"]);
+        assert!(!receipt.boundary_evidence_refs.is_empty());
+        match receipt.validate() {
+            Ok(()) => (),
+            Err(error) => panic!("committed receipt is invalid: {error}"),
+        }
+        let observation = match observe_transition(&proposal, &receipt) {
+            Ok(observation) => observation,
+            Err(error) => panic!("transition observation failed: {error}"),
+        };
+        assert_eq!(observation.completed_steps, 8);
+        assert!(observation.committed);
+    }
+
+    #[test]
+    fn mismatched_records_fail_closed_with_visible_partial() {
+        let (proposal, outcome) = propose_move();
+        let mut bad = evidence();
+        bad.affected_record_refs = vec!["record:other".into()];
+        let Err(failure) = execute_transition(&proposal, &outcome, "receipt:one", &bad) else {
+            panic!("mismatched records must fail the transition");
+        };
+        assert_eq!(failure.failed_step, ScopeTransitionStep::IdentifyAffected);
+        assert!(!failure.partial.committed);
+        assert_eq!(failure.partial.step_outcomes.len(), 2);
+        assert!(failure.partial.step_outcomes[0].completed);
+        assert_eq!(
+            failure.partial.step_outcomes[0].step,
+            ScopeTransitionStep::Propose
+        );
+        assert!(!failure.partial.step_outcomes[1].completed);
+        assert_eq!(
+            failure.partial.step_outcomes[1].step,
+            ScopeTransitionStep::IdentifyAffected
+        );
+        match failure.partial.validate() {
+            Ok(()) => (),
+            Err(error) => panic!("partial receipt is invalid: {error}"),
+        }
+        let observation = match observe_transition(&proposal, &failure.partial) {
+            Ok(observation) => observation,
+            Err(error) => panic!("partial observation failed: {error}"),
+        };
+        assert_eq!(observation.completed_steps, 1);
+        assert!(!observation.committed);
+    }
+
+    #[test]
+    fn stale_commit_fence_fails_at_commit_with_seven_visible_steps() {
+        let (proposal, outcome) = propose_move();
+        let mut bad = evidence();
+        bad.commit_fence = fence_at(1);
+        let Err(failure) = execute_transition(&proposal, &outcome, "receipt:one", &bad) else {
+            panic!("stale commit fence must fail the transition");
+        };
+        assert_eq!(failure.failed_step, ScopeTransitionStep::CommitReceipt);
+        assert_eq!(failure.reason, WorkScopeError::StateFenceMismatch);
+        let completed = failure
+            .partial
+            .step_outcomes
+            .iter()
+            .filter(|step_outcome| step_outcome.completed)
+            .count();
+        assert_eq!(completed, 7);
+        match failure.partial.validate() {
+            Ok(()) => (),
+            Err(error) => panic!("partial receipt is invalid: {error}"),
+        }
+    }
+
+    #[test]
+    fn resume_completes_interrupted_saga_as_new_revision() {
+        let (proposal, outcome) = propose_move();
+        let mut bad = evidence();
+        bad.commit_fence = fence_at(1);
+        let Err(failure) = execute_transition(&proposal, &outcome, "receipt:one", &bad) else {
+            panic!("stale commit fence must fail the transition");
+        };
+        let resumed = match resume_transition(&proposal, &failure.partial, &evidence()) {
+            Ok(receipt) => receipt,
+            Err(failure) => panic!("transition resume failed: {:?}", failure.reason),
+        };
+        assert!(resumed.committed);
+        assert_eq!(resumed.revision, failure.partial.revision + 1);
+        assert_eq!(resumed.receipt_ref, failure.partial.receipt_ref);
+        assert_eq!(resumed.step_outcomes.len(), 8);
+        assert!(
+            resumed
+                .step_outcomes
+                .iter()
+                .all(|step_outcome| step_outcome.completed)
+        );
+        match resumed.validate() {
+            Ok(()) => (),
+            Err(error) => panic!("resumed receipt is invalid: {error}"),
+        }
+        assert!(resume_transition(&proposal, &resumed, &evidence()).is_err());
+    }
+
+    #[test]
+    fn staged_candidates_withhold_effects_until_validity_transfer() {
+        assert!(!staged("record:one").admits_material_effects());
+        let transferred = StagedCandidateRecord {
+            record_ref: "record:one".into(),
+            provenance_ref: "provenance:old".into(),
+            standing: CandidateRecordStanding::ValidityTransferred {
+                transfer_ref: "transfer:one".into(),
+            },
+        };
+        assert!(transferred.admits_material_effects());
+        match transferred.validate() {
+            Ok(()) => (),
+            Err(error) => panic!("transferred candidate is invalid: {error}"),
+        }
+        let receipt = execute_receipt("receipt:one");
+        assert!(!receipt.staged_candidates.is_empty());
+        assert!(
+            receipt
+                .staged_candidates
+                .iter()
+                .all(|candidate| !candidate.admits_material_effects())
+        );
+    }
+
+    #[test]
+    fn post_commit_guard_requires_matched_new_generation() {
+        let receipt = execute_receipt("receipt:one");
+        let endorsed = match attach_post_commit_guard(receipt, &matched_guard(2)) {
+            Ok(endorsed) => endorsed,
+            Err(error) => panic!("post-commit endorsement failed: {error}"),
+        };
+        assert!(endorsed.post_commit_guard.is_some());
+        match endorsed.validate() {
+            Ok(()) => (),
+            Err(error) => panic!("endorsed receipt is invalid: {error}"),
+        }
+        let fresh = execute_receipt("receipt:two");
+        assert!(matches!(
+            attach_post_commit_guard(fresh, &matched_guard(1)),
+            Err(WorkScopeError::BindingReceiptMismatch)
+        ));
+    }
 }
