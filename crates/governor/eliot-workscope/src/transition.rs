@@ -484,6 +484,9 @@ fn references(values: &[String], field: &'static str, max: usize) -> Result<(), 
 /// Visible interruption of the saga: the partial receipt with every completed
 /// step's outcome intact, the failed step, and the exact failure reason.
 /// Nothing is rolled back silently and no step claims atomicity across scopes.
+/// Post-commit driver failures carry the committed receipt instead of an
+/// uncommitted partial so endorsement can be retried; such receipts are never
+/// resumed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransitionFailure {
     pub partial: Box<ScopeTransitionReceipt>,
@@ -1019,6 +1022,115 @@ pub fn observe_transition(
     };
     observation.validate()?;
     Ok(observation)
+}
+
+/// Endorses a committed receipt with the post-commit guard and projects its
+/// observation.
+///
+/// A failure carries the committed receipt inside [`TransitionFailure`]
+/// (failed step [`ScopeTransitionStep::CommitReceipt`]): the commit stands,
+/// endorsement or observation is retried, the receipt is never resumed.
+fn endorse_and_observe(
+    proposal: &ScopeTransition,
+    receipt: ScopeTransitionReceipt,
+    post_commit_guard: &ScopeBindingGuardReceipt,
+) -> Result<(ScopeTransitionReceipt, TransitionObservation), TransitionFailure> {
+    let retained = receipt.clone();
+    let endorsed = attach_post_commit_guard(receipt, post_commit_guard).map_err(|reason| {
+        TransitionFailure {
+            partial: Box::new(retained),
+            failed_step: ScopeTransitionStep::CommitReceipt,
+            reason,
+        }
+    })?;
+    let committed = endorsed.clone();
+    let observation =
+        observe_transition(proposal, &endorsed).map_err(|reason| TransitionFailure {
+            partial: Box::new(committed),
+            failed_step: ScopeTransitionStep::CommitReceipt,
+            reason,
+        })?;
+    Ok((endorsed, observation))
+}
+
+impl ScopeTransition {
+    /// Drives this proposal from admission to endorsed, observed receipt.
+    ///
+    /// This is the intra-crate production caller of the transition surface:
+    /// it re-admits the proposal through [`propose_transition`] (step 1),
+    /// runs [`execute_transition`] (steps 2–8),
+    /// [`attach_post_commit_guard`] (MATCHED revalidation on the new
+    /// generation), and [`observe_transition`] in product code, outside test
+    /// fixtures. The Governor transition driver is the intended external
+    /// caller: it builds the proposal, supplies the caller-observed step
+    /// evidence and the MATCHED post-commit guard on the new generation, and
+    /// retains the returned receipt.
+    ///
+    /// On interruption the [`TransitionFailure`] carries the visible partial:
+    /// resume it with [`ScopeTransition::resume_interrupted`] and fresh
+    /// evidence under a new revision. A post-commit failure carries the
+    /// committed receipt (failed step [`ScopeTransitionStep::CommitReceipt`]):
+    /// the commit stands and endorsement is retried, never resumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransitionFailure`] when the proposal is malformed, any
+    /// step's evidence disagrees with the proposal, the commit fence is not
+    /// bound to the new generation, or post-commit endorsement/observation
+    /// fails.
+    pub fn drive(
+        &self,
+        receipt_ref: impl Into<String>,
+        evidence: &TransitionStepEvidence,
+        post_commit_guard: &ScopeBindingGuardReceipt,
+    ) -> Result<(ScopeTransitionReceipt, TransitionObservation), TransitionFailure> {
+        let receipt_ref: String = receipt_ref.into();
+        let (proposal, propose_outcome) = propose_transition(
+            self.transition_ref.clone(),
+            self.kind,
+            self.scope_ref.clone(),
+            self.related_scope_refs.clone(),
+            self.old_generation,
+            self.new_generation,
+            self.affected_record_refs.clone(),
+            self.authority_refs.clone(),
+            &self.pre_commit_guard,
+            &self.state_fence,
+        )
+        .map_err(|reason| {
+            StepRunner::for_proposal(self, receipt_ref.clone())
+                .fail(ScopeTransitionStep::Propose, reason)
+        })?;
+        let receipt = execute_transition(&proposal, &propose_outcome, receipt_ref, evidence)?;
+        endorse_and_observe(&proposal, receipt, post_commit_guard)
+    }
+
+    /// Resumes an interrupted saga in product code and drives it to an
+    /// endorsed, observed receipt.
+    ///
+    /// This is the intra-crate production caller of [`resume_transition`]:
+    /// the visible partial from a [`TransitionFailure`] continues after its
+    /// last completed step under a new revision, then endorses and observes
+    /// exactly like [`ScopeTransition::drive`]. The caller retains the
+    /// original proposal and supplies fresh evidence for the remaining steps;
+    /// a committed receipt is never resumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransitionFailure`] when the proposal or partial receipt is
+    /// malformed, the partial does not belong to the proposal or is already
+    /// committed, any remaining step's evidence fails, or post-commit
+    /// endorsement/observation fails (carrying the committed receipt for
+    /// endorsement retry).
+    pub fn resume_interrupted(
+        &self,
+        partial: &ScopeTransitionReceipt,
+        evidence: &TransitionStepEvidence,
+        post_commit_guard: &ScopeBindingGuardReceipt,
+    ) -> Result<(ScopeTransitionReceipt, TransitionObservation), TransitionFailure> {
+        let receipt = resume_transition(self, partial, evidence)?;
+        endorse_and_observe(self, receipt, post_commit_guard)
+    }
 }
 
 #[cfg(test)]
