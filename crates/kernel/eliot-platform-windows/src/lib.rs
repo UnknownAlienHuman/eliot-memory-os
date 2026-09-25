@@ -4260,10 +4260,24 @@ fn read_service_security_binding(
     let mut revision = 0_u32;
     // SAFETY: GetSecurityDescriptorControl borrows the validated descriptor; control/revision are valid
     // writable out-pointers; descriptor outlives the call; SE_DACL_PROTECTED bit read only on success.
-    let protected_dacl = unsafe {
+    let control_read = unsafe {
         GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
-            && control & SE_DACL_PROTECTED != 0
     };
+    if !control_read {
+        // The protected-control fact was never read. Collapsing this failure
+        // into `protected_dacl = false` would publish a never-read control
+        // bit as a proven security mismatch (issue #1352), so the unread
+        // read is reported through the existing typed `Unknown` owner with
+        // its own `GetLastError`.
+        // SAFETY: LocalFree releases the descriptor allocated above exactly once.
+        unsafe { LocalFree(descriptor.cast()) };
+        return Err(ServiceGrantReadError::unknown(
+            WindowsAdapterError::Failed,
+            last_win32_code(),
+            "read-grant",
+        ));
+    }
+    let protected_dacl = control & SE_DACL_PROTECTED != 0;
     // SAFETY: ACL byte compare dereferences the live DACL returned by GetSecurityInfo and the
     // validated expected DACL for exactly their declared sizes; both pointers are non-null.
     let dacl_matches = unsafe {
@@ -5153,15 +5167,20 @@ fn classify_service_runtime_observation(
     process: Option<ProcessIdentity>,
 ) -> ServiceRegistrationRuntimeInspection {
     use crate::service_registration::ServiceInspectionUnknownDetail;
-    let requires_process = matches!(state, ServiceState::Running | ServiceState::Stopping);
-    let permits_process = matches!(
+    // Every non-stopped live state the SCM can report requires a nonzero PID
+    // and a verified live process identity. `Starting` is included: SCM
+    // publishes `START_PENDING` before the service process exists, so PID 0
+    // with no verified identity is an unread transient, not a proven
+    // registration match (issue #1352). The typed owner keeps that contour
+    // `Unknown` with its raw `START_PENDING`/PID 0 sample.
+    let requires_process = matches!(
         state,
         ServiceState::Starting | ServiceState::Running | ServiceState::Stopping
     );
     if matches!(
         state,
         ServiceState::Unknown | ServiceState::Absent | ServiceState::Failed
-    ) || (!permits_process && process_id != 0)
+    ) || (!requires_process && process_id != 0)
         || (requires_process && process_id == 0)
         || (process_id == 0 && process.is_some())
         || (process_id != 0 && process.is_none())

@@ -43,15 +43,15 @@ use eliot_platform_windows::{
     InstallerRootPrimitiveCreate, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
     InstallerRootProfile, InstallerRootStage, InstallerSecretCreateDisposition,
     InstallerSecretObservation, ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease,
-    ServiceAbsentProof, ServiceAccount, ServiceBootstrapArguments, ServiceRegistrationCurrent,
-    ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
-    ServiceRegistrationRuntimeReadback, ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome,
-    StagingReceipt, SupervisionAuthorityKeyError, SupervisionAuthorityKeyStoreRequest,
-    UserOwnedPathLease, WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider,
-    WindowsPlatform, WindowsStoreCredentialTargetGenerator, WindowsSupervisionAuthorityKeyStore,
-    current_user_local_app_data_root, fresh_service_registration_nonce,
-    observe_running_eliot_host_process, protected_program_data_root,
-    require_protected_program_data_path, resolve_service_sid,
+    ServiceAbsentProof, ServiceAccount, ServiceBootstrapArguments, ServiceInspectionUnknownDetail,
+    ServiceRegistrationCurrent, ServiceRegistrationOutcome, ServiceRegistrationRequest,
+    ServiceRegistrationRuntimeInspection, ServiceRegistrationRuntimeReadback, ServiceStartMode,
+    ServiceStartOutcome, ServiceStopOutcome, StagingReceipt, SupervisionAuthorityKeyError,
+    SupervisionAuthorityKeyStoreRequest, UserOwnedPathLease, WindowsInstallerRootPrimitive,
+    WindowsInstallerSecretProvider, WindowsPlatform, WindowsStoreCredentialTargetGenerator,
+    WindowsSupervisionAuthorityKeyStore, current_user_local_app_data_root,
+    fresh_service_registration_nonce, observe_running_eliot_host_process,
+    protected_program_data_root, require_protected_program_data_path, resolve_service_sid,
 };
 #[cfg(test)]
 use eliot_platform_windows::{
@@ -4537,8 +4537,14 @@ impl WindowsInstallationEffectPort {
                 }
             }
             ServiceRegistrationRuntimeReadback::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationRuntimeReadback::Unknown { .. } => {
-                Ok(root_mismatch("service-readback"))
+            ServiceRegistrationRuntimeReadback::Unknown { detail } => {
+                // Issue #1352: an indeterminate or failed read is not an
+                // established configuration mismatch. Preserve the exact
+                // typed stage/Win32/state/PID cause through the existing
+                // `PortError::ProviderReference` owner so the coordinator
+                // retains it as `InstallationEffectProgressState::Unknown`
+                // instead of publishing a known `Mismatch`.
+                Err(service_registration_unknown_port_error(request, &detail))
             }
         }
     }
@@ -4627,8 +4633,13 @@ impl WindowsInstallationEffectPort {
                 )
             }
             ServiceRegistrationRuntimeReadback::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationRuntimeReadback::Unknown { .. } => {
-                Ok(root_mismatch("service-readback"))
+            ServiceRegistrationRuntimeReadback::Unknown { detail } => {
+                // Issue #1352: the same bounded non-`Known` projection as
+                // `inspect_service`. After a registration effect the retained
+                // reference is correlated to this exact request identity, so
+                // the unresolved read stays attributable to its original
+                // operation instead of becoming a known mismatch.
+                Err(service_registration_unknown_port_error(request, &detail))
             }
         }
     }
@@ -9749,6 +9760,179 @@ fn effect_request(
 
 const REDACTED_PROVIDER_REFERENCE_PENDING: &str = "pending:provider-reference-redacted";
 
+/// Bounded, request-correlated projection of one typed
+/// `ServiceRegistrationRuntimeReadback::Unknown` detail.
+///
+/// Grammar (exactly five `:`-separated fields after the prefix):
+///
+/// ```text
+/// service-registration-unknown-v1:<intent-digest>:<stage>:<win32>:<state|none>:<pid|none>
+/// ```
+///
+/// The reference carries only the exact effect request's identity digest and
+/// the stage, `GetLastError` code and raw SCM state/PID sample the platform
+/// actually observed. It contains no filesystem path, credential, SACL value,
+/// free-form provider prose or authority identity, and it never synthesizes a
+/// sample the platform did not read. `win32` is exactly eight lowercase hex
+/// digits; `state`/`pid` are exactly eight lowercase hex digits when the stage
+/// carries a status sample and the literal `none` when it does not.
+const SERVICE_REGISTRATION_UNKNOWN_REFERENCE_PREFIX: &str = "service-registration-unknown-v1:";
+
+/// The exact platform-owned `ServiceInspectionUnknownDetail` stages that the
+/// service-registration runtime readback can carry.
+///
+/// This is the closed producer set of
+/// `WindowsPlatform::inspect_service_registration_runtime_with_control_grant`.
+/// A stage outside it is never rewritten into a representable reference: the
+/// durable projection keeps the existing redaction disposition instead.
+fn is_service_registration_unknown_stage(stage: &str) -> bool {
+    matches!(
+        stage,
+        "open-scm"
+            | "open-service"
+            | "query-config"
+            | "query-sid-type"
+            | "read-grant"
+            | "query-owner"
+            | "query-group"
+            | "resolve-expected-group"
+            | "query-status"
+            | "absent-proof"
+            | "unsupported-platform"
+    )
+}
+
+/// Only the `query-status` stage carries the raw SCM state/PID sample; every
+/// other stage fails before any status sample exists.
+fn is_service_registration_unknown_sample_stage(stage: &str) -> bool {
+    stage == "query-status"
+}
+
+fn is_lowercase_hex8(value: &str) -> bool {
+    value.len() == 8
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Accepts only the exact reference grammar this module produces, with the
+/// stage/sample relationship the platform owner actually establishes.
+fn is_typed_service_registration_unknown_reference(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix(SERVICE_REGISTRATION_UNKNOWN_REFERENCE_PREFIX) else {
+        return false;
+    };
+    let mut parts = rest.split(':');
+    let Some(digest) = parts.next() else {
+        return false;
+    };
+    let Some(stage) = parts.next() else {
+        return false;
+    };
+    let Some(code) = parts.next() else {
+        return false;
+    };
+    let Some(state) = parts.next() else {
+        return false;
+    };
+    let Some(pid) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some()
+        || !is_lower_sha256(digest)
+        || !is_service_registration_unknown_stage(stage)
+        || !is_lowercase_hex8(code)
+    {
+        return false;
+    }
+    if (state, pid) == ("none", "none") {
+        return true;
+    }
+    is_service_registration_unknown_sample_stage(stage)
+        && is_lowercase_hex8(state)
+        && is_lowercase_hex8(pid)
+}
+
+/// Projects one observed typed detail into the bounded reference.
+///
+/// A sample is published only when the platform actually read one, and a
+/// stage that cannot carry a sample never gains one. A detail outside the
+/// closed grammar is a contract-level rejection of the platform token rather
+/// than a synthesized reference.
+fn service_registration_unknown_reference(
+    request: &InstallationEffectRequest,
+    detail: &ServiceInspectionUnknownDetail,
+) -> Result<PlatformHandle, PortError> {
+    // A request that cannot form its own canonical identity cannot carry a
+    // request-correlated reference; that is a deterministic contract
+    // rejection, never a synthesized digest and never a published mismatch.
+    let intent_digest = request
+        .intent_digest()
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+    let (state, pid) = match (detail.current_state(), detail.process_id()) {
+        (Some(state), Some(pid)) if is_service_registration_unknown_sample_stage(detail.stage()) => {
+            (format!("{state:08x}"), format!("{pid:08x}"))
+        }
+        (None, None) => ("none".to_owned(), "none".to_owned()),
+        _ => {
+            return Err(PortError::InvalidText {
+                field: SERVICE_REGISTRATION_UNKNOWN_REFERENCE_PREFIX.to_owned(),
+            });
+        }
+    };
+    let reference = format!(
+        "{SERVICE_REGISTRATION_UNKNOWN_REFERENCE_PREFIX}{}:{}:{:08x}:{state}:{pid}",
+        intent_digest.as_str(),
+        detail.stage(),
+        detail.win32_error()
+    );
+    if !is_typed_service_registration_unknown_reference(&reference) {
+        return Err(PortError::InvalidText {
+            field: SERVICE_REGISTRATION_UNKNOWN_REFERENCE_PREFIX.to_owned(),
+        });
+    }
+    PlatformHandle::new(reference)
+}
+
+/// The non-retryable provider classification for one observed read failure.
+///
+/// Access denial stays distinguishable from other failed reads, and the
+/// `unsupported-platform` contour stays distinguishable from a Windows read
+/// failure. None of these codes is retryable before an exact reconciliation
+/// probe succeeds.
+fn service_registration_unknown_provider_error(
+    detail: &ServiceInspectionUnknownDetail,
+) -> ProviderError {
+    let code = if detail.stage() == "unsupported-platform" {
+        ProviderErrorCode::Unavailable
+    } else if detail.win32_error() == 5 {
+        ProviderErrorCode::PermissionDenied
+    } else {
+        ProviderErrorCode::Failed
+    };
+    ProviderError {
+        code,
+        retryable: false,
+    }
+}
+
+/// Preserves a typed indeterminate service-registration read as a
+/// non-`Known` port error carrying its exact bounded cause.
+///
+/// This is the single production projection used by both
+/// `WindowsInstallationEffectPort::inspect_service` and
+/// `::reconcile_service`. A failed or indeterminate read is never published as
+/// `InstallationEffectObservation::Mismatch`, never as `Absent`, and never as
+/// `Matching`; only an actual `Mismatched` readback stays a known mismatch.
+fn service_registration_unknown_port_error(
+    request: &InstallationEffectRequest,
+    detail: &ServiceInspectionUnknownDetail,
+) -> PortError {
+    PortError::ProviderReference {
+        error: service_registration_unknown_provider_error(detail),
+        reference: service_registration_unknown_reference(request, detail)?,
+    }
+}
+
 fn port_pending<T>(outcome: PortOutcome<T>) -> PlatformHandle {
     let value = match outcome {
         PortOutcome::Known(_) => "unknown:unexpected-known".to_owned(),
@@ -9760,6 +9944,7 @@ fn port_pending<T>(outcome: PortOutcome<T>) -> PlatformHandle {
         PortOutcome::Error(PortError::ProviderReference { reference, .. }) => {
             if is_typed_installer_root_reference(reference.as_str())
                 || is_typed_package_staging_reference(reference.as_str())
+                || is_typed_service_registration_unknown_reference(reference.as_str())
             {
                 return reference;
             }
