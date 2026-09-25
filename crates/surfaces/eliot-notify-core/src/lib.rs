@@ -22,9 +22,12 @@ use std::fmt::Write as _;
 
 use eliot_contracts::{RequestMetadata, StateFence};
 pub use eliot_kernel_core::NotificationSeverity;
+/// Re-exported so an authorized acknowledgement/disposition producer can
+/// present the protected, evidence-bound resolution authorization on the
+/// production entry without re-declaring the shared model type.
+pub use eliot_kernel_core::ResolutionAuthorization;
 use eliot_kernel_core::{
     DeliveryChannel, DeliveryState, Notification, NotificationDraft, NotificationError,
-    ResolutionAuthorization,
 };
 use eliot_platform::{
     NotificationObservation, NotificationPort, NotificationRequest, PlatformHandle, PortError,
@@ -1552,22 +1555,31 @@ where
         )
     }
 
-    fn persist_canonical_upsert(
+    /// Applies one canonical notification lifecycle leg through the
+    /// authenticated canonical-state port and returns the owner's exact
+    /// post-commit record and receipt.
+    ///
+    /// This is the single validated entry for all four I11.5/I11.7 legs — the
+    /// create/coalesce leg before a delivery attempt, the delivery leg after
+    /// it, the operator acknowledgement, and the evidence-backed authorized
+    /// disposition. The surface validates the typed request against the parent
+    /// route, hands it to the authenticated owner, and re-validates the owner's
+    /// response against the same request; it never fabricates a record, a
+    /// receipt, or a success. An acknowledgement therefore travels the same
+    /// path as a delivery and still cannot resolve its record, and a
+    /// disposition is admitted only with a protected, evidence-bound authority
+    /// receipt the surface cannot mint.
+    pub fn apply_notification_state(
         &mut self,
-        draft: &NotificationDraft,
-        source_receipt: &ReceiptEnvelope,
-        request: &NotificationRequest,
+        parent: &NotificationRequest,
+        mutation: NotificationStateMutation,
     ) -> Result<NotificationStateResponse, NotifyError> {
-        let mutation = NotificationStateMutation::Upsert {
-            record: draft.clone(),
-            source_receipt: source_receipt.clone(),
-        };
         let state_request = NotificationStateRequest {
-            context: request.context.clone(),
-            state_fence: request.context.state_fence.clone(),
+            context: parent.context.clone(),
+            state_fence: parent.context.state_fence.clone(),
             mutation,
         };
-        state_request.validate_for_parent(request)?;
+        state_request.validate_for_parent(parent)?;
         let state = self
             .ports
             .notification_state
@@ -1577,11 +1589,26 @@ where
                 reason: "canonical notification state port is missing",
             })?;
         let response = require_known(
-            state.mutate(request, &state_request),
+            state.mutate(parent, &state_request),
             ProviderId::CanonicalNotificationState,
         )?;
         validate_state_response(&state_request, &response)?;
         Ok(response)
+    }
+
+    fn persist_canonical_upsert(
+        &mut self,
+        draft: &NotificationDraft,
+        source_receipt: &ReceiptEnvelope,
+        request: &NotificationRequest,
+    ) -> Result<NotificationStateResponse, NotifyError> {
+        self.apply_notification_state(
+            request,
+            NotificationStateMutation::Upsert {
+                record: draft.clone(),
+                source_receipt: source_receipt.clone(),
+            },
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1890,29 +1917,9 @@ where
             },
             delivery: state,
         };
-        let state_request = NotificationStateRequest {
-            context: request.context.clone(),
-            state_fence: request.context.state_fence.clone(),
-            mutation,
-        };
-        let result = (|| {
-            state_request.validate_for_parent(request)?;
-            let state_port =
-                self.ports
-                    .notification_state
-                    .as_mut()
-                    .ok_or(NotifyError::PlanGap {
-                        provider: ProviderId::CanonicalNotificationState,
-                        reason: "canonical notification state port is missing",
-                    })?;
-            let response = require_known(
-                state_port.mutate(request, &state_request),
-                ProviderId::CanonicalNotificationState,
-            )?;
-            validate_state_response(&state_request, &response)
-        })();
+        let result = self.apply_notification_state(request, mutation);
         match result {
-            Ok(()) => Ok(()),
+            Ok(_) => Ok(()),
             Err(_error) => match observation {
                 Some(observation) => Err(NotifyError::CanonicalStateCommitUncertain(Box::new(
                     observation.clone(),
