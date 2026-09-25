@@ -5,8 +5,10 @@
 //! 5659245939): the supplier is Kernel over one authenticated front-door
 //! session, and every proof kind is verified by lookup of the Kernel/ORS
 //! operation record bound to the exact attempt plus operation (T4
-//! `ProviderExecutionBinding`), with the Governor current route and capacity
-//! revisions carried only as presented inputs. No behavior, no stores, no IO:
+//! `ProviderExecutionBinding`), with the proof-presented route and capacity
+//! revisions compared against the separately presented Governor-observed
+//! currentness (the daemon resolves both halves; the Kernel compares them
+//! and never equates them). No behavior, no stores, no IO:
 //! persistence, lookup, and daemon composition land outside this file. Kernel
 //! validates identity, epoch, presented worker generation, presented
 //! revisions, presented fence digest, and digest equality only; it never

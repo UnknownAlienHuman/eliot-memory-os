@@ -82,6 +82,7 @@ pub use activation_projection::AgentActivationResolver;
 pub use activation_projection::{
     ActivationClaim, classify_claimed_ticket_value, terminal_for_invalid_ticket,
 };
+use agent_fabric::build_admitted_provider_capability;
 pub use agent_fabric::{
     ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric,
     AgentFabricDescriptor, AttemptLifecycle, AttemptResultRecord, COORDINATOR_CRATE,
@@ -90,7 +91,7 @@ pub use agent_fabric::{
     FabricError, FabricPorts, FabricSnapshot, LedgerEntry, ModelRegistryPort, PREREQ_PORTS,
     PeerChannelPort, PeerMessage, PeerReceipt, Reservation, RouteRequirements, SwarmControlPort,
     SwarmDefinition, SwarmEntryReceipt, VerifiedProviderMaterial, WorkerAck,
-    build_admitted_provider_capability, daemon_coordinator_config, plan_candidate, prereq_ports,
+    daemon_coordinator_config, plan_candidate, prereq_ports,
 };
 
 use controlboard_adapters::SharedOperatorReplay;
@@ -1734,13 +1735,15 @@ impl DaemonComposition {
     /// in `material` are unconditionally overwritten, never trusted; the
     /// threaded Governor expectation is epoch-bound to the live session
     /// fence (a stale or foreign expectation fails closed here, never at
-    /// first effect). The composition retains no client, no capability, and
-    /// no owner half: the driver re-resolves per admitted operation, so a
-    /// fence move surfaces as an exact mismatch instead of silent
-    /// divergence, and currency is re-checked on every coordinator
-    /// `verify` call. Without a validated handshake the composition has no
-    /// live session and resolution fails closed — the daemon stays
-    /// plan-only.
+    /// first effect). This is the sole cross-crate capability construction
+    /// path: the material-to-capability builder is crate-internal, so no
+    /// external caller can bypass the session-half overwrite. The
+    /// composition retains no client, no capability, and no owner half: the
+    /// driver re-resolves per admitted operation, so a fence move surfaces
+    /// as an exact mismatch instead of silent divergence, and currency is
+    /// re-checked on every coordinator `verify` call. Without a validated
+    /// handshake the composition has no live session and resolution fails
+    /// closed — the daemon stays plan-only.
     ///
     /// # Errors
     ///
