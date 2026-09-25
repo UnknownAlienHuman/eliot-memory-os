@@ -641,7 +641,9 @@ function Get-CodeBearingExecutableExtensions {
     # are NOT deleted here.  They fail closed in
     # Assert-CompleteCodeBearingDenominator as unmanifested/unsigned
     # executables until their owners land retirement or an explicit signed
-    # role.
+    # role.  Full governor retire/re-home is BLOCKED-BY #18
+    # (legacy-deletion owner); the Codex entry re-home additionally awaits
+    # the eliot-mcp behavior track per canon.
     @('.exe', '.dll', '.sys', '.drv', '.efi', '.scr', '.cpl', '.ocx', '.ax', '.winmd', '.node')
 }
 
