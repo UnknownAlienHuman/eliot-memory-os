@@ -1160,6 +1160,11 @@ fn is_daemon_operation(operation: &str) -> bool {
             // `ProcessExecutionRequest` decode, and fenced the session.
             | NOTIFICATION_STATE_MUTATION_OPERATION
             | NOTIFICATION_STATE_READ_OPERATION
+            // #1862: the Task Controller claim/result legs are separate
+            // admitted operations with their own queue and attempt type, so the
+            // frame must reach their own dispatch.
+            | "task_controller_claim"
+            | "task_controller_result"
     )
 }
 

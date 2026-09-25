@@ -15,6 +15,7 @@ eliot-learning-contracts.workspace = true
 eliot-protocol = { workspace = true }
 eliot-receipts = { workspace = true }
 eliot-security-contracts = { workspace = true }
+eliot-reactive-context-plan = { path = "../../smart/eliot-reactive-context-plan", version = "0.1.0" }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
