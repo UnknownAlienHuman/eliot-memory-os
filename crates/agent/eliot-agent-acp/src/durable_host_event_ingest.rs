@@ -44,15 +44,18 @@ use std::collections::BTreeMap;
 
 use eliot_agent_api::{
     ContractError, EventId, HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM,
-    HostEventPrivacyClass, LowercaseSha256, NormalizedHostEventEnvelope,
-    ProviderObservationLineage,
+    HostEventDeliveryDisposition, HostEventPrivacyClass, LowercaseSha256,
+    NormalizedHostEventEnvelope, ProviderObservationLineage, QualifiedSourceDigest,
+    host_event::HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM,
 };
-use eliot_contracts::sha256_hex;
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::{ACP_NORMALIZER_IDENTITY, ACP_SCHEMA_VERSION, DEFAULT_MAX_FRAME_BYTES};
+use crate::{
+    ACP_NORMALIZER_IDENTITY, ACP_SCHEMA_VERSION, DEFAULT_MAX_FRAME_BYTES, decode_source_message,
+};
 
 /// Transformation pipeline version bound into every durable record alongside
 /// the adapter version.
@@ -281,6 +284,36 @@ pub struct ReplayItem {
     pub envelope_digest: LowercaseSha256,
 }
 
+/// Why a best-effort observation was dropped instead of retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BestEffortDropReason {
+    /// The same stream cursor or transport hash arrived with different bytes.
+    ConflictingDuplicate,
+    /// A stale cursor arrived with bytes that do not match the record.
+    StaleSequence,
+}
+
+/// Exact coverage gap emitted when a best-effort observation is dropped. The
+/// dropped event is never fabricated into an observation and never advances
+/// acknowledgement or cursor state: the gap preserves its stream, sequence,
+/// transport hash, and envelope digest so forensic replay can distinguish a
+/// deliberate best-effort drop from a blind interval.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BestEffortDropGap {
+    /// Owning stream identifier.
+    pub stream_id: String,
+    /// Dropped sequence within the stream.
+    pub sequence: u64,
+    /// Immutable hash of the dropped transport bytes.
+    pub transport_hash: LowercaseSha256,
+    /// Canonical digest of the dropped normalized envelope.
+    pub envelope_digest: LowercaseSha256,
+    /// Why the observation was dropped.
+    pub reason: BestEffortDropReason,
+}
+
 /// Admissible-raw staging request: the exact transport bytes plus the
 /// normalized envelope that must bind them.
 #[derive(Clone, Debug)]
@@ -291,7 +324,9 @@ pub struct StageAllowed<'a> {
     pub stream_sequence: u64,
     /// Exact admissible raw transport bytes. Stored verbatim.
     pub transport_bytes: &'a [u8],
-    /// Normalized envelope binding `sha256(transport_bytes)`.
+    /// Normalized envelope binding the stored bytes under its declared
+    /// source-digest algorithm (canonical message digest or raw-bytes
+    /// digest for quarantine/redacted inputs).
     pub envelope: NormalizedHostEventEnvelope,
     /// Requested route reference digest, when the lineage carries one.
     pub requested_route_digest: Option<LowercaseSha256>,
@@ -440,6 +475,7 @@ pub struct DurableHostEventJournal {
     progress: BTreeMap<String, StreamProgress>,
     records: BTreeMap<(String, u64), DurableHostEventRecord>,
     by_transport_hash: BTreeMap<String, (String, u64)>,
+    dropped_gaps: Vec<BestEffortDropGap>,
 }
 
 impl DurableHostEventJournal {
@@ -473,11 +509,24 @@ impl DurableHostEventJournal {
         self.records.get(&(key.stream_id.clone(), key.sequence))
     }
 
+    /// Returns every recorded best-effort drop gap for a stream, in record
+    /// order. Dropped best-effort observations leave this exact coverage gap
+    /// instead of advancing acknowledgement or cursor state.
+    #[must_use]
+    pub fn drop_gaps(&self, stream_id: &str) -> Vec<BestEffortDropGap> {
+        self.dropped_gaps
+            .iter()
+            .filter(|gap| gap.stream_id == stream_id)
+            .cloned()
+            .collect()
+    }
+
     /// Stages admissible raw bytes plus their normalized envelope.
     ///
     /// Fails closed with [`IngestError::PrivacyViolation`] when the bytes
     /// carry denied content, and with [`IngestError::EnvelopeMismatch`] when
-    /// the envelope does not bind `sha256(transport_bytes)`. An identical
+    /// the envelope does not bind the stored bytes under its declared
+    /// source-digest algorithm. An identical
     /// redelivery returns the existing key with `fresh: false`; a conflicting
     /// same-cursor or same-hash delivery is quarantined with
     /// [`IngestError::ConflictingDuplicate`]. Staging alone never advances a
@@ -669,6 +718,34 @@ impl DurableHostEventJournal {
         Ok(true)
     }
 
+    /// Records the exact coverage gap when a best-effort observation is
+    /// dropped instead of retained. Only best-effort envelopes leave gaps:
+    /// durable conflicts stay errors without gap evidence. Gap recording is
+    /// the only mutation on these paths; the call returns before any commit
+    /// or acknowledgement, so acknowledgement and cursor advancement stay
+    /// suppressed by construction.
+    #[allow(clippy::too_many_arguments)]
+    fn record_best_effort_drop(
+        &mut self,
+        stream_id: &str,
+        sequence: u64,
+        transport_hash: &LowercaseSha256,
+        envelope_digest: &LowercaseSha256,
+        delivery: HostEventDeliveryDisposition,
+        reason: BestEffortDropReason,
+    ) {
+        if delivery != HostEventDeliveryDisposition::BestEffortOrdered {
+            return;
+        }
+        self.dropped_gaps.push(BestEffortDropGap {
+            stream_id: stream_id.to_owned(),
+            sequence,
+            transport_hash: transport_hash.clone(),
+            envelope_digest: envelope_digest.clone(),
+            reason,
+        });
+    }
+
     /// Shared staging core: envelope linkage checks, idempotent-duplicate
     /// detection, and staged insertion. Never advances a cursor.
     #[allow(clippy::too_many_arguments)]
@@ -688,6 +765,13 @@ impl DurableHostEventJournal {
         if predecessors.len() > eliot_agent_api::MAX_HOST_EVENT_PREDECESSORS {
             return Err(IngestError::InvalidInput("predecessors"));
         }
+        // Parent agreement before mutation: the predecessors carried at
+        // ingest must equal the envelope's own `causal_predecessors`. A wrong
+        // parent (divergent lineage columns for one record) is rejected here
+        // instead of persisting two disagreeing parent claims.
+        if predecessors != envelope.causal_predecessors {
+            return Err(IngestError::EnvelopeMismatch("predecessors"));
+        }
         Self::check_envelope_linkage(&envelope, sequence, &stored)?;
         let envelope_digest = envelope
             .compute_digest()
@@ -706,9 +790,25 @@ impl DurableHostEventJournal {
             {
                 return Ok(StageOutcome { key, fresh: false });
             }
+            self.record_best_effort_drop(
+                stream_id,
+                sequence,
+                &transport_hash,
+                &envelope_digest,
+                envelope.delivery,
+                BestEffortDropReason::ConflictingDuplicate,
+            );
             return Err(IngestError::ConflictingDuplicate);
         }
         if self.by_transport_hash.contains_key(&hash_hex) {
+            self.record_best_effort_drop(
+                stream_id,
+                sequence,
+                &transport_hash,
+                &envelope_digest,
+                envelope.delivery,
+                BestEffortDropReason::ConflictingDuplicate,
+            );
             return Err(IngestError::ConflictingDuplicate);
         }
         let durable = self
@@ -716,6 +816,14 @@ impl DurableHostEventJournal {
             .get(stream_id)
             .map_or(0, |progress| progress.last_durable_sequence);
         if sequence <= durable {
+            self.record_best_effort_drop(
+                stream_id,
+                sequence,
+                &transport_hash,
+                &envelope_digest,
+                envelope.delivery,
+                BestEffortDropReason::StaleSequence,
+            );
             return Err(IngestError::StaleSequence);
         }
         if envelope.producer_adapter_identity != ACP_NORMALIZER_IDENTITY {
@@ -749,8 +857,9 @@ impl DurableHostEventJournal {
     }
 
     /// Checks that the envelope binds the stored bytes: schema version,
-    /// stream sequence, `raw_source` digest over the stored bytes, and receipt
-    /// coherence, plus framing validation for session lineage.
+    /// stream sequence, `raw_source` digest over the stored bytes under its
+    /// declared algorithm, and receipt coherence, plus framing validation for
+    /// session lineage.
     fn check_envelope_linkage(
         envelope: &NormalizedHostEventEnvelope,
         sequence: u64,
@@ -765,13 +874,7 @@ impl DurableHostEventJournal {
         if envelope.normalization.input_digest != envelope.raw_source.digest {
             return Err(IngestError::EnvelopeMismatch("input_digest"));
         }
-        if envelope.raw_source.digest.algorithm != HOST_EVENT_DIGEST_ALGORITHM {
-            return Err(IngestError::EnvelopeMismatch("digest_algorithm"));
-        }
-        let stored_hex = sha256_hex(stored.bytes());
-        if stored_hex != envelope.raw_source.digest.digest.as_str() {
-            return Err(IngestError::EnvelopeMismatch("raw_source"));
-        }
+        Self::check_source_digest(&envelope.raw_source.digest, stored.bytes())?;
         if matches!(
             envelope.lineage,
             ProviderObservationLineage::SessionObservation(_)
@@ -779,6 +882,37 @@ impl DurableHostEventJournal {
             envelope
                 .validate_as_session_observation()
                 .map_err(IngestError::Contract)?;
+        }
+        Ok(())
+    }
+
+    /// Verifies the envelope source digest against the stored bytes under its
+    /// declared algorithm qualifier. Canonical-JSON digests decode the stored
+    /// bytes (bare or single-framed) and canonicalize before hashing, so
+    /// whitespace/key-order variants of one message verify while the digest
+    /// of unrelated bytes fails here before any cursor moves. Raw-bytes
+    /// digests (typed quarantine, deterministic redacted projections) hash
+    /// the stored bytes exactly. The immutable transport hash is preserved
+    /// separately on the durable record either way, never collapsed into the
+    /// semantic digest.
+    fn check_source_digest(
+        digest: &QualifiedSourceDigest,
+        stored: &[u8],
+    ) -> Result<(), IngestError> {
+        if digest.algorithm != HOST_EVENT_DIGEST_ALGORITHM
+            && digest.algorithm != HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM
+        {
+            return Err(IngestError::EnvelopeMismatch("digest_algorithm"));
+        }
+        let expected_hex = if digest.algorithm == HOST_EVENT_DIGEST_ALGORITHM {
+            let message = decode_source_message(stored)
+                .map_err(|_| IngestError::EnvelopeMismatch("raw_source"))?;
+            sha256_hex(&canonical_json_bytes(&message).map_err(|_| IngestError::DigestEncoding)?)
+        } else {
+            sha256_hex(stored)
+        };
+        if expected_hex != digest.digest.as_str() {
+            return Err(IngestError::EnvelopeMismatch("raw_source"));
         }
         Ok(())
     }

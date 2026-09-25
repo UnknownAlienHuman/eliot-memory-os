@@ -12,10 +12,11 @@
 
 mod durable_host_event_ingest;
 pub use durable_host_event_ingest::{
-    DURABLE_INGEST_TRANSFORMATION_VERSION, DurableHostEventJournal, DurableHostEventRecord,
-    EventKey, IngestError, REDACTED_PROJECTION_MARKER, RecordDisposition, RedactionReason,
-    RedactionReceipt, ReplayItem, StageAllowed, StageOutcome, StageRedacted, StoredPayload,
-    StreamCursorState, contains_forbidden_content, deterministic_redacted_bytes,
+    BestEffortDropGap, BestEffortDropReason, DURABLE_INGEST_TRANSFORMATION_VERSION,
+    DurableHostEventJournal, DurableHostEventRecord, EventKey, IngestError,
+    REDACTED_PROJECTION_MARKER, RecordDisposition, RedactionReason, RedactionReceipt, ReplayItem,
+    StageAllowed, StageOutcome, StageRedacted, StoredPayload, StreamCursorState,
+    contains_forbidden_content, deterministic_redacted_bytes,
 };
 mod host_event_producer;
 pub use host_event_producer::{
@@ -35,7 +36,8 @@ use eliot_agent_api::{
     HostEventPrivacyClass, LowercaseSha256, NormalizationCoverage, NormalizedHostEventEnvelope,
     NormalizedHostEventPayload, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
     ProviderObservationLineage, QuotaKnowledge, RestrictedRawSourceHandle, ResultDisposition,
-    RouteFingerprint, RouteObservationState, TaskId, UnsupportedDisposition, UsageReceipt,
+    RouteFingerprint, RouteObservationState, TaskId, UnsupportedDisposition,
+    UnsupportedEventObservation, UnsupportedEventReason, UsageReceipt,
 };
 use eliot_process::{
     ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest,
@@ -1018,9 +1020,13 @@ impl AcpEvent {
 /// Every field is typed: the exact execution lineage travels as
 /// [`ProviderObservationLineage`] (never parsed from provider locators), the
 /// public payload is the closed [`NormalizedHostEventPayload`] (never an
-/// arbitrary `serde_json::Value`), digests are computed inside from
-/// `raw_source_bytes` (never caller-supplied strings), and observation time
-/// is a typed [`ClockReading`] (never a wall-clock string). The legacy
+/// arbitrary `serde_json::Value`), digests are computed inside from the single
+/// decoded source message behind `raw_source_bytes` (canonical JSON digest
+/// for decodable bytes, raw-bytes digest for redacted projections; never
+/// caller-supplied strings), and observation time
+/// is a typed [`ClockReading`] (never a wall-clock string). Undecodable
+/// non-projection bytes never mint the supplied payload: they fall into typed
+/// quarantine with the real omission declared. The legacy
 /// [`AcpEvent`] with `payload: Value` plus [`AcpEvent::into_host_event`] is
 /// untouched for existing consumers.
 #[derive(Clone, Debug)]
@@ -1066,18 +1072,75 @@ pub struct AcpHostEventInput<'a> {
 /// their own producer identity.
 pub const ACP_NORMALIZER_IDENTITY: &str = "eliot-agent-acp";
 
+/// Omitted-manifest entry naming the source message that could not be decoded
+/// into a typed observation. The undecodable bytes are actually omitted from
+/// the quarantined projection, so the loss manifest names the real omission
+/// instead of an empty claim.
+pub const ACP_UNDECODABLE_SOURCE_ENTRY: &str = "acp.source_message";
+
+/// Builds an algorithm-qualified source digest from a hex digest string.
+fn qualified_digest(
+    hex: String,
+    algorithm: &str,
+) -> Result<eliot_agent_api::QualifiedSourceDigest, AcpAdapterError> {
+    let digest: LowercaseSha256 = serde_json::from_value(Value::String(hex)).map_err(|_| {
+        AcpAdapterError::ContractValidation(eliot_agent_api::ContractError::DigestMismatch)
+    })?;
+    Ok(eliot_agent_api::QualifiedSourceDigest {
+        algorithm: algorithm.to_owned(),
+        digest,
+    })
+}
+
+/// Decodes the single source-bound ACP message behind `raw_source_bytes`.
+///
+/// Accepts either bare ACP JSON-RPC bytes or exactly one complete
+/// content-length frame (the bridge producer stages framed transport bytes
+/// verbatim). The decoded value is the one canonicalized for the source
+/// digest, so a normalization receipt always names the message the bytes
+/// actually carry: unrelated bounded non-JSON bytes never decode and fail
+/// here before any receipt is issued.
+pub(crate) fn decode_source_message(
+    raw_source_bytes: &[u8],
+) -> Result<AcpJsonRpcMessage, AcpProtocolError> {
+    if let Ok(message) = AcpJsonRpcMessage::from_json_slice(raw_source_bytes) {
+        return Ok(message);
+    }
+    let mut codec = AcpFrameCodec::default();
+    let mut bodies = codec.feed(raw_source_bytes)?;
+    codec.finish()?;
+    if bodies.len() != 1 {
+        return Err(AcpProtocolError::InvalidEnvelope(
+            "source must decode as one ACP message".into(),
+        ));
+    }
+    AcpJsonRpcMessage::from_frame(&bodies.pop().unwrap_or_default())
+}
+
 /// Normalizes one typed ACP observation into the closed v7 host-event schema
 /// (issue #371 T4 S7).
 ///
 /// The adapter identity/version (`eliot-agent-acp` / [`ACP_SCHEMA_VERSION`])
-/// is bound by this function, never supplied by the caller; the input source
-/// digest is computed from `raw_source_bytes` with the canonical
-/// `sha256-canonical-json-v1` algorithm; and the sealed envelope is validated
-/// before return (execution-unit lineage against the exact binding plus the
-/// #369 admission, session lineage on the session path). Raw bytes stay behind
-/// the restricted handle; the public payload holds the bounded typed summary
-/// only. `raw_source_bytes` plus the [`RestrictedRawSourceHandle`] are both
-/// required: a missing handle or missing bytes fails closed, and the combined
+/// is bound by this function, never supplied by the caller. The input source
+/// digest is bound to the single decoded source message, never to unrelated
+/// bytes: bare or single-framed ACP JSON-RPC bytes decode to one
+/// [`AcpJsonRpcMessage`] whose canonical JSON bytes carry the
+/// `sha256-canonical-json-v1` digest, so whitespace/key-order variants of one
+/// message verify identically. Deterministic redacted projections (marked
+/// [`REDACTED_PROJECTION_MARKER`]) admit no canonical JSON form and carry the
+/// honest `sha256-raw-bytes-v1` digest over the exact projection bytes with a
+/// non-public privacy class; a projection mislabeled public fails closed.
+/// Bytes that decode as neither (and are not a redacted projection) never
+/// become a fabricated typed observation: they are routed to the typed
+/// [`NormalizedHostEventPayload::UnsupportedQuarantined`] quarantine with
+/// [`UnsupportedEventReason::SourceDecodeFailure`], lossy coverage, and the
+/// actual omission named in the loss manifest. The sealed envelope is
+/// validated before return (execution-unit lineage against the exact binding
+/// plus the #369 admission, session lineage on the session path). Raw bytes
+/// stay behind the restricted handle; the public payload holds the bounded
+/// typed summary only. `raw_source_bytes` plus the
+/// [`RestrictedRawSourceHandle`] are both required: a missing handle or
+/// missing bytes fails closed, and the combined
 /// [`RawSourceRecord`](eliot_agent_api::RawSourceRecord) is validated before
 /// sealing. Absent native cursor/replay evidence is never synthesized: cursors
 /// arrive from the post-R1 owner via the input fields, and delivery stays as
@@ -1123,30 +1186,105 @@ fn validate_acp_event_input(input: &AcpHostEventInput<'_>) -> Result<(), AcpAdap
     Ok(())
 }
 
+/// Resolves the effective normalization source for [`normalize_acp_event`]:
+/// payload, coverage, loss manifest, and qualified digest bound to the single
+/// decoded source message behind `raw_source_bytes`.
+///
+/// Decodable bytes bind the canonical JSON of the decoded message, so the
+/// receipt names the message the bytes actually carry. Deterministic redacted
+/// projections bind their exact bytes under the raw-bytes qualifier. Bytes
+/// that decode as neither never mint the supplied payload: they fall into
+/// typed quarantine ([`UnsupportedEventReason::SourceDecodeFailure`]) with
+/// lossy coverage and the actual omission named in the manifest.
+fn bind_normalization_source(
+    input: &AcpHostEventInput<'_>,
+) -> Result<
+    (
+        NormalizedHostEventPayload,
+        NormalizationCoverage,
+        Vec<String>,
+        eliot_agent_api::QualifiedSourceDigest,
+    ),
+    AcpAdapterError,
+> {
+    let redacted_projection = input
+        .raw_source_bytes
+        .starts_with(REDACTED_PROJECTION_MARKER.as_bytes());
+    if redacted_projection && input.privacy_class == HostEventPrivacyClass::PublicSummary {
+        return Err(AcpAdapterError::InvalidInput("privacy_class/projection"));
+    }
+    if redacted_projection {
+        return Ok((
+            input.payload.clone(),
+            input.coverage,
+            input.omitted_source_fields.clone(),
+            qualified_digest(
+                eliot_contracts::sha256_hex(input.raw_source_bytes),
+                eliot_agent_api::host_event::HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM,
+            )?,
+        ));
+    }
+    if let Ok(message) = decode_source_message(input.raw_source_bytes) {
+        let canonical = eliot_contracts::canonical_json_bytes(&message).map_err(|_| {
+            AcpAdapterError::ContractValidation(eliot_agent_api::ContractError::DigestMismatch)
+        })?;
+        return Ok((
+            input.payload.clone(),
+            input.coverage,
+            input.omitted_source_fields.clone(),
+            qualified_digest(
+                eliot_contracts::sha256_hex(&canonical),
+                eliot_agent_api::HOST_EVENT_DIGEST_ALGORITHM,
+            )?,
+        ));
+    }
+    let mut omitted = input.omitted_source_fields.clone();
+    if !omitted
+        .iter()
+        .any(|entry| entry == ACP_UNDECODABLE_SOURCE_ENTRY)
+    {
+        omitted.push(ACP_UNDECODABLE_SOURCE_ENTRY.to_owned());
+    }
+    Ok((
+        NormalizedHostEventPayload::UnsupportedQuarantined(UnsupportedEventObservation {
+            source_namespace: ACP_NORMALIZER_IDENTITY.to_owned(),
+            source_version: None,
+            reason: UnsupportedEventReason::SourceDecodeFailure,
+            detail_ref: None,
+        }),
+        NormalizationCoverage::LossyOmission,
+        omitted,
+        qualified_digest(
+            eliot_contracts::sha256_hex(input.raw_source_bytes),
+            eliot_agent_api::host_event::HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM,
+        )?,
+    ))
+}
+
 pub fn normalize_acp_event(
     input: AcpHostEventInput<'_>,
 ) -> Result<(NormalizedHostEventEnvelope, HostEventNormalizationReceipt), AcpAdapterError> {
     validate_acp_event_input(&input)?;
-    let input_digest: LowercaseSha256 = serde_json::from_value(Value::String(
-        eliot_contracts::sha256_hex(input.raw_source_bytes),
-    ))
-    .map_err(|_| {
-        AcpAdapterError::ContractValidation(eliot_agent_api::ContractError::DigestMismatch)
-    })?;
+    // Source binding: the digest always names the message the bytes actually
+    // carry (see [`bind_normalization_source`]).
+    let (effective_payload, effective_coverage, effective_omitted, input_digest) =
+        bind_normalization_source(&input)?;
     // The restricted handle plus its qualified digest must validate together
     // before any envelope is minted; a handle without its digest (or vice
     // versa) fails closed here.
     let raw_record = eliot_agent_api::RawSourceRecord {
         handle: input.raw_source_handle.clone(),
-        digest: eliot_agent_api::QualifiedSourceDigest {
-            algorithm: eliot_agent_api::HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
-            digest: input_digest.clone(),
-        },
+        digest: input_digest.clone(),
     };
     raw_record
         .validate()
         .map_err(AcpAdapterError::ContractValidation)?;
-    let unsupported_disposition = match &input.payload {
+    let unsupported_disposition = match &effective_payload {
+        NormalizedHostEventPayload::UnsupportedQuarantined(observation)
+            if observation.reason == UnsupportedEventReason::SourceDecodeFailure =>
+        {
+            UnsupportedDisposition::SourceDecodeFailure
+        }
         NormalizedHostEventPayload::UnsupportedQuarantined(_) => {
             UnsupportedDisposition::UnsupportedMethodQuarantined
         }
@@ -1156,10 +1294,7 @@ pub fn normalize_acp_event(
         normalizer_identity: ACP_NORMALIZER_IDENTITY.to_owned(),
         normalizer_version: ACP_SCHEMA_VERSION.to_owned(),
         input_handle: input.raw_source_handle.clone(),
-        input_digest: eliot_agent_api::QualifiedSourceDigest {
-            algorithm: eliot_agent_api::HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
-            digest: input_digest,
-        },
+        input_digest: input_digest.clone(),
         output_schema_version: eliot_agent_api::HOST_EVENT_CONTRACT_VERSION.to_owned(),
         output_digest: serde_json::from_value(Value::String(
             "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
@@ -1167,11 +1302,11 @@ pub fn normalize_acp_event(
         .map_err(|_| {
             AcpAdapterError::ContractValidation(eliot_agent_api::ContractError::DigestMismatch)
         })?,
-        omitted_fields: input.omitted_source_fields.clone(),
+        omitted_fields: effective_omitted,
         warnings: input.warnings.clone(),
         unsupported_disposition,
         privacy_class: input.privacy_class,
-        coverage: input.coverage,
+        coverage: effective_coverage,
         proof_ceiling: eliot_agent_api::ProofCeiling::Observation,
     };
     let admitted_route_digest = input
@@ -1186,7 +1321,7 @@ pub fn normalize_acp_event(
         adapter_contract_version: ACP_SCHEMA_VERSION.to_owned(),
         sequence: input.sequence,
         causal_predecessors: input.predecessors,
-        payload: input.payload,
+        payload: effective_payload,
         admitted_route_digest,
         raw_source: eliot_agent_api::RawSourceRecord {
             handle: input.raw_source_handle,
