@@ -2122,10 +2122,20 @@ async fn dispatch_command(
                 force,
             } => commands::run_daemon_init_default(config, &source_config, force),
             DaemonCommand::Run { instance } => {
-                // #1858 step 1': `daemon run` is the retained shared runtime for
-                // the hosts that have not cut over (codex/opencode/claude-desktop
-                // per #1719). The front-door gate intentionally does not cover it;
-                // refusing here would break those retained paths.
+                // #1858 (I19.10): once the front-door flag selects the new
+                // stack, `daemon run` refuses with the stable cutover code plus
+                // the canonical-route receipt instead of starting DbClientSet,
+                // CanonicalStore, ControlWal, or WriterActor. Absent flag
+                // preserves the retained shared runtime.
+                if let Err(detail) =
+                    front_door_cutover::gate_legacy_entrypoint("eliot-governor daemon run", None)
+                {
+                    front_door_cutover::write_cutover_rejection(
+                        front_door_cutover::LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER,
+                        &detail,
+                    );
+                    return Err(anyhow::anyhow!(detail));
+                }
                 commands::run_daemon(
                     config,
                     selected_instance(instance, implicit_instance).as_deref(),
@@ -2150,7 +2160,23 @@ async fn dispatch_command(
             ),
         },
         Command::Service { command } => match command {
-            ServiceCommand::Run => windows_service::run_dispatcher().map_err(Into::into),
+            ServiceCommand::Run => {
+                // #1858 (I19.10): `service run` enters the same shared runtime
+                // as `daemon run`, so it carries the same front-door gate on
+                // the same terms: refuse with the stable cutover code plus the
+                // canonical-route receipt once the flag selects the new stack,
+                // before the Windows service dispatcher starts.
+                if let Err(detail) =
+                    front_door_cutover::gate_legacy_entrypoint("eliot-governor service run", None)
+                {
+                    front_door_cutover::write_cutover_rejection(
+                        front_door_cutover::LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER,
+                        &detail,
+                    );
+                    return Err(anyhow::anyhow!(detail));
+                }
+                windows_service::run_dispatcher().map_err(Into::into)
+            }
             ServiceCommand::Validate => commands::run_service_validate(config),
             ServiceCommand::Install { dry_run } => commands::run_service_install(config, dry_run),
             ServiceCommand::Uninstall { dry_run } => {
@@ -2444,9 +2470,20 @@ async fn dispatch_command(
         Command::Adapter { command } => dispatch_adapter_command(config, command).await,
         Command::Verifier { command } => dispatch_verifier_command(config, command).await,
         Command::Hook { command } => {
-            // #1858 step 1': hook arms are the retained plugin-lifecycle path.
-            // The front-door gate intentionally does not apply here; hook cutover
-            // is owned by #1719/#13. See front_door_cutover disposition docs.
+            // #1858 (I19.10): hook arms are a legacy entrypoint on the same
+            // terms as the other dispatch arms. Once the front-door flag
+            // selects the new stack, every hook event refuses with the stable
+            // cutover code plus the canonical-route receipt before any hook
+            // processing or store-backed work starts.
+            if let Err(detail) =
+                front_door_cutover::gate_legacy_entrypoint("eliot-governor hook", None)
+            {
+                front_door_cutover::write_cutover_rejection(
+                    front_door_cutover::LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER,
+                    &detail,
+                );
+                return Err(anyhow::anyhow!(detail));
+            }
             dispatch_hook_command(config, command)
         }
         Command::Mcp {
@@ -2458,12 +2495,12 @@ async fn dispatch_command(
                 },
         } => {
             // #1858 (I19.5, I19.10): once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge
-            // selects the new stack, the retired `claude` host edge refuses
+            // selects the new stack, every `mcp stdio` host edge refuses
             // with a stable cutover code plus the canonical-route receipt.
             // The refusal precedes ensure_daemon_ready, so a cut-over
             // invocation never auto-launches the daemon, starts a store, or
-            // constructs a ControlWal/WriterActor. Remaining hosts proceed on
-            // the retained legacy path while their cutover is pending.
+            // constructs a ControlWal/WriterActor. Absent flag preserves
+            // today's behavior on every host edge.
             if let Err(detail) = front_door_cutover::gate_legacy_entrypoint(
                 "eliot-governor mcp stdio",
                 host.as_deref(),
