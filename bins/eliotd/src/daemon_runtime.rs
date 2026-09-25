@@ -37,8 +37,8 @@ use eliotd::testd_terminal_completion::{
 };
 use eliotd::{
     ActivationClaim, DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus,
-    LocalReadSubmitOutcome, PROTOCOL_VERSION, SERVICE_NAME, forward_admitted_local_read,
-    terminal_for_invalid_ticket,
+    LocalReadSubmitOutcome, MaintenanceObservation, MaintenanceTriggerOrigin, PROTOCOL_VERSION,
+    SELF_OBSERVED_FAMILY, SERVICE_NAME, forward_admitted_local_read, terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -268,6 +268,31 @@ pub(super) fn run() -> Result<(), String> {
     // explicit disposition for each. The returned ledger — not control flow —
     // decides whether this generation may report Governor readiness.
     let bindings = bind_declared_startup_capabilities(&kernel, &mut composition);
+    // #1688 (I14.22): the Governor-owned maintenance trigger evaluator runs
+    // here, at the one startup-reconciliation site that holds both the concrete
+    // `Arc<DaemonKernelClient>` and the composition, and again once the declared
+    // startup binding ledger has completed. The first pass observes that owner
+    // recovery just rebuilt every owner at the current fence; the second
+    // observes that the daemon is now whole, so first-run obligations became
+    // visible. Both are pure reads of the composed Governor owner: no queue,
+    // no scheduler, no background maintenance loop, and no new thread. Neither
+    // is a startup gate - a trigger that cannot be evaluated is recorded as a
+    // typed gap and the daemon continues, exactly like the attach paths above.
+    note_maintenance_trigger_at(
+        &composition,
+        MaintenanceTriggerOrigin::StartupReconciliation,
+        vec![bindings.report()],
+        false,
+    );
+    note_maintenance_trigger_at(
+        &composition,
+        MaintenanceTriggerOrigin::ColdStartCompletion,
+        vec![format!(
+            "startup_bindings_complete={}",
+            bindings.is_complete()
+        )],
+        false,
+    );
     // Issue #88, wave 3: the ready answer carries the once-per-generation
     // supervision bundle. The per-tick producer below cites it verbatim; the
     // Kernel re-verifies every echoed field on each submit.
@@ -881,6 +906,13 @@ async fn run_loop(
                     &mut testd_owner_flight,
                     &mut flight,
                 );
+                // #1688 (I14.22): the idle trigger rides this cadence branch
+                // because it is the one place that observes the activation
+                // flight, so the `idle` gate the evaluator consumes is a real
+                // observation of admitted interactive work rather than a
+                // literal. Separate cadence and separate observation from the
+                // health-heartbeat admitted-observation trigger below.
+                note_idle_maintenance_trigger(&composition, &flight).await;
             }
             completion = async {
                 match &mut flight {
@@ -1039,6 +1071,58 @@ fn note_supervision_applied(producer: Option<&mut eliotd::SupervisionProgressPro
     }
 }
 
+/// Runs one Governor maintenance trigger evaluation from a real durable
+/// trigger site (I14.22, issue #1688).
+///
+/// This is the single runtime entry for every wired trigger. It is
+/// deliberately tolerant: [`DaemonComposition::note_maintenance_trigger`]
+/// records an explicit typed gap through the existing minimal operational
+/// diagnostics and returns, so a maintenance observation can never become a
+/// startup gate, a readiness gate, or a daemon-killing error. I14.22 keeps an
+/// unevaluable trigger durable and surfaces it on the next eligible startup
+/// rather than dropping it.
+///
+/// Evidence identities are passed through the shared diagnostics sanitizer so
+/// a trigger can never carry control characters, secrets or unbounded detail
+/// into the evaluator's own field validation. The family is the one
+/// self-observed family this daemon can honestly name today; the registered
+/// per-observation family catalog is #1693's to supply.
+fn note_maintenance_trigger_at(
+    composition: &DaemonComposition,
+    origin: MaintenanceTriggerOrigin,
+    evidence_refs: Vec<String>,
+    activation_in_flight: bool,
+) {
+    let evidence_refs = evidence_refs
+        .iter()
+        .map(|reference| eliotd::diagnostics::sanitize_identity(reference))
+        .collect();
+    composition.note_maintenance_trigger(MaintenanceObservation {
+        origin,
+        family: SELF_OBSERVED_FAMILY,
+        evidence_refs,
+        activation_in_flight,
+    });
+}
+
+/// Evaluates the idle trigger from the activation-poll cadence branch.
+///
+/// The evidence is the flight state the tick just decided from, so the
+/// decision and its evidence are the same observation. This is a periodic
+/// idle *observation*, not a busy-to-idle edge detector: the loop retains no
+/// previous-idle flag, and inventing one to manufacture a transition edge
+/// would be a fabricated event source.
+async fn note_idle_maintenance_trigger(composition: &SharedComposition, flight: &ActivationFlight) {
+    let activation_in_flight = matches!(flight, ActivationFlight::InFlight(_));
+    let guard = composition.lock().await;
+    note_maintenance_trigger_at(
+        &guard,
+        MaintenanceTriggerOrigin::IdleTransition,
+        vec![format!("activation_in_flight={activation_in_flight}")],
+        activation_in_flight,
+    );
+}
+
 /// Runs one health-heartbeat tick (Implements #88, wave 3): the Kernel
 /// health poll stays evidence-only, then the same tick submits supervision
 /// progress built from observed work. The poll's Store dimension is reused as
@@ -1058,14 +1142,28 @@ async fn run_health_heartbeat_tick(
     let health: StoreHealth = KernelTransitionPort::health(kernel.as_ref())
         .await
         .map_err(|error| format!("Kernel health heartbeat: {error}"))?;
+    // #1688 (I14.22): the Kernel health poll is this daemon's one admitted
+    // self-observation per heartbeat, so it is the admitted-observation
+    // trigger. The evidence identities are the observed health status and the
+    // store manifest digest the poll actually returned - never a synthetic
+    // signal. `activation_in_flight` is the same live observation the
+    // supervision submit below uses, so the `idle` gate stays consistent with
+    // what this tick actually did.
+    let activation_in_flight = matches!(flight, ActivationFlight::InFlight(_));
+    {
+        let guard = composition.lock().await;
+        note_maintenance_trigger_at(
+            &guard,
+            MaintenanceTriggerOrigin::AdmittedObservation,
+            vec![
+                format!("store_health={:?}", health.status),
+                health.manifest_digest.as_str().to_owned(),
+            ],
+            activation_in_flight,
+        );
+    }
     if let Some(producer) = supervision_progress.as_mut() {
-        submit_supervision_heartbeat(
-            kernel,
-            producer,
-            &health,
-            matches!(flight, ActivationFlight::InFlight(_)),
-        )
-        .await?;
+        submit_supervision_heartbeat(kernel, producer, &health, activation_in_flight).await?;
     }
     // #2100: revision-advance trigger for the Kernel P-07 owner feed.
     // Unchanged providers perform no IO here; an advanced provider
