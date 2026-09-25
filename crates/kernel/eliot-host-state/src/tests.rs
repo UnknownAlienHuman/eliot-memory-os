@@ -565,6 +565,7 @@ fn partial_runtime_contours_cannot_use_genesis_clean_marker_exception() {
                 drain_generation: generation.clone(),
                 state: DrainState::Requested,
                 evidence_refs: vec![h("partial-drain-evidence")],
+                expected_predecessor: None,
             }),
         ),
         (
@@ -920,6 +921,7 @@ fn dependency_wake_and_drain_replay_or_conflict_by_exact_identity() -> TestResul
         drain_generation: step("activation-lineage", 1),
         state: DrainState::Requested,
         evidence_refs: vec![h("drain-evidence")],
+        expected_predecessor: None,
     });
 
     for record in [&dependency, &wake, &drain] {
@@ -1501,6 +1503,7 @@ fn committed_drain_cannot_be_cancelled_into_same_generation() -> TestResult {
         drain_generation: drain_generation.clone(),
         state: DrainState::Requested,
         evidence_refs: vec![h("drain-request-evidence")],
+        expected_predecessor: None,
     }))?;
     journal.append(HostStateRecord::Drain(DrainRecord {
         fence: fence(&host, &generation),
@@ -1508,6 +1511,7 @@ fn committed_drain_cannot_be_cancelled_into_same_generation() -> TestResult {
         drain_generation: drain_generation.clone(),
         state: DrainState::Draining,
         evidence_refs: vec![h("drain-start-evidence")],
+        expected_predecessor: None,
     }))?;
     advance_activation(
         &journal,

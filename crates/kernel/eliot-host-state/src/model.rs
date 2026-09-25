@@ -52,6 +52,28 @@ fn digest(value: &PlatformHandle, field: &'static str) -> Result<(), JournalErro
     Ok(())
 }
 
+/// Exact lowercase SHA-256 record-checksum form, as emitted by
+/// [`crate::record_checksum`].
+///
+/// The reducer compares an attempt link to that checksum by exact string
+/// identity, so a differently cased or truncated digest is a *different* byte
+/// string and is refused rather than normalized into a match.
+fn record_checksum_digest(value: &str, field: &'static str) -> Result<(), JournalError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(JournalError::Invalid(format!("{field} must be non-blank")));
+    }
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(JournalError::Invalid(format!(
+            "{field} must be a 64-character lowercase hexadecimal record checksum"
+        )));
+    }
+    Ok(())
+}
+
 fn handles(
     values: &[PlatformHandle],
     field: &'static str,
@@ -1164,6 +1186,23 @@ pub struct DrainRecord {
     pub drain_generation: EpochTransition,
     pub state: DrainState,
     pub evidence_refs: Vec<PlatformHandle>,
+    /// Attempt link of a re-armed pre-commit drain, set on exactly one edge:
+    /// the `Cancelled -> Requested` successor inside the same
+    /// `drain_generation` (Implementation I1.5: "A new observable-use trigger
+    /// received before the durable drain linearization point cancels drain and
+    /// returns the same generation to `ACTIVE` after readiness revalidation";
+    /// the re-armed drain stays inside that same generation). The value is the
+    /// exact record checksum of the `Cancelled` predecessor this attempt
+    /// re-arms, so the projection keeps exactly one `DrainRecord` and still
+    /// distinguishes attempt N from attempt N+1. Every other drain edge
+    /// continues the current attempt and carries `None`.
+    ///
+    /// `default` is mandatory, not stylistic: `DrainRecord` and
+    /// `HostStateRecord` both deny unknown fields and `JOURNAL_VERSION` is 3,
+    /// so a required field would make every installed v3 frame fail
+    /// `decode_record_for_replay` and render the whole epoch unloadable.
+    #[serde(default)]
+    pub expected_predecessor: Option<String>,
 }
 
 impl DrainRecord {
@@ -1175,6 +1214,9 @@ impl DrainRecord {
             != self.fence.activation_generation.current.lineage_id
         {
             return Err(JournalError::EpochLineageConflict);
+        }
+        if let Some(predecessor) = self.expected_predecessor.as_deref() {
+            record_checksum_digest(predecessor, "drain.expected_predecessor")?;
         }
         handles(&self.evidence_refs, "drain.evidence_refs", true)
     }
