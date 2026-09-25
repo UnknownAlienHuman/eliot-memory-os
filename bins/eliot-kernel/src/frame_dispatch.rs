@@ -15,6 +15,7 @@ use super::dreamer_job_dispatch::is_dreamer_operation;
 use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
 use super::generation_control::ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION;
 use super::native_worker_lifecycle_route::is_native_worker_operation;
+use super::request_dispatch::{dispatch_backup_frame, is_backup_operation};
 use super::wasm_runtime_port_grant::{
     HandlerSession, HostBinaryFacts, KernelObservedGrantFacts, WASM_GRANT_REQUEST_WIRE_ID,
     WASM_GRANT_REQUEST_WIRE_VERSION, WASM_PORT_GRANT_OPERATION, WasmGrantRequest,
@@ -788,6 +789,43 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 return self.dispatch_dreamer_frame(session, frame);
+            }
+            if is_backup_operation(native_operation) {
+                // Backup create/verify/restore-test requests ride the same
+                // admitted transport through this closed gateway. Backup is
+                // fenced here, before the route reads a single payload field,
+                // because the closed entry can request an archive capture,
+                // admit archive bytes for bounded verification, or rehearse an
+                // isolated restore: none of them is a passive read, and a
+                // capture or restore request must never be admitted from a
+                // degraded or still-starting Kernel. Only `Request`/`Execute`
+                // intake is routed, so a cancel frame can never become a
+                // capture or a restore; the peer identity must validate; and
+                // both the request id and the request identity must be
+                // present, so the route can never proceed on an absent
+                // operation identity. Peer, correlation, and fence joins
+                // mirror the Dreamer gate above. Per-operation payload, class,
+                // digest, lineage, provisioning, and isolation checks, plus
+                // every typed domain refusal, live in `dispatch_backup_frame`;
+                // this arm never reaches an owner itself.
+                if frame.kind != FrameKind::Request || frame.message_type != MessageType::Execute {
+                    return Err(TransportError::SessionFenced);
+                }
+                if self
+                    .service_state()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    != KernelServiceState::Ready
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                session
+                    .peer
+                    .validate()
+                    .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+                if frame.request_id.is_none() || frame.request_identity.is_none() {
+                    return Err(TransportError::SessionFenced);
+                }
+                return dispatch_backup_frame(session, frame);
             }
             if self
                 .service_state()

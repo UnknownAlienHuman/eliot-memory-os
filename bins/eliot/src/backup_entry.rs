@@ -1,4 +1,4 @@
-//! Backup/restore class entrypoints (issue #1873).
+//! Backup/restore class entrypoints (issue #1873, extended by #963).
 //!
 //! Argument decoding plus typed calls into `eliot_backup::product_command`
 //! (class parsing, create/restore previews) and the `product_run` issuance and
@@ -7,7 +7,20 @@
 //! with class receipts, and `restore-run` executes only into a temp-enforced
 //! isolated root with no cutover. Library mismatches print as JSON reports
 //! with a nonzero exit; only input errors share the invalid-request exit.
+//!
+//! The three advertised `create` / `verify` / `restore-test` catalogue
+//! commands (#963) are the other half of this tree. They carry no typed
+//! field on argv: each one reads exactly one admitted
+//! [`eliot_cli::CommandRequest`] from the same JSON channel `eliot dispatch`
+//! reads, because the correlated `RequestIdentity` — principal, session,
+//! fence, deadline, and idempotency identity — belongs to the admitted
+//! host-request path and the CLI never mints one. The bounded typed fields
+//! therefore arrive inside that admitted envelope, where the closed parsers
+//! in `eliot_cli::backup` admit them; a request that names another command,
+//! omits a required field, or carries a defaulted scope or destination
+//! refuses as a typed usage failure before any byte reaches the Kernel.
 
+use std::io::Read;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
@@ -17,8 +30,17 @@ use eliot_backup::{
     BackupBundle, BackupCreateArgs, RestoreContext, RestoreEpochSpec, WrappedKeyManifest,
     issue_backup, preview_backup_create, preview_restore, run_restore, verify_key_coverage,
 };
+use eliot_cli::{CommandId, CommandRequest};
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
 use serde_json::json;
+
+/// Maximum admitted bytes for one backup command request read from the
+/// operator front door.
+///
+/// Bounded by the closed archive bound byte-exact: a 1 MiB archive becomes
+/// 2 MiB of lowercase hex inside the request envelope, and 3 MiB leaves
+/// envelope headroom without admitting an unbounded stream.
+const BACKUP_REQUEST_INPUT_LIMIT: u64 = 3 * 1024 * 1024;
 
 #[derive(Debug, Subcommand)]
 pub enum BackupCommand {
@@ -35,6 +57,11 @@ pub enum BackupCommand {
         #[arg(long)]
         scope_id: Option<String>,
         /// Whether a self-consistent ORS snapshot is present.
+        ///
+        /// This is a preview input only: it selects no capture, writes no
+        /// archive, and never becomes a default for the routed
+        /// `create` command, which requires an explicit scope descriptor and
+        /// an explicit class.
         #[arg(long, default_value_t = false)]
         ors_present: bool,
     },
@@ -109,10 +136,99 @@ pub enum BackupCommand {
         #[arg(long)]
         new_lineage: Option<String>,
     },
+    /// Route the advertised `backup-create` command through the
+    /// authenticated Kernel front door.
+    ///
+    /// Reads exactly one admitted `backup-create` command request from
+    /// standard input, with the explicit `scope_descriptor` and `class`
+    /// typed fields the closed parser requires. Neither is ever defaulted,
+    /// and a create request is never satisfied by a preview.
+    Create,
+    /// Route the advertised `backup-verify` command through the
+    /// authenticated Kernel front door.
+    ///
+    /// Reads exactly one admitted `backup-verify` command request from
+    /// standard input, with the explicit bounded `bundle_hex` archive bytes
+    /// the closed parser requires. Verification is bounded: it never
+    /// restores and never changes an installation.
+    Verify,
+    /// Route the advertised `backup-restore-test` command through the
+    /// authenticated Kernel front door.
+    ///
+    /// Reads exactly one admitted `backup-restore-test` command request from
+    /// standard input, with every explicit binding the closed parser
+    /// requires. The rehearsal is isolated and never cuts over, retires the
+    /// source, or selects an installation change.
+    RestoreTest,
 }
 
 fn read_json(path: &Path, what: &str) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("read {what}"))
+}
+
+/// Reads exactly one admitted backup command request from the operator front
+/// door.
+///
+/// The read is bounded by [`BACKUP_REQUEST_INPUT_LIMIT`] and never truncated:
+/// an oversized stream refuses instead of delivering a partial request. The
+/// correlated `RequestIdentity` inside that envelope is the only correlation
+/// this process ever uses — the CLI never mints principal, session, fence,
+/// deadline, or idempotency identity — and a blank stream is exactly as
+/// unadmitted as a malformed one.
+fn read_admitted_backup_request() -> Result<CommandRequest> {
+    let mut input = Vec::new();
+    std::io::stdin()
+        .take(BACKUP_REQUEST_INPUT_LIMIT + 1)
+        .read_to_end(&mut input)
+        .context("read the admitted backup command request")?;
+    if input.len() as u64 > BACKUP_REQUEST_INPUT_LIMIT {
+        anyhow::bail!(
+            "the admitted backup command request exceeds the {BACKUP_REQUEST_INPUT_LIMIT} byte limit"
+        );
+    }
+    if input.iter().all(u8::is_ascii_whitespace) {
+        anyhow::bail!(
+            "no admitted backup command request was supplied; the correlated request identity must arrive from the admitted host request path"
+        );
+    }
+    serde_json::from_slice::<CommandRequest>(&input)
+        .context("decode the admitted backup command request")
+}
+
+/// Routes one advertised backup catalogue command through the authenticated
+/// Kernel front door.
+///
+/// The subcommand name is the operator's selection and the admitted request's
+/// `command` is the typed one; they must agree exactly, so `eliot backup
+/// verify` can never run a create or a restore rehearsal. Validation of the
+/// bounded typed arguments runs before any byte reaches the Kernel, and a
+/// missing, unknown, oversized, or non-isolated field is a typed usage
+/// failure rather than a guessed production scope or a default production
+/// destination.
+fn run_routed_backup(expected: CommandId) -> Result<i32> {
+    let request = match read_admitted_backup_request() {
+        Ok(request) => request,
+        Err(error) => {
+            crate::write_installation_error("BACKUP_REQUEST_NOT_ADMITTED", &error.to_string());
+            return Ok(crate::INVALID_REQUEST_EXIT);
+        }
+    };
+    if let Err(error) = request.validate() {
+        crate::write_installation_error("BACKUP_REQUEST_INVALID", &error.to_string());
+        return Ok(crate::INVALID_REQUEST_EXIT);
+    }
+    if request.command != expected {
+        crate::write_installation_error(
+            "BACKUP_COMMAND_MISMATCH",
+            &format!(
+                "this subcommand routes {}, but the admitted request carries {}",
+                expected.as_str(),
+                request.command.as_str()
+            ),
+        );
+        return Ok(crate::INVALID_REQUEST_EXIT);
+    }
+    crate::dispatch_backup_command(&request)
 }
 
 fn target_context(
@@ -142,6 +258,9 @@ pub fn run_backup(command: BackupCommand) -> Result<i32> {
             scope_id,
             ors_present,
         } => run_create_preview(&backup_id, &class, scope_id.as_deref(), ors_present),
+        BackupCommand::Create => run_routed_backup(CommandId::BackupCreate),
+        BackupCommand::Verify => run_routed_backup(CommandId::BackupVerify),
+        BackupCommand::RestoreTest => run_routed_backup(CommandId::BackupRestoreTest),
         BackupCommand::RestorePreview {
             bundle_json,
             target_id,

@@ -64,6 +64,14 @@ const UNKNOWN_OUTCOME_EXIT: i32 = 75;
 /// The serving owner invalidated the generation/session-bound operator
 /// handoff: the UI must restart through a fresh broker-issued binding.
 const RESTART_REQUIRED_EXIT: i32 = 77;
+/// A backup command reached its registered typed Kernel operation and the
+/// Kernel answered honestly, but a named owner is not admitted yet.
+///
+/// This is deliberately neither a usage failure (the bounded typed
+/// arguments were accepted) nor success (no capture, verification, or
+/// rehearsal was proven): backup existence is not recovery proof, so a
+/// process exit never stands in for it.
+const BACKUP_OWNER_ADMISSION_REQUIRED_EXIT: i32 = 78;
 const INSTALLATION_INPUT_LIMIT: u64 = 16 * 1024 * 1024;
 const INSTALLATION_CONTRACT_VERSION: &str = "3.0.0";
 const INSTALLATION_SCOPE: &str = "bounded_all_effects_or_exact_rollback";
@@ -127,7 +135,7 @@ enum Command {
         #[command(subcommand)]
         command: ControlBoardCommand,
     },
-    /// Backup creation/restore previews, issuance, isolated restore runs, and key coverage (#1873; previews never issue; restore runs never cut over).
+    /// Backup creation/restore previews, issuance, isolated restore runs, key coverage (#1873; previews never issue; restore runs never cut over), and the three advertised `create`/`verify`/`restore-test` catalogue commands routed through the authenticated Kernel front door (#963).
     Backup {
         #[command(subcommand)]
         command: backup_entry::BackupCommand,
@@ -4120,6 +4128,43 @@ impl CommandPort for AuthenticatedKernelPort {
                 result: eliot_cli::CommandResult::Forwarded { payload: routed },
             });
         }
+        // The three advertised backup command IDs map one-to-one onto the
+        // three closed Kernel backup operations. They never travel as a
+        // generic `eliot.cli.command`: a payload that selects another
+        // method, another owner, or a defaulted scope or destination is
+        // refused by the typed surface and by the Kernel route.
+        if matches!(
+            request.command,
+            eliot_cli::CommandId::BackupCreate
+                | eliot_cli::CommandId::BackupVerify
+                | eliot_cli::CommandId::BackupRestoreTest
+        ) {
+            return match request.command {
+                eliot_cli::CommandId::BackupCreate => {
+                    eliot_cli::backup::backup_create(&mut self.client, request)
+                }
+                eliot_cli::CommandId::BackupVerify => {
+                    eliot_cli::backup::backup_verify(&mut self.client, request)
+                }
+                eliot_cli::CommandId::BackupRestoreTest => {
+                    eliot_cli::backup::backup_restore_test(&mut self.client, request)
+                }
+                _ => Err(eliot_cli::backup::BackupClientError::Client(
+                    eliot_cli::CliError::ArgumentCommandMismatch,
+                )),
+            }
+            .map_err(|error| match error {
+                eliot_cli::backup::BackupClientError::Transport(transport) => match transport {
+                    eliot_cli::kernel_client::KernelClientError::FrontDoorClosed(contract) => {
+                        CommandPortError::FrontDoorClosed { contract }
+                    }
+                    other => CommandPortError::Rejected(other.to_string()),
+                },
+                eliot_cli::backup::BackupClientError::Client(client) => {
+                    CommandPortError::Rejected(client.to_string())
+                }
+            });
+        }
         let payload = serde_json::to_value(request)
             .map_err(|error| CommandPortError::Rejected(error.to_string()))?;
         let response = self
@@ -4134,6 +4179,191 @@ impl CommandPort for AuthenticatedKernelPort {
         serde_json::from_value(response)
             .map_err(|error| CommandPortError::Rejected(error.to_string()))
     }
+}
+
+/// Returns the closed Kernel operation selector a backup catalogue command
+/// routes to, or `None` when the command is not a backup command.
+///
+/// The mapping is one-to-one and closed: the CLI never names an owner, a
+/// method the catalogue does not advertise, or a destination.
+#[cfg(windows)]
+fn backup_operation(command: eliot_cli::CommandId) -> Option<&'static str> {
+    match command {
+        eliot_cli::CommandId::BackupCreate => Some(eliot_cli::backup::BACKUP_CREATE_OPERATION),
+        eliot_cli::CommandId::BackupVerify => Some(eliot_cli::backup::BACKUP_VERIFY_OPERATION),
+        eliot_cli::CommandId::BackupRestoreTest => {
+            Some(eliot_cli::backup::BACKUP_RESTORE_TEST_OPERATION)
+        }
+        _ => None,
+    }
+}
+
+/// Renders the bounded human and JSON projections of one routed backup
+/// command and returns its typed exit status.
+///
+/// Both projections are rendered from the same
+/// [`eliot_cli::backup::BackupOperationOutcome`], so the bounded human text
+/// and the JSON document cannot disagree. A verified outcome exits zero; an
+/// invalid one exits as a usage failure; a refused or blocked one exits as
+/// owner-admission-required. No exit status is ever a capture, verification,
+/// or restore proof.
+#[cfg(windows)]
+fn render_backup_outcome(response: &eliot_cli::CommandResponse) -> Result<i32> {
+    let eliot_cli::CommandResult::Forwarded { payload } = &response.result else {
+        write_json_error(
+            "BACKUP_RESULT_NOT_TYPED",
+            "the backup route returned no typed outcome projection",
+        );
+        return Ok(INVALID_REQUEST_EXIT);
+    };
+    let outcome: eliot_cli::backup::BackupOperationOutcome =
+        match serde_json::from_value(payload.clone()) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                write_json_error("BACKUP_RESULT_NOT_TYPED", &error.to_string());
+                return Ok(INVALID_REQUEST_EXIT);
+            }
+        };
+    print!(
+        "{}",
+        eliot_cli::backup::render_backup_outcome_human(&outcome)
+    );
+    println!("{}", serde_json::to_string(&outcome)?);
+    Ok(match outcome.state.as_str() {
+        eliot_cli::backup::BACKUP_STATE_VERIFIED => 0,
+        eliot_cli::backup::BACKUP_STATE_INVALID => INVALID_REQUEST_EXIT,
+        _ => BACKUP_OWNER_ADMISSION_REQUIRED_EXIT,
+    })
+}
+
+/// Maps one typed backup delegation failure onto its own bounded status.
+///
+/// The typed failures stay distinct across the layer boundary: a closed
+/// front door, an unadmitted request identity, an unproven outcome, and a
+/// typed argument or result mismatch are four different reports. An unproven
+/// outcome is reported with the same-operation reconciliation instruction
+/// and never with a second capture or restore.
+#[cfg(windows)]
+fn report_backup_failure(
+    operation: &str,
+    request: &CommandRequest,
+    error: eliot_cli::backup::BackupClientError,
+) -> Result<i32> {
+    use eliot_cli::backup::BackupClientError;
+    use eliot_cli::kernel_client::KernelClientError;
+
+    match error {
+        BackupClientError::Transport(KernelClientError::FrontDoorClosed(contract)) => {
+            write_json_error("KERNEL_APPLICATION_PORT_CLOSED", contract);
+            Ok(FRONT_DOOR_CLOSED_EXIT)
+        }
+        BackupClientError::Transport(KernelClientError::UnknownOutcome(detail)) => {
+            let unknown =
+                eliot_cli::backup::backup_unknown_outcome(operation, &request.request, &detail);
+            print!(
+                "{}",
+                eliot_cli::backup::render_backup_unknown_human(&unknown)
+            );
+            println!("{}", serde_json::to_string(&unknown)?);
+            Ok(UNKNOWN_OUTCOME_EXIT)
+        }
+        BackupClientError::Transport(KernelClientError::MissingRequestIdentity) => {
+            write_json_error(
+                "BACKUP_REQUEST_IDENTITY_NOT_ADMITTED",
+                "no admitted EBP request identity is bound for this backup operation; the identity must arrive through the admitted host request path, and the CLI never mints one",
+            );
+            Ok(INVALID_REQUEST_EXIT)
+        }
+        BackupClientError::Transport(KernelClientError::RestartRequired(detail)) => {
+            write_json_error("KERNEL_OPERATOR_RESTART_REQUIRED", &detail);
+            Ok(RESTART_REQUIRED_EXIT)
+        }
+        BackupClientError::Transport(
+            KernelClientError::Rejected(detail) | KernelClientError::Configuration(detail),
+        ) => {
+            write_json_error("BACKUP_OPERATION_REJECTED", &detail);
+            Ok(INVALID_REQUEST_EXIT)
+        }
+        BackupClientError::Client(error) => {
+            let (code, detail): (&str, String) = match error {
+                eliot_cli::CliError::InvalidArgument { field } => (
+                    "BACKUP_ARGUMENT_INVALID",
+                    format!("bounded typed field {field} is missing, blank, oversized, or outside the closed vocabulary"),
+                ),
+                eliot_cli::CliError::ArgumentCommandMismatch => (
+                    "BACKUP_COMMAND_ARGUMENT_MISMATCH",
+                    "the typed arguments do not match the advertised backup command".to_owned(),
+                ),
+                eliot_cli::CliError::CorrelationMismatch => (
+                    "BACKUP_CORRELATION_MISMATCH",
+                    "the Kernel reply is not bound to this request's operation identity".to_owned(),
+                ),
+                eliot_cli::CliError::ResultMismatch => (
+                    "BACKUP_RESULT_NOT_TYPED",
+                    "the Kernel reply does not carry the exact typed domain result for this operation"
+                        .to_owned(),
+                ),
+                other => ("BACKUP_REQUEST_REJECTED", other.to_string()),
+            };
+            write_json_error(code, &detail);
+            Ok(INVALID_REQUEST_EXIT)
+        }
+    }
+}
+
+/// Routes one backup catalogue command through the authenticated Kernel
+/// front door and renders both projections of the same typed result.
+///
+/// The Kernel client is the one already used by every other authenticated
+/// front door in this binary: this creates no second transport and no second
+/// client. The bounded typed arguments were admitted locally by the closed
+/// parsers, the correlated request identity came from the admitted host
+/// request path, and the domain outcome comes back as a typed result or as a
+/// distinct typed failure — never as a fabricated success.
+#[cfg(windows)]
+fn dispatch_backup_command(request: &CommandRequest) -> Result<i32> {
+    use eliot_cli::CliError;
+    use eliot_cli::backup::{BackupClientError, backup_create, backup_restore_test, backup_verify};
+
+    let Some(operation) = backup_operation(request.command) else {
+        write_json_error(
+            "BACKUP_COMMAND_UNKNOWN",
+            "the requested command is not one of the three advertised backup commands",
+        );
+        return Ok(INVALID_REQUEST_EXIT);
+    };
+    let mut port = match AuthenticatedKernelPort::load() {
+        Ok(port) => port,
+        Err(CommandPortError::FrontDoorClosed { contract }) => {
+            write_json_error("KERNEL_APPLICATION_PORT_CLOSED", contract);
+            return Ok(FRONT_DOOR_CLOSED_EXIT);
+        }
+        Err(error) => {
+            write_json_error("KERNEL_CLIENT_CONFIGURATION_REJECTED", &error.to_string());
+            return Ok(FRONT_DOOR_CLOSED_EXIT);
+        }
+    };
+    let routed = match request.command {
+        eliot_cli::CommandId::BackupCreate => backup_create(&mut port.client, request),
+        eliot_cli::CommandId::BackupVerify => backup_verify(&mut port.client, request),
+        eliot_cli::CommandId::BackupRestoreTest => backup_restore_test(&mut port.client, request),
+        _ => Err(BackupClientError::Client(CliError::ArgumentCommandMismatch)),
+    };
+    match routed {
+        Ok(response) => render_backup_outcome(&response),
+        Err(error) => report_backup_failure(operation, request, error),
+    }
+}
+
+/// Non-Windows builds have no authenticated Windows Kernel front door, so
+/// no backup operation is ever admitted there.
+#[cfg(not(windows))]
+fn dispatch_backup_command(_request: &CommandRequest) -> Result<i32> {
+    write_json_error(
+        "KERNEL_APPLICATION_PORT_CLOSED",
+        "Windows authenticated Kernel front door",
+    );
+    Ok(FRONT_DOOR_CLOSED_EXIT)
 }
 
 fn run_catalogue(command: &CatalogueCommand) -> Result<()> {

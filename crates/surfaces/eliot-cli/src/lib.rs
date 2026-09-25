@@ -175,9 +175,45 @@ pub enum CommandArguments {
     DoctorIntegration {
         profile: String,
     },
-    BackupCreate,
-    BackupVerify,
-    BackupRestoreTest,
+    BackupCreate {
+        /// Capture scope descriptor; required, bounded, never defaulted.
+        scope_descriptor: String,
+        /// Requested archive class; required, closed, never defaulted.
+        class: String,
+    },
+    BackupVerify {
+        /// Archive bytes as bounded lowercase hex; required, never
+        /// defaulted.
+        bundle_hex: String,
+    },
+    BackupRestoreTest {
+        /// Archive bytes as bounded lowercase hex; required, never
+        /// defaulted.
+        bundle_hex: String,
+        /// Host-issued destination authorization bytes; required, bounded,
+        /// never defaulted.
+        destination_authorization_hex: String,
+        /// Isolated-restore target identity; required, never defaulted.
+        target_id: String,
+        /// Target authority lineage UUID text.
+        target_lineage: String,
+        /// Target authority sequence; nonzero.
+        target_sequence: u64,
+        /// Target resource generation; nonzero.
+        target_generation: u64,
+        /// Provisioned isolated destination store identity; required and
+        /// distinct from the restore target.
+        dest_store_id: String,
+        /// Capture residency denominator digest.
+        residency_denominator_digest: String,
+        /// Source snapshot digest the restore replays.
+        source_snapshot_digest: String,
+        /// Capture operation that produced the source snapshot.
+        capture_operation_id: String,
+        /// Console-presented capability introductions; an explicit array,
+        /// possibly explicitly empty, never absent.
+        introductions: Vec<Value>,
+    },
     MaintenanceRun,
     UserAutomation {
         operation: UserAutomationCommand,
@@ -208,9 +244,9 @@ impl CommandArguments {
             Self::ModuleRollback { .. } => CommandId::ModuleRollback,
             Self::ReleaseVerify => CommandId::ReleaseVerify,
             Self::DoctorIntegration { .. } => CommandId::DoctorIntegration,
-            Self::BackupCreate => CommandId::BackupCreate,
-            Self::BackupVerify => CommandId::BackupVerify,
-            Self::BackupRestoreTest => CommandId::BackupRestoreTest,
+            Self::BackupCreate { .. } => CommandId::BackupCreate,
+            Self::BackupVerify { .. } => CommandId::BackupVerify,
+            Self::BackupRestoreTest { .. } => CommandId::BackupRestoreTest,
             Self::MaintenanceRun => CommandId::MaintenanceRun,
             Self::UserAutomation { .. } => CommandId::UserAutomation,
         }
@@ -277,6 +313,44 @@ impl CommandArguments {
                 Self::validate_text(generation, "generation")
             }
             Self::DoctorIntegration { profile } => Self::validate_text(profile, "profile"),
+            // The backup variants carry explicit bounded typed fields, and
+            // the closed parsers are the only admission for them: a missing,
+            // blank, oversized, unknown-class, or non-isolated field refuses
+            // as a typed usage error here, so an empty payload can never
+            // select production scope or a default production destination.
+            Self::BackupCreate {
+                scope_descriptor,
+                class,
+            } => backup::parse_backup_create(scope_descriptor, class).map(|_| ()),
+            Self::BackupVerify { bundle_hex } => {
+                backup::parse_backup_verify(bundle_hex).map(|_| ())
+            }
+            Self::BackupRestoreTest {
+                bundle_hex,
+                destination_authorization_hex,
+                target_id,
+                target_lineage,
+                target_sequence,
+                target_generation,
+                dest_store_id,
+                residency_denominator_digest,
+                source_snapshot_digest,
+                capture_operation_id,
+                introductions,
+            } => backup::parse_backup_restore_test(
+                bundle_hex,
+                destination_authorization_hex,
+                target_id,
+                target_lineage,
+                *target_sequence,
+                *target_generation,
+                dest_store_id,
+                residency_denominator_digest,
+                source_snapshot_digest,
+                capture_operation_id,
+                introductions,
+            )
+            .map(|_| ()),
             Self::UserAutomation { operation } => operation
                 .validate()
                 .map_err(|error| CliError::UserAutomation(error.to_string())),
@@ -287,9 +361,6 @@ impl CommandArguments {
             | Self::DevCheckChanged
             | Self::DevTestChanged
             | Self::ReleaseVerify
-            | Self::BackupCreate
-            | Self::BackupVerify
-            | Self::BackupRestoreTest
             | Self::MaintenanceRun => Ok(()),
         }
     }
@@ -1423,6 +1494,9 @@ pub enum ArgumentKind {
     ModuleScope,
     ModuleGeneration,
     UserAutomation,
+    BackupCreate,
+    BackupVerify,
+    BackupRestoreTest,
 }
 
 /// Generated availability metadata; it is never inferred from a runtime probe.
@@ -1749,7 +1823,7 @@ static COMMANDS: &[CommandSpec] = &[
         summary: "manage a recovery artifact creation request",
         owner: "eliot-cli",
         required_work_id: "A-06",
-        argument_kind: ArgumentKind::Empty,
+        argument_kind: ArgumentKind::BackupCreate,
         effect: EffectClass::ReversibleMutation,
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
@@ -1763,7 +1837,7 @@ static COMMANDS: &[CommandSpec] = &[
         summary: "verify a recovery artifact",
         owner: "eliot-cli",
         required_work_id: "A-06",
-        argument_kind: ArgumentKind::Empty,
+        argument_kind: ArgumentKind::BackupVerify,
         effect: EffectClass::Candidate,
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
@@ -1777,7 +1851,7 @@ static COMMANDS: &[CommandSpec] = &[
         summary: "run an isolated restore test",
         owner: "eliot-cli",
         required_work_id: "A-06",
-        argument_kind: ArgumentKind::Empty,
+        argument_kind: ArgumentKind::BackupRestoreTest,
         effect: EffectClass::Candidate,
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
@@ -2096,9 +2170,19 @@ fn validate_result_for(
         // The catalogue remains an honest PlanGap until the Kernel selector
         // is registered, but an authenticated provider may already expose the
         // exact typed route. Accept that provider projection only for the
-        // UserAutomation command; local `execute` still returns PlanGap.
+        // commands whose authenticated provider route is registered in this
+        // surface: the UserAutomation narrow payload, and the three backup
+        // commands whose Kernel route refuses with a typed owner-admission
+        // outcome rather than a fake success. Local `execute` still returns
+        // PlanGap for every one of them.
         (CommandAvailability::PlanGap { .. }, CommandResult::Forwarded { .. })
-            if command == CommandId::UserAutomation => {}
+            if matches!(
+                command,
+                CommandId::UserAutomation
+                    | CommandId::BackupCreate
+                    | CommandId::BackupVerify
+                    | CommandId::BackupRestoreTest
+            ) => {}
         (
             CommandAvailability::Unsupported { dependency, detail },
             CommandResult::Unavailable {
