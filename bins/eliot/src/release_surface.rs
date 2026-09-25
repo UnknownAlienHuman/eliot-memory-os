@@ -1721,16 +1721,24 @@ fn optional_field<T, F>(
     }
 }
 
-fn render_text(value: &String) -> String {
-    value.clone()
-}
-
-fn render_number(value: &u64) -> String {
+/// Renders one scalar compared field as the exact string both sides are judged
+/// on.
+///
+/// Generic over the borrowed type so that a single renderer satisfies
+/// `F: Fn(&T) -> String` for every compared field type: a monomorphic
+/// `fn(&str) -> String` would not implement `Fn(&String) -> String`, which is
+/// what [`optional_field`] requires.
+fn render_display<T: std::fmt::Display>(value: &T) -> String {
     value.to_string()
 }
 
-fn render_list(value: &Vec<String>) -> String {
-    joined_list(value)
+/// Renders one list-valued compared field as one exact string.
+///
+/// Generic for the same [`optional_field`] reason as [`render_display`]; the
+/// separator-joined projection is identical on the manifest and observed sides,
+/// so a list difference is still reported field by field.
+fn render_list<T: AsRef<[String]>>(value: &T) -> String {
+    joined_list(value.as_ref())
 }
 
 #[derive(Default)]
@@ -1985,7 +1993,7 @@ fn compare_route_profile(
         section,
         expected,
         observed,
-        render_text,
+        render_display,
         [
             profile,
             portable_root,
@@ -2032,7 +2040,7 @@ fn compare_route_profile(
         section,
         expected,
         observed,
-        render_number,
+        render_display,
         [installation_sequence, authority_generation]
     );
     compare_optional_fields!(
@@ -2121,7 +2129,7 @@ fn compare_migration_evidence(collector: &mut DriftCollector, manifest: &Release
             &format!("{field}.architecture_sha256"),
             pair.architecture_sha256.as_ref(),
             Some(&artifact.snapshot.normative_pair.architecture_sha256),
-            render_text,
+            render_display,
         );
         optional_field(
             collector,
@@ -2129,7 +2137,7 @@ fn compare_migration_evidence(collector: &mut DriftCollector, manifest: &Release
             &format!("{field}.implementation_sha256"),
             pair.implementation_sha256.as_ref(),
             Some(&artifact.snapshot.normative_pair.implementation_sha256),
-            render_text,
+            render_display,
         );
     }
 }
@@ -2145,7 +2153,7 @@ fn compare_release_identity(collector: &mut DriftCollector, manifest: &ReleaseSu
         "product",
         identity.product.as_ref(),
         Some(&env!("CARGO_PKG_NAME").to_owned()),
-        render_text,
+        render_display,
     );
     optional_field(
         collector,
@@ -2153,7 +2161,7 @@ fn compare_release_identity(collector: &mut DriftCollector, manifest: &ReleaseSu
         "product_version",
         identity.product_version.as_ref(),
         Some(&env!("CARGO_PKG_VERSION").to_owned()),
-        render_text,
+        render_display,
     );
     let cross_check = "the bound release-scoped migration evidence snapshots";
     for (field, present) in [
@@ -2290,7 +2298,7 @@ fn compare_runtime_fingerprints(
         "active_runtime_generation",
         runtime.active_runtime_generation.as_ref(),
         observed.and_then(|route| route.generation.as_ref()),
-        render_text,
+        render_display,
     );
     optional_field(
         collector,
@@ -2298,7 +2306,7 @@ fn compare_runtime_fingerprints(
         "authority_generation",
         runtime.authority_generation.as_ref(),
         observed.and_then(|route| route.authority_generation.as_ref()),
-        render_number,
+        render_display,
     );
     optional_field(
         collector,
@@ -2306,7 +2314,7 @@ fn compare_runtime_fingerprints(
         "supervision_lease_scope_id",
         runtime.supervision_lease_scope_id.as_ref(),
         observed.and_then(|route| route.supervision_lease_scope_id.as_ref()),
-        render_text,
+        render_display,
     );
     optional_field(
         collector,
@@ -2314,7 +2322,7 @@ fn compare_runtime_fingerprints(
         "runtime_state_roots_digest",
         runtime.runtime_state_roots_digest.as_ref(),
         observed.and_then(|route| route.runtime_state_roots_digest.as_ref()),
-        render_text,
+        render_display,
     );
     optional_field(
         collector,
@@ -2322,7 +2330,7 @@ fn compare_runtime_fingerprints(
         "live_store_identity",
         runtime.live_store_identity.as_ref(),
         observed.map(live_store_identity_text).as_ref(),
-        render_text,
+        render_display,
     );
     optional_field(
         collector,
@@ -2330,7 +2338,7 @@ fn compare_runtime_fingerprints(
         "store_credential_target",
         runtime.store_credential_target.as_ref(),
         observed.and_then(|route| route.store_credential_target.as_ref()),
-        render_text,
+        render_display,
     );
     optional_field(
         collector,
@@ -2338,7 +2346,7 @@ fn compare_runtime_fingerprints(
         "protected_snapshot_digest",
         runtime.protected_snapshot_digest.as_ref(),
         observed.and_then(|route| route.protected_snapshot_digest.as_ref()),
-        render_text,
+        render_display,
     );
     collector.declared_only(
         section,
@@ -2613,24 +2621,20 @@ fn publish_manifest(
     Ok(bytes)
 }
 
-/// Compare one accepted manifest against the observed installation.
+/// Phase one: the accepted document's own identity, self-digest integrity, and
+/// required-section completeness.
 ///
-/// The comparison is read-only: it reads the manifest before and after the
-/// comparison, records both digests, and never regenerates, repairs, or
-/// re-signs the accepted bytes.
-pub fn verify_release_surface(
-    manifest_path: &Path,
-    observed_at_unix_seconds: i64,
-) -> Result<ReleaseSurfaceDriftReport, ReleaseSurfaceError> {
-    require_absolute(manifest_path, "manifest")?;
-    let before = read_bounded(manifest_path, "manifest", MAX_MANIFEST_BYTES)?;
-    let manifest: ReleaseSurfaceManifest = serde_json::from_slice(&before)
-        .map_err(|error| ReleaseSurfaceError::Serialization(error.to_string()))?;
-    let recomputed = manifest.compute_surface_digest()?;
-    let self_digest_verified = manifest.surface_digest.as_deref() == Some(recomputed.as_str());
-    let observed_route = observed_route_profile(&manifest);
-
-    let mut collector = DriftCollector::default();
+/// This phase answers only "is the accepted file the current release-surface
+/// manifest, are its bytes self-consistent, and does it carry all ten required
+/// I19.8 sections". It is separated from the observation phase because none of
+/// these verdicts depends on the installed surface, so an integrity failure
+/// cannot be confused with installation drift.
+fn compare_accepted_document(
+    collector: &mut DriftCollector,
+    manifest: &ReleaseSurfaceManifest,
+    recomputed_surface_digest: &str,
+    self_digest_verified: bool,
+) {
     let identity_section = ReleaseSurfaceSection::ProductAndSourceIdentity;
     match manifest.wire_id.as_deref() {
         Some(MANIFEST_WIRE_ID) => collector.scalar(
@@ -2666,13 +2670,18 @@ pub fn verify_release_surface(
     }
     let digest_section = ReleaseSurfaceSection::InvalidationAndExpiry;
     if self_digest_verified {
-        collector.scalar(digest_section, "surface_digest", &recomputed, &recomputed);
+        collector.scalar(
+            digest_section,
+            "surface_digest",
+            recomputed_surface_digest,
+            recomputed_surface_digest,
+        );
     } else {
         collector.push(
             digest_section,
             "surface_digest",
             ReleaseSurfaceFieldVerdict::Mismatch,
-            Some(recomputed.clone()),
+            Some(recomputed_surface_digest.to_owned()),
             manifest.surface_digest.clone(),
             "the accepted manifest bytes do not reproduce their own content digest",
         );
@@ -2690,19 +2699,48 @@ pub fn verify_release_surface(
             );
         }
     }
+}
 
-    compare_release_identity(&mut collector, &manifest);
-    compare_generated_surfaces(&mut collector, &manifest);
-    compare_installed_surface(&mut collector, &manifest);
-    compare_executables_and_route(&mut collector, &manifest, &observed_route);
-    compare_runtime_fingerprints(&mut collector, &manifest, &observed_route);
-    compare_capability_and_governance(&mut collector, &manifest);
-    compare_migration_and_rollback(&mut collector, &manifest);
-    compare_release_receipt(&mut collector, &manifest);
-    compare_invalidation(&mut collector, &manifest, observed_at_unix_seconds);
+/// Phase two: the field-level comparison of the accepted manifest against the
+/// observed installation, one I19.8 section at a time.
+///
+/// Each delegated phase owns one independent observation source — release
+/// payload bytes, installed Phase-A bytes, the installed route profile, the
+/// installed registry of registries, the bound evidence, and the release
+/// clock — so a failing section localizes to the observation that produced it.
+fn compare_observed_installation(
+    collector: &mut DriftCollector,
+    manifest: &ReleaseSurfaceManifest,
+    observed_route: &ObservedRoute,
+    observed_at_unix_seconds: i64,
+) {
+    compare_release_identity(collector, manifest);
+    compare_generated_surfaces(collector, manifest);
+    compare_installed_surface(collector, manifest);
+    compare_executables_and_route(collector, manifest, observed_route);
+    compare_runtime_fingerprints(collector, manifest, observed_route);
+    compare_capability_and_governance(collector, manifest);
+    compare_migration_and_rollback(collector, manifest);
+    compare_release_receipt(collector, manifest);
+    compare_invalidation(collector, manifest, observed_at_unix_seconds);
+}
 
-    let after = read_bounded(manifest_path, "manifest", MAX_MANIFEST_BYTES)?;
-    let findings = collector.into_sorted_findings();
+/// Phase three: aggregate the collected findings into the terminal read-only
+/// report.
+///
+/// Aggregation only. It derives per-verdict counts and the drift disposition
+/// from the typed findings and records both manifest observations; it never
+/// re-derives a verdict, and it holds no write path to the accepted bytes.
+fn build_drift_report(
+    manifest: &ReleaseSurfaceManifest,
+    findings: Vec<ReleaseSurfaceFinding>,
+    manifest_path: &Path,
+    before: &[u8],
+    after: &[u8],
+    recomputed_surface_digest: &str,
+    self_digest_verified: bool,
+    observed_at_unix_seconds: i64,
+) -> ReleaseSurfaceDriftReport {
     let mut counts = ReleaseSurfaceVerdictCounts::default();
     for finding in &findings {
         match finding.verdict {
@@ -2718,15 +2756,15 @@ pub fn verify_release_surface(
         .into_iter()
         .filter(|section| manifest.carries(*section))
         .collect();
-    Ok(ReleaseSurfaceDriftReport {
+    ReleaseSurfaceDriftReport {
         contract: DRIFT_REPORT_CONTRACT.to_owned(),
         contract_version: DRIFT_REPORT_CONTRACT_VERSION.to_owned(),
         manifest_path: manifest_path.display().to_string(),
-        manifest_sha256_before: sha256_hex(&before),
-        manifest_sha256_after: sha256_hex(&after),
+        manifest_sha256_before: sha256_hex(before),
+        manifest_sha256_after: sha256_hex(after),
         manifest_bytes_unchanged: before == after,
         manifest_self_digest_verified: self_digest_verified,
-        surface_digest: recomputed,
+        surface_digest: recomputed_surface_digest.to_owned(),
         release_id: manifest.release_id.clone(),
         generation: manifest
             .product_and_source_identity
@@ -2743,7 +2781,46 @@ pub fn verify_release_surface(
         },
         manifest_mutated: false,
         observed_at_unix_seconds,
-    })
+    }
+}
+
+/// Compare one accepted manifest against the observed installation.
+///
+/// The comparison is read-only: it reads the manifest before and after the
+/// comparison, records both digests, and never regenerates, repairs, or
+/// re-signs the accepted bytes.
+pub fn verify_release_surface(
+    manifest_path: &Path,
+    observed_at_unix_seconds: i64,
+) -> Result<ReleaseSurfaceDriftReport, ReleaseSurfaceError> {
+    require_absolute(manifest_path, "manifest")?;
+    let before = read_bounded(manifest_path, "manifest", MAX_MANIFEST_BYTES)?;
+    let manifest: ReleaseSurfaceManifest = serde_json::from_slice(&before)
+        .map_err(|error| ReleaseSurfaceError::Serialization(error.to_string()))?;
+    let recomputed = manifest.compute_surface_digest()?;
+    let self_digest_verified = manifest.surface_digest.as_deref() == Some(recomputed.as_str());
+    let observed_route = observed_route_profile(&manifest);
+
+    let mut collector = DriftCollector::default();
+    compare_accepted_document(&mut collector, &manifest, &recomputed, self_digest_verified);
+    compare_observed_installation(
+        &mut collector,
+        &manifest,
+        &observed_route,
+        observed_at_unix_seconds,
+    );
+
+    let after = read_bounded(manifest_path, "manifest", MAX_MANIFEST_BYTES)?;
+    Ok(build_drift_report(
+        &manifest,
+        collector.into_sorted_findings(),
+        manifest_path,
+        &before,
+        &after,
+        &recomputed,
+        self_digest_verified,
+        observed_at_unix_seconds,
+    ))
 }
 
 impl DriftCollector {
