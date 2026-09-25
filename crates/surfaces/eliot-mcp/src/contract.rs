@@ -861,6 +861,26 @@ pub const ADMITTED_TOOL_NAMES: [&str; 8] = [
     "eliot.finish",
 ];
 
+/// Canonical selector of the strict finish tool.
+const FINISH_TOOL_NAME: &str = "eliot.finish";
+
+/// Stable agent-facing reason code for a legacy caller-supplied finish proof.
+///
+/// I7.9 pins this exact code: a legacy caller-supplied proof is rejected with
+/// `LEGACY_FINISH_INPUT_REJECTED`; absence of strict fields never selects a
+/// weaker path. I7.20 carries the code in the cognition/proof group of the
+/// open reason registry. It is emitted by `TypedRejection::LegacyFinishProof`
+/// at the protected ingress and by the Governor finish-service guard for the
+/// wrapper-level proof field; no other rejection may use it.
+pub const LEGACY_FINISH_INPUT_REJECTED: &str = "LEGACY_FINISH_INPUT_REJECTED";
+
+/// Exact legacy member spelling rejected from `eliot.finish` arguments.
+///
+/// This is the `completion_proof` field the Governor finish wrapper captures
+/// solely to reject; the strict `FinishAttemptDraft` contract has no such
+/// member. Only this exact spelling is recognized — no aliases are invented.
+const LEGACY_FINISH_PROOF_MEMBER: &str = "completion_proof";
+
 /// Maximum decoded control-name length echoed in diagnostics. Longer names
 /// are truncated so diagnostics never echo protected bodies.
 const MAX_CONTROL_NAME_CHARS: usize = 64;
@@ -883,6 +903,15 @@ pub enum TypedRejection {
     UnknownVariant {
         /// Bounded variant name (tool selector).
         variant: String,
+    },
+    /// A legacy caller-supplied finish proof member was observed in an
+    /// `eliot.finish` request (Implements #1741: reject with
+    /// `LEGACY_FINISH_INPUT_REJECTED`). Only the exact static member
+    /// spelling is carried; no caller bytes are echoed.
+    #[error("LEGACY_FINISH_INPUT_REJECTED: {member}")]
+    LegacyFinishProof {
+        /// Exact static legacy member spelling that was rejected.
+        member: &'static str,
     },
     /// Raw bytes are not a well-formed protected envelope.
     #[error("MALFORMED_PROTECTED_REQUEST: {reason}")]
@@ -928,6 +957,20 @@ pub fn decode_protected_request_bytes(bytes: &[u8]) -> Result<ApplicationRequest
             variant: bound_control_name(&variant),
         });
     }
+    // A legacy caller-supplied proof in an `eliot.finish` request is rejected
+    // with its pinned reason code before strict typed decoding (which would
+    // otherwise report only a generic unknown-field failure). Strict
+    // `FinishAttemptDraft` requests without the member decode unchanged;
+    // other unknown members and missing strict fields keep their existing
+    // generic rejections — absence of strict fields never selects a weaker
+    // path and never becomes proof.
+    if tool_variant_name(&value).as_deref() == Some(FINISH_TOOL_NAME)
+        && finish_arguments_contain_legacy_proof(&value)
+    {
+        return Err(TypedRejection::LegacyFinishProof {
+            member: LEGACY_FINISH_PROOF_MEMBER,
+        });
+    }
     serde_json::from_slice::<ApplicationRequest>(bytes).map_err(|error| {
         let message = error.to_string();
         if message.starts_with("duplicate field") {
@@ -967,6 +1010,20 @@ fn field_between_backticks(message: &str) -> Option<String> {
 
 fn tool_variant_name(value: &Value) -> Option<String> {
     value.get("tool")?.get("name")?.as_str().map(str::to_owned)
+}
+
+/// Returns whether an `eliot.finish` request carries the legacy
+/// caller-supplied proof member in its arguments object.
+///
+/// Detection only: the collapsed `Value` is consulted for the exact static
+/// member spelling after the raw duplicate-key scan has already run, so this
+/// never weakens duplicate protection and never decodes caller bytes.
+fn finish_arguments_contain_legacy_proof(value: &Value) -> bool {
+    value
+        .get("tool")
+        .and_then(|tool| tool.get("arguments"))
+        .and_then(|arguments| arguments.get(LEGACY_FINISH_PROOF_MEMBER))
+        .is_some()
 }
 
 fn reject_duplicate_keys(bytes: &[u8]) -> Result<(), TypedRejection> {
