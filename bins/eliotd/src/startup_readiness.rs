@@ -214,6 +214,16 @@ pub enum CapabilityAvailability {
 }
 
 impl CapabilityAvailability {
+    /// The declared capability this verdict is about.
+    #[must_use]
+    pub const fn capability(&self) -> DeclaredStartupCapability {
+        match self {
+            Self::Available { capability, .. } | Self::Unavailable { capability, .. } => {
+                *capability
+            }
+        }
+    }
+
     /// Returns whether the operation may proceed on this capability.
     #[must_use]
     pub const fn is_available(&self) -> bool {
@@ -427,17 +437,32 @@ impl StartupReadinessProjection {
         outcome
     }
 
-    /// Retires every retained binding because the owner moved to a new
-    /// generation, and returns how many slots were retired.
+    /// Retires every retained *generation-scoped* binding because the owner
+    /// moved to a new generation, and returns how many slots were retired.
     ///
-    /// This is the one whole-ledger invalidation, and it exists because
-    /// generation replacement is a real owner event that revokes every
-    /// generation-bound proof at once (I1.5, I14.14). It is not a refresh
-    /// sweep: it does not re-attach, re-read or poll anything, and each slot
-    /// keeps its prior disposition as bounded history.
-    pub fn invalidate_for_replaced_generation(&mut self, reason: &str) -> usize {
+    /// Generation replacement is a real owner event that revokes every
+    /// generation-bound proof at once (I1.5, I14.14), so the affected slots are
+    /// retired through their owner rather than left readable.
+    ///
+    /// It is deliberately **not** a whole-ledger invalidation. The owner
+    /// session binding, the notification page and the Skill catalogue terms
+    /// carry no generation identity, and the authenticated owner session is the
+    /// one mandatory core capability: retiring it here would withhold core
+    /// readiness for the whole daemon on an ordinary generation advance, which
+    /// is the exact conflation this issue removes. Those three slots stay with
+    /// the owning owner that established them, which is also what
+    /// [`retained_matches_owner_generation`] already relies on.
+    ///
+    /// It is not a refresh sweep: it does not re-attach, re-read or poll
+    /// anything, and each retired slot keeps its prior disposition as bounded
+    /// history. A retired slot is re-evaluated on the next event that actually
+    /// concerns it (see [`Self::reevaluate_capability`]).
+    pub fn retire_generation_scoped_bindings(&mut self, reason: &str) -> usize {
         let mut retired = 0_usize;
         for capability in DeclaredStartupCapability::ALL {
+            if !is_generation_scoped(capability) {
+                continue;
+            }
             self.remember_prior_failure(capability);
             self.bindings.replace_disposition(
                 capability,
@@ -675,6 +700,21 @@ impl StartupReadinessProjection {
             self.prior_failures[capability.index()] = Some(reason);
         }
     }
+}
+
+/// Whether a declared slot's retained proof carries owner generation identity.
+///
+/// The three that do are the two Dreamer route contexts and the agent-fabric
+/// descriptor. The owner session binding, the notification page and the Skill
+/// catalogue terms do not, and are left to the owning owner that established
+/// them; the check below never invents a revocation the owner did not report.
+fn is_generation_scoped(capability: DeclaredStartupCapability) -> bool {
+    matches!(
+        capability,
+        DeclaredStartupCapability::DreamerIntake
+            | DeclaredStartupCapability::DreamerModel
+            | DeclaredStartupCapability::AgentFabric
+    )
 }
 
 /// Whether a retained proof was admitted under the current owner generation.

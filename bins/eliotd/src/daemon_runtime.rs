@@ -30,6 +30,9 @@ use eliotd::startup_capability_bindings::{
     DeclaredStartupCapability, RetainedStartupBinding, StartupBindingDisposition,
     StartupCapabilityBindings,
 };
+use eliotd::startup_readiness::{
+    CapabilityRefresh, CapabilityRefreshOutcome, StartupReadinessProjection, StartupRefreshReason,
+};
 use eliotd::testd_terminal_completion::{
     TestdOwnerDrainOutcome, ack_testd_owner_terminal_completion,
     bind_testd_owner_verifier_dispatch, emit_testd_owner_drain_skip,
@@ -262,7 +265,20 @@ enum LocalReadPollOutcome {
 /// share one flight branch so health and shutdown stay pollable while the
 /// step is outstanding; the step handles at most one pair per tick.
 enum LocalReadCompletion {
-    Settled(Result<LocalReadPollOutcome, String>),
+    Settled(Result<LocalReadStep, String>),
+}
+
+/// What one settled local-read step produced.
+///
+/// #2560: the readiness snapshot the step borrowed comes back with the result,
+/// so a demand-driven capability re-evaluation performed inside the flight is
+/// filed into the run loop's single authoritative projection instead of being
+/// kept in a second copy. There is no second owner and no shared handle.
+struct LocalReadStep {
+    /// The poll outcome the loop acts on.
+    outcome: LocalReadPollOutcome,
+    /// The readiness projection as the step left it.
+    readiness: StartupReadinessProjection,
 }
 
 struct LocalReadFlightState {
@@ -344,8 +360,15 @@ pub(super) fn run() -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     // #18 item A: bind the seven declared startup capabilities and record one
     // explicit disposition for each. The returned ledger — not control flow —
-    // decides whether this generation may report Governor readiness.
+    // decides what this generation observed.
     let bindings = bind_declared_startup_capabilities(&kernel, &mut composition);
+    // #2560: the retained ledger answers no readiness question. This projection
+    // derives the required set from the composition's own live owners and keeps
+    // core control readiness separate from optional capability availability, so
+    // one failed optional attach degrades exactly the operations that name it
+    // instead of withholding readiness for the whole daemon. It performs no IO
+    // and starts nothing.
+    let startup_readiness = StartupReadinessProjection::new(bindings, &composition);
     // #1688 (I14.22): the Governor-owned maintenance trigger evaluator runs
     // here, at the one startup-reconciliation site that holds both the concrete
     // `Arc<DaemonKernelClient>` and the composition, and again once the declared
@@ -359,16 +382,19 @@ pub(super) fn run() -> Result<(), String> {
     note_maintenance_trigger_at(
         &composition,
         MaintenanceTriggerOrigin::StartupReconciliation,
-        vec![bindings.report()],
+        vec![startup_readiness.ledger_report()],
         false,
     );
     note_maintenance_trigger_at(
         &composition,
         MaintenanceTriggerOrigin::ColdStartCompletion,
-        vec![format!(
-            "startup_bindings_complete={}",
-            bindings.is_complete()
-        )],
+        vec![
+            format!(
+                "startup_bindings_complete={}",
+                startup_readiness.every_declared_capability_bound()
+            ),
+            startup_readiness.report(),
+        ],
         false,
     );
     // Issue #88, wave 3: the ready answer carries the once-per-generation
@@ -376,14 +402,25 @@ pub(super) fn run() -> Result<(), String> {
     // Kernel re-verifies every echoed field on each submit.
     //
     // #18 item A: `report_ready` sends the Kernel `daemon_ready` operation, so
-    // reaching it on an unbound composition would claim a Governor readiness
-    // the daemon does not have. It is reached only when the ledger proves every
-    // declared capability bound. When one is unbound there is no
+    // reaching it on an unadmitted composition would claim a Governor
+    // readiness the daemon does not have.
+    //
+    // #2560: the gate is now the core readiness prerequisites — the composition's
+    // own owner set, generation/fence and recovery preconditions plus the
+    // mandatory capability set — and not "all seven optional slots bound". A
+    // failed notification/Dreamer/Skill attach therefore no longer withholds
+    // supervision for the whole daemon; it degrades exactly the operations that
+    // name that capability. When a core prerequisite is missing there is no
     // `daemon_ready` answer, so no supervision bundle exists: its lineage and
     // lease head are Kernel-authored and are never invented here. The daemon
     // stays alive, observable, and running, and renews no supervision progress
-    // until a later generation binds every capability.
-    let supervision_progress = if bindings.is_complete() {
+    // until a later pass satisfies the core prerequisites. The producer is still
+    // built once per generation, from the validated ready response and the real
+    // owner session only.
+    let supervision_progress = if startup_readiness
+        .core_readiness_prerequisites_satisfied()
+        .is_satisfied()
+    {
         let ready_supervision = kernel.report_ready().map_err(|error| error.to_string())?;
         let session_facts = kernel.owner_session_facts().ok_or_else(|| {
             "daemon has no validated Kernel session binding for supervision progress".to_owned()
@@ -429,20 +466,31 @@ pub(super) fn run() -> Result<(), String> {
     // warned with the partition).
     //
     // #18 item A: the reported readiness is the composition's computed
-    // readiness ANDed with the declared binding ledger, never a literal. An
-    // unbound capability therefore withholds readiness and reports visible
-    // degradation while the process keeps running.
+    // readiness ANDed with the declared binding ledger, never a literal.
+    //
+    // #2560: that AND is now split. Core control readiness is the composition's
+    // own owner state plus the mandatory capability set; optional capability
+    // availability is a separate, visible fact. So a ready generation with one
+    // degraded optional capability reports `ready` with `degraded`/`degraded`
+    // and the exact per-slot reason, while a missing owner session, a stale view
+    // or unresolved recovery still withholds ready and effects regardless of
+    // how many optional descriptors are present. `DaemonStatus` keeps its exact
+    // wire shape.
     let composition_status = composition.status();
-    let ready = composition_status.ready && bindings.is_complete();
+    let core_readiness = startup_readiness.core_readiness_prerequisites_satisfied();
+    let degraded_capabilities = startup_readiness.degraded_capabilities();
+    let capability_degraded = !degraded_capabilities.is_empty();
+    let ready = composition_status.ready && core_readiness.is_satisfied();
     let degraded = composition_status.degraded
-        || !bindings.is_complete()
+        || !core_readiness.is_satisfied()
+        || capability_degraded
         || capability_summary.has_restrictions();
-    // The composition's own health ladder is preserved: a stopped or stale
-    // composition still reports exactly that, and an unbound capability reads
-    // as degraded instead of healthy.
-    let health = if ready
-        || composition_status.health == "stopped"
+    // The composition's own health ladder is preserved exactly: a stopped or
+    // stale composition still reports that, and a ready generation is only
+    // reported healthy when no optional capability is degraded.
+    let health = if composition_status.health == "stopped"
         || composition_status.health == "stale"
+        || (ready && !capability_degraded)
     {
         composition_status.health.clone()
     } else {
@@ -455,6 +503,19 @@ pub(super) fn run() -> Result<(), String> {
         ..composition_status
     };
     let _ = eliotd::diagnostics::emit_daemon_readiness(ready, degraded);
+    // #2560: the same evaluation that produced the ready/degraded record above
+    // reaches diagnostics, so stdout, diagnostics and dispatch cannot disagree.
+    // Every declared slot is shown with its mandatory flag, its exact retained
+    // binding or exact reason, its current availability and any prior failure.
+    tracing::info!(
+        target: "eliotd::diagnostics",
+        event = "eliotd.startup_readiness",
+        core_ready = ready,
+        core_satisfied = core_readiness.is_satisfied(),
+        capability_degraded,
+        slots_accounted = startup_readiness.all_slots_accounted_for().is_accounted(),
+        readiness = %startup_readiness.report(),
+    );
     write_json(&ready_message(&status))?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -472,6 +533,7 @@ pub(super) fn run() -> Result<(), String> {
         Arc::clone(&kernel),
         Arc::clone(&composition),
         supervision_progress,
+        startup_readiness,
     ));
     // The loop dropped its handle on return, so this unwrap is deterministic;
     // the error arm documents the invariant instead of panicking on it.
@@ -803,7 +865,7 @@ fn record_startup_bindings(
     tracing::info!(
         target: "eliotd::diagnostics",
         event = "eliotd.startup_capability_bindings",
-        complete = bindings.is_complete(),
+        complete = bindings.every_declared_capability_bound(),
         unbound = bindings
             .unbound_reasons()
             .iter()
@@ -940,6 +1002,9 @@ async fn run_loop(
     kernel: Arc<DaemonKernelClient>,
     composition: SharedComposition,
     mut supervision_progress: Option<eliotd::SupervisionProgressProducer>,
+    // #2560: sole owner of the readiness projection; a local-read flight
+    // borrows a snapshot and returns it, so there is one authoritative copy.
+    mut startup_readiness: StartupReadinessProjection,
 ) -> Result<RunLoopExit, String> {
     let mut cadence = LoopCadence::production();
     // Sole owner of activation state. No second owner and no second
@@ -1004,6 +1069,7 @@ async fn run_loop(
                 start_tick_work(
                     &kernel,
                     &composition,
+                    &startup_readiness,
                     &mut local_read_flight,
                     &mut testd_owner_flight,
                     &mut flight,
@@ -1026,7 +1092,11 @@ async fn run_loop(
                 )?;
             }
             local_read_completion = next_local_read_completion(&mut local_read_flight) => {
-                settle_local_read_completion(local_read_completion, &mut local_read_flight)?;
+                settle_local_read_completion(
+                    local_read_completion,
+                    &mut local_read_flight,
+                    &mut startup_readiness,
+                )?;
             }
             testd_owner_completion = next_testd_owner_completion(&mut testd_owner_flight) => {
                 settle_testd_owner_completion(testd_owner_completion, &mut testd_owner_flight)?;
@@ -1046,6 +1116,7 @@ async fn run_loop(
                     &mut owner_feed_flight,
                     &mut supervision_progress,
                     &flight,
+                    &mut startup_readiness,
                 )
                 .await?;
             }
@@ -1150,11 +1221,12 @@ fn settle_activation_completion(
 fn start_tick_work(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
+    startup_readiness: &StartupReadinessProjection,
     local_read_flight: &mut LocalReadFlight,
     testd_owner_flight: &mut TestdOwnerFlight,
     flight: &mut ActivationFlight,
 ) {
-    maybe_start_local_read_poll(kernel, composition, local_read_flight);
+    maybe_start_local_read_poll(kernel, composition, startup_readiness, local_read_flight);
     maybe_start_testd_owner_drain(kernel, composition, testd_owner_flight);
     if decide_activation_tick(flight) == ActivationTickDecision::StartClaim {
         *flight = ActivationFlight::InFlight(ActivationFlightState {
@@ -1258,6 +1330,7 @@ async fn run_health_heartbeat_tick(
     owner_feed_flight: &mut OwnerFeedFlight,
     supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
     flight: &ActivationFlight,
+    startup_readiness: &mut StartupReadinessProjection,
 ) -> Result<(), String> {
     let health: StoreHealth = KernelTransitionPort::health(kernel.as_ref())
         .await
@@ -1272,6 +1345,13 @@ async fn run_health_heartbeat_tick(
     let activation_in_flight = matches!(flight, ActivationFlight::InFlight(_));
     {
         let guard = composition.lock().await;
+        // #2560: re-read the composition's own owner facts once per heartbeat.
+        // This performs no capability IO and re-files no slot, so a slow
+        // optional attach never blocks here and an unchanged owner does no work.
+        // Generation-scoped retained proofs are re-checked against the observed
+        // generation/epoch, so a proof admitted at an earlier generation reads
+        // as unavailable instead of staying usable because it was retained.
+        startup_readiness.observe_owner(&guard);
         note_maintenance_trigger_at(
             &guard,
             MaintenanceTriggerOrigin::AdmittedObservation,
@@ -1280,6 +1360,21 @@ async fn run_health_heartbeat_tick(
                 health.manifest_digest.as_str().to_owned(),
             ],
             activation_in_flight,
+        );
+    }
+    // #2560: the same readiness evaluation that produced the startup record
+    // reaches diagnostics here, so an operator sees exactly when a core
+    // prerequisite is missing or an optional capability is degraded. A fully
+    // healthy generation stays quiet rather than re-recording itself every
+    // heartbeat: this is a change report, not a poll of every optional provider.
+    let core_readiness = startup_readiness.core_readiness_prerequisites_satisfied();
+    if !core_readiness.is_satisfied() || !startup_readiness.degraded_capabilities().is_empty() {
+        tracing::info!(
+            target: "eliotd::diagnostics",
+            event = "eliotd.startup_readiness_heartbeat",
+            core_satisfied = core_readiness.is_satisfied(),
+            slots_accounted = startup_readiness.all_slots_accounted_for().is_accounted(),
+            readiness = %startup_readiness.report(),
         );
     }
     if let Some(producer) = supervision_progress.as_mut() {
@@ -1652,10 +1747,13 @@ async fn run_owner_feed_sync(
 fn start_local_read_poll(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
+    startup_readiness: StartupReadinessProjection,
 ) -> Pin<Box<dyn std::future::Future<Output = LocalReadCompletion>>> {
     let kernel_clone = Arc::clone(kernel);
     Box::pin(async move {
-        LocalReadCompletion::Settled(run_local_read_poll(&kernel_clone, composition).await)
+        LocalReadCompletion::Settled(
+            run_local_read_poll(&kernel_clone, composition, startup_readiness).await,
+        )
     })
 }
 
@@ -1665,11 +1763,18 @@ fn start_local_read_poll(
 fn maybe_start_local_read_poll(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
+    startup_readiness: &StartupReadinessProjection,
     flight: &mut LocalReadFlight,
 ) {
     if decide_local_read_tick(flight) == LocalReadTickDecision::StartPoll {
         *flight = LocalReadFlight::InFlight(LocalReadFlightState {
-            future: start_local_read_poll(kernel, Arc::clone(composition)),
+            // #2560: a bounded snapshot travels with the step and comes back
+            // with it. The run loop keeps the only authoritative copy.
+            future: start_local_read_poll(
+                kernel,
+                Arc::clone(composition),
+                startup_readiness.clone(),
+            ),
         });
     }
 }
@@ -1691,13 +1796,37 @@ async fn next_local_read_completion(flight: &mut LocalReadFlight) -> LocalReadCo
 fn settle_local_read_completion(
     completion: LocalReadCompletion,
     flight: &mut LocalReadFlight,
+    startup_readiness: &mut StartupReadinessProjection,
 ) -> Result<(), String> {
     match completion {
-        LocalReadCompletion::Settled(Ok(_)) => {
+        LocalReadCompletion::Settled(Ok(step)) => {
+            // #2560: take the projection back, so any demand-driven
+            // re-evaluation the step performed becomes the loop's state.
+            *startup_readiness = step.readiness;
+            // The poll outcome itself stays what it always was — a settle
+            // signal, not a decision — but it is named rather than dropped, so
+            // a capability refusal is distinguishable from an ordinary accept
+            // in the loop's own record.
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.local_read_settled",
+                outcome = local_read_outcome_name(&step.outcome),
+                readiness = %startup_readiness.report(),
+            );
             *flight = LocalReadFlight::Idle;
             Ok(())
         }
         LocalReadCompletion::Settled(Err(error)) => Err(error),
+    }
+}
+
+/// Names one settled local-read poll outcome for the loop's own record.
+fn local_read_outcome_name(outcome: &LocalReadPollOutcome) -> &'static str {
+    match outcome {
+        LocalReadPollOutcome::IdleBackoff => "idle_backoff",
+        LocalReadPollOutcome::Accepted => "accepted",
+        LocalReadPollOutcome::Expired => "expired",
+        LocalReadPollOutcome::StaleAttempt => "stale_attempt",
     }
 }
 
@@ -1713,7 +1842,8 @@ fn settle_local_read_completion(
 async fn run_local_read_poll(
     kernel: &DaemonKernelClient,
     composition: SharedComposition,
-) -> Result<LocalReadPollOutcome, String> {
+    mut startup_readiness: StartupReadinessProjection,
+) -> Result<LocalReadStep, String> {
     // #740: receipt span over the claim/forward/submit poll step. Pair
     // presence and submit outcome are named; payload bytes never are.
     let _span = tracing::info_span!("eliotd.local_read_poll").entered();
@@ -1722,7 +1852,13 @@ async fn run_local_read_poll(
         .await
         .map_err(|error| format!("Kernel local-read pair claim: {error}"))?;
     let Some((envelope, tool, attempt)) = pair else {
-        return Ok(LocalReadPollOutcome::IdleBackoff);
+        return Ok(LocalReadStep {
+            outcome: LocalReadPollOutcome::IdleBackoff,
+            readiness: startup_readiness,
+        });
+    };
+    let step = |outcome: LocalReadPollOutcome, readiness: StartupReadinessProjection| {
+        LocalReadStep { outcome, readiness }
     };
     // Issue #2559: the composition guard is held only around the Skill
     // drive, which borrows the Governor owner. Ordinary forwarded reads use
@@ -1737,26 +1873,127 @@ async fn run_local_read_poll(
     // byte-identical. The served result body submits through the same
     // idempotent leg below, so claimed skill pairs settle exactly like
     // forwarded ones.
+    //
+    // #2560: a request that names an unavailable startup capability is refused
+    // specifically, and only that request is. The check runs before the
+    // composition guard is taken (it needs no owner state) and before any
+    // dispatch, so a refusal never blocks on the Skill driver and never stops
+    // an unrelated admitted read. The claimed pair still settles through the
+    // same idempotent submit leg, so a capability refusal is never a dropped
+    // pair.
+    if eliotd::skill_dispatch::is_skill_tool(&tool) {
+        let refused = skill_capability_refusal(&mut startup_readiness);
+        if let Some(refusal) = refused {
+            let body = eliotd::skill_dispatch::skill_result_body(
+                &envelope,
+                &attempt,
+                &eliot_agent_bridge_core::SkillResultEnvelope::refused(
+                    &eliot_skill::SkillError::Surface(refusal.clone()),
+                ),
+            )
+            .map_err(|error| format!("daemon skill capability refusal body: {error}"))?;
+            let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
+                LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,
+                LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
+                LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
+            };
+            return Ok(step(outcome, startup_readiness));
+        }
+    }
     if eliotd::skill_dispatch::is_skill_tool(&tool) {
         let body = {
             let guard = composition.lock().await;
             eliotd::skill_dispatch::serve_skill_pair(&guard, kernel, &envelope, &tool, &attempt)
                 .await
         };
-        return match submit_local_read_result_idempotent(kernel, &body).await? {
-            LocalReadSubmitOutcome::Accepted => Ok(LocalReadPollOutcome::Accepted),
-            LocalReadSubmitOutcome::Expired => Ok(LocalReadPollOutcome::Expired),
-            LocalReadSubmitOutcome::StaleAttempt => Ok(LocalReadPollOutcome::StaleAttempt),
+        let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
+            LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,
+            LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
+            LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
         };
+        return Ok(step(outcome, startup_readiness));
     }
     let body = forward_admitted_local_read(kernel, envelope, tool, attempt)
         .await
         .map_err(|error| format!("daemon local-read forward: {error}"))?;
-    match submit_local_read_result_idempotent(kernel, &body).await? {
-        LocalReadSubmitOutcome::Accepted => Ok(LocalReadPollOutcome::Accepted),
-        LocalReadSubmitOutcome::Expired => Ok(LocalReadPollOutcome::Expired),
-        LocalReadSubmitOutcome::StaleAttempt => Ok(LocalReadPollOutcome::StaleAttempt),
+    let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
+        LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,
+        LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
+        LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
+    };
+    Ok(step(outcome, startup_readiness))
+}
+
+/// Re-evaluates the Skill startup capabilities this demand names, and returns
+/// the exact refusal when one of them is still unavailable afterwards (#2560).
+///
+/// This is the demand-driven half of the updateable projection: an admitted
+/// Skill request is the real event that makes one slot worth reevaluating, so
+/// only that slot is touched. It re-runs the owning attach — the same
+/// `attach_skill_tool_source` the startup path used, which proves the live
+/// canonical tools-owner edge and installs, issues and displays nothing — and
+/// files the owner's own outcome through
+/// [`StartupReadinessProjection::reevaluate_capability`]. Nothing here launches
+/// a model or a worker, and a slot that is already available is never
+/// re-evaluated, so the step performs no work on the healthy path.
+fn skill_capability_refusal(startup_readiness: &mut StartupReadinessProjection) -> Option<String> {
+    let required = [
+        DeclaredStartupCapability::SkillToolSource,
+        DeclaredStartupCapability::SkillToolBasis,
+    ];
+    let missing = startup_readiness
+        .capabilities_available_for_operation(&required)
+        .into_iter()
+        .find(|availability| !availability.is_available())?;
+    let capability = missing.capability();
+    if capability == DeclaredStartupCapability::SkillToolSource {
+        // The one slot this demand can actually re-evaluate: re-run the real
+        // owner attach and file exactly what it returned.
+        let observed = attach_skill_tool_source().map(|admitted_definition_version| {
+            RetainedStartupBinding::SkillToolSource {
+                admitted_definition_version,
+            }
+        });
+        let reason = observed.as_ref().err().cloned();
+        let outcome = startup_readiness.reevaluate_capability(CapabilityRefresh {
+            capability,
+            reason: StartupRefreshReason::CapabilityDemanded,
+            observed,
+        });
+        if matches!(outcome, CapabilityRefreshOutcome::Rebound { .. }) {
+            return skill_capability_refusal_after_rebind(startup_readiness, &required);
+        }
+        return Some(format!(
+            "startup capability {} is unavailable: {}",
+            capability.as_str(),
+            reason.unwrap_or_else(|| "owner attach did not bind".to_owned())
+        ));
     }
+    Some(format!(
+        "startup capability {} is unavailable: {}",
+        capability.as_str(),
+        missing.refusal_reason().unwrap_or("no owner evidence")
+    ))
+}
+
+/// Re-reads the operation's availability once after a successful rebind.
+///
+/// The rebind above restored exactly one slot, so a second refusal here can
+/// only be the other slot of the same operation. Kept as its own function so
+/// the recursive call is a single reviewed edge rather than a loop.
+fn skill_capability_refusal_after_rebind(
+    startup_readiness: &StartupReadinessProjection,
+    required: &[DeclaredStartupCapability],
+) -> Option<String> {
+    let missing = startup_readiness
+        .capabilities_available_for_operation(required)
+        .into_iter()
+        .find(|availability| !availability.is_available())?;
+    Some(format!(
+        "startup capability {} is unavailable: {}",
+        missing.capability().as_str(),
+        missing.refusal_reason().unwrap_or("no owner evidence")
+    ))
 }
 
 /// Submits one forwarded local-read result body, retrying once with the
