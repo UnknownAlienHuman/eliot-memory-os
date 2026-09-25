@@ -2000,8 +2000,41 @@ impl GrantActivationPort {
                 continue;
             };
             let is_revoked = covered.contains(&hydration.intent.grant_id);
-            let status = match row.phase() {
-                OperationalPhase::Active if !is_revoked => LiveStatus::Active,
+            match row.phase() {
+                OperationalPhase::Active if !is_revoked => {
+                    // Restart rehydration of one standalone authority-root
+                    // activation (`#1110` W5). The identity is reinstated only
+                    // after triple agreement: the ORS row carries the exact
+                    // admitted activation bytes, its store-issued receipt names
+                    // that record and subject at `Active`, and the
+                    // opaque/intent seal holds under the admitted epoch. The
+                    // reinstalled ledger state is the one the commit path
+                    // wrote, so an exact replay of the same `activate_grant`
+                    // resolves as a replay and returns the same canonical
+                    // receipt instead of refusing a reactivation.
+                    let active_epoch = hydration.intent.binding.authority_epoch.clone();
+                    verify_grant_seal(&hydration.durable_record, &hydration.intent, &active_epoch)?;
+                    if row.record() != hydration.durable_record.record()
+                        || row.receipt().record_id().as_str()
+                            != hydration.durable_record.record().record_id.as_str()
+                        || row.receipt().subject_id().as_str() != hydration.intent.grant_id
+                        || row.receipt().phase() != OperationalPhase::Active
+                    {
+                        return Err(KernelError::RecoveryUnavailable(
+                            "owner-admitted grant row disagrees with its admitted activation"
+                                .to_owned(),
+                        ));
+                    }
+                    let digest = hydrated_grant_member_digest(&hydration)?;
+                    let receipt = runtime_activation_receipt(&hydration.intent, &active_epoch)?;
+                    if candidate
+                        .intents
+                        .contains_key(&hydration.intent.operation_id)
+                    {
+                        return Err(KernelError::IdempotencyConflict);
+                    }
+                    install_root_activation(&mut candidate, &hydration.intent, &receipt, digest);
+                }
                 OperationalPhase::Applying if !is_revoked => {
                     if hydration.intent.parent_grant_id.is_some() {
                         return Err(KernelError::RecoveryUnavailable(
@@ -2021,25 +2054,26 @@ impl GrantActivationPort {
                     );
                     continue;
                 }
-                OperationalPhase::Fenced if is_revoked => LiveStatus::Revoked,
+                OperationalPhase::Fenced if is_revoked => {
+                    candidate.grants.insert(
+                        hydration.intent.grant_id.clone(),
+                        LiveGrantRecord {
+                            authority_root_ref: hydration.intent.authority_root_ref.clone(),
+                            binding: hydration.intent.binding.clone(),
+                            allowed_effect: hydration.intent.allowed_effect,
+                            proof_ceiling: hydration.intent.proof_ceiling,
+                            expires_at_ms: hydration.intent.expires_at_ms,
+                            status: LiveStatus::Revoked,
+                        },
+                    );
+                }
                 _ => {
                     return Err(KernelError::RecoveryUnavailable(
                         "owner-admitted grant phase disagrees with durable closure coverage"
                             .to_owned(),
                     ));
                 }
-            };
-            candidate.grants.insert(
-                hydration.intent.grant_id.clone(),
-                LiveGrantRecord {
-                    authority_root_ref: hydration.intent.authority_root_ref.clone(),
-                    binding: hydration.intent.binding.clone(),
-                    allowed_effect: hydration.intent.allowed_effect,
-                    proof_ceiling: hydration.intent.proof_ceiling,
-                    expires_at_ms: hydration.intent.expires_at_ms,
-                    status,
-                },
-            );
+            }
         }
         for hydration in boundary
             .hydration
@@ -2062,10 +2096,138 @@ impl GrantActivationPort {
                 .supporting_grant_ids
                 .iter()
                 .any(|grant_id| covered.contains(grant_id));
+            let active_epoch = hydration.intent.binding.authority_epoch.clone();
             let status = match row.phase() {
-                OperationalPhase::Active if !support_revoked => LiveStatus::Active,
+                OperationalPhase::Active if !support_revoked => {
+                    // Restart rehydration of one standalone introduction
+                    // activation (`#1110` W5): the same triple agreement as
+                    // the admitted grant row, then the exact
+                    // `PortIntentRecord` the commit path wrote, so an exact
+                    // replay returns the same canonical receipt.
+                    verify_introduction_seal(
+                        &hydration.durable_record,
+                        &hydration.intent,
+                        &active_epoch,
+                    )?;
+                    if row.record() != hydration.durable_record.record()
+                        || row.receipt().record_id().as_str()
+                            != hydration.durable_record.record().record_id.as_str()
+                        || row.receipt().subject_id().as_str() != hydration.intent.introduction_id
+                        || row.receipt().phase() != OperationalPhase::Active
+                    {
+                        return Err(KernelError::RecoveryUnavailable(
+                            "owner-admitted introduction row disagrees with its admitted activation"
+                                .to_owned(),
+                        ));
+                    }
+                    let digest = hydrated_introduction_digest(&hydration)?;
+                    let receipt =
+                        runtime_introduction_activation_receipt(&hydration.intent, &active_epoch)?;
+                    if candidate
+                        .intents
+                        .contains_key(&hydration.intent.operation_id)
+                    {
+                        return Err(KernelError::IdempotencyConflict);
+                    }
+                    candidate.note_revision(
+                        &hydration.intent.authority_root_ref,
+                        hydration.intent.grant_graph_revision,
+                    );
+                    candidate.intents.insert(
+                        hydration.intent.operation_id.clone(),
+                        PortIntentRecord {
+                            operation_id: hydration.intent.operation_id.clone(),
+                            digest,
+                            kind: IntentKind::IntroductionActivation,
+                            disposition: IntentDisposition::Committed(
+                                CommittedReceipt::Activation(receipt),
+                            ),
+                            fenced: Vec::new(),
+                            closure_receipt: None,
+                            closure_member_receipts: Vec::new(),
+                        },
+                    );
+                    LiveStatus::Active
+                }
                 OperationalPhase::Applying if !support_revoked => continue,
                 OperationalPhase::Fenced if support_revoked => LiveStatus::Revoked,
+                OperationalPhase::Fenced => {
+                    // A standalone `revoke_introduction` writes no
+                    // `GrantClosureReceipt`, so the durable closure coverage
+                    // above cannot explain this fence and the restart would
+                    // refuse to bind the owner at all. Prove the row IS the
+                    // fence of the admitted activation bytes instead: its
+                    // record identity must be exactly the derived standalone
+                    // revocation identity, and every other field must equal the
+                    // admitted activation record. This is the same
+                    // `activation_bytes_equal` fence proof
+                    // `verify_bundle_provenance` already accepts, and it is
+                    // narrowing only — the result is `Revoked`, never
+                    // `Active` (I6.15 "restore never reactivates a path or
+                    // epoch"; I14.20 "restore never revives an activation
+                    // record as current authority").
+                    let revoke_operation_id = thin_operation_id(
+                        "revoke-introduction",
+                        hydration.intent.introduction_id.as_str(),
+                        hydration.intent.snapshot_id.as_str(),
+                        &active_epoch,
+                    );
+                    let fence = introduction_fence_input(
+                        hydration.durable_record.record(),
+                        &revoke_operation_id,
+                    )?;
+                    if row.record().record_id.as_str() != fence.record().record_id.as_str()
+                        || !activation_bytes_equal(row.record(), fence.record())
+                        || row.receipt().record_id().as_str() != fence.record().record_id.as_str()
+                        || row.receipt().subject_id().as_str() != hydration.intent.introduction_id
+                        || row.receipt().phase() != OperationalPhase::Fenced
+                    {
+                        return Err(KernelError::RecoveryUnavailable(
+                            "owner-admitted introduction phase disagrees with durable closure coverage"
+                                .to_owned(),
+                        ));
+                    }
+                    let revoked = IntroductionRevocationIntent {
+                        operation_id: revoke_operation_id.clone(),
+                        introduction_id: hydration.intent.introduction_id.clone(),
+                        authority_root_ref: hydration.intent.authority_root_ref.clone(),
+                        snapshot_id: hydration.intent.snapshot_id.clone(),
+                        grant_graph_revision: hydration.intent.grant_graph_revision,
+                        binding: hydration.intent.binding.clone(),
+                        unknown_outcome_operations: Vec::new(),
+                        receipt_obligations: Vec::new(),
+                    };
+                    let digest = revoked.digest()?;
+                    let receipt = AuthorityRevocationReceipt {
+                        revocation_id: format!("revocation-{revoke_operation_id}"),
+                        snapshot_id: hydration.intent.snapshot_id.clone(),
+                        authority_epoch: active_epoch,
+                        state: AuthorityState::Revoked,
+                    };
+                    receipt.validate()?;
+                    if candidate.intents.contains_key(&revoke_operation_id) {
+                        return Err(KernelError::IdempotencyConflict);
+                    }
+                    candidate.note_revision(
+                        &hydration.intent.authority_root_ref,
+                        hydration.intent.grant_graph_revision,
+                    );
+                    candidate.intents.insert(
+                        revoke_operation_id.clone(),
+                        PortIntentRecord {
+                            operation_id: revoke_operation_id,
+                            digest,
+                            kind: IntentKind::IntroductionRevocation,
+                            disposition: IntentDisposition::Committed(
+                                CommittedReceipt::Revocation(receipt),
+                            ),
+                            fenced: vec![hydration.intent.introduction_id.clone()],
+                            closure_receipt: None,
+                            closure_member_receipts: Vec::new(),
+                        },
+                    );
+                    LiveStatus::Revoked
+                }
                 _ => {
                     return Err(KernelError::RecoveryUnavailable(
                         "owner-admitted introduction phase disagrees with durable closure coverage"
