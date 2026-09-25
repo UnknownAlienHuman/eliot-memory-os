@@ -2399,6 +2399,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-build-test-graph",
  "eliot-contracts",
+ "eliot-evidence",
  "eliot-instrument-api",
  "eliot-instrument-scip",
  "eliot-observability",

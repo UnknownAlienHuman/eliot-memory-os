@@ -58,9 +58,9 @@ use eliot_diagnostic::{
 use eliot_evaluation_contracts::{TerminalVerifierBinding, VerifierEvidenceRef};
 use eliot_finish::{DescendantClosure, FinishDecisionReceipt, FinishService};
 use eliot_instrument_api::{
-    EvidenceAxes, EvidenceCoverage, EvidenceFreshness, ExecutionStatus, InstrumentInvocation,
-    InstrumentKind, NormalizedEvidence, RawEvidence, RawEvidenceSource, VerificationOutcome,
-    VerificationRun,
+    CaptureProvenance, EvidenceAxes, EvidenceCoverage, EvidenceFreshness, ExecutionStatus,
+    InstrumentInvocation, InstrumentKind, NormalizedEvidence, RawEvidence, RawEvidenceSource,
+    VerificationOutcome, VerificationRun, WorkscopeIdentity,
 };
 use eliot_instrument_nextest::{
     NextestTestEvent, NextestTestStatus, catalog_test_id, parse_test_events,
@@ -3588,6 +3588,30 @@ fn normalize_nextest_run(
             "registered nextest normalizer has no stdout event stream".to_owned(),
         ));
     }
+    // I10.8.5 capture attach: every normalized item carries the
+    // owner-observed executable identity, config hash, WorkScope/candidate
+    // identity, profile revision, and truncation signal of the exact run it
+    // was parsed from. Timing detail stays on the run clocks; the TestD
+    // receipt projects no Job Object resource accounting, so
+    // `resource_outcome` stays absent rather than invented. Parse success is
+    // proven by the fail-closed full-consumption check below, so no parse
+    // note is attached.
+    let stream_truncated = stdout.iter().any(|evidence| evidence.truncated);
+    let capture = CaptureProvenance {
+        executable_identity: Some(tool.nextest_identity()),
+        config_hash: Some(plan.planned.verifier_config_hash.clone()),
+        workscope: Some(WorkscopeIdentity {
+            branch: Some(source_before.branch.clone()),
+            commit: Some(source_before.commit.clone()),
+            dirty_state_sha256: Some(source_before.dirty_state_sha256.clone()),
+            target: Some(job.invocation.target.clone()),
+            scope: Some(job.invocation.declared_scope.clone()),
+        }),
+        profile_revision: Some(job.invocation.profile.clone()),
+        resource_outcome: None,
+        truncated: stream_truncated,
+        parse_note: None,
+    };
     let mut stream = Vec::new();
     let mut spans = Vec::new();
     for evidence in stdout {
@@ -3724,7 +3748,7 @@ fn normalize_nextest_run(
                 // and run-level status are not item-level acceptance proof.
                 value["nextest_test_id"] = serde_json::json!(catalog_test_id(name));
                 value["nextest_status"] = serde_json::json!(status_label);
-                normalized.push(NormalizedEvidence {
+                let mut item = NormalizedEvidence {
                     evidence_id,
                     raw_artifact_id: raw_observation_ref,
                     normalizer: ContractId::new(DIAGNOSTIC_CONTRACT).map_err(|error| {
@@ -3742,7 +3766,13 @@ fn normalize_nextest_run(
                     } else {
                         EvidenceCoverage::PartialForScope
                     },
-                });
+                };
+                item.attach_capture_provenance(&capture).map_err(|error| {
+                    CompositionError::Recovery(format!(
+                        "normalized evidence capture attach failed: {error}"
+                    ))
+                })?;
+                normalized.push(item);
             }
         }
         line_start = line_end.saturating_add(1);
