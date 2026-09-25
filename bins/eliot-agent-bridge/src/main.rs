@@ -5,8 +5,8 @@ mod request_input;
 use eliot_agent_bridge::{
     AdmissionBasis, BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError,
     CurrentAssessment, FiringEvidence, HotResourceView, InjectionReceipt, ItemDisposition,
-    NormalizedCue, Profile, ScopeLevel, UnderstandingBootstrap, UseOutcome,
-    kernel_ports_with_declaration, parse_args, reactive_runtime_composition,
+    NormalizedCue, Profile, UnderstandingBootstrap, UseOutcome, kernel_ports_with_declaration,
+    parse_args, reactive_runtime_composition,
 };
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
@@ -827,9 +827,13 @@ fn main() {
 /// Serves one bounded `GetUnderstandingBootstrap` retrieval.
 ///
 /// An optional context establishes the session inputs first; invalid context
-/// fails closed and stores nothing. The first successful retrieval in a
-/// session also satisfies the once-per-session auto-boot; later retrievals
-/// use the explicit path so they stay available after auto-boot delivery.
+/// fails closed and stores nothing. The context is noted together with the
+/// supplied task inputs as one owner-produced snapshot sealed to the live
+/// attach, so the once-per-session auto-boot below composes from the same
+/// snapshot rather than a separate empty task set. The first successful
+/// retrieval in a session also satisfies the once-per-session auto-boot;
+/// later retrievals use the explicit path so they stay available after
+/// auto-boot delivery.
 fn handle_bootstrap(
     runner: &mut BridgeRunner,
     context: Option<BootstrapContext>,
@@ -837,7 +841,7 @@ fn handle_bootstrap(
     requested_assessment: CurrentAssessment,
 ) -> Response {
     if let Some(context) = context {
-        if let Err(error) = runner.note_bootstrap_context(context) {
+        if let Err(error) = runner.note_owner_snapshot(context, tasks.clone()) {
             return Response::Error {
                 code: "BOOTSTRAP_CONTEXT_REJECTED",
                 detail: error.to_string(),
@@ -860,8 +864,12 @@ fn handle_bootstrap(
 ///
 /// Error and dry-run responses never carry a bootstrap: a dry run is a
 /// zero-side-effect preview, not a successful ELIOT response, and its
-/// envelope has no bootstrap slot. When no valid context is noted
-/// the response is left untouched rather than carrying invented authority.
+/// envelope has no bootstrap slot. When no owner snapshot is noted, or the
+/// live attach moved away from the noted seal, the response is left
+/// untouched rather than carrying invented authority. The composed task
+/// inputs are always the retained owner-supplied snapshot tasks — never a
+/// separate empty candidate set — so the agent identifies or explicitly
+/// requests the intended task from owner-produced inputs alone.
 fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
     let slot = match response {
         Response::Status { bootstrap, .. }
@@ -881,11 +889,7 @@ fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
         }
     };
     if slot.is_none() {
-        let tasks = BootstrapTaskInputs {
-            scope_level: ScopeLevel::Session,
-            candidates: Vec::new(),
-            authoritative_selection: None,
-        };
+        let tasks = runner.retained_auto_boot_tasks();
         *slot = runner.take_first_response_bootstrap(&tasks, CurrentAssessment::Ready);
     }
 }
@@ -1968,6 +1972,7 @@ fn write_response(response: &Response) -> StdioWriteReceipt {
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use eliot_agent_bridge::ScopeLevel;
     use serde_json::Value;
 
     const INVOKE: &str = r#"{

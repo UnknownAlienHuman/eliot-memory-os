@@ -156,6 +156,20 @@ pub struct BootstrapContext {
     pub role_lease_ref: String,
     pub state_fence_ref: String,
     pub governance: GovernanceEvidence,
+    /// Selected qualified route profile reference (opaque owner handle).
+    ///
+    /// Carried so the default bootstrap preserves the route profile the
+    /// Decision Safety Floor below was selected under; the bridge never
+    /// qualifies a route itself.
+    #[serde(default)]
+    pub route_profile_ref: String,
+    /// Decision Safety Floor member handles carried in default output.
+    ///
+    /// Opaque owner handles (bounded like governance evidence); full floor
+    /// content stays behind explicit expansion. Presence is not invented:
+    /// an empty list projects no floor rather than a forged one.
+    #[serde(default)]
+    pub decision_safety_floor_refs: Vec<String>,
     #[serde(default)]
     pub supported_count: u32,
     #[serde(default)]
@@ -192,6 +206,8 @@ impl BootstrapContext {
         role_lease_ref: String,
         state_fence_ref: String,
         governance: GovernanceEvidence,
+        route_profile_ref: String,
+        decision_safety_floor_refs: Vec<String>,
         supported_count: u32,
         verified_count: u32,
         candidate_count: u32,
@@ -211,6 +227,8 @@ impl BootstrapContext {
             role_lease_ref,
             state_fence_ref,
             governance,
+            route_profile_ref,
+            decision_safety_floor_refs,
             supported_count,
             verified_count,
             candidate_count,
@@ -260,6 +278,9 @@ pub struct UnderstandingBootstrap {
     pub role_lease_ref: String,
     pub state_fence_ref: String,
     pub current_assessment: CurrentAssessment,
+    pub route_profile_ref: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_safety_floor_refs: Vec<String>,
     pub supported_count: u32,
     pub verified_count: u32,
     pub candidate_count: u32,
@@ -355,6 +376,20 @@ fn validate_context(context: &BootstrapContext) -> Result<(), BootstrapError> {
     bounded_list(&context.attention_handles, "ATTENTION_BOUND", MAX_HANDLES)?;
     bounded_list(&context.problem_handles, "PROBLEMS_BOUND", MAX_HANDLES)?;
     bounded_list(&context.conflicts_unknowns, "CONFLICTS_BOUND", MAX_HANDLES)?;
+    if context.route_profile_ref.len() > MAX_HANDLE_LEN {
+        return Err(BootstrapError::new(
+            "ROUTE_PROFILE_BOUND",
+            "route profile reference exceeds bound",
+        ));
+    }
+    if !context.route_profile_ref.is_empty() {
+        non_blank(&context.route_profile_ref, "ROUTE_PROFILE_MISSING")?;
+    }
+    bounded_list(
+        &context.decision_safety_floor_refs,
+        "FLOOR_BOUND",
+        MAX_EVIDENCE_HANDLES,
+    )?;
     validate_governance(&context.governance)
 }
 
@@ -620,6 +655,8 @@ pub fn get_understanding_bootstrap(
         role_lease_ref: context.role_lease_ref.clone(),
         state_fence_ref: context.state_fence_ref.clone(),
         current_assessment,
+        route_profile_ref: context.route_profile_ref.clone(),
+        decision_safety_floor_refs: context.decision_safety_floor_refs.clone(),
         supported_count: context.supported_count,
         verified_count: context.verified_count,
         candidate_count: context.candidate_count,
@@ -699,6 +736,11 @@ mod tests {
             role_lease_ref: "role-lease-1".to_owned(),
             state_fence_ref: "fence-epoch-3-gen-7".to_owned(),
             governance: fixture_governance(),
+            route_profile_ref: "route-profile-constrained-1".to_owned(),
+            decision_safety_floor_refs: vec![
+                "floor:goal-scope-authority".to_owned(),
+                "floor:task-selection-proof".to_owned(),
+            ],
             supported_count: 4,
             verified_count: 3,
             candidate_count: 1,
@@ -1082,6 +1124,11 @@ mod tests {
             "role-lease-1".to_owned(),
             "fence-epoch-3-gen-7".to_owned(),
             fixture_governance(),
+            "route-profile-constrained-1".to_owned(),
+            vec![
+                "floor:goal-scope-authority".to_owned(),
+                "floor:task-selection-proof".to_owned(),
+            ],
             4,
             3,
             1,
