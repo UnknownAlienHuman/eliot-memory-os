@@ -7648,6 +7648,7 @@ mod tests {
             lease_ref: "onboarding:work".to_owned(),
             lineage_candidate_ref: "lineage:work".to_owned(),
             workspace_instance_candidate_ref: "instance:work".to_owned(),
+            privacy_class: eliot_security_contracts::PrivacyClass::Internal,
             governing_source_generation: 1,
             compiler_epoch: 1,
             state: eliot_workscope::OnboardingLeaseState::Compiling,
