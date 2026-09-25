@@ -96,10 +96,10 @@ pub use eliot_finish::FinishDecisionReceipt;
 /// path (same reason as the [`CanonicalWriteEnvelope`] re-export below).
 pub use eliot_task::{TaskCommand, TaskCommandContext, TaskProposal, TaskRecord};
 pub use learning_admission::{
-    LEARNING_ADMISSION_CONTRACT, LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim,
-    LearningAdmissionError, LearningAdmissionPermit, VerifiedLearningAdmission,
-    issue_learning_admission, issue_learning_ticket, verify_learning_admission,
-    verify_learning_ticket,
+    CrossTaskAdmissionError, CrossTaskAdmissionRecord, LEARNING_ADMISSION_CONTRACT,
+    LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim, LearningAdmissionError,
+    LearningAdmissionPermit, VerifiedLearningAdmission, issue_learning_admission,
+    issue_learning_ticket, verify_learning_admission, verify_learning_ticket,
 };
 pub use learning_delta_integration::{
     AttemptCloseError, admission_claim_for_delta, close_attempt_with_activation_receipt,
