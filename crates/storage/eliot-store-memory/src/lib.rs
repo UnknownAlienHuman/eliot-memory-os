@@ -22,6 +22,7 @@ use eliot_kernel_core::{
     DeliveryChannel, DeliveryState, NotificationDraft, NotificationError, NotificationSeverity,
     NotificationStore, ResolutionAuthorization,
 };
+use eliot_security_contracts::RevocationReason;
 use eliot_store_api::epistemic_revision::{EpistemicCommit, position_key};
 use eliot_store_api::{
     AUTOMATION_QUERY_CURRENT, AUTOMATION_QUERY_FAILURE, AUTOMATION_QUERY_HISTORY,
@@ -34,18 +35,22 @@ use eliot_store_api::{
     OWNER_SNAPSHOT_SCHEMA, OperationId, OperationManifestDigest, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
     PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
-    ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
-    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
+    ProjectionStatus, REVOCATION_HISTORY_MAX_RECORDS, REVOCATION_HISTORY_PAYLOAD_VERSION,
+    REVOCATION_HISTORY_ROOT_KEY, REVOCATION_HISTORY_ROOT_NAMESPACE, REVOCATION_HISTORY_ROOT_SCHEMA,
+    REVOCATION_HISTORY_ROOT_SELECTOR, RecordedRevocation, RecoveryRecord, RecoveryRecordKey,
+    RequestMeta, Resubmission, RevisionDelta, RevisionHead, RevisionHeadExpectation, RevisionKey,
+    RevocationHistoryPayload, RevocationHistoryRoot, ScopeId, ScopeRevisionView, SplitView,
     StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
     StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
-    bind_issue18_receipt, canonical_json_bytes, canonical_request_hash, decode_automation_mutation,
+    advance_revocation_history_digest, affected_reference_digest, bind_issue18_receipt,
+    canonical_json_bytes, canonical_request_hash, decode_automation_mutation,
     decode_erasure_surfaces, decode_notification_mutation, decode_reactive_mutation,
     decode_resource_content, generated_operation_manifests, genesis_manifest, genesis_transition,
     is_genesis_fence, issue_genesis_receipt_envelope, issue_store_receipt_envelope,
-    named_mutation_operation_name, sha256_hex, validate_automation_read_params,
-    validate_genesis_receipt_envelope, validate_reactive_ledger_read_params,
-    validate_resource_snapshot_read_params, validate_store_receipt_envelope,
-    verify_canonical_request_hash,
+    named_mutation_operation_name, recorded_revocation_digest, revocation_fence_digest, sha256_hex,
+    validate_automation_read_params, validate_genesis_receipt_envelope,
+    validate_reactive_ledger_read_params, validate_resource_snapshot_read_params,
+    validate_store_receipt_envelope, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 use serde::de::Error as _;
@@ -345,6 +350,8 @@ impl MemoryStore {
         dispatch_apply_experience_state(&mut state, &transition, &mut plan)?;
         dispatch_apply_finish_evidence(&mut state, &transition)?;
         dispatch_apply_finish_decision(&mut state, &transition)?;
+        dispatch_apply_authority_fanout_state(&mut state, &transition)?;
+        dispatch_apply_authority_revocation(&mut state, &transition)?;
         let receipt = transaction_receipt(ctx, &transition, idempotency_key, recomputed, &plan)?;
         if let (Some(commit), Some(key)) = (epistemic, epistemic_key) {
             commit.readback(&receipt)?;
@@ -738,6 +745,385 @@ fn dispatch_apply_finish_decision(
     record.validate()?;
     state.recovery_records.insert(key, record);
     Ok(())
+}
+
+const REVOCATION_OWNER_NAMESPACE: &str = "authority-revocation";
+const REVOCATION_OWNER_SCHEMA: &str = "eliot.store.authority-revocation.v1";
+const AUTHORITY_OWNER_NAMESPACE: &str = "owner";
+const AUTHORITY_OWNER_KEY: &str = "authority";
+
+/// Persists the complete Governor Authority-owner image carrying the compiled
+/// active View, invalidation keys, rebuild orders, Problems, and effect
+/// contest state. The Store treats the image as opaque canonical bytes; only
+/// the fenced owner revision and digest are physical concerns here.
+fn dispatch_apply_authority_fanout_state(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+) -> Result<(), StoreError> {
+    let Some(command) = transition
+        .named_operations
+        .iter()
+        .find(|command| command.operation == NamedMutationOperation::RecordAuthorityFanoutState)
+    else {
+        return Ok(());
+    };
+    if transition.transition_class != TransitionClass::RecoverySchema {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let text_param = |name: &str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })
+    };
+    let expected_revision = text_param("expected_owner_revision")?
+        .parse::<u64>()
+        .map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "expected_owner_revision must be a decimal revision",
+        })?;
+    let snapshot_json = text_param("owner_snapshot_json")?;
+    let snapshot_digest = text_param("owner_snapshot_digest")?;
+    if snapshot_json.is_empty() {
+        return Err(StoreError::Empty {
+            field: "authority.fanout.owner_snapshot_json",
+        });
+    }
+    if snapshot_json.len() > MAX_RECOVERY_RECORD_BYTES {
+        return Err(StoreError::PayloadTooLarge);
+    }
+    if sha256_hex(snapshot_json.as_bytes()) != snapshot_digest {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter.owner_snapshot_digest",
+            reason: "does not match the exact owner snapshot bytes",
+        });
+    }
+    // Parse only to reject an accidental scalar/non-object carrier. The
+    // Governor remains the semantic decoder of this owner image.
+    let value: Value = serde_json::from_str(snapshot_json).map_err(|error| {
+        StoreError::Serialization(format!(
+            "authority fan-out owner image is not JSON: {error}"
+        ))
+    })?;
+    if !value.is_object() {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter.owner_snapshot_json",
+            reason: "owner snapshot must be a JSON object",
+        });
+    }
+
+    let key = RecoveryRecordKey::new(AUTHORITY_OWNER_NAMESPACE, AUTHORITY_OWNER_KEY)?;
+    if let Some(existing) = state.recovery_records.get(&key) {
+        if existing.state_fence != transition.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        if existing.revision != expected_revision {
+            return Err(StoreError::RevisionConflict);
+        }
+        if existing.value_digest == snapshot_digest && existing.payload == snapshot_json.as_bytes()
+        {
+            return Ok(());
+        }
+        return Err(StoreError::IdentityConflict);
+    } else if expected_revision != 0 {
+        return Err(StoreError::RevisionConflict);
+    }
+    let revision = expected_revision
+        .checked_add(1)
+        .ok_or(StoreError::InvalidField {
+            field: "authority.fanout.owner_revision",
+            reason: "revision overflow",
+        })?;
+    let record = RecoveryRecord {
+        namespace: AUTHORITY_OWNER_NAMESPACE.to_owned(),
+        key: AUTHORITY_OWNER_KEY.to_owned(),
+        state_fence: transition.state_fence.clone(),
+        revision,
+        schema: OWNER_SNAPSHOT_SCHEMA.to_owned(),
+        value_digest: snapshot_digest.to_owned(),
+        payload: snapshot_json.as_bytes().to_vec(),
+    };
+    record.validate()?;
+    state.recovery_records.insert(key, record);
+    Ok(())
+}
+
+fn revocation_root_key() -> Result<RecoveryRecordKey, StoreError> {
+    RecoveryRecordKey::new(
+        REVOCATION_HISTORY_ROOT_NAMESPACE,
+        REVOCATION_HISTORY_ROOT_KEY,
+    )
+}
+
+fn read_revocation_root(state: &MemoryState) -> Result<RevocationHistoryRoot, StoreError> {
+    let key = revocation_root_key()?;
+    let record = state
+        .recovery_records
+        .get(&key)
+        .ok_or(StoreError::InvalidProjection)?;
+    record.validate()?;
+    let root: RevocationHistoryRoot = serde_json::from_slice(&record.payload).map_err(|error| {
+        StoreError::Serialization(format!("revocation history root is malformed: {error}"))
+    })?;
+    root.validate()?;
+    if record.namespace != REVOCATION_HISTORY_ROOT_NAMESPACE
+        || record.key != REVOCATION_HISTORY_ROOT_KEY
+        || record.revision != root.history_revision
+        || record.schema != REVOCATION_HISTORY_ROOT_SCHEMA
+        || record.state_fence != root.state_fence
+        || record.value_digest != sha256_hex(&record.payload)
+    {
+        return Err(StoreError::InvalidProjection);
+    }
+    Ok(root)
+}
+
+fn read_all_revocation_records(state: &MemoryState) -> Result<Vec<RecordedRevocation>, StoreError> {
+    let mut records = Vec::new();
+    for (key, record) in &state.recovery_records {
+        if key.namespace != REVOCATION_OWNER_NAMESPACE {
+            continue;
+        }
+        record.validate()?;
+        if record.namespace != REVOCATION_OWNER_NAMESPACE
+            || record.key != key.key
+            || record.schema != REVOCATION_OWNER_SCHEMA
+            || record.value_digest != sha256_hex(&record.payload)
+        {
+            return Err(StoreError::InvalidProjection);
+        }
+        let decoded: RecordedRevocation =
+            serde_json::from_slice(&record.payload).map_err(|error| {
+                StoreError::Serialization(format!(
+                    "revocation record {} is malformed: {error}",
+                    key.key
+                ))
+            })?;
+        decoded.validate()?;
+        if decoded.closure_id != key.key || decoded.history_revision != record.revision {
+            return Err(StoreError::InvalidProjection);
+        }
+        records.push(decoded);
+    }
+    Ok(records)
+}
+
+fn persist_revocation_root(
+    state: &mut MemoryState,
+    root: &RevocationHistoryRoot,
+) -> Result<(), StoreError> {
+    let payload =
+        serde_json::to_vec(root).map_err(|error| StoreError::Serialization(error.to_string()))?;
+    if payload.len() > MAX_RECOVERY_RECORD_BYTES {
+        return Err(StoreError::PayloadTooLarge);
+    }
+    let key = revocation_root_key()?;
+    let record = RecoveryRecord {
+        namespace: key.namespace.clone(),
+        key: key.key.clone(),
+        state_fence: root.state_fence.clone(),
+        revision: root.history_revision,
+        schema: REVOCATION_HISTORY_ROOT_SCHEMA.to_owned(),
+        value_digest: sha256_hex(&payload),
+        payload,
+    };
+    record.validate()?;
+    state.recovery_records.insert(key, record);
+    Ok(())
+}
+
+/// Persists the admitted authority-revocation closure and advances the
+/// independent Store history root in the same locked reference transaction.
+/// A malformed existing row is an integrity failure, never a filtered-out
+/// record.
+fn dispatch_apply_authority_revocation(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+) -> Result<(), StoreError> {
+    let Some(command) = transition
+        .named_operations
+        .iter()
+        .find(|command| command.operation == NamedMutationOperation::RecordAuthorityRevocation)
+    else {
+        return Ok(());
+    };
+    if transition.transition_class != TransitionClass::RecoverySchema {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let text_param = |name: &str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })
+    };
+    let origin_ref = text_param("origin_ref")?.to_owned();
+    let closure_id = text_param("closure_id")?.to_owned();
+    let closure_revision = text_param("closure_revision")?
+        .parse::<u64>()
+        .map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "closure_revision must be a decimal revision",
+        })?;
+    let affected_refs: Vec<String> =
+        serde_json::from_value(command.parameters.get("affected_refs").cloned().ok_or(
+            StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            },
+        )?)
+        .map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "affected_refs must be a canonical string array",
+        })?;
+    let affected_digest = text_param("affected_digest")?.to_owned();
+    let affected_count =
+        text_param("affected_count")?
+            .parse::<u64>()
+            .map_err(|_| StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "affected_count must be a decimal count",
+            })?;
+    if affected_count == 0 {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "affected_count must include the revoked origin",
+        });
+    }
+    let invalidation_reason = text_param("invalidation_reason")?;
+    let reason: RevocationReason =
+        serde_json::from_value(Value::String(invalidation_reason.to_owned())).map_err(|_| {
+            StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "invalidation_reason is not a closed revocation reason",
+            }
+        })?;
+    let fence_digest = text_param("fence_digest")?.to_owned();
+    let history_revision = text_param("history_revision")?
+        .parse::<u64>()
+        .map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "history_revision must be a decimal revision",
+        })?;
+    let root_revision =
+        text_param("root_revision")?
+            .parse::<u64>()
+            .map_err(|_| StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "root_revision must be a decimal revision",
+            })?;
+    let history_root_digest = text_param("history_root_digest")?.to_owned();
+    if closure_revision == 0 || history_revision == 0 || root_revision == 0 {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "revocation revisions must be non-zero",
+        });
+    }
+    if affected_reference_digest(&affected_refs)? != affected_digest
+        || affected_count != affected_refs.len() as u64
+        || !affected_refs.iter().any(|value| value == &origin_ref)
+    {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter.affected_refs",
+            reason: "affected digest/count/reference binding is invalid",
+        });
+    }
+    if revocation_fence_digest(&transition.state_fence)? != fence_digest {
+        return Err(StoreError::FenceMismatch);
+    }
+
+    let existing_records = read_all_revocation_records(state)?;
+    let current_root = read_revocation_root(state)?;
+    if current_root.state_fence != transition.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    current_root.validate_against_records(&existing_records)?;
+    if history_root_digest != current_root.ledger_digest {
+        return Err(StoreError::RevisionConflict);
+    }
+    let expected_history = current_root
+        .history_revision
+        .checked_add(1)
+        .ok_or(StoreError::RevisionConflict)?;
+    let expected_root = current_root
+        .root_revisions
+        .get(&origin_ref)
+        .copied()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(StoreError::RevisionConflict)?;
+    if history_revision != expected_history || root_revision != expected_root {
+        return Err(StoreError::RevisionConflict);
+    }
+
+    let recorded = RecordedRevocation {
+        closure_id: closure_id.clone(),
+        root_ref: origin_ref.clone(),
+        dependent_refs: affected_refs,
+        affected_digest,
+        affected_count,
+        invalidation_reason: reason,
+        state_fence: transition.state_fence.clone(),
+        fence_digest,
+        revision: closure_revision,
+        history_revision,
+        root_revision,
+    };
+    recorded.validate()?;
+    let payload = serde_json::to_vec(&recorded)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    if payload.len() > MAX_RECOVERY_RECORD_BYTES {
+        return Err(StoreError::PayloadTooLarge);
+    }
+    let key = RecoveryRecordKey::new(REVOCATION_OWNER_NAMESPACE, &closure_id)?;
+    if let Some(existing) = state.recovery_records.get(&key) {
+        if existing.state_fence != transition.state_fence
+            || existing.payload != payload
+            || existing.value_digest != sha256_hex(&payload)
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+        return Ok(());
+    }
+
+    let record = RecoveryRecord {
+        namespace: REVOCATION_OWNER_NAMESPACE.to_owned(),
+        key: closure_id,
+        state_fence: transition.state_fence.clone(),
+        revision: history_revision,
+        schema: REVOCATION_OWNER_SCHEMA.to_owned(),
+        value_digest: sha256_hex(&payload),
+        payload,
+    };
+    record.validate()?;
+    let mut next_records = existing_records;
+    next_records.push(recorded.clone());
+    let current_ledger_digest = current_root.ledger_digest.clone();
+    let mut next_root = current_root;
+    next_root.history_revision = history_revision;
+    next_root.record_count = next_root
+        .record_count
+        .checked_add(1)
+        .ok_or(StoreError::RevisionConflict)?;
+    if !next_root.root_refs.contains(&origin_ref) {
+        next_root.root_refs.push(origin_ref.clone());
+        next_root.root_refs.sort();
+    }
+    next_root.root_revisions.insert(origin_ref, root_revision);
+    next_root.ledger_digest = advance_revocation_history_digest(
+        &current_ledger_digest,
+        &recorded_revocation_digest(&recorded)?,
+    )?;
+    next_root.validate_against_records(&next_records)?;
+    state.recovery_records.insert(key, record);
+    persist_revocation_root(state, &next_root)
 }
 
 /// Executes admitted notification-state legs on already-locked state
@@ -2170,6 +2556,7 @@ fn validate_transaction_state(
                 command.operation,
                 NamedMutationOperation::RecordFinishDecision
                     | NamedMutationOperation::RecordFinishEvidence
+                    | NamedMutationOperation::RecordAuthorityRevocation
             )
         })
     {
@@ -2589,6 +2976,7 @@ impl MemoryStore {
                 | NamedReadOperation::GetExperienceBankRange
                 | NamedReadOperation::GetAgentFeedbackRange
                 | NamedReadOperation::GetAuditRange
+                | NamedReadOperation::GetAuthorityRevocationHistory
         ) {
             let entries = generated_operation_manifests()?;
             query.validate_against_catalogue(&entries)?;
@@ -2709,6 +3097,10 @@ impl MemoryStore {
                 experience_range_payload(&state, query, &fence, false)
             }
             NamedReadOperation::GetAuditRange => audit_range_payload(&state, query, &fence),
+            NamedReadOperation::GetAuthorityRevocationHistory => {
+                Self::revocation_history_payload(&state, query, &fence)
+                    .map_err(|error| serde_json::Error::custom(error.to_string()))
+            }
             _ => serde_json::to_value(json!({
                 "operation": format!("{:?}", query.operation),
                 "records": state.named_operations.iter().map(|record| &record.operation).collect::<Vec<_>>(),
@@ -2723,6 +3115,89 @@ impl MemoryStore {
         };
         response.validate()?;
         Ok(response)
+    }
+
+    fn revocation_history_payload(
+        state: &MemoryState,
+        query: &NamedReadRequest,
+        fence: &StateFence,
+    ) -> Result<Value, StoreError> {
+        let origin_ref = query
+            .parameters
+            .get("origin_ref")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
+        if origin_ref.trim().is_empty() || origin_ref.chars().any(char::is_control) {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "origin_ref must be a non-blank string",
+            });
+        }
+        let max_records = query
+            .parameters
+            .get("max_records")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?
+            .parse::<u32>()
+            .map_err(|_| StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "max_records must be a positive decimal bound",
+            })?;
+        if max_records == 0 {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "max_records must be a positive decimal bound",
+            });
+        }
+        if max_records > REVOCATION_HISTORY_MAX_RECORDS {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        if query.scope_id.as_ref().map(|scope| scope.as_str()) != Some("governor") {
+            return Err(StoreError::ManifestMismatch);
+        }
+        if query.state_fence != *fence {
+            return Err(StoreError::FenceMismatch);
+        }
+
+        // Hydrate and validate the complete all-root ledger before selecting
+        // one origin. A missing root, malformed row, stale fence, broken hash
+        // chain, or partial denominator is an integrity failure; it is never
+        // converted into an empty origin result.
+        let history_root = read_revocation_root(state)?;
+        if history_root.state_fence != *fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        let all_records = read_all_revocation_records(state)?;
+        history_root.validate_against_records(&all_records)?;
+
+        let mut closures = if origin_ref == REVOCATION_HISTORY_ROOT_SELECTOR {
+            Vec::new()
+        } else {
+            all_records
+                .into_iter()
+                .filter(|closure| closure.root_ref == origin_ref)
+                .collect::<Vec<_>>()
+        };
+        closures.sort_by(|left, right| left.closure_id.cmp(&right.closure_id));
+        if closures.len() > max_records as usize {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        let source_revision = history_root.history_revision;
+        let payload = RevocationHistoryPayload {
+            version: REVOCATION_HISTORY_PAYLOAD_VERSION,
+            origin_ref: origin_ref.to_owned(),
+            source_revision,
+            history_root,
+            closures,
+        };
+        payload.validate_for_fence(fence)?;
+        serde_json::to_value(payload).map_err(|error| StoreError::Serialization(error.to_string()))
     }
 
     /// Builds the versioned exact evidence-pack payload for one request.
@@ -3322,9 +3797,18 @@ impl MemoryStore {
             .cloned()
             .map(|record| (record.record_key(), record))
             .collect::<Vec<(RecoveryRecordKey, RecoveryRecord)>>();
+        let reserved_root_key = revocation_root_key()?;
+        if owner_records
+            .iter()
+            .any(|(key, _)| key == &reserved_root_key)
+        {
+            return Err(StoreError::IdentityConflict);
+        }
         for (key, record) in owner_records {
             state.recovery_records.insert(key, record);
         }
+        let history_root = RevocationHistoryRoot::genesis(request.state_fence.clone())?;
+        persist_revocation_root(&mut state, &history_root)?;
         state.fences = Some(request.state_fence.clone());
         state.next_commit_sequence = next_commit_sequence;
         // Bind the recomputed digest, never a blind copy of the supplied value

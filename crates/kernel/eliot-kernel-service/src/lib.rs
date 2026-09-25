@@ -36,7 +36,6 @@ mod notification_state;
 #[cfg(test)]
 mod notification_state_tests;
 mod notify_grant;
-mod owner_history;
 mod process_execution_client;
 mod protocol;
 mod reactive_state;
@@ -110,7 +109,6 @@ pub use notify_grant::{
     NOTIFY_GRANT_OPERATION_PREFIX, NOTIFY_IMAGE_FILE_NAME, NotifyGrantInputs,
     NotifyLaunchAuthorization, bind_notify_launch_grant,
 };
-pub use owner_history::serve_authority_revocation_history;
 pub use process_execution_client::{
     KernelProcessExecutionClient, ProcessOperationFuture, ProcessOperationPort, ProcessStarter,
     ProcessStarterFuture,

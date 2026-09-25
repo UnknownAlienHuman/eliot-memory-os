@@ -174,6 +174,35 @@ impl RestoreJournalResult {
     }
 }
 
+/// Exact opaque state record used by the production backup-journal adapter.
+///
+/// The backup owner owns the meaning of `payload`; ORS validates only its
+/// bounded UTF-8 envelope, revision monotonicity, and byte digest. This keeps
+/// the `RestoreJournalPort` CAS seam lossless without making the operational
+/// owner depend on the backup contract crate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreJournalStateRecord {
+    pub journal_key: String,
+    pub revision: u64,
+    pub payload: String,
+    pub payload_sha256: String,
+}
+
+impl RestoreJournalStateRecord {
+    pub fn validate(&self) -> Result<(), OrsError> {
+        text(&self.journal_key, "restore_state.journal_key")?;
+        if self.payload.len() > MAX_JOURNAL_PAYLOAD_BYTES {
+            return Err(OrsError::PayloadTooLarge);
+        }
+        crate::model::validate_digest(&self.payload_sha256, "restore_state.payload_sha256")?;
+        if crate::model::sha256_hex(self.payload.as_bytes()) != self.payload_sha256 {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        Ok(())
+    }
+}
+
 /// Stream binding: the exact restore context every append on a stream carries.
 ///
 /// Bound once per stream before the first append (idempotent for identical

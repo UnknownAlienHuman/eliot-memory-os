@@ -12,8 +12,8 @@
 //!
 //! * the evidence fence validates and is the exact recovery fence checked by
 //!   the caller (same origin, scope, fence, and epoch);
-//! * the source revision is nonzero and every closure carries exactly that
-//!   revision (no target revision drift between a closure and its source);
+//! * the Store history-root revision is nonzero and is independent from
+//!   the authority/graph revision carried by each closure;
 //! * every closure validates, names a non-blank origin, carries a
 //!   non-empty affected set, and reports a terminal `Revoked` influence
 //!   state with its invalidation reason;
@@ -50,7 +50,8 @@ use crate::{AuthorityError, GrantGraph, GrantId, validate_text};
 pub struct RevocationHistoryEvidence {
     /// Exact fence the history was observed at.
     pub state_fence: StateFence,
-    /// Durable revocation-history revision; must be nonzero.
+    /// Independent Store history-root revision observed for this read.  It
+    /// is intentionally not the grant-graph revision carried by each closure.
     pub source_revision: u64,
     /// CURRENT committed revocation closures in strictly increasing
     /// `closure_id` order. Empty attests zero revocations at
@@ -118,9 +119,11 @@ impl ValidatedRevocationClosure {
         if closure.state_fence != evidence.state_fence {
             return Err(RevocationHistoryError::StaleHistory);
         }
-        if closure.revision != evidence.source_revision {
-            return Err(RevocationHistoryError::StaleHistory);
-        }
+        // The closure revision is the authority/graph revision at which the
+        // decision was made.  It is intentionally independent from the
+        // Store history-root revision above; equating them would make a
+        // legitimate authority decision look stale merely because the
+        // canonical history has advanced.
         if closure.current_influence != InfluenceState::Revoked {
             return Err(RevocationHistoryError::UnknownHistory);
         }

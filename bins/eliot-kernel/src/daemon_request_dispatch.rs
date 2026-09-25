@@ -26,6 +26,8 @@ use eliot_kernel_service::{
     UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationWakeCancellation,
     UserAutomationWakePort, UserAutomationWakeReadRequest,
 };
+use eliot_maintenance::MaintenanceJob;
+use eliot_ors::{DurableMaintenanceJobRecord, DurableRuntimeLeaseRecord};
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlOperation, OriginControlPresentation,
     ProcessExecutionView, ProcessLifecycle,
@@ -39,6 +41,7 @@ use eliot_runtime_contracts::{
     DaemonChannelCursor, DaemonProgressObservation, DaemonSupervisionRenewalDecision,
     DaemonSupervisionRenewalReceipt, SupervisionLeasePredecessorProof,
 };
+use eliot_runtime_contracts::{LeaseState, RuntimeLease};
 use eliot_store_api::{
     CanonicalRequestView, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OperationIdentity, OrderingHeadExpectation, PreparedTransition, ReadConsistency,
@@ -68,6 +71,20 @@ pub(crate) const DAEMON_SUPERVISION_PROGRESS_OPERATION: &str = "daemon_supervisi
 /// open handshake supplies the channel evidence and the Host owner supplies
 /// the Durable Job/Wake effects.
 pub(crate) const USER_AUTOMATION_RUNTIME_OPERATION: &str = "user_automation_runtime";
+/// Authenticated Kernel route that issues one active RuntimeLease for a
+/// bounded maintenance operation.
+pub(crate) const ISSUE_RUNTIME_LEASE_OPERATION: &str = "issue_runtime_lease";
+/// Authenticated Kernel route that reads one ORS-backed runtime lease.
+pub(crate) const LOAD_RUNTIME_LEASE_OPERATION: &str = "load_runtime_lease";
+/// Authenticated Kernel route that reads one ORS-backed durable job.
+pub(crate) const LOAD_DURABLE_JOB_OPERATION: &str = "load_durable_job";
+/// Authenticated Kernel route that persists one ORS-backed durable job.
+pub(crate) const SAVE_DURABLE_JOB_OPERATION: &str = "save_durable_job";
+/// Authenticated Kernel route that lists ORS-backed durable jobs.
+pub(crate) const LIST_DURABLE_JOBS_OPERATION: &str = "list_durable_jobs";
+/// Authenticated production restore route. The request carries owner-admitted
+/// backup evidence; Kernel supplies the live fence and retained ORS journal.
+pub(crate) const RESTORE_BACKUP_OPERATION: &str = "restore_backup";
 
 const STARTUP_EVIDENCE_FIELDS: [&str; 8] = [
     "transport_binding",
@@ -374,6 +391,12 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "apply_prepared" => "apply_prepared",
         "receipt" => "receipt",
         "store_named" => "store_named",
+        ISSUE_RUNTIME_LEASE_OPERATION => ISSUE_RUNTIME_LEASE_OPERATION,
+        LOAD_RUNTIME_LEASE_OPERATION => LOAD_RUNTIME_LEASE_OPERATION,
+        LOAD_DURABLE_JOB_OPERATION => LOAD_DURABLE_JOB_OPERATION,
+        SAVE_DURABLE_JOB_OPERATION => SAVE_DURABLE_JOB_OPERATION,
+        LIST_DURABLE_JOBS_OPERATION => LIST_DURABLE_JOBS_OPERATION,
+        RESTORE_BACKUP_OPERATION => RESTORE_BACKUP_OPERATION,
         "local_read" => "local_read",
         "daemon_degraded" => "daemon_degraded",
         "daemon_fatal" => "daemon_fatal",
@@ -403,6 +426,44 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
 #[serde(deny_unknown_fields)]
 struct StoreNamedOperation {
     request: NamedReadRequest,
+}
+
+/// Closed authenticated request for a Kernel-issued maintenance lease.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeLeaseOperation {
+    scope_ref: String,
+    state_fence: StateFence,
+}
+
+/// Closed authenticated durable runtime-lease read request.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeLeaseLoadOperation {
+    lease_id: String,
+    state_fence: StateFence,
+}
+
+/// Closed authenticated durable-job read request.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableJobLoadOperation {
+    job_id: String,
+    state_fence: StateFence,
+}
+
+/// Closed authenticated durable-job save request.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableJobSaveOperation {
+    job: MaintenanceJob,
+}
+
+/// Closed authenticated durable-job list request.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableJobListOperation {
+    state_fence: StateFence,
 }
 
 /// Closed local-read envelope for one admitted `eliot.query` (Implements #18).
@@ -925,11 +986,56 @@ impl KernelComposition {
                     .await
             }
             "apply_prepared" => {
-                Box::pin(self.store_apply_operation(session, request_id.clone(), payload.clone()))
-                    .await
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                Box::pin(self.store_apply_operation(
+                    session,
+                    request_id.clone(),
+                    identity.clone(),
+                    payload.clone(),
+                ))
+                .await
             }
             "receipt" => store_receipt_dispatch::dispatch(self, session, payload.clone()).await,
             "store_named" => self.store_named_operation(session, payload.clone()).await,
+            ISSUE_RUNTIME_LEASE_OPERATION => {
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                self.issue_runtime_lease_operation(session, &request_id, identity, payload.clone())
+            }
+            LOAD_RUNTIME_LEASE_OPERATION => {
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                self.load_runtime_lease_operation(session, &request_id, identity, payload.clone())
+            }
+            LOAD_DURABLE_JOB_OPERATION => {
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                self.load_durable_job_operation(session, &request_id, identity, payload.clone())
+            }
+            SAVE_DURABLE_JOB_OPERATION => {
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                self.save_durable_job_operation(session, &request_id, identity, payload.clone())
+            }
+            LIST_DURABLE_JOBS_OPERATION => {
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                self.list_durable_jobs_operation(session, &request_id, identity, payload.clone())
+            }
+            RESTORE_BACKUP_OPERATION => {
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                let request: ProductionRestoreRequest = serde_json::from_value(payload.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let outcome = self
+                    .backup_restore
+                    .execute_production_restore(
+                        &session.module_generation.state_fence,
+                        identity,
+                        request,
+                        self.p07_ors.clone(),
+                    )
+                    .map_err(|error| {
+                        observe_daemon_operation(RESTORE_BACKUP_OPERATION, "fenced");
+                        let _ = error;
+                        TransportError::SessionFenced
+                    })?;
+                serde_json::to_value(outcome).map_err(|_| TransportError::SessionFenced)
+            }
             "local_read" => self.local_read_operation(session, payload.clone()).await,
             "daemon_degraded" => {
                 let reason = payload
@@ -2892,6 +2998,7 @@ impl KernelComposition {
         &self,
         session: &Session,
         request_id: RequestId,
+        request_identity: RequestIdentity,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: StoreApplyOperation =
@@ -2903,6 +3010,16 @@ impl KernelComposition {
             .context
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
+        request_identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if request_identity.request.metadata.request_id != request_id
+            || request_identity.request.state_fence != operation.context.state_fence
+            || request_identity.request.metadata.state_fence != operation.context.state_fence
+            || request_identity.idempotency_key != operation.transition.identity.idempotency_key
+        {
+            return Err(TransportError::SessionFenced);
+        }
         if let Err(error) = operation.transition.validate() {
             return Ok(Self::store_error_response_text(
                 "write_receipt",
@@ -2981,10 +3098,320 @@ impl KernelComposition {
         &self,
         _session: &Session,
         _request_id: RequestId,
+        _request_identity: RequestIdentity,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let _ = payload;
         Err(TransportError::SessionFenced)
+    }
+
+    fn load_runtime_lease_operation(
+        &self,
+        session: &Session,
+        request_id: &RequestId,
+        identity: &RequestIdentity,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if identity.request.metadata.request_id != *request_id
+            || identity.request.state_fence != session.module_generation.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let operation: RuntimeLeaseLoadOperation =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        if operation.lease_id.trim().is_empty()
+            || operation.lease_id.chars().any(char::is_control)
+            || operation.state_fence != session.module_generation.state_fence
+            || operation.state_fence != identity.request.metadata.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let lease_id = eliot_ors::OperationIdentity::new(operation.lease_id.as_str())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let Some(record) = self
+            .p07_ors
+            .load_runtime_lease_record(&lease_id)
+            .map_err(|_| TransportError::SessionFenced)?
+        else {
+            return Ok(serde_json::json!({ "kind": "runtime_lease", "value": null }));
+        };
+        let lease: RuntimeLease =
+            serde_json::from_str(&record.payload).map_err(|_| TransportError::SessionFenced)?;
+        lease
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !record.is_active()
+            || lease.state != LeaseState::Active
+            || lease.lease_id != operation.lease_id
+            || lease.state_fence != operation.state_fence
+            || !lease
+                .authority_epoch
+                .is_same_authority(&session.authority_epoch)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(serde_json::json!({ "kind": "runtime_lease", "value": lease }))
+    }
+
+    fn issue_runtime_lease_operation(
+        &self,
+        session: &Session,
+        request_id: &RequestId,
+        identity: &RequestIdentity,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if identity.request.metadata.request_id != *request_id
+            || identity.request.state_fence != session.module_generation.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let operation: RuntimeLeaseOperation =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        if operation.scope_ref.trim().is_empty()
+            || operation.scope_ref.chars().any(char::is_control)
+            || operation.scope_ref.len() > 1_024
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if operation.state_fence != session.module_generation.state_fence
+            || operation.state_fence != identity.request.metadata.state_fence
+            || !operation
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&session.authority_epoch)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if self
+            .service_state()
+            .map_err(|_| TransportError::SessionFenced)?
+            != KernelServiceState::Ready
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let lease_material = canonical_json_bytes(&serde_json::json!({
+            "scope_ref": operation.scope_ref,
+            "state_fence": operation.state_fence,
+        }))
+        .map_err(|_| TransportError::SessionFenced)?;
+        let request_digest = sha256_hex(&lease_material);
+        let lease_id = format!("runtime-lease:{request_digest}");
+        let lease = RuntimeLease {
+            lease_id,
+            scope_ref: operation.scope_ref,
+            authority_epoch: operation.state_fence.authority_epoch.clone(),
+            state_fence: operation.state_fence,
+            state: LeaseState::Active,
+        };
+        lease
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let issuer_operation_id =
+            eliot_ors::OperationIdentity::new(identity.idempotency_key.as_str())
+                .map_err(|_| TransportError::SessionFenced)?;
+        let lease_payload =
+            serde_json::to_string(&lease).map_err(|_| TransportError::SessionFenced)?;
+        let record = DurableRuntimeLeaseRecord::first(
+            &lease,
+            issuer_operation_id,
+            request_digest,
+            lease_payload,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let stored =
+            self.p07_ors
+                .issue_runtime_lease_record(&record)
+                .map_err(|error| match error {
+                    eliot_ors::OrsError::DuplicateConflict => TransportError::IdentityConflict,
+                    _ => TransportError::SessionFenced,
+                })?;
+        if !stored.is_active() {
+            return Err(TransportError::SessionFenced);
+        }
+        let lease: RuntimeLease =
+            serde_json::from_str(&stored.payload).map_err(|_| TransportError::SessionFenced)?;
+        lease
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if lease.state != LeaseState::Active
+            || lease.state_fence != session.module_generation.state_fence
+            || !lease
+                .authority_epoch
+                .is_same_authority(&session.authority_epoch)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(serde_json::json!({
+            "kind": "runtime_lease",
+            "value": lease,
+        }))
+    }
+
+    fn list_durable_jobs_operation(
+        &self,
+        session: &Session,
+        request_id: &RequestId,
+        identity: &RequestIdentity,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if identity.request.metadata.request_id != *request_id
+            || identity.request.state_fence != session.module_generation.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let operation: DurableJobListOperation =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        if operation.state_fence != session.module_generation.state_fence
+            || operation.state_fence != identity.request.metadata.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let records = self
+            .p07_ors
+            .load_all_durable_maintenance_jobs()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let mut jobs = Vec::with_capacity(records.len());
+        for record in records {
+            let job: MaintenanceJob =
+                serde_json::from_str(&record.payload).map_err(|_| TransportError::SessionFenced)?;
+            job.validate().map_err(|_| TransportError::SessionFenced)?;
+            if job.state_fence != operation.state_fence
+                || job.job_id.as_str() != record.job_id.as_str()
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            jobs.push(job);
+        }
+        Ok(serde_json::json!({ "kind": "durable_jobs", "value": jobs }))
+    }
+
+    fn load_durable_job_operation(
+        &self,
+        session: &Session,
+        request_id: &RequestId,
+        identity: &RequestIdentity,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if identity.request.metadata.request_id != *request_id
+            || identity.request.state_fence != session.module_generation.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let operation: DurableJobLoadOperation =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        if operation.job_id.trim().is_empty()
+            || operation.job_id.chars().any(char::is_control)
+            || operation.state_fence != session.module_generation.state_fence
+            || operation.state_fence != identity.request.metadata.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let job_id = eliot_ors::OperationIdentity::new(operation.job_id.as_str())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let Some(record) = self
+            .p07_ors
+            .load_durable_maintenance_job(&job_id)
+            .map_err(|_| TransportError::SessionFenced)?
+        else {
+            return Ok(serde_json::json!({ "kind": "durable_job", "value": null }));
+        };
+        let job: MaintenanceJob =
+            serde_json::from_str(&record.payload).map_err(|_| TransportError::SessionFenced)?;
+        job.validate().map_err(|_| TransportError::SessionFenced)?;
+        if job.job_id != operation.job_id || job.state_fence != operation.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(serde_json::json!({ "kind": "durable_job", "value": job }))
+    }
+
+    fn save_durable_job_operation(
+        &self,
+        session: &Session,
+        request_id: &RequestId,
+        identity: &RequestIdentity,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if identity.request.metadata.request_id != *request_id
+            || identity.request.state_fence != session.module_generation.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let operation: DurableJobSaveOperation =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        operation
+            .job
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let fence = session.module_generation.state_fence.clone();
+        if operation.job.state_fence != fence
+            || operation.job.runtime_lease.state_fence != fence
+            || operation.job.runtime_lease.state != LeaseState::Active
+            || !operation
+                .job
+                .runtime_lease
+                .authority_epoch
+                .is_same_authority(&session.authority_epoch)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let lease_id =
+            eliot_ors::OperationIdentity::new(operation.job.runtime_lease.lease_id.as_str())
+                .map_err(|_| TransportError::SessionFenced)?;
+        let lease_record = self
+            .p07_ors
+            .load_runtime_lease_record(&lease_id)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::SessionFenced)?;
+        let durable_lease: RuntimeLease = serde_json::from_str(&lease_record.payload)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !lease_record.is_active() || durable_lease != operation.job.runtime_lease {
+            return Err(TransportError::SessionFenced);
+        }
+        let job_bytes =
+            canonical_json_bytes(&operation.job).map_err(|_| TransportError::SessionFenced)?;
+        let job_payload =
+            String::from_utf8(job_bytes).map_err(|_| TransportError::SessionFenced)?;
+        let request_digest = sha256_hex(
+            &canonical_json_bytes(&serde_json::json!({
+                "request_id": request_id,
+                "idempotency_key": identity.idempotency_key,
+                "job": &operation.job,
+            }))
+            .map_err(|_| TransportError::SessionFenced)?,
+        );
+        let issuer_operation_id =
+            eliot_ors::OperationIdentity::new(identity.idempotency_key.as_str())
+                .map_err(|_| TransportError::SessionFenced)?;
+        let record = DurableMaintenanceJobRecord::first(
+            operation.job.job_id.as_str(),
+            fence,
+            issuer_operation_id,
+            request_digest,
+            job_payload,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        self.p07_ors
+            .save_durable_maintenance_job(&record)
+            .map_err(|error| match error {
+                eliot_ors::OrsError::DuplicateConflict => TransportError::IdentityConflict,
+                _ => TransportError::SessionFenced,
+            })?;
+        Ok(Self::accepted_daemon_response())
     }
 
     #[cfg(windows)]
@@ -3002,28 +3429,9 @@ impl KernelComposition {
             ));
         }
         validate_store_session_fence(session, &operation.request.state_fence)?;
-        // Authority-history reads are Kernel-owned fence state (`#2100`):
-        // serve durable closure-fence history from the retained ORS instead
-        // of forwarding to the store bridge. The store catalogue truthfully
-        // still lists the operation unsupported because the store never
-        // serves it; every other named read forwards unchanged below. The
-        // live session fence binds the served view: the projector refuses
-        // a request fence that disagrees with it.
-        if operation.request.operation
-            == eliot_store_api::NamedReadOperation::GetAuthorityRevocationHistory
-        {
-            return match eliot_kernel_service::serve_authority_revocation_history(
-                self.p07_ors.as_ref(),
-                &operation.request,
-                &session.module_generation.state_fence,
-            ) {
-                Ok(response) => Ok(store_named_response(&response)),
-                Err(error) => Ok(Self::store_error_response_text(
-                    "store_named",
-                    &error.to_string(),
-                )),
-            };
-        }
+        // Authority-revocation history is a Store-owned semantic ledger.
+        // The Kernel only authenticates/fences this named read; it never
+        // substitutes ORS closure rows or a local projection for that ledger.
         let gateway = self.retained_store_gateway()?;
         match gateway.execute_named(operation.request).await {
             Ok(response) => Ok(store_named_response(&response)),

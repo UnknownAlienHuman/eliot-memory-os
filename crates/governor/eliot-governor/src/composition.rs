@@ -19,8 +19,14 @@ use crate::controlboard_projection::{
 };
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
-use crate::owner_closure_feed::{OwnerPublishPort, synchronize_owner_feed};
+use crate::owner_closure_feed::{
+    OwnerPublishPort, PreparedOwnerFeed, prepare_owner_feed_for_roots, publish_owner_feed,
+};
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
+use crate::revocation_workflow::{
+    DurableActiveView, RevocationClaim, RevocationFanoutInput, RevocationFanoutState,
+    RevocationInvalidationLedger, apply_revocation_fanout,
+};
 use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
 use crate::{
@@ -28,9 +34,9 @@ use crate::{
     QueueLimits, STARTUP_ORDER, ServiceId, ServiceObservation,
 };
 use eliot_authority::{
-    GrantActivationRequest, GrantId, GrantRevocationRequest, GrantStatus,
-    IntroductionActivationRequest, IntroductionId, IntroductionRevocationRequest,
-    IntroductionStatus, P07AuthorityPort, P07PortError,
+    ActionLease, AuthorizedEffect, GrantActivationRequest, GrantId, GrantRevocationRequest,
+    GrantStatus, IntroductionActivationRequest, IntroductionId, IntroductionRevocationRequest,
+    IntroductionStatus, LogicalTime, P07AuthorityPort, P07PortError, ProposedEffect,
 };
 use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
 use eliot_canonical::{
@@ -38,9 +44,13 @@ use eliot_canonical::{
 };
 use eliot_change_monitor::ChangeMonitor;
 use eliot_config::ConfigPolicySnapshot;
+use eliot_context::{
+    CompiledContext, ContextAtom, ContextInput, ContextRecipe, ContextRole, RoleBudget,
+};
 use eliot_contracts::{
-    ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId,
-    ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
+    ArtifactId, ClockReading, ContractId, ContractVersion, DecisionId, EpochId, OperationId,
+    ResourceGeneration, SessionId, StateFence, TaskId, TaskRevision, canonical_json_bytes,
+    sha256_hex,
 };
 use eliot_coordination::CoordinationOwner;
 use eliot_diagnostic::{
@@ -48,28 +58,37 @@ use eliot_diagnostic::{
     DiagnosticSeverity, DiagnosticStatus,
 };
 use eliot_evaluation_contracts::{TerminalVerifierBinding, VerifierEvidenceRef};
+use eliot_evidence::{
+    Assertability, EpistemicStatus, EvidenceFreshness as ContextEvidenceFreshness,
+};
 use eliot_finish::{DescendantClosure, FinishDecisionReceipt, FinishService};
 use eliot_instrument_api::{
-    EvidenceAxes, EvidenceCoverage, EvidenceFreshness, ExecutionStatus, InstrumentInvocation,
-    InstrumentKind, NormalizedEvidence, RawEvidence, RawEvidenceSource, VerificationOutcome,
-    VerificationRun,
+    EvidenceAxes, EvidenceCoverage, EvidenceFreshness as InstrumentEvidenceFreshness,
+    ExecutionStatus, InstrumentInvocation, InstrumentKind, NormalizedEvidence, RawEvidence,
+    RawEvidenceSource, VerificationOutcome, VerificationRun,
 };
 use eliot_instrument_nextest::{
     NextestTestEvent, NextestTestStatus, catalog_test_id, parse_test_events,
 };
 use eliot_maintenance::{
-    MaintenanceController, MaintenanceError, MaintenanceJob, MaintenanceStateStore,
+    AutomationDecision, MaintenanceAutomationMode, MaintenanceController, MaintenanceError,
+    MaintenanceFamily, MaintenanceJob, MaintenanceStateStore, MaintenanceTrigger,
+    MaintenanceTriggerInput,
 };
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
+use eliot_problem::RevocationRebuildOrder;
 use eliot_protocol::RequestIdentity;
-use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
+use eliot_receipts::{SessionBinding, WorkScopeBinding};
+use eliot_runtime_contracts::{
+    AuthorityActivationReceipt, AuthorityRevocationReceipt, RuntimeLease,
+};
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
     CanonicalReadClient, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
-    ScopeRevisionView, StoreHealth, WriteReceipt,
+    RevocationHistoryRoot, ScopeRevisionView, StoreHealth, WriteReceipt,
 };
 use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskState};
 use eliot_testd_core::{
@@ -84,14 +103,15 @@ use thiserror::Error;
 #[path = "authority_recovery.rs"]
 mod authority_recovery;
 pub use authority_recovery::{
-    AuthorityOwner, AuthorityOwnerSnapshot, AuthorityPresentationState, AuthorityRestoreOutcome,
-    PresentedAuthorityRequest, RetainedAuthorityRequest,
+    AuthorityOwner, AuthorityOwnerSnapshot, AuthorityOwnerStateIngress, AuthorityPresentationState,
+    AuthorityRestoreOutcome, PresentedAuthorityRequest, RetainedAuthorityRequest,
+    authority_owner_state_envelope,
 };
 #[path = "authority_revocation.rs"]
 mod authority_revocation;
 pub use authority_revocation::{
-    authority_revocation_envelope, decode_revocation_history_evidence,
-    revocation_history_read_request,
+    AuthorityRevocationIngress, authority_revocation_envelope, decode_revocation_history_evidence,
+    decode_revocation_history_with_root, revocation_history_read_request,
 };
 #[path = "genesis_owner_packet.rs"]
 mod genesis_owner_packet;
@@ -221,6 +241,32 @@ pub trait KernelDurableJobPort: Send + Sync {
 
     /// Persists one validated job revision in the Kernel-owned durable ledger.
     fn save_durable_job(&self, job: &MaintenanceJob) -> Result<(), KernelPortError>;
+
+    /// Requests one Kernel-issued active RuntimeLease for a bounded
+    /// maintenance job.  The default refuses closed so an unreviewed adapter
+    /// cannot silently manufacture a lease; production Kernel adapters must
+    /// implement the authenticated issuance route.
+    fn issue_runtime_lease(
+        &self,
+        _scope_ref: &str,
+        _state_fence: &StateFence,
+    ) -> Result<RuntimeLease, KernelPortError> {
+        Err(KernelPortError::Contract(
+            "Kernel runtime-lease issuance is not implemented by this adapter".to_owned(),
+        ))
+    }
+
+    /// Reads the exact durable lease record back from the Kernel/ORS owner.
+    /// Issuance without a matching readback is never admissible for work.
+    fn load_runtime_lease(
+        &self,
+        _lease_id: &str,
+        _state_fence: &StateFence,
+    ) -> Result<Option<RuntimeLease>, KernelPortError> {
+        Err(KernelPortError::Contract(
+            "Kernel runtime-lease readback is not implemented by this adapter".to_owned(),
+        ))
+    }
 }
 
 /// Exact authenticated Kernel snapshot expected by N4.
@@ -1779,9 +1825,9 @@ impl CanonicalVerifierExecutionFact {
     pub fn certifies_completion(&self) -> bool {
         let fresh = matches!(
             self.verification_run.freshness,
-            EvidenceFreshness::ExactCandidate
-                | EvidenceFreshness::ExactCommit
-                | EvidenceFreshness::ExactQuiescedWorktree
+            InstrumentEvidenceFreshness::ExactCandidate
+                | InstrumentEvidenceFreshness::ExactCommit
+                | InstrumentEvidenceFreshness::ExactQuiescedWorktree
         );
         self.job_state == "succeeded"
             && self.receipt.execution == ExecutionStatus::Succeeded
@@ -1800,9 +1846,9 @@ impl CanonicalVerifierExecutionFact {
             && self.verification_run.evidence.iter().all(|evidence| {
                 matches!(
                     evidence.freshness,
-                    EvidenceFreshness::ExactCandidate
-                        | EvidenceFreshness::ExactCommit
-                        | EvidenceFreshness::ExactQuiescedWorktree
+                    InstrumentEvidenceFreshness::ExactCandidate
+                        | InstrumentEvidenceFreshness::ExactCommit
+                        | InstrumentEvidenceFreshness::ExactQuiescedWorktree
                 ) && evidence.coverage == EvidenceCoverage::CompleteForScope
             })
             && self
@@ -1824,9 +1870,9 @@ pub(crate) fn acceptance_coverage_from_verifier_fact(
     let run_ref = fact.verification_run.run_id.to_string();
     let run_is_current = matches!(
         fact.verification_run.freshness,
-        EvidenceFreshness::ExactCandidate
-            | EvidenceFreshness::ExactCommit
-            | EvidenceFreshness::ExactQuiescedWorktree
+        InstrumentEvidenceFreshness::ExactCandidate
+            | InstrumentEvidenceFreshness::ExactCommit
+            | InstrumentEvidenceFreshness::ExactQuiescedWorktree
     );
     let mut acceptance = Vec::with_capacity(verifier_plan.required_test_ids.len());
     for item_id in &verifier_plan.required_test_ids {
@@ -2349,6 +2395,28 @@ impl CanonicalAdmissionOwner {
                 "canonical current plan is absent; semantic activation is unavailable".to_owned(),
             )
         })
+    }
+
+    /// Returns the current plan projection when one exists, while retaining
+    /// the same fence and snapshot validation as [`Self::read_current_plan`].
+    /// An absent plan is an explicit `None`, not a malformed-owner error.
+    pub fn read_current_plan_optional(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<Option<CanonicalPlanBinding>, CompositionError> {
+        state_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.state_fence != *state_fence
+            || self.scope.state_fence != *state_fence
+            || self.snapshot.state_fence != *state_fence
+        {
+            return Err(CompositionError::Recovery(
+                "canonical plan projection read used a stale state fence".to_owned(),
+            ));
+        }
+        self.snapshot.validate()?;
+        Ok(self.snapshot.current_plan.clone())
     }
 
     /// Returns the durable canonical owner revision used by a finish-evidence
@@ -3082,6 +3150,29 @@ pub enum CompositionReadiness {
     Stopped,
 }
 
+/// Complete product admission input for one pending effect.
+///
+/// The lease, work-scope binding, session binding, operation proposal, and
+/// logical time are supplied by the authenticated product action path.  The
+/// Governor validates them against its current owner records and then admits
+/// the effect through `EffectAuthorizer`; this type never creates a lease,
+/// operation identity, or authority set.
+#[derive(Clone, Debug)]
+pub struct PendingEffectAdmission {
+    /// Exact short-lived action lease issued by the product authority path.
+    pub action_lease: ActionLease,
+    /// Exact proposed effect carried by that lease.
+    pub proposal: ProposedEffect,
+    /// Current WorkScope binding observed by the caller.
+    pub work_scope: WorkScopeBinding,
+    /// Current authenticated Session binding observed by the caller.
+    pub session: SessionBinding,
+    /// Executor boundary retained in the authoritative pending-effect record.
+    pub executor_boundary: String,
+    /// Logical time supplied by the owning action path.
+    pub now: LogicalTime,
+}
+
 /// One daemon-owned Governor composition. There is no second provider or
 /// process executor hidden behind this value.
 pub struct GovernorComposition<P: ?Sized> {
@@ -3098,6 +3189,52 @@ pub struct GovernorComposition<P: ?Sized> {
     /// Exact P-07 presentations retained with their owner snapshots until
     /// exact reconciliation, keyed by [`PresentedAuthorityRequest::ledger_key`].
     authority_presentations: BTreeMap<String, RetainedAuthorityRequest>,
+    /// Volatile exact cache/context/module-profile keys invalidated by the
+    /// production revocation fan-out. Durable history remains in the store.
+    revocation_invalidation_keys: BTreeSet<String>,
+    /// Current revoked lineage retained as a rebuild fence.
+    revoked_lineage: BTreeSet<String>,
+    /// Rebuildable cache/context/module-profile invalidation owner.
+    derivative_invalidation: RevocationInvalidationLedger,
+    /// Typed rebuild orders awaiting a clean-input rebuild owner.
+    scheduled_rebuilds: Vec<RevocationRebuildOrder>,
+    /// Last graph revision plus exact Store history root proven published.
+    /// It suppresses duplicate fan-out only after a complete readback; the
+    /// durable source remains the Store root, never this volatile marker.
+    owner_feed_watermark: Option<(u64, RevocationHistoryRoot)>,
+}
+
+fn product_context_atom(
+    role: ContextRole,
+    atom_id: String,
+    payload: String,
+    source_ref: String,
+    state_fence: &StateFence,
+    required: bool,
+    protected: bool,
+) -> Result<ContextAtom, CompositionError> {
+    let atom_id = ArtifactId::new(atom_id).map_err(|error| {
+        CompositionError::Owner(format!("active View atom id is invalid: {error}"))
+    })?;
+    let source_handle = ArtifactId::new(source_ref).map_err(|error| {
+        CompositionError::Owner(format!("active View source handle is invalid: {error}"))
+    })?;
+    Ok(ContextAtom {
+        atom_id,
+        role,
+        payload,
+        source_handles: vec![source_handle],
+        status: EpistemicStatus::Supported,
+        assertability: Assertability::Assertable,
+        freshness: ContextEvidenceFreshness::ExactCandidate,
+        state_fence: state_fence.clone(),
+        required,
+        protected,
+        cost: 1,
+        expected_decision_delta: 1,
+        risk: 0,
+        cues: Vec::new(),
+    })
 }
 
 fn testd_finished_clock(job: &TestJob) -> ClockReading {
@@ -3179,7 +3316,7 @@ fn normalize_nextest_run(
         ));
     }
     let Some(source_observation) = receipt.source_observation.as_ref() else {
-        run.freshness = EvidenceFreshness::Unknown;
+        run.freshness = InstrumentEvidenceFreshness::Unknown;
         run.coverage = EvidenceCoverage::PartialForScope;
         return Ok(());
     };
@@ -3194,7 +3331,7 @@ fn normalize_nextest_run(
         ));
     }
     if !source_observation.unchanged() {
-        run.freshness = EvidenceFreshness::Unknown;
+        run.freshness = InstrumentEvidenceFreshness::Unknown;
         run.coverage = EvidenceCoverage::PartialForScope;
     }
     let source_before = &source_observation.before;
@@ -3501,6 +3638,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             service_observations,
             readiness: CompositionReadiness::Ready,
             authority_presentations: BTreeMap::new(),
+            revocation_invalidation_keys: BTreeSet::new(),
+            revoked_lineage: BTreeSet::new(),
+            derivative_invalidation: RevocationInvalidationLedger::default(),
+            scheduled_rebuilds: Vec::new(),
+            owner_feed_watermark: None,
         })
     }
 
@@ -3508,6 +3650,162 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     #[must_use]
     pub const fn owners(&self) -> &GovernorOwners<P> {
         &self.owners
+    }
+
+    /// Returns the exact volatile cache/context/module-profile keys invalidated
+    /// by the live revocation fan-out.
+    #[must_use]
+    pub fn revocation_invalidation_keys(&self) -> &BTreeSet<String> {
+        &self.revocation_invalidation_keys
+    }
+
+    /// Returns the current revoked lineage retained as a rebuild fence.
+    #[must_use]
+    pub fn revoked_lineage(&self) -> &BTreeSet<String> {
+        &self.revoked_lineage
+    }
+
+    /// Returns the rebuildable derivative invalidation ledger.
+    #[must_use]
+    pub const fn derivative_invalidation(&self) -> &RevocationInvalidationLedger {
+        &self.derivative_invalidation
+    }
+
+    /// Returns the typed clean-input rebuild orders scheduled by the live
+    /// revocation workflow. The owner can now durably hand these to its
+    /// maintenance/rebuild scheduler without re-deriving scope.
+    #[must_use]
+    pub fn scheduled_rebuilds(&self) -> &[RevocationRebuildOrder] {
+        &self.scheduled_rebuilds
+    }
+
+    /// Consumes the current revocation rebuild obligations through the one
+    /// MaintenanceController.  Before each admission it obtains a lease from
+    /// the authenticated Kernel port and revalidates the lease state, fence,
+    /// epoch, and scope; a local test fixture or process-liveness signal can
+    /// never substitute for that Kernel-issued proof.
+    pub fn consume_revocation_rebuilds(
+        &mut self,
+        now_ms: i64,
+    ) -> Result<Vec<MaintenanceJob>, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let mut admitted = Vec::new();
+        let pending = self.scheduled_rebuilds.clone();
+        for order in &pending {
+            let scope_ref = order.impacted_scopes.first().cloned().ok_or_else(|| {
+                CompositionError::Owner("rebuild order has no bounded scope".to_owned())
+            })?;
+            let lease = self
+                .kernel
+                .issue_runtime_lease(&scope_ref, &fence)
+                .map_err(|error| CompositionError::Kernel(error))?;
+            lease.validate().map_err(|error| {
+                CompositionError::Provider(format!(
+                    "Kernel-issued runtime lease is invalid: {error}"
+                ))
+            })?;
+            if lease.state != eliot_runtime_contracts::LeaseState::Active
+                || lease.state_fence != fence
+                || lease.scope_ref != scope_ref
+                || !lease
+                    .authority_epoch
+                    .is_same_authority(&fence.authority_epoch)
+            {
+                return Err(CompositionError::Provider(
+                    "Kernel-issued runtime lease is not active and fence-bound for rebuild"
+                        .to_owned(),
+                ));
+            }
+            let durable_lease = self
+                .kernel
+                .load_runtime_lease(lease.lease_id.as_str(), &fence)
+                .map_err(CompositionError::Kernel)?;
+            if durable_lease.as_ref() != Some(&lease) {
+                return Err(CompositionError::Provider(
+                    "Kernel runtime-lease issuance has no exact durable ORS readback".to_owned(),
+                ));
+            }
+            let decision = self
+                .owners
+                .maintenance
+                .evaluate_trigger(&MaintenanceTriggerInput {
+                    trigger_id: format!("revocation-rebuild:{}", order.problem_id),
+                    evidence_refs: order
+                        .revocation_evidence
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    family: MaintenanceFamily::DerivedIndexRebuild,
+                    scope_ref: scope_ref.clone(),
+                    mode: MaintenanceAutomationMode::ContinuousBounded,
+                    trigger: MaintenanceTrigger::WatchdogProblem,
+                    explicit_request: true,
+                    idle: true,
+                    scheduled_window: true,
+                    route_available: true,
+                    budget_available: true,
+                    user_session_available: true,
+                    user_session_required: false,
+                    safety_required: true,
+                    now_ms,
+                    expires_at_ms: None,
+                    active_job_id: None,
+                })
+                .map_err(|error| CompositionError::Owner(error.to_string()))?;
+            if decision.decision != AutomationDecision::Start || !decision.admits_job {
+                return Err(CompositionError::Owner(
+                    "revocation rebuild order was not admitted by maintenance policy".to_owned(),
+                ));
+            }
+            let job = self
+                .owners
+                .maintenance
+                .admit(
+                    &decision,
+                    fence.clone(),
+                    lease,
+                    format!("budget:revocation-rebuild:{}", order.problem_id),
+                    1,
+                    false,
+                )
+                .map_err(|error| CompositionError::Owner(error.to_string()))?;
+            admitted.push(job);
+            // Remove by the order identity, not the clone's positional index:
+            // each successful admission shifts the remaining vector, and a
+            // second order must not address or remove the first one.
+            if let Some(pending_index) = self
+                .scheduled_rebuilds
+                .iter()
+                .position(|pending| pending.problem_id == order.problem_id)
+            {
+                self.scheduled_rebuilds.remove(pending_index);
+            }
+        }
+        Ok(admitted)
+    }
+
+    /// Returns the durable active Context/View projection produced by the
+    /// latest committed revocation fan-out.  The projection is rebuilt from
+    /// current owner records before it is published and is restored as part of
+    /// the Authority owner image; callers never receive a synthetic cache
+    /// placeholder.
+    #[must_use]
+    pub fn active_context_view(&self) -> Option<&CompiledContext> {
+        self.owners
+            .authority
+            .revocation_fanout()
+            .and_then(|state| state.active_view.as_ref())
+            .map(|view| &view.compiled)
+    }
+
+    /// Returns the complete durable fan-out state, including the active input,
+    /// compiled output, Problems, invalidation keys, and rebuild orders.
+    #[must_use]
+    pub fn revocation_fanout_state(&self) -> Option<&RevocationFanoutState> {
+        self.owners.authority.revocation_fanout()
     }
 
     /// Rehydrates one verifier execution fact from the current Governor task,
@@ -3844,6 +4142,282 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             self.kernel.as_ref(),
             self.readiness,
         )
+    }
+
+    /// Admits one real product effect into the Authority owner's durable
+    /// effect-authorizer projection.  The caller supplies the authenticated
+    /// lease and exact proposal; this method only checks them against the
+    /// current WorkScope, Session, Canonical plan, and Authority fence before
+    /// calling the existing `EffectAuthorizer` admission path.  It does not
+    /// construct a synthetic effect or mutate historical authorization bytes.
+    pub fn admit_pending_effect(
+        &mut self,
+        admission: &PendingEffectAdmission,
+    ) -> Result<AuthorizedEffect, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        if admission.work_scope.state_fence != fence
+            || admission.session.state_fence != fence
+            || admission.action_lease.authority_binding.state_fence != fence
+            || admission.action_lease.work_scope != admission.work_scope
+            || admission.action_lease.session != admission.session
+        {
+            return Err(CompositionError::Provider(
+                "pending effect admission is not bound to the active WorkScope/Session fence"
+                    .to_owned(),
+            ));
+        }
+        let scope_owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "pending effect admission has no current WorkScope owner".to_owned(),
+            )
+        })?;
+        let scope = scope_owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if admission.work_scope.scope_id.as_str() != scope.binding.scope.scope_ref {
+            return Err(CompositionError::Provider(
+                "pending effect WorkScope does not match the current owner".to_owned(),
+            ));
+        }
+        let session_id = SessionId::new(admission.session.session_id.as_str().to_owned())
+            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+        let session = self.owners.session.session(&session_id).ok_or_else(|| {
+            CompositionError::Recovery("pending effect Session owner is absent".to_owned())
+        })?;
+        if session.session_id != session_id
+            || session.status != SessionState::Active
+            || session.state_fence != fence
+            || !session
+                .authority_epoch
+                .is_same_authority(&admission.session.authority_epoch)
+        {
+            return Err(CompositionError::Provider(
+                "pending effect Session is not the current active owner session".to_owned(),
+            ));
+        }
+        let plan = self.owners.canonical.read_current_plan(&fence)?;
+        if plan.work_scope_id != admission.work_scope.scope_id.as_str() {
+            return Err(CompositionError::Provider(
+                "pending effect is outside the current canonical plan WorkScope".to_owned(),
+            ));
+        }
+        let mut lease = admission.action_lease.clone();
+        let mut revoked_roots = self.revoked_lineage.clone();
+        if let Ok(snapshot) = self.owners.authority.grants.recovery_snapshot() {
+            revoked_roots.extend(snapshot.revoked);
+        }
+        self.owners
+            .authority
+            .effects
+            .authorize_with_revoked_roots(
+                &mut lease,
+                admission.proposal.clone(),
+                admission.executor_boundary.clone(),
+                &admission.work_scope,
+                &admission.session,
+                admission.now,
+                (!revoked_roots.is_empty()).then_some(&revoked_roots),
+            )
+            .map_err(|error| {
+                CompositionError::Owner(format!("pending effect admission failed: {error}"))
+            })
+    }
+
+    /// Admits one real pending effect and commits the resulting Authority
+    /// owner image through the authenticated owner-state CAS. The volatile
+    /// admission is rolled back to the pre-admission snapshot if persistence
+    /// or readback fails, so an uncommitted effect is never exposed.
+    pub async fn admit_pending_effect_and_persist(
+        &mut self,
+        admission: &PendingEffectAdmission,
+        state_ingress: &AuthorityOwnerStateIngress,
+    ) -> Result<AuthorizedEffect, CompositionError> {
+        let fence = self.snapshot.state_fence();
+        let before = self.owners.authority.snapshot()?;
+        let effect = self.admit_pending_effect(admission)?;
+        if let Err(error) = self
+            .persist_current_authority_owner_state_and_readback(state_ingress)
+            .await
+        {
+            self.owners.authority = AuthorityOwner::from_snapshot(&before, &fence)?;
+            return Err(error);
+        }
+        Ok(effect)
+    }
+
+    /// Builds and commits one durable `RecordAuthorityRevocation` transition
+    /// through the existing Kernel transition port. The complete authenticated
+    /// ingress is supplied by the production caller; this method never
+    /// invents a request identity, operation id, affected set, or history CAS.
+    /// The activated Store handler and the independent history-root read
+    /// supply the restore gate.
+    pub async fn record_authority_revocation(
+        &self,
+        ingress: &AuthorityRevocationIngress,
+    ) -> Result<WriteReceipt, CompositionError> {
+        let envelope = authority_revocation_envelope(ingress)?;
+        self.commit_canonical(&ingress.identity, envelope).await
+    }
+
+    /// Commits the current post-fan-out Authority-owner image through the
+    /// authenticated `RecordAuthorityFanoutState` transition. The caller
+    /// supplies only the admitted request/operation identity and owner CAS
+    /// witness; the Governor serializes its own current snapshot, so a caller
+    /// cannot replace semantic owner bytes through this boundary.
+    pub async fn persist_current_authority_owner_state(
+        &self,
+        ingress: &AuthorityOwnerStateIngress,
+    ) -> Result<WriteReceipt, CompositionError> {
+        let snapshot = self.owners.authority.snapshot()?;
+        let (_, _, receipt) = self
+            .persist_authority_owner_snapshot_and_readback(&snapshot, ingress)
+            .await?;
+        Ok(receipt)
+    }
+
+    /// Commits one candidate Authority owner image and proves the exact bytes
+    /// by reading the Store-owned `owner/authority` record back through
+    /// Kernel. This phase deliberately does not install anything in the live
+    /// composition: callers can therefore keep the old owner visible while a
+    /// persistence or subsequent publication attempt is still unproven.
+    async fn persist_authority_owner_snapshot_and_readback(
+        &self,
+        expected: &AuthorityOwnerSnapshot,
+        ingress: &AuthorityOwnerStateIngress,
+    ) -> Result<(AuthorityOwnerSnapshot, KernelNamedReadReply, WriteReceipt), CompositionError>
+    {
+        ingress
+            .validate()
+            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+        expected
+            .validate()
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        let current_revision = self
+            .recovery
+            .owner_read(RecoveryOwner::Authority)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?
+            .revision;
+        if ingress.expected_owner_revision != current_revision {
+            return Err(CompositionError::Owner(
+                "authority owner-state expected revision is stale".to_owned(),
+            ));
+        }
+        let envelope = authority_owner_state_envelope(ingress, expected)?;
+        let receipt = self.commit_canonical(&ingress.identity, envelope).await?;
+        if receipt.operation_id != ingress.operation_id
+            || receipt.idempotency_key != ingress.identity.idempotency_key
+        {
+            return Err(CompositionError::Recovery(
+                "authority owner-state receipt does not match the authenticated ingress".to_owned(),
+            ));
+        }
+        let read = self
+            .kernel
+            .named_read(KernelNamedReadRequest {
+                owner: RecoveryOwner::Authority,
+                state_fence: ingress.identity.request.state_fence.clone(),
+                protected_snapshot_digest: self.snapshot.protected_snapshot_digest.clone(),
+            })
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "authority owner-state readback returned no owner record".to_owned(),
+                )
+            })?;
+        let expected_revision =
+            ingress
+                .expected_owner_revision
+                .checked_add(1)
+                .ok_or_else(|| {
+                    CompositionError::Owner("authority owner revision overflow".to_owned())
+                })?;
+        let expected_bytes = canonical_json_bytes(expected)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        if read.owner != RecoveryOwner::Authority
+            || read.state_fence != ingress.identity.request.state_fence
+            || read.schema != OWNER_SNAPSHOT_SCHEMA
+            || read.revision != expected_revision
+            || read.payload != expected_bytes
+            || read.value_digest != sha256_hex(&expected_bytes)
+        {
+            return Err(CompositionError::Recovery(
+                "authority owner-state Store readback does not match the committed fan-out image"
+                    .to_owned(),
+            ));
+        }
+        let decoded: AuthorityOwnerSnapshot = serde_json::from_slice(&read.payload)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if decoded != *expected {
+            return Err(CompositionError::Recovery(
+                "authority owner-state Store readback decoded to a different owner image"
+                    .to_owned(),
+            ));
+        }
+        Ok((decoded, read, receipt))
+    }
+
+    /// Installs an owner image only after its exact Store readback and receipt
+    /// have been proven. All validation and lookup happens before the first
+    /// mutation, so a failed install leaves the previous live owner intact.
+    fn install_authority_owner_readback(
+        &mut self,
+        snapshot: AuthorityOwnerSnapshot,
+        read: KernelNamedReadReply,
+        receipt: WriteReceipt,
+    ) -> Result<(), CompositionError> {
+        let fence = self.snapshot.state_fence();
+        let owner = AuthorityOwner::from_snapshot(&snapshot, &fence)?;
+        let owner_slot = self
+            .recovery
+            .owner_reads
+            .iter()
+            .position(|entry| entry.owner == RecoveryOwner::Authority)
+            .ok_or_else(|| {
+                CompositionError::Recovery("authority owner recovery read is absent".to_owned())
+            })?;
+        if let Some(existing) = self
+            .recovery
+            .receipts
+            .iter()
+            .find(|existing| existing.operation_id == receipt.operation_id)
+            && existing != &receipt
+        {
+            return Err(CompositionError::Recovery(
+                "authority owner-state receipt conflicts with retained recovery evidence"
+                    .to_owned(),
+            ));
+        }
+        self.owners.authority = owner;
+        self.recovery.owner_reads[owner_slot] = read;
+        if !self
+            .recovery
+            .receipts
+            .iter()
+            .any(|existing| existing.operation_id == receipt.operation_id)
+        {
+            self.recovery.receipts.push(receipt);
+        }
+        Ok(())
+    }
+
+    /// Commits the current Authority owner image and proves the exact bytes by
+    /// reading the Store-owned `owner/authority` record back through Kernel.
+    /// The refreshed owner set is installed only after the readback matches;
+    /// a stale CAS, missing row, foreign fence, or byte drift refuses without
+    /// claiming a durable owner state.
+    async fn persist_current_authority_owner_state_and_readback(
+        &mut self,
+        ingress: &AuthorityOwnerStateIngress,
+    ) -> Result<AuthorityOwnerSnapshot, CompositionError> {
+        let expected = self.owners.authority.snapshot()?;
+        let (snapshot, read, receipt) = self
+            .persist_authority_owner_snapshot_and_readback(&expected, ingress)
+            .await?;
+        self.install_authority_owner_readback(snapshot.clone(), read, receipt)?;
+        Ok(snapshot)
     }
 
     /// Applies one Canonical-admitted transition through the sole retained
@@ -4557,39 +5131,536 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )
     }
 
+    /// Builds the product-owned active Context/View input from the current
+    /// Governor owner records.  Every atom names an exact current plan,
+    /// task, WorkScope, grant, or admitted effect record; a missing optional
+    /// plan is represented as an explicit unknown, never as fabricated task
+    /// content.  The recipe is the bounded admission policy for those same
+    /// records, so the compiler output can be restored and reproduced.
+    fn current_product_context(
+        &self,
+        state_fence: &StateFence,
+        authority: &AuthorityOwner,
+    ) -> Result<(ContextInput, ContextRecipe), CompositionError> {
+        let plan = self
+            .owners
+            .canonical
+            .read_current_plan_optional(state_fence)?;
+        let task = plan
+            .as_ref()
+            .map(|plan| {
+                self.owners.task.task(&plan.task_id).ok_or_else(|| {
+                    CompositionError::Recovery(
+                        "current canonical plan has no matching task owner record".to_owned(),
+                    )
+                })
+            })
+            .transpose()?;
+
+        let task_revision = task
+            .map(|record| TaskRevision::new(record.revision))
+            .transpose()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?
+            .or(state_fence.task_revision)
+            .unwrap_or_else(TaskRevision::genesis);
+        if let (Some(record), Some(bound_revision)) = (task, state_fence.task_revision)
+            && bound_revision.value() != record.revision
+        {
+            return Err(CompositionError::Recovery(
+                "current task owner revision disagrees with the active fence".to_owned(),
+            ));
+        }
+
+        let task_id = plan
+            .as_ref()
+            .map(|plan| {
+                DecisionId::new(plan.task_id.as_str().to_owned())
+                    .map_err(|error| CompositionError::Recovery(error.to_string()))
+            })
+            .transpose()?;
+
+        let scope = self
+            .owners
+            .work_scope
+            .as_ref()
+            .map(|owner| {
+                owner
+                    .read_current(state_fence)
+                    .map_err(|error| CompositionError::Recovery(error.to_string()))
+            })
+            .transpose()?;
+        let scope_ref = scope
+            .as_ref()
+            .map(|binding| binding.binding.scope.scope_ref.clone())
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "active View requires a current WorkScope owner record".to_owned(),
+                )
+            })?;
+
+        let mut atoms = Vec::new();
+        let mut role_costs = BTreeMap::<ContextRole, u32>::new();
+        let mut add_atom = |role: ContextRole, atom: ContextAtom| {
+            *role_costs.entry(role).or_default() = role_costs
+                .get(&role)
+                .copied()
+                .unwrap_or_default()
+                .saturating_add(atom.cost);
+            atoms.push(atom);
+        };
+
+        if let Some(scope) = scope.as_ref() {
+            add_atom(
+                ContextRole::Safety,
+                product_context_atom(
+                    ContextRole::Safety,
+                    format!("context:work-scope:{}", scope.binding.scope.scope_ref),
+                    format!(
+                        "current WorkScope {} instance {}",
+                        scope.binding.scope.scope_ref, scope.binding.scope.instance_ref
+                    ),
+                    format!("work-scope:{}", scope.binding.scope.scope_ref),
+                    state_fence,
+                    true,
+                    true,
+                )?,
+            );
+        }
+
+        if let (Some(plan), Some(task)) = (plan.as_ref(), task) {
+            add_atom(
+                ContextRole::Continuity,
+                product_context_atom(
+                    ContextRole::Continuity,
+                    format!("context:plan:{}", plan.plan_id),
+                    format!(
+                        "current canonical plan {} revision {} for task {}",
+                        plan.plan_id, plan.plan_revision, plan.task_id
+                    ),
+                    format!("plan:{}", plan.plan_id),
+                    state_fence,
+                    false,
+                    false,
+                )?,
+            );
+            add_atom(
+                ContextRole::Goal,
+                product_context_atom(
+                    ContextRole::Goal,
+                    format!("context:task:{}", task.task_id),
+                    format!("current task goal: {}", task.goal),
+                    format!("task:{}", task.task_id),
+                    state_fence,
+                    true,
+                    true,
+                )?,
+            );
+        }
+
+        let grant_snapshot = authority.grants.recovery_snapshot().map_err(|error| {
+            CompositionError::Owner(format!("grant graph recovery failed: {error}"))
+        })?;
+        for grant in &grant_snapshot.grants {
+            if grant.status != GrantStatus::Active
+                || grant_snapshot.revoked.contains(&grant.grant_id)
+            {
+                continue;
+            }
+            add_atom(
+                ContextRole::Affordance,
+                product_context_atom(
+                    ContextRole::Affordance,
+                    format!("context:grant:{}", grant.grant_id),
+                    format!(
+                        "current authority grant {} root {} status {:?}",
+                        grant.grant_id, grant.authority_root_ref, grant.status
+                    ),
+                    format!("grant:{}", grant.grant_id),
+                    state_fence,
+                    false,
+                    false,
+                )?,
+            );
+        }
+
+        let effect_snapshot = authority.effects.snapshot().map_err(|error| {
+            CompositionError::Owner(format!("effect owner recovery failed: {error}"))
+        })?;
+        for effect in &effect_snapshot.records {
+            if authority
+                .effects
+                .dependent_effect_state(&effect.idempotency_key)
+                .is_contested()
+            {
+                continue;
+            }
+            add_atom(
+                ContextRole::DecisionTail,
+                product_context_atom(
+                    ContextRole::DecisionTail,
+                    format!("context:effect:{}", effect.idempotency_key),
+                    format!(
+                        "current pending effect {} operation {} resource {}",
+                        effect.idempotency_key, effect.operation_name, effect.resource_ref
+                    ),
+                    format!("effect:{}", effect.idempotency_key),
+                    state_fence,
+                    false,
+                    false,
+                )?,
+            );
+        }
+
+        if atoms.is_empty() {
+            return Err(CompositionError::Recovery(
+                "current product owner state has no material for an active Context View".to_owned(),
+            ));
+        }
+        let total_cost = role_costs
+            .values()
+            .fold(0_u32, |total, cost| total.saturating_add(*cost));
+        let role_budgets = role_costs
+            .into_iter()
+            .map(|(role, cost)| RoleBudget {
+                role,
+                maximum_cost: cost,
+            })
+            .collect::<Vec<_>>();
+        let required_roles = role_budgets
+            .iter()
+            .map(|budget| budget.role)
+            .collect::<Vec<_>>();
+        let input = ContextInput {
+            scope: scope_ref,
+            task_id,
+            task_revision,
+            state_fence: state_fence.clone(),
+            atoms,
+            unknowns: if plan.is_none() {
+                vec!["no current canonical plan is available for this owner view".to_owned()]
+            } else {
+                Vec::new()
+            },
+        };
+        let recipe = ContextRecipe {
+            recipe_revision: task_revision,
+            total_cost,
+            role_budgets,
+            required_roles,
+        };
+        input.validate().map_err(|error| {
+            CompositionError::Owner(format!("active View input is invalid: {error}"))
+        })?;
+        recipe.validate().map_err(|error| {
+            CompositionError::Owner(format!("active View recipe is invalid: {error}"))
+        })?;
+        Ok((input, recipe))
+    }
+
     /// Synchronizes the Kernel P-07 owner from live Governor state after
-    /// a revision advance (`#2100` owner-closure feed call).
     ///
     /// Binds the feed to the live composition snapshot and fence at call
     /// time — never caller-supplied — and runs the full
-    /// read→decode→restore→publish→readback exchange through
-    /// [`synchronize_owner_feed`]. The owning daemon runtime calls this
+    /// read→decode→restore→fan-out→publish→readback exchange through
+    /// [`prepare_owner_feed`] and [`publish_owner_feed`]. The owning daemon runtime calls this
     /// on provider-revision advance and on recovery; a stale trigger
     /// refuses before any publish, and no owner state installs until
     /// the Kernel readback proves the exact published bytes.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the production owner-feed seam keeps read, fan-out, and publish ordering together"
+    )]
     pub async fn synchronize_kernel_owner<
         R: CanonicalReadClient + ?Sized,
         K: OwnerPublishPort + ?Sized,
     >(
-        &self,
+        &mut self,
         reads: &R,
         kernel: &K,
         origin_ref: &str,
         max_records: u32,
         expected_revision: u64,
     ) -> Result<u64, CompositionError> {
-        let snapshot = self.owners.authority.snapshot()?;
-        let state_fence = self.snapshot.state_fence();
-        synchronize_owner_feed(
+        let (revision, _) = self
+            .synchronize_kernel_owner_batch(
+                reads,
+                kernel,
+                &[origin_ref.to_owned()],
+                max_records,
+                expected_revision,
+            )
+            .await?;
+        Ok(revision)
+    }
+
+    /// Synchronizes all live authority roots from one shared Store history
+    /// watermark.  Every origin read must return the identical durable root;
+    /// the union is fanned out once and the owner bundle is published/read
+    /// back once.  Per-origin publication is intentionally not exposed here.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the all-root feed keeps hydration, fan-out, and single publication causally ordered"
+    )]
+    pub async fn synchronize_kernel_owner_batch<
+        R: CanonicalReadClient + ?Sized,
+        K: OwnerPublishPort + ?Sized,
+    >(
+        &mut self,
+        reads: &R,
+        kernel: &K,
+        origins: &[String],
+        max_records: u32,
+        expected_revision: u64,
+    ) -> Result<(u64, RevocationHistoryRoot), CompositionError> {
+        self.synchronize_kernel_owner_batch_inner(
             reads,
             kernel,
-            snapshot,
-            &state_fence,
-            origin_ref,
+            origins,
             max_records,
             expected_revision,
+            None,
         )
         .await
+    }
+
+    /// Synchronizes the shared root feed and commits the resulting Authority
+    /// owner image through the authenticated product-event ingress before
+    /// publishing the Kernel owner bundle. The ingress is required for this
+    /// persistence variant; no identity, operation id, or owner revision is
+    /// synthesized here.
+    pub async fn synchronize_kernel_owner_batch_with_state<
+        R: CanonicalReadClient + ?Sized,
+        K: OwnerPublishPort + ?Sized,
+    >(
+        &mut self,
+        reads: &R,
+        kernel: &K,
+        origins: &[String],
+        max_records: u32,
+        expected_revision: u64,
+        state_ingress: &AuthorityOwnerStateIngress,
+    ) -> Result<(u64, RevocationHistoryRoot), CompositionError> {
+        self.synchronize_kernel_owner_batch_inner(
+            reads,
+            kernel,
+            origins,
+            max_records,
+            expected_revision,
+            Some(state_ingress),
+        )
+        .await
+    }
+
+    async fn synchronize_kernel_owner_batch_inner<
+        R: CanonicalReadClient + ?Sized,
+        K: OwnerPublishPort + ?Sized,
+    >(
+        &mut self,
+        reads: &R,
+        kernel: &K,
+        origins: &[String],
+        max_records: u32,
+        expected_revision: u64,
+        state_ingress: Option<&AuthorityOwnerStateIngress>,
+    ) -> Result<(u64, RevocationHistoryRoot), CompositionError> {
+        let snapshot = self.owners.authority.snapshot()?;
+        let state_fence = self.snapshot.state_fence();
+        let (
+            PreparedOwnerFeed {
+                mut provider,
+                history,
+            },
+            history_root,
+        ) = prepare_owner_feed_for_roots(
+            reads,
+            snapshot.clone(),
+            &state_fence,
+            origins,
+            max_records,
+        )
+        .await?;
+        if state_ingress.is_none()
+            && self.owner_feed_watermark.as_ref()
+                == Some(&(expected_revision, history_root.clone()))
+        {
+            return Ok((expected_revision, history_root));
+        }
+        if state_ingress.is_none() {
+            if !history.closures.is_empty() {
+                return Err(CompositionError::Owner(
+                    "revocation fan-out requires an authenticated owner-state CAS ingress before publication"
+                        .to_owned(),
+                ));
+            }
+            if let Some(existing) = snapshot.revocation_fanout.as_ref()
+                && (existing.history_root_digest != history_root.ledger_digest
+                    || existing.history_revision != history_root.history_revision)
+            {
+                return Err(CompositionError::Owner(
+                    "persisted owner fan-out state is stale for the current Store history root"
+                        .to_owned(),
+                ));
+            }
+            let revision = publish_owner_feed(kernel, &provider, expected_revision).await?;
+            self.owner_feed_watermark = Some((expected_revision, history_root.clone()));
+            return Ok((revision, history_root));
+        }
+
+        // Build the complete post-history Authority image off to the side.
+        // The live owner is never used as a scratch pad: a failed context
+        // compile, persistence CAS, readback, or publication must not install
+        // claims, effect contests, or fan-out state in the current process.
+        let restored = AuthorityOwner::from_snapshot_with_revocation_history(
+            &snapshot,
+            &state_fence,
+            Some(&history),
+        )?;
+        let mut candidate_owner = restored.owner;
+        let mut graph = Vec::new();
+        let mut affected = BTreeSet::new();
+        for closure in &history.closures {
+            affected.insert(closure.root_ref.clone());
+            for dependent in &closure.dependent_refs {
+                affected.insert(dependent.clone());
+                graph.push(eliot_influence::InfluenceEdge {
+                    source_ref: closure.root_ref.clone(),
+                    dependent_ref: dependent.clone(),
+                });
+            }
+        }
+        let grant_snapshot = candidate_owner
+            .grants
+            .recovery_snapshot()
+            .map_err(|error| {
+                CompositionError::Owner(format!("grant graph recovery failed: {error}"))
+            })?;
+        for grant in &grant_snapshot.grants {
+            graph.push(eliot_influence::InfluenceEdge {
+                source_ref: grant.authority_root_ref.clone(),
+                dependent_ref: grant.grant_id.clone(),
+            });
+            if let Some(parent) = &grant.parent_grant_id {
+                graph.push(eliot_influence::InfluenceEdge {
+                    source_ref: parent.as_str().to_owned(),
+                    dependent_ref: grant.grant_id.clone(),
+                });
+            }
+        }
+        for closure in &history.closures {
+            affected.extend(eliot_influence::traverse_dependency_closure(
+                &closure.root_ref,
+                &graph,
+            ));
+        }
+        for grant in &grant_snapshot.grants {
+            candidate_owner.register_revocation_claim(
+                eliot_authority::RevocationDependentClaim {
+                    id: format!("justification:{}", grant.grant_id),
+                    kind: "justification".to_owned(),
+                    support_refs: BTreeSet::from([grant.authority_root_ref.clone()]),
+                },
+            )?;
+        }
+        let (context, recipe) = self.current_product_context(&state_fence, &candidate_owner)?;
+        if let Some(plan) = self
+            .owners
+            .canonical
+            .read_current_plan_optional(&state_fence)?
+        {
+            let support_refs = affected
+                .iter()
+                .filter(|reference| *reference == &plan.plan_id)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if !support_refs.is_empty() {
+                candidate_owner.register_revocation_claim(
+                    eliot_authority::RevocationDependentClaim {
+                        id: format!("plan:{}", plan.plan_id),
+                        kind: "plan".to_owned(),
+                        support_refs,
+                    },
+                )?;
+            }
+        }
+        let current_claims = candidate_owner
+            .revocation_claims()
+            .into_iter()
+            .map(|claim| RevocationClaim {
+                id: claim.id,
+                support_refs: claim.support_refs,
+            })
+            .collect();
+        let fanout = apply_revocation_fanout(&RevocationFanoutInput {
+            history: history.clone(),
+            graph,
+            context: context.clone(),
+            recipe: recipe.clone(),
+            current_claims,
+        })?;
+        let revoked_roots = fanout.affected_refs.clone();
+        candidate_owner.contest_effects_for_revocation(&revoked_roots);
+        let active_view = DurableActiveView::from_compilation(
+            context,
+            recipe,
+            fanout.compiled_context.clone(),
+            revoked_roots.clone(),
+        )?;
+        let fanout_state = RevocationFanoutState {
+            schema: crate::revocation_workflow::REVOCATION_FANOUT_STATE_SCHEMA.to_owned(),
+            version: crate::revocation_workflow::REVOCATION_FANOUT_STATE_VERSION,
+            state_fence: state_fence.clone(),
+            history_root_digest: history_root.ledger_digest.clone(),
+            history_revision: history_root.history_revision,
+            closure_ids: history
+                .closures
+                .iter()
+                .map(|closure| closure.closure_id.clone())
+                .collect(),
+            affected_refs: revoked_roots.clone(),
+            active_view: Some(active_view),
+            invalidation_keys: fanout.invalidation_keys.clone(),
+            contested_claims: fanout.contested_claims.clone(),
+            rebuild_orders: fanout.rebuild_orders.clone(),
+            problems: fanout.problems.clone(),
+            effect_contest_roots: revoked_roots.clone(),
+        };
+        fanout_state
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        candidate_owner.set_revocation_fanout(fanout_state)?;
+        let candidate_snapshot = candidate_owner.snapshot()?;
+
+        // Rebind the local provider to the exact candidate image before any
+        // publication. `OwnerClosureProvider::restore` normalizes the graph
+        // under history, so this bundle cannot carry the pre-revocation
+        // graph even when the Store owner image was read earlier.
+        provider.refresh(
+            candidate_snapshot.clone(),
+            Some(history.clone()),
+            expected_revision,
+        )?;
+
+        // The maintenance-only path returned above; every semantic fan-out
+        // therefore has an authenticated owner-state CAS witness.
+        let state_ingress = state_ingress.ok_or_else(|| {
+            CompositionError::Owner(
+                "revocation fan-out requires an authenticated owner-state CAS ingress".to_owned(),
+            )
+        })?;
+        let (persisted_snapshot, read, receipt) = self
+            .persist_authority_owner_snapshot_and_readback(&candidate_snapshot, state_ingress)
+            .await?;
+        let revision = publish_owner_feed(kernel, &provider, expected_revision).await?;
+        self.install_authority_owner_readback(persisted_snapshot, read, receipt)?;
+
+        self.scheduled_rebuilds = fanout.rebuild_orders.clone();
+        self.revocation_invalidation_keys
+            .extend(fanout.invalidation_keys.iter().cloned());
+        self.derivative_invalidation
+            .invalidate(&fanout.invalidation_keys);
+        self.revoked_lineage.extend(revoked_roots);
+        self.owner_feed_watermark = Some((expected_revision, history_root.clone()));
+        Ok((revision, history_root))
     }
 
     /// Reads one coherent semantic activation from all required owner records.

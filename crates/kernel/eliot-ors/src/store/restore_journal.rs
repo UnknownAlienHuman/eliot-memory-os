@@ -13,6 +13,7 @@
 
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
+use super::RESTORE_JOURNAL_STATE_CURRENT;
 use super::RedbRecoveryStore;
 use super::persistence_codec::{PersistedValue, decode_named, encode};
 use super::storage;
@@ -21,7 +22,7 @@ use crate::model::sha256_hex;
 use crate::restore_journal::{
     MAX_JOURNAL_PAGE_ENTRIES, MAX_JOURNAL_PAYLOAD_BYTES, MAX_JOURNAL_STREAM_KEY_BYTES,
     RESTORE_JOURNAL_RECORD_SCHEMA, RESTORE_JOURNAL_SCHEMA_VERSION, RestoreJournalEntry,
-    RestoreJournalOperation, RestoreJournalResult,
+    RestoreJournalOperation, RestoreJournalResult, RestoreJournalStateRecord,
 };
 
 /// Versioned intent table: owner-neutral restore intent rows.
@@ -48,6 +49,14 @@ impl PersistedValue for RestoreJournalEntry {
 
 impl PersistedValue for RestoreJournalResult {
     const RECORD_TYPE: &'static str = "restore_journal_result";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PersistedValue for RestoreJournalStateRecord {
+    const RECORD_TYPE: &'static str = "restore_journal_state";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
@@ -251,6 +260,92 @@ impl RedbRecoveryStore {
         }
         write.commit().map_err(storage)?;
         Ok(RESTORE_JOURNAL_SCHEMA_VERSION)
+    }
+
+    /// Loads one exact opaque restore-journal state row, if present.
+    pub fn load_restore_journal_state(
+        &self,
+        journal_key: &str,
+    ) -> Result<Option<RestoreJournalStateRecord>, OrsError> {
+        validate_journal_text(journal_key, "restore_state.journal_key")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(RESTORE_JOURNAL_STATE_CURRENT)
+            .map_err(storage)?;
+        table
+            .get(journal_key)
+            .map_err(storage)?
+            .map(|value| {
+                let record: RestoreJournalStateRecord =
+                    decode_named(value.value(), "restore_journal_state")?;
+                record.validate()?;
+                if record.journal_key != journal_key {
+                    return Err(integrity(
+                        "restore_journal_state",
+                        "journal key does not match the durable row",
+                    ));
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Compare-and-swaps one opaque restore-journal state row.
+    ///
+    /// Revision zero is the explicit initial state used by the backup
+    /// coordinator. Every later write must advance by exactly one; an exact
+    /// replay is idempotent, while a stale or skipped revision refuses.
+    pub fn compare_and_swap_restore_journal_state(
+        &self,
+        journal_key: &str,
+        expected_revision: u64,
+        next: RestoreJournalStateRecord,
+    ) -> Result<(), OrsError> {
+        validate_journal_text(journal_key, "restore_state.journal_key")?;
+        next.validate()?;
+        if next.journal_key != journal_key {
+            return Err(integrity(
+                "restore_journal_state",
+                "next journal key does not match the requested key",
+            ));
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut table = write
+                .open_table(RESTORE_JOURNAL_STATE_CURRENT)
+                .map_err(storage)?;
+            let current = table
+                .get(journal_key)
+                .map_err(storage)?
+                .map(|value| {
+                    decode_named::<RestoreJournalStateRecord>(
+                        value.value(),
+                        "restore_journal_state",
+                    )
+                })
+                .transpose()?;
+            if let Some(current) = current {
+                current.validate()?;
+                if current.revision != expected_revision {
+                    return Err(OrsError::DuplicateConflict);
+                }
+                if current == next {
+                    return Ok(());
+                }
+                if next.revision != expected_revision.saturating_add(1) {
+                    return Err(integrity(
+                        "restore_journal_state",
+                        "journal revision must advance by exactly one",
+                    ));
+                }
+            } else if expected_revision != 0 || next.revision != 0 {
+                return Err(OrsError::DuplicateConflict);
+            }
+            table
+                .insert(journal_key, encode(&next)?.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)
     }
 
     /// Appends one intent with exact-predecessor compare, or replays it.

@@ -11,7 +11,9 @@ use serde::de::DeserializeOwned;
 use super::DurableGrantClosureRecord;
 use super::DurableGrantGraphRevision;
 use super::DurableInboxRecord;
+use super::DurableMaintenanceJobRecord;
 use super::DurableOperationalRecord;
+use super::DurableRuntimeLeaseRecord;
 use super::DurableSupervisionLeaseResult;
 use super::OperationalKind;
 use super::ScopeReservationHead;
@@ -348,6 +350,22 @@ impl PersistedValue for DurableSupervisionLeaseResult {
             return Err(OrsError::SupervisionLeaseBindingMismatch);
         }
         Ok(())
+    }
+}
+
+impl PersistedValue for DurableRuntimeLeaseRecord {
+    const RECORD_TYPE: &'static str = "runtime_lease_record";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PersistedValue for DurableMaintenanceJobRecord {
+    const RECORD_TYPE: &'static str = "maintenance_job_record";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
     }
 }
 

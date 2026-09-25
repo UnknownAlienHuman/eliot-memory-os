@@ -4,11 +4,11 @@ use eliot_contracts::{
 use eliot_platform::{PlatformHandle, SecretReference};
 use eliot_receipts::{ReceiptDisposition, ReceiptEnvelope};
 use eliot_runtime_contracts::{
-    GenerationCutoverRecord as RuntimeGenerationCutoverRecord, LeaseState, SignedSupervisionLease,
-    SupervisionGenerationBinding, SupervisionLease, SupervisionLeaseActiveStateBinding,
-    SupervisionLeaseTerminalDisposition, SupervisionLeaseVerificationContext,
-    SupervisionObservationScope, SupervisionOrsMirrorBinding, VerifiedSupervisionLease,
-    VerifiedSupervisionLeaseTerminalTransition,
+    GenerationCutoverRecord as RuntimeGenerationCutoverRecord, LeaseState, RuntimeLease,
+    SignedSupervisionLease, SupervisionGenerationBinding, SupervisionLease,
+    SupervisionLeaseActiveStateBinding, SupervisionLeaseTerminalDisposition,
+    SupervisionLeaseVerificationContext, SupervisionObservationScope, SupervisionOrsMirrorBinding,
+    VerifiedSupervisionLease, VerifiedSupervisionLeaseTerminalTransition,
 };
 use eliot_security_contracts::PrivacyClass;
 use schemars::JsonSchema;
@@ -1872,6 +1872,223 @@ operational_input!(CapabilityGrantRevocation);
 operational_input!(CapabilityIntroductionActivation);
 operational_input!(CapabilityIntroductionFence);
 
+/// Stable schema for the opaque Kernel-issued runtime lease record.
+pub const DURABLE_RUNTIME_LEASE_SCHEMA: &str = "eliot.ors.runtime-lease.v1";
+/// Stable schema version for the opaque Kernel-issued runtime lease record.
+pub const DURABLE_RUNTIME_LEASE_VERSION: u16 = 1;
+/// Stable schema for the opaque durable maintenance-job record.
+pub const DURABLE_MAINTENANCE_JOB_SCHEMA: &str = "eliot.ors.maintenance-job.v1";
+/// Stable schema version for the opaque durable maintenance-job record.
+pub const DURABLE_MAINTENANCE_JOB_VERSION: u16 = 1;
+
+/// Non-semantic lifecycle marker retained beside an operational payload.
+///
+/// ORS stores this marker for restart/reconciliation only. It does not
+/// interpret the payload or grant a lease, job, or capability.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DurableOperationalState {
+    /// The authenticated owner has admitted the record.
+    Active,
+    /// An external outcome is being reconciled under the original identity.
+    Reconciling,
+    /// The owner has released the record without a terminal effect.
+    Released,
+    /// The owner has fenced the record.
+    Fenced,
+    /// The owner cannot currently establish the external outcome.
+    Unknown,
+}
+
+/// Integrity-bound opaque record for one Kernel-issued runtime lease.
+///
+/// `payload` is the exact canonical JSON lease projection supplied by Kernel;
+/// ORS validates only its bytes, identity, fence, and reconciliation metadata.
+/// The semantic lease owner remains Kernel and the daemon-side adapter.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableRuntimeLeaseRecord {
+    /// Closed record schema.
+    pub schema: String,
+    /// Closed record schema version.
+    pub version: u16,
+    /// Monotonic ORS revision for this lease identity.
+    pub revision: u64,
+    /// Stable lease identity.
+    pub lease_id: OperationIdentity,
+    /// Fence captured by Kernel at issuance.
+    pub state_fence: StateFence,
+    /// Authenticated Kernel operation that issued the lease.
+    pub issuer_operation_id: OperationIdentity,
+    /// Digest of the exact authenticated issuance request.
+    pub request_digest: String,
+    /// Exact canonical opaque lease payload.
+    pub payload: String,
+    /// SHA-256 of `payload`.
+    pub payload_sha256: String,
+    /// Current non-semantic reconciliation marker.
+    pub reconciliation_state: DurableOperationalState,
+    /// Optional owner-supplied reconciliation evidence handle.
+    pub reconciliation_ref: Option<OpaqueLabel>,
+}
+
+impl DurableRuntimeLeaseRecord {
+    /// Constructs the first durable revision for a Kernel-issued lease.
+    pub fn first(
+        lease: &RuntimeLease,
+        issuer_operation_id: OperationIdentity,
+        request_digest: String,
+        payload: String,
+    ) -> Result<Self, OrsError> {
+        let record = Self {
+            schema: DURABLE_RUNTIME_LEASE_SCHEMA.to_owned(),
+            version: DURABLE_RUNTIME_LEASE_VERSION,
+            revision: 1,
+            lease_id: OpaqueLabel::new(lease.lease_id.clone())?,
+            state_fence: lease.state_fence.clone(),
+            issuer_operation_id,
+            request_digest,
+            payload,
+            payload_sha256: String::new(),
+            reconciliation_state: DurableOperationalState::Active,
+            reconciliation_ref: None,
+        };
+        let mut record = record;
+        record.payload_sha256 = sha256_hex(record.payload.as_bytes());
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// Validates opaque bytes and all non-semantic identity bindings.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.schema != DURABLE_RUNTIME_LEASE_SCHEMA
+            || self.version != DURABLE_RUNTIME_LEASE_VERSION
+            || self.revision == 0
+        {
+            return Err(OrsError::InvalidField {
+                field: "runtime_lease_record_schema",
+                reason: "unsupported schema, version, or zero revision",
+            });
+        }
+        validate_text(self.lease_id.as_str(), "runtime_lease_id")?;
+        validate_text(
+            self.issuer_operation_id.as_str(),
+            "runtime_lease_issuer_operation_id",
+        )?;
+        validate_digest(&self.request_digest, "runtime_lease_request_digest")?;
+        validate_digest(&self.payload_sha256, "runtime_lease_payload_sha256")?;
+        if self.payload.is_empty() || self.payload.len() as u64 > MAX_INLINE_RECOVERY_BYTES {
+            return Err(OrsError::PayloadTooLarge);
+        }
+        let value: serde_json::Value = serde_json::from_str(&self.payload)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if !value.is_object() || sha256_hex(self.payload.as_bytes()) != self.payload_sha256 {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        if let Some(reference) = &self.reconciliation_ref {
+            validate_text(reference.as_str(), "runtime_lease_reconciliation_ref")?;
+        }
+        Ok(())
+    }
+
+    /// Returns whether this record is still usable as an active lease row.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        matches!(self.reconciliation_state, DurableOperationalState::Active)
+    }
+}
+
+/// Integrity-bound opaque record for one durable maintenance job.
+///
+/// The job JSON remains owner-decoded by the maintenance/Kernel adapter. ORS
+/// supplies only durable identity, revision, fence, and reconciliation state.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableMaintenanceJobRecord {
+    /// Closed record schema.
+    pub schema: String,
+    /// Closed record schema version.
+    pub version: u16,
+    /// Monotonic ORS revision for this job identity.
+    pub revision: u64,
+    /// Stable job identity.
+    pub job_id: OperationIdentity,
+    /// Fence captured by the authenticated owner.
+    pub state_fence: StateFence,
+    /// Authenticated operation that last persisted the job revision.
+    pub issuer_operation_id: OperationIdentity,
+    /// Digest of the exact authenticated persistence request.
+    pub request_digest: String,
+    /// Exact canonical opaque maintenance-job payload.
+    pub payload: String,
+    /// SHA-256 of `payload`.
+    pub payload_sha256: String,
+    /// Current non-semantic reconciliation marker.
+    pub reconciliation_state: DurableOperationalState,
+    /// Optional owner-supplied reconciliation evidence handle.
+    pub reconciliation_ref: Option<OpaqueLabel>,
+}
+
+impl DurableMaintenanceJobRecord {
+    /// Constructs the first durable revision for a maintenance job.
+    pub fn first(
+        job_id: &str,
+        state_fence: StateFence,
+        issuer_operation_id: OperationIdentity,
+        request_digest: String,
+        payload: String,
+    ) -> Result<Self, OrsError> {
+        let mut record = Self {
+            schema: DURABLE_MAINTENANCE_JOB_SCHEMA.to_owned(),
+            version: DURABLE_MAINTENANCE_JOB_VERSION,
+            revision: 1,
+            job_id: OpaqueLabel::new(job_id)?,
+            state_fence,
+            issuer_operation_id,
+            request_digest,
+            payload,
+            payload_sha256: String::new(),
+            reconciliation_state: DurableOperationalState::Active,
+            reconciliation_ref: None,
+        };
+        record.payload_sha256 = sha256_hex(record.payload.as_bytes());
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// Validates opaque bytes and all non-semantic identity bindings.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.schema != DURABLE_MAINTENANCE_JOB_SCHEMA
+            || self.version != DURABLE_MAINTENANCE_JOB_VERSION
+            || self.revision == 0
+        {
+            return Err(OrsError::InvalidField {
+                field: "maintenance_job_record_schema",
+                reason: "unsupported schema, version, or zero revision",
+            });
+        }
+        validate_text(self.job_id.as_str(), "maintenance_job_id")?;
+        validate_text(
+            self.issuer_operation_id.as_str(),
+            "maintenance_job_issuer_operation_id",
+        )?;
+        validate_digest(&self.request_digest, "maintenance_job_request_digest")?;
+        validate_digest(&self.payload_sha256, "maintenance_job_payload_sha256")?;
+        if self.payload.is_empty() || self.payload.len() as u64 > MAX_INLINE_RECOVERY_BYTES {
+            return Err(OrsError::PayloadTooLarge);
+        }
+        let value: serde_json::Value = serde_json::from_str(&self.payload)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if !value.is_object() || sha256_hex(self.payload.as_bytes()) != self.payload_sha256 {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        if let Some(reference) = &self.reconciliation_ref {
+            validate_text(reference.as_str(), "maintenance_job_reconciliation_ref")?;
+        }
+        Ok(())
+    }
+}
+
 /// Read-only ORS evidence for one Kernel generation transition or committed
 /// cutover.  The runtime contract and its integrity-bound ORS receipt are
 /// projected from the canonical operational current/history tables; ORS does
@@ -2127,12 +2344,26 @@ pub struct GrantClosurePreserved {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrantClosureCommit {
+    /// Stable closure identity. For an authority-revocation mirror this is
+    /// the canonical Store `closure_id`; it is never a process-local row id.
     pub operation_id: OperationIdentity,
+    /// Exact revoked/activated target. A target-scoped mirror read must match
+    /// this field exactly; root-prefix or grant-presence inference is forbidden.
     pub target_id: OperationIdentity,
+    /// Durable lineage root carried by the closure.
     pub authority_root: OpaqueLabel,
+    /// Exact authority/graph revision at which the closure was committed.
     pub revision: u64,
+    /// Canonical closure digest supplied by the owning semantic producer.
     pub digest: String,
+    /// Complete affected-reference denominator in canonical order.
     pub affected: Vec<OperationIdentity>,
+    /// Canonical digest of the exact affected-reference vector.
+    pub affected_digest: String,
+    /// State fence at which the closure was committed.
+    pub state_fence: StateFence,
+    /// Canonical digest of `state_fence`.
+    pub fence_digest: String,
     pub preserved: Vec<GrantClosurePreserved>,
     /// Introductions fenced live when the closure committed, in sorted
     /// order. They carry no supporting set here: the fence was verified
@@ -2152,6 +2383,26 @@ impl GrantClosureCommit {
             });
         }
         validate_digest(&self.digest, "grant_closure_digest")?;
+        self.state_fence
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        validate_digest(&self.affected_digest, "grant_closure_affected_digest")?;
+        let affected_text = self
+            .affected
+            .iter()
+            .map(|identity| identity.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let affected_bytes = canonical_json_bytes(&affected_text)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if sha256_hex(&affected_bytes) != self.affected_digest {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        validate_digest(&self.fence_digest, "grant_closure_fence_digest")?;
+        let fence_bytes = canonical_json_bytes(&self.state_fence)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if sha256_hex(&fence_bytes) != self.fence_digest {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
         if self.affected.is_empty() {
             return Err(OrsError::InvalidField {
                 field: "grant_closure_affected",

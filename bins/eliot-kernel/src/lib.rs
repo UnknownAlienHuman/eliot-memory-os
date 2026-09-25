@@ -74,7 +74,7 @@ pub use backup_capture_ports::{
 pub use backup_restore::{
     BlobOwnerClient, CanonicalOwnerClient, CutoverQualification, InvalidationKind,
     InvalidationOwnerClient, KernelBackupRestore, KernelRestoreOutcome, OrsOwnerClient,
-    PurgeOwnerClient, phase_owner,
+    ProductionOrsRestoreJournal, ProductionRestoreRequest, PurgeOwnerClient, phase_owner,
 };
 pub use backup_restore_ports::{
     DESTINATION_ADMISSION_FILE, DestinationManifestEvidence, KernelIsolatedDestination,
@@ -935,6 +935,8 @@ pub enum KernelFrameAction {
     Daemon {
         /// Correlation identity to echo in the response.
         request_id: RequestId,
+        /// Exact authenticated frame identity admitted by the front door.
+        identity: RequestIdentity,
         /// Closed operation name from the daemon application wire.
         operation: String,
         /// Bounded operation payload.

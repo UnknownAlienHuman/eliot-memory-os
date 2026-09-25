@@ -36,9 +36,11 @@ use eliot_store_api::{
     BackupOperationReconciliation, BlobResidency, BlobResidencyDomain, CONTRACT_VERSION,
     CanonicalRestoreBatch, DestinationClass, IsolatedDestination, IsolatedRestorePort,
     IsolationEvidence, MAX_RESTORE_MEMBERS, OperationIdentity, OrderingHeadExpectation,
-    OrderingScopeId, ReconciliationOutcome, RequestMeta, RestoreValidationReceipt,
-    RevisionHeadExpectation, RevisionKey, SnapshotCompleteness, SnapshotSourceIdentity, StoreError,
-    StoreMutationDisposition, reconcile_same_operation,
+    OrderingScopeId, REVOCATION_HISTORY_PAYLOAD_VERSION, ReconciliationOutcome, RequestMeta,
+    RestoreCleanRequalification, RestoreRevocationHistoryArtifact, RestoreValidationReceipt,
+    RevisionHeadExpectation, RevisionKey, RevocationHistoryPayload, RevocationHistoryRoot,
+    SnapshotCompleteness, SnapshotSourceIdentity, StoreError, StoreMutationDisposition,
+    reconcile_same_operation, sha256_hex,
 };
 use eliot_store_surreal_adapter::backup_restore::{
     MAX_ADMISSION_AGE_MS, MAX_RESTORE_BATCH_MEMBERS, MAX_RESTORE_BYTES, MAX_RESTORE_DURATION_MS,
@@ -114,6 +116,34 @@ fn valid_operation(id: &str, hash: &str) -> OperationIdentity {
     }
 }
 
+fn valid_revocation_history() -> RestoreRevocationHistoryArtifact {
+    let state_fence = fence();
+    let history_root = RevocationHistoryRoot::genesis(state_fence.clone()).expect("history root");
+    let payload = RevocationHistoryPayload {
+        version: REVOCATION_HISTORY_PAYLOAD_VERSION,
+        origin_ref: "root:restore-test".to_owned(),
+        source_revision: history_root.history_revision,
+        history_root: history_root.clone(),
+        closures: Vec::new(),
+    };
+    let bytes = serde_json::to_vec(&payload).expect("history payload serializes");
+    let sha256 = sha256_hex(&bytes);
+    RestoreRevocationHistoryArtifact {
+        artifact_id: "revocation-history-restore-test".to_owned(),
+        bytes,
+        sha256,
+        state_fence: state_fence.clone(),
+        current_history_root_digest: history_root.ledger_digest.clone(),
+        clean_requalification: RestoreCleanRequalification {
+            qualification_id: "restore-test-clean-requalification".to_owned(),
+            source_history_root_digest: history_root.ledger_digest,
+            state_fence,
+            proof_digest: hex('d'),
+            clean: true,
+        },
+    }
+}
+
 fn valid_batch() -> CanonicalRestoreBatch {
     CanonicalRestoreBatch {
         contract_version: CONTRACT_VERSION,
@@ -121,6 +151,7 @@ fn valid_batch() -> CanonicalRestoreBatch {
         source: valid_source(),
         destination: valid_destination(),
         archive_member_digest: hex('c'),
+        revocation_history: valid_revocation_history(),
         target_schema: TARGET_SCHEMA_952.to_owned(),
         purge_policy_revision: PURGE_REVISION_952,
         expected_revision_heads: vec![RevisionHeadExpectation {

@@ -524,6 +524,7 @@ impl KernelComposition {
                 }
                 return Ok(KernelFrameAction::Daemon {
                     request_id,
+                    identity: identity.clone(),
                     operation: operation.to_owned(),
                     payload,
                 });
@@ -892,6 +893,12 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "apply_prepared"
             | "receipt"
             | "store_named"
+            | super::daemon_request_dispatch::ISSUE_RUNTIME_LEASE_OPERATION
+            | super::daemon_request_dispatch::LOAD_RUNTIME_LEASE_OPERATION
+            | super::daemon_request_dispatch::LOAD_DURABLE_JOB_OPERATION
+            | super::daemon_request_dispatch::SAVE_DURABLE_JOB_OPERATION
+            | super::daemon_request_dispatch::LIST_DURABLE_JOBS_OPERATION
+            | super::daemon_request_dispatch::RESTORE_BACKUP_OPERATION
             | "local_read"
             | "local_read_claim"
             | "local_read_result"

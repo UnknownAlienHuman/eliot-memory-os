@@ -29,27 +29,26 @@
 //! [`CompositionError::Provider`]; every other deterministic admission
 //! refusal is [`CompositionError::Owner`].
 //!
-//! Honest gaps: `RecordAuthorityRevocation` and
-//! `GetAuthorityRevocationHistory` are known-but-unsupported at the store
-//! catalogue gate until a store-owned slice activates their rows with
-//! proven handlers (see `operation_catalogue`). The envelope therefore
-//! binds the generated catalogue set digest so it passes that gate
-//! unchanged once the row exists; until then commits fail closed with
-//! `UnknownOperation`, never as silent success. The `scope:governor`
-//! ordering-head expectation mirrors the operator/recovery precedent (the
-//! store enforces the live sequence).
+//! The store catalogue now admits both operations. The envelope binds the
+//! generated catalogue set digest; the store handler preserves the typed
+//! record in the durable recovery-owner ledger, and the history read serves
+//! that ledger to the production owner-feed restore gate. The
+//! `scope:governor` ordering-head expectation mirrors the operator/recovery
+//! precedent (the store enforces the live sequence).
 
 use std::collections::BTreeMap;
 
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{OperationId, canonical_json_bytes, sha256_hex};
 use eliot_protocol::RequestIdentity;
+use eliot_security_contracts::RevocationReason;
 use eliot_store_api::{
     EffectClass, EventProjectionRelationIntents, InfluenceDependencyClosure,
     NamedMutationOperation, NamedMutationRequest, NamedReadOperation, NamedReadRequest,
     NamedReadResponse, OperationManifestDigest, OrderingHeadExpectation, OrderingScopeId,
-    ReadConsistency, ScopeId, SecurityContext, TransitionClass, generated_operation_manifests,
-    operation_manifest_set_digest, parse_revocation_history_payload,
+    REVOCATION_HISTORY_ROOT_SELECTOR, ReadConsistency, RevocationHistoryRoot, ScopeId,
+    SecurityContext, TransitionClass, affected_reference_digest, generated_operation_manifests,
+    operation_manifest_set_digest, parse_revocation_history_payload, revocation_fence_digest,
 };
 
 use crate::CompositionError;
@@ -88,80 +87,192 @@ fn catalogue_set_digest() -> Result<OperationManifestDigest, CompositionError> {
     operation_manifest_set_digest(&entries).map_err(|error| owner_refused(error.to_string()))
 }
 
-/// Builds the canonical authority-revocation envelope binding one exact
-/// committed influence revocation.
+/// Authenticated, exact ingress for one authority-revocation record.
 ///
-/// The envelope reuses the exact identity types the store already keys on
-/// (`operation_id`, the request metadata fence, and the idempotency key
-/// from the admitted identity), so a later retry resolves through the
-/// receipt route instead of re-admitting. The `RecordAuthorityRevocation`
-/// parameters record the seven owner-approved revocation fields; ceilings
-/// stay fixed at `RecoverySchema` / `ReversibleMutation` by construction.
-/// `invalidation_reason` carries the terminal reason in its
-/// `SCREAMING_SNAKE_CASE` wire spelling; `closure_revision` and
-/// `affected_count` travel as decimal strings, mirroring how
-/// `AppendAuditEvent` carries `expected_revision`.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the envelope binds every recorded revocation identity explicitly; grouping them would hide a binding"
-)]
-pub fn authority_revocation_envelope(
-    identity: &RequestIdentity,
-    operation_id: &OperationId,
-    origin_ref: &str,
-    closure_id: &str,
-    closure_revision: u64,
-    affected_digest: &str,
-    affected_count: u64,
-    invalidation_reason: &str,
-    fence_digest: &str,
-) -> Result<CanonicalWriteEnvelope, CompositionError> {
-    identity
-        .validate()
-        .map_err(|error| identity_refused(error.to_string()))?;
-    let fence = &identity.request.metadata.state_fence;
-    if identity.request.state_fence != *fence {
-        return Err(identity_refused(
-            "admitted request fence does not match the request binding fence".to_owned(),
-        ));
-    }
-    for (value, field) in [
-        (origin_ref, "origin_ref"),
-        (closure_id, "closure_id"),
-        (affected_digest, "affected_digest"),
-        (invalidation_reason, "invalidation_reason"),
-        (fence_digest, "fence_digest"),
-    ] {
-        if value.trim().is_empty() || value.chars().any(char::is_control) {
-            return Err(owner_refused(format!(
-                "revocation {field} is blank or contains control characters"
-            )));
+/// The identity and operation id are supplied by the admitted front-door
+/// ingress; this type never manufactures either one.  The affected vector,
+/// digest/count, state-fence digest, independent history revision, per-root
+/// revision, and prior history-root digest are all checked before a canonical
+/// transition is built.  The prior root digest is the Store CAS witness: a
+/// caller cannot append a row to a stale or forked history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityRevocationIngress {
+    /// Identity admitted by the authenticated Kernel frame.
+    pub identity: RequestIdentity,
+    /// Stable canonical operation identity.
+    pub operation_id: OperationId,
+    /// Revoked origin.
+    pub origin_ref: String,
+    /// Stable closure identity.
+    pub closure_id: String,
+    /// Authority/graph revision carried by the closure.
+    pub closure_revision: u64,
+    /// Exact affected-reference denominator, including the origin.
+    pub affected_refs: Vec<String>,
+    /// Canonical digest of `affected_refs`.
+    pub affected_digest: String,
+    /// Exact affected-reference count.
+    pub affected_count: u64,
+    /// Closed terminal invalidation reason.
+    pub invalidation_reason: RevocationReason,
+    /// Canonical digest of the admitted state fence.
+    pub fence_digest: String,
+    /// Independent Store history revision to append.
+    pub history_revision: u64,
+    /// Independent per-origin root revision to append.
+    pub root_revision: u64,
+    /// Current complete Store history-root digest observed by ingress.
+    pub history_root_digest: String,
+    /// Current canonical ordering-head sequence observed by ingress.
+    pub expected_ordering_sequence: u64,
+}
+
+impl AuthorityRevocationIngress {
+    /// Validates the complete authenticated ingress without touching a Store.
+    pub fn validate(&self) -> Result<(), CompositionError> {
+        self.identity
+            .validate()
+            .map_err(|error| identity_refused(error.to_string()))?;
+        if self.identity.request.state_fence != self.identity.request.metadata.state_fence {
+            return Err(identity_refused(
+                "authenticated request fence does not match its request metadata".to_owned(),
+            ));
         }
+        if self.affected_refs.is_empty()
+            || self.affected_refs.windows(2).any(|pair| pair[0] >= pair[1])
+            || !self
+                .affected_refs
+                .iter()
+                .any(|value| value == &self.origin_ref)
+        {
+            return Err(owner_refused(
+                "revocation affected references must be sorted, unique, and include the origin"
+                    .to_owned(),
+            ));
+        }
+        if self.affected_count != self.affected_refs.len() as u64 {
+            return Err(owner_refused(
+                "revocation affected count does not match the exact reference vector".to_owned(),
+            ));
+        }
+        if affected_reference_digest(&self.affected_refs)
+            .map_err(|error| owner_refused(error.to_string()))?
+            != self.affected_digest
+        {
+            return Err(owner_refused(
+                "revocation affected digest does not match the exact reference vector".to_owned(),
+            ));
+        }
+        for (value, field) in [
+            (&self.origin_ref, "origin_ref"),
+            (&self.closure_id, "closure_id"),
+            (&self.fence_digest, "fence_digest"),
+            (&self.affected_digest, "affected_digest"),
+            (&self.history_root_digest, "history_root_digest"),
+        ] {
+            if value.trim().is_empty() || value.chars().any(char::is_control) {
+                return Err(owner_refused(format!(
+                    "revocation {field} is blank or contains controls"
+                )));
+            }
+        }
+        if self.origin_ref == REVOCATION_HISTORY_ROOT_SELECTOR {
+            return Err(owner_refused(
+                "the Store history root selector is reserved and cannot be a semantic origin"
+                    .to_owned(),
+            ));
+        }
+        if self.closure_revision == 0
+            || self.history_revision == 0
+            || self.root_revision == 0
+            || self.expected_ordering_sequence == 0
+        {
+            return Err(owner_refused(
+                "revocation revisions must all be non-zero".to_owned(),
+            ));
+        }
+        let fence = &self.identity.request.state_fence;
+        if revocation_fence_digest(fence).map_err(|error| owner_refused(error.to_string()))?
+            != self.fence_digest
+        {
+            return Err(identity_refused(
+                "revocation fence digest does not match the authenticated identity".to_owned(),
+            ));
+        }
+        if !is_digest(&self.affected_digest) || !is_digest(&self.history_root_digest) {
+            return Err(owner_refused(
+                "revocation digest fields must be lowercase SHA-256 values".to_owned(),
+            ));
+        }
+        Ok(())
     }
-    if closure_revision == 0 {
-        return Err(owner_refused(
-            "revocation closure revision must be non-zero".to_owned(),
-        ));
+
+    fn parameter_reason(&self) -> Result<String, CompositionError> {
+        serde_json::to_value(self.invalidation_reason)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| owner_refused("revocation reason is not encodable".to_owned()))
     }
-    if affected_count == 0 {
-        return Err(owner_refused(
-            "revocation affected count must be non-zero: the origin itself is always affected"
-                .to_owned(),
-        ));
-    }
+}
+
+/// Builds the canonical authority-revocation envelope from one authenticated
+/// ingress.  The operation id, request identity, exact affected denominator,
+/// fence, and independent history CAS witness all cross this single boundary.
+pub fn authority_revocation_envelope(
+    ingress: &AuthorityRevocationIngress,
+) -> Result<CanonicalWriteEnvelope, CompositionError> {
+    ingress.validate()?;
+    let identity = &ingress.identity;
+    let operation_id = &ingress.operation_id;
+    let fence = &identity.request.metadata.state_fence;
+    let reason = ingress.parameter_reason()?;
     let manifest_digest = catalogue_set_digest()?;
     let mut parameters = BTreeMap::new();
-    for (name, value) in [
-        ("origin_ref", origin_ref.to_owned()),
-        ("closure_id", closure_id.to_owned()),
-        ("closure_revision", closure_revision.to_string()),
-        ("affected_digest", affected_digest.to_owned()),
-        ("affected_count", affected_count.to_string()),
-        ("invalidation_reason", invalidation_reason.to_owned()),
-        ("fence_digest", fence_digest.to_owned()),
-    ] {
-        parameters.insert(name.to_owned(), serde_json::Value::String(value));
-    }
+    parameters.insert(
+        "origin_ref".to_owned(),
+        serde_json::Value::String(ingress.origin_ref.clone()),
+    );
+    parameters.insert(
+        "closure_id".to_owned(),
+        serde_json::Value::String(ingress.clone().closure_id),
+    );
+    parameters.insert(
+        "closure_revision".to_owned(),
+        serde_json::Value::String(ingress.closure_revision.to_string()),
+    );
+    parameters.insert(
+        "affected_refs".to_owned(),
+        serde_json::to_value(ingress.affected_refs.clone())
+            .map_err(|error| owner_refused(error.to_string()))?,
+    );
+    parameters.insert(
+        "affected_digest".to_owned(),
+        serde_json::Value::String(ingress.affected_digest.clone()),
+    );
+    parameters.insert(
+        "affected_count".to_owned(),
+        serde_json::Value::String(ingress.affected_count.to_string()),
+    );
+    parameters.insert(
+        "invalidation_reason".to_owned(),
+        serde_json::Value::String(reason),
+    );
+    parameters.insert(
+        "fence_digest".to_owned(),
+        serde_json::Value::String(ingress.fence_digest.clone()),
+    );
+    parameters.insert(
+        "history_revision".to_owned(),
+        serde_json::Value::String(ingress.history_revision.to_string()),
+    );
+    parameters.insert(
+        "root_revision".to_owned(),
+        serde_json::Value::String(ingress.root_revision.to_string()),
+    );
+    parameters.insert(
+        "history_root_digest".to_owned(),
+        serde_json::Value::String(ingress.history_root_digest.clone()),
+    );
     let envelope = CanonicalWriteEnvelope {
         operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
@@ -177,15 +288,19 @@ pub fn authority_revocation_envelope(
         transition_class: TransitionClass::RecoverySchema,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
         admission_contract_set_digest: canonical_digest(&(
-            origin_ref,
-            closure_id,
-            closure_revision,
-            affected_digest,
-            affected_count,
-            invalidation_reason,
-            fence_digest,
+            &ingress.origin_ref,
+            &ingress.closure_id,
+            ingress.closure_revision,
+            &ingress.affected_refs,
+            &ingress.affected_digest,
+            ingress.affected_count,
+            ingress.invalidation_reason,
+            &ingress.fence_digest,
+            ingress.history_revision,
+            ingress.root_revision,
+            &ingress.history_root_digest,
             operation_id.as_str(),
-            identity.idempotency_key.clone(),
+            identity.idempotency_key.as_str(),
         ))?,
         operation_manifest_digest: manifest_digest,
         semantic_commands: vec![NamedMutationRequest {
@@ -203,12 +318,19 @@ pub fn authority_revocation_envelope(
         expected_ordering_heads: vec![OrderingHeadExpectation {
             scope: OrderingScopeId::new(GOVERNOR_ORDERING_SCOPE)
                 .map_err(|error| owner_refused(error.to_string()))?,
-            expected_sequence: 1,
+            expected_sequence: ingress.expected_ordering_sequence,
             state_fence: fence.clone(),
         }],
     };
     envelope.validate()?;
     Ok(envelope)
+}
+
+fn is_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Builds the typed `GetAuthorityRevocationHistory` named read for one
@@ -278,10 +400,10 @@ pub fn revocation_history_read_request(
 /// (CURRENT vs stale/unknown) is enforced at restore by
 /// [`AuthorityOwner::from_snapshot_with_revocation_history`](crate::AuthorityOwner::from_snapshot_with_revocation_history),
 /// not here.
-pub fn decode_revocation_history_evidence(
+pub fn decode_revocation_history_with_root(
     response: &NamedReadResponse,
     expected_fence: &eliot_contracts::StateFence,
-) -> Result<RevocationHistoryEvidence, CompositionError> {
+) -> Result<(RevocationHistoryRoot, RevocationHistoryEvidence), CompositionError> {
     if response.operation != NamedReadOperation::GetAuthorityRevocationHistory {
         return Err(owner_refused(
             "revocation history response names a different operation".to_owned(),
@@ -298,6 +420,14 @@ pub fn decode_revocation_history_evidence(
     let payload = parse_revocation_history_payload(&response.payload).map_err(|error| {
         owner_refused(format!("revocation history payload is malformed: {error}"))
     })?;
+    payload
+        .validate_for_fence(&response.state_fence)
+        .map_err(|error| {
+            owner_refused(format!(
+                "revocation history payload fence/root is invalid: {error}"
+            ))
+        })?;
+    let history_root = payload.history_root.clone();
     let closures = payload
         .closures
         .into_iter()
@@ -307,15 +437,27 @@ pub fn decode_revocation_history_evidence(
             dependent_refs: row.dependent_refs,
             invalidation_reason: Some(row.invalidation_reason),
             current_influence: eliot_store_api::InfluenceState::Revoked,
-            state_fence: response.state_fence.clone(),
+            state_fence: row.state_fence,
             revision: row.revision,
         })
         .collect();
-    Ok(RevocationHistoryEvidence {
-        state_fence: response.state_fence.clone(),
-        source_revision: payload.source_revision,
-        closures,
-    })
+    Ok((
+        history_root,
+        RevocationHistoryEvidence {
+            state_fence: response.state_fence.clone(),
+            source_revision: payload.source_revision,
+            closures,
+        },
+    ))
+}
+
+/// Decodes one `GetAuthorityRevocationHistory` reply into typed
+/// revocation-history evidence.
+pub fn decode_revocation_history_evidence(
+    response: &NamedReadResponse,
+    expected_fence: &eliot_contracts::StateFence,
+) -> Result<RevocationHistoryEvidence, CompositionError> {
+    decode_revocation_history_with_root(response, expected_fence).map(|(_, history)| history)
 }
 
 #[cfg(test)]
@@ -336,6 +478,7 @@ mod authority_revocation_tests {
     use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling};
     use eliot_store_api::{
         REVOCATION_HISTORY_PAYLOAD_VERSION, RecordedRevocation, RevocationHistoryPayload,
+        RevocationHistoryRoot, advance_revocation_history_digest, recorded_revocation_digest,
     };
 
     use crate::{AuthorityOwner, AuthorityOwnerSnapshot};
@@ -444,21 +587,63 @@ mod authority_revocation_tests {
             .map(str::to_owned)
     }
 
+    fn ingress_for(
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        origin_ref: &str,
+        closure_id: &str,
+        closure_revision: u64,
+        affected_refs: Vec<String>,
+        invalidation_reason: RevocationReason,
+        history_revision: u64,
+        root_revision: u64,
+    ) -> AuthorityRevocationIngress {
+        let fence = &identity.request.state_fence;
+        let affected_digest = affected_reference_digest(&affected_refs).expect("affected digest");
+        let fence_digest = revocation_fence_digest(fence).expect("fence digest");
+        let affected_count = affected_refs.len() as u64;
+        AuthorityRevocationIngress {
+            identity: identity.clone(),
+            operation_id: operation_id.clone(),
+            origin_ref: origin_ref.to_owned(),
+            closure_id: closure_id.to_owned(),
+            closure_revision,
+            affected_refs,
+            affected_digest,
+            affected_count,
+            invalidation_reason,
+            fence_digest,
+            history_revision,
+            root_revision,
+            history_root_digest: "c".repeat(64),
+            expected_ordering_sequence: 1,
+        }
+    }
+
     #[test]
-    fn revocation_envelope_carries_the_closed_seven_field_command() {
+    fn revocation_envelope_carries_the_closed_ingress_fields() {
         let fence = fence();
-        let envelope = authority_revocation_envelope(
-            &identity(&fence),
-            &operation_id(),
+        let identity = identity(&fence);
+        let operation = operation_id();
+        let affected_refs = vec![
+            "grant:child".to_owned(),
+            "grant:origin".to_owned(),
+            "root:alpha".to_owned(),
+        ];
+        let mut ingress = ingress_for(
+            &identity,
+            &operation,
             "root:alpha",
             "revocation-686-01",
             9,
-            &"a".repeat(64),
-            3,
-            "SOURCE_REVOKED",
-            &"b".repeat(64),
-        )
-        .expect("envelope builds");
+            affected_refs,
+            RevocationReason::SourceRevoked,
+            2,
+            1,
+        );
+        ingress.affected_count = 3;
+        ingress.history_root_digest = "c".repeat(64);
+        let envelope = authority_revocation_envelope(&ingress).expect("envelope builds");
         assert_eq!(envelope.transition_class, TransitionClass::RecoverySchema);
         assert_eq!(
             envelope.requested_effect_ceiling,
@@ -480,7 +665,7 @@ mod authority_revocation_tests {
         assert_eq!(param(&envelope, "closure_revision").as_deref(), Some("9"));
         assert_eq!(
             param(&envelope, "affected_digest").as_deref(),
-            Some("a".repeat(64).as_str())
+            Some(ingress.affected_digest.as_str())
         );
         assert_eq!(param(&envelope, "affected_count").as_deref(), Some("3"));
         assert_eq!(
@@ -489,8 +674,10 @@ mod authority_revocation_tests {
         );
         assert_eq!(
             param(&envelope, "fence_digest").as_deref(),
-            Some("b".repeat(64).as_str())
+            Some(ingress.fence_digest.as_str())
         );
+        assert_eq!(param(&envelope, "history_revision").as_deref(), Some("2"));
+        assert_eq!(param(&envelope, "root_revision").as_deref(), Some("1"));
         let entries = generated_operation_manifests().expect("catalogue generates");
         let set_digest = operation_manifest_set_digest(&entries).expect("set digest");
         assert_eq!(envelope.operation_manifest_digest, set_digest);
@@ -501,25 +688,27 @@ mod authority_revocation_tests {
         let fence = fence();
         let identity = identity(&fence);
         let operation = operation_id();
+        let affected_refs = vec!["grant:child".to_owned(), "root:alpha".to_owned()];
         for (origin, closure, revision, count) in [
-            ("", "revocation-686-01", 9, 3),
-            ("root:alpha", "", 9, 3),
-            ("root:alpha", "revocation-686-01", 0, 3),
+            ("", "revocation-686-01", 9_u64, 2_u64),
+            ("root:alpha", "", 9, 2),
+            ("root:alpha", "revocation-686-01", 0, 2),
             ("root:alpha", "revocation-686-01", 9, 0),
         ] {
+            let mut ingress = ingress_for(
+                &identity,
+                &operation,
+                origin,
+                closure,
+                revision,
+                affected_refs.clone(),
+                RevocationReason::SourceRevoked,
+                2,
+                1,
+            );
+            ingress.affected_count = count;
             assert!(
-                authority_revocation_envelope(
-                    &identity,
-                    &operation,
-                    origin,
-                    closure,
-                    revision,
-                    &"a".repeat(64),
-                    count,
-                    "SOURCE_REVOKED",
-                    &"b".repeat(64),
-                )
-                .is_err(),
+                authority_revocation_envelope(&ingress).is_err(),
                 "blank origin/closure, zero revision, or zero count must refuse"
             );
         }
@@ -532,19 +721,19 @@ mod authority_revocation_tests {
             .expect("epoch"),
             ResourceGeneration::new(1).expect("generation"),
         );
+        let ingress = ingress_for(
+            &drifted,
+            &operation,
+            "root:alpha",
+            "revocation-686-01",
+            9,
+            affected_refs,
+            RevocationReason::SourceRevoked,
+            2,
+            1,
+        );
         assert!(
-            authority_revocation_envelope(
-                &drifted,
-                &operation,
-                "root:alpha",
-                "revocation-686-01",
-                9,
-                &"a".repeat(64),
-                3,
-                "SOURCE_REVOKED",
-                &"b".repeat(64),
-            )
-            .is_err(),
+            authority_revocation_envelope(&ingress).is_err(),
             "fence drift between binding and metadata must refuse"
         );
     }
@@ -585,18 +774,46 @@ mod authority_revocation_tests {
     }
 
     fn history_response(fence: &StateFence) -> NamedReadResponse {
+        let dependent_refs = vec!["grant:child".to_owned(), "grant:origin".to_owned()];
+        let affected_digest = affected_reference_digest(&dependent_refs).expect("affected digest");
+        let record = RecordedRevocation {
+            closure_id: "revocation-686-01".to_owned(),
+            root_ref: "root:alpha".to_owned(),
+            dependent_refs: dependent_refs.clone(),
+            affected_count: dependent_refs.len() as u64,
+            affected_digest,
+            invalidation_reason: RevocationReason::SourceRevoked,
+            state_fence: fence.clone(),
+            fence_digest: revocation_fence_digest(fence).expect("fence digest"),
+            revision: 9,
+            history_revision: 2,
+            root_revision: 1,
+        };
+        let mut history_root = RevocationHistoryRoot::genesis(fence.clone()).expect("genesis root");
+        history_root.history_revision = 2;
+        history_root.record_count = 1;
+        history_root.root_refs = vec!["root:alpha".to_owned()];
+        history_root
+            .root_revisions
+            .insert("root:alpha".to_owned(), 1);
+        history_root.ledger_digest = advance_revocation_history_digest(
+            &history_root.ledger_digest,
+            &recorded_revocation_digest(&record).expect("record digest"),
+        )
+        .expect("advance root");
+        history_root
+            .validate_against_records(std::slice::from_ref(&record))
+            .expect("root validates");
         let payload = RevocationHistoryPayload {
             version: REVOCATION_HISTORY_PAYLOAD_VERSION,
             origin_ref: "root:alpha".to_owned(),
-            source_revision: 9,
-            closures: vec![RecordedRevocation {
-                closure_id: "revocation-686-01".to_owned(),
-                root_ref: "root:alpha".to_owned(),
-                dependent_refs: vec!["grant:child".to_owned(), "grant:origin".to_owned()],
-                invalidation_reason: eliot_store_api::RevocationReason::SourceRevoked,
-                revision: 9,
-            }],
+            source_revision: history_root.history_revision,
+            history_root,
+            closures: vec![record],
         };
+        payload
+            .validate_for_fence(fence)
+            .expect("history payload validates");
         NamedReadResponse {
             operation: NamedReadOperation::GetAuthorityRevocationHistory,
             state_fence: fence.clone(),
@@ -610,7 +827,7 @@ mod authority_revocation_tests {
         let fence = fence();
         let evidence =
             decode_revocation_history_evidence(&history_response(&fence), &fence).expect("decode");
-        assert_eq!(evidence.source_revision, 9);
+        assert_eq!(evidence.source_revision, 2);
         assert_eq!(evidence.closures.len(), 1);
         let snapshot = owner_snapshot(&fence);
         let outcome = AuthorityOwner::from_snapshot_with_revocation_history(

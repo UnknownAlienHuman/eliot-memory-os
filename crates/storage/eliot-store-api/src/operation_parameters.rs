@@ -44,8 +44,9 @@
 //! idempotency key).
 //! Every other [`NamedReadOperation`](crate::NamedReadOperation) variant and
 //! every other [`NamedMutationOperation`](crate::NamedMutationOperation)
-//! variant stays known-but-unsupported and unadvertised, and no other mutation
-//! has an owner-approved typed schema yet.
+//! variant stays known-but-unsupported and unadvertised. The authority
+//! revocation read and mutation are now activated with their owner-approved
+//! typed schemas.
 //!
 //! This module is the single source of truth for those contracts: the closed
 //! operation-name mapping, the declared parameter list per activated
@@ -122,10 +123,7 @@ pub enum ParameterShape {
     /// `UpdateTaskState` fields (`task_id`, `event_id`, `from`, `to`,
     /// `expected_revision` as its decimal string, and `actor_ref`; `from` is
     /// optional because the proposing transition carries no predecessor state),
-    /// for the seven authority-revocation `RecordAuthorityRevocation` fields
-    /// (`origin_ref`, `closure_id`, `closure_revision` as its decimal string,
-    /// `affected_digest`, `affected_count` as its decimal string,
-    /// `invalidation_reason`, `fence_digest`), and for the
+    /// for the authority-revocation scalar fields, and for the
     /// two `GetEvidencePack` selectors (the exact captured-observation
     /// `subject` and the explicit `max_records` bound as its decimal
     /// string, range-checked against
@@ -142,6 +140,10 @@ pub enum ParameterShape {
     /// mechanism that bounds the activated reads), so no separate string
     /// length constant exists here.
     Subject,
+    /// A canonical, strictly ordered JSON array of non-blank reference strings.
+    /// This is used only for the exact affected-reference denominator of the
+    /// authority-revocation record; it is not a generic payload escape hatch.
+    ReferenceList,
     /// A closed canonical notification-state payload object (issue #1780):
     /// the canonical record, receipt, delivery-state, or authorization JSON
     /// for the `ApplyNotificationState` legs and the read selectors that
@@ -158,6 +160,7 @@ impl ParameterShape {
             Self::EpistemicRevision => "eliot.storage.epistemic-revision.v1",
             Self::OperationId => "operation-id",
             Self::Subject => "subject-text",
+            Self::ReferenceList => "reference-list-v1",
             Self::NotificationState => "eliot.notify.state.v1",
         }
     }
@@ -420,7 +423,7 @@ static GET_CAPABILITY_EVIDENCE_STATE_PARAMETERS: [ParameterDeclaration; 2] = [
 /// (`affected_count`), the terminal `invalidation_reason` in its
 /// `SCREAMING_SNAKE_CASE` wire spelling, and the `fence_digest` binding the
 /// record to its state fence.
-static RECORD_AUTHORITY_REVOCATION_PARAMETERS: [ParameterDeclaration; 7] = [
+static RECORD_AUTHORITY_REVOCATION_PARAMETERS: [ParameterDeclaration; 11] = [
     ParameterDeclaration {
         name: "origin_ref",
         shape: ParameterShape::Subject,
@@ -434,6 +437,11 @@ static RECORD_AUTHORITY_REVOCATION_PARAMETERS: [ParameterDeclaration; 7] = [
     ParameterDeclaration {
         name: "closure_revision",
         shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "affected_refs",
+        shape: ParameterShape::ReferenceList,
         required: true,
     },
     ParameterDeclaration {
@@ -456,6 +464,21 @@ static RECORD_AUTHORITY_REVOCATION_PARAMETERS: [ParameterDeclaration; 7] = [
         shape: ParameterShape::Subject,
         required: true,
     },
+    ParameterDeclaration {
+        name: "history_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "root_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "history_root_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
 ];
 
 /// Owner-approved revocation-history selectors for the
@@ -465,6 +488,27 @@ static RECORD_AUTHORITY_REVOCATION_PARAMETERS: [ParameterDeclaration; 7] = [
 /// `max_records` selectors and range-checked against
 /// [`REVOCATION_HISTORY_MAX_RECORDS`](crate::REVOCATION_HISTORY_MAX_RECORDS)
 /// by every handler.
+/// Owner-approved Authority-owner fan-out image fields. The Store persists
+/// the exact opaque snapshot bytes and arbitrates only the expected owner
+/// revision; the Governor owns every semantic field in the image.
+static RECORD_AUTHORITY_FANOUT_STATE_PARAMETERS: [ParameterDeclaration; 3] = [
+    ParameterDeclaration {
+        name: "owner_snapshot_json",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "owner_snapshot_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_owner_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+
 static GET_AUTHORITY_REVOCATION_HISTORY_PARAMETERS: [ParameterDeclaration; 2] = [
     ParameterDeclaration {
         name: "origin_ref",
@@ -943,6 +987,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::RecordFinishEvidence => "RecordFinishEvidence",
         NamedMutationOperation::AppendAuditEvent => "AppendAuditEvent",
         NamedMutationOperation::RecordAuthorityRevocation => "RecordAuthorityRevocation",
+        NamedMutationOperation::RecordAuthorityFanoutState => "RecordAuthorityFanoutState",
         NamedMutationOperation::ApplyErasure => "ApplyErasure",
         NamedMutationOperation::ApplyNotificationState => "ApplyNotificationState",
         NamedMutationOperation::ApplyReactiveInjectionState => "ApplyReactiveInjectionState",
@@ -966,6 +1011,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"RecordFinishEvidence" => Some(NamedMutationOperation::RecordFinishEvidence),
         b"AppendAuditEvent" => Some(NamedMutationOperation::AppendAuditEvent),
         b"RecordAuthorityRevocation" => Some(NamedMutationOperation::RecordAuthorityRevocation),
+        b"RecordAuthorityFanoutState" => Some(NamedMutationOperation::RecordAuthorityFanoutState),
         b"ApplyErasure" => Some(NamedMutationOperation::ApplyErasure),
         b"ApplyNotificationState" => Some(NamedMutationOperation::ApplyNotificationState),
         b"ApplyReactiveInjectionState" => Some(NamedMutationOperation::ApplyReactiveInjectionState),
@@ -1056,10 +1102,11 @@ pub const fn declared_read_parameters(
 /// `observation_record_id`, `observation_request_digest`); `UpdateTaskState`
 /// declares the six required-except-`from` task-control fields (`task_id`,
 /// `event_id`, optional `from`, `to`, `expected_revision`, `actor_ref`);
-/// `RecordAuthorityRevocation` declares the seven required
+/// `RecordAuthorityRevocation` declares the complete owner-approved
 /// authority-revocation fields (`origin_ref`, `closure_id`,
-/// `closure_revision`, `affected_digest`, `affected_count`,
-/// `invalidation_reason`, `fence_digest`); `ApplyEpistemicRevision` declares
+/// `closure_revision`, the exact affected-reference vector, its digest and
+/// count, `invalidation_reason`, `fence_digest`, the independent history and
+/// root revisions, and the prior history-root digest); `ApplyEpistemicRevision` declares
 /// the required `revision` epistemic-revision payload; `ApplyErasure`
 /// declares the five required canonical-erasure fields (`subject`,
 /// `surfaces`, `reason`, `requester`, `erasure_operation_id`);
@@ -1100,6 +1147,9 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::UpdateTaskState => &UPDATE_TASK_STATE_PARAMETERS,
         NamedMutationOperation::RecordAuthorityRevocation => {
             &RECORD_AUTHORITY_REVOCATION_PARAMETERS
+        }
+        NamedMutationOperation::RecordAuthorityFanoutState => {
+            &RECORD_AUTHORITY_FANOUT_STATE_PARAMETERS
         }
         NamedMutationOperation::ApplyErasure => &APPLY_ERASURE_PARAMETERS,
         NamedMutationOperation::ApplyEpistemicRevision => &EPISTEMIC_REVISION_PARAMETERS,
@@ -1185,7 +1235,9 @@ pub fn verify_declaration_holds_no_payload_encoding(
 ) -> Result<(), StoreError> {
     let structured = match declaration.shape {
         ParameterShape::OperationId | ParameterShape::Subject => false,
-        ParameterShape::EpistemicRevision | ParameterShape::NotificationState => true,
+        ParameterShape::ReferenceList
+        | ParameterShape::EpistemicRevision
+        | ParameterShape::NotificationState => true,
     };
     if structured && CONTROL_FIELD_DENYLIST.contains(&declaration.name) {
         return Err(StoreError::InvalidField {
@@ -1309,6 +1361,40 @@ fn check_declared_shape(
                     field: "operation.parameter",
                     reason: "subject must be a non-blank string",
                 });
+            }
+            Ok(())
+        }
+        ParameterShape::ReferenceList => {
+            let values = value.as_array().ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "affected_refs must be a JSON array",
+            })?;
+            if values.is_empty() {
+                return Err(StoreError::Empty {
+                    field: "operation.parameter.affected_refs",
+                });
+            }
+            let mut previous: Option<&str> = None;
+            for value in values {
+                let text = value.as_str().ok_or(StoreError::InvalidField {
+                    field: "operation.parameter.affected_refs",
+                    reason: "affected references must be strings",
+                })?;
+                if text.trim().is_empty() || text.chars().any(char::is_control) {
+                    return Err(StoreError::InvalidField {
+                        field: "operation.parameter.affected_refs",
+                        reason: "affected references must be non-blank strings",
+                    });
+                }
+                if let Some(previous) = previous
+                    && previous >= text
+                {
+                    return Err(StoreError::InvalidField {
+                        field: "operation.parameter.affected_refs",
+                        reason: "affected references must be strictly sorted and unique",
+                    });
+                }
+                previous = Some(text);
             }
             Ok(())
         }

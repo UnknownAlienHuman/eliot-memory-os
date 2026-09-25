@@ -29,9 +29,13 @@ use eliot_authority::{
     IntroductionRevocationRequest, P07AuthorityPort, P07PortError, SnapshotId,
 };
 use eliot_contracts::StateFence;
-use eliot_governor::{KernelGenerationSnapshotProvider, KernelPortError};
+use eliot_governor::{
+    AuthorityRevocationIngress, KernelGenerationSnapshotProvider, KernelPortError,
+    KernelTransitionPort, authority_revocation_envelope,
+};
 use eliot_receipts::AuthorityBinding;
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
+use eliot_store_api::{WriteReceipt, validate_store_receipt_envelope};
 
 use super::{DaemonKernelClient, kind_value};
 
@@ -72,6 +76,48 @@ impl KernelAuthorityClient {
 
     fn active_fence(&self) -> StateFence {
         self.kernel.snapshot().state_fence()
+    }
+
+    /// Commits the complete authenticated authority-revocation ingress
+    /// through the same Canonical → Kernel → Store path as every other
+    /// Governor write. This is deliberately separate from
+    /// [`P07AuthorityPort::revoke_grant`], whose payload is only the P-07
+    /// metadata/receipt operation.
+    pub(crate) async fn record_authority_revocation(
+        &self,
+        ingress: &AuthorityRevocationIngress,
+    ) -> Result<WriteReceipt, KernelPortError> {
+        let envelope = authority_revocation_envelope(ingress)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        let transition = envelope
+            .prepare()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        let expected_transition = transition.clone();
+        let receipt = self
+            .kernel
+            .apply_prepared(
+                &ingress.identity,
+                transition,
+                envelope.expected_revision_heads.clone(),
+                envelope.expected_ordering_heads.clone(),
+            )
+            .await?;
+        validate_store_receipt_envelope(
+            &ingress.identity.request.metadata,
+            &expected_transition,
+            &receipt,
+        )
+        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if receipt.operation_id != ingress.operation_id
+            || receipt.idempotency_key != ingress.identity.idempotency_key
+            || receipt.state_fence != ingress.identity.request.state_fence
+        {
+            return Err(KernelPortError::Contract(
+                "authority-revocation receipt does not match the exact authenticated ingress"
+                    .to_owned(),
+            ));
+        }
+        Ok(receipt)
     }
 }
 

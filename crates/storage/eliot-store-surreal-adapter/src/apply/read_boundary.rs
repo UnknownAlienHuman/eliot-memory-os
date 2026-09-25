@@ -18,8 +18,11 @@ use crate::schema;
 use eliot_store_api::{
     CanonicalValidationSnapshot, EVIDENCE_PACK_MAX_RECORDS, ExactJsonBytes, NamedReadOperation,
     NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingScopeId,
-    PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, RevisionHead, RevisionKey, ScopeId,
-    ScopeRevisionView, StateFence, StoreError, WriteReceipt, WriteReceiptStatus,
+    PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, REVOCATION_HISTORY_MAX_RECORDS,
+    REVOCATION_HISTORY_PAYLOAD_VERSION, REVOCATION_HISTORY_ROOT_KEY,
+    REVOCATION_HISTORY_ROOT_NAMESPACE, REVOCATION_HISTORY_ROOT_SCHEMA, RecordedRevocation,
+    RecoveryRecord, RevisionHead, RevisionKey, RevocationHistoryPayload, RevocationHistoryRoot,
+    ScopeId, ScopeRevisionView, StateFence, StoreError, WriteReceipt, WriteReceiptStatus,
     generated_operation_manifests, named_mutation_operation_name,
 };
 
@@ -381,6 +384,9 @@ async fn named_read_payload(
         NamedReadOperation::GetAuditRange => {
             audit_range_payload(db, &adapter.config, query, state_fence).await
         }
+        NamedReadOperation::GetAuthorityRevocationHistory => {
+            revocation_history_payload(db, &adapter.config, query, state_fence).await
+        }
         other => Err(AdapterError::NamedOperationUnavailable {
             operation: format!("{other:?}"),
         }),
@@ -643,6 +649,186 @@ async fn read_erasure_suppression(
     Ok(ErasureSuppression::Known(suppressed_pairs(
         &intents, &outcomes,
     )))
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RevocationOwnerRow {
+    namespace: String,
+    key: String,
+    state_fence: StateFence,
+    revision: u64,
+    schema: String,
+    payload: Vec<u8>,
+    value_digest: String,
+}
+
+/// Reads and validates the complete Store-owned revocation ledger in one
+/// provider read.  The root row and every immutable record are decoded
+/// before an origin projection is selected; a missing root, malformed row,
+/// stale fence, broken chain, or count mismatch is an integrity refusal.
+pub(crate) async fn read_revocation_ledger(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+) -> Result<(RevocationHistoryRoot, Vec<RecordedRevocation>), AdapterError> {
+    let mut bindings = Map::new();
+    bindings.insert(
+        "revocation_root_namespace".to_owned(),
+        json!(REVOCATION_HISTORY_ROOT_NAMESPACE),
+    );
+    bindings.insert(
+        "revocation_record_namespace".to_owned(),
+        json!("authority-revocation"),
+    );
+    let select = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = $revocation_root_namespace OR namespace = $revocation_record_namespace;";
+    let sql = format!("BEGIN TRANSACTION; {select} COMMIT TRANSACTION;");
+    let mut response = client::query(
+        db,
+        config,
+        "read.authority_revocation_ledger",
+        &sql,
+        bindings,
+    )
+    .await?;
+    if !response.take_errors().is_empty() {
+        return Err(AdapterError::Store(StoreError::InvalidProjection));
+    }
+    // The root and every immutable record are read in one provider
+    // transaction.  A torn scan is not an empty history and must never be
+    // filtered into one by the origin projection below.
+    let rows = take_vec::<RevocationOwnerRow>(&mut response, 1)?;
+    let mut root = None;
+    let mut records = Vec::new();
+    for row in rows {
+        let record = RecoveryRecord {
+            namespace: row.namespace.clone(),
+            key: row.key.clone(),
+            state_fence: row.state_fence,
+            revision: row.revision,
+            schema: row.schema,
+            value_digest: row.value_digest,
+            payload: row.payload,
+        };
+        record.validate().map_err(AdapterError::Store)?;
+        if record.namespace == REVOCATION_HISTORY_ROOT_NAMESPACE {
+            if record.key != REVOCATION_HISTORY_ROOT_KEY
+                || record.schema != REVOCATION_HISTORY_ROOT_SCHEMA
+                || root.is_some()
+            {
+                return Err(AdapterError::Store(StoreError::InvalidProjection));
+            }
+            let decoded: RevocationHistoryRoot =
+                serde_json::from_slice(&record.payload).map_err(|error| {
+                    AdapterError::Store(StoreError::Serialization(format!(
+                        "revocation history root is malformed: {error}"
+                    )))
+                })?;
+            decoded.validate().map_err(AdapterError::Store)?;
+            if decoded.history_revision != record.revision
+                || decoded.state_fence != record.state_fence
+                || record.value_digest != eliot_store_api::sha256_hex(&record.payload)
+            {
+                return Err(AdapterError::Store(StoreError::InvalidProjection));
+            }
+            root = Some(decoded);
+        } else if record.namespace == "authority-revocation" {
+            let decoded: RecordedRevocation =
+                serde_json::from_slice(&record.payload).map_err(|error| {
+                    AdapterError::Store(StoreError::Serialization(format!(
+                        "revocation record {} is malformed: {error}",
+                        record.key
+                    )))
+                })?;
+            decoded.validate().map_err(AdapterError::Store)?;
+            if decoded.closure_id != record.key
+                || decoded.history_revision != record.revision
+                || decoded.state_fence != record.state_fence
+                || record.value_digest != eliot_store_api::sha256_hex(&record.payload)
+            {
+                return Err(AdapterError::Store(StoreError::InvalidProjection));
+            }
+            records.push(decoded);
+        } else {
+            return Err(AdapterError::Store(StoreError::InvalidProjection));
+        }
+    }
+    let root = root.ok_or(AdapterError::Store(StoreError::InvalidProjection))?;
+    root.validate_against_records(&records)
+        .map_err(AdapterError::Store)?;
+    Ok((root, records))
+}
+
+/// Reads the bounded current authority-revocation ledger from the durable
+/// recovery-owner table. The table is store-owned; this handler only decodes
+/// the exact typed record and applies the request's origin/bound.
+async fn revocation_history_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    let origin_ref = query
+        .parameters
+        .get("origin_ref")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "missing required parameter",
+        })?;
+    if origin_ref.trim().is_empty() || origin_ref.chars().any(char::is_control) {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "origin_ref must be a non-blank string",
+        }));
+    }
+    let max_records = query
+        .parameters
+        .get("max_records")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "missing required parameter",
+        })?
+        .parse::<u32>()
+        .map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "max_records must be a positive decimal bound",
+        })?;
+    if max_records == 0 || max_records > REVOCATION_HISTORY_MAX_RECORDS {
+        return Err(StoreError::PayloadTooLarge.into());
+    }
+    if query.scope_id.as_ref().map(ScopeId::as_str) != Some("governor") {
+        return Err(StoreError::ManifestMismatch.into());
+    }
+    let (history_root, all_records) = read_revocation_ledger(db, config).await?;
+    history_root.validate().map_err(AdapterError::Store)?;
+    if history_root.state_fence != *state_fence {
+        return Err(StoreError::FenceMismatch.into());
+    }
+    history_root
+        .validate_against_records(&all_records)
+        .map_err(AdapterError::Store)?;
+    let mut closures = all_records
+        .into_iter()
+        .filter(|closure| closure.root_ref == origin_ref)
+        .collect::<Vec<_>>();
+    closures.sort_by(|left, right| left.closure_id.cmp(&right.closure_id));
+    if closures.len() > max_records as usize {
+        return Err(StoreError::PayloadTooLarge.into());
+    }
+    let payload = RevocationHistoryPayload {
+        version: REVOCATION_HISTORY_PAYLOAD_VERSION,
+        origin_ref: origin_ref.to_owned(),
+        source_revision: history_root.history_revision,
+        history_root,
+        closures,
+    };
+    payload
+        .validate_for_fence(state_fence)
+        .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(StoreError::FenceMismatch.into());
+    }
+    to_value(&payload)
 }
 
 /// Reads all persisted capture-evidence rows through the closed SELECT.

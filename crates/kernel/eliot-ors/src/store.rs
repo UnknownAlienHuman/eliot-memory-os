@@ -41,16 +41,17 @@ use crate::{
     AuthorityHandoffState, AuthorityRevocation, AuthorityRevocationReceipt,
     AuthoritySnapshotReceipt, CanonicalDisposition, CanonicalReconciliation,
     CapabilityGrantActivation, CapabilityGrantProjection, CapabilityGrantRevocation,
-    CapabilityIntroductionActivation, CapabilityIntroductionFence, CapabilityIntroductionProjection,
-    CapabilityIntroductionReceipt,
-    DeliveryAcknowledgement, DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity,
-    EpochLineage, GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
-    GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit, GrantClosureCommitReceipt,
-    GrantClosureProjection, HostRequestRecord, HostRequestState,
+    CapabilityIntroductionActivation, CapabilityIntroductionFence,
+    CapabilityIntroductionProjection, CapabilityIntroductionReceipt, DeliveryAcknowledgement,
+    DeliveryCursorReceipt, DeliveryCursorState, DurableMaintenanceJobRecord,
+    DurableOperationalState, DurableRuntimeLeaseRecord, EpochIdentity, EpochLineage,
+    GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
+    GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit,
+    GrantClosureCommitReceipt, GrantClosureProjection, HostRequestRecord, HostRequestState,
     JobCheckpoint, KernelAuthoritySnapshot, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
-    NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationalMutationReceipt,
-    OperationalPhase, OperationalRecordContext, OperationalRecordInput, OrsError,
-    OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord,
+    NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationIdentity,
+    OperationalMutationReceipt, OperationalPhase, OperationalRecordContext, OperationalRecordInput,
+    OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord,
     ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
     RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
     RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope, RecoveryProblem,
@@ -135,6 +136,16 @@ const GRANT_CLOSURE_CURRENT: TableDefinition<&str, &str> =
 /// the stored revision only moves forward.
 const GRANT_GRAPH_REVISION_CURRENT: TableDefinition<&str, &str> =
     TableDefinition::new("ors_grant_graph_revision_current_v1");
+/// Exact opaque restore-journal state rows used by the production backup
+/// adapter. The payload remains owner-neutral; ORS arbitrates only CAS.
+const RESTORE_JOURNAL_STATE_CURRENT: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_restore_journal_state_current_v1");
+/// Durable opaque Kernel-issued runtime lease rows.
+const RUNTIME_LEASE_RECORDS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_runtime_lease_records_v1");
+/// Durable opaque maintenance-job rows owned by Kernel/ORS.
+const MAINTENANCE_JOB_RECORDS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_maintenance_job_records_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY: &str = "supervision_stage_resolution_schema";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1: &str = "eliot.ors.supervision-stage-resolution.v1";
@@ -376,6 +387,17 @@ pub trait OperationalRecoveryStore: Send + Sync {
         lineage: &OpaqueLabel,
         limit: u16,
     ) -> Result<(Vec<GrantClosureProjection>, Option<u64>), OrsError>;
+    /// Scans only closure rows whose exact target is `target`.
+    ///
+    /// This is the canonical-mirror join: a target-scoped read never widens
+    /// a target into a root/grant-presence search. The selected rows are read
+    /// under one durable snapshot and retain operation order; an over-bound
+    /// exact set refuses rather than truncating.
+    fn scan_grant_closures_for_target(
+        &self,
+        target: &OpaqueLabel,
+        limit: u16,
+    ) -> Result<Vec<GrantClosureProjection>, OrsError>;
     fn activate_capability_introduction(
         &self,
         activation: CapabilityIntroductionActivation,
@@ -883,6 +905,253 @@ impl persistence_codec::PersistedValue for crate::DoctorBudgetLedger {
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
+    }
+}
+
+impl RedbRecoveryStore {
+    /// Commits one opaque Kernel-issued runtime-lease record with an exact
+    /// replay boundary. The immutable issuance binding cannot be replaced;
+    /// only the non-semantic reconciliation marker/revision may advance.
+    pub fn issue_runtime_lease_record(
+        &self,
+        record: &DurableRuntimeLeaseRecord,
+    ) -> Result<DurableRuntimeLeaseRecord, OrsError> {
+        record.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = record.lease_id.as_str();
+        let existing = {
+            let table = write.open_table(RUNTIME_LEASE_RECORDS).map_err(storage)?;
+            table
+                .get(key)
+                .map_err(storage)?
+                .map(|value| {
+                    decode_named::<DurableRuntimeLeaseRecord>(value.value(), "runtime_lease_record")
+                })
+                .transpose()?
+        };
+        let prior = existing.clone();
+        let next = if let Some(existing) = existing {
+            if existing.state_fence != record.state_fence
+                || existing.request_digest != record.request_digest
+                || existing.payload_sha256 != record.payload_sha256
+            {
+                return Err(OrsError::DuplicateConflict);
+            }
+            if existing.state_fence == record.state_fence
+                && existing.request_digest == record.request_digest
+                && existing.payload_sha256 == record.payload_sha256
+            {
+                existing
+            } else {
+                let mut next = record.clone();
+                next.revision = existing
+                    .revision
+                    .checked_add(1)
+                    .ok_or(OrsError::InvalidField {
+                        field: "runtime_lease_revision",
+                        reason: "revision overflow",
+                    })?;
+                next.validate()?;
+                next
+            }
+        } else {
+            record.clone()
+        };
+        if prior.is_none() || next.revision > 1 {
+            let encoded = encode(&next)?;
+            write
+                .open_table(RUNTIME_LEASE_RECORDS)
+                .map_err(storage)?
+                .insert(key, encoded.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(next)
+    }
+
+    /// Loads one exact durable runtime-lease record and revalidates its
+    /// integrity envelope before returning it to Kernel.
+    pub fn load_runtime_lease_record(
+        &self,
+        lease_id: &OperationIdentity,
+    ) -> Result<Option<DurableRuntimeLeaseRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(RUNTIME_LEASE_RECORDS).map_err(storage)?;
+        table
+            .get(lease_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: DurableRuntimeLeaseRecord =
+                    decode_named(value.value(), "runtime_lease_record")?;
+                if record.lease_id != *lease_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "runtime_lease_record",
+                        reason: "lease key does not match its durable identity".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Advances only the reconciliation projection of an existing lease. The
+    /// issuance identity, fence, request digest, and payload remain immutable.
+    pub fn reconcile_runtime_lease_record(
+        &self,
+        lease_id: &OperationIdentity,
+        expected_revision: u64,
+        reconciliation_state: DurableOperationalState,
+        reconciliation_ref: Option<OpaqueLabel>,
+    ) -> Result<DurableRuntimeLeaseRecord, OrsError> {
+        if expected_revision == 0 {
+            return Err(OrsError::InvalidField {
+                field: "runtime_lease_expected_revision",
+                reason: "must be non-zero",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = lease_id.as_str();
+        let mut record = {
+            let table = write.open_table(RUNTIME_LEASE_RECORDS).map_err(storage)?;
+            let value = table
+                .get(key)
+                .map_err(storage)?
+                .ok_or(OrsError::ReservationNotFound)?;
+            decode_named::<DurableRuntimeLeaseRecord>(value.value(), "runtime_lease_record")?
+        };
+        if record.lease_id != *lease_id || record.revision != expected_revision {
+            return Err(OrsError::InvalidField {
+                field: "runtime_lease_revision",
+                reason: "does not match the expected durable revision",
+            });
+        }
+        if record.reconciliation_state == reconciliation_state
+            && record.reconciliation_ref == reconciliation_ref
+        {
+            write.commit().map_err(storage)?;
+            return Ok(record);
+        }
+        record.revision = expected_revision
+            .checked_add(1)
+            .ok_or(OrsError::InvalidField {
+                field: "runtime_lease_revision",
+                reason: "revision overflow",
+            })?;
+        record.reconciliation_state = reconciliation_state;
+        record.reconciliation_ref = reconciliation_ref;
+        record.validate()?;
+        let encoded = encode(&record)?;
+        write
+            .open_table(RUNTIME_LEASE_RECORDS)
+            .map_err(storage)?
+            .insert(key, encoded.as_str())
+            .map_err(storage)?;
+        write.commit().map_err(storage)?;
+        Ok(record)
+    }
+
+    /// Commits one opaque durable maintenance-job revision. Exact payload
+    /// replay is idempotent; a changed payload advances only the ORS revision
+    /// under the same job identity and fence.
+    pub fn save_durable_maintenance_job(
+        &self,
+        record: &DurableMaintenanceJobRecord,
+    ) -> Result<DurableMaintenanceJobRecord, OrsError> {
+        record.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = record.job_id.as_str();
+        let existing = {
+            let table = write.open_table(MAINTENANCE_JOB_RECORDS).map_err(storage)?;
+            table
+                .get(key)
+                .map_err(storage)?
+                .map(|value| {
+                    decode_named::<DurableMaintenanceJobRecord>(
+                        value.value(),
+                        "maintenance_job_record",
+                    )
+                })
+                .transpose()?
+        };
+        let prior = existing.clone();
+        let next = if let Some(existing) = existing {
+            if existing.state_fence != record.state_fence {
+                return Err(OrsError::DuplicateConflict);
+            }
+            if existing.payload == record.payload {
+                existing
+            } else {
+                let mut next = record.clone();
+                next.revision = existing
+                    .revision
+                    .checked_add(1)
+                    .ok_or(OrsError::InvalidField {
+                        field: "maintenance_job_revision",
+                        reason: "revision overflow",
+                    })?;
+                next.validate()?;
+                next
+            }
+        } else {
+            record.clone()
+        };
+        if prior.is_none() || next.revision > 1 {
+            let encoded = encode(&next)?;
+            write
+                .open_table(MAINTENANCE_JOB_RECORDS)
+                .map_err(storage)?
+                .insert(key, encoded.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(next)
+    }
+
+    /// Loads one exact durable maintenance-job record.
+    pub fn load_durable_maintenance_job(
+        &self,
+        job_id: &OperationIdentity,
+    ) -> Result<Option<DurableMaintenanceJobRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(MAINTENANCE_JOB_RECORDS).map_err(storage)?;
+        table
+            .get(job_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: DurableMaintenanceJobRecord =
+                    decode_named(value.value(), "maintenance_job_record")?;
+                if record.job_id != *job_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "maintenance_job_record",
+                        reason: "job key does not match its durable identity".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Lists bounded durable maintenance-job rows for Kernel recovery.
+    pub fn load_all_durable_maintenance_jobs(
+        &self,
+    ) -> Result<Vec<DurableMaintenanceJobRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(MAINTENANCE_JOB_RECORDS).map_err(storage)?;
+        let mut records = Vec::new();
+        for row in table.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            let record: DurableMaintenanceJobRecord =
+                decode_named(value.value(), "maintenance_job_record")?;
+            if key.value() != record.job_id.as_str() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "maintenance_job_record",
+                    reason: "job key does not match its durable identity".to_owned(),
+                });
+            }
+            records.push(record);
+        }
+        records.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+        Ok(records)
     }
 }
 
@@ -4854,7 +5123,11 @@ impl RedbRecoveryStore {
             drop(write.open_table(DOCTOR_BUDGETS).map_err(storage)?);
             drop(write.open_table(RECOVERY_PROBLEMS).map_err(storage)?);
             drop(write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?);
-            drop(write.open_table(GRANT_GRAPH_REVISION_CURRENT).map_err(storage)?);
+            drop(
+                write
+                    .open_table(GRANT_GRAPH_REVISION_CURRENT)
+                    .map_err(storage)?,
+            );
             if initialize_resolution_schema {
                 let mut meta = write.open_table(META).map_err(storage)?;
                 meta.insert(
@@ -5492,8 +5765,7 @@ impl RedbRecoveryStore {
         let Some(value) = current.get(key.as_str()).map_err(storage)? else {
             return Ok(None);
         };
-        let row: DurableGrantGraphRevision =
-            decode_named(value.value(), "grant_graph_revision")?;
+        let row: DurableGrantGraphRevision = decode_named(value.value(), "grant_graph_revision")?;
         if row.root.as_str() != authority_root {
             return Err(OrsError::IntegrityProblem {
                 record_type: "grant_graph_revision",
@@ -6790,7 +7062,9 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             current
                 .get(key.as_str())
                 .map_err(storage)?
-                .map(|value| decode_named::<DurableGrantClosureRecord>(value.value(), "grant_closure"))
+                .map(|value| {
+                    decode_named::<DurableGrantClosureRecord>(value.value(), "grant_closure")
+                })
                 .transpose()?
         };
         if let Some(existing) = existing {
@@ -6801,9 +7075,9 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 });
             }
             if existing.commit == closure && existing.phase == phase {
-                return Ok(GrantClosureCommitReceipt::from_receipt(Self::closure_receipt_for(
-                    &existing,
-                )?));
+                return Ok(GrantClosureCommitReceipt::from_receipt(
+                    Self::closure_receipt_for(&existing)?,
+                ));
             }
             return Err(OrsError::DuplicateConflict);
         }
@@ -6816,7 +7090,9 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         let encoded = encode(&record)?;
         {
             let mut current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
-            current.insert(key.as_str(), encoded.as_str()).map_err(storage)?;
+            current
+                .insert(key.as_str(), encoded.as_str())
+                .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
         Ok(GrantClosureCommitReceipt::from_receipt(
@@ -6834,8 +7110,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         let Some(value) = current.get(key.as_str()).map_err(storage)? else {
             return Ok(None);
         };
-        let record: DurableGrantClosureRecord =
-            decode_named(value.value(), "grant_closure")?;
+        let record: DurableGrantClosureRecord = decode_named(value.value(), "grant_closure")?;
         if record.commit.operation_id.as_str() != operation_id.as_str() {
             return Err(OrsError::IntegrityProblem {
                 record_type: "grant_closure",
@@ -6871,8 +7146,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         let mut resolved_root: Option<String> = None;
         for row in current.iter().map_err(storage)? {
             let (key, value) = row.map_err(storage)?;
-            let record: DurableGrantClosureRecord =
-                decode_named(value.value(), "grant_closure")?;
+            let record: DurableGrantClosureRecord = decode_named(value.value(), "grant_closure")?;
             let expected = format!("grant_closure:{}", record.commit.operation_id.as_str());
             if key.value() != expected.as_str() {
                 return Err(OrsError::IntegrityProblem {
@@ -6923,6 +7197,51 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             ));
         }
         Ok((projections, watermark))
+    }
+
+    fn scan_grant_closures_for_target(
+        &self,
+        target: &OpaqueLabel,
+        limit: u16,
+    ) -> Result<Vec<GrantClosureProjection>, OrsError> {
+        if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+        let mut rows: Vec<(u64, DurableGrantClosureRecord)> = Vec::new();
+        for row in current.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            let record: DurableGrantClosureRecord = decode_named(value.value(), "grant_closure")?;
+            let expected = format!("grant_closure:{}", record.commit.operation_id.as_str());
+            if key.value() != expected.as_str() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "grant_closure",
+                    reason: "grant-closure key drifts from its committed operation identity"
+                        .to_owned(),
+                });
+            }
+            record.commit.validate()?;
+            if record.commit.target_id.as_str() != target.as_str() {
+                continue;
+            }
+            rows.push((record.operation_order, record));
+            if rows.len() > usize::from(limit) {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+        }
+        rows.sort_by_key(|(order, _)| *order);
+        rows.into_iter()
+            .map(|(_, record)| {
+                let receipt = Self::closure_receipt_for(&record)?;
+                Ok(GrantClosureProjection::from_store(
+                    record.commit,
+                    record.phase,
+                    record.operation_order,
+                    GrantClosureCommitReceipt::from_receipt(receipt),
+                ))
+            })
+            .collect()
     }
 
     fn note_grant_graph_revision(

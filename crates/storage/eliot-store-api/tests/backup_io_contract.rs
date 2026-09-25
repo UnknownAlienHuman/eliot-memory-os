@@ -47,13 +47,14 @@ use eliot_store_api::{
     IsolatedRestorePort, IsolationEvidence, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_MEMBERS,
     NamedReadRequest, NamedReadResponse, OperationIdentity, OperationManifestDigest, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, PreparedTransition, ReconciliationOutcome,
-    RequestMeta, RestoreConflictKind, RestoreValidationReceipt, Resubmission, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SnapshotBeginRequest,
-    SnapshotBounds, SnapshotCompleteness, SnapshotCursor, SnapshotDenominator, SnapshotEndReceipt,
-    SnapshotHandle, SnapshotMember, SnapshotMemberType, SnapshotPage, SnapshotSourceIdentity,
-    SnapshotValidationReceipt, StoreError, StoreHealth, StoreMutationDisposition, TransitionClass,
-    WriteReceipt, WriteReceiptStatus, classify_restore_conflict, is_backup_io_capability,
-    reconcile_same_operation,
+    RequestMeta, RestoreCleanRequalification, RestoreConflictKind,
+    RestoreRevocationHistoryArtifact, RestoreValidationReceipt, Resubmission, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, RevocationHistoryPayload, RevocationHistoryRoot, ScopeId,
+    ScopeRevisionView, SnapshotBeginRequest, SnapshotBounds, SnapshotCompleteness, SnapshotCursor,
+    SnapshotDenominator, SnapshotEndReceipt, SnapshotHandle, SnapshotMember, SnapshotMemberType,
+    SnapshotPage, SnapshotSourceIdentity, SnapshotValidationReceipt, StoreError, StoreHealth,
+    StoreMutationDisposition, TransitionClass, WriteReceipt, WriteReceiptStatus,
+    classify_restore_conflict, is_backup_io_capability, reconcile_same_operation, sha256_hex,
 };
 use serde_json::{Value, json};
 
@@ -290,6 +291,35 @@ fn destination() -> IsolatedDestination {
     }
 }
 
+fn revocation_history_artifact() -> RestoreRevocationHistoryArtifact {
+    let state_fence = fence();
+    let history_root = RevocationHistoryRoot::genesis(state_fence.clone()).unwrap();
+    let current_history_root_digest = history_root.ledger_digest.clone();
+    let payload = RevocationHistoryPayload {
+        version: 2,
+        origin_ref: "origin-950-1".to_owned(),
+        source_revision: history_root.history_revision,
+        history_root,
+        closures: Vec::new(),
+    };
+    let bytes = serde_json::to_vec(&payload).unwrap();
+    let sha256 = sha256_hex(&bytes);
+    RestoreRevocationHistoryArtifact {
+        artifact_id: "revocation-history-950-1".to_owned(),
+        bytes,
+        sha256,
+        state_fence: state_fence.clone(),
+        current_history_root_digest: current_history_root_digest.clone(),
+        clean_requalification: RestoreCleanRequalification {
+            qualification_id: "qualification-950-1".to_owned(),
+            source_history_root_digest: current_history_root_digest,
+            state_fence,
+            proof_digest: hex('9'),
+            clean: true,
+        },
+    }
+}
+
 fn batch() -> CanonicalRestoreBatch {
     CanonicalRestoreBatch {
         contract_version: CONTRACT_VERSION,
@@ -297,6 +327,7 @@ fn batch() -> CanonicalRestoreBatch {
         source: source(),
         destination: destination(),
         archive_member_digest: hex('7'),
+        revocation_history: revocation_history_artifact(),
         target_schema: "eliot.storage.snapshot.v1".to_owned(),
         purge_policy_revision: 3,
         expected_revision_heads: vec![RevisionHeadExpectation {

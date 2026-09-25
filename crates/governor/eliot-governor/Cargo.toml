@@ -14,6 +14,7 @@ eliot-change-monitor.workspace = true
 eliot-config.workspace = true
 eliot-context-candidates = { path = "../../smart/eliot-context-candidates", version = "0.1.0" }
 eliot-context-contracts = { path = "../../smart/eliot-context-contracts", version = "0.1.0" }
+eliot-context.workspace = true
 eliot-coordination.workspace = true
 eliot-contracts.workspace = true
 eliot-cue-contracts = { path = "../../smart/eliot-cue-contracts", version = "0.1.0" }
@@ -21,6 +22,7 @@ eliot-cue-index = { path = "../../smart/eliot-cue-index", version = "0.1.0" }
 eliot-doctor-core.workspace = true
 eliot-diagnostic = { path = "../../instrument/eliot-diagnostic", version = "0.1.0" }
 eliot-instrument-nextest = { path = "../../instrument/eliot-instrument-nextest", version = "0.1.0" }
+eliot-influence.workspace = true
 eliot-epistemic = { path = "../../smart/eliot-epistemic", version = "0.1.0" }
 eliot-epistemic-contracts = { path = "../../smart/eliot-epistemic-contracts", version = "0.1.0" }
 eliot-evaluation-contracts.workspace = true

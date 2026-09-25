@@ -46,7 +46,8 @@ pub use restore_journal::{
     JournalPredecessor, MAX_JOURNAL_PAGE_ENTRIES, MAX_JOURNAL_PAYLOAD_BYTES,
     MAX_JOURNAL_STREAM_KEY_BYTES, RESTORE_JOURNAL_RECORD_SCHEMA, RESTORE_JOURNAL_SCHEMA_VERSION,
     RestoreJournalAppendReceipt, RestoreJournalArchiveClass, RestoreJournalEntry,
-    RestoreJournalOperation, RestoreJournalResult, RestoreJournalStreamBinding,
+    RestoreJournalOperation, RestoreJournalResult, RestoreJournalStateRecord,
+    RestoreJournalStreamBinding,
 };
 pub use snapshot_model::{OrsSnapshotReceipt, OrsSnapshotRequest};
 pub use status::{

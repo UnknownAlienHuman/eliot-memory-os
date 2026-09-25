@@ -13,17 +13,26 @@
 //! state, or lets Kernel decode these semantic records.
 
 use super::CompositionError;
+use crate::revocation_workflow::RevocationFanoutState;
 use eliot_authority::{
     EffectAuthorizer, EffectAuthorizerRecoverySnapshot, GrantActivationRequest, GrantGraph,
     GrantGraphRecoverySnapshot, GrantRevocationRequest, GrantStatus, IntroductionActivationRequest,
     IntroductionRevocationRequest, IntroductionStatus, P07PortError, RevocationHistoryEvidence,
     SnapshotId, SuppressedGrant,
 };
-use eliot_contracts::{EpochId, StateFence};
+use eliot_canonical::CanonicalWriteEnvelope;
+use eliot_contracts::{EpochId, OperationId, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_protocol::RequestIdentity;
 use eliot_receipts::AuthorityBinding;
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
+use eliot_store_api::{
+    EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+    OperationManifestDigest, OrderingHeadExpectation, OrderingScopeId, ScopeId, SecurityContext,
+    TransitionClass, generated_operation_manifests, operation_manifest_set_digest,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 /// Versioned semantic owner payload retained by Governor recovery.
@@ -44,6 +53,15 @@ pub struct AuthorityOwnerSnapshot {
     pub grant_graph: GrantGraphRecoverySnapshot,
     /// Full deterministic effect-idempotency snapshot.
     pub effect_authorizer: EffectAuthorizerRecoverySnapshot,
+    /// Durable owner hydration registry consumed before a closure bundle is
+    /// served. `None` is an explicit empty registry; it is never synthesized
+    /// from graph similarity at publish time.
+    #[serde(default)]
+    pub hydration_registry: Option<Vec<u8>>,
+    /// Current compiled View and all derivative invalidation/rebuild/effect
+    /// contest state produced by the last durable revocation fan-out.
+    #[serde(default)]
+    pub revocation_fanout: Option<RevocationFanoutState>,
 }
 
 impl AuthorityOwnerSnapshot {
@@ -53,12 +71,47 @@ impl AuthorityOwnerSnapshot {
         grant_graph: GrantGraphRecoverySnapshot,
         effect_authorizer: EffectAuthorizerRecoverySnapshot,
     ) -> Result<Self, CompositionError> {
+        Self::with_hydration_registry(state_fence, grant_graph, effect_authorizer, None)
+    }
+
+    /// Constructs a complete owner snapshot with the exact durable hydration
+    /// registry that will be imported before a closure bundle is served.
+    pub fn with_hydration_registry(
+        state_fence: StateFence,
+        grant_graph: GrantGraphRecoverySnapshot,
+        effect_authorizer: EffectAuthorizerRecoverySnapshot,
+        hydration_registry: Option<Vec<u8>>,
+    ) -> Result<Self, CompositionError> {
         let snapshot = Self {
             schema: AUTHORITY_OWNER_SNAPSHOT_SCHEMA.to_owned(),
             version: AUTHORITY_OWNER_SNAPSHOT_VERSION,
             state_fence,
             grant_graph,
             effect_authorizer,
+            hydration_registry,
+            revocation_fanout: None,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Constructs the complete owner image including the durable derivative
+    /// fan-out state restored from the Store owner record.
+    pub fn with_recovery_state(
+        state_fence: StateFence,
+        grant_graph: GrantGraphRecoverySnapshot,
+        effect_authorizer: EffectAuthorizerRecoverySnapshot,
+        hydration_registry: Option<Vec<u8>>,
+        revocation_fanout: Option<RevocationFanoutState>,
+    ) -> Result<Self, CompositionError> {
+        let snapshot = Self {
+            schema: AUTHORITY_OWNER_SNAPSHOT_SCHEMA.to_owned(),
+            version: AUTHORITY_OWNER_SNAPSHOT_VERSION,
+            state_fence,
+            grant_graph,
+            effect_authorizer,
+            hydration_registry,
+            revocation_fanout,
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -102,6 +155,23 @@ impl AuthorityOwnerSnapshot {
                 "authority effect snapshot contains a stale nested fence".to_owned(),
             ));
         }
+        if self
+            .hydration_registry
+            .as_ref()
+            .is_some_and(|bytes| bytes.is_empty() || bytes.len() > 4 * 1024 * 1024)
+        {
+            return Err(CompositionError::Recovery(
+                "authority owner hydration registry is empty or exceeds its bound".to_owned(),
+            ));
+        }
+        if let Some(fanout) = &self.revocation_fanout {
+            fanout.validate()?;
+            if fanout.state_fence != self.state_fence {
+                return Err(CompositionError::Recovery(
+                    "authority revocation fan-out state has a stale owner fence".to_owned(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -116,6 +186,146 @@ impl AuthorityOwnerSnapshot {
     }
 }
 
+/// Authenticated ingress identity for one durable Authority-owner projection
+/// update.
+///
+/// The product event supplies the request identity and operation identity;
+/// the Governor supplies the post-fan-out snapshot bytes. Keeping those
+/// concerns separate prevents a caller from fabricating a durable owner image
+/// while still making the owner-revision CAS explicit and replayable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityOwnerStateIngress {
+    /// Identity admitted by the authenticated product event.
+    pub identity: RequestIdentity,
+    /// Stable canonical operation identity for the owner-state write.
+    pub operation_id: OperationId,
+    /// Exact owner revision observed before the fan-out update.
+    pub expected_owner_revision: u64,
+    /// Current canonical ordering-head sequence observed by ingress.
+    pub expected_ordering_sequence: u64,
+}
+
+impl AuthorityOwnerStateIngress {
+    /// Validates the authenticated owner-state ingress without touching Store.
+    pub fn validate(&self) -> Result<(), CompositionError> {
+        self.identity
+            .validate()
+            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+        if self.identity.request.state_fence != self.identity.request.metadata.state_fence {
+            return Err(CompositionError::Provider(
+                "authority owner-state request fence does not match its metadata".to_owned(),
+            ));
+        }
+        if self.expected_owner_revision == 0 || self.expected_ordering_sequence == 0 {
+            return Err(CompositionError::Owner(
+                "authority owner-state expected revisions must be non-zero".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+const AUTHORITY_OWNER_STATE_SCOPE_ID: &str = "governor";
+const AUTHORITY_OWNER_STATE_ORDERING_SCOPE: &str = "scope:governor";
+
+/// Builds the canonical `RecordAuthorityFanoutState` transition from an
+/// authenticated ingress and the exact post-fan-out owner snapshot.
+///
+/// The snapshot is serialized only after the Governor has validated it. The
+/// Store receives those bytes as an opaque, digest-bound owner record and
+/// arbitrates only `expected_owner_revision`; it never interprets authority or
+/// derivative semantics.
+pub fn authority_owner_state_envelope(
+    ingress: &AuthorityOwnerStateIngress,
+    snapshot: &AuthorityOwnerSnapshot,
+) -> Result<CanonicalWriteEnvelope, CompositionError> {
+    ingress.validate()?;
+    snapshot.validate()?;
+    let fence = &ingress.identity.request.metadata.state_fence;
+    if snapshot.state_fence != *fence {
+        return Err(CompositionError::Provider(
+            "authority owner-state snapshot is not bound to the authenticated fence".to_owned(),
+        ));
+    }
+    let entries = generated_operation_manifests()
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+    let operation_manifest_digest: OperationManifestDigest =
+        operation_manifest_set_digest(&entries)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+    let snapshot_bytes = canonical_json_bytes(snapshot).map_err(|error| {
+        CompositionError::Owner(format!("authority owner snapshot encoding failed: {error}"))
+    })?;
+    let snapshot_json = String::from_utf8(snapshot_bytes.clone()).map_err(|error| {
+        CompositionError::Owner(format!(
+            "authority owner snapshot is not UTF-8 JSON: {error}"
+        ))
+    })?;
+    let snapshot_digest = sha256_hex(&snapshot_bytes);
+    let mut parameters = BTreeMap::new();
+    parameters.insert(
+        "owner_snapshot_json".to_owned(),
+        serde_json::Value::String(snapshot_json),
+    );
+    parameters.insert(
+        "owner_snapshot_digest".to_owned(),
+        serde_json::Value::String(snapshot_digest.clone()),
+    );
+    parameters.insert(
+        "expected_owner_revision".to_owned(),
+        serde_json::Value::String(ingress.expected_owner_revision.to_string()),
+    );
+    let admission_contract_set_digest = sha256_hex(
+        &canonical_json_bytes(&(
+            &ingress.operation_id,
+            ingress.identity.idempotency_key.as_str(),
+            ingress.expected_owner_revision,
+            &snapshot_digest,
+            fence,
+        ))
+        .map_err(|error| CompositionError::Owner(error.to_string()))?,
+    );
+    let envelope = CanonicalWriteEnvelope {
+        operation_id: ingress.operation_id.clone(),
+        request: ingress.identity.request.metadata.clone(),
+        idempotency_key: ingress.identity.idempotency_key.clone(),
+        scope_id: ScopeId::new(AUTHORITY_OWNER_STATE_SCOPE_ID)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?,
+        task_id: ingress
+            .identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(|task| task.as_str().to_owned()),
+        transition_class: TransitionClass::RecoverySchema,
+        requested_effect_ceiling: EffectClass::ReversibleMutation,
+        admission_contract_set_digest,
+        operation_manifest_digest,
+        semantic_commands: vec![NamedMutationRequest {
+            operation: NamedMutationOperation::RecordAuthorityFanoutState,
+            parameters,
+        }],
+        event_projection_relation_intents: EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+        security: SecurityContext::default(),
+        required_proof_and_approval_refs: Vec::new(),
+        expected_revision_heads: Vec::new(),
+        expected_ordering_heads: vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new(AUTHORITY_OWNER_STATE_ORDERING_SCOPE)
+                .map_err(|error| CompositionError::Owner(error.to_string()))?,
+            expected_sequence: ingress.expected_ordering_sequence,
+            state_fence: fence.clone(),
+        }],
+    };
+    envelope
+        .validate()
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+    Ok(envelope)
+}
+
 /// Authority owner retaining only restored, pure authority state.
 #[derive(Clone, Debug)]
 pub struct AuthorityOwner {
@@ -125,6 +335,10 @@ pub struct AuthorityOwner {
     pub effects: EffectAuthorizer,
     /// Grant graph lineage restored from its complete typed snapshot.
     pub grants: GrantGraph,
+    /// Exact durable hydration registry restored with this owner.
+    hydration_registry: Option<Vec<u8>>,
+    /// Exact durable derivative fan-out state restored with this owner.
+    revocation_fanout: Option<RevocationFanoutState>,
 }
 
 /// Restored authority owner with the exact history-suppressed set.
@@ -156,6 +370,8 @@ impl AuthorityOwner {
             state_fence: snapshot.state_fence.clone(),
             effects,
             grants,
+            hydration_registry: snapshot.hydration_registry.clone(),
+            revocation_fanout: snapshot.revocation_fanout.clone(),
         })
     }
 
@@ -208,17 +424,92 @@ impl AuthorityOwner {
             .flat_map(|suppressed| [suppressed.grant_id.clone(), suppressed.closure_id.clone()])
             .collect();
         effects.contest_dependent_effects(&revoked_roots);
+        effects.contest_current_claims(&revoked_roots);
         Ok(AuthorityRestoreOutcome {
             owner: Self {
                 state_fence: snapshot.state_fence.clone(),
                 effects,
                 grants: outcome.graph,
+                hydration_registry: snapshot.hydration_registry.clone(),
+                revocation_fanout: snapshot.revocation_fanout.clone(),
             },
             suppressed: outcome.suppressed,
         })
     }
 
-    /// Returns the exact fence retained by this authority owner.
+    /// Registers a current justification/plan/answer claim in the authority
+    /// owner's revocation overlay.
+    pub fn register_revocation_claim(
+        &mut self,
+        claim: eliot_authority::RevocationDependentClaim,
+    ) -> Result<(), CompositionError> {
+        self.effects
+            .register_current_claim(claim)
+            .map_err(|error| CompositionError::Owner(error.to_string()))
+    }
+
+    /// Returns current claim overlays for the production fan-out caller.
+    #[must_use]
+    pub fn revocation_claims(&self) -> Vec<eliot_authority::RevocationDependentClaim> {
+        self.effects.current_claims()
+    }
+
+    /// Applies current effect and claim contest overlays for a committed
+    /// revocation closure. Historical authorized records remain immutable.
+    pub fn contest_effects_for_revocation(&mut self, revoked_roots: &BTreeSet<String>) -> usize {
+        self.effects.contest_dependent_effects(revoked_roots)
+            + self.effects.contest_current_claims(revoked_roots)
+    }
+
+    /// Replaces the exact durable hydration registry after its producer has
+    /// persisted and validated the owner image. The bytes are opaque to the
+    /// authority owner; the closure provider revalidates them on restoration.
+    pub fn set_hydration_registry(
+        &mut self,
+        bytes: Option<Vec<u8>>,
+    ) -> Result<(), CompositionError> {
+        if bytes
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 4 * 1024 * 1024)
+        {
+            return Err(CompositionError::Recovery(
+                "authority owner hydration registry is empty or exceeds its bound".to_owned(),
+            ));
+        }
+        self.hydration_registry = bytes;
+        Ok(())
+    }
+
+    /// Returns the exact durable hydration registry bytes, if one was
+    /// recovered. Consumers must import and validate them before serving.
+    #[must_use]
+    pub fn hydration_registry(&self) -> Option<&[u8]> {
+        self.hydration_registry.as_deref()
+    }
+
+    /// Returns the durable derivative fan-out state, if one has been
+    /// committed. Consumers must use this state rather than rebuilding it from
+    /// a synthetic context.
+    #[must_use]
+    pub fn revocation_fanout(&self) -> Option<&RevocationFanoutState> {
+        self.revocation_fanout.as_ref()
+    }
+
+    /// Installs a validated durable fan-out state on the real Authority owner.
+    pub fn set_revocation_fanout(
+        &mut self,
+        state: RevocationFanoutState,
+    ) -> Result<(), CompositionError> {
+        state.validate()?;
+        if state.state_fence != self.state_fence {
+            return Err(CompositionError::Recovery(
+                "revocation fan-out state is bound to a different authority fence".to_owned(),
+            ));
+        }
+        self.revocation_fanout = Some(state);
+        Ok(())
+    }
+
     #[must_use]
     pub const fn state_fence(&self) -> &StateFence {
         &self.state_fence
@@ -234,7 +525,13 @@ impl AuthorityOwner {
             .effects
             .snapshot()
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        AuthorityOwnerSnapshot::new(self.state_fence.clone(), grant_graph, effect_authorizer)
+        AuthorityOwnerSnapshot::with_recovery_state(
+            self.state_fence.clone(),
+            grant_graph,
+            effect_authorizer,
+            self.hydration_registry.clone(),
+            self.revocation_fanout.clone(),
+        )
     }
 }
 

@@ -121,7 +121,7 @@ path_globs = [
   "crates/**/*context*/**",
 ]
 topic_keywords = ["memory", "context compiler", "active view", "understanding", "causal graph", "code graph", "cognitive inheritance", "cue"]
-required_handles = ["A4", "A5", "A6", "A7", "A14.1..A14.4", "I12.9..I12.10", "I13", "I16"]
+required_handles = ["A4", "A5", "A6", "A7", "A14.1..A14.4", "I12.9..I12.10", "I12.13", "I12.20", "I13", "I16"]
 optional_handles = ["A4.*", "A5.*", "A6.*", "A7.*", "I9.*", "I12.*", "I13.*", "I16.*"]
 required_files = []
 optional_files = []

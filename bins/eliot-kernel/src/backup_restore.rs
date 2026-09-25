@@ -71,22 +71,26 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use eliot_backup::{
     BackupBlob, BackupBundle, BackupError, BlobRestorationReceipt, CanonicalRecord,
     CutoverAuthorization, DestinationRestoreAdapter, DestinationScope, OrsSnapshotFence,
     RestoreAppliedEffect, RestoreArchiveDisposition, RestoreArchiveDispositionKind, RestoreContext,
     RestoreEffectReceipt, RestoreEvidence, RestoreHistoricalAuthority, RestoreIntent,
-    RestoreJournalPort, RestoreObligationState, RestoreObligations, RestoreOwnerObligation,
-    RestorePhase, RestorePlan, RestoreReceipt, RestoreReconciliation, RestoreStep, RestoreTarget,
-    RestoredFence, RestoredSealedBlob, WrappedKeyManifest, issue_restoration_receipts,
-    suspended_recovery_entries, verify_key_coverage,
+    RestoreJournalAdmission, RestoreJournalPort, RestoreJournalRecord, RestoreObligationState,
+    RestoreObligations, RestoreOwnerObligation, RestorePhase, RestorePlan, RestoreReceipt,
+    RestoreReconciliation, RestoreStep, RestoreTarget, RestoredFence, RestoredSealedBlob,
+    WrappedKeyManifest, issue_restoration_receipts, suspended_recovery_entries,
+    verify_key_coverage,
 };
 use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreProvenance};
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_ors::{RedbRecoveryStore, RestoreJournalStateRecord};
+use eliot_protocol::RequestIdentity;
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::{RevocationHistoryPayload, WriteReceipt, parse_revocation_history_payload};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::backup_restore_ports::{
     DESTINATION_ADMISSION_FILE, DestinationManifestEvidence, KernelIsolatedDestination,
@@ -194,8 +198,8 @@ impl<'a> PurgeOwnerClient<'a> {
 /// ledger, so the accompanying history travels as an integrity-bound
 /// artifact (`BackupArtifact::validate` plus the manifest section
 /// checksums already bind its bytes) under this kind. Absence of the slot
-/// means the source carries no revocation history and restore proceeds
-/// exactly as before.
+/// is unknown history and refuses production restore; it is never treated as
+/// proof of a clean ledger.
 const REVOCATION_HISTORY_ARTIFACT_KIND: &str = "revocation-history";
 
 /// Restore/import revocation-ledger gate (issue #1732).
@@ -206,7 +210,8 @@ const REVOCATION_HISTORY_ARTIFACT_KIND: &str = "revocation-history";
 /// clean requalification:
 ///
 /// ```text
-/// no history slot ............. clean snapshot: Ok, behavior unchanged;
+/// one integrity-bound history artifact is mandatory; absence is not a clean
+///                                      history claim;
 /// unparseable history ......... unknown evidence: refuse, never lossy;
 /// disagreeing history views ... stale/drifted evidence: refuse;
 /// recorded revocations ........ refuse: no accepted in-tree contract maps
@@ -224,10 +229,9 @@ const REVOCATION_HISTORY_ARTIFACT_KIND: &str = "revocation-history";
 ///
 /// Fail-closed like the grant-side restore gate
 /// (`AuthorityOwner::from_snapshot_with_revocation_history`): the only
-/// passing histories are an absent slot or a valid explicit-empty view.
-/// A recorded revocation refuses until a requalification carrier and a
-/// closure-to-member matching API land; that backlog must not unblock
-/// restore in this lane.
+/// passing history is one valid explicit-empty view. A recorded revocation
+/// refuses until a requalification carrier and a closure-to-member matching
+/// API land; that backlog must not unblock restore in this lane.
 fn gate_revocation_ledger(bundle: &BackupBundle) -> Result<(), BackupError> {
     let mut histories: Vec<RevocationHistoryPayload> = Vec::new();
     for artifact in bundle
@@ -240,14 +244,27 @@ fn gate_revocation_ledger(bundle: &BackupBundle) -> Result<(), BackupError> {
         histories.push(parse_revocation_history_payload(&payload).map_err(BackupError::Store)?);
     }
     let Some(first) = histories.first() else {
-        return Ok(());
-    };
-    if histories.iter().any(|history| {
-        history.source_revision != first.source_revision || history.origin_ref != first.origin_ref
-    }) {
         return Err(BackupError::Security(
-            "revocation history is stale for this restore".to_owned(),
+            "restore requires one integrity-bound revocation-history artifact".to_owned(),
         ));
+    };
+    if histories.len() != 1 {
+        return Err(BackupError::Security(
+            "restore observed ambiguous revocation-history artifacts".to_owned(),
+        ));
+    }
+    for history in &histories {
+        history
+            .validate_for_fence(&bundle.export_fence.state_fence)
+            .map_err(|error| BackupError::Security(error.to_string()))?;
+        if history.source_revision != first.source_revision
+            || history.origin_ref != first.origin_ref
+            || history.history_root.ledger_digest != first.history_root.ledger_digest
+        {
+            return Err(BackupError::Security(
+                "revocation history is stale or disagrees for this restore".to_owned(),
+            ));
+        }
     }
     if histories.iter().any(|history| !history.closures.is_empty()) {
         return Err(BackupError::Security(
@@ -444,7 +461,7 @@ impl InvalidationOwnerClient {
 /// resumed run's evidence file re-validated), suspended work, the exact
 /// applied phase log, and the observed paths. No cutover, activation, or
 /// retirement is performed or reported.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct KernelRestoreOutcome {
     /// Journaled terminal receipt from the single phase engine.
     pub receipt: RestoreReceipt,
@@ -480,6 +497,105 @@ pub struct CutoverQualification {
     pub obligations_checked: u32,
     /// Whether owner-issued new-epoch evidence was present and validated.
     pub owner_epoch_present: bool,
+}
+
+/// Authenticated production restore request accepted by the Kernel daemon
+/// route. Every value is owner/admission evidence supplied by the caller;
+/// Kernel binds the live session fence and the retained ORS handle.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionRestoreRequest {
+    pub bundle: BackupBundle,
+    pub target: RestoreContext,
+    pub journal_admission: RestoreJournalAdmission,
+    pub manifest_evidence: DestinationManifestEvidence,
+    pub keys: Option<WrappedKeyManifest>,
+}
+
+/// Production `RestoreJournalPort` adapter over the existing Kernel ORS.
+///
+/// The backup contract remains owner-neutral: ORS stores the exact serialized
+/// `RestoreJournalRecord` as an opaque, digest-bound row and arbitrates only
+/// the revision CAS. No in-memory, file, or fixture journal is substituted.
+pub struct ProductionOrsRestoreJournal {
+    store: Arc<RedbRecoveryStore>,
+}
+
+impl ProductionOrsRestoreJournal {
+    /// Binds the adapter to one admitted production journal owner and opens
+    /// the versioned ORS journal schema. A fixture or mismatched owner refuses
+    /// before any restore destination can be touched.
+    pub fn bind(
+        store: Arc<RedbRecoveryStore>,
+        admission: &RestoreJournalAdmission,
+    ) -> Result<Self, KernelRestoreError> {
+        admission
+            .validate()
+            .map_err(|error| KernelRestoreError::OwnerEvidenceInvalid(error.to_string()))?;
+        if !admission.admits_production_durable_recovery() {
+            return Err(KernelRestoreError::JournalNotAdmitted);
+        }
+        if admission.journal_identity_ref != super::backup_restore_ports::RESTORE_JOURNAL_IDENTITY
+            || admission.persistent_owner.owner_id
+                != super::backup_restore_ports::RESTORE_JOURNAL_OWNER_LABEL
+        {
+            return Err(KernelRestoreError::OwnerEvidenceInvalid(
+                "production restore journal admission does not identify the Kernel ORS owner"
+                    .to_owned(),
+            ));
+        }
+        store
+            .ensure_restore_journal_schema()
+            .map_err(|error| KernelRestoreError::JournalIo(error.to_string()))?;
+        Ok(Self { store })
+    }
+}
+
+fn map_ors_journal_error(error: eliot_ors::OrsError) -> BackupError {
+    match error {
+        eliot_ors::OrsError::DuplicateConflict => BackupError::RestoreJournalCasConflict,
+        _ => BackupError::RestoreJournalCorrupt,
+    }
+}
+
+impl RestoreJournalPort for ProductionOrsRestoreJournal {
+    fn load(&mut self, journal_key: &str) -> Result<Option<RestoreJournalRecord>, BackupError> {
+        let Some(state) = self
+            .store
+            .load_restore_journal_state(journal_key)
+            .map_err(map_ors_journal_error)?
+        else {
+            return Ok(None);
+        };
+        let record: RestoreJournalRecord =
+            serde_json::from_str(&state.payload).map_err(|_| BackupError::RestoreJournalCorrupt)?;
+        if record.journal_key != journal_key || record.revision != state.revision {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
+        Ok(Some(record))
+    }
+
+    fn compare_and_swap(
+        &mut self,
+        journal_key: &str,
+        expected_revision: u64,
+        next: RestoreJournalRecord,
+    ) -> Result<(), BackupError> {
+        if next.journal_key != journal_key {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
+        let payload = serde_json::to_string(&next)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        let state = RestoreJournalStateRecord {
+            journal_key: journal_key.to_owned(),
+            revision: next.revision,
+            payload_sha256: sha256_hex(payload.as_bytes()),
+            payload,
+        };
+        self.store
+            .compare_and_swap_restore_journal_state(journal_key, expected_revision, state)
+            .map_err(map_ors_journal_error)
+    }
 }
 
 /// Kernel-owned production restore adapter.
@@ -562,6 +678,11 @@ impl KernelBackupRestore {
         bundle
             .validate()
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        // Refuse missing, ambiguous, stale, or non-empty revocation-history
+        // evidence before opening (and therefore creating) the isolated
+        // destination. The phase-level gate remains as defense in depth for
+        // resumed execution.
+        gate_revocation_ledger(bundle).map_err(KernelRestoreError::TargetFailed)?;
         ports.validate()?;
         if ports.rehearsal {
             ports
@@ -663,6 +784,57 @@ impl KernelBackupRestore {
             journal_owner,
             rehearsal: ports.rehearsal,
         })
+    }
+
+    /// Executes the restore with the one production ORS-backed journal
+    /// adapter. The caller supplies only owner-admitted ports; this method
+    /// never constructs a fixture or file journal and refuses an unbound ORS
+    /// owner before destination preparation.
+    pub fn restore_with_production_ors_journal(
+        &self,
+        bundle: &BackupBundle,
+        target: RestoreContext,
+        ports: &RestorePorts<'_>,
+        ors: Arc<RedbRecoveryStore>,
+    ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
+        let mut journal = ProductionOrsRestoreJournal::bind(ors, ports.journal_admission)?;
+        self.restore(bundle, target, ports, &mut journal)
+    }
+
+    /// Executes one authenticated production restore request against the
+    /// retained Kernel ORS. The frame identity is checked against the live
+    /// session fence here; the request never chooses the journal owner or
+    /// destination path.
+    pub fn execute_production_restore(
+        &self,
+        session_fence: &StateFence,
+        identity: &RequestIdentity,
+        request: ProductionRestoreRequest,
+        ors: Arc<RedbRecoveryStore>,
+    ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
+        identity
+            .validate()
+            .map_err(|error| KernelRestoreError::OwnerEvidenceInvalid(error.to_string()))?;
+        if identity.request.state_fence != *session_fence
+            || identity.request.metadata.state_fence != *session_fence
+        {
+            return Err(KernelRestoreError::FenceMismatch(
+                "authenticated restore identity is not bound to the live Kernel fence".to_owned(),
+            ));
+        }
+        request
+            .manifest_evidence
+            .validate()
+            .map_err(|error| KernelRestoreError::OwnerEvidenceInvalid(error.to_string()))?;
+        let ports = RestorePorts {
+            journal_admission: &request.journal_admission,
+            kernel_fence: session_fence,
+            keys: request.keys.as_ref(),
+            blob_scope: None,
+            manifest_evidence: Some(request.manifest_evidence),
+            rehearsal: false,
+        };
+        self.restore_with_production_ors_journal(&request.bundle, request.target, &ports, ors)
     }
 
     /// Refuses a destination pinned to a different transaction, target, or
@@ -1129,6 +1301,11 @@ impl<'a> KernelRestoreTarget<'a> {
         bundle: &BackupBundle,
         intent: &RestoreIntent,
     ) -> Result<RestoreAppliedEffect, BackupError> {
+        // The integrity-bound revocation artifact is checked before the
+        // isolated destination is created or any admission evidence is
+        // staged.  A missing artifact is an unknown history, never a clean
+        // snapshot shortcut.
+        gate_revocation_ledger(bundle)?;
         self.prepare_isolated(&plan.target, &plan.restored_fence)?;
         self.gate(bundle)?;
         if let Some(evidence) = self.manifest_evidence.clone() {

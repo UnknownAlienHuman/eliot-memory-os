@@ -80,8 +80,8 @@ pub(crate) use health_probe::{adapter_health, health};
 #[cfg(test)]
 use read_boundary::{READ_VALIDATION_SNAPSHOT, build_validation_snapshot};
 pub(crate) use read_boundary::{
-    execute_named, read_ordering_heads, read_revision_heads, read_scope_view,
-    read_validation_snapshot,
+    execute_named, read_ordering_heads, read_revision_heads, read_revocation_ledger,
+    read_scope_view, read_validation_snapshot,
 };
 pub(crate) use receipt_reconciliation::read_receipt;
 use receipt_reconciliation::{read_fence, read_idempotency, read_receipt_by_operation};
@@ -1010,6 +1010,7 @@ struct AttemptLegWrites {
     reactive: surreal_reactive::ReactiveWrites,
     automation: surreal_automation::AutomationWrites,
     experience: surreal_experience::ExperienceWrites,
+    revocation: Option<atomic_write::RevocationWrite>,
 }
 
 /// Same-operation reuse check for one apply attempt (issue #63).
@@ -1134,11 +1135,17 @@ async fn prepare_attempt_leg_writes(
         surreal_automation::prepare_automation_writes(db, &adapter.config, transition).await?;
     let experience_writes =
         surreal_experience::prepare_experience_writes(db, &adapter.config, transition).await?;
+    // Issue #1732: prepare the Store-owned revocation record and independent
+    // history-root CAS beside the other admitted side legs, after all
+    // fallible preconditions and before the canonical transaction/receipt.
+    let revocation_write =
+        atomic_write::prepare_revocation_write(db, &adapter.config, transition).await?;
     Ok(AttemptLegWrites {
         notification: notification_writes,
         reactive: reactive_writes,
         automation: automation_writes,
         experience: experience_writes,
+        revocation: revocation_write,
     })
 }
 
@@ -1216,7 +1223,8 @@ async fn apply_with_retry(
 
         // Admitted side-leg dispatch after every fallible precondition
         // and before receipt planning (erasure once, other legs
-        // recomputed from fresh rows each attempt).
+        // recomputed from fresh rows each attempt). The helper also prepares
+        // the Store-owned revocation record/root CAS for the same transaction.
         let legs =
             prepare_attempt_leg_writes(adapter, db, &transition, &mut erasure_dispatched).await?;
 
@@ -1277,6 +1285,7 @@ async fn apply_with_retry(
             &legs.reactive,
             &legs.automation,
             &legs.experience,
+            legs.revocation.as_ref(),
         )
         .await
         {
@@ -2038,12 +2047,10 @@ mod admitted_operation_gate_tests {
         }
     }
 
-    /// Issue #686: the revocation-record mutation is known-but-unsupported
-    /// until a store-owned slice activates its catalogue row with proven
-    /// handlers. The closed name spelling holds and the pre-stage gate
-    /// refuses it with typed `UnknownOperation` — never silent success.
+    /// Issue #686: the activated revocation-record mutation passes the
+    /// pre-stage gate with its closed seven-field payload.
     #[test]
-    fn revocation_record_mutation_fails_closed_until_store_activation() {
+    fn revocation_record_mutation_passes_the_activated_gate() {
         use eliot_store_api::{named_mutation_operation_by_name, named_mutation_operation_name};
         assert_eq!(
             named_mutation_operation_name(NamedMutationOperation::RecordAuthorityRevocation),
@@ -2068,18 +2075,13 @@ mod admitted_operation_gate_tests {
             EffectClass::ReversibleMutation,
             vec![revocation_operation()],
         );
-        assert_eq!(
-            validate_transition(&context, &pending),
-            Err(AdapterError::Store(StoreError::UnknownOperation))
-        );
+        assert!(validate_transition(&context, &pending).is_ok());
     }
 
-    /// Issue #686: the revocation-history read is known-but-unsupported
-    /// until a store-owned slice activates its catalogue row with a proven
-    /// handler. The closed name spelling holds and the read gate refuses it
-    /// with typed `UnknownOperation` — never a successful empty view.
+    /// Issue #686: the activated revocation-history read passes its closed
+    /// catalogue gate with the exact origin and bounded record count.
     #[test]
-    fn revocation_history_read_fails_closed_until_store_activation() {
+    fn revocation_history_read_passes_the_activated_gate() {
         use eliot_store_api::{
             NamedReadOperation, ReadConsistency, ScopeId, named_read_operation_by_name,
             named_read_operation_name,
@@ -2104,10 +2106,7 @@ mod admitted_operation_gate_tests {
                 ("max_records".to_owned(), json!("8")),
             ]),
         };
-        assert_eq!(
-            query.validate_against_catalogue(&entries),
-            Err(StoreError::UnknownOperation)
-        );
+        assert!(query.validate_against_catalogue(&entries).is_ok());
     }
 
     fn erasure_operation() -> eliot_store_api::NamedMutationRequest {
@@ -2773,6 +2772,7 @@ mod concurrent_allocation_tests {
                 &surreal_reactive::ReactiveWrites::default(),
                 &surreal_automation::AutomationWrites::default(),
                 &surreal_experience::ExperienceWrites::default(),
+                None,
             )
             .await
             .expect("first writer commits");
@@ -2796,6 +2796,7 @@ mod concurrent_allocation_tests {
                 &surreal_reactive::ReactiveWrites::default(),
                 &surreal_automation::AutomationWrites::default(),
                 &surreal_experience::ExperienceWrites::default(),
+                None,
             )
             .await
             {
@@ -2842,6 +2843,7 @@ mod concurrent_allocation_tests {
                 &surreal_reactive::ReactiveWrites::default(),
                 &surreal_automation::AutomationWrites::default(),
                 &surreal_experience::ExperienceWrites::default(),
+                None,
             )
             .await
             .expect("bounded retry commits");

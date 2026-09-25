@@ -604,11 +604,8 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
         text(&decision.scope_ref, "scope_ref")?;
         text(&budget_ref, "budget_ref")?;
         let job_id = format!("maintenance:{}:{}", decision.family, decision.trigger_id);
-        if self.store.load(&job_id)?.is_some() {
-            return Err(MaintenanceError::IdentityConflict);
-        }
         let job = MaintenanceJob {
-            job_id,
+            job_id: job_id.clone(),
             trigger_id: decision.trigger_id.clone(),
             family: decision.family,
             scope_ref: decision.scope_ref.clone(),
@@ -623,6 +620,12 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
             user_session_required,
         };
         job.validate()?;
+        if let Some(existing) = self.store.load(&job_id)? {
+            if existing == job {
+                return Ok(existing);
+            }
+            return Err(MaintenanceError::IdentityConflict);
+        }
         self.store.save(&job)?;
         Ok(job)
     }

@@ -21,9 +21,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CONTRACT_VERSION, ContractVersion, OperationId, OperationIdentity, OrderingHeadExpectation,
-    RequestMeta, ResourceGeneration, RevisionHeadExpectation, ScopeRevisionView, StoreError,
-    StoreMutationDisposition, canonical_json_bytes, sha256_hex, unique, validate_digest,
-    validate_text,
+    RequestMeta, ResourceGeneration, RevisionHeadExpectation, ScopeRevisionView, StateFence,
+    StoreError, StoreMutationDisposition, canonical_json_bytes, parse_revocation_history_payload,
+    sha256_hex, unique, validate_digest, validate_text,
 };
 
 /// Stable contract name for the backup-I/O surface.
@@ -786,10 +786,134 @@ impl IsolatedDestination {
     }
 }
 
+/// Explicit clean-input requalification proof required before an archive can
+/// be imported into an isolated destination.
+///
+/// A restore may preserve historical records, but it may not make a revoked
+/// lineage active merely because the archive contains an old active View.
+/// The proof is therefore a first-class, digest-bound part of the restore
+/// contract rather than an inferred boolean or a later best-effort check.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreCleanRequalification {
+    /// Stable qualification receipt identity.
+    pub qualification_id: String,
+    /// Exact source history-root digest on which the clean rebuild was based.
+    pub source_history_root_digest: String,
+    /// Exact source fence on which the clean rebuild was performed.
+    pub state_fence: StateFence,
+    /// Digest of the clean-input/rebuild proof bundle.
+    pub proof_digest: String,
+    /// Must be true; a merely present or failed proof never qualifies a restore.
+    pub clean: bool,
+}
+
+impl RestoreCleanRequalification {
+    /// Validates the complete clean-requalification proof.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_text(
+            &self.qualification_id,
+            "restore.revocation_history.qualification_id",
+        )?;
+        validate_digest(
+            &self.source_history_root_digest,
+            "restore.revocation_history.source_history_root_digest",
+        )?;
+        validate_digest(
+            &self.proof_digest,
+            "restore.revocation_history.proof_digest",
+        )?;
+        self.state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        if !self.clean {
+            return Err(StoreError::InvalidField {
+                field: "restore.revocation_history.clean",
+                reason: "clean-input requalification is required",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Integrity-bound revocation-history artifact required by a canonical restore.
+///
+/// The artifact is deliberately not an optional cleanup hint. Its bytes are
+/// parsed through the Store history contract, its digest is checked, its
+/// complete root is bound to the current destination watermark, and a clean
+/// requalification proof is mandatory. A missing, stale, corrupt, or unbound
+/// artifact refuses the batch before any destination or import work.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreRevocationHistoryArtifact {
+    /// Stable artifact identity carried by the archive manifest.
+    pub artifact_id: String,
+    /// Exact serialized `RevocationHistoryPayload` bytes.
+    pub bytes: Vec<u8>,
+    /// Lowercase SHA-256 of `bytes`.
+    pub sha256: String,
+    /// Exact source fence to which the history artifact is bound.
+    pub state_fence: StateFence,
+    /// Current destination Store history-root digest observed immediately
+    /// before restore. This closes the source-archive-to-destination join.
+    pub current_history_root_digest: String,
+    /// Explicit clean-input rebuild/requalification proof.
+    pub clean_requalification: RestoreCleanRequalification,
+}
+
+impl RestoreRevocationHistoryArtifact {
+    /// Validates the artifact bytes, complete root, destination watermark,
+    /// fence binding, and clean requalification proof.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_text(&self.artifact_id, "restore.revocation_history.artifact_id")?;
+        validate_digest(&self.sha256, "restore.revocation_history.sha256")?;
+        validate_digest(
+            &self.current_history_root_digest,
+            "restore.revocation_history.current_history_root_digest",
+        )?;
+        if self.bytes.is_empty() {
+            return Err(StoreError::Empty {
+                field: "restore.revocation_history.bytes",
+            });
+        }
+        if sha256_hex(&self.bytes) != self.sha256 {
+            return Err(StoreError::InvalidField {
+                field: "restore.revocation_history.sha256",
+                reason: "does not match artifact bytes",
+            });
+        }
+        self.state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        let value: serde_json::Value = serde_json::from_slice(&self.bytes).map_err(|error| {
+            StoreError::Serialization(format!("revocation-history artifact is not JSON: {error}"))
+        })?;
+        let payload = parse_revocation_history_payload(&value)?;
+        payload.validate_for_fence(&self.state_fence)?;
+        if payload.history_root.ledger_digest != self.current_history_root_digest {
+            return Err(StoreError::InvalidField {
+                field: "restore.revocation_history.current_history_root_digest",
+                reason: "does not match the complete archived history root",
+            });
+        }
+        self.clean_requalification.validate()?;
+        if self.clean_requalification.source_history_root_digest != self.current_history_root_digest
+            || self.clean_requalification.state_fence != self.state_fence
+        {
+            return Err(StoreError::InvalidField {
+                field: "restore.revocation_history.clean_requalification",
+                reason: "clean requalification is not bound to the current history and fence",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Bounded canonical restore batch into an isolated destination.
 ///
 /// Structural only; archive content is referenced solely as an opaque member
-/// digest, never as a second archive format.
+/// digest, never as a second archive format.  The revocation-history artifact
+/// is mandatory and is validated before the batch can be admitted.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalRestoreBatch {
@@ -798,6 +922,8 @@ pub struct CanonicalRestoreBatch {
     pub source: SnapshotSourceIdentity,
     pub destination: IsolatedDestination,
     pub archive_member_digest: String,
+    /// Mandatory Store-owned revocation-history artifact for this restore.
+    pub revocation_history: RestoreRevocationHistoryArtifact,
     pub target_schema: String,
     pub purge_policy_revision: u64,
     pub expected_revision_heads: Vec<RevisionHeadExpectation>,
@@ -821,6 +947,22 @@ impl CanonicalRestoreBatch {
         self.operation.validate()?;
         self.source.validate()?;
         validate_digest(&self.archive_member_digest, "restore.archive_member_digest")?;
+        self.revocation_history.validate()?;
+        let bound_fences = self
+            .expected_revision_heads
+            .iter()
+            .map(|head| &head.state_fence)
+            .chain(
+                self.expected_ordering_heads
+                    .iter()
+                    .map(|head| &head.state_fence),
+            );
+        if bound_fences
+            .into_iter()
+            .any(|fence| fence != &self.revocation_history.state_fence)
+        {
+            return Err(StoreError::FenceMismatch);
+        }
         validate_text(&self.target_schema, "restore.target_schema")?;
         if self.target_schema != self.destination.target_schema {
             return Err(StoreError::InvalidField {

@@ -12,6 +12,7 @@ workspace_admission = "non-runtime implementation-support reference per #1715; v
 [dependencies]
 eliot-kernel-core.workspace = true
 eliot-store-api = { workspace = true }
+eliot-security-contracts.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true

@@ -38,6 +38,7 @@ use std::sync::atomic::Ordering;
 
 mod activation_projection;
 pub mod agent_fabric;
+mod authority_event;
 pub mod canonical_config_precedence;
 mod capability_admission;
 mod capability_evidence_wiring;
@@ -83,6 +84,14 @@ pub use activation_projection::AgentActivationResolver;
 pub use activation_projection::{
     ActivationClaim, classify_claimed_ticket_value, terminal_for_invalid_ticket,
 };
+pub use authority_event::{
+    AUTHORITY_REVOCATION_EVENT_KIND, AUTHORITY_REVOCATION_EVENT_VERSION, AuthenticatedProductEvent,
+    AuthorityRevocationProductEvent, AuthorityRevocationProductEventOutcome,
+    PENDING_EFFECT_ADMISSION_EVENT_KIND, PENDING_EFFECT_ADMISSION_EVENT_VERSION,
+    PendingEffectProductEvent, dispatch_authenticated_product_event,
+    dispatch_authority_revocation_product_event, dispatch_pending_effect_product_event,
+};
+
 pub use agent_fabric::{
     ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric,
     AgentFabricDescriptor, AttemptLifecycle, AttemptResultRecord, COORDINATOR_CRATE,
@@ -767,6 +776,70 @@ impl DaemonComposition {
             })?;
         let draft = finish_draft_from_agent_api_v7(task_id, expected_task_revision, result);
         self.finish_attempt(identity, operation_id, draft).await
+    }
+
+    /// Admits one product-supplied pending effect through the Governor's
+    /// authenticated authority owner.  The daemon passes the exact lease,
+    /// proposal, WorkScope, and Session binding across; it does not synthesize
+    /// any of them or execute the effect.
+    pub fn admit_pending_effect(
+        &mut self,
+        admission: &eliot_governor::PendingEffectAdmission,
+    ) -> Result<eliot_authority::AuthorizedEffect, DaemonError> {
+        self.governor
+            .admit_pending_effect(admission)
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Admits a product pending effect and persists the post-admission
+    /// Authority owner image using an authenticated owner-state event.
+    pub async fn admit_pending_effect_and_persist(
+        &mut self,
+        admission: &eliot_governor::PendingEffectAdmission,
+        state_ingress: &eliot_governor::AuthorityOwnerStateIngress,
+    ) -> Result<eliot_authority::AuthorizedEffect, DaemonError> {
+        self.governor
+            .admit_pending_effect_and_persist(admission, state_ingress)
+            .await
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Commits one fully authenticated authority-revocation ingress. The
+    /// caller supplies every closure coordinate and both canonical identities;
+    /// this method does not derive an operation id or affected set.
+    pub async fn record_authority_revocation(
+        &mut self,
+        ingress: &eliot_governor::AuthorityRevocationIngress,
+    ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
+        self.governor
+            .record_authority_revocation(ingress)
+            .await
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Commits the current post-fan-out Authority-owner image through the
+    /// authenticated owner-state ingress. The caller supplies the exact
+    /// request/operation identity and owner CAS witness; this composition
+    /// never manufactures either value.
+    pub async fn persist_authority_owner_state(
+        &mut self,
+        ingress: &eliot_governor::AuthorityOwnerStateIngress,
+    ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
+        self.governor
+            .persist_current_authority_owner_state(ingress)
+            .await
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Hands the current revocation rebuild obligations to the authenticated
+    /// Kernel maintenance route through the one Governor MaintenanceController.
+    pub fn consume_revocation_rebuilds(
+        &mut self,
+        now_ms: i64,
+    ) -> Result<Vec<eliot_maintenance::MaintenanceJob>, DaemonError> {
+        self.governor
+            .consume_revocation_rebuilds(now_ms)
+            .map_err(DaemonError::Composition)
     }
 
     /// Returns the admitted Kernel snapshot.

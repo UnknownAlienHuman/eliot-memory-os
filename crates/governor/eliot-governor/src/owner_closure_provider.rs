@@ -217,13 +217,28 @@ impl OwnerClosureProvider {
             expected_fence,
             Some(&history),
         )?;
-        Ok(Self {
-            state_fence: snapshot.state_fence.clone(),
-            snapshot,
+        // `outcome.owner` is the effective owner after the explicit history
+        // has suppressed every affected grant.  Retain that effective image
+        // in the provider's wire snapshot as well; keeping the pre-history
+        // input here would make `serve_restore` publish a graph that can
+        // resurrect a revoked lineage even though the in-memory owner is
+        // fenced.
+        let effective_snapshot = outcome.owner.snapshot()?;
+        let mut provider = Self {
+            state_fence: effective_snapshot.state_fence.clone(),
+            snapshot: effective_snapshot,
             history,
             owner: outcome.owner,
             registry: AdmittedHydrations::default(),
-        })
+        };
+        // Hydration is a required pre-publish phase. The durable owner image
+        // carries the exact registry bytes; importing them here revalidates
+        // every grant/introduction seal against the restored graph before
+        // `serve_restore` can expose a single member.
+        if let Some(bytes) = provider.snapshot.hydration_registry.clone() {
+            provider.import_registry(&bytes)?;
+        }
+        Ok(provider)
     }
 
     /// Returns the exact restored graph revision this provider serves.
@@ -1022,6 +1037,7 @@ mod owner_closure_provider_tests {
         LogicalTime, PrincipalRef,
     };
     use eliot_contracts::{ContractId, EpochId, EpochLineageId, ResourceGeneration};
+    use eliot_security_contracts::{InfluenceDependencyClosure, InfluenceState, RevocationReason};
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -1145,6 +1161,42 @@ mod owner_closure_provider_tests {
     fn restore_refuses_absent_history() {
         let fence = test_fence();
         assert!(OwnerClosureProvider::restore(owner_snapshot(&fence), None, &fence).is_err());
+    }
+
+    #[test]
+    fn restore_persists_history_suppression_in_the_served_snapshot() -> Result<(), CompositionError>
+    {
+        let fence = test_fence();
+        let history = RevocationHistoryEvidence {
+            state_fence: fence.clone(),
+            source_revision: 8,
+            closures: vec![InfluenceDependencyClosure {
+                closure_id: "closure:revoke-alpha".to_owned(),
+                root_ref: "root:alpha".to_owned(),
+                dependent_refs: vec!["grant:child".to_owned(), "root:alpha".to_owned()],
+                invalidation_reason: Some(RevocationReason::SourceRevoked),
+                current_influence: InfluenceState::Revoked,
+                state_fence: fence.clone(),
+                revision: 7,
+            }],
+        };
+        let provider =
+            OwnerClosureProvider::restore(owner_snapshot(&fence), Some(history), &fence)?;
+        assert!(
+            provider
+                .owner_snapshot()
+                .grant_graph
+                .revoked
+                .contains(&"grant:origin".to_owned())
+        );
+        assert!(
+            provider
+                .owner_snapshot()
+                .grant_graph
+                .revoked
+                .contains(&"grant:child".to_owned())
+        );
+        Ok(())
     }
 
     #[test]

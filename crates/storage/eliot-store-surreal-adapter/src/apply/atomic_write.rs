@@ -9,6 +9,7 @@
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use super::read_boundary::read_revocation_ledger;
 use super::surreal_automation::{AutomationWrites, automation_write_statements};
 use super::surreal_experience::{ExperienceWrites, experience_write_statements};
 use super::surreal_reactive::{ReactiveWrites, reactive_write_statements};
@@ -17,8 +18,15 @@ use crate::config::SurrealAdapterConfig;
 use crate::error::AdapterError;
 use crate::plan::{ApplyPlan, EvidenceRecord, PayloadAuthorityRecord};
 use crate::schema;
+use eliot_security_contracts::RevocationReason;
 use eliot_store_api::epistemic_revision::EpistemicCommit;
-use eliot_store_api::{OrderingHead, RevisionHead, ScopeId, StateFence, StoreError, WriteReceipt};
+use eliot_store_api::{
+    OrderingHead, REVOCATION_HISTORY_ROOT_KEY, REVOCATION_HISTORY_ROOT_NAMESPACE,
+    REVOCATION_HISTORY_ROOT_SCHEMA, RecordedRevocation, RecoveryRecordKey, RevisionHead,
+    RevocationHistoryRoot, ScopeId, StateFence, StoreError, WriteReceipt,
+    advance_revocation_history_digest, affected_reference_digest, recorded_revocation_digest,
+    revocation_fence_digest,
+};
 
 // Read and compare in the same transaction as the fence CAS and receipt.
 // The fence CAS serializes racing writers even when the position is absent.
@@ -92,8 +100,211 @@ const ALLOCATION_CONFLICT_MARKERS: &[&str] = &[
     "experience_feedback_conflict",
 ];
 
-/// Provider markers proving a deterministic semantic conflict: stale
-/// epistemic position, revision head, or ordering head.
+/// Prepared durable write for one authority-revocation record and its
+/// independent Store history-root CAS witness.
+#[derive(Clone, Debug)]
+pub(super) struct RevocationWrite {
+    pub(super) recorded: RecordedRevocation,
+    pub(super) expected_root: RevocationHistoryRoot,
+    pub(super) next_root: RevocationHistoryRoot,
+}
+
+fn digest_text(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Reads the complete current ledger, validates its root, and prepares the
+/// next root/record pair for one admitted `RecordAuthorityRevocation` leg.
+/// The returned CAS witness is consumed by the same canonical transaction
+/// that creates the record; a stale or malformed preflight is refused before
+/// any provider mutation.
+pub(super) async fn prepare_revocation_write(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<Option<RevocationWrite>, AdapterError> {
+    let commands: Vec<_> = transition
+        .named_operations
+        .iter()
+        .filter(|command| {
+            command.operation == eliot_store_api::NamedMutationOperation::RecordAuthorityRevocation
+        })
+        .collect();
+    if commands.is_empty() {
+        return Ok(None);
+    }
+    if commands.len() != 1 {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "authority-revocation transition must carry exactly one record",
+        }));
+    }
+    let command = commands[0];
+    let text_param = |name: &'static str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            }))
+    };
+    let origin_ref = text_param("origin_ref")?.to_owned();
+    let closure_id = text_param("closure_id")?.to_owned();
+    let closure_revision = text_param("closure_revision")?
+        .parse::<u64>()
+        .map_err(|_| {
+            AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "closure_revision must be a decimal revision",
+            })
+        })?;
+    let affected_refs: Vec<String> =
+        serde_json::from_value(command.parameters.get("affected_refs").cloned().ok_or(
+            AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            }),
+        )?)
+        .map_err(|_| {
+            AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "affected_refs must be a canonical string array",
+            })
+        })?;
+    let affected_digest = text_param("affected_digest")?.to_owned();
+    let affected_count = text_param("affected_count")?.parse::<u64>().map_err(|_| {
+        AdapterError::Store(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "affected_count must be a decimal count",
+        })
+    })?;
+    let reason: RevocationReason =
+        serde_json::from_value(Value::String(text_param("invalidation_reason")?.to_owned()))
+            .map_err(|_| {
+                AdapterError::Store(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "invalidation_reason is not a closed revocation reason",
+                })
+            })?;
+    let fence_digest = text_param("fence_digest")?.to_owned();
+    let history_revision = text_param("history_revision")?
+        .parse::<u64>()
+        .map_err(|_| {
+            AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "history_revision must be a decimal revision",
+            })
+        })?;
+    let root_revision = text_param("root_revision")?.parse::<u64>().map_err(|_| {
+        AdapterError::Store(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "root_revision must be a decimal revision",
+        })
+    })?;
+    let history_root_digest = text_param("history_root_digest")?.to_owned();
+    if closure_revision == 0 || history_revision == 0 || root_revision == 0 {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "revocation revisions must be non-zero",
+        }));
+    }
+    if !digest_text(&affected_digest)
+        || !digest_text(&fence_digest)
+        || !digest_text(&history_root_digest)
+        || affected_reference_digest(&affected_refs).map_err(AdapterError::Store)?
+            != affected_digest
+        || affected_count != affected_refs.len() as u64
+        || !affected_refs.iter().any(|value| value == &origin_ref)
+        || revocation_fence_digest(&transition.state_fence).map_err(AdapterError::Store)?
+            != fence_digest
+    {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "revocation digest/count/fence binding is invalid",
+        }));
+    }
+
+    let recorded = RecordedRevocation {
+        closure_id,
+        root_ref: origin_ref.clone(),
+        dependent_refs: affected_refs,
+        affected_digest,
+        affected_count,
+        invalidation_reason: reason,
+        state_fence: transition.state_fence.clone(),
+        fence_digest,
+        revision: closure_revision,
+        history_revision,
+        root_revision,
+    };
+    recorded.validate().map_err(AdapterError::Store)?;
+    let (current_root, records) = read_revocation_ledger(db, config).await?;
+    if records
+        .iter()
+        .any(|record| record.closure_id == recorded.closure_id)
+    {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
+    if current_root.state_fence != transition.state_fence
+        || records
+            .iter()
+            .any(|record| record.state_fence != transition.state_fence)
+    {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    current_root
+        .validate_against_records(&records)
+        .map_err(AdapterError::Store)?;
+    if history_root_digest != current_root.ledger_digest {
+        return Err(AdapterError::Store(StoreError::RevisionConflict));
+    }
+    let expected_history = current_root
+        .history_revision
+        .checked_add(1)
+        .ok_or(AdapterError::Store(StoreError::RevisionConflict))?;
+    let expected_root = current_root
+        .root_revisions
+        .get(&origin_ref)
+        .copied()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(AdapterError::Store(StoreError::RevisionConflict))?;
+    if history_revision != expected_history || root_revision != expected_root {
+        return Err(AdapterError::Store(StoreError::RevisionConflict));
+    }
+    let mut next_root = current_root.clone();
+    next_root.history_revision = history_revision;
+    next_root.record_count = next_root
+        .record_count
+        .checked_add(1)
+        .ok_or(AdapterError::Store(StoreError::RevisionConflict))?;
+    if !next_root.root_refs.contains(&origin_ref) {
+        next_root.root_refs.push(origin_ref.clone());
+        next_root.root_refs.sort();
+    }
+    next_root.root_revisions.insert(origin_ref, root_revision);
+    next_root.ledger_digest = advance_revocation_history_digest(
+        &current_root.ledger_digest,
+        &recorded_revocation_digest(&recorded).map_err(AdapterError::Store)?,
+    )
+    .map_err(AdapterError::Store)?;
+    let mut next_records = records;
+    next_records.push(recorded.clone());
+    next_root
+        .validate_against_records(&next_records)
+        .map_err(AdapterError::Store)?;
+    Ok(Some(RevocationWrite {
+        recorded,
+        expected_root: current_root,
+        next_root,
+    }))
+}
+
 const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "epistemic_position_cas_conflict",
     "revision_head_cas_conflict",
@@ -102,8 +313,14 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "ordering_head_create_conflict",
     "finish_owner_cas_conflict",
     "finish_owner_create_conflict",
+    "authority_owner_cas_conflict",
+    "authority_owner_create_conflict",
     "canonical_owner_cas_conflict",
     "canonical_owner_create_conflict",
+    "revocation_root_cas_conflict",
+    "revocation_root_create_conflict",
+    "revocation_record_conflict",
+    "revocation_record_create_conflict",
 ];
 
 /// Reports whether a provider statement error proves shared-allocation
@@ -210,6 +427,7 @@ pub(super) async fn write_transaction(
     reactive: &ReactiveWrites,
     automation: &AutomationWrites,
     experience: &ExperienceWrites,
+    revocation: Option<&RevocationWrite>,
 ) -> Result<(), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
     let (sql, bindings) = build_apply_statements(
@@ -225,6 +443,7 @@ pub(super) async fn write_transaction(
         reactive,
         automation,
         experience,
+        revocation,
     )?;
     // 688-B classifies provider replies after the atomic RPC: deterministic
     // fence/head markers are conflicts, while an unavailable or unclassified
@@ -286,6 +505,7 @@ fn build_apply_statements(
     reactive: &ReactiveWrites,
     automation: &AutomationWrites,
     experience: &ExperienceWrites,
+    revocation: Option<&RevocationWrite>,
 ) -> Result<(String, Map<String, Value>), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
     let revision = plan.next_revision_heads.first().ok_or_else(|| {
@@ -507,6 +727,8 @@ fn build_apply_statements(
     append_experience_statements(&mut sql, &mut bindings, experience)?;
     append_finish_evidence_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_owner_statement(&mut sql, &mut bindings, transition)?;
+    append_authority_fanout_owner_statement(&mut sql, &mut bindings, transition)?;
+    append_authority_revocation_statement(&mut sql, &mut bindings, transition, revocation)?;
 
     sql.push_str(schema::TX_CREATE_RECEIPT);
     bindings.insert(
@@ -735,6 +957,232 @@ fn append_finish_owner_statement(
     // prevents a future caller from silently dropping the required parameter
     // while preserving Governor ownership of its interpretation.
     bindings.insert("finish_attempt_id".to_owned(), json!(attempt_id));
+    Ok(())
+}
+
+/// Appends the durable Governor Authority-owner fan-out image. The image
+/// contains the active compiled View and all derivative/effect contest state;
+/// the Store only fences and commits its exact bytes.
+fn append_authority_fanout_owner_statement(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let Some(command) = transition.named_operations.iter().find(|command| {
+        command.operation == eliot_store_api::NamedMutationOperation::RecordAuthorityFanoutState
+    }) else {
+        return Ok(());
+    };
+    if transition.transition_class != eliot_store_api::TransitionClass::RecoverySchema {
+        return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
+    }
+    let text_param = |name: &'static str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            }))
+    };
+    let expected_revision = text_param("expected_owner_revision")?
+        .parse::<u64>()
+        .map_err(|_| {
+            AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "expected_owner_revision must be a decimal revision",
+            })
+        })?;
+    let snapshot_json = text_param("owner_snapshot_json")?;
+    let snapshot_digest = text_param("owner_snapshot_digest")?;
+    if snapshot_json.is_empty() {
+        return Err(AdapterError::Store(StoreError::Empty {
+            field: "authority.fanout.owner_snapshot_json",
+        }));
+    }
+    if snapshot_json.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
+        return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+    }
+    if !digest_text(snapshot_digest)
+        || eliot_store_api::sha256_hex(snapshot_json.as_bytes()) != snapshot_digest
+    {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "operation.parameter.owner_snapshot_digest",
+            reason: "does not match the exact owner snapshot bytes",
+        }));
+    }
+    let value: Value = serde_json::from_str(snapshot_json).map_err(|error| {
+        AdapterError::Serialization(format!(
+            "authority fan-out owner image is not JSON: {error}"
+        ))
+    })?;
+    if !value.is_object() {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "operation.parameter.owner_snapshot_json",
+            reason: "owner snapshot must be a JSON object",
+        }));
+    }
+    let owner_key = eliot_store_api::RecoveryRecordKey::new("owner", "authority")
+        .map_err(AdapterError::Store)?;
+    let owner_id = recovery_owner_id(&owner_key)?;
+    let revision = expected_revision.checked_add(1).ok_or_else(|| {
+        AdapterError::Store(StoreError::InvalidField {
+            field: "authority.fanout.owner_revision",
+            reason: "revision overflow",
+        })
+    })?;
+    let payload = snapshot_json.as_bytes();
+    let mut record = Map::new();
+    record.insert("namespace".to_owned(), json!(owner_key.namespace));
+    record.insert("key".to_owned(), json!(owner_key.key));
+    record.insert("state_fence".to_owned(), json!(&transition.state_fence));
+    record.insert("revision".to_owned(), json!(revision));
+    record.insert(
+        "schema".to_owned(),
+        json!(eliot_store_api::OWNER_SNAPSHOT_SCHEMA),
+    );
+    record.insert("payload".to_owned(), json!(payload));
+    record.insert("value_digest".to_owned(), json!(snapshot_digest));
+
+    sql.push_str(schema::TX_AUTHORITY_OWNER);
+    bindings.insert(
+        "authority_owner_table".to_owned(),
+        json!(schema::table::RECOVERY_OWNER),
+    );
+    bindings.insert("authority_owner_id".to_owned(), json!(owner_id));
+    bindings.insert(
+        "authority_expected_state_fence".to_owned(),
+        json!(&transition.state_fence),
+    );
+    bindings.insert(
+        "authority_expected_revision".to_owned(),
+        json!(expected_revision),
+    );
+    bindings.insert(
+        "authority_expected_digest".to_owned(),
+        json!(snapshot_digest),
+    );
+    bindings.insert("authority_owner_record".to_owned(), Value::Object(record));
+    Ok(())
+}
+
+/// Appends the Store-owned history-root CAS and the immutable revocation
+/// record in the same transaction as the canonical receipt.
+fn append_authority_revocation_statement(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+    write: Option<&RevocationWrite>,
+) -> Result<(), AdapterError> {
+    let has_command = transition.named_operations.iter().any(|command| {
+        command.operation == eliot_store_api::NamedMutationOperation::RecordAuthorityRevocation
+    });
+    if !has_command {
+        if write.is_some() {
+            return Err(AdapterError::Store(StoreError::UnknownOperation));
+        }
+        return Ok(());
+    }
+    if transition.transition_class != eliot_store_api::TransitionClass::RecoverySchema {
+        return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
+    }
+    let write = write.ok_or(AdapterError::Store(StoreError::UnknownOperation))?;
+    let record_payload = serde_json::to_vec(&write.recorded)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    if record_payload.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
+        return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+    }
+    let record_key = RecoveryRecordKey::new("authority-revocation", &write.recorded.closure_id)
+        .map_err(AdapterError::Store)?;
+    let record_id = recovery_owner_id(&record_key)?;
+    let record_digest = eliot_store_api::sha256_hex(&record_payload);
+    let mut record = Map::new();
+    record.insert("namespace".to_owned(), json!(record_key.namespace));
+    record.insert("key".to_owned(), json!(record_key.key));
+    record.insert("state_fence".to_owned(), json!(&write.recorded.state_fence));
+    record.insert(
+        "revision".to_owned(),
+        json!(write.recorded.history_revision),
+    );
+    record.insert(
+        "schema".to_owned(),
+        json!("eliot.store.authority-revocation.v1"),
+    );
+    record.insert("payload".to_owned(), json!(record_payload));
+    record.insert("value_digest".to_owned(), json!(record_digest));
+
+    let root_payload = serde_json::to_vec(&write.next_root)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    if root_payload.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
+        return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+    }
+    let root_key = RecoveryRecordKey::new(
+        REVOCATION_HISTORY_ROOT_NAMESPACE,
+        REVOCATION_HISTORY_ROOT_KEY,
+    )
+    .map_err(AdapterError::Store)?;
+    let root_id = recovery_owner_id(&root_key)?;
+    let expected_root = &write.expected_root;
+    let expected_root_revision = expected_root.history_revision;
+    let expected_root_bytes = serde_json::to_vec(expected_root)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    let expected_root_digest = eliot_store_api::sha256_hex(&expected_root_bytes);
+    let next_root_digest = eliot_store_api::sha256_hex(&root_payload);
+    let mut root_record = Map::new();
+    root_record.insert("namespace".to_owned(), json!(root_key.namespace));
+    root_record.insert("key".to_owned(), json!(root_key.key));
+    root_record.insert(
+        "state_fence".to_owned(),
+        json!(&write.next_root.state_fence),
+    );
+    root_record.insert(
+        "revision".to_owned(),
+        json!(write.next_root.history_revision),
+    );
+    root_record.insert("schema".to_owned(), json!(REVOCATION_HISTORY_ROOT_SCHEMA));
+    root_record.insert("payload".to_owned(), json!(root_payload));
+    root_record.insert("value_digest".to_owned(), json!(next_root_digest));
+
+    sql.push_str(schema::TX_AUTHORITY_REVOCATION_ROOT);
+    bindings.insert(
+        "revocation_root_table".to_owned(),
+        json!(schema::table::RECOVERY_OWNER),
+    );
+    bindings.insert("revocation_root_id".to_owned(), json!(root_id));
+    bindings.insert(
+        "revocation_root_expected_state_fence".to_owned(),
+        json!(&transition.state_fence),
+    );
+    bindings.insert(
+        "revocation_root_expected_revision".to_owned(),
+        json!(expected_root_revision),
+    );
+    bindings.insert(
+        "revocation_root_expected_digest".to_owned(),
+        json!(expected_root_digest),
+    );
+    bindings.insert(
+        "revocation_root_record".to_owned(),
+        Value::Object(root_record),
+    );
+
+    sql.push_str(schema::TX_AUTHORITY_REVOCATION);
+    bindings.insert(
+        "revocation_owner_table".to_owned(),
+        json!(schema::table::RECOVERY_OWNER),
+    );
+    bindings.insert("revocation_owner_id".to_owned(), json!(record_id));
+    bindings.insert(
+        "revocation_expected_state_fence".to_owned(),
+        json!(&transition.state_fence),
+    );
+    bindings.insert("revocation_expected_revision".to_owned(), json!(0));
+    bindings.insert(
+        "revocation_expected_record_digest".to_owned(),
+        json!(record_digest),
+    );
+    bindings.insert("revocation_owner_record".to_owned(), Value::Object(record));
     Ok(())
 }
 
@@ -1796,6 +2244,7 @@ mod allocation_classification_tests {
             &ReactiveWrites::default(),
             &AutomationWrites::default(),
             &ExperienceWrites::default(),
+            None,
         )
         .expect("statements assemble");
         assert!(sql.starts_with(schema::TX_BEGIN), "one transaction opens");
@@ -1845,6 +2294,7 @@ mod allocation_classification_tests {
             &ReactiveWrites::default(),
             &AutomationWrites::default(),
             &ExperienceWrites::default(),
+            None,
         )
         .expect("create path assembles");
         assert!(
@@ -1872,6 +2322,7 @@ mod allocation_classification_tests {
             &ReactiveWrites::default(),
             &AutomationWrites::default(),
             &ExperienceWrites::default(),
+            None,
         )
         .expect("genesis assembles");
         assert!(
@@ -1903,6 +2354,7 @@ mod allocation_classification_tests {
             &ReactiveWrites::default(),
             &AutomationWrites::default(),
             &ExperienceWrites::default(),
+            None,
         )
         .expect("statements assemble");
         assert_eq!(

@@ -28,9 +28,9 @@ use eliot_runtime_contracts::DaemonProgressChannel;
 use eliot_store_api::{StoreHealth, StoreHealthStatus};
 use eliotd::testd_terminal_completion::TestdOwnerDrainOutcome;
 use eliotd::{
-    ActivationClaim, DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus,
-    LocalReadSubmitOutcome, PROTOCOL_VERSION, SERVICE_NAME, forward_admitted_local_read,
-    terminal_for_invalid_ticket,
+    ActivationClaim, AuthenticatedProductEvent, DaemonComposition, DaemonConfig,
+    DaemonKernelClient, DaemonStatus, LocalReadSubmitOutcome, PROTOCOL_VERSION, SERVICE_NAME,
+    forward_admitted_local_read, terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -405,6 +405,11 @@ pub(super) fn run() -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
+    // The authenticated product-event lane is the only source accepted for
+    // authority-revocation ingress. The sender remains process-owned and is
+    // intentionally not populated by the periodic owner-feed trigger; this
+    // keeps absent product events absent rather than fabricating identities.
+    let (_product_event_sender, product_event_receiver) = tokio::sync::mpsc::channel(16);
     // The run loop is the only writer of the composition (TestD owner
     // finish drain); readers lock briefly per step. Wrap here: every
     // pre-loop exclusive use above is complete.
@@ -416,6 +421,7 @@ pub(super) fn run() -> Result<(), String> {
         Arc::clone(&kernel),
         Arc::clone(&composition),
         supervision_progress,
+        product_event_receiver,
     ));
     // The loop dropped its handle on return, so this unwrap is deterministic;
     // the error arm documents the invariant instead of panicking on it.
@@ -673,6 +679,7 @@ async fn run_loop(
     kernel: Arc<DaemonKernelClient>,
     composition: SharedComposition,
     mut supervision_progress: eliotd::SupervisionProgressProducer,
+    mut product_events: tokio::sync::mpsc::Receiver<AuthenticatedProductEvent>,
 ) -> Result<RunLoopExit, String> {
     let mut cadence = LoopCadence::production();
     // Sole owner of activation state. No second owner and no second
@@ -801,6 +808,19 @@ async fn run_loop(
                     &flight,
                 )
                 .await?;
+            }
+            product_event = product_events.recv() => {
+                if let Some(event) = product_event {
+                    let mut guard = composition.lock().await;
+                    eliotd::dispatch_authenticated_product_event(
+                        &mut guard,
+                        &kernel,
+                        &mut owner_feed,
+                        &event,
+                    )
+                    .await
+                    .map_err(|error| format!("authority revocation product event: {error}"))?;
+                }
             }
         }
     }
@@ -1020,8 +1040,8 @@ async fn sync_owner_feed(
     composition: &SharedComposition,
     trigger: &mut eliotd::OwnerFeedTrigger,
 ) {
-    let guard = composition.lock().await;
-    match eliotd::maintain_owner_feed(&guard, kernel, trigger).await {
+    let mut guard = composition.lock().await;
+    match eliotd::maintain_owner_feed(&mut guard, kernel, trigger).await {
         Ok(Some(revision)) => {
             tracing::info!(
                 target: "eliotd::diagnostics",

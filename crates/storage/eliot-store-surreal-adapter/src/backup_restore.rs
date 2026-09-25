@@ -23,8 +23,8 @@ use eliot_store_api::{
     BACKUP_IO_CAPABILITY_ISOLATED_RESTORE, BACKUP_IO_RESTORE_SCHEMA_V1,
     BackupOperationReconciliation, CanonicalRestoreBatch, IsolatedDestination, IsolatedRestorePort,
     MAX_RESTORE_MEMBERS, OperationIdentity, ReconciliationOutcome, RequestMeta,
-    RestoreValidationReceipt, SnapshotCompleteness, StoreError, StoreMutationDisposition,
-    canonical_json_bytes, reconcile_same_operation, sha256_hex,
+    RestoreValidationReceipt, RevocationHistoryRoot, SnapshotCompleteness, StoreError,
+    StoreMutationDisposition, canonical_json_bytes, reconcile_same_operation, sha256_hex,
 };
 
 use crate::{SurrealStoreAdapter, config::SurrealAdapterConfig, error::AdapterError};
@@ -474,6 +474,45 @@ pub fn active_store_identity(config: &SurrealAdapterConfig) -> (String, String) 
     (config.database.clone(), config.installation_id.clone())
 }
 
+/// Reads the destination's complete canonical revocation root before a
+/// restore can be validated or applied. The archive is never trusted as the
+/// current ledger merely because its own bytes parse.
+async fn read_current_revocation_root(
+    adapter: &SurrealStoreAdapter,
+) -> Result<RevocationHistoryRoot, StoreError> {
+    let db = crate::apply::client(adapter)
+        .await
+        .map_err(AdapterError::into_store_error)?;
+    crate::apply::ensure_ready(adapter, db)
+        .await
+        .map_err(AdapterError::into_store_error)?;
+    let (root, _records) = crate::apply::read_revocation_ledger(db, &adapter.config)
+        .await
+        .map_err(AdapterError::into_store_error)?;
+    Ok(root)
+}
+
+async fn validate_current_history_for_restore(
+    adapter: &SurrealStoreAdapter,
+    batch: &CanonicalRestoreBatch,
+) -> Result<(), StoreError> {
+    let current = read_current_revocation_root(adapter).await?;
+    if current.ledger_digest != batch.revocation_history.current_history_root_digest {
+        return Err(StoreError::RevisionConflict);
+    }
+    if batch.revocation_history.clean_requalification.state_fence
+        != batch.revocation_history.state_fence
+        || batch
+            .revocation_history
+            .clean_requalification
+            .source_history_root_digest
+            != current.ledger_digest
+    {
+        return Err(StoreError::FenceMismatch);
+    }
+    Ok(())
+}
+
 impl IsolatedRestorePort for SurrealStoreAdapter {
     async fn prepare_isolated_destination(
         &self,
@@ -526,6 +565,7 @@ impl IsolatedRestorePort for SurrealStoreAdapter {
             current_unix_ms(),
         )
         .map_err(redact_store_error)?;
+        validate_current_history_for_restore(self, &batch).await?;
         let mut ledger = shared_restore_ledger().lock().map_err(|_| {
             AdapterError::UnknownOutcome {
                 operation_id: batch.operation.operation_id.as_str().to_owned(),
@@ -564,6 +604,7 @@ impl IsolatedRestorePort for SurrealStoreAdapter {
             current_unix_ms(),
         )
         .map_err(redact_store_error)?;
+        validate_current_history_for_restore(self, &batch).await?;
         let receipt = RestoreValidationReceipt {
             operation: batch.operation.clone(),
             destination: batch.destination.clone(),

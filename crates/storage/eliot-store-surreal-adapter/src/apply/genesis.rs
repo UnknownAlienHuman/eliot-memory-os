@@ -10,10 +10,12 @@ use crate::config::SurrealAdapterConfig;
 use crate::error::AdapterError;
 use crate::schema;
 use eliot_store_api::{
-    CommitId, MAX_DIGEST_DETAIL_CHARS, RecoveryRecord, RecoveryRecordKey, RequestMeta,
-    Resubmission, StoreError, StoreGenesisRequest, TransitionClass, WriteReceipt,
-    WriteReceiptStatus, bind_issue18_receipt, genesis_manifest, genesis_transition,
-    is_genesis_fence, issue_genesis_receipt_envelope, validate_genesis_receipt_envelope,
+    CommitId, MAX_DIGEST_DETAIL_CHARS, MAX_RECOVERY_RECORD_BYTES, REVOCATION_HISTORY_ROOT_KEY,
+    REVOCATION_HISTORY_ROOT_NAMESPACE, REVOCATION_HISTORY_ROOT_SCHEMA, RecoveryRecord,
+    RecoveryRecordKey, RequestMeta, Resubmission, RevocationHistoryRoot, StoreError,
+    StoreGenesisRequest, TransitionClass, WriteReceipt, WriteReceiptStatus, bind_issue18_receipt,
+    genesis_manifest, genesis_transition, is_genesis_fence, issue_genesis_receipt_envelope,
+    validate_genesis_receipt_envelope,
 };
 
 use super::receipt_reconciliation::read_receipt_by_operation;
@@ -123,6 +125,7 @@ pub(super) fn validate_replayed_genesis_state(
     state: &GenesisState,
     request: &StoreGenesisRequest,
 ) -> Result<(), AdapterError> {
+    let expected_owners = expected_genesis_owner_records(request)?;
     let fence = state
         .fence
         .as_ref()
@@ -138,7 +141,7 @@ pub(super) fn validate_replayed_genesis_state(
         || !state.projections.is_empty()
         || !state.outbox.is_empty()
         || !state.relations.is_empty()
-        || sorted_recovery_records(&state.owners) != sorted_recovery_records(&request.owner_records)
+        || sorted_recovery_records(&state.owners) != sorted_recovery_records(&expected_owners)
     {
         return Err(AdapterError::Store(StoreError::IdentityConflict));
     }
@@ -163,6 +166,57 @@ fn sorted_recovery_records(records: &[RecoveryRecord]) -> Vec<RecoveryRecord> {
     sorted
 }
 
+/// Builds the durable empty history root that is mandatory after Store
+/// genesis.  A legacy store without this root is not a valid starting point
+/// for a history read or append; it is never lazily synthesized by a caller.
+fn genesis_history_root_record(
+    request: &StoreGenesisRequest,
+) -> Result<RecoveryRecord, AdapterError> {
+    let root =
+        RevocationHistoryRoot::genesis(request.state_fence.clone()).map_err(AdapterError::Store)?;
+    let payload = serde_json::to_vec(&root)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    if payload.len() > MAX_RECOVERY_RECORD_BYTES {
+        return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+    }
+    let key = RecoveryRecordKey::new(
+        REVOCATION_HISTORY_ROOT_NAMESPACE,
+        REVOCATION_HISTORY_ROOT_KEY,
+    )
+    .map_err(AdapterError::Store)?;
+    let record = RecoveryRecord {
+        namespace: key.namespace,
+        key: key.key,
+        state_fence: request.state_fence.clone(),
+        revision: root.history_revision,
+        schema: REVOCATION_HISTORY_ROOT_SCHEMA.to_owned(),
+        value_digest: eliot_store_api::sha256_hex(&payload),
+        payload,
+    };
+    record.validate().map_err(AdapterError::Store)?;
+    Ok(record)
+}
+
+fn expected_genesis_owner_records(
+    request: &StoreGenesisRequest,
+) -> Result<Vec<RecoveryRecord>, AdapterError> {
+    let root_key = RecoveryRecordKey::new(
+        REVOCATION_HISTORY_ROOT_NAMESPACE,
+        REVOCATION_HISTORY_ROOT_KEY,
+    )
+    .map_err(AdapterError::Store)?;
+    if request
+        .owner_records
+        .iter()
+        .any(|record| record.record_key() == root_key)
+    {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
+    let mut records = request.owner_records.clone();
+    records.push(genesis_history_root_record(request)?);
+    Ok(records)
+}
+
 pub(super) fn build_genesis_sql(owner_count: usize) -> String {
     let mut sql = format!(
         "{} {} {}",
@@ -173,6 +227,13 @@ pub(super) fn build_genesis_sql(owner_count: usize) -> String {
     for index in 0..owner_count {
         sql.push_str(&schema::indexed(schema::TX_GENESIS_CREATE_OWNER, index));
     }
+    // The Store-owned revocation history root is part of the atomic genesis
+    // seed, not a lazy read-time default.  Its binding index follows the
+    // caller-supplied opaque owner records.
+    sql.push_str(&schema::indexed(
+        schema::TX_GENESIS_CREATE_OWNER,
+        owner_count,
+    ));
     sql.push_str(schema::TX_GENESIS_FENCE_CAS);
     sql.push_str(schema::TX_GENESIS_CREATE_RECEIPT);
     sql.push_str(schema::TX_GENESIS_COMMIT);
@@ -228,6 +289,18 @@ pub(super) fn build_genesis_bindings(
             "body": receipt,
         }),
     );
+    let root_key = RecoveryRecordKey::new(
+        REVOCATION_HISTORY_ROOT_NAMESPACE,
+        REVOCATION_HISTORY_ROOT_KEY,
+    )
+    .map_err(AdapterError::Store)?;
+    if request
+        .owner_records
+        .iter()
+        .any(|owner| owner.record_key() == root_key)
+    {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
     for (index, owner) in request.owner_records.iter().enumerate() {
         let suffix = index.to_string();
         bindings.insert(
@@ -240,6 +313,17 @@ pub(super) fn build_genesis_bindings(
         );
         bindings.insert(format!("owner{suffix}"), json!(owner));
     }
+    let root = genesis_history_root_record(request)?;
+    let root_index = request.owner_records.len().to_string();
+    bindings.insert(
+        format!("owner_table{root_index}"),
+        json!(schema::table::RECOVERY_OWNER),
+    );
+    bindings.insert(
+        format!("owner_id{root_index}"),
+        json!(recovery_owner_id(&root.record_key())?),
+    );
+    bindings.insert(format!("owner{root_index}"), json!(root));
     Ok(bindings)
 }
 

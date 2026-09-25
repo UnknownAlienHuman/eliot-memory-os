@@ -62,6 +62,7 @@ mod owner_closure_feed;
 mod owner_closure_provider;
 mod owner_projection_refresh;
 mod reactive_admission;
+mod revocation_workflow;
 mod skill_lifecycle;
 mod swarm_plan_attachment_composition;
 mod swarm_plan_attachment_ownership;
@@ -110,7 +111,10 @@ pub use observation_reconciliation::{
     WatchdogEntryKind,
 };
 pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
-pub use owner_closure_feed::{OwnerPublishPort, publish_owner_feed, synchronize_owner_feed};
+pub use owner_closure_feed::{
+    OwnerFeedSync, OwnerPublishPort, PreparedOwnerFeed, prepare_owner_feed,
+    prepare_owner_feed_for_roots, publish_owner_feed, synchronize_owner_feed,
+};
 pub use owner_closure_provider::{
     GrantAdmissionParams, IntroductionAdmissionParams, OWNER_HYDRATION_SNAPSHOT_SCHEMA,
     OWNER_HYDRATION_SNAPSHOT_VERSION, OwnerClosureProvider, PreservedAdmission,
@@ -118,6 +122,12 @@ pub use owner_closure_provider::{
 pub use reactive_admission::{
     AtomRiskBinding, ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier,
     assess_reactive_risk, bind_atom_risk,
+};
+pub use revocation_workflow::{
+    DurableActiveView, REVOCATION_FANOUT_STATE_SCHEMA, REVOCATION_FANOUT_STATE_VERSION,
+    RevocationClaim, RevocationFanoutInput, RevocationFanoutResult, RevocationFanoutState,
+    RevocationInvalidationLedger, apply_revocation_fanout, current_mixed_lineage_ceiling,
+    revocation_cache_input,
 };
 pub use skill_lifecycle::{GovernorSkillLifecycle, canonical_skill_tool_source};
 pub use swarm_plan_attachment_composition::SwarmAttachmentComposition;

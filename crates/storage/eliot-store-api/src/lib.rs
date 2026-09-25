@@ -54,11 +54,12 @@ pub use backup_io::{
     CanonicalSnapshotPort, DestinationClass, EventInterval, IsolatedDestination,
     IsolatedRestorePort, IsolationEvidence, MAX_DENOMINATOR_REFERENCES, MAX_PROOF_HANDLES,
     MAX_RESTORE_MEMBERS, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_MEMBERS, MAX_SNAPSHOT_PAGE_MEMBERS,
-    MAX_SNAPSHOT_PAGES, ReconciliationOutcome, RestoreConflictKind, RestoreValidationReceipt,
-    SnapshotBeginRequest, SnapshotBounds, SnapshotCompleteness, SnapshotCursor,
-    SnapshotDenominator, SnapshotEndReceipt, SnapshotHandle, SnapshotMember, SnapshotMemberType,
-    SnapshotPage, SnapshotSourceIdentity, SnapshotValidationReceipt, classify_restore_conflict,
-    is_backup_io_capability, reconcile_same_operation,
+    MAX_SNAPSHOT_PAGES, ReconciliationOutcome, RestoreCleanRequalification, RestoreConflictKind,
+    RestoreRevocationHistoryArtifact, RestoreValidationReceipt, SnapshotBeginRequest,
+    SnapshotBounds, SnapshotCompleteness, SnapshotCursor, SnapshotDenominator, SnapshotEndReceipt,
+    SnapshotHandle, SnapshotMember, SnapshotMemberType, SnapshotPage, SnapshotSourceIdentity,
+    SnapshotValidationReceipt, classify_restore_conflict, is_backup_io_capability,
+    reconcile_same_operation,
 };
 
 pub use dreamer_job::{
@@ -220,8 +221,12 @@ pub use operation_parameters::{
 };
 
 pub use revocation_history::{
-    REVOCATION_HISTORY_MAX_RECORDS, REVOCATION_HISTORY_PAYLOAD_VERSION, RecordedRevocation,
-    RevocationHistoryPayload, parse_revocation_history_payload,
+    REVOCATION_HISTORY_GENESIS_DIGEST, REVOCATION_HISTORY_MAX_RECORDS,
+    REVOCATION_HISTORY_PAYLOAD_VERSION, REVOCATION_HISTORY_ROOT_KEY,
+    REVOCATION_HISTORY_ROOT_NAMESPACE, REVOCATION_HISTORY_ROOT_SCHEMA,
+    REVOCATION_HISTORY_ROOT_SELECTOR, RecordedRevocation, RevocationHistoryPayload,
+    RevocationHistoryRoot, advance_revocation_history_digest, affected_reference_digest,
+    parse_revocation_history_payload, recorded_revocation_digest, revocation_fence_digest,
 };
 
 /// Stable identity of this contract surface.
@@ -821,10 +826,8 @@ pub enum NamedReadOperation {
     GetMailbox,
     GetAuditRange,
     ResolveWriteReceipt,
-    /// CURRENT authority revocation history (issue #686). Known-but-
-    /// unsupported until a store-owned slice activates its catalogue row
-    /// with proven handlers; the typed parameters and payload contract
-    /// (`revocation_history`) are already closed.
+    /// CURRENT authority revocation history (issue #686), served from the
+    /// durable store ledger and used by the production owner-feed restore gate.
     GetAuthorityRevocationHistory,
     /// Canonical notification-state read (issue #1780).
     GetNotificationState,
@@ -866,10 +869,14 @@ pub enum NamedMutationOperation {
     /// the snapshot as opaque bytes and only arbitrates `owner/canonical`.
     RecordFinishEvidence,
     AppendAuditEvent,
-    /// Durable authority-revocation record (issue #686). Known-but-
-    /// unsupported until a store-owned slice activates its catalogue row
-    /// with proven handlers; the typed parameters are already closed.
+    /// Durable authority-revocation record (issue #686), written through the
+    /// closed Governor→Kernel→store transition path.
     RecordAuthorityRevocation,
+    /// Persists the Governor-owned derivative fan-out image (compiled View,
+    /// invalidation keys, rebuild orders, Problems, and effect contests) in
+    /// the real Authority owner record. The Store treats the image as opaque
+    /// canonical bytes and arbitrates only its fenced revision.
+    RecordAuthorityFanoutState,
     /// Named canonical erasure/disposition transaction (issue #1712).
     ///
     /// Explicit user request ONLY, never automatic: the prepared transition
@@ -943,7 +950,8 @@ impl NamedMutationOperation {
             Self::ReconcileRecovery
             | Self::RecordFinishDecision
             | Self::RecordFinishEvidence
-            | Self::RecordAuthorityRevocation => TransitionClass::RecoverySchema,
+            | Self::RecordAuthorityRevocation
+            | Self::RecordAuthorityFanoutState => TransitionClass::RecoverySchema,
             Self::ApplyErasure => TransitionClass::Erasure,
             Self::ApplyNotificationState => TransitionClass::NotificationState,
             Self::ApplyReactiveInjectionState | Self::ApplyResourceSnapshot => {

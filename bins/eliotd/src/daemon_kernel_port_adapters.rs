@@ -16,6 +16,7 @@ use eliot_governor::{
     KernelPortError, KernelServiceObservationPort, KernelServiceRecovery,
 };
 use eliot_maintenance::MaintenanceJob;
+use eliot_runtime_contracts::{LeaseState, RuntimeLease};
 
 use super::DaemonKernelClient;
 
@@ -87,5 +88,68 @@ impl KernelDurableJobPort for DaemonKernelClient {
         let _span = tracing::info_span!("eliotd.kernel_durable_save").entered();
         let _ = self.request_blocking("save_durable_job", serde_json::json!({ "job": job }))?;
         Ok(())
+    }
+
+    fn issue_runtime_lease(
+        &self,
+        scope_ref: &str,
+        state_fence: &StateFence,
+    ) -> Result<RuntimeLease, KernelPortError> {
+        let value = self.request_blocking(
+            "issue_runtime_lease",
+            serde_json::json!({
+                "scope_ref": scope_ref,
+                "state_fence": state_fence,
+            }),
+        )?;
+        let value = kind_value(&value, "runtime_lease")?;
+        let lease: RuntimeLease = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        lease
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if lease.state != LeaseState::Active
+            || lease.scope_ref != scope_ref
+            || lease.state_fence != *state_fence
+            || !lease
+                .authority_epoch
+                .is_same_authority(&state_fence.authority_epoch)
+        {
+            return Err(KernelPortError::Contract(
+                "Kernel returned an invalid active runtime lease".to_owned(),
+            ));
+        }
+        Ok(lease)
+    }
+
+    fn load_runtime_lease(
+        &self,
+        lease_id: &str,
+        state_fence: &StateFence,
+    ) -> Result<Option<RuntimeLease>, KernelPortError> {
+        let value = self.request_blocking(
+            "load_runtime_lease",
+            serde_json::json!({
+                "lease_id": lease_id,
+                "state_fence": state_fence,
+            }),
+        )?;
+        let value = kind_value(&value, "runtime_lease")?;
+        let lease: Option<RuntimeLease> = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if let Some(lease) = &lease {
+            lease
+                .validate()
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            if lease.lease_id != lease_id
+                || lease.state_fence != *state_fence
+                || lease.state != LeaseState::Active
+            {
+                return Err(KernelPortError::Contract(
+                    "Kernel runtime-lease readback is not the exact active lease".to_owned(),
+                ));
+            }
+        }
+        Ok(lease)
     }
 }

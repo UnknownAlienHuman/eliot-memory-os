@@ -62,16 +62,11 @@
 //! mutation entry and any transition carrying another named command fails
 //! closed against the generated set.
 //!
-//! Issue #686 notes: `RecordAuthorityRevocation` and
-//! `GetAuthorityRevocationHistory` are deliberately known-but-unsupported
-//! here. Their typed parameter contracts
-//! (`operation_parameters::declared_mutation_parameters` /
-//! `declared_read_parameters`) and the Governor decision edge (revocation
-//! envelope, history evidence decoding) are already closed, but catalogue
-//! activation (row, proven per-backend handlers, consumer triple, and the
-//! count-test migration in `tests/operation_manifest_catalogue.rs`) belongs
-//! to a store-owned follow-up slice. Until then both operations fail closed
-//! with [`StoreError::UnknownOperation`] at this gate.
+//! Issue #686 activates `RecordAuthorityRevocation` and
+//! `GetAuthorityRevocationHistory` in the generated catalogue. The typed
+//! parameter contracts, Governor decision edge, store handlers, and restore
+//! consumer are now one closed path; malformed parameters still fail before
+//! provider I/O.
 //!
 //! Authority split (one authority, two mechanisms over the same table):
 //!
@@ -272,7 +267,7 @@ struct ActivatedReadDescriptor {
 /// consumer-side per I12-26, mirroring the `GetMailbox` split where the
 /// Governor facade requires a caller scope while catalogue rows stay
 /// scope-free).
-const ACTIVATED_READS: [ActivatedReadDescriptor; 17] = [
+const ACTIVATED_READS: [ActivatedReadDescriptor; 18] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -358,11 +353,16 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 17] = [
         requires_scope_id: false,
         scope_kind: SCOPE_KIND_NONE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetAuthorityRevocationHistory,
+        requires_scope_id: true,
+        scope_kind: SCOPE_KIND_SCOPE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 17] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 18] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -381,6 +381,7 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 17] {
         ACTIVATED_READS[14].operation,
         ACTIVATED_READS[15].operation,
         ACTIVATED_READS[16].operation,
+        ACTIVATED_READS[17].operation,
     ]
 }
 
@@ -398,8 +399,9 @@ struct ActivatedMutationDescriptor {
 /// `CaptureObservation` and `AppendAuditEvent` persist the lowest ceiling
 /// (`Candidate`) through the `CaptureCandidate` family; `ApplyLifecyclePolicy`
 /// persists `ReversibleMutation` through the `LifecyclePolicy` family;
-/// `ReconcileRecovery`, `RecordFinishEvidence`, and `RecordFinishDecision` persist
-/// `ReversibleMutation` through the `RecoverySchema` family;
+/// `ReconcileRecovery`, `RecordFinishEvidence`, `RecordFinishDecision`, and
+/// `RecordAuthorityFanoutState` persist `ReversibleMutation` through the
+/// `RecoverySchema` family;
 /// `UpdateTaskState` persists `ReversibleMutation`
 /// through the `TaskControl` family; `ApplyEpistemicRevision` persists
 /// `ReversibleMutation` through the `Epistemic` family; `ApplyErasure`
@@ -415,10 +417,9 @@ struct ActivatedMutationDescriptor {
 /// `CommitExperienceBank` and `CommitAgentFeedback` persist `Candidate`
 /// through the `CaptureCandidate` family (issue #223: Store-owned durable
 /// experience-bank/feedback rows with the closed experience typed
-/// contract). All fifteen address no scope, mirroring the scope-free read
-/// descriptors. Every
-/// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 15] = [
+/// contract). All activated mutations address no scope, mirroring the
+/// scope-free read descriptors. Every other mutation stays known-but-unsupported.
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 17] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -509,6 +510,18 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 15] = [
         maximum_effect: EffectClass::Candidate,
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordAuthorityRevocation,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: READ_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordAuthorityFanoutState,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
 ];
 
 fn read_entry_spec(descriptor: &ActivatedReadDescriptor) -> OperationManifestSpec {
@@ -572,8 +585,8 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 
 /// Generates the per-operation manifest descriptors from the declaration table.
 ///
-/// Declaration order is the canonical order: the seventeen activated reads, the
-/// fifteen activated mutations, then the genesis bootstrap entry. Generation is
+/// Declaration order is the canonical order: the eighteen activated reads, the
+/// sixteen activated mutations, then the genesis bootstrap entry. Generation is
 /// pure over crate constants, so the same source always yields byte-identical
 /// entries.
 pub fn generated_operation_manifests() -> Result<Vec<NamedOperationManifest>, StoreError> {
@@ -830,8 +843,9 @@ pub fn validate_transition_against_catalogue(
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 crate::validate_experience_mutation_params(command.operation, &command.parameters)?;
             }
-            NamedMutationOperation::RecordAuthorityRevocation => {
-                return Err(StoreError::UnknownOperation);
+            NamedMutationOperation::RecordAuthorityRevocation
+            | NamedMutationOperation::RecordAuthorityFanoutState => {
+                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
             }
         }
         let parameter_bytes = canonical_json_bytes(&command.parameters)

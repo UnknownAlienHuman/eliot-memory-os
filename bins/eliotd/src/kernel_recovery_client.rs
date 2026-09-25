@@ -38,7 +38,6 @@ use eliot_store_api::{
 use super::{DaemonKernelClient, SERVICE_NAME, kind_value, unix_ms, unix_ms_i64};
 
 const OWNER_RECOVERY_NAMESPACE: &str = "owner";
-const JOB_RECOVERY_NAMESPACE: &str = "job";
 
 impl KernelRecoveryPort for DaemonKernelClient {
     fn named_read(
@@ -182,39 +181,37 @@ impl KernelRecoveryPort for DaemonKernelClient {
         state_fence: &StateFence,
         protected_snapshot_digest: &str,
     ) -> Result<Vec<MaintenanceJob>, KernelPortError> {
-        let snapshot = self.recovery_snapshot(
-            state_fence,
-            protected_snapshot_digest,
-            Vec::new(),
-            false,
-            true,
+        // Durable maintenance jobs are ORS-owned operational records, not
+        // canonical Store recovery rows. Read them through the authenticated
+        // Kernel route so restart/reconciliation cannot silently lose the
+        // process-local scheduler image.
+        if self.snapshot.state_fence() != *state_fence
+            || self.snapshot.protected_snapshot_digest != protected_snapshot_digest
+        {
+            return Err(KernelPortError::Contract(
+                "durable-job recovery request does not match the admitted snapshot".to_owned(),
+            ));
+        }
+        let value = self.request_blocking(
+            "list_durable_jobs",
+            serde_json::json!({ "state_fence": state_fence }),
         )?;
+        let value = kind_value(&value, "durable_jobs")?;
+        let jobs: Vec<MaintenanceJob> = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
         let mut job_ids = BTreeSet::new();
-        snapshot
-            .job_records
-            .into_iter()
-            .map(|record| {
-                if record.namespace != JOB_RECOVERY_NAMESPACE {
-                    return Err(KernelPortError::Contract(
-                        "Kernel Store recovery returned a non-job durable record".to_owned(),
-                    ));
-                }
-                let job: MaintenanceJob = serde_json::from_slice(&record.payload)
-                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                job.validate()
-                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                if record.key != job.job_id
-                    || job.state_fence != *state_fence
-                    || !job_ids.insert(job.job_id.clone())
-                {
-                    return Err(KernelPortError::Contract(
-                        "Kernel Store recovery returned an invalid or duplicate durable job"
-                            .to_owned(),
-                    ));
-                }
-                Ok(job)
-            })
-            .collect()
+        let mut validated = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            job.validate()
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            if job.state_fence != *state_fence || !job_ids.insert(job.job_id.clone()) {
+                return Err(KernelPortError::Contract(
+                    "Kernel ORS returned an invalid or duplicate durable job".to_owned(),
+                ));
+            }
+            validated.push(job);
+        }
+        Ok(validated)
     }
 }
 

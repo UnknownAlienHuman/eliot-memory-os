@@ -24,9 +24,15 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use eliot_governor::{CompositionError, OwnerPublishPort};
+use eliot_governor::{
+    AuthorityOwnerStateIngress, CompositionError, OwnerPublishPort,
+    decode_revocation_history_with_root, revocation_history_read_request,
+};
 use eliot_kernel_core::GovernorClosureRestore;
-use eliot_store_api::REVOCATION_HISTORY_MAX_RECORDS;
+use eliot_store_api::{
+    CanonicalReadClient, REVOCATION_HISTORY_MAX_RECORDS, REVOCATION_HISTORY_ROOT_SELECTOR,
+    RevocationHistoryRoot,
+};
 
 use super::daemon_kernel_client::DaemonKernelClient;
 use super::kernel_context_read_client::KernelContextReadClient;
@@ -149,9 +155,9 @@ impl OwnerPublishPort for KernelOwnerPublishPort {
 /// runtime retains one trigger across passes so an unchanged provider
 /// performs no IO while a revision advance or a recovery re-presentation
 /// republishes exactly once per pass.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OwnerFeedTrigger {
-    last_published_revision: Option<u64>,
+    last_published: Option<(u64, RevocationHistoryRoot)>,
 }
 
 impl OwnerFeedTrigger {
@@ -159,14 +165,14 @@ impl OwnerFeedTrigger {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            last_published_revision: None,
+            last_published: None,
         }
     }
 
     /// Returns the provider revision last proven published, if any.
     #[must_use]
-    pub const fn last_published_revision(&self) -> Option<u64> {
-        self.last_published_revision
+    pub fn last_published_revision(&self) -> Option<u64> {
+        self.last_published.as_ref().map(|(revision, _)| *revision)
     }
 }
 
@@ -186,7 +192,7 @@ impl OwnerFeedTrigger {
 /// with the typed reason when the pass degraded: the daemon continues and
 /// retries on a later pass, and no partial publish is ever claimed.
 pub async fn maintain_owner_feed(
-    composition: &DaemonComposition,
+    composition: &mut DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
     trigger: &mut OwnerFeedTrigger,
 ) -> Result<Option<u64>, CompositionError> {
@@ -197,34 +203,128 @@ pub async fn maintain_owner_feed(
             "owner feed live graph revision is zero".to_owned(),
         ));
     }
-    if trigger.last_published_revision == Some(revision) {
-        return Ok(None);
-    }
-    let roots: Vec<String> = snapshot
+    let reads = KernelContextReadClient::new(Arc::clone(kernel));
+
+    // The durable Store root index is the trigger source. Grant presence is
+    // used only to enumerate the semantic graph after the index has been
+    // observed; a graph with no current grant cannot silently suppress a
+    // revocation already present in the independent history ledger.
+    let root_request = revocation_history_read_request(
+        &snapshot.state_fence,
+        REVOCATION_HISTORY_ROOT_SELECTOR,
+        REVOCATION_HISTORY_MAX_RECORDS,
+    )?;
+    let root_response = reads
+        .execute_named(root_request)
+        .await
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    let (root_index, _) =
+        decode_revocation_history_with_root(&root_response, &snapshot.state_fence)?;
+
+    let mut root_set: BTreeSet<String> = snapshot
         .grant_graph
         .grants
         .iter()
         .map(|grant| grant.authority_root_ref.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
         .collect();
+    root_set.extend(root_index.root_refs.iter().cloned());
+    let roots: Vec<String> = root_set.into_iter().collect();
     if roots.is_empty() {
         return Ok(None);
     }
-    let reads = KernelContextReadClient::new(Arc::clone(kernel));
     let publish = KernelOwnerPublishPort::new(Arc::clone(kernel));
-    for root in &roots {
-        composition
-            .governor
-            .synchronize_kernel_owner(
-                &reads,
-                &publish,
-                root,
-                REVOCATION_HISTORY_MAX_RECORDS,
-                revision,
-            )
-            .await?;
+    let (bound_revision, history_root) = composition
+        .governor
+        .synchronize_kernel_owner_batch(
+            &reads,
+            &publish,
+            &roots,
+            REVOCATION_HISTORY_MAX_RECORDS,
+            revision,
+        )
+        .await?;
+    // The same production owner-feed pass hands the durable rebuild queue to
+    // the one MaintenanceController.  The controller obtains and validates a
+    // Kernel-issued active RuntimeLease before admitting each job; a missing
+    // lease fails closed and leaves the order for a later pass.
+    composition
+        .consume_revocation_rebuilds(super::unix_ms_i64())
+        .map_err(|error| match error {
+            super::DaemonError::Composition(error) => error,
+            other => CompositionError::Recovery(other.to_string()),
+        })?;
+    if trigger.last_published == Some((bound_revision, history_root.clone())) {
+        return Ok(None);
     }
-    trigger.last_published_revision = Some(revision);
-    Ok(Some(revision))
+    trigger.last_published = Some((bound_revision, history_root));
+    Ok(Some(bound_revision))
+}
+
+/// Runs the owner-feed arm for one authenticated product revocation event.
+///
+/// Unlike the periodic recovery/publication trigger, this arm requires the
+/// caller-supplied owner-state ingress. It commits the post-fan-out Authority
+/// image, proves the Store readback, and only then publishes the Kernel owner
+/// bundle. No identity, operation id, or owner revision is derived here.
+pub async fn maintain_owner_feed_with_product_event(
+    composition: &mut DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    trigger: &mut OwnerFeedTrigger,
+    state_ingress: &AuthorityOwnerStateIngress,
+) -> Result<(u64, RevocationHistoryRoot), CompositionError> {
+    state_ingress
+        .validate()
+        .map_err(|error| CompositionError::Provider(error.to_string()))?;
+    let snapshot = composition.governor.owners().authority.snapshot()?;
+    let revision = snapshot.grant_graph.revision;
+    if revision == 0 {
+        return Err(CompositionError::Owner(
+            "owner feed live graph revision is zero".to_owned(),
+        ));
+    }
+    let reads = KernelContextReadClient::new(Arc::clone(kernel));
+    let root_request = revocation_history_read_request(
+        &snapshot.state_fence,
+        REVOCATION_HISTORY_ROOT_SELECTOR,
+        REVOCATION_HISTORY_MAX_RECORDS,
+    )?;
+    let root_response = reads
+        .execute_named(root_request)
+        .await
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    let (root_index, _) =
+        decode_revocation_history_with_root(&root_response, &snapshot.state_fence)?;
+    let mut root_set: BTreeSet<String> = snapshot
+        .grant_graph
+        .grants
+        .iter()
+        .map(|grant| grant.authority_root_ref.clone())
+        .collect();
+    root_set.extend(root_index.root_refs.iter().cloned());
+    let roots: Vec<String> = root_set.into_iter().collect();
+    if roots.is_empty() {
+        return Err(CompositionError::Recovery(
+            "authenticated revocation event has no live authority root to synchronize".to_owned(),
+        ));
+    }
+    let publish = KernelOwnerPublishPort::new(Arc::clone(kernel));
+    let (bound_revision, history_root) = composition
+        .governor
+        .synchronize_kernel_owner_batch_with_state(
+            &reads,
+            &publish,
+            &roots,
+            REVOCATION_HISTORY_MAX_RECORDS,
+            revision,
+            state_ingress,
+        )
+        .await?;
+    composition
+        .consume_revocation_rebuilds(super::unix_ms_i64())
+        .map_err(|error| match error {
+            super::DaemonError::Composition(error) => error,
+            other => CompositionError::Recovery(other.to_string()),
+        })?;
+    trigger.last_published = Some((bound_revision, history_root.clone()));
+    Ok((bound_revision, history_root))
 }

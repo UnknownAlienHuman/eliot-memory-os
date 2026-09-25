@@ -36,12 +36,34 @@
 
 use eliot_contracts::StateFence;
 use eliot_kernel_core::{GovernorClosureRestore, owner_bundle_digest};
-use eliot_store_api::CanonicalReadClient;
+use eliot_store_api::{
+    CanonicalReadClient, REVOCATION_HISTORY_ROOT_SELECTOR, RevocationHistoryRoot,
+};
 
 use crate::{
     AuthorityOwnerSnapshot, CompositionError, OwnerClosureProvider,
-    decode_revocation_history_evidence, revocation_history_read_request,
+    decode_revocation_history_with_root, revocation_history_read_request,
 };
+
+/// Result of one owner-feed synchronization, including the exact live
+/// revocation evidence consumed by the production fan-out.
+#[derive(Clone, Debug)]
+pub struct OwnerFeedSync {
+    /// Revision proven by Kernel readback.
+    pub revision: u64,
+    /// CURRENT history decoded from the canonical read.
+    pub history: eliot_authority::RevocationHistoryEvidence,
+}
+
+/// A read-and-restored owner feed that has not yet been published. The
+/// production Governor applies its derivative invalidation fan-out to this
+/// value before `publish_owner_feed` makes the restored owner observable.
+pub struct PreparedOwnerFeed {
+    /// Restored provider carrying the explicit current history.
+    pub provider: OwnerClosureProvider,
+    /// Exact history read from the canonical store.
+    pub history: eliot_authority::RevocationHistoryEvidence,
+}
 
 /// Kernel publish endpoint for owner bundles, implemented by the daemon
 /// runtime (O1) against the front-door operations.
@@ -112,6 +134,127 @@ pub async fn publish_owner_feed<P: OwnerPublishPort + ?Sized>(
     Ok(acknowledged)
 }
 
+/// Reads and restores one owner feed without publishing it yet.
+///
+/// Keeping this phase separate is causal: the production Governor can apply
+/// revocation fan-out to the restored provider and its current effects,
+/// context, cache, and rebuild owners before the Kernel can observe a newly
+/// published owner bundle.
+pub async fn prepare_owner_feed<R: CanonicalReadClient + ?Sized>(
+    reads: &R,
+    snapshot: AuthorityOwnerSnapshot,
+    state_fence: &StateFence,
+    origin_ref: &str,
+    max_records: u32,
+    expected_revision: u64,
+) -> Result<PreparedOwnerFeed, CompositionError> {
+    let root_request = revocation_history_read_request(
+        state_fence,
+        REVOCATION_HISTORY_ROOT_SELECTOR,
+        max_records,
+    )?;
+    let root_response = reads
+        .execute_named(root_request)
+        .await
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    let (root_index, _) = decode_revocation_history_with_root(&root_response, state_fence)?;
+    let request = revocation_history_read_request(state_fence, origin_ref, max_records)?;
+    let response = reads
+        .execute_named(request)
+        .await
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    let (root, history) = decode_revocation_history_with_root(&response, state_fence)?;
+    if root != root_index {
+        return Err(CompositionError::Recovery(
+            "owner feed origin and independent Store root-index reads disagree".to_owned(),
+        ));
+    }
+    // `expected_revision` is the authority/graph revision. The Store history
+    // root has its own independent revision; equating the two would reject a
+    // valid history advance (or accept a stale graph) and is intentionally not
+    // done here. The root watermark above is the history comparison.
+    let _ = expected_revision;
+    let provider = OwnerClosureProvider::restore(snapshot, Some(history.clone()), state_fence)?;
+    Ok(PreparedOwnerFeed { provider, history })
+}
+
+/// Reads every origin named by the live owner snapshot and proves that every
+/// read carries the same complete Store history root.  The provider is
+/// restored once from the union, so the caller can fan out and publish one
+/// coherent owner bundle rather than publishing per-origin projections.
+pub async fn prepare_owner_feed_for_roots<R: CanonicalReadClient + ?Sized>(
+    reads: &R,
+    snapshot: AuthorityOwnerSnapshot,
+    state_fence: &StateFence,
+    origins: &[String],
+    max_records: u32,
+) -> Result<(PreparedOwnerFeed, RevocationHistoryRoot), CompositionError> {
+    if origins.is_empty() {
+        return Err(CompositionError::Recovery(
+            "owner feed requires at least one live authority root".to_owned(),
+        ));
+    }
+    if origins
+        .iter()
+        .any(|origin| origin == REVOCATION_HISTORY_ROOT_SELECTOR)
+    {
+        return Err(CompositionError::Recovery(
+            "the Store history root selector cannot be used as a semantic authority origin"
+                .to_owned(),
+        ));
+    }
+
+    // The independent root-index read is the first observation and the
+    // watermark against which every semantic origin read is compared.  A
+    // caller-provided root list is only an additional live-graph enumeration;
+    // it cannot replace or silently omit the Store-owned trigger.
+    let root_request = revocation_history_read_request(
+        state_fence,
+        REVOCATION_HISTORY_ROOT_SELECTOR,
+        max_records,
+    )?;
+    let root_response = reads
+        .execute_named(root_request)
+        .await
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    let (root_index, _) = decode_revocation_history_with_root(&root_response, state_fence)?;
+    let mut pending: Vec<String> = origins.to_vec();
+    pending.extend(root_index.root_refs.iter().cloned());
+    pending.sort();
+    pending.dedup();
+
+    let mut next = 0_usize;
+    let mut closures = Vec::new();
+    while next < pending.len() {
+        let origin = pending[next].clone();
+        next += 1;
+        let request = revocation_history_read_request(state_fence, &origin, max_records)?;
+        let response = reads
+            .execute_named(request)
+            .await
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let (root, history) = decode_revocation_history_with_root(&response, state_fence)?;
+        if root != root_index {
+            return Err(CompositionError::Recovery(
+                "owner feed roots were not read at one shared Store history watermark".to_owned(),
+            ));
+        }
+        closures.extend(history.closures);
+    }
+    let root = root_index;
+    closures.sort_by(|left, right| left.closure_id.cmp(&right.closure_id));
+    let history = eliot_authority::RevocationHistoryEvidence {
+        state_fence: state_fence.clone(),
+        source_revision: root.history_revision,
+        closures,
+    };
+    history
+        .require_current()
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    let provider = OwnerClosureProvider::restore(snapshot, Some(history.clone()), state_fence)?;
+    Ok((PreparedOwnerFeed { provider, history }, root))
+}
+
 /// Runs one complete trigger-driven owner synchronization (`#2100`
 /// admitted caller → publish → recover path).
 ///
@@ -120,10 +263,10 @@ pub async fn publish_owner_feed<P: OwnerPublishPort + ?Sized>(
 /// origin, executes it through the canonical read client, decodes the
 /// reply against the expected fence, restores the provider with that
 /// live evidence, and publishes through [`publish_owner_feed`]. The
-/// observed evidence revision must equal the expected revision, or the
-/// trigger is stale and the call refuses before any publish. Unavailable
-/// history, fence disagreement, stale evidence, and readback mismatch
-/// all refuse before any owner state is installed or claimed.
+/// independent Store history-root watermark, rather than the graph
+/// revision, is compared across the root-index and origin reads. Unavailable
+/// history, fence disagreement, stale evidence, and readback mismatch all
+/// refuse before any owner state is installed or claimed.
 pub async fn synchronize_owner_feed<
     R: CanonicalReadClient + ?Sized,
     P: OwnerPublishPort + ?Sized,
@@ -135,19 +278,19 @@ pub async fn synchronize_owner_feed<
     origin_ref: &str,
     max_records: u32,
     expected_revision: u64,
-) -> Result<u64, CompositionError> {
-    let request = revocation_history_read_request(state_fence, origin_ref, max_records)?;
-    let response = reads
-        .execute_named(request)
-        .await
-        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-    let evidence = decode_revocation_history_evidence(&response, state_fence)?;
-    if evidence.source_revision != expected_revision {
-        return Err(CompositionError::Recovery(format!(
-            "owner feed observed revision {} disagrees with expected {expected_revision}; trigger is stale",
-            evidence.source_revision
-        )));
-    }
-    let provider = OwnerClosureProvider::restore(snapshot, Some(evidence), state_fence)?;
-    publish_owner_feed(kernel, &provider, expected_revision).await
+) -> Result<OwnerFeedSync, CompositionError> {
+    let prepared = prepare_owner_feed(
+        reads,
+        snapshot,
+        state_fence,
+        origin_ref,
+        max_records,
+        expected_revision,
+    )
+    .await?;
+    let revision = publish_owner_feed(kernel, &prepared.provider, expected_revision).await?;
+    Ok(OwnerFeedSync {
+        revision,
+        history: prepared.history,
+    })
 }
