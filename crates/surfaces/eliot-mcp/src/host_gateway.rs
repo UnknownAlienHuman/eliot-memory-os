@@ -12,11 +12,11 @@ use thiserror::Error;
 use crate::{
     ContractViolation, HostCancellationRequest, HostContractError, HostCorrelationId,
     HostInvocationRequest, HostOperationHandle, McpResponse, PortFailure, RequestCorrelation,
-    validate_proof_ceiling,
+    ToolRequest, classify_response_failure, validate_mcp_response_for_tool, validate_proof_ceiling,
 };
 
 /// Stable revision of the stateless host-request gateway contract.
-pub const HOST_REQUEST_GATEWAY_CONTRACT_REVISION: &str = "1.0.0";
+pub const HOST_REQUEST_GATEWAY_CONTRACT_REVISION: &str = "1.1.0";
 
 /// Trusted Kernel/Governor boundary for inert host invocation and cancellation.
 ///
@@ -342,7 +342,6 @@ impl HostRequestGateway {
     ) -> Result<(HostInvocationResult, HostCorrelationReceipt), HostGatewayError> {
         request.validate()?;
         let correlation_id = request.correlation_id.clone();
-        let expected_tool = request.tool.canonical_name();
         let outcome = match port.invoke(request) {
             Ok(HostInvocationPortOutcome::Accepted { operation_handle }) => {
                 HostInvocationOutcome::Accepted { operation_handle }
@@ -351,10 +350,18 @@ impl HostRequestGateway {
                 operation_handle,
                 response,
             }) => {
-                validate_port_response(expected_tool, &response)?;
-                HostInvocationOutcome::Responded {
-                    operation_handle,
-                    response,
+                validate_port_response(&request.tool, &response)?;
+                match classify_response_failure(&response).map_err(|_| {
+                    HostGatewayError::InvalidPortResult {
+                        field: "response.content",
+                        reason: "typed negative response is malformed",
+                    }
+                })? {
+                    Some(failure) => HostInvocationOutcome::Rejected { failure },
+                    None => HostInvocationOutcome::Responded {
+                        operation_handle,
+                        response,
+                    },
                 }
             }
             Err(failure) => HostInvocationOutcome::Rejected { failure },
@@ -422,7 +429,7 @@ pub enum HostGatewayError {
 }
 
 fn validate_port_response(
-    expected_tool: &str,
+    expected_tool: &ToolRequest,
     response: &McpResponse,
 ) -> Result<(), HostGatewayError> {
     public_text(&response.request_id, "response.request_id")?;
@@ -435,12 +442,12 @@ fn validate_port_response(
         &response.canonical_tool_name,
         "response.canonical_tool_name",
     )?;
-    if response.canonical_tool_name != expected_tool {
-        return Err(HostGatewayError::InvalidPortResult {
-            field: "response.canonical_tool_name",
-            reason: "must match the requested canonical tool",
-        });
-    }
+    validate_mcp_response_for_tool(expected_tool, response).map_err(|_| {
+        HostGatewayError::InvalidPortResult {
+            field: "response.content",
+            reason: "response does not match the requested tool's evidence contract",
+        }
+    })?;
     validate_proof_ceiling(response.proof_ceiling).map_err(port_contract_violation)?;
     let encoded = serde_json::to_vec(response)
         .map_err(|error| HostGatewayError::ResponseSerialization(error.to_string()))?;

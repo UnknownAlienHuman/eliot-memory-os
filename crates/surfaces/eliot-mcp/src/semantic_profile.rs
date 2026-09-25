@@ -504,7 +504,7 @@ pub fn validate_operational_projection(
 }
 
 /// Exact Tool Definition version governed by this registry revision.
-pub const CANONICAL_DEFINITION_VERSION: &str = "1.2.0";
+pub const CANONICAL_DEFINITION_VERSION: &str = "1.3.0";
 
 /// Builds the canonical registry owning the eight hot-surface methods.
 pub fn canonical_registry() -> Result<SemanticRegistry, SemanticProfileError> {

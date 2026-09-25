@@ -89,6 +89,7 @@ fn response(tool: &str) -> McpResponse {
         canonical_request_sha256: "a".repeat(64),
         kind: ResponseKind::Projection,
         canonical_tool_name: tool.to_owned(),
+        recall_disposition: None,
         content: json!({"projection": "current"}),
         artifacts: Vec::new(),
         proof_ceiling: ProofCeiling::Observation,
