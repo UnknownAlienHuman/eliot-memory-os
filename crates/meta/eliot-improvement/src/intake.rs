@@ -14,31 +14,39 @@
 //!   for its caller to resolve.
 //! - [`intake_from_evidence_governed`] is the owner-verified entry. It
 //!   confirms the bound policy's owning authority against a Governor
-//!   issuance, resolves the campaign's retrieval material from the backlog's
-//!   owner-retained registry instead of from caller strings, and admits
-//!   through the pressure-reporting path so a full bound performs and
-//!   RETURNS the summarized archive transition. What is and is not atomic:
-//!   every pre-admission gate refuses before anything is written, and the
-//!   lineage-merge path validates the merged entry before it writes it, so a
-//!   refusal from either leaves the backlog untouched. Bound relief is the
-//!   one deliberate exception: it retires entries one at a time, so a
-//!   failure part-way through leaves a partially relieved backlog — a state
-//!   that stays observable because [`PressureAdmissionError::ReliefFailed`]
-//!   carries the receipts produced so far, and a caller that drops them is
-//!   discarding durable history rather than seeing an empty receipt list.
+//!   issuance, BINDS the campaign owner's retained overlay and reusable
+//!   material into the backlog's owner-retained registries under that same
+//!   permit, RESOLVES every influence subject back out of those registries
+//!   instead of from caller strings, and admits through the
+//!   pressure-reporting path so a full bound performs and RETURNS the
+//!   summarized archive transition. Binding and resolving on one
+//!   owner-verified path is what makes the registries load-bearing: a permit
+//!   that binds an influence subject with no live retained record is refused
+//!   instead of served from the request. What is and is not atomic:
+//!   every pre-admission gate refuses before any candidate entry is written,
+//!   and the lineage-merge path validates the merged entry before it writes
+//!   it, so a refusal from either leaves the backlog's entries untouched. The
+//!   owner-retained bindings are the one step that can be half-done, and a
+//!   half-written binding is re-checked against the same permit on every
+//!   later read. Bound relief is the other deliberate exception: it retires
+//!   entries one at a time, so a failure part-way through leaves a partially
+//!   relieved backlog — a state that stays observable because
+//!   [`PressureAdmissionError::ReliefFailed`] carries the receipts produced
+//!   so far, and a caller that drops them is discarding durable history
+//!   rather than seeing an empty receipt list.
 //!
 //! Neither entry persists anything: the archive receipts and the owner-bound
-//! overlay travel back in the returned outcome so the owning lane can make
-//! the evidence durable. I12.24:293 requires raw evidence to be durable and
-//! backlog/archive history not to stay process-local, so no receipt is
-//! dropped inside this crate.
+//! overlay / reusable material travel back in the returned outcome so the
+//! owning lane can make the evidence durable. I12.24:293 requires raw evidence
+//! to be durable and backlog/archive history not to stay process-local, so no
+//! receipt is dropped inside this crate.
 
 use crate::application_class::{ChangeDescriptor, check_class_gate, classify};
 use crate::brief::{ImprovementBrief, SafeBoundary, brief_at_safe_boundary};
 use crate::budget_proof::{BudgetProof, require_matched_budget_for_promotion};
 use crate::candidate_bounds::{
     AdmitOutcome, ArchivedCandidate, BoundedBacklog, BoundsError, GovernedOverlay,
-    PressureAdmissionError,
+    PressureAdmissionError, ReusableCandidateRef,
 };
 use crate::evidence_sources::{SourcedEvidence, candidate_from_evidence};
 use crate::{ImprovementError, ImprovementSurface, ReplayPlan};
@@ -47,6 +55,55 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
 use time::OffsetDateTime;
+
+/// The campaign owner's RETAINED learning material for one governed intake.
+///
+/// This is the owner-side record of what the campaign keeps, not a requester's
+/// assertion about what the campaign may use. It is the input the intake path
+/// writes into the backlog's owner-retained registries under the admitting
+/// permit, and everything the intake then resolves comes back OUT of those
+/// registries rather than out of this value.
+///
+/// It is deliberately not authority, and nothing here is accepted on trust:
+///
+/// - `local_overlay` is cross-checked field-by-field against the verified
+///   permit by [`BoundedBacklog::bind_local_overlay`], and its `admission_ref`
+///   must equal `permit.digest()`. A caller that presents material for another
+///   campaign, task, fence or overlay is refused, and a caller that presents
+///   an overlay when the permit admits none is refused too.
+/// - `reusable_closure` supplies the candidate subject and the closure handle;
+///   the ORIGIN CAMPAIGN is not taken from here at all, because
+///   [`BoundedBacklog::bind_reusable_candidate`] derives it from
+///   `permit.source_campaign_id()`. The candidate's OWNER is likewise copied
+///   from the retained backlog entry, never from this request.
+///
+/// Both fields are `Option` because "the campaign retains no such record" is a
+/// real state, and the intake must not invent one to satisfy a permit. A
+/// `None` where the permit binds that influence subject is a refusal, not a
+/// fallback: it is exactly the case where a candidate must not be admitted
+/// into a campaign that could never use it (I12.24:295).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RetainedCampaignLearning {
+    /// The campaign's retained task-local overlay record, when the campaign
+    /// retains one.
+    pub local_overlay: Option<GovernedOverlay>,
+    /// The campaign's retained reusable-candidate closure material, when the
+    /// campaign retains one.
+    pub reusable_closure: Option<RetainedReusableClosure>,
+}
+
+/// The campaign owner's retained closure material for one reusable candidate.
+///
+/// `closure_ref` is the owner-DECLARED closure disposition handle. The
+/// verified permit exposes no closure ref, so
+/// [`BoundedBacklog::bind_reusable_candidate`] presence-checks it only and a
+/// consumer must not read the stored handle as an owner-issued disposition
+/// handle. `candidate_id` must equal the permit's bound subject.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetainedReusableClosure {
+    pub candidate_id: String,
+    pub closure_ref: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IntakeRequest {
@@ -104,6 +161,10 @@ pub struct GovernedIntakeOutcome {
     /// owner-retained registry under the admitting permit. `None` only when
     /// the permit binds no overlay subject at all.
     pub bound_overlay: Option<GovernedOverlay>,
+    /// The campaign's reusable-candidate material, resolved from the backlog's
+    /// owner-retained registry under the admitting permit. `None` only when
+    /// the permit binds no reusable candidate subject at all.
+    pub bound_reusable: Option<ReusableCandidateRef>,
 }
 
 /// Fail-closed refusals of [`intake_from_evidence_governed`].
@@ -125,8 +186,9 @@ pub enum GovernedIntakeError {
     Backlog(#[from] PressureAdmissionError),
     /// A bounded-candidate gate refused: the surface bound policy is absent
     /// or its owning authority is not the one the permit authenticates, or
-    /// the owner-retained overlay material for this permit is missing,
-    /// re-issued, fence-drifted, foreign, expired or otherwise not live.
+    /// the owner-retained overlay / reusable-candidate material for this
+    /// permit is missing, re-issued, fence-drifted, foreign, expired or
+    /// otherwise not live.
     #[error("bounded candidate gate refused the governed intake: {0}")]
     Bounds(#[from] BoundsError),
 }
@@ -256,6 +318,54 @@ pub fn intake_from_evidence(
     Ok(intake_outcome(outcome, prepared.brief))
 }
 
+/// Write the campaign owner's retained learning material into the backlog's
+/// owner-retained registries, under the same owner-verified permit that will
+/// read it back.
+///
+/// This is the owner-side binding step. It runs on the admission path in this
+/// crate, so `bound_overlays` and `bound_reusables` are written and read by
+/// one owner-verified path instead of staying permanently empty.
+///
+/// The permit is the authority, not the request:
+///
+/// - the retained overlay's overlay id, campaign id, task id and State Fence
+///   must equal the permit's own values, and its `admission_ref` must equal
+///   `permit.digest()`. Anything else is refused with the matching typed
+///   [`BoundsError`] and nothing is written;
+/// - the reusable binding's candidate subject must equal the permit's, its
+///   ORIGIN CAMPAIGN is DERIVED from `permit.source_campaign_id()` rather than
+///   taken from the request, the candidate must still be an active backlog
+///   entry admitted under the permit's authority, and its OWNER is copied from
+///   that retained entry. An unclosed or ownerless candidate is refused.
+///
+/// The order is overlay first, then reusable: neither binding reads or writes
+/// the other, and both precede the resolution below, so a refusal here leaves
+/// no candidate admitted into a campaign whose retained material is not there.
+///
+/// Mutating only `bound_overlays` / `bound_reusables`. When it refuses, the
+/// only possible change is a binding written before the refusal, which the
+/// next resolution re-checks; no entry, revision or archive receipt is
+/// touched, so [`GovernedIntakeError::Bounds`] stays truthful.
+fn bind_retained_learning_material(
+    backlog: &mut BoundedBacklog,
+    retained: &RetainedCampaignLearning,
+    verified: &VerifiedLearningAdmission<'_>,
+) -> Result<(), BoundsError> {
+    let permit = verified.permit();
+    if let Some(overlay) = &retained.local_overlay {
+        backlog.bind_local_overlay(overlay.clone(), verified)?;
+    }
+    if let Some(closure) = &retained.reusable_closure {
+        backlog.bind_reusable_candidate(
+            &closure.candidate_id,
+            &closure.closure_ref,
+            permit.source_campaign_id(),
+            verified,
+        )?;
+    }
+    Ok(())
+}
+
 /// Owner-verified intake: bound policy, owner-retained retrieval material,
 /// and pressure-reporting admission.
 ///
@@ -265,27 +375,33 @@ pub fn intake_from_evidence(
 ///    surface with no policy — or a policy whose `governor_authority_ref` is
 ///    not the authority the permit authenticates — is refused before any
 ///    candidate, brief or brief cost is produced;
-/// 2. the campaign's overlay is resolved from the backlog's owner-retained
-///    registry under the same permit, so no caller-presented
-///    `GovernedOverlay` can stand in for it. A permit that binds no overlay
-///    subject has no overlay to resolve and yields `None`; a permit that
-///    binds one and has no live retained overlay is refused, which is what
-///    keeps a candidate from being admitted into a campaign that could never
-///    use it (I12.24:295);
-/// 3. the shared pre-admission gates run unchanged;
-/// 4. admission goes through
+/// 2. the campaign owner's retained material is BOUND into the backlog's
+///    owner-retained registries under that same permit by
+///    `bind_retained_learning_material`;
+/// 3. the campaign's influence subjects are RESOLVED back out of those
+///    registries — never out of the request — so no caller-presented
+///    `GovernedOverlay` or reusable record can stand in for the retained one.
+///    A permit that binds an overlay subject has no overlay to resolve and
+///    yields `None`; a permit that binds one and has no live retained overlay
+///    is refused, which is what keeps a candidate from being admitted into a
+///    campaign that could never use it (I12.24:295). The same holds for the
+///    reusable candidate subject;
+/// 4. the shared pre-admission gates run unchanged;
+/// 5. admission goes through
 ///    [`BoundedBacklog::admit_reporting_pressure`], so a full surface bound
 ///    performs the explicit summarized archive transition and returns its
 ///    receipts.
 ///
-/// What atomicity this entry actually has. It is NOT transactional and this
-/// doc does not claim it is:
+/// Steps 1 to 3 take the backlog mutably but write nothing a candidate entry
+/// depends on, and step 4 never touches it, so every refusal they produce
+/// happens before the admission is attempted. What atomicity this entry
+/// actually has is stated below and is not a transaction:
 ///
-/// - Steps 1 to 3 and the backlog's own pre-admission assessment either take
-///   the backlog by shared reference or run before it, so every refusal they
-///   produce happens before a single field of the backlog is written. No
-///   admitted candidate, archive receipt or revision bump can be left behind
-///   by them.
+/// - Step 2's binding writes only the two owner-retained registries. A
+///   refusal in the middle of it can leave the first binding written, and
+///   that record is re-checked by the same permit on every later read, so a
+///   refused intake cannot hand a caller a usable influence it never earned.
+///   No candidate entry, revision bump or archive receipt is affected.
 /// - The lineage-merge arm mutates only after it has validated the resulting
 ///   entry: the merge computes the whole post-merge entry to one side,
 ///   validates it, and writes it back in a single assignment. A refused merge
@@ -310,14 +426,20 @@ pub fn intake_from_evidence(
 pub fn intake_from_evidence_governed(
     backlog: &mut BoundedBacklog,
     request: IntakeRequest,
+    retained: &RetainedCampaignLearning,
     verified: &VerifiedLearningAdmission<'_>,
     now: OffsetDateTime,
 ) -> Result<GovernedIntakeOutcome, GovernedIntakeError> {
     backlog
         .policy_for(request.target_surface)?
         .validate_governed(verified)?;
+    bind_retained_learning_material(backlog, retained, verified)?;
     let bound_overlay = match verified.permit().overlay_id() {
         Some(_) => Some(backlog.live_local_overlay(verified, now)?.clone()),
+        None => None,
+    };
+    let bound_reusable = match verified.permit().candidate_id() {
+        Some(candidate_id) => Some(backlog.active_reusable(candidate_id, verified)?.clone()),
         None => None,
     };
     let prepared = prepare_intake(request)?;
@@ -331,5 +453,6 @@ pub fn intake_from_evidence_governed(
         intake: intake_outcome(report.outcome, prepared.brief),
         archived: report.archived,
         bound_overlay,
+        bound_reusable,
     })
 }
