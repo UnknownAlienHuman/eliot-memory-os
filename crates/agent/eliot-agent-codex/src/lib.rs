@@ -1576,30 +1576,10 @@ fn validate_terminal_observation(
 /// observation is always `UNOBSERVED` with an explicit reason (the adapter
 /// records no separate physical route), and the admitted/binding linkage is
 /// enforced via `validate_against(binding, admission)`.
-pub fn translate_result(
-    input: CodexResultInput,
-    binding: &ProviderExecutionBinding,
-    admission: &AdmittedRouteReceipt,
-    authority: &EffectCeiling,
-) -> Result<AgentResult, CodexAdapterError> {
-    validate_codex_route(&input.route)?;
-    input.session.validate(&input.route)?;
-    validate_binding_for_codex(binding)?;
-    if input.route != binding.route {
-        return Err(CodexAdapterError::Contract(
-            eliot_agent_api::ContractError::BindingMismatch,
-        ));
-    }
-    validate_session_locator_against_binding(&input.session, binding)?;
-    if let Some(locator) = &input.continuation {
-        if locator.route != input.route {
-            return Err(CodexAdapterError::RouteMismatch);
-        }
-        locator.validate()?;
-    }
-    if let Some(terminal) = &input.terminal_observation {
-        validate_terminal_observation(terminal, binding, admission)?;
-    }
+/// Evidence references carried by a translated Codex result: a content hash
+/// of the provider output text when present, otherwise the terminal-event
+/// identity the outcome was derived from. Pure projection, no I/O.
+fn codex_result_evidence_refs(input: &CodexResultInput) -> Vec<String> {
     let output_digest = input
         .output
         .as_deref()
@@ -1613,30 +1593,42 @@ pub fn translate_result(
     {
         evidence_refs.push(format!("codex-terminal:{}", terminal.event_id.as_str()));
     }
-    let (disposition, unknown_reason) = if input.cancelled {
-        (ResultDisposition::CancelledObserved, input.unknown_reason)
+    evidence_refs
+}
+
+/// Result disposition for a translated Codex result: cancellation is
+/// observed, a missing terminal observation is an unknown outcome with an
+/// explicit reason, otherwise the partial terminal state stands.
+fn codex_result_disposition(input: &CodexResultInput) -> (ResultDisposition, Option<String>) {
+    if input.cancelled {
+        (
+            ResultDisposition::CancelledObserved,
+            input.unknown_reason.clone(),
+        )
     } else if input.terminal_observation.is_none() {
         (
             ResultDisposition::UnknownOutcome,
             Some(
                 input
                     .unknown_reason
+                    .clone()
                     .unwrap_or_else(|| "terminal observation absent".into()),
             ),
         )
     } else {
-        (ResultDisposition::Partial, input.unknown_reason)
-    };
-    // The request commitment is the bound start request preserved verbatim:
-    // a substituted digest fails `validate_against` below, so two different
-    // start requests can never report the same commitment.
-    let request_digest = PhysicalRouteObservationReceipt::bound_request_digest(binding)
-        .map_err(CodexAdapterError::Contract)?;
-    // Binding-gated physical observation: UNOBSERVED with explicit reason,
-    // never observed=requested. Cancelled carries observed cancellation;
-    // all other outcomes stay UNKNOWN_OUTCOME with a quarantine recovery
-    // handle, preserving evidence without fabricating wall time.
-    let (execution_outcome, cancellation, recovery_ref) = if input.cancelled {
+        (ResultDisposition::Partial, input.unknown_reason.clone())
+    }
+}
+
+/// Execution-outcome axis for a translated Codex result, kept independent
+/// of the route axis: cancelled carries observed cancellation, every other
+/// outcome stays unknown with a quarantine recovery handle, preserving
+/// evidence without fabricating wall time.
+fn codex_execution_outcome(
+    input: &CodexResultInput,
+    unknown_reason: &Option<String>,
+) -> (ExecutionOutcome, Option<CancellationState>, Option<String>) {
+    if input.cancelled {
         (
             ExecutionOutcome::Observed,
             Some(CancellationState::Acknowledged),
@@ -1659,7 +1651,23 @@ pub fn translate_result(
                     .unwrap_or_else(|| "terminal observation absent".to_owned()),
             ),
         )
-    };
+    }
+}
+
+/// Binding-gated physical observation for a translated Codex result:
+/// `UNOBSERVED` with an explicit reason, never observed=requested. The
+/// request commitment is the bound start request preserved verbatim, and
+/// the sealed receipt is enforced against the live binding/admission here,
+/// never at a later intake.
+fn codex_observation_receipt(
+    input: &CodexResultInput,
+    binding: &ProviderExecutionBinding,
+    admission: &AdmittedRouteReceipt,
+    request_digest: LowercaseSha256,
+    execution_outcome: ExecutionOutcome,
+    cancellation: Option<CancellationState>,
+    recovery_ref: Option<String>,
+) -> Result<PhysicalRouteObservationReceipt, CodexAdapterError> {
     let mut actual_route = PhysicalRouteObservationReceipt {
         schema_version: CONTRACT_VERSION.to_owned(),
         attempt_id: binding.attempt_id.clone(),
@@ -1703,6 +1711,55 @@ pub fn translate_result(
     // agreement and requested==admitted-selected; forged or mismatched
     // linkage fails closed here, never at a later intake.
     actual_route.validate_against(binding, admission)?;
+    Ok(actual_route)
+}
+
+pub fn translate_result(
+    input: CodexResultInput,
+    binding: &ProviderExecutionBinding,
+    admission: &AdmittedRouteReceipt,
+    authority: &EffectCeiling,
+) -> Result<AgentResult, CodexAdapterError> {
+    validate_codex_route(&input.route)?;
+    input.session.validate(&input.route)?;
+    validate_binding_for_codex(binding)?;
+    if input.route != binding.route {
+        return Err(CodexAdapterError::Contract(
+            eliot_agent_api::ContractError::BindingMismatch,
+        ));
+    }
+    validate_session_locator_against_binding(&input.session, binding)?;
+    if let Some(locator) = &input.continuation {
+        if locator.route != input.route {
+            return Err(CodexAdapterError::RouteMismatch);
+        }
+        locator.validate()?;
+    }
+    if let Some(terminal) = &input.terminal_observation {
+        validate_terminal_observation(terminal, binding, admission)?;
+    }
+    let evidence_refs = codex_result_evidence_refs(&input);
+    let (disposition, unknown_reason) = codex_result_disposition(&input);
+    // The request commitment is the bound start request preserved verbatim:
+    // a substituted digest fails `validate_against` below, so two different
+    // start requests can never report the same commitment.
+    let request_digest = PhysicalRouteObservationReceipt::bound_request_digest(binding)
+        .map_err(CodexAdapterError::Contract)?;
+    // Binding-gated physical observation: UNOBSERVED with explicit reason,
+    // never observed=requested. Cancelled carries observed cancellation;
+    // all other outcomes stay UNKNOWN_OUTCOME with a quarantine recovery
+    // handle, preserving evidence without fabricating wall time.
+    let (execution_outcome, cancellation, recovery_ref) =
+        codex_execution_outcome(&input, &unknown_reason);
+    let actual_route = codex_observation_receipt(
+        &input,
+        binding,
+        admission,
+        request_digest,
+        execution_outcome,
+        cancellation,
+        recovery_ref,
+    )?;
     let result = AgentResult {
         attempt_id: binding.attempt_id.clone(),
         disposition,
