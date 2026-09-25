@@ -138,6 +138,18 @@ const GRANT_GRAPH_REVISION_CURRENT: TableDefinition<&str, &str> =
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY: &str = "supervision_stage_resolution_schema";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1: &str = "eliot.ors.supervision-stage-resolution.v1";
+/// Ceiling on table names enumerated at store open. Provenance checks and the
+/// restore-journal family check both read this set, so the scan must be bounded
+/// rather than proportional to a malformed database's table count.
+const MAX_ORS_TABLES_SCANNED: usize = 4096;
+/// Ceiling on a persisted marker value read during open, checked before the
+/// value is copied out of Redb.
+const MAX_ORS_MARKER_BYTES: usize = 256;
+/// Base-`META` marker recording that this store has adopted the v2 restore
+/// journal. It lives outside the journal table family so that deleting those
+/// tables is detectable rather than silently re-created as an empty journal.
+/// Owned by the journal initializer; see `store/restore_journal.rs`.
+pub(super) const RESTORE_JOURNAL_ADOPTION_KEY: &str = "restore_journal_adoption";
 
 fn current_unix_ms() -> Result<i64, OrsError> {
     let millis = SystemTime::now()
@@ -4770,18 +4782,32 @@ impl RedbRecoveryStore {
 
     fn initialize(&self) -> Result<(), OrsError> {
         let write = self.database.begin_write().map_err(storage)?;
-        let table_names = write
-            .list_tables()
-            .map_err(storage)?
-            .map(|table| table.name().to_owned())
-            .collect::<BTreeSet<_>>();
+        // Bounded: provenance below and the journal family check that follows
+        // both depend on this set, so an unbounded table-name scan would be an
+        // unbounded open-time cost on a malformed database.
+        let mut table_names = BTreeSet::new();
+        for table in write.list_tables().map_err(storage)? {
+            table_names.insert(restore_journal::bound_table_name(table.name())?);
+            if table_names.len() > MAX_ORS_TABLES_SCANNED {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+        }
         let store_is_empty = table_names.is_empty();
         let has_resolution_table = table_names.contains(SUPERVISION_LEASE_STAGE_RESOLUTIONS.name());
         let resolution_schema_marker = if table_names.contains(META.name()) {
             let meta = write.open_table(META).map_err(storage)?;
-            meta.get(SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY)
+            // Bounded before it is copied out: a corrupt marker must not be able
+            // to force an unbounded allocation during open.
+            match meta
+                .get(SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY)
                 .map_err(storage)?
-                .map(|value| value.value().to_owned())
+            {
+                Some(value) if value.value().len() > MAX_ORS_MARKER_BYTES => {
+                    return Err(OrsError::ProjectionLimitExceeded);
+                }
+                Some(value) => Some(value.value().to_owned()),
+                None => None,
+            }
         } else {
             None
         };
@@ -4797,79 +4823,95 @@ impl RedbRecoveryStore {
                     .to_owned(),
             });
         };
-        {
-            drop(write.open_table(META).map_err(storage)?);
-            drop(write.open_table(ENVELOPES).map_err(storage)?);
-            drop(write.open_table(RESERVATIONS).map_err(storage)?);
-            drop(write.open_table(RESERVATION_ORDERS).map_err(storage)?);
-            drop(write.open_table(OPERATIONS).map_err(storage)?);
-            drop(write.open_table(SCOPE_HEADS).map_err(storage)?);
-            drop(write.open_table(SCOPE_TERMINALS).map_err(storage)?);
-            drop(write.open_table(OPERATIONAL_CURRENT).map_err(storage)?);
-            drop(write.open_table(OPERATIONAL_HISTORY).map_err(storage)?);
-            drop(write.open_table(RECOVERY_INBOX).map_err(storage)?);
-            drop(write.open_table(RECOVERY_INBOX_HISTORY).map_err(storage)?);
-            drop(write.open_table(PROCESS_START_REPLAY).map_err(storage)?);
-            drop(write.open_table(AUTHORITY_HANDOFFS).map_err(storage)?);
-            drop(write.open_table(PROCESS_EVIDENCE).map_err(storage)?);
-            drop(
-                write
-                    .open_table(SUPERVISION_LEASE_STAGED)
-                    .map_err(storage)?,
-            );
-            drop(
-                write
-                    .open_table(SUPERVISION_LEASE_CURRENT)
-                    .map_err(storage)?,
-            );
-            drop(
-                write
-                    .open_table(SUPERVISION_LEASE_HISTORY)
-                    .map_err(storage)?,
-            );
-            drop(
-                write
-                    .open_table(SUPERVISION_LEASE_RESULTS)
-                    .map_err(storage)?,
-            );
-            drop(
-                write
-                    .open_table(SUPERVISION_LEASE_STAGE_RESOLUTIONS)
-                    .map_err(storage)?,
-            );
-            drop(write.open_table(STORE_REBIND_REPLAY).map_err(storage)?);
-            drop(write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?);
-            drop(write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?);
-            drop(
-                write
-                    .open_table(ACTIVATION_RESULT_RETENTION)
-                    .map_err(storage)?,
-            );
-            drop(write.open_table(REPLAY_STREAMS).map_err(storage)?);
-            drop(write.open_table(REPLAY_REQUESTS).map_err(storage)?);
-            drop(write.open_table(REPLAY_EVENTS).map_err(storage)?);
-            drop(write.open_table(REPLAY_ACKS).map_err(storage)?);
-            drop(write.open_table(DOCTOR_ATTEMPTS).map_err(storage)?);
-            drop(write.open_table(DOCTOR_EFFECTS).map_err(storage)?);
-            drop(write.open_table(DOCTOR_BUDGETS).map_err(storage)?);
-            drop(write.open_table(RECOVERY_PROBLEMS).map_err(storage)?);
-            drop(write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?);
-            drop(
-                write
-                    .open_table(GRANT_GRAPH_REVISION_CURRENT)
-                    .map_err(storage)?,
-            );
-            if initialize_resolution_schema {
-                let mut meta = write.open_table(META).map_err(storage)?;
-                meta.insert(
-                    SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY,
-                    SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1,
-                )
-                .map_err(storage)?;
-            }
-        }
+        Self::initialize_ors_tables(&write, initialize_resolution_schema)?;
+        // The journal initializer owns the family AND the base-META adoption
+        // marker, so every entry point that can materialize the family — this
+        // one plus `ensure_restore_journal_schema` and
+        // `bind_restore_journal_stream` — enforces the same adoption rule. It
+        // also re-checks the table ceiling as a postcondition, so the base
+        // tables added above cannot push this transaction past the bound.
+        restore_journal::initialize_restore_journal_schema(&write)?;
         Self::validate_activation_result_retention_table(&write)?;
         write.commit().map_err(storage)
+    }
+
+    /// Materializes the base ORS table family and, when the store is new or
+    /// already carries the exact v1 stage-resolution provenance, the
+    /// stage-resolution schema marker.
+    fn initialize_ors_tables(
+        write: &redb::WriteTransaction,
+        initialize_resolution_schema: bool,
+    ) -> Result<(), OrsError> {
+        drop(write.open_table(META).map_err(storage)?);
+        drop(write.open_table(ENVELOPES).map_err(storage)?);
+        drop(write.open_table(RESERVATIONS).map_err(storage)?);
+        drop(write.open_table(RESERVATION_ORDERS).map_err(storage)?);
+        drop(write.open_table(OPERATIONS).map_err(storage)?);
+        drop(write.open_table(SCOPE_HEADS).map_err(storage)?);
+        drop(write.open_table(SCOPE_TERMINALS).map_err(storage)?);
+        drop(write.open_table(OPERATIONAL_CURRENT).map_err(storage)?);
+        drop(write.open_table(OPERATIONAL_HISTORY).map_err(storage)?);
+        drop(write.open_table(RECOVERY_INBOX).map_err(storage)?);
+        drop(write.open_table(RECOVERY_INBOX_HISTORY).map_err(storage)?);
+        drop(write.open_table(PROCESS_START_REPLAY).map_err(storage)?);
+        drop(write.open_table(AUTHORITY_HANDOFFS).map_err(storage)?);
+        drop(write.open_table(PROCESS_EVIDENCE).map_err(storage)?);
+        drop(
+            write
+                .open_table(SUPERVISION_LEASE_STAGED)
+                .map_err(storage)?,
+        );
+        drop(
+            write
+                .open_table(SUPERVISION_LEASE_CURRENT)
+                .map_err(storage)?,
+        );
+        drop(
+            write
+                .open_table(SUPERVISION_LEASE_HISTORY)
+                .map_err(storage)?,
+        );
+        drop(
+            write
+                .open_table(SUPERVISION_LEASE_RESULTS)
+                .map_err(storage)?,
+        );
+        drop(
+            write
+                .open_table(SUPERVISION_LEASE_STAGE_RESOLUTIONS)
+                .map_err(storage)?,
+        );
+        drop(write.open_table(STORE_REBIND_REPLAY).map_err(storage)?);
+        drop(write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?);
+        drop(write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?);
+        drop(
+            write
+                .open_table(ACTIVATION_RESULT_RETENTION)
+                .map_err(storage)?,
+        );
+        drop(write.open_table(REPLAY_STREAMS).map_err(storage)?);
+        drop(write.open_table(REPLAY_REQUESTS).map_err(storage)?);
+        drop(write.open_table(REPLAY_EVENTS).map_err(storage)?);
+        drop(write.open_table(REPLAY_ACKS).map_err(storage)?);
+        drop(write.open_table(DOCTOR_ATTEMPTS).map_err(storage)?);
+        drop(write.open_table(DOCTOR_EFFECTS).map_err(storage)?);
+        drop(write.open_table(DOCTOR_BUDGETS).map_err(storage)?);
+        drop(write.open_table(RECOVERY_PROBLEMS).map_err(storage)?);
+        drop(write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?);
+        drop(
+            write
+                .open_table(GRANT_GRAPH_REVISION_CURRENT)
+                .map_err(storage)?,
+        );
+        if initialize_resolution_schema {
+            let mut meta = write.open_table(META).map_err(storage)?;
+            meta.insert(
+                SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY,
+                SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1,
+            )
+            .map_err(storage)?;
+        }
+        Ok(())
     }
 
     fn validate_activation_result_retention_table(
