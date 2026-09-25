@@ -4,10 +4,10 @@ use eliot_agent_api::{
     AdmittedRouteReceipt, AgentAttempt, AgentResult, AttemptId, AttemptState, AuthorityEnvelope,
     CancellationState, CandidateSelectionDisposition, ContinuityKind, ContractError, EffectCeiling,
     EffectKind, HostEventNormalizationReceipt, HostEventQuarantineReason,
-    HostEventReplayDisposition, NormalizedHostEventEnvelope, PhysicalRouteObservationReceipt,
-    ProviderExecutionBinding, ProviderObservationLineage, RejectedRouteCandidate,
-    ResultDisposition, RouteSelectionCandidate, WorkLeaseId, candidate_digest_for,
-    validate_execution_binding,
+    HostEventReplayDisposition, MAX_ROUTE_CANDIDATES, NormalizedHostEventEnvelope,
+    PhysicalRouteObservationReceipt, ProviderExecutionBinding, ProviderObservationLineage,
+    RejectedRouteCandidate, ResultDisposition, RouteSelectionCandidate, WorkLeaseId,
+    candidate_digest_for, validate_execution_binding,
 };
 use eliot_agent_contracts::{
     AgentAttemptId, CoordinationEntry, CoordinationMapView, DescendantTerminalState,
@@ -2440,18 +2440,49 @@ fn validate_recipe(request: &StaffingPlanRequest) -> Result<(), CoordinatorError
     Ok(())
 }
 
+/// Hard-constraint rejection codes recorded in
+/// [`RejectedRouteCandidate::reason_code`] (issue #1703). Rank losers keep
+/// `LOWER_DETERMINISTIC_RANK`; these codes name the exact failed eligibility
+/// dimension so the receipt exposes the material hard-constraint rationale.
+/// Reason codes are selector-owned labels and prove nothing by themselves.
+const REJECT_CAPACITY_MISMATCH: &str = "CAPACITY_MISMATCH";
+const REJECT_NO_CAPACITY: &str = "NO_CAPACITY";
+const REJECT_ROUTE_CLASS: &str = "ROUTE_CLASS_REJECTED";
+const REJECT_MISSING_EVIDENCE: &str = "MISSING_EVIDENCE";
+
+#[allow(clippy::too_many_lines)]
 fn select_route(
     config: &CoordinatorConfig,
     request: &StaffingPlanRequest,
     role: &RoleProfileManifest,
-    mut candidates: Vec<RouteCandidateEvidence>,
+    candidates: Vec<RouteCandidateEvidence>,
     health: Option<&ProviderSelectionHealth>,
 ) -> Result<RouteSelectionCandidate, CoordinatorError> {
     if candidates.is_empty() {
         return Err(CoordinatorError::RouteEvidence);
     }
+    // Whole-request bound before expensive processing (issue #1703, I10.15
+    // route allocation): an over-bound set rejects instead of silently
+    // truncating the considered set.
+    if candidates.len() > MAX_ROUTE_CANDIDATES {
+        return Err(CoordinatorError::RouteEvidence);
+    }
+    // Contradictory input rejects as a whole: a duplicated route identity is
+    // malformed, not an honest ineligible alternative.
     let mut identities = BTreeSet::new();
     for candidate in &candidates {
+        if !identities.insert(route_key(&candidate.route)) {
+            return Err(CoordinatorError::DuplicateIdentity("route_candidate"));
+        }
+    }
+    // Hard constraints filter before ranking (issue #1703, I10.15 route
+    // allocation): malformed shapes reject the whole request, while honest
+    // hard-constraint misses become per-candidate ineligibility with a reason
+    // code, so one exhausted candidate never erases valid alternatives and a
+    // cheaper/high-ranked but ineligible route can never win.
+    let mut eligible = Vec::with_capacity(candidates.len());
+    let mut ineligible = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
         candidate.route.validate().map_err(provider_contract)?;
         candidate
             .budget_evidence
@@ -2459,47 +2490,76 @@ fn select_route(
             .map_err(provider_contract)?;
         validate_text(&candidate.capacity_identity, "capacity_identity")?;
         validate_text(candidate.capacity_revision.as_str(), "capacity_revision")?;
-        if candidate.capacity_limit == 0
-            || candidate.capacity_identity != config.capacity_identity
-            || candidate.capacity_revision != config.capacity_revision
-            || candidate.evidence_refs.is_empty()
-        {
-            return Err(CoordinatorError::RouteEvidence);
-        }
-        if !route_class_allowed(
-            &request.launch.allowed_route_classes,
-            &candidate.route.provider,
-        ) || !route_class_allowed(&role.allowed_route_classes, &candidate.route.provider)
-        {
-            return Err(CoordinatorError::RouteEvidence);
-        }
         for evidence in &candidate.evidence_refs {
             validate_text(evidence, "route_evidence_ref")?;
         }
-        if !identities.insert(route_key(&candidate.route)) {
-            return Err(CoordinatorError::DuplicateIdentity("route_candidate"));
+        let reason_code = if candidate.capacity_identity != config.capacity_identity
+            || candidate.capacity_revision != config.capacity_revision
+        {
+            Some(REJECT_CAPACITY_MISMATCH)
+        } else if candidate.capacity_limit == 0 {
+            Some(REJECT_NO_CAPACITY)
+        } else if !route_class_allowed(&request.launch.allowed_route_classes, &candidate.route)
+            || !route_class_allowed(&role.allowed_route_classes, &candidate.route)
+        {
+            Some(REJECT_ROUTE_CLASS)
+        } else if candidate.evidence_refs.is_empty() {
+            Some(REJECT_MISSING_EVIDENCE)
+        } else {
+            None
+        };
+        if let Some(reason_code) = reason_code {
+            ineligible.push(RejectedRouteCandidate {
+                route: candidate.route,
+                reason_code: reason_code.to_owned(),
+                evidence_ref: candidate.evidence_refs.first().cloned(),
+            });
+        } else {
+            eligible.push(candidate);
         }
     }
-    candidates.sort_by(|left, right| {
+    if eligible.is_empty() {
+        // Typed refusal before admission: no eligible route selects nothing
+        // and falls back to no provider. The bounded per-candidate reasons
+        // are recomputed deterministically by re-running selection over the
+        // same inputs.
+        return Err(CoordinatorError::RouteEvidence);
+    }
+    eligible.sort_by(|left, right| {
         left.preference_rank
             .cmp(&right.preference_rank)
             .then_with(|| route_key(&left.route).cmp(&route_key(&right.route)))
     });
-    let selected = candidates.remove(0);
-    let all_routes = std::iter::once(selected.route.clone())
-        .chain(candidates.iter().map(|candidate| candidate.route.clone()))
-        .collect::<Vec<_>>();
-    let rejected = candidates
-        .into_iter()
-        .map(|candidate| RejectedRouteCandidate {
+    // Deterministic rejected order: hard-constraint misses by field-complete
+    // route key first, then lower-ranked alternatives in rank order. A sole
+    // eligible candidate keeps an honestly empty rank tail: no alternative is
+    // invented.
+    ineligible.sort_by_key(|rejected| route_key(&rejected.route));
+    let selected = eligible.remove(0);
+    let mut rank_rejected = Vec::with_capacity(eligible.len());
+    let mut all_routes = Vec::with_capacity(eligible.len() + ineligible.len() + 1);
+    all_routes.push(selected.route.clone());
+    for candidate in eligible {
+        all_routes.push(candidate.route.clone());
+        rank_rejected.push(RejectedRouteCandidate {
             route: candidate.route,
             reason_code: "LOWER_DETERMINISTIC_RANK".to_owned(),
             evidence_ref: candidate.evidence_refs.first().cloned(),
-        })
-        .collect::<Vec<_>>();
+        });
+    }
+    for rejected_candidate in &ineligible {
+        all_routes.push(rejected_candidate.route.clone());
+    }
+    let mut rejected = ineligible;
+    rejected.extend(rank_rejected);
     // Typed policy revision binds to the fence's policy revision when present;
     // no bare-string parsing. Capability/intent/scope are deterministic
     // staffing-lane projections, never admission claims.
+    // Explicit compatibility (issue #1703 residual): an absent fence policy
+    // keeps the long-standing genesis mapping so pre-policy wire still plans;
+    // the selector cannot mint an unknown-policy marker in the required
+    // `PolicyRevision` field, so callers must supply the fence revision and
+    // the fence producer owns making it always present.
     let policy_revision = request
         .state_fence
         .policy_revision
@@ -2545,10 +2605,22 @@ fn select_route(
     Ok(candidate)
 }
 
-fn route_class_allowed(allowed_route_classes: &[String], provider: &str) -> bool {
-    allowed_route_classes
-        .iter()
-        .any(|class| class == provider || class == "*")
+/// Owner-defined route-class match (issue #1703): a class entry names a
+/// provider, host family, or adapter label, or the `*` wildcard. Route class
+/// is an owner-defined property, not necessarily the provider name. The model
+/// display name never satisfies a class constraint on its own: model-name
+/// inference is forbidden, so a class naming only a model stays ineligible.
+/// Both the launch and the role allowlists must admit the candidate.
+fn route_class_allowed(
+    allowed_route_classes: &[String],
+    route: &eliot_agent_api::RouteFingerprint,
+) -> bool {
+    allowed_route_classes.iter().any(|class| {
+        class == "*"
+            || class.as_str() == route.provider
+            || class.as_str() == route.host_family
+            || class.as_str() == route.adapter
+    })
 }
 
 fn validate_admission_text(receipt: &ProviderAdmissionReceipt) -> Result<(), CoordinatorError> {
