@@ -282,6 +282,18 @@ where
     /// validation, admission, grant checks (including the claim echo and the
     /// executable expectation when the request carries one), the executable
     /// join gate, P-03 start, and receipt/proof validation.
+    ///
+    /// Start-failure disposition (issue #1701, step 4): a reported
+    /// [`ProcessExecutionError::UnknownOutcome`] retains the exact possible
+    /// effect under the admitted binding. Any other start error is reconciled
+    /// through the existing P-03 inspect owner before the local lifecycle
+    /// moves: reset to `Created` happens only when the executor retains
+    /// nothing under the admitted operation identity (`NotFound`, which
+    /// establishes no effect from this call). A retained operation, a
+    /// reported unknown outcome, or an inconclusive inspection retains the
+    /// binding and fences to `UnknownOutcome`, blocking overlapping work
+    /// until the existing reconcile path resolves the operation. The
+    /// reservation is never released on a locally-unknown outcome.
     #[allow(clippy::too_many_lines)]
     async fn demand_start_inner(
         &mut self,
@@ -348,30 +360,17 @@ where
         let receipt = match start_result {
             Ok(receipt) => receipt,
             Err(ProcessExecutionError::UnknownOutcome) => {
-                self.install_binding(&hello, grant, process_binding);
-                self.transition(WorkerLifecycle::UnknownOutcome)?;
-                let _ = self.append_from_hello(
+                return self.retain_unknown_start_outcome(
                     &hello,
-                    "worker.unknown_outcome",
-                    WorkerEventPayload::UnknownOutcome,
-                    ReceiptDisposition::Unknown {
-                        reason: "process start outcome requires reconciliation".to_owned(),
-                    },
-                    DeliveryClass::DurableControl,
-                    true,
-                )?;
-                return Err(WorkerError::UnknownOutcome);
-            }
-            Err(ProcessExecutionError::Unavailable(_)) => {
-                self.lifecycle = WorkerLifecycle::Created;
-                return Err(WorkerError::PlanGap {
-                    code: PROCESS_PROVIDER_PLAN_GAP,
-                    detail: "P-03 ProcessExecutor is unavailable",
-                });
+                    grant,
+                    process_binding,
+                    "process start outcome requires reconciliation",
+                );
             }
             Err(error) => {
-                self.lifecycle = WorkerLifecycle::Created;
-                return Err(WorkerError::Process(error.to_string()));
+                return self
+                    .reconcile_start_failure(&hello, grant, process_binding, error)
+                    .await;
             }
         };
         if let Err(error) = validate_start_receipt(&receipt, &process_binding) {
@@ -454,6 +453,92 @@ where
             process_start_receipt: receipt,
             ready_event,
         })
+    }
+
+    /// Retains a possibly-effected start under the exact admitted binding
+    /// (issue #1701): installs the grant/binding, fences the lifecycle to
+    /// `UnknownOutcome`, and records the durable unknown-outcome event
+    /// carrying the exact reason. Overlapping work stays blocked until the
+    /// existing reconcile path resolves the operation; the reservation is
+    /// never released on a locally-unknown outcome.
+    fn retain_unknown_start_outcome(
+        &mut self,
+        hello: &WorkerHello,
+        grant: CapabilityGrant,
+        process: ProcessBindingSnapshot,
+        reason: &str,
+    ) -> Result<WorkerReady, WorkerError> {
+        self.install_binding(hello, grant, process);
+        self.transition(WorkerLifecycle::UnknownOutcome)?;
+        let _ = self.append_from_hello(
+            hello,
+            "worker.unknown_outcome",
+            WorkerEventPayload::UnknownOutcome,
+            ReceiptDisposition::Unknown {
+                reason: reason.to_owned(),
+            },
+            DeliveryClass::DurableControl,
+            true,
+        )?;
+        Err(WorkerError::UnknownOutcome)
+    }
+
+    /// Reconciles a non-unknown P-03 start failure through the existing
+    /// process owner before deciding the local disposition (issue #1701,
+    /// step 4).
+    ///
+    /// The provider contract establishes no effect only when the executor
+    /// retains nothing under the admitted operation identity: `inspect`
+    /// answers `NotFound`, so this call started nothing and the lifecycle
+    /// resets to `Created` with the provider's original error mapping
+    /// (`Unavailable` stays a `PlanGap`, anything else stays `Process`).
+    /// When the executor retains the operation, reports `UnknownOutcome`,
+    /// or cannot answer, the possible effect is retained exactly like a
+    /// reported unknown outcome: the binding is installed, the lifecycle
+    /// fences to `UnknownOutcome`, and the durable event preserves the
+    /// original failure text as the reason. Inconclusive inspection fails
+    /// closed to retention, never to reset.
+    async fn reconcile_start_failure(
+        &mut self,
+        hello: &WorkerHello,
+        grant: CapabilityGrant,
+        process: ProcessBindingSnapshot,
+        error: ProcessExecutionError,
+    ) -> Result<WorkerReady, WorkerError> {
+        let operation_id = process.operation_id().clone();
+        let inspection = self
+            .executor
+            .as_ref()
+            .ok_or(WorkerError::PlanGap {
+                code: PROCESS_PROVIDER_PLAN_GAP,
+                detail: "P-03 ProcessExecutor was not injected",
+            })?
+            .inspect(operation_id)
+            .await;
+        // Only a `NotFound` answer establishes no effect from this call: the
+        // executor retains nothing under the admitted operation identity. A
+        // retained operation, a reported unknown outcome, or any other
+        // inspection failure keeps the possible effect.
+        let retained = !matches!(inspection, Err(ProcessExecutionError::NotFound));
+        if retained {
+            let reason = format!(
+                "process start failed without a no-effect proof ({error}); outcome requires reconciliation"
+            );
+            return self.retain_unknown_start_outcome(hello, grant, process, &reason);
+        }
+        match error {
+            ProcessExecutionError::Unavailable(_) => {
+                self.lifecycle = WorkerLifecycle::Created;
+                Err(WorkerError::PlanGap {
+                    code: PROCESS_PROVIDER_PLAN_GAP,
+                    detail: "P-03 ProcessExecutor is unavailable",
+                })
+            }
+            error => {
+                self.lifecycle = WorkerLifecycle::Created;
+                Err(WorkerError::Process(error.to_string()))
+            }
+        }
     }
 
     /// Restores an exact process/admission binding after an A-13 restart without
