@@ -7738,6 +7738,7 @@ mod tests {
         let lineage = readiness_lineage();
         let candidate = eliot_workscope::WorkScopeCandidate {
             scope: scope.clone(),
+            descriptor_revision: 1,
             lineage: Some(lineage.clone()),
             instance: instance.clone(),
             privacy_class: eliot_security_contracts::PrivacyClass::Internal,
