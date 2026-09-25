@@ -15,7 +15,7 @@
 //! Public construction semantics remain on `KernelComposition`; this ordinary
 //! module only houses their implementation.
 use super::{
-    AgentActivationPendingState, ArtifactId, AuthorityDescriptorContour, AuthorityEpoch,
+    AgentActivationPendingState, ArtifactId, AuthorityDescriptorContour,
     AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState,
     AuthorityPreparationError, AuthoritySnapshotBinding, BlobStoreController, BoundCanonicalOwner,
     ContractId, DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId,
@@ -1036,14 +1036,14 @@ impl KernelComposition {
         // reserved for the explicitly standalone composition, where no Store
         // authority has been injected.
         //
-        // Lineage-aware split (Implements #64): the scalar `GenerationRouter`
-        // residual keeps the exact sequence projection, while canonical
-        // `StateFence`/`KernelService` fencing uses the full `EpochId` tuple.
-        // Cross-lineage same-sequence routes never authorize through the
-        // canonical gate.
-        let (authority_epoch, canonical_epoch, generation) = match store_bootstrap.as_ref() {
+        // Lineage-aware route seed (Implements #64): the Kernel route table is
+        // built from the exact canonical `EpochId` tuple carried by the
+        // Host-approved bootstrap fence. There is no scalar `AuthorityEpoch`
+        // projection left for the route, so a route minted under another
+        // lineage at the same sequence can never be admitted as the active
+        // route.
+        let (canonical_epoch, generation) = match store_bootstrap.as_ref() {
             None => (
-                AuthorityEpoch::genesis(),
                 eliot_contracts::EpochId::new(
                     eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
                         .map_err(|error| KernelBuildError::Service(error.to_string()))?,
@@ -1052,26 +1052,19 @@ impl KernelComposition {
                 .map_err(|error| KernelBuildError::Service(error.to_string()))?,
                 ResourceGeneration::genesis(),
             ),
-            Some(requirement) => {
-                let canonical = requirement.state_fence.authority_epoch.clone();
-                let scalar = AuthorityEpoch::new(canonical.sequence.get())
-                    .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-                (
-                    scalar,
-                    canonical,
-                    requirement.state_fence.resource_generation,
-                )
-            }
+            Some(requirement) => (
+                requirement.state_fence.authority_epoch.clone(),
+                requirement.state_fence.resource_generation,
+            ),
         };
-        let mut generations = GenerationRouter::at_epoch(authority_epoch)
-            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        let mut generations = GenerationRouter::at_epoch(canonical_epoch.clone());
         generations
             .register(
                 GenerationRoute::new(
                     RouteScope::new("daemon")
                         .map_err(|error| KernelBuildError::Core(error.to_string()))?,
                     generation,
-                    authority_epoch,
+                    canonical_epoch.clone(),
                 )
                 .map_err(|error| KernelBuildError::Core(error.to_string()))?,
             )
@@ -1085,28 +1078,28 @@ impl KernelComposition {
                     RouteScope::new("store_bridge")
                         .map_err(|error| KernelBuildError::Core(error.to_string()))?,
                     generation,
-                    authority_epoch,
+                    canonical_epoch.clone(),
                 )
                 .map_err(|error| KernelBuildError::Core(error.to_string()))?,
             )
             .map_err(|error| KernelBuildError::Core(error.to_string()))?;
         // F-LOG-KERNEL-2 (#899): exact route/generation observation. Only the
-        // fixed route names plus numeric epoch/generation are emitted, never
-        // raw bootstrap/launch/descriptor material.
+        // fixed route names plus the lineage-aware epoch tuple and generation
+        // are emitted, never raw bootstrap/launch/descriptor material. The
+        // epoch keeps its lineage: a sequence-only spelling would let two
+        // unrelated lineages share one observation.
         observe_entrypoint_with_detail(
             EntrypointStage::Composition,
             &format!(
-                "kernel.composition.route_registered:daemon:epoch={}:generation={}",
-                authority_epoch.value(),
-                generation.value()
+                "kernel.composition.route_registered:daemon:epoch={:?}:generation={}",
+                canonical_epoch, generation.value()
             ),
         );
         observe_entrypoint_with_detail(
             EntrypointStage::StoreBootstrap,
             &format!(
-                "kernel.composition.route_registered:store_bridge:epoch={}:generation={}",
-                authority_epoch.value(),
-                generation.value()
+                "kernel.composition.route_registered:store_bridge:epoch={:?}:generation={}",
+                canonical_epoch, generation.value()
             ),
         );
         let service = KernelService::new(dispatch_key(&work_root), 4, 128)

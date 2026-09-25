@@ -22,7 +22,7 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+use eliot_contracts::ResourceGeneration;
 use eliot_kernel::kernel_diagnostics::KERNEL_DIAGNOSTICS_TARGET;
 use eliot_kernel::{KernelComposition, KernelConfig};
 use eliot_kernel_core::{CutoverDecision, RouteScope};
@@ -93,6 +93,15 @@ impl Drop for TempGuard {
     }
 }
 
+fn test_epoch(sequence: u64) -> eliot_contracts::EpochId {
+    eliot_contracts::EpochId::new(
+        eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("test sequence"),
+    )
+    .expect("test epoch")
+}
+
 fn test_kernel() -> (KernelComposition, TempGuard) {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -112,8 +121,8 @@ fn uncommitted_cutover() -> CutoverDecision {
         RouteScope::new("daemon").expect("daemon scope"),
         Some(ResourceGeneration::new(1).expect("old generation")),
         ResourceGeneration::new(2).expect("new generation"),
-        AuthorityEpoch::new(1).expect("old epoch"),
-        AuthorityEpoch::new(2).expect("new epoch"),
+        test_epoch(1),
+        test_epoch(2),
         GenerationCutoverState::Preparing,
     )
     .expect("uncommitted cutover decision")

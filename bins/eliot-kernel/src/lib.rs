@@ -1627,7 +1627,10 @@ impl KernelComposition {
             .route(&route_scope)
             .map_err(|e| KernelBuildError::Core(e.to_string()))?
             .clone();
-        if route.authority_epoch().value() != requirement.authority_epoch().sequence.get()
+        // Exact tuple equality is the authorization rule (Implements #64).
+        if !route
+            .authority_epoch()
+            .is_same_authority(requirement.authority_epoch())
             || route.active_generation() != requirement.store_generation
             || requirement.route_identity.as_str() != STORE_BRIDGE_ROUTE
         {

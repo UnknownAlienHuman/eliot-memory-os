@@ -897,10 +897,17 @@ async fn kernel_route(case: &str, adapter: Arc<SurrealStoreAdapter>) -> KernelRo
     let fixture =
         KernelRouteStoreFixture::open(&format!("994-kr-{case}")).expect("994 route fixture opens");
     let service = Arc::new(Mutex::new(ready_service()));
+    // The route carries the live service's complete epoch tuple; a sequence-only
+    // route could no longer be proven current (Implements #64).
+    let route_epoch = service
+        .lock()
+        .expect("994 route service")
+        .authority_epoch()
+        .clone();
     let route = GenerationRoute::new(
         RouteScope::new("store_bridge").expect("994 route scope"),
         ResourceGeneration::genesis(),
-        AuthorityEpoch::new(1).expect("994 route epoch"),
+        route_epoch,
     )
     .expect("994 route");
     let gateway = Arc::new(KernelStoreGateway::new(

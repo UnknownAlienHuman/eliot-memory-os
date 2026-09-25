@@ -5,7 +5,7 @@
 //! so a consumer can surface an exact reason without crossing the secret
 //! boundary.
 
-use eliot_contracts::{AuthorityEpoch, ContractError};
+use eliot_contracts::{AuthorityEpoch, ContractError, EpochId};
 use eliot_process::ContractError as ProcessContractError;
 use eliot_receipts::ReceiptError;
 use eliot_runtime_contracts::RuntimeContractError;
@@ -58,6 +58,21 @@ pub enum KernelError {
         observed: u64,
         /// Epoch the Kernel is currently fencing.
         active: u64,
+    },
+
+    /// A lineage-aware epoch tuple is not the tuple the Kernel currently
+    /// fences (contract `types.EpochId` exact-tuple rule; I6.10).
+    ///
+    /// Distinct from [`Self::StaleEpoch`]: two epochs from different lineages
+    /// are unrelated and are never ordered by sequence, so this failure
+    /// reports the two complete tuples instead of two counters. Callers must
+    /// not narrow it back to a numeric comparison.
+    #[error("authority epoch tuple {observed:?} does not match active epoch {active:?}")]
+    StaleEpochTuple {
+        /// Complete lineage-aware epoch presented by the caller.
+        observed: EpochId,
+        /// Complete lineage-aware epoch the Kernel is currently fencing.
+        active: EpochId,
     },
 
     /// The presented authority receipt targets a different route.

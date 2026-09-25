@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use eliot_contracts::{EpochId, OperationId, RequestMetadata, StateFence};
+use eliot_contracts::{OperationId, RequestMetadata, StateFence};
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
 use eliot_kernel_core::user_automation::UserAutomationInvocation;
@@ -145,13 +145,6 @@ pub struct KernelStoreGateway {
     service: Arc<Mutex<KernelService>>,
     store: Arc<EbpCanonicalStoreClient<NamedPipeTransport>>,
     route: GenerationRoute,
-    /// Canonical epoch the scalar route contour was bound to at composition
-    /// (Implements #64): the route's sequence projection is only meaningful
-    /// under this exact `(lineage_id, sequence)` tuple. Route currency is
-    /// proven with `is_same_authority` against live authority — never by
-    /// coercing a sequence to `u64`. `None` (a poisoned service lock at
-    /// bind time) fails every later gate closed.
-    route_epoch: Option<EpochId>,
     flight: GatewayFlight,
     /// Durable owner for unknown-commit recovery (I14.21, issue #1690).
     /// Production composition always supplies the Kernel ORS handle; `None`
@@ -184,17 +177,17 @@ impl KernelStoreGateway {
         route: GenerationRoute,
         commit_ors: Option<Arc<RedbRecoveryStore>>,
     ) -> Self {
-        // Bind the scalar route contour to its canonical lineage at
-        // composition (Implements #64): the sequence inside `route` was
-        // minted by the Host-approved bootstrap for the live tuple observed
-        // here, so snapshot that tuple as the route's canonical mirror. Mint
-        // stays Host-owned; the gateway only pins and re-checks the tuple.
-        let route_epoch = service.lock().map(|guard| guard.authority_epoch()).ok();
+        // Bind the route to the live lineage at composition (Implements #64).
+        // `GenerationRoute` carries its own complete `(lineage_id, sequence)`
+        // tuple, so this gateway keeps no second epoch mirror: route currency
+        // is read from `route.authority_epoch()` and proven with
+        // `is_same_authority` against live authority — never by coercing a
+        // sequence to `u64`. Mint stays Host-owned; the gateway only pins and
+        // re-checks the tuple.
         Self {
             service,
             store,
             route,
-            route_epoch,
             flight: GatewayFlight::new(),
             commit_ors,
             paused_scopes: Mutex::new(BTreeSet::new()),
@@ -264,16 +257,16 @@ impl KernelStoreGateway {
             if self.is_fenced() {
                 return Err("canonical-store gateway is fenced for rebind".to_owned());
             }
-            // Canonical route/epoch mirror (Implements #64): route currency
-            // is the exact-tuple match between the composition-bound route
-            // epoch and live authority — never a scalar `sequence.get()`
-            // coercion. Cross-lineage same-sequence routes never authorize:
-            // the bound tuple carries its lineage.
+            // Canonical route/epoch gate (Implements #64): route currency is
+            // the exact-tuple match between the composition-bound route epoch
+            // and live authority — never a scalar `sequence.get()` coercion.
+            // Cross-lineage same-sequence routes never authorize: the route
+            // carries its own lineage.
             let live_epoch = service.authority_epoch();
-            if self
-                .route_epoch
-                .as_ref()
-                .is_none_or(|bound| !bound.is_same_authority(&live_epoch))
+            if !self
+                .route
+                .authority_epoch()
+                .is_same_authority(&live_epoch)
                 || self.route.active_generation() != transition.state_fence.resource_generation
             {
                 return Err(
@@ -521,10 +514,10 @@ impl KernelStoreGateway {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
         let live_epoch = service.authority_epoch();
-        if self
-            .route_epoch
-            .as_ref()
-            .is_none_or(|bound| !bound.is_same_authority(&live_epoch))
+        if !self
+            .route
+            .authority_epoch()
+            .is_same_authority(&live_epoch)
             || self.route.active_generation() != transition.state_fence.resource_generation
             || !live_epoch.is_same_authority(&context.state_fence.authority_epoch)
         {
@@ -778,7 +771,6 @@ impl KernelStoreGateway {
             &self.flight,
             &self.service,
             &self.route,
-            self.route_epoch.as_ref(),
             &self.store,
             request,
         )
@@ -989,12 +981,7 @@ impl KernelStoreGateway {
     }
 
     fn validate_active_route(&self, state_fence: &StateFence) -> Result<(), String> {
-        validate_route(
-            &self.service,
-            &self.route,
-            self.route_epoch.as_ref(),
-            state_fence,
-        )
+        validate_route(&self.service, &self.route, state_fence)
     }
 
     /// Reads and validates the retained canonical Store health observation.
@@ -1010,7 +997,7 @@ impl KernelStoreGateway {
     }
 }
 
-/// Canonical route/epoch mirror shared by every gateway read/write path.
+/// Canonical route/epoch gate shared by every gateway read/write path.
 ///
 /// `validate_active_route` delegates here so the transport-generic named-read
 /// helper below enforces the identical gate without a second implementation:
@@ -1021,7 +1008,6 @@ impl KernelStoreGateway {
 fn validate_route(
     service: &Mutex<KernelService>,
     route: &GenerationRoute,
-    route_epoch: Option<&EpochId>,
     state_fence: &StateFence,
 ) -> Result<(), String> {
     let service = service
@@ -1031,7 +1017,7 @@ fn validate_route(
         return Err("Kernel generation is fenced".to_owned());
     }
     let live_epoch = service.authority_epoch();
-    if route_epoch.is_none_or(|bound| !bound.is_same_authority(&live_epoch))
+    if !route.authority_epoch().is_same_authority(&live_epoch)
         || !live_epoch.is_same_authority(&state_fence.authority_epoch)
     {
         return Err("canonical-store route is outside the active Kernel epoch".to_owned());
@@ -1131,7 +1117,6 @@ async fn execute_named_via<T>(
     flight: &GatewayFlight,
     service: &Mutex<KernelService>,
     route: &GenerationRoute,
-    route_epoch: Option<&EpochId>,
     store: &EbpCanonicalStoreClient<T>,
     request: NamedReadRequest,
 ) -> Result<NamedReadResponse, String>
@@ -1143,7 +1128,7 @@ where
         return Err("canonical-store gateway is fenced for rebind".to_owned());
     }
     request.validate().map_err(|error| error.to_string())?;
-    validate_route(service, route, route_epoch, &request.state_fence)?;
+    validate_route(service, route, &request.state_fence)?;
     let response = store
         .execute_named(request.clone())
         .await
@@ -1151,7 +1136,7 @@ where
     if flight.is_fenced() {
         return Err("canonical-store gateway is fenced for rebind".to_owned());
     }
-    validate_route(service, route, route_epoch, &request.state_fence)?;
+    validate_route(service, route, &request.state_fence)?;
     response.validate().map_err(|error| error.to_string())?;
     if response.operation != request.operation {
         return Err("Store named-read operation does not match request".to_owned());
@@ -1332,7 +1317,7 @@ mod named_read_gateway_tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
-    use eliot_contracts::{AuthorityEpoch, EpochId, EpochLineageId, RequestId, ResourceGeneration};
+    use eliot_contracts::{EpochId, EpochLineageId, RequestId, ResourceGeneration};
     use eliot_ipc::{DeliveryOutcome, TransportLimits, server_hello_frame};
     use eliot_kernel_core::RouteScope;
     use eliot_platform::PlatformHandle;
@@ -1729,15 +1714,9 @@ mod named_read_gateway_tests {
         let route = eliot_kernel_core::GenerationRoute::new(
             RouteScope::new("store_bridge").expect("route scope"),
             ResourceGeneration::genesis(),
-            AuthorityEpoch::new(1).expect("route epoch"),
+            test_epoch(1),
         )
         .expect("store route binds");
-        let route_epoch = Some(
-            service
-                .lock()
-                .expect("service lock reads")
-                .authority_epoch(),
-        );
         let transport = LoopbackSurrealTransport {
             requirement: bootstrap.clone(),
             pending: None,
@@ -1759,7 +1738,6 @@ mod named_read_gateway_tests {
             &flight,
             &service,
             &route,
-            route_epoch.as_ref(),
             &store,
             request,
         )
@@ -1818,7 +1796,6 @@ mod named_read_gateway_tests {
             &flight,
             &service,
             &route,
-            route_epoch.as_ref(),
             &store,
             fenced_request,
         )
@@ -1841,7 +1818,6 @@ mod named_read_gateway_tests {
             &flight,
             &service,
             &route,
-            route_epoch.as_ref(),
             &store,
             over_bound,
         )
@@ -1874,15 +1850,9 @@ mod named_read_gateway_tests {
         let route = eliot_kernel_core::GenerationRoute::new(
             RouteScope::new("store_bridge").expect("route scope"),
             ResourceGeneration::genesis(),
-            AuthorityEpoch::new(1).expect("route epoch"),
+            test_epoch(1),
         )
         .expect("store route binds");
-        let route_epoch = Some(
-            service
-                .lock()
-                .expect("service lock reads")
-                .authority_epoch(),
-        );
         let transport = LoopbackSurrealTransport {
             requirement: bootstrap.clone(),
             pending: None,
@@ -1904,7 +1874,6 @@ mod named_read_gateway_tests {
             &flight,
             &service,
             &route,
-            route_epoch.as_ref(),
             &store,
             request,
         )
@@ -1933,7 +1902,6 @@ mod named_read_gateway_tests {
             &flight,
             &service,
             &route,
-            route_epoch.as_ref(),
             &store,
             fenced_request,
         )
@@ -1955,7 +1923,6 @@ mod named_read_gateway_tests {
                 &flight,
                 &service,
                 &route,
-                route_epoch.as_ref(),
                 &store,
                 eventual
             )
@@ -1976,7 +1943,6 @@ mod named_read_gateway_tests {
                 &flight,
                 &service,
                 &route,
-                route_epoch.as_ref(),
                 &store,
                 missing
             )

@@ -381,7 +381,10 @@ impl KernelComposition {
             .route(&route_scope)
             .map_err(|error| KernelBuildError::Core(error.to_string()))?
             .clone();
-        if route.authority_epoch().value() != requirement.authority_epoch().sequence.get()
+        // Exact tuple equality is the authorization rule (Implements #64).
+        if !route
+            .authority_epoch()
+            .is_same_authority(requirement.authority_epoch())
             || route.active_generation() != requirement.store_generation
             || requirement.route_identity.as_str() != STORE_BRIDGE_ROUTE
         {
@@ -393,13 +396,13 @@ impl KernelComposition {
                 "store bootstrap does not match the active Kernel store route".to_owned(),
             ));
         }
-        // Exact route/generation match; only numeric epoch/generation plus
-        // the fixed bridge name are emitted.
+        // Exact route/generation match; only the fixed bridge name plus the
+        // lineage-aware epoch tuple and generation are emitted.
         observe_entrypoint_with_detail(
             EntrypointStage::StoreBootstrap,
             &format!(
-                "kernel.store.route_matched:store_bridge:epoch={}:generation={}",
-                route.authority_epoch().value(),
+                "kernel.store.route_matched:store_bridge:epoch={:?}:generation={}",
+                route.authority_epoch(),
                 route.active_generation().value()
             ),
         );
