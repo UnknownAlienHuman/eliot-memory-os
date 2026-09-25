@@ -1,0 +1,12 @@
+{
+  "openCode": "opencode-cli.exe",
+  "model": "opencode-go/muse-spark-1.3-contributor",
+  "role": "manager",
+  "variant": "high",
+  "session": "ses_f4f2f4e22ffeQEg1lh8ydQJX5C",
+  "taskFile": "C:\\Development\\Rust\\projects\\eliot-swarm\\work-702-dreamer\\task-702-fix4.md",
+  "repository": "C:\\Development\\Rust\\projects\\eliot-swarm\\work-702-dreamer",
+  "statePath": "C:\\Development\\Rust\\projects\\eliot-swarm\\work-702-dreamer\\state.json",
+  "stdoutPath": "C:\\Development\\Rust\\projects\\eliot-swarm\\work-702-dreamer\\stdout.log",
+  "stderrPath": "C:\\Development\\Rust\\projects\\eliot-swarm\\work-702-dreamer\\stderr.log"
+}
