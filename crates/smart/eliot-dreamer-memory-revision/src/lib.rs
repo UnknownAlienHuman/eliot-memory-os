@@ -268,7 +268,8 @@ impl NegativeMemoryExtinctionCandidate {
 /// and compared with the package's current freeze constants before any
 /// owner material is interpreted. A caller cannot omit the binding and rely
 /// on a source-file scan or an issue-body reference.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SchemaFreezeBinding {
     /// Exact freeze identity, including revision.
     pub freeze_id: String,

@@ -56,10 +56,12 @@
 //!                         envelope validation)
 //! ```
 //!
-//! Fail-closed owner checks before any commit: ingress identity
-//! validity, exact request-fence equality with the record fence,
-//! scope-id equality with the admitted record scope, and idempotency
-//! agreement between ingress and commit payload. Anything else is
+//! Fail-closed owner checks before any commit: the current page binding
+//! (driver instance, family generations, source revisions, and fence),
+//! ledger-sequenced revision, ingress identity validity, exact request-fence
+//! equality with the record fence, scope-id equality with the admitted
+//! record scope, and idempotency agreement between ingress and commit
+//! payload. Anything else is
 //! rejected here with an exact owner error; the owner re-validates the
 //! envelope, fence, identity, and heads again downstream.
 //!
@@ -70,7 +72,7 @@
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::OperationId;
 use eliot_observation::bank_admission::{
-    ExperienceRevisionLedger, produce_bank_commit, produce_feedback_commit,
+    ExperienceReadBinding, ExperienceRevisionLedger, produce_bank_commit, produce_feedback_commit,
 };
 use eliot_observation_contracts::{AgentFeedbackRecord, ExperienceBankRecord};
 use eliot_protocol::RequestIdentity;
@@ -96,8 +98,9 @@ struct CommitLeg {
 fn bank_commit_leg(
     record: &ExperienceBankRecord,
     ledger: &ExperienceRevisionLedger,
+    binding: &ExperienceReadBinding,
 ) -> Result<CommitLeg, CompositionError> {
-    let commit = produce_bank_commit(ledger, record)
+    let commit = produce_bank_commit(ledger, record, binding)
         .map_err(|error| CompositionError::Owner(format!("bank commit payload: {error}")))?;
     let record_json = serde_json::to_string(record)
         .map_err(|error| CompositionError::Owner(format!("bank record encode: {error}")))?;
@@ -119,8 +122,9 @@ fn bank_commit_leg(
 fn feedback_commit_leg(
     record: &AgentFeedbackRecord,
     ledger: &ExperienceRevisionLedger,
+    binding: &ExperienceReadBinding,
 ) -> Result<CommitLeg, CompositionError> {
-    let commit = produce_feedback_commit(ledger, record)
+    let commit = produce_feedback_commit(ledger, record, binding)
         .map_err(|error| CompositionError::Owner(format!("feedback commit payload: {error}")))?;
     let record_json = serde_json::to_string(record)
         .map_err(|error| CompositionError::Owner(format!("feedback record encode: {error}")))?;
@@ -287,13 +291,14 @@ pub async fn commit_experience_bank<P: KernelGenerationPort + ?Sized>(
     composition: &GovernorComposition<P>,
     identity: &RequestIdentity,
     ledger: &ExperienceRevisionLedger,
+    binding: &ExperienceReadBinding,
     record: &ExperienceBankRecord,
     scope_id: ScopeId,
     proof_refs: Vec<String>,
     expected_revision_heads: Vec<RevisionHeadExpectation>,
     expected_ordering_heads: Vec<OrderingHeadExpectation>,
 ) -> Result<WriteReceipt, CompositionError> {
-    let leg = bank_commit_leg(record, ledger)?;
+    let leg = bank_commit_leg(record, ledger, binding)?;
     let operation_id = bind_commit_identity(
         identity,
         &record.fence,
@@ -355,13 +360,14 @@ pub async fn commit_experience_feedback<P: KernelGenerationPort + ?Sized>(
     composition: &GovernorComposition<P>,
     identity: &RequestIdentity,
     ledger: &ExperienceRevisionLedger,
+    binding: &ExperienceReadBinding,
     record: &AgentFeedbackRecord,
     scope_id: ScopeId,
     proof_refs: Vec<String>,
     expected_revision_heads: Vec<RevisionHeadExpectation>,
     expected_ordering_heads: Vec<OrderingHeadExpectation>,
 ) -> Result<WriteReceipt, CompositionError> {
-    let leg = feedback_commit_leg(record, ledger)?;
+    let leg = feedback_commit_leg(record, ledger, binding)?;
     let operation_id = bind_commit_identity(
         identity,
         &record.fence,

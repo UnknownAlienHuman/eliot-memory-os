@@ -50,6 +50,7 @@ pub mod diagnostics;
 mod dreamer_admission;
 mod dreamer_materials;
 mod dreamer_model_adapter;
+pub mod experience_audit;
 mod experience_runtime;
 mod first_run_wiring;
 mod freshness_admission;
@@ -383,6 +384,10 @@ pub struct DaemonComposition {
     /// identities. Volatile fast path only, like `operator_replay`: durable
     /// truth stays with the owner receipts, never with this map.
     committed_experience: BTreeMap<String, eliot_store_api::WriteReceipt>,
+    /// Retained manual/O1 paging state. It is a rebuildable consumer
+    /// projection retained across claimed local-read requests so family-local
+    /// restarts and continuations cannot manufacture a fresh generation.
+    experience_session: experience_audit::ManualExperienceSession,
     /// Already-validated Kernel-issued owner session facts threaded once by
     /// the daemon runtime where the concrete client and this composition meet
     /// (AUD-C02-B, Implements #1187). Facts only, never the client itself:
@@ -468,6 +473,7 @@ impl DaemonComposition {
             view_stale: false,
             cached_revision_fence,
             committed_experience: BTreeMap::new(),
+            experience_session: experience_audit::ManualExperienceSession::new(),
             operator_replay: SharedOperatorReplay::new(),
             owner_session: None,
             notification_snapshot: Vec::new(),
@@ -565,6 +571,22 @@ impl DaemonComposition {
         Ok(())
     }
 
+    /// Refreshes the dependent daemon view through the Governor owner and
+    /// rekeys the revision cache only after an exact fence match.  A refresh
+    /// failure is visible as an error and permanently marks this composition
+    /// stale until reconnect; it is never converted into a healthy result.
+    pub fn refresh_dependent_view(&mut self) -> Result<(), DaemonError> {
+        self.governor
+            .refresh_from_kernel()
+            .map_err(DaemonError::Composition)?;
+        if let Err(mismatch) = self.require_revision_fence_match() {
+            self.view_stale = true;
+            return Err(DaemonError::Lifecycle(mismatch.to_string()));
+        }
+        self.cached_revision_fence = Some(Box::new(self.governor.kernel_snapshot().state_fence()));
+        Ok(())
+    }
+
     /// Commits one ledger-sequenced experience-bank record through the
     /// canonical Governor experience-commit caller, then publishes the
     /// resulting owner change.
@@ -575,10 +597,12 @@ impl DaemonComposition {
     /// stale/pending instead of hiding divergence. The identity must be
     /// admitted ingress agreeing with the record (fence, scope,
     /// idempotency); the owner re-validates everything downstream.
+    #[allow(clippy::too_many_arguments)]
     pub async fn commit_experience_bank_record(
         &mut self,
         identity: &eliot_protocol::RequestIdentity,
         ledger: &eliot_observation::bank_admission::ExperienceRevisionLedger,
+        binding: &eliot_observation::bank_admission::ExperienceReadBinding,
         record: &eliot_observation_contracts::ExperienceBankRecord,
         scope_id: eliot_store_api::ScopeId,
         proof_refs: Vec<String>,
@@ -589,6 +613,7 @@ impl DaemonComposition {
             &self.governor,
             identity,
             ledger,
+            binding,
             record,
             scope_id,
             proof_refs,
@@ -606,10 +631,12 @@ impl DaemonComposition {
     /// Commits one ledger-sequenced agent-feedback record through the
     /// canonical Governor experience-commit caller. Same refresh/stale
     /// rule as [`Self::commit_experience_bank_record`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn commit_experience_feedback_record(
         &mut self,
         identity: &eliot_protocol::RequestIdentity,
         ledger: &eliot_observation::bank_admission::ExperienceRevisionLedger,
+        binding: &eliot_observation::bank_admission::ExperienceReadBinding,
         record: &eliot_observation_contracts::AgentFeedbackRecord,
         scope_id: eliot_store_api::ScopeId,
         proof_refs: Vec<String>,
@@ -620,6 +647,7 @@ impl DaemonComposition {
             &self.governor,
             identity,
             ledger,
+            binding,
             record,
             scope_id,
             proof_refs,
@@ -787,6 +815,21 @@ impl DaemonComposition {
             DaemonError::Composition(CompositionError::Recovery(error.to_string()))
         })?;
         Ok(eliot_contracts::sha256_hex(&bytes))
+    }
+
+    /// Takes the retained manual experience paging session for one bounded
+    /// claimed request. The caller restores it before returning; this keeps
+    /// the state owner-visible without exposing a second paging owner.
+    pub(crate) fn take_experience_session(&mut self) -> experience_audit::ManualExperienceSession {
+        std::mem::take(&mut self.experience_session)
+    }
+
+    /// Restores the retained manual experience paging session.
+    pub(crate) fn restore_experience_session(
+        &mut self,
+        session: experience_audit::ManualExperienceSession,
+    ) {
+        self.experience_session = session;
     }
 
     /// Returns the exact readiness state.

@@ -73,6 +73,8 @@ use eliot_store_api::{
     ReadConsistency, RevisionHeadExpectation, RevisionKey, ScopeId, StoreError, WriteReceipt,
     epistemic_revision::EpistemicPositionReadback,
 };
+use serde::{Deserialize, Serialize};
+
 use eliot_understanding_assessment::{
     AssessmentClosure, AssessmentScope, CommonGroundAssessment, CommonGroundInput, EvidenceCite,
     ExperienceEvidence, OwnerContext, ScopedUnderstandingAssessment,
@@ -403,6 +405,8 @@ pub async fn produce_journal_projection(
 
 /// Bank-family event inputs: durable owner range envelope plus the read
 /// context the edge owns.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExperienceBankEventInputs {
     /// Verbatim owner range envelope (`records` contains wrapper rows or
     /// owner-held bare documents, and `next_cursor` is explicit `null` or
@@ -422,6 +426,8 @@ pub struct ExperienceBankEventInputs {
 }
 
 /// Feedback-family event inputs. Same owner-envelope rule as bank.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExperienceFeedbackEventInputs {
     /// Verbatim owner range envelope from the feedback range read.
     pub payload: serde_json::Value,
@@ -957,19 +963,16 @@ pub struct ExperienceCommitOutput {
     pub feedback_receipts: Vec<WriteReceipt>,
     /// True when the composition's dependent view is stale/pending after
     /// this batch, echoed from the composition status projection.
-    ///
-    /// P2 stale-projection marking: every per-record commit publishes
-    /// its owner change through the composition's refresh/stale
-    /// discipline (a failed post-commit refresh keeps the already
-    /// durable receipt and marks the dependent view stale/pending
-    /// instead of hiding divergence). This flag echoes that marker so
-    /// the caller can observe it without a second status read; when
-    /// set, projections must not be trusted until the caller drops this
-    /// composition and re-runs authenticated connect+start. There is no
-    /// `refresh_dependent_view` entry: refresh runs inside the
-    /// per-record composition commit calls, never as a separate step
-    /// from this file.
     pub view_stale: bool,
+    /// Bounded daemon health projection after the commit and refresh.
+    pub health: String,
+    /// Readiness projection after the commit and refresh.
+    pub ready: bool,
+    /// Degraded/stale projection after the commit and refresh.
+    pub degraded: bool,
+    /// Exact post-commit refresh error, when the durable receipts remain
+    /// valid but the dependent view could not be re-keyed.
+    pub refresh_error: Option<String>,
 }
 
 /// Derives admitted commit ingress from retained invocation state.
@@ -1026,7 +1029,8 @@ pub fn derive_commit_ingress(
 /// ([`run_experience_quality_event`]) is unchanged and stays read-only.
 /// Checklist for the O1 copy:
 /// - call with the SAME decoded record slices the read entry consumed
-///   (bank/feedback range payloads already digest re-proved upstream);
+///   (bank/feedback range payloads already digest re-proved upstream) and
+///   the retained owner driver's current page/ledger binding;
 /// - pass `event.scope_id` verbatim; scope/record mismatch fails closed
 ///   in the commit caller with an exact owner error;
 /// - pass edge-supplied live head expectations when held, else empty
@@ -1038,8 +1042,9 @@ pub fn derive_commit_ingress(
 ///   retry without re-deriving expectations (P1-1, #1942), so retry is
 ///   convergent and never double-persists.
 ///
-/// Runs, in source terms: ledger rebuild from the admitted slices (only
-/// the greatest admitted revision per handle passes the owner
+/// Runs, in source terms: the retained owner ledger is revalidated against
+/// the admitted slices and page binding (only the greatest admitted revision
+/// per handle passes the owner
 /// sequencing gate; older revisions fail closed, never silently
 /// skipped), per-record owner commit payload (`produce_bank_commit` /
 /// `produce_feedback_commit`), admitted ingress derivation, the
@@ -1048,11 +1053,14 @@ pub fn derive_commit_ingress(
 /// unmodified. Proof refs are verbatim admitted refs from the
 /// edge-supplied per-attempt receipts (admission + activation-request
 /// receipt identities, blanks dropped); nothing is inferred.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn commit_experience_event_records(
     composition: &mut DaemonComposition,
     ctx: &RequestMetadata,
     event: &ExperienceQualityEvent<'_>,
+    driver: &ConsumerPagedReadDriver,
+    page: &PagedExperienceConsumerBundle,
+    ledger: &mut ExperienceRevisionLedger,
     bank_records: &[ExperienceBankRecord],
     feedback_records: &[AgentFeedbackRecord],
     expected_revision_heads: Vec<RevisionHeadExpectation>,
@@ -1062,6 +1070,36 @@ pub async fn commit_experience_event_records(
         field: "request_metadata",
         reason: "retained invocation metadata is invalid",
     })?;
+    let binding = driver
+        .current_binding(page)
+        .map_err(|error| ExperienceDriverError::Cursor {
+            field: "experience_page.generation",
+            reason: match error {
+                GovernorObservationError::InvalidField { reason, .. } => reason,
+                _ => "page binding is not current for the retained owner driver",
+            },
+        })?;
+    if binding.fence() != &ctx.state_fence
+        || binding.bank_source_revision() != event.bank.source_revision
+        || binding.feedback_source_revision() != event.feedback.source_revision
+        || page.bank.scope != event.scope
+        || page.feedback.scope != event.scope
+    {
+        return Err(ExperienceDriverError::Cursor {
+            field: "experience_page.binding",
+            reason: "page fence, source revision, or scope does not equal the event binding",
+        });
+    }
+    let event_bank_page = parse_experience_range_page(&event.bank.payload)?;
+    let event_feedback_page = parse_experience_range_page(&event.feedback.payload)?;
+    if event_bank_page.next_cursor != page.bank_next_cursor
+        || event_feedback_page.next_cursor != page.feedback_next_cursor
+    {
+        return Err(ExperienceDriverError::Cursor {
+            field: "experience_page.next_cursor",
+            reason: "event payload boundary does not equal the current owner page",
+        });
+    }
     let kernel_fence = composition.kernel_snapshot().state_fence().clone();
     let mut proof_refs: Vec<String> = Vec::new();
     for receipt in event.receipts {
@@ -1076,12 +1114,15 @@ pub async fn commit_experience_event_records(
             }
         }
     }
-    let mut ledger = ExperienceRevisionLedger::new();
-    ledger.rebuild_bank(bank_records);
-    ledger.rebuild_feedback(feedback_records);
+    ledger.validate_bank_records_for_binding(bank_records, &event.bank.source_revision, binding)?;
+    ledger.validate_feedback_records_for_binding(
+        feedback_records,
+        &event.feedback.source_revision,
+        binding,
+    )?;
     let mut bank_receipts = Vec::with_capacity(bank_records.len());
     for record in bank_records {
-        let commit_key = produce_bank_commit(&ledger, record)
+        let commit_key = produce_bank_commit(ledger, record, binding)
             .map_err(ExperienceDriverError::Governor)?
             .idempotency_key;
         // P1-1 (#1942): a key this composition already committed is durable
@@ -1098,7 +1139,8 @@ pub async fn commit_experience_event_records(
         let receipt = composition
             .commit_experience_bank_record(
                 &identity,
-                &ledger,
+                ledger,
+                binding,
                 record,
                 event.scope_id.clone(),
                 proof_refs.clone(),
@@ -1112,7 +1154,7 @@ pub async fn commit_experience_event_records(
     }
     let mut feedback_receipts = Vec::with_capacity(feedback_records.len());
     for record in feedback_records {
-        let commit_key = produce_feedback_commit(&ledger, record)
+        let commit_key = produce_feedback_commit(ledger, record, binding)
             .map_err(ExperienceDriverError::Governor)?
             .idempotency_key;
         // P1-1 (#1942): same convergent-retry rule as the bank leg above.
@@ -1124,7 +1166,8 @@ pub async fn commit_experience_event_records(
         let receipt = composition
             .commit_experience_feedback_record(
                 &identity,
-                &ledger,
+                ledger,
+                binding,
                 record,
                 event.scope_id.clone(),
                 proof_refs.clone(),
@@ -1136,10 +1179,18 @@ pub async fn commit_experience_event_records(
         composition.note_experience_committed(commit_key, receipt.clone());
         feedback_receipts.push(receipt);
     }
-    let view_stale = composition.status().health.as_str() == "stale";
+    let refresh_error = composition
+        .refresh_dependent_view()
+        .err()
+        .map(|error| error.to_string());
+    let status = composition.status();
     Ok(ExperienceCommitOutput {
         bank_receipts,
         feedback_receipts,
-        view_stale,
+        view_stale: status.health == "stale",
+        health: status.health,
+        ready: status.ready,
+        degraded: status.degraded,
+        refresh_error,
     })
 }

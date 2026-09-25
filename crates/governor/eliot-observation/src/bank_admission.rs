@@ -95,6 +95,7 @@
 //! scope-addressed and unchanged.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use eliot_store_api::StoreError;
 pub use eliot_store_api::{ExperiencePageBoundary, ExperienceRangePage, PageBoundary};
@@ -118,6 +119,119 @@ pub const BANK_SOURCE_ID: &str = "governor.experience-bank";
 /// Owner source identity minted feedback cursors under.
 pub const FEEDBACK_SOURCE_ID: &str = "governor.agent-feedback";
 
+static DRIVER_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_driver_instance() -> u64 {
+    DRIVER_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Exact owner binding for one current paged experience read.
+///
+/// A paged projection is not authorized by a cursor or a record revision
+/// alone.  The consumer carries the exact fence and the owner revision marker
+/// for each family together with that family's generation.  The revision
+/// ledger and the canonical commit caller compare this token before producing
+/// a commit payload.  The fields are private so a caller can only obtain a
+/// token from the owner-side page driver; arbitrary JSON cannot manufacture a
+/// generation/fence binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExperienceReadBinding {
+    driver_instance: u64,
+    fence: StateFence,
+    bank_generation: u64,
+    bank_source_revision: String,
+    feedback_generation: u64,
+    feedback_source_revision: String,
+}
+
+impl ExperienceReadBinding {
+    /// Builds an owner binding for the current two-family page.
+    fn new(
+        driver_instance: u64,
+        fence: StateFence,
+        bank_generation: u64,
+        bank_source_revision: impl Into<String>,
+        feedback_generation: u64,
+        feedback_source_revision: impl Into<String>,
+    ) -> Result<Self, GovernorObservationError> {
+        fence
+            .validate()
+            .map_err(GovernorObservationError::Foundation)?;
+        let bank_source_revision = bounded_binding_text(
+            bank_source_revision.into(),
+            "experience_read.bank_source_revision",
+        )?;
+        let feedback_source_revision = bounded_binding_text(
+            feedback_source_revision.into(),
+            "experience_read.feedback_source_revision",
+        )?;
+        Ok(Self {
+            driver_instance,
+            fence,
+            bank_generation,
+            bank_source_revision,
+            feedback_generation,
+            feedback_source_revision,
+        })
+    }
+
+    /// Returns the owner-driver instance that issued this binding.
+    #[must_use]
+    pub const fn driver_instance(&self) -> u64 {
+        self.driver_instance
+    }
+
+    /// Returns the exact fence under which both owner reads were assembled.
+    #[must_use]
+    pub const fn fence(&self) -> &StateFence {
+        &self.fence
+    }
+
+    /// Returns the current bank enumeration generation.
+    #[must_use]
+    pub const fn bank_generation(&self) -> u64 {
+        self.bank_generation
+    }
+
+    /// Returns the current feedback enumeration generation.
+    #[must_use]
+    pub const fn feedback_generation(&self) -> u64 {
+        self.feedback_generation
+    }
+
+    /// Returns the owner revision marker for the bank projection.
+    #[must_use]
+    pub fn bank_source_revision(&self) -> &str {
+        &self.bank_source_revision
+    }
+
+    /// Returns the owner revision marker for the feedback projection.
+    #[must_use]
+    pub fn feedback_source_revision(&self) -> &str {
+        &self.feedback_source_revision
+    }
+}
+
+fn bounded_binding_text(
+    value: String,
+    field: &'static str,
+) -> Result<String, GovernorObservationError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) || value.chars().count() > 256
+    {
+        return Err(GovernorObservationError::InvalidField {
+            field,
+            reason: "must be non-blank, bounded, and free of control characters",
+        });
+    }
+    Ok(value)
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExperienceFamilyRevisionState {
+    revisions: BTreeMap<String, u64>,
+    binding: Option<ExperienceReadBinding>,
+}
+
 /// Rebuildable per-handle revision monotonicity for bank/feedback admission.
 ///
 /// The ledger tracks the greatest admitted revision per record handle for
@@ -130,42 +244,111 @@ pub const FEEDBACK_SOURCE_ID: &str = "governor.agent-feedback";
 /// non-monotonic admission attempts before they reach it.
 #[derive(Clone, Debug, Default)]
 pub struct ExperienceRevisionLedger {
-    bank: BTreeMap<String, u64>,
-    feedback: BTreeMap<String, u64>,
+    bank: ExperienceFamilyRevisionState,
+    feedback: ExperienceFamilyRevisionState,
 }
 
 impl ExperienceRevisionLedger {
-    /// Create an empty ledger. Prefer [`rebuild_bank`](Self::rebuild_bank)
-    /// + [`rebuild_feedback`](Self::rebuild_feedback) after restarts.
+    /// Create an empty ledger. Prefer the generation-bound rebuild methods
+    /// when the records came from a paged owner read.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Rebuild bank sequencing from admitted records (greatest revision
-    /// wins per handle). Idempotent: rebuilding twice changes nothing.
+    /// Rebuild bank sequencing from an owner snapshot.
+    ///
+    /// The snapshot replaces this family's revision map. The operation remains
+    /// useful for single-page admission owners that do not yet carry a paged
+    /// binding, but a commit caller must use
+    /// [`Self::rebuild_bank_for_binding`] before producing a payload.
     pub fn rebuild_bank(&mut self, records: &[ExperienceBankRecord]) {
-        for record in records {
-            let entry = self
-                .bank
-                .entry(record.handle.as_str().to_owned())
-                .or_insert(0);
-            if record.bank_revision > *entry {
-                *entry = record.bank_revision;
-            }
-        }
+        self.bank.revisions = greatest_bank_revisions(records);
+        self.bank.binding = None;
     }
 
-    /// Rebuild feedback sequencing from admitted records.
+    /// Rebuild feedback sequencing from an owner snapshot, replacing only the
+    /// feedback family.
     pub fn rebuild_feedback(&mut self, records: &[AgentFeedbackRecord]) {
-        for record in records {
-            let entry = self
-                .feedback
-                .entry(record.handle.as_str().to_owned())
-                .or_insert(0);
-            if record.feedback_revision > *entry {
-                *entry = record.feedback_revision;
-            }
+        self.feedback.revisions = greatest_feedback_revisions(records);
+        self.feedback.binding = None;
+    }
+
+    fn replace_bank_revisions(&mut self, records: &[ExperienceBankRecord]) {
+        self.bank.revisions = greatest_bank_revisions(records);
+    }
+
+    fn replace_feedback_revisions(&mut self, records: &[AgentFeedbackRecord]) {
+        self.feedback.revisions = greatest_feedback_revisions(records);
+    }
+
+    /// Rebuilds and binds the bank family to one exact owner page.
+    pub fn rebuild_bank_for_binding(
+        &mut self,
+        records: &[ExperienceBankRecord],
+        source_revision: &str,
+        binding: &ExperienceReadBinding,
+    ) -> Result<(), GovernorObservationError> {
+        validate_bank_binding(records, source_revision, binding)?;
+        self.bank.revisions = greatest_bank_revisions(records);
+        self.bank.binding = Some(binding.clone());
+        Ok(())
+    }
+
+    /// Rebuilds and binds the feedback family to one exact owner page.
+    pub fn rebuild_feedback_for_binding(
+        &mut self,
+        records: &[AgentFeedbackRecord],
+        source_revision: &str,
+        binding: &ExperienceReadBinding,
+    ) -> Result<(), GovernorObservationError> {
+        validate_feedback_binding(records, source_revision, binding)?;
+        self.feedback.revisions = greatest_feedback_revisions(records);
+        self.feedback.binding = Some(binding.clone());
+        Ok(())
+    }
+
+    /// Drops all bank-family revisions and its generation binding. The
+    /// feedback family is deliberately untouched, which is the family-local
+    /// restart rule for the paged consumer.
+    pub fn invalidate_bank(&mut self) {
+        self.bank = ExperienceFamilyRevisionState::default();
+    }
+
+    /// Drops all feedback-family revisions and its generation binding while
+    /// preserving the unrelated bank family.
+    pub fn invalidate_feedback(&mut self) {
+        self.feedback = ExperienceFamilyRevisionState::default();
+    }
+
+    /// Binds an already complete family without replacing its retained
+    /// revisions. This is used when the other family is the only one making
+    /// progress on a page.
+    pub fn retain_bank_binding(
+        &mut self,
+        binding: &ExperienceReadBinding,
+    ) -> Result<(), GovernorObservationError> {
+        if self.bank.binding.as_ref() != Some(binding) {
+            return Err(GovernorObservationError::InvalidField {
+                field: "consumer_page.bank_binding",
+                reason: "completed family binding changed; restart that family explicitly",
+            });
         }
+        Ok(())
+    }
+
+    /// Binds an already complete feedback family without replacing its
+    /// retained revisions.
+    pub fn retain_feedback_binding(
+        &mut self,
+        binding: &ExperienceReadBinding,
+    ) -> Result<(), GovernorObservationError> {
+        if self.feedback.binding.as_ref() != Some(binding) {
+            return Err(GovernorObservationError::InvalidField {
+                field: "consumer_page.feedback_binding",
+                reason: "completed family binding changed; restart that family explicitly",
+            });
+        }
+        Ok(())
     }
 
     /// Check a bank revision against the tracked greatest and track it.
@@ -176,13 +359,16 @@ impl ExperienceRevisionLedger {
         handle: &ArtifactId,
         revision: u64,
     ) -> Result<(), GovernorObservationError> {
-        match self.bank.get(handle.as_str()) {
+        match self.bank.revisions.get(handle.as_str()) {
             Some(last) if revision <= *last => Err(GovernorObservationError::InvalidField {
                 field: "bank_record.bank_revision",
                 reason: "revision is not strictly greater than the tracked revision",
             }),
             _ => {
-                self.bank.insert(handle.as_str().to_owned(), revision);
+                self.bank
+                    .revisions
+                    .insert(handle.as_str().to_owned(), revision);
+                self.bank.binding = None;
                 Ok(())
             }
         }
@@ -194,30 +380,173 @@ impl ExperienceRevisionLedger {
         handle: &ArtifactId,
         revision: u64,
     ) -> Result<(), GovernorObservationError> {
-        match self.feedback.get(handle.as_str()) {
+        match self.feedback.revisions.get(handle.as_str()) {
             Some(last) if revision <= *last => Err(GovernorObservationError::InvalidField {
                 field: "feedback_record.feedback_revision",
                 reason: "revision is not strictly greater than the tracked revision",
             }),
             _ => {
-                self.feedback.insert(handle.as_str().to_owned(), revision);
+                self.feedback
+                    .revisions
+                    .insert(handle.as_str().to_owned(), revision);
+                self.feedback.binding = None;
                 Ok(())
             }
         }
     }
 
-    /// Greatest tracked bank revision for one handle, when admitted
-    /// through this owner. The commit producer requires an exact match:
-    /// only the current revision of each handle may enter the durable
-    /// path, never a superseded or never-admitted one.
+    /// Greatest tracked bank revision for one handle, when admitted through
+    /// this owner. This legacy view is intentionally not sufficient for a
+    /// commit; [`Self::tracked_bank_revision_for_binding`] is the commit gate.
     pub fn tracked_bank_revision(&self, handle: &ArtifactId) -> Option<u64> {
-        self.bank.get(handle.as_str()).copied()
+        self.bank.revisions.get(handle.as_str()).copied()
     }
 
-    /// Greatest tracked feedback revision for one handle.
+    /// Greatest tracked feedback revision for one handle, without generation
+    /// authority.
     pub fn tracked_feedback_revision(&self, handle: &ArtifactId) -> Option<u64> {
-        self.feedback.get(handle.as_str()).copied()
+        self.feedback.revisions.get(handle.as_str()).copied()
     }
+
+    /// Validates that a commit record slice is the current owner page for the
+    /// already-bound bank family without replacing unrelated family state.
+    pub fn validate_bank_records_for_binding(
+        &self,
+        records: &[ExperienceBankRecord],
+        source_revision: &str,
+        binding: &ExperienceReadBinding,
+    ) -> Result<(), GovernorObservationError> {
+        validate_bank_binding(records, source_revision, binding)?;
+        for record in records {
+            if self.tracked_bank_revision_for_binding(&record.handle, binding)
+                != Some(record.bank_revision)
+            {
+                return Err(GovernorObservationError::InvalidField {
+                    field: "bank_record.bank_revision",
+                    reason: "record is not the current owner-page revision for this binding",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates the current feedback page without replacing the bank family.
+    pub fn validate_feedback_records_for_binding(
+        &self,
+        records: &[AgentFeedbackRecord],
+        source_revision: &str,
+        binding: &ExperienceReadBinding,
+    ) -> Result<(), GovernorObservationError> {
+        validate_feedback_binding(records, source_revision, binding)?;
+        for record in records {
+            if self.tracked_feedback_revision_for_binding(&record.handle, binding)
+                != Some(record.feedback_revision)
+            {
+                return Err(GovernorObservationError::InvalidField {
+                    field: "feedback_record.feedback_revision",
+                    reason: "record is not the current owner-page revision for this binding",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns a bank revision only when the complete family binding matches
+    /// the page token and the revision is the current snapshot revision.
+    pub fn tracked_bank_revision_for_binding(
+        &self,
+        handle: &ArtifactId,
+        binding: &ExperienceReadBinding,
+    ) -> Option<u64> {
+        if self.bank.binding.as_ref() != Some(binding) {
+            return None;
+        }
+        self.bank.revisions.get(handle.as_str()).copied()
+    }
+
+    /// Returns a feedback revision only for the exact current family binding.
+    pub fn tracked_feedback_revision_for_binding(
+        &self,
+        handle: &ArtifactId,
+        binding: &ExperienceReadBinding,
+    ) -> Option<u64> {
+        if self.feedback.binding.as_ref() != Some(binding) {
+            return None;
+        }
+        self.feedback.revisions.get(handle.as_str()).copied()
+    }
+}
+
+fn greatest_bank_revisions(records: &[ExperienceBankRecord]) -> BTreeMap<String, u64> {
+    let mut revisions = BTreeMap::new();
+    for record in records {
+        let entry = revisions
+            .entry(record.handle.as_str().to_owned())
+            .or_insert(0);
+        *entry = (*entry).max(record.bank_revision);
+    }
+    revisions
+}
+
+fn greatest_feedback_revisions(records: &[AgentFeedbackRecord]) -> BTreeMap<String, u64> {
+    let mut revisions = BTreeMap::new();
+    for record in records {
+        let entry = revisions
+            .entry(record.handle.as_str().to_owned())
+            .or_insert(0);
+        *entry = (*entry).max(record.feedback_revision);
+    }
+    revisions
+}
+
+fn validate_bank_binding(
+    records: &[ExperienceBankRecord],
+    source_revision: &str,
+    binding: &ExperienceReadBinding,
+) -> Result<(), GovernorObservationError> {
+    if source_revision != binding.bank_source_revision() {
+        return Err(GovernorObservationError::InvalidField {
+            field: "experience_read.bank_source_revision",
+            reason: "owner source revision does not equal the exact paged binding",
+        });
+    }
+    for record in records {
+        record
+            .validate()
+            .map_err(GovernorObservationError::Observation)?;
+        if record.fence != *binding.fence() {
+            return Err(GovernorObservationError::InvalidField {
+                field: "bank_record.fence",
+                reason: "record fence does not equal the exact paged owner binding",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_feedback_binding(
+    records: &[AgentFeedbackRecord],
+    source_revision: &str,
+    binding: &ExperienceReadBinding,
+) -> Result<(), GovernorObservationError> {
+    if source_revision != binding.feedback_source_revision() {
+        return Err(GovernorObservationError::InvalidField {
+            field: "experience_read.feedback_source_revision",
+            reason: "owner source revision does not equal the exact paged binding",
+        });
+    }
+    for record in records {
+        record
+            .validate()
+            .map_err(GovernorObservationError::Observation)?;
+        if record.fence != *binding.fence() {
+            return Err(GovernorObservationError::InvalidField {
+                field: "feedback_record.fence",
+                reason: "record fence does not equal the exact paged owner binding",
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Admit one experience-bank record.
@@ -752,7 +1081,7 @@ pub fn supply_bank_projection_from_store(
     schedule: &RetentionSchedule,
     holds: &BTreeMap<String, RetentionHold>,
 ) -> Result<BankProjection, GovernorObservationError> {
-    ledger.rebuild_bank(snapshot.records);
+    ledger.replace_bank_revisions(snapshot.records);
     let mut readable: Vec<ExperienceBankRecord> = Vec::with_capacity(snapshot.records.len());
     let mut omissions = snapshot.omissions;
     for record in snapshot.records {
@@ -802,7 +1131,7 @@ pub fn supply_feedback_projection_from_store(
     schedule: &RetentionSchedule,
     holds: &BTreeMap<String, RetentionHold>,
 ) -> Result<FeedbackProjection, GovernorObservationError> {
-    ledger.rebuild_feedback(snapshot.records);
+    ledger.replace_feedback_revisions(snapshot.records);
     let mut readable: Vec<AgentFeedbackRecord> = Vec::with_capacity(snapshot.records.len());
     let mut omissions = snapshot.omissions;
     for record in snapshot.records {
@@ -1042,6 +1371,16 @@ pub struct PagedExperienceConsumerBundle {
     /// Typed owner proof for the next feedback page.
     pub feedback_next_cursor: PageBoundary,
     generation: ConsumerPagedReadGeneration,
+    binding: ExperienceReadBinding,
+}
+
+impl PagedExperienceConsumerBundle {
+    /// Returns the owner token that authorizes a commit for this exact page.
+    /// The token cannot be assembled outside this module.
+    #[must_use]
+    pub const fn binding(&self) -> &ExperienceReadBinding {
+        &self.binding
+    }
 }
 
 /// Assemble and edge-consume one page of both experience envelopes.
@@ -1065,6 +1404,16 @@ pub fn assemble_experience_for_consumer_paged(
     bank_next_cursor: PageBoundary,
     feedback_next_cursor: PageBoundary,
 ) -> Result<PagedExperienceConsumerBundle, GovernorObservationError> {
+    let binding = ExperienceReadBinding::new(
+        0,
+        fence.clone(),
+        0,
+        bank.source_revision.clone(),
+        0,
+        feedback.source_revision.clone(),
+    )?;
+    ledger.rebuild_bank_for_binding(bank.records, &bank.source_revision, &binding)?;
+    ledger.rebuild_feedback_for_binding(feedback.records, &feedback.source_revision, &binding)?;
     let bank = supply_bank_projection_from_store_paged(
         ledger,
         bank,
@@ -1093,6 +1442,7 @@ pub fn assemble_experience_for_consumer_paged(
         bank_next_cursor: bank.next_cursor,
         feedback_next_cursor: feedback.next_cursor,
         generation: ConsumerPagedReadGeneration::initial(),
+        binding,
     })
 }
 
@@ -1149,6 +1499,7 @@ impl ConsumerPagedReadGeneration {
 /// restart method; that method invalidates only that family's retained page
 /// and generation while leaving the other family untouched.
 pub struct ConsumerPagedReadDriver {
+    driver_instance: u64,
     bank_state: ConsumerPagedFamilyState,
     feedback_state: ConsumerPagedFamilyState,
     bank_projection: Option<BankProjection>,
@@ -1161,6 +1512,7 @@ impl ConsumerPagedReadDriver {
     /// Start a headless read: both families explicitly need their first page.
     pub fn headless() -> Self {
         Self {
+            driver_instance: next_driver_instance(),
             bank_state: ConsumerPagedFamilyState::NeedsFirstPage,
             feedback_state: ConsumerPagedFamilyState::NeedsFirstPage,
             bank_projection: None,
@@ -1222,6 +1574,30 @@ impl ConsumerPagedReadDriver {
         self.bank_page_is_current(bundle) && self.feedback_page_is_current(bundle)
     }
 
+    /// Checks both the opaque generation token and its exact owner binding.
+    /// A caller must also compare the event fence before committing; this
+    /// method is the generation side of that fail-closed join.
+    pub fn binding_is_current(&self, bundle: &PagedExperienceConsumerBundle) -> bool {
+        bundle.binding.driver_instance == self.driver_instance
+            && bundle.binding.bank_generation == self.bank_generation
+            && bundle.binding.feedback_generation == self.feedback_generation
+    }
+
+    /// Returns the binding only when the page belongs to this exact retained
+    /// driver instance and both current family generations.
+    pub fn current_binding<'bundle>(
+        &self,
+        bundle: &'bundle PagedExperienceConsumerBundle,
+    ) -> Result<&'bundle ExperienceReadBinding, GovernorObservationError> {
+        if !self.bundle_is_current(bundle) || !self.binding_is_current(bundle) {
+            return Err(GovernorObservationError::InvalidField {
+                field: "experience_page.binding",
+                reason: "page binding is not current for the retained owner driver",
+            });
+        }
+        Ok(&bundle.binding)
+    }
+
     /// Return whether the bank projection in `bundle` belongs to the
     /// current bank enumeration.
     pub fn bank_page_is_current(&self, bundle: &PagedExperienceConsumerBundle) -> bool {
@@ -1237,19 +1613,23 @@ impl ConsumerPagedReadDriver {
     /// Restart bank enumeration from the headless first page after the
     /// owner store rejects the echoed bank cursor. The bank projection and
     /// all of its old-generation pages are invalidated; feedback state,
-    /// projection, and generation are untouched.
-    pub fn restart_bank_from_head(&mut self) {
+    /// projection, and generation are untouched. The revision ledger is a
+    /// required argument so a restart cannot leave old-generation revisions
+    /// authorized by a separate additive map.
+    pub fn restart_bank_from_head(&mut self, ledger: &mut ExperienceRevisionLedger) {
         self.bank_state = ConsumerPagedFamilyState::NeedsFirstPage;
         self.bank_projection = None;
         self.bank_generation = self.bank_generation.wrapping_add(1);
+        ledger.invalidate_bank();
     }
 
     /// Restart feedback enumeration from the headless first page. The
     /// independence and invalidation rules mirror [`Self::restart_bank_from_head`].
-    pub fn restart_feedback_from_head(&mut self) {
+    pub fn restart_feedback_from_head(&mut self, ledger: &mut ExperienceRevisionLedger) {
         self.feedback_state = ConsumerPagedFamilyState::NeedsFirstPage;
         self.feedback_projection = None;
         self.feedback_generation = self.feedback_generation.wrapping_add(1);
+        ledger.invalidate_feedback();
     }
 
     /// Assemble the next consumer page from fresh caller-supplied snapshots
@@ -1389,6 +1769,55 @@ impl ConsumerPagedReadDriver {
             "consumer_page.feedback_next_cursor",
         )?;
 
+        let bank_source_revision = if matches!(self.bank_state, ConsumerPagedFamilyState::Complete)
+        {
+            self.bank_projection
+                .as_ref()
+                .ok_or(GovernorObservationError::InvalidField {
+                    field: "consumer_page.bank_projection",
+                    reason: "completed bank enumeration has no retained page",
+                })?
+                .source_revision
+                .clone()
+        } else {
+            bank.source_revision.clone()
+        };
+        let feedback_source_revision =
+            if matches!(self.feedback_state, ConsumerPagedFamilyState::Complete) {
+                self.feedback_projection
+                    .as_ref()
+                    .ok_or(GovernorObservationError::InvalidField {
+                        field: "consumer_page.feedback_projection",
+                        reason: "completed feedback enumeration has no retained page",
+                    })?
+                    .source_revision
+                    .clone()
+            } else {
+                feedback.source_revision.clone()
+            };
+        let binding = ExperienceReadBinding::new(
+            self.driver_instance,
+            fence.clone(),
+            self.bank_generation,
+            bank_source_revision,
+            self.feedback_generation,
+            feedback_source_revision,
+        )?;
+        if matches!(self.bank_state, ConsumerPagedFamilyState::Complete) {
+            ledger.retain_bank_binding(&binding)?;
+        } else {
+            ledger.rebuild_bank_for_binding(bank.records, &bank.source_revision, &binding)?;
+        }
+        if matches!(self.feedback_state, ConsumerPagedFamilyState::Complete) {
+            ledger.retain_feedback_binding(&binding)?;
+        } else {
+            ledger.rebuild_feedback_for_binding(
+                feedback.records,
+                &feedback.source_revision,
+                &binding,
+            )?;
+        }
+
         let bank_page = if matches!(self.bank_state, ConsumerPagedFamilyState::Complete) {
             None
         } else {
@@ -1488,6 +1917,7 @@ impl ConsumerPagedReadDriver {
             bank_next_cursor: bank_next,
             feedback_next_cursor: feedback_next,
             generation: self.generation(),
+            binding,
         })
     }
 }
@@ -1556,11 +1986,12 @@ fn validate_completed_family_cursor(
 pub fn produce_bank_commit(
     ledger: &ExperienceRevisionLedger,
     record: &ExperienceBankRecord,
+    binding: &ExperienceReadBinding,
 ) -> Result<ExperienceCommitParameters, GovernorObservationError> {
     record
         .validate()
         .map_err(GovernorObservationError::Observation)?;
-    match ledger.tracked_bank_revision(&record.handle) {
+    match ledger.tracked_bank_revision_for_binding(&record.handle, binding) {
         Some(tracked) if tracked == record.bank_revision => {}
         _ => {
             return Err(GovernorObservationError::InvalidField {
@@ -1577,11 +2008,12 @@ pub fn produce_bank_commit(
 pub fn produce_feedback_commit(
     ledger: &ExperienceRevisionLedger,
     record: &AgentFeedbackRecord,
+    binding: &ExperienceReadBinding,
 ) -> Result<ExperienceCommitParameters, GovernorObservationError> {
     record
         .validate()
         .map_err(GovernorObservationError::Observation)?;
-    match ledger.tracked_feedback_revision(&record.handle) {
+    match ledger.tracked_feedback_revision_for_binding(&record.handle, binding) {
         Some(tracked) if tracked == record.feedback_revision => {}
         _ => {
             return Err(GovernorObservationError::InvalidField {
@@ -1667,6 +2099,36 @@ pub fn feedback_records_from_page(
 /// record documents (no `record_json` member) pass through for
 /// owner-held fixture input. Every mismatch is a typed envelope-mismatch
 /// refusal, never a silent default.
+#[cfg(test)]
+#[allow(dead_code)]
+mod generation_binding_compile_fixtures {
+    use super::{
+        ConsumerPagedReadDriver, ExperienceBankRecord, ExperienceReadBinding,
+        ExperienceRevisionLedger,
+    };
+
+    /// Compile fixture: a page from another retained driver is never current.
+    fn stale_page_binding_is_rejected(
+        current: &ConsumerPagedReadDriver,
+        stale: &super::PagedExperienceConsumerBundle,
+    ) -> bool {
+        !current.binding_is_current(stale)
+    }
+
+    /// Compile fixture: a commit ledger rebuild cannot omit the exact owner
+    /// source-revision check before a generation token is accepted.
+    fn source_revision_gate_compiles(
+        ledger: &mut ExperienceRevisionLedger,
+        records: &[ExperienceBankRecord],
+        source_revision: &str,
+        binding: &ExperienceReadBinding,
+    ) -> bool {
+        ledger
+            .rebuild_bank_for_binding(records, source_revision, binding)
+            .is_ok()
+    }
+}
+
 fn unwrap_range_member(
     member: &Value,
     revision_field: &'static str,

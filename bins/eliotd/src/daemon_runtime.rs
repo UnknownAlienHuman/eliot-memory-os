@@ -927,6 +927,7 @@ async fn sync_owner_feed(
 /// #18): claim one queued admitted `eliot.query` pair, forward it through
 /// the Kernel `local_read` leg, and submit its result body. At most one pair
 /// per tick; a null claim backs off until the next tick.
+#[allow(clippy::large_futures)]
 fn start_local_read_poll(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
@@ -988,8 +989,9 @@ fn settle_local_read_completion(
 /// the daemon closed — a claimed pair that cannot forward or submit is never
 /// silently discarded. A stale capability is never retried: the step settles
 /// and the next tick claims the current generation anew.
+#[allow(clippy::large_futures)]
 async fn run_local_read_poll(
-    kernel: &DaemonKernelClient,
+    kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
 ) -> Result<LocalReadPollOutcome, String> {
     // #740: receipt span over the claim/forward/submit poll step. Pair
@@ -1002,7 +1004,23 @@ async fn run_local_read_poll(
     let Some((envelope, tool, attempt)) = pair else {
         return Ok(LocalReadPollOutcome::IdleBackoff);
     };
-    let guard = composition.lock().await;
+    let mut guard = composition.lock().await;
+    // #223: the authenticated manual/O1 experience lane is a real current
+    // daemon dispatch. It is reached only for the exact admitted capability,
+    // consumes the owner request through the existing local-read claim, and
+    // submits the typed result through the same idempotent leg below.
+    if eliotd::experience_audit::is_manual_experience_tool(&tool) {
+        let body = eliotd::experience_audit::serve_manual_experience_pair(
+            &mut guard, kernel, &envelope, &tool, &attempt,
+        )
+        .await
+        .map_err(|error| format!("daemon manual experience dispatch: {error}"))?;
+        return match submit_local_read_result_idempotent(kernel, &body).await? {
+            LocalReadSubmitOutcome::Accepted => Ok(LocalReadPollOutcome::Accepted),
+            LocalReadSubmitOutcome::Expired => Ok(LocalReadPollOutcome::Expired),
+            LocalReadSubmitOutcome::StaleAttempt => Ok(LocalReadPollOutcome::StaleAttempt),
+        };
+    }
     // #1882: Skill pairs serve locally through the composition Skill driver
     // instead of forwarding on the Kernel `local_read` leg (which serves
     // store reads only). Recognition is the shared Skill tool predicate over
