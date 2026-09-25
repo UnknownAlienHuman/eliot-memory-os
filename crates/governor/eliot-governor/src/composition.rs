@@ -4631,17 +4631,22 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .await
     }
 
-    /// Admits one scope-sensitive canonical write under material readiness
+    /// Admits one scope-sensitive effect under material readiness
     /// (issue #1789, readiness-gate production caller).
     ///
-    /// Evaluates [`evaluate_material_request`] for
-    /// [`RequestedEffect::CanonicalWrite`] over the presented readiness
-    /// facts. Currency is judged against the retained Kernel fence, never a
-    /// caller-presented fence: the evaluated inputs carry the presented
-    /// receipt, descriptor, coverage, guard receipt, lease, and tick with
-    /// the live fence substituted, so a stale receipt fails even when it
-    /// agrees with its own fence (re-evaluation on fence change is owned
-    /// here, not delegated to the presenter).
+    /// Evaluates [`evaluate_material_request`] for `effect` over the presented
+    /// readiness facts. The effect class matters: only
+    /// [`RequestedEffect::CanonicalWrite`] and
+    /// [`RequestedEffect::MaterialEffect`] need `READY_MATERIAL`
+    /// ([`RequestedEffect::requires_material_readiness`]); the read-only
+    /// orientation family is admitted in any orientable lifecycle once
+    /// currency holds, so the exploratory-versus-mutation distinction is
+    /// evaluated per effect, never hardcoded. Currency is judged against the
+    /// retained Kernel fence, never a caller-presented fence: the evaluated
+    /// inputs carry the presented receipt, descriptor, coverage, guard
+    /// receipt, lease, and tick with the live fence substituted, so a stale
+    /// receipt fails even when it agrees with its own fence (re-evaluation
+    /// on fence change is owned here, not delegated to the presenter).
     ///
     /// An admission is then bound to the retained authenticated instance:
     /// the presented receipt must name exactly the live `WorkScope` binding
@@ -4649,8 +4654,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// authenticated instance to bind, so the write fails closed. A denial
     /// or a malformed bundle fails as [`CompositionError::Recovery`] carrying
     /// the typed directive token; nothing is committed on any failure.
-    pub fn check_material_readiness_for_write(
+    pub fn check_material_readiness_for_effect(
         &self,
+        effect: RequestedEffect,
         readiness: &MaterialReadinessInputs<'_>,
     ) -> Result<MaterialAdmission, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
@@ -4661,12 +4667,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             fence: &live_fence,
             ..*readiness
         };
-        let admission = evaluate_material_request(&effective, RequestedEffect::CanonicalWrite)
-            .map_err(|error| {
-                CompositionError::Recovery(format!(
-                    "material readiness inputs are malformed: {error}"
-                ))
-            })?;
+        let admission = evaluate_material_request(&effective, effect).map_err(|error| {
+            CompositionError::Recovery(format!("material readiness inputs are malformed: {error}"))
+        })?;
         if matches!(admission, MaterialAdmission::Admitted { .. }) {
             let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
                 CompositionError::Recovery(
@@ -4685,6 +4688,31 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             }
         }
         Ok(admission)
+    }
+
+    /// Admits one scope-sensitive canonical write under material readiness
+    /// (issue #1789, readiness-gate production caller).
+    ///
+    /// Evaluates [`Self::check_material_readiness_for_effect`] for
+    /// [`RequestedEffect::CanonicalWrite`] over the presented readiness
+    /// facts. Currency is judged against the retained Kernel fence, never a
+    /// caller-presented fence: the evaluated inputs carry the presented
+    /// receipt, descriptor, coverage, guard receipt, lease, and tick with
+    /// the live fence substituted, so a stale receipt fails even when it
+    /// agrees with its own fence (re-evaluation on fence change is owned
+    /// here, not delegated to the presenter).
+    ///
+    /// An admission is then bound to the retained authenticated instance:
+    /// the presented receipt must name exactly the live `WorkScope` binding
+    /// read at the retained fence. Without a retained binding there is no
+    /// authenticated instance to bind, so the write fails closed. A denial
+    /// or a malformed bundle fails as [`CompositionError::Recovery`] carrying
+    /// the typed directive token; nothing is committed on any failure.
+    pub fn check_material_readiness_for_write(
+        &self,
+        readiness: &MaterialReadinessInputs<'_>,
+    ) -> Result<MaterialAdmission, CompositionError> {
+        self.check_material_readiness_for_effect(RequestedEffect::CanonicalWrite, readiness)
     }
 
     /// Applies one Canonical-admitted transition only after material
