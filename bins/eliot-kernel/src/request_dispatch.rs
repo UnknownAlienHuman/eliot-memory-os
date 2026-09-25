@@ -25,9 +25,11 @@
 //!   imports; owning lane Governor/eliotd). Owner-backed gates are marked
 //!   `-deferred` in `gates_passed` and never claimed as proven.
 //!
-//! The dispatch-matrix arm lives in `frame_dispatch` (manager-serialized
-//! shared registration); this file holds only the route. Until that arm
-//! lands, [`dispatch_backup_frame`] is dead code by construction.
+//! The dispatch-matrix arm is [`crate::frame_dispatch`]'s closed `backup`
+//! operation gate; this file holds only the route. The arm fences the frame
+//! before this route reads a payload field, and this route re-proves the
+//! request identity, session fence join, connection join, JSON payload, and
+//! exact operation allowlist for every direct caller.
 //!
 //! Capability cell: Kernel front-door backup dispatch (bounded backup method
 //! entry). Forbidden authority: no capture orchestration, no coordination
@@ -38,6 +40,7 @@ use std::num::NonZeroU64;
 
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
 use eliot_ipc::{Session, TransportError};
+use eliot_protocol::backup::BackupClassWire;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
 use serde_json::{Map, Value};
 
@@ -139,11 +142,21 @@ fn hex_bytes(value: &str, field: &'static str, max_bytes: usize) -> Result<Vec<u
 
 /// Requires a 64-character lowercase hex SHA-256 digest shape (length and
 /// alphabet only; digest binding itself is owner-held).
+///
+/// The rule is the shared protocol rule, not a second one: the predicate is
+/// exactly the private `lowercase_sha256` predicate of
+/// `crates/foundation/eliot-protocol/src/backup.rs:220` (64 characters, and
+/// every byte an ASCII hex digit that is not an ASCII uppercase letter).
+/// `eliot_protocol` exposes no public digest validator — `lowercase_sha256`
+/// is a private `fn` and is not re-exported from `crates/foundation/
+/// eliot-protocol/src/lib.rs` — so the identical expression is kept here
+/// rather than importing a second digest rule or widening the foundation
+/// owner from this route.
 fn sha256_digest_shape(value: &str, field: &'static str) -> Result<(), InvalidShape> {
     if value.len() != 64
         || !value
             .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     {
         return Err(InvalidShape {
             field,
@@ -151,6 +164,29 @@ fn sha256_digest_shape(value: &str, field: &'static str) -> Result<(), InvalidSh
         });
     }
     Ok(())
+}
+
+/// Decodes the operator class token into the closed protocol class vocabulary.
+///
+/// [`BackupClassWire`] is the single class owner and the only closed class
+/// set this route admits; an unknown token decodes to `None` and refuses. The
+/// function is a spelling decoder only, never a second class set: I5.13 fixes
+/// the operator/wire tokens as `full_recovery`, `canonical_only_degraded`,
+/// and `scope_export`, while the protocol enum's serde spelling is
+/// `SCREAMING_SNAKE_CASE`, so the two spellings must be bound in one place.
+///
+/// [`BackupClassWire::validate_transition`] has no applicable site on this
+/// entry: a request carries a declared class only, and the evidenced class
+/// belongs to the capture owner's receipt (`backup-capture-owner (#959)`,
+/// open). Binding an evidenced value here would fabricate a receipt, so the
+/// transition check is left to the owner that can actually attest one.
+fn backup_class(token: &str) -> Option<BackupClassWire> {
+    match token {
+        "full_recovery" => Some(BackupClassWire::FullRecovery),
+        "canonical_only_degraded" => Some(BackupClassWire::CanonicalOnlyDegraded),
+        "scope_export" => Some(BackupClassWire::ScopeExport),
+        _ => None,
+    }
 }
 
 fn get_str<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a str, String> {
@@ -196,6 +232,18 @@ fn require_exact_keys(object: &Map<String, Value>, keys: &[&str]) -> Result<(), 
 /// The operation string only selects this entry; every call still proves its
 /// exact payload shape, session joins, and fence below. Unknown operations
 /// never reach the handlers.
+///
+/// The three selectors stay literals because the protocol's own operation
+/// vocabulary is a different, non-interchangeable one:
+/// `eliot_protocol::backup::BackupOperationKind` names backup *control*
+/// operations (`REQUEST_CAPTURE`, `VERIFY_ARCHIVE`,
+/// `PREPARE_ISOLATED_RESTORE`, `RESTORE_STEP`, `COMPLETE_REHEARSAL`, …) at
+/// `crates/foundation/eliot-protocol/src/backup.rs:257`, while these strings
+/// name the front-door *method selectors* the operator surface and
+/// `frame_dispatch` route on. Deriving one from the other would assert an
+/// identity the protocol does not state, and `backup.restore-test` has no
+/// single protocol kind at all: the isolated rehearsal spans destination
+/// preparation, restore steps, and rehearsal completion.
 pub(crate) fn is_backup_operation(operation: &str) -> bool {
     matches!(
         operation,
@@ -308,10 +356,7 @@ fn handle_backup_create(payload: &Value, idempotency_key: &str) -> Value {
             );
         }
     };
-    if !matches!(
-        class,
-        "full_recovery" | "canonical_only_degraded" | "scope_export"
-    ) {
+    if backup_class(class).is_none() {
         return invalid_reply(
             BACKUP_CREATE_OPERATION,
             idempotency_key,
@@ -766,16 +811,9 @@ fn handle_backup_restore_test(payload: &Value, idempotency_key: &str) -> Value {
 /// only command fields. Domain outcomes return as typed reply frames; only
 /// authentication, session, fence, and routing failures fence.
 ///
-/// Service-readiness and peer-authentication gates stay with the pending
-/// `frame_dispatch` arm (manager-serialized shared registration), which owns
-/// the exact pre-dispatch binding this free function must not duplicate.
-///
-/// Uncalled until that backup arm lands: the allow below documents exactly
-/// that pending wiring instead of pretending otherwise.
-#[allow(
-    dead_code,
-    reason = "no frame_dispatch backup arm calls into the route yet; remove when the shared arm lands"
-)]
+/// Service-readiness and peer-authentication gates stay with the
+/// `frame_dispatch` backup arm, which owns the exact pre-dispatch binding
+/// this free function must not duplicate.
 pub(crate) fn dispatch_backup_frame(
     session: &Session,
     frame: &Frame,
@@ -817,7 +855,19 @@ pub(crate) fn dispatch_backup_frame(
     let params = match payload {
         Value::Object(mut map) => {
             map.remove("operation");
-            Value::Object(map)
+            // The one canonical EBP envelope is `{operation, payload}`: the
+            // authenticated `KernelClient` sets `operation` as the routing
+            // selector and carries the command fields inside `payload`.
+            // Descend exactly one level and no deeper, so the handlers'
+            // exact-key checks still see only command fields and no caller can
+            // smuggle extra top-level keys past them. A frame with no
+            // `payload` member keeps the flat shape, and a non-object
+            // `payload` is handed on so the handlers refuse it on shape.
+            match map.remove("payload") {
+                Some(Value::Object(fields)) => Value::Object(fields),
+                Some(other) => other,
+                None => Value::Object(map),
+            }
         }
         other => other,
     };
