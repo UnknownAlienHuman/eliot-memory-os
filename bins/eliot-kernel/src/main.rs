@@ -272,12 +272,19 @@ pub(crate) fn exit_error(code: &str, detail: &str) -> ! {
     // F-LOG-KERNEL-0 (#895): the single terminal error boundary. One
     // underlying failed operation yields exactly one terminal diagnostic
     // record here; receipt framing and the exit below are unchanged.
+    // W6 correlation is single-funnel adjacency: a lower phase emits its
+    // one correlated observation (e.g. the fenced listener bind) and this
+    // funnel emits the one terminal record. No op identity is threaded
+    // through `KernelBuildError` by design.
     observe_terminal_error(code);
     write_error(code, detail);
     std::process::exit(1);
 }
 
 pub(crate) fn write_error(code: &str, detail: &str) {
+    // F-LOG-KERNEL-0 (#895 W2): no-event reason — stderr is the terminal
+    // sink itself, so a failed write here is unobservable by design and,
+    // per W5, must not fail the process. No behavior change.
     let _ = writeln!(
         io::stderr().lock(),
         "{{\"error\":\"{code}\",\"detail\":{detail:?}}}"

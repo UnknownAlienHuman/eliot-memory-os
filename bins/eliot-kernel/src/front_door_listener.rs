@@ -136,9 +136,13 @@ impl KernelComposition {
                 observe_listener("kernel.front_door_listener_bind", "success");
                 observe_listener("kernel.front_door_listener_accept_ready", "success");
             }
-            Err(error) => {
+            Err(_) => {
+                // F-LOG-KERNEL-0 (#895 W6/T17): keep only the correlated
+                // lower-phase observation here. The designated terminal
+                // emitter for this startup bind failure is `exit_error`
+                // (`COMPOSITION_FAILURE`); correlation is single-funnel
+                // adjacency, not a threaded op identity.
                 observe_listener("kernel.front_door_listener_bind", "fenced");
-                super::kernel_diagnostics::observe_terminal_error(listener_terminal_code(error));
             }
         }
         result
