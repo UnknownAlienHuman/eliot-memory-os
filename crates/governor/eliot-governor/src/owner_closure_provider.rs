@@ -48,15 +48,18 @@ use eliot_ors::{
     OperationalRecordContext, OperationalRecordInput, StateFenceSnapshot,
 };
 use eliot_platform::SecretReference;
-use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling};
+use eliot_receipts::{
+    AuthorityBinding, EffectClass, GRANT_CLOSURE_SCHEMA, GRANT_CLOSURE_VERSION,
+    GrantClosureDeclaration, GrantClosureMemberDeclaration, ProofCeiling,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{AuthorityOwner, AuthorityOwnerSnapshot, CompositionError};
 
 /// Versioned admitted-hydration snapshot retained by the Governor owner.
-pub const OWNER_HYDRATION_SNAPSHOT_SCHEMA: &str = "eliot.governor.owner-hydrations.v1";
+pub const OWNER_HYDRATION_SNAPSHOT_SCHEMA: &str = "eliot.governor.owner-hydrations.v2";
 /// Versioned admitted-hydration snapshot version.
-pub const OWNER_HYDRATION_SNAPSHOT_VERSION: u16 = 1;
+pub const OWNER_HYDRATION_SNAPSHOT_VERSION: u16 = 2;
 
 /// Canonical Governor closure owner behind the P-07 durable boundary.
 ///
@@ -85,6 +88,33 @@ struct AdmittedHydrations {
     roots: BTreeMap<String, RootGrantHydration>,
     introductions: BTreeMap<String, IntroductionHydration>,
     preserved: BTreeMap<String, Vec<GrantClosureSurvivor>>,
+}
+
+impl AdmittedHydrations {
+    fn to_snapshot(
+        &self,
+        state_fence: &StateFence,
+        grant_graph_revision: u64,
+    ) -> AdmittedHydrationsSnapshot {
+        AdmittedHydrationsSnapshot {
+            schema: OWNER_HYDRATION_SNAPSHOT_SCHEMA.to_owned(),
+            version: OWNER_HYDRATION_SNAPSHOT_VERSION,
+            state_fence: state_fence.clone(),
+            grant_graph_revision,
+            members: self.members.values().cloned().collect(),
+            roots: self.roots.values().cloned().collect(),
+            introductions: self.introductions.values().cloned().collect(),
+            preserved: self
+                .preserved
+                .iter()
+                .map(|(target, survivors)| {
+                    let mut survivors = survivors.clone();
+                    survivors.sort();
+                    (target.clone(), survivors)
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Complete semantic admission context for one grant hydration.
@@ -181,6 +211,22 @@ pub struct PreservedAdmission {
     pub covering_grant_id: String,
     /// Lineage domain of the surviving alternate path.
     pub covering_root_ref: String,
+    /// Canonical effect/operation identity for the exact surviving use.
+    pub operation_id: String,
+    /// Exact admitted operation name.
+    pub operation_name: String,
+    /// Exact resource reference covered by the alternate path.
+    pub resource_ref: String,
+    /// Exact effect ceiling claimed for the use.
+    pub effect: EffectClass,
+    /// Holder principal admitted for the use.
+    pub holder_principal: String,
+    /// Session identity admitted for the use.
+    pub session_id: String,
+    /// `WorkScope` identity admitted for the use.
+    pub scope_id: String,
+    /// Canonical request digest for the exact use.
+    pub canonical_request_hash: String,
 }
 
 impl OwnerClosureProvider {
@@ -217,13 +263,41 @@ impl OwnerClosureProvider {
             expected_fence,
             Some(&history),
         )?;
-        Ok(Self {
+        let hydrations = outcome.owner.owner_hydrations.clone();
+        let graph_snapshot = outcome
+            .owner
+            .grants
+            .recovery_snapshot()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let revoked_ids = graph_snapshot
+            .revoked
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let has_live_owner = graph_snapshot.grants.iter().any(|grant| {
+            !revoked_ids.contains(grant.grant_id.as_str())
+                && matches!(
+                    grant.status,
+                    GrantStatus::Active | GrantStatus::PendingActivation
+                )
+        });
+        if hydrations.is_none() && has_live_owner {
+            return Err(CompositionError::Recovery(
+                "canonical owner snapshot has no explicit closure hydrations; owner feed remains unavailable"
+                    .to_owned(),
+            ));
+        }
+        let mut provider = Self {
             state_fence: snapshot.state_fence.clone(),
             snapshot,
             history,
             owner: outcome.owner,
             registry: AdmittedHydrations::default(),
-        })
+        };
+        if let Some(hydrations) = hydrations.as_ref() {
+            provider.import_hydration_snapshot(hydrations)?;
+        }
+        Ok(provider)
     }
 
     /// Returns the exact restored graph revision this provider serves.
@@ -285,9 +359,8 @@ impl OwnerClosureProvider {
     ///
     /// The fence must equal the retained fence (a fence advance is a new
     /// restoration, not a refresh) and the revision must not move backwards.
-    /// The admitted registry carries over only when every admitted entry
-    /// still resolves at the new revision; otherwise refresh refuses and the
-    /// live provider is untouched.
+    /// The replacement snapshot carries its own exact admitted registry; it is
+    /// imported and fully revalidated before the live provider is replaced.
     ///
     /// # Errors
     ///
@@ -306,15 +379,12 @@ impl OwnerClosureProvider {
             ));
         }
         let fence = self.state_fence.clone();
-        let mut candidate = Self::restore(snapshot, history, &fence)?;
+        let candidate = Self::restore(snapshot, history, &fence)?;
         if candidate.revision() != expected_revision {
             return Err(CompositionError::Recovery(
                 "restored owner revision disagrees with the expected revision".to_owned(),
             ));
         }
-        let registry = std::mem::take(&mut self.registry);
-        candidate.revalidate_registry(&registry)?;
-        candidate.registry = registry;
         *self = candidate;
         Ok(())
     }
@@ -344,6 +414,7 @@ impl OwnerClosureProvider {
                 "admitted member identity is already registered".to_owned(),
             ));
         }
+        self.sync_owner_hydrations()?;
         Ok(member)
     }
 
@@ -381,6 +452,7 @@ impl OwnerClosureProvider {
                 "admitted root identity is already registered".to_owned(),
             ));
         }
+        self.sync_owner_hydrations()?;
         Ok(hydration)
     }
 
@@ -409,6 +481,7 @@ impl OwnerClosureProvider {
                 "admitted introduction identity is already registered".to_owned(),
             ));
         }
+        self.sync_owner_hydrations()?;
         Ok(hydration)
     }
 
@@ -422,63 +495,147 @@ impl OwnerClosureProvider {
         &mut self,
         admission: PreservedAdmission,
     ) -> Result<(), CompositionError> {
-        reject_blank(&admission.target_grant_id, "preserved.target_grant_id")?;
-        reject_blank(&admission.grant_id, "preserved.grant_id")?;
-        reject_blank(&admission.covering_grant_id, "preserved.covering_grant_id")?;
-        reject_blank(&admission.covering_root_ref, "preserved.covering_root_ref")?;
-        for grant_id in [
-            &admission.target_grant_id,
-            &admission.grant_id,
-            &admission.covering_grant_id,
-        ] {
-            if self.snapshot_grant(grant_id).is_none() {
-                return Err(CompositionError::Owner(
-                    "preserved admission names unknown grant lineage".to_owned(),
-                ));
-            }
-        }
-        self.registry
+        let survivor = GrantClosureSurvivor {
+            grant_id: admission.grant_id,
+            covering_grant_id: admission.covering_grant_id,
+            covering_root_ref: admission.covering_root_ref,
+            operation_id: admission.operation_id,
+            operation_name: admission.operation_name,
+            resource_ref: admission.resource_ref,
+            effect: admission.effect,
+            holder_principal: admission.holder_principal,
+            session_id: admission.session_id,
+            scope_id: admission.scope_id,
+            canonical_request_hash: admission.canonical_request_hash,
+        };
+        self.check_preserved_admission(&admission.target_grant_id, &survivor)?;
+        let preserved = self
+            .registry
             .preserved
-            .entry(admission.target_grant_id.clone())
-            .or_default()
-            .push(GrantClosureSurvivor {
-                grant_id: admission.grant_id,
-                covering_grant_id: admission.covering_grant_id,
-                covering_root_ref: admission.covering_root_ref,
-            });
-        Ok(())
+            .entry(admission.target_grant_id)
+            .or_default();
+        if preserved.contains(&survivor) {
+            return Err(CompositionError::Owner(
+                "preserved exact-use alternate path is already registered".to_owned(),
+            ));
+        }
+        preserved.push(survivor);
+        preserved.sort();
+        self.sync_owner_hydrations()
+    }
+
+    fn closure_declarations(&self) -> Result<Vec<GrantClosureDeclaration>, CompositionError> {
+        let effective_graph = self
+            .owner
+            .grants
+            .recovery_snapshot()
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        let effective_revocations = effective_graph
+            .revoked
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let mut declarations = Vec::with_capacity(effective_graph.grants.len());
+        for target in &effective_graph.grants {
+            if effective_revocations.contains(target.grant_id.as_str()) {
+                continue;
+            }
+            if !matches!(
+                target.status,
+                GrantStatus::Active | GrantStatus::PendingActivation
+            ) {
+                continue;
+            }
+            let target_id = GrantId::new(&target.grant_id)
+                .map_err(|_| CompositionError::Owner("grant identity is invalid".to_owned()))?;
+            let closure = self
+                .owner
+                .grants
+                .delegated_closure(&target_id)
+                .map_err(|error| CompositionError::Owner(error.to_string()))?;
+            let mut preserved = self
+                .registry
+                .preserved
+                .get(&target.grant_id)
+                .cloned()
+                .unwrap_or_default();
+            preserved.sort();
+            let preserved_ids = preserved
+                .iter()
+                .map(|survivor| survivor.grant_id.as_str())
+                .collect::<BTreeSet<_>>();
+            let mut members = Vec::with_capacity(closure.members.len());
+            let mut proof_ceiling = ProofCeiling::ObservedExternalEffect;
+            for member in &closure.members {
+                if preserved_ids.contains(member.grant_id.as_str()) {
+                    continue;
+                }
+                let hydration = registry_grant(&self.registry, member.grant_id.as_str())
+                    .ok_or_else(|| {
+                        CompositionError::Owner(
+                            "current closure member has no admitted canonical hydration".to_owned(),
+                        )
+                    })?;
+                proof_ceiling = proof_ceiling
+                    .min(hydration.proof_ceiling)
+                    .min(hydration.binding.proof_ceiling);
+                members.push(GrantClosureMemberDeclaration {
+                    grant_id: member.grant_id.as_str().to_owned(),
+                    parent_grant_id: member
+                        .parent_grant_id
+                        .as_ref()
+                        .map(|parent| parent.as_str().to_owned()),
+                });
+            }
+            let declaration = GrantClosureDeclaration {
+                schema: GRANT_CLOSURE_SCHEMA.to_owned(),
+                version: GRANT_CLOSURE_VERSION,
+                target_grant_id: target.grant_id.clone(),
+                authority_root_ref: closure.authority_root_ref,
+                grant_graph_revision: closure.revision,
+                members,
+                preserved,
+                proof_ceiling,
+            };
+            declaration
+                .validate()
+                .map_err(|error| CompositionError::Owner(error.to_string()))?;
+            declarations.push(declaration);
+        }
+        Ok(declarations)
     }
 
     /// Serves the complete restore bundle the Kernel-side mirror binds at
     /// the provider revision: durable snapshot, CURRENT history, admitted
     /// members, roots, introductions, and preserved survivors.
     ///
-    /// Refuses with no admitted grant hydrations: an empty registry binds
-    /// nothing, and the Kernel-side bootstrap refuses an empty bundle the
-    /// same way.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CompositionError::Recovery`] when no grant hydration is
-    /// admitted.
+    /// A fully closed graph may legitimately have no current grant hydrations;
+    /// its graph roots and durable history still reach the Kernel so revoked
+    /// rows can be rehydrated. A live owner with missing hydrations was already
+    /// rejected by [`Self::restore`].
     pub fn serve_restore(&self) -> Result<GovernorClosureRestore, CompositionError> {
-        if self.registry.members.is_empty() && self.registry.roots.is_empty() {
-            return Err(CompositionError::Recovery(
-                "no admitted grant hydrations to serve".to_owned(),
-            ));
-        }
+        let declarations = self.closure_declarations()?;
+        let preserved = declarations
+            .iter()
+            .map(|declaration| {
+                let mut survivors = self
+                    .registry
+                    .preserved
+                    .get(&declaration.target_grant_id)
+                    .cloned()
+                    .unwrap_or_default();
+                survivors.sort();
+                (declaration.target_grant_id.clone(), survivors)
+            })
+            .collect();
         Ok(GovernorClosureRestore {
             graph_snapshot: self.snapshot.grant_graph.clone(),
             revocation_history: Some(self.history.clone()),
             members: self.registry.members.values().cloned().collect(),
             roots: self.registry.roots.values().cloned().collect(),
             introductions: self.registry.introductions.values().cloned().collect(),
-            preserved: self
-                .registry
-                .preserved
-                .iter()
-                .map(|(target, survivors)| (target.clone(), survivors.clone()))
-                .collect(),
+            declarations,
+            preserved,
         })
     }
 
@@ -492,22 +649,12 @@ impl OwnerClosureProvider {
     /// Returns [`CompositionError::Recovery`] when the snapshot cannot be
     /// rendered.
     pub fn export_registry(&self) -> Result<Vec<u8>, CompositionError> {
-        let snapshot = AdmittedHydrationsSnapshot {
-            schema: OWNER_HYDRATION_SNAPSHOT_SCHEMA.to_owned(),
-            version: OWNER_HYDRATION_SNAPSHOT_VERSION,
-            state_fence: self.state_fence.clone(),
-            grant_graph_revision: self.revision(),
-            members: self.registry.members.values().cloned().collect(),
-            roots: self.registry.roots.values().cloned().collect(),
-            introductions: self.registry.introductions.values().cloned().collect(),
-            preserved: self
-                .registry
-                .preserved
-                .iter()
-                .map(|(target, survivors)| (target.clone(), survivors.clone()))
-                .collect(),
-        };
-        canonical_json_bytes(&snapshot).map_err(recovery)
+        let hydrations = self.owner.owner_hydrations.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "cannot export an unavailable canonical hydration registry".to_owned(),
+            )
+        })?;
+        canonical_json_bytes(hydrations).map_err(recovery)
     }
 
     /// Imports a registry snapshot exported by
@@ -526,13 +673,14 @@ impl OwnerClosureProvider {
             serde_json::from_slice(bytes).map_err(|error| {
                 CompositionError::Recovery(format!("hydration snapshot is malformed: {error}"))
             })?;
-        if snapshot.schema != OWNER_HYDRATION_SNAPSHOT_SCHEMA
-            || snapshot.version != OWNER_HYDRATION_SNAPSHOT_VERSION
-        {
-            return Err(CompositionError::Recovery(
-                "hydration snapshot has an invalid schema or version".to_owned(),
-            ));
-        }
+        self.import_hydration_snapshot(&snapshot)
+    }
+
+    fn import_hydration_snapshot(
+        &mut self,
+        snapshot: &AdmittedHydrationsSnapshot,
+    ) -> Result<(), CompositionError> {
+        snapshot.validate_shape()?;
         if snapshot.state_fence != self.state_fence
             || snapshot.grant_graph_revision != self.revision()
         {
@@ -542,7 +690,7 @@ impl OwnerClosureProvider {
         }
         let mut shadow = AdmittedHydrations::default();
         for member in &snapshot.members {
-            self.check_member_admission(
+            self.check_restored_member_admission(
                 &member.intent.grant_id,
                 member.intent.parent_grant_id.as_deref(),
                 &member.intent.authority_root_ref,
@@ -564,7 +712,7 @@ impl OwnerClosureProvider {
             }
         }
         for root in &snapshot.roots {
-            self.check_member_admission(
+            self.check_restored_member_admission(
                 &root.intent.grant_id,
                 root.intent.parent_grant_id.as_deref(),
                 &root.intent.authority_root_ref,
@@ -610,9 +758,19 @@ impl OwnerClosureProvider {
                 ));
             }
         }
+        let mut preserved_targets = BTreeSet::new();
         for (target, survivors) in &snapshot.preserved {
+            reject_blank(target, "preserved.target_grant_id")?;
+            if !preserved_targets.insert(target.clone())
+                || survivors.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                return Err(CompositionError::Recovery(
+                    "hydration snapshot alternate-path targets and uses must be unique and sorted"
+                        .to_owned(),
+                ));
+            }
             for survivor in survivors {
-                self.check_preserved_admission(target, survivor)?;
+                self.check_preserved_admission_with_registry(target, survivor, &shadow)?;
             }
             shadow
                 .preserved
@@ -621,40 +779,16 @@ impl OwnerClosureProvider {
                 .extend(survivors.clone());
         }
         self.registry = shadow;
-        Ok(())
+        self.sync_owner_hydrations()
     }
 
-    /// Revalidates a previously admitted registry against this provider
-    /// state: every member, root, introduction, and survivor must still
-    /// resolve. Used by [`Self::refresh`] before carrying admissions over.
-    fn revalidate_registry(&self, registry: &AdmittedHydrations) -> Result<(), CompositionError> {
-        for member in registry.members.values() {
-            self.check_member_admission(
-                &member.intent.grant_id,
-                member.intent.parent_grant_id.as_deref(),
-                &member.intent.authority_root_ref,
-                &member.intent.binding,
-            )?;
-        }
-        for root in registry.roots.values() {
-            self.check_member_admission(
-                &root.intent.grant_id,
-                root.intent.parent_grant_id.as_deref(),
-                &root.intent.authority_root_ref,
-                &root.intent.binding,
-            )?;
-        }
-        for hydration in registry.introductions.values() {
-            self.check_introduction_admission(
-                &hydration.intent.supporting_grant_ids,
-                &hydration.intent.authority_root_ref,
-            )?;
-        }
-        for (target, survivors) in &registry.preserved {
-            for survivor in survivors {
-                self.check_preserved_admission(target, survivor)?;
-            }
-        }
+    fn sync_owner_hydrations(&mut self) -> Result<(), CompositionError> {
+        let snapshot = self
+            .registry
+            .to_snapshot(&self.state_fence, self.revision());
+        snapshot.validate_shape()?;
+        self.owner.replace_owner_hydrations(snapshot);
+        self.snapshot = self.owner.snapshot()?;
         Ok(())
     }
 
@@ -731,12 +865,47 @@ impl OwnerClosureProvider {
         authority_root_ref: &str,
         binding: &AuthorityBinding,
     ) -> Result<(), CompositionError> {
+        self.check_member_admission_with_status(
+            grant_id,
+            parent_grant_id,
+            authority_root_ref,
+            binding,
+            false,
+        )
+    }
+
+    fn check_restored_member_admission(
+        &self,
+        grant_id: &str,
+        parent_grant_id: Option<&str>,
+        authority_root_ref: &str,
+        binding: &AuthorityBinding,
+    ) -> Result<(), CompositionError> {
+        self.check_member_admission_with_status(
+            grant_id,
+            parent_grant_id,
+            authority_root_ref,
+            binding,
+            true,
+        )
+    }
+
+    fn check_member_admission_with_status(
+        &self,
+        grant_id: &str,
+        parent_grant_id: Option<&str>,
+        authority_root_ref: &str,
+        binding: &AuthorityBinding,
+        allow_revoked_history: bool,
+    ) -> Result<(), CompositionError> {
         let record = self.snapshot_grant(grant_id).ok_or_else(|| {
             CompositionError::Owner("admission names unknown grant lineage".to_owned())
         })?;
-        if record.status == GrantStatus::Revoked {
+        if matches!(record.status, GrantStatus::Stale | GrantStatus::Expired)
+            || (record.status == GrantStatus::Revoked && !allow_revoked_history)
+        {
             return Err(CompositionError::Owner(
-                "admission names revoked grant lineage".to_owned(),
+                "admission names non-active grant lineage".to_owned(),
             ));
         }
         if record.parent_grant_id.as_deref() != parent_grant_id {
@@ -857,22 +1026,140 @@ impl OwnerClosureProvider {
         Ok(())
     }
 
-    /// Validates one preserved admission against the restored graph.
+    /// Validates one exact-use alternate path against the canonical owner
+    /// graph and the admitted hydration registry.
     fn check_preserved_admission(
         &self,
         target_grant_id: &str,
         survivor: &GrantClosureSurvivor,
     ) -> Result<(), CompositionError> {
-        for grant_id in [
-            target_grant_id,
-            survivor.grant_id.as_str(),
-            survivor.covering_grant_id.as_str(),
+        self.check_preserved_admission_with_registry(target_grant_id, survivor, &self.registry)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "alternate-path proof keeps canonical identity, exact use, hydration, and effect contour checks together"
+    )]
+    fn check_preserved_admission_with_registry(
+        &self,
+        target_grant_id: &str,
+        survivor: &GrantClosureSurvivor,
+        registry: &AdmittedHydrations,
+    ) -> Result<(), CompositionError> {
+        reject_blank(target_grant_id, "preserved.target_grant_id")?;
+        for (value, field) in [
+            (&survivor.grant_id, "preserved.grant_id"),
+            (&survivor.covering_grant_id, "preserved.covering_grant_id"),
+            (&survivor.covering_root_ref, "preserved.covering_root_ref"),
+            (&survivor.operation_id, "preserved.operation_id"),
+            (&survivor.operation_name, "preserved.operation_name"),
+            (&survivor.resource_ref, "preserved.resource_ref"),
+            (&survivor.holder_principal, "preserved.holder_principal"),
+            (&survivor.session_id, "preserved.session_id"),
+            (&survivor.scope_id, "preserved.scope_id"),
         ] {
-            if self.snapshot_grant(grant_id).is_none() {
-                return Err(CompositionError::Recovery(
-                    "preserved admission names unknown grant lineage".to_owned(),
+            reject_blank(value, field)?;
+        }
+        reject_digest(
+            &survivor.canonical_request_hash,
+            "preserved.canonical_request_hash",
+        )?;
+        let target = self.snapshot_grant(target_grant_id).ok_or_else(|| {
+            CompositionError::Owner("preserved admission names an unknown target".to_owned())
+        })?;
+        let descendant = self.snapshot_grant(&survivor.grant_id).ok_or_else(|| {
+            CompositionError::Owner("preserved admission names an unknown survivor".to_owned())
+        })?;
+        let covering = self
+            .snapshot_grant(&survivor.covering_grant_id)
+            .ok_or_else(|| {
+                CompositionError::Owner("preserved admission names an unknown cover".to_owned())
+            })?;
+        if target.grant_id == survivor.grant_id {
+            return Err(CompositionError::Owner(
+                "closure target cannot be its own alternate-path survivor".to_owned(),
+            ));
+        }
+        if matches!(
+            target.status,
+            GrantStatus::Revoked | GrantStatus::Stale | GrantStatus::Expired
+        ) {
+            return Err(CompositionError::Owner(
+                "preserved target is no longer admissible".to_owned(),
+            ));
+        }
+        if descendant.status != GrantStatus::Active || covering.status != GrantStatus::Active {
+            return Err(CompositionError::Owner(
+                "preserved survivor and covering grant must both be active".to_owned(),
+            ));
+        }
+        if covering.authority_root_ref != survivor.covering_root_ref
+            || descendant.holder != survivor.holder_principal
+            || covering.holder != survivor.holder_principal
+        {
+            return Err(CompositionError::Owner(
+                "preserved exact use disagrees with grant holder or covering root".to_owned(),
+            ));
+        }
+        if !covering
+            .allowed_operations
+            .iter()
+            .any(|operation| operation == &survivor.operation_name)
+            || !covering
+                .allowed_resources
+                .iter()
+                .any(|resource| resource == &survivor.resource_ref)
+            || effect_rank(survivor.effect) > effect_rank(covering.max_effect)
+        {
+            return Err(CompositionError::Owner(
+                "covering grant does not authorize the exact preserved use".to_owned(),
+            ));
+        }
+        let target_id = GrantId::new(target_grant_id)
+            .map_err(|_| CompositionError::Owner("preserved target is invalid".to_owned()))?;
+        let closure = self
+            .owner
+            .grants
+            .delegated_closure(&target_id)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        if !closure
+            .members
+            .iter()
+            .any(|member| member.grant_id.as_str() == survivor.grant_id)
+            || closure
+                .members
+                .iter()
+                .any(|member| member.grant_id.as_str() == survivor.covering_grant_id)
+        {
+            return Err(CompositionError::Owner(
+                "preserved survivor must be a target descendant and its cover must remain outside the fenced closure"
+                    .to_owned(),
+            ));
+        }
+        let survivor_hydration = registry_grant(registry, &survivor.grant_id).ok_or_else(|| {
+            CompositionError::Owner("preserved survivor has no admitted hydration".to_owned())
+        })?;
+        let covering_hydration =
+            registry_grant(registry, &survivor.covering_grant_id).ok_or_else(|| {
+                CompositionError::Owner("preserved cover has no admitted hydration".to_owned())
+            })?;
+        for hydration in [survivor_hydration, covering_hydration] {
+            if hydration.holder_principal != survivor.holder_principal
+                || hydration.session_id != survivor.session_id
+                || hydration.scope_id != survivor.scope_id
+            {
+                return Err(CompositionError::Owner(
+                    "preserved exact use disagrees with admitted principal/session/scope"
+                        .to_owned(),
                 ));
             }
+        }
+        if covering_hydration.authority_root_ref != survivor.covering_root_ref
+            || effect_rank(survivor.effect) > effect_rank(covering_hydration.allowed_effect)
+        {
+            return Err(CompositionError::Owner(
+                "preserved cover hydration does not authorize the exact use".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -982,6 +1269,39 @@ fn verify_imported_introduction_seal(
     Ok(())
 }
 
+const fn effect_rank(effect: EffectClass) -> u8 {
+    match effect {
+        EffectClass::Read => 0,
+        EffectClass::Candidate => 1,
+        EffectClass::ReversibleMutation => 2,
+        EffectClass::ExternalEffect => 3,
+    }
+}
+
+fn registry_grant<'a>(
+    registry: &'a AdmittedHydrations,
+    grant_id: &str,
+) -> Option<&'a GrantActivationIntent> {
+    registry
+        .members
+        .get(grant_id)
+        .map(|member| &member.intent)
+        .or_else(|| registry.roots.get(grant_id).map(|root| &root.intent))
+}
+
+fn reject_digest(value: &str, field: &'static str) -> Result<(), CompositionError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(CompositionError::Owner(format!(
+            "{field} must be a lowercase SHA-256 digest"
+        )));
+    }
+    Ok(())
+}
+
 /// Rejects blank or control-character identities before admission.
 fn reject_blank(value: &str, field: &'static str) -> Result<(), CompositionError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
@@ -997,18 +1317,74 @@ fn reject_blank(value: &str, field: &'static str) -> Result<(), CompositionError
     Ok(())
 }
 
-/// Versioned admitted-registry snapshot for daemon state persistence.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Versioned admitted-registry snapshot carried by the canonical authority
+/// owner state and re-admitted before every Kernel owner publication.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct AdmittedHydrationsSnapshot {
-    schema: String,
-    version: u16,
-    state_fence: StateFence,
-    grant_graph_revision: u64,
-    members: Vec<GrantClosureMember>,
-    roots: Vec<RootGrantHydration>,
-    introductions: Vec<IntroductionHydration>,
-    preserved: Vec<(String, Vec<GrantClosureSurvivor>)>,
+pub struct AdmittedHydrationsSnapshot {
+    /// Closed owner-hydration schema identity.
+    pub schema: String,
+    /// Closed owner-hydration schema version.
+    pub version: u16,
+    /// Exact canonical owner fence.
+    pub state_fence: StateFence,
+    /// Exact grant-graph revision admitted by the owner.
+    pub grant_graph_revision: u64,
+    /// Complete delegated member hydrations.
+    #[schemars(with = "String")]
+    pub members: Vec<GrantClosureMember>,
+    /// Complete authority-root hydrations.
+    #[schemars(with = "String")]
+    pub roots: Vec<RootGrantHydration>,
+    /// Complete introduction hydrations.
+    #[schemars(with = "String")]
+    pub introductions: Vec<IntroductionHydration>,
+    /// Complete owner-declared alternate-path dispositions.
+    #[schemars(with = "String")]
+    pub preserved: Vec<(String, Vec<GrantClosureSurvivor>)>,
+}
+
+impl AdmittedHydrationsSnapshot {
+    /// Creates the only shape-valid empty registry: an owner with no admitted
+    /// grant closure is still refused by [`OwnerClosureProvider::serve_restore`]
+    /// until real hydrations are present.
+    pub fn empty(
+        state_fence: StateFence,
+        grant_graph_revision: u64,
+    ) -> Result<Self, CompositionError> {
+        if grant_graph_revision == 0 {
+            return Err(CompositionError::Recovery(
+                "owner hydration snapshot revision must be nonzero".to_owned(),
+            ));
+        }
+        let snapshot = Self {
+            schema: OWNER_HYDRATION_SNAPSHOT_SCHEMA.to_owned(),
+            version: OWNER_HYDRATION_SNAPSHOT_VERSION,
+            state_fence,
+            grant_graph_revision,
+            members: Vec::new(),
+            roots: Vec::new(),
+            introductions: Vec::new(),
+            preserved: Vec::new(),
+        };
+        snapshot.validate_shape()?;
+        Ok(snapshot)
+    }
+
+    pub(crate) fn validate_shape(&self) -> Result<(), CompositionError> {
+        self.state_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.schema != OWNER_HYDRATION_SNAPSHOT_SCHEMA
+            || self.version != OWNER_HYDRATION_SNAPSHOT_VERSION
+            || self.grant_graph_revision == 0
+        {
+            return Err(CompositionError::Recovery(
+                "owner hydration snapshot has an invalid schema, version, or revision".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

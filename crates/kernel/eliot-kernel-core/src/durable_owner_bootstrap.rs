@@ -41,7 +41,7 @@ use crate::error::{KernelError, validate_id};
 use crate::governor_closure_source::{
     GovernorClosureRestore, GovernorClosureSource, GovernorClosureSourceHandle,
 };
-use crate::grant_activation_port::GrantActivationPort;
+use crate::grant_activation_port::{GrantActivationPort, activation_bytes_equal};
 
 /// Binds the canonical Governor owner to a fresh P-07 port at one exact
 /// graph revision.
@@ -50,25 +50,25 @@ use crate::grant_activation_port::GrantActivationPort;
 /// manifest or the ORS revision watermark read before startup): the restored
 /// graph revision must equal it exactly. A zero revision, an absent
 /// revocation history, an invalid snapshot, admitted material that disagrees
-/// with the graph, an empty root set, a revision disagreement, a stale
-/// presentation against the durable watermark, or admitted bytes that
-/// disagree with an already-committed durable row all refuse before any
-/// port is built.
+/// with the graph, a revision disagreement, a stale presentation against the
+/// durable watermark, or admitted bytes that disagree with an already-committed
+/// durable row all refuse before any port is built.
 ///
 /// # Errors
 ///
-/// Returns [`KernelError::InvalidField`] for a zero or disagreeing revision
-/// or an empty admitted root set, [`KernelError::RecoveryUnavailable`] for an
-/// unavailable history, invalid snapshot, disagreeing material, or stale
-/// watermark presentation, and [`KernelError::RecoveryState`] for an
-/// unusable ORS identity.
+/// Returns [`KernelError::InvalidField`] for a zero or disagreeing revision,
+/// [`KernelError::RecoveryUnavailable`] for an unavailable history, invalid
+/// snapshot, disagreeing material, or stale watermark presentation, and
+/// [`KernelError::RecoveryState`] for an unusable ORS identity.
 pub fn bind_canonical_owner(
     restore: GovernorClosureRestore,
     expected_revision: u64,
     store: Arc<dyn OperationalRecoveryStore>,
 ) -> Result<BoundCanonicalOwner, KernelError> {
     verify_bundle_provenance(&restore, &store)?;
+    let bound_digest = owner_bundle_digest(&restore)?;
     let (source, roots) = checked_source(restore, expected_revision)?;
+    let revoked_grants = source.revoked_grants();
     advance_revision_watermark(&store, &roots, expected_revision)?;
     let source_handle: GovernorClosureSourceHandle = Arc::new(source);
     let port = GrantActivationPort::with_durable_root_grant(
@@ -76,11 +76,13 @@ pub fn bind_canonical_owner(
             as Arc<dyn crate::grant_activation_port::RootGrantHydrationSource>,
         store,
     );
+    port.rehydrate_committed_authority(&roots, expected_revision, &revoked_grants)?;
     Ok(BoundCanonicalOwner {
         port,
         source: source_handle,
         bound_revision: expected_revision,
         bound_roots: roots,
+        bound_digest,
     })
 }
 
@@ -94,6 +96,7 @@ pub struct BoundCanonicalOwner {
     source: GovernorClosureSourceHandle,
     bound_revision: u64,
     bound_roots: Vec<String>,
+    bound_digest: String,
 }
 
 impl BoundCanonicalOwner {
@@ -146,12 +149,27 @@ impl BoundCanonicalOwner {
                 reason: "owner refresh must not move the bound revision backwards",
             });
         }
+        let candidate_digest = owner_bundle_digest(&restore)?;
+        if expected_revision == self.bound_revision && candidate_digest != self.bound_digest {
+            return Err(KernelError::RecoveryUnavailable(
+                "same-revision owner refresh carries different canonical bytes".to_owned(),
+            ));
+        }
         verify_bundle_provenance(&restore, store)?;
-        let (checked, roots) = checked_source(restore.clone(), expected_revision)?;
-        drop(checked);
+        let (checked, roots) = checked_source(restore, expected_revision)?;
+        let revoked_grants = checked.revoked_grants();
+        let candidate_source: GovernorClosureSourceHandle = Arc::new(checked);
         advance_revision_watermark(store, &roots, expected_revision)?;
-        self.source.refresh(restore)?;
+        let candidate_port = GrantActivationPort::with_durable_root_grant(
+            Arc::clone(&candidate_source)
+                as Arc<dyn crate::grant_activation_port::RootGrantHydrationSource>,
+            Arc::clone(store),
+        );
+        candidate_port.rehydrate_committed_authority(&roots, expected_revision, &revoked_grants)?;
+        self.source = candidate_source;
+        self.port = candidate_port;
         self.bound_revision = self.source.revision();
+        self.bound_digest = candidate_digest;
         self.bound_roots = self.source.authority_roots();
         Ok(())
     }
@@ -215,12 +233,6 @@ fn checked_source(
         });
     }
     let roots = source.authority_roots();
-    if roots.is_empty() {
-        return Err(KernelError::InvalidField {
-            field: "restore.roots",
-            reason: "the bound owner must admit at least one lineage root",
-        });
-    }
     for root in &roots {
         validate_id(root, "restore.root.authority_root_ref")?;
     }
@@ -264,13 +276,14 @@ fn verify_bundle_provenance(
         if let Some(existing) = store
             .load_capability_grant(&subject)
             .map_err(KernelError::RecoveryState)?
+            && existing.record() != record
+            && !(existing.phase() == eliot_ors::OperationalPhase::Fenced
+                && activation_bytes_equal(existing.record(), record))
         {
-            if existing.record() != record {
-                return Err(KernelError::InvalidField {
-                    field: "restore.durable_record",
-                    reason: "admitted bytes disagree with the committed durable row",
-                });
-            }
+            return Err(KernelError::InvalidField {
+                field: "restore.durable_record",
+                reason: "admitted bytes disagree with the committed durable row",
+            });
         }
     }
     for hydration in &restore.introductions {
@@ -279,13 +292,14 @@ fn verify_bundle_provenance(
         if let Some(existing) = store
             .load_capability_introduction(&subject)
             .map_err(KernelError::RecoveryState)?
+            && existing.record() != hydration.durable_record.record()
+            && !(existing.phase() == eliot_ors::OperationalPhase::Fenced
+                && activation_bytes_equal(existing.record(), hydration.durable_record.record()))
         {
-            if existing.record() != hydration.durable_record.record() {
-                return Err(KernelError::InvalidField {
-                    field: "restore.durable_record",
-                    reason: "admitted bytes disagree with the committed durable row",
-                });
-            }
+            return Err(KernelError::InvalidField {
+                field: "restore.durable_record",
+                reason: "admitted bytes disagree with the committed durable row",
+            });
         }
     }
     Ok(())
@@ -300,16 +314,12 @@ fn advance_revision_watermark(
     roots: &[String],
     revision: u64,
 ) -> Result<(), KernelError> {
-    for root in roots {
-        let label = OpaqueLabel::new(root).map_err(KernelError::RecoveryState)?;
-        let stored = store
-            .note_grant_graph_revision(&label, revision)
-            .map_err(KernelError::RecoveryState)?;
-        if stored != revision {
-            return Err(KernelError::RecoveryUnavailable(
-                "stale owner revision against the durable grant-graph watermark".to_owned(),
-            ));
-        }
-    }
-    Ok(())
+    let revisions = roots
+        .iter()
+        .map(|root| OpaqueLabel::new(root).map(|label| (label, revision)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(KernelError::RecoveryState)?;
+    store
+        .note_grant_graph_revisions(&revisions)
+        .map_err(KernelError::RecoveryState)
 }

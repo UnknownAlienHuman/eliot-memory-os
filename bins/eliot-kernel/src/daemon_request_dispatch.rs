@@ -387,6 +387,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "agent_host_request_cancel" => "agent_host_request_cancel",
         "publish_owner_bundle" => "publish_owner_bundle",
         "query_owner_bundle" => "query_owner_bundle",
+        "initialize_owner_revision" => "initialize_owner_revision",
         "activate_grant" => "activate_grant",
         "revoke_grant" => "revoke_grant",
         "activate_introduction" => "activate_introduction",
@@ -438,6 +439,15 @@ struct StoreRecoveryOperation {
 struct OwnerPublishOperation {
     bundle: super::GovernorClosureRestore,
     expected_revision: u64,
+}
+
+/// Closed owner-lineage revision initialization operation (`#2100`).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerRevisionOperation {
+    authority_root_ref: String,
+    expected_revision: u64,
+    state_fence: StateFence,
 }
 
 /// Closed P-07 grant activation operation (`#1110`).
@@ -548,6 +558,12 @@ fn owner_bundle_agrees_with_session(
     bundle: &super::GovernorClosureRestore,
     session: &Session,
 ) -> bool {
+    let Some(history) = &bundle.revocation_history else {
+        return false;
+    };
+    if history.state_fence != session.module_generation.state_fence {
+        return false;
+    }
     let mut bindings = bundle
         .members
         .iter()
@@ -560,9 +576,8 @@ fn owner_bundle_agrees_with_session(
                 .map(|hydration| &hydration.intent.binding),
         );
     bindings.all(|binding| {
-        binding
-            .authority_epoch
-            .is_same_authority(&session.authority_epoch)
+        binding.authority_epoch == session.authority_epoch
+            && binding.state_fence == session.module_generation.state_fence
     })
 }
 
@@ -1196,6 +1211,27 @@ impl KernelComposition {
                 Ok(host_request_route::host_request_rehydrated_response(
                     &record,
                 ))
+            }
+            "initialize_owner_revision" => {
+                let operation: OwnerRevisionOperation = serde_json::from_value(payload.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if operation.state_fence != session.module_generation.state_fence {
+                    return Err(TransportError::SessionFenced);
+                }
+                let revision = self
+                    .initialize_p07_owner_revision(
+                        &operation.authority_root_ref,
+                        operation.expected_revision,
+                        &operation.state_fence,
+                    )
+                    .map_err(|error| match error {
+                        KernelBuildError::Core(_) => TransportError::IdentityConflict,
+                        _ => TransportError::SessionFenced,
+                    })?;
+                Ok(serde_json::json!({
+                    "kind": "owner_revision_receipt",
+                    "value": { "revision": revision },
+                }))
             }
             "publish_owner_bundle" => {
                 let operation: OwnerPublishOperation = serde_json::from_value(payload.clone())

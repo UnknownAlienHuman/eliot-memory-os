@@ -101,11 +101,19 @@ impl PersistedValue for ScopeReservationHead {
     }
 }
 
+impl PersistedValue for crate::GrantClosureCommit {
+    const RECORD_TYPE: &'static str = "grant_closure_commit";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        crate::model::validate_grant_closure_contract(self)
+    }
+}
+
 impl PersistedValue for DurableGrantClosureRecord {
     const RECORD_TYPE: &'static str = "grant_closure";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
-        self.commit.validate()?;
+        PersistedValue::validate_persisted(&self.commit)?;
         if self.operation_order == 0 {
             return Err(OrsError::IntegrityProblem {
                 record_type: "grant_closure",
@@ -114,7 +122,7 @@ impl PersistedValue for DurableGrantClosureRecord {
         }
         let expected = match self.commit.state {
             crate::GrantClosureState::Active => OperationalPhase::Active,
-            crate::GrantClosureState::Fenced => OperationalPhase::Fenced,
+            crate::GrantClosureState::Revoked => OperationalPhase::Fenced,
         };
         if self.phase != expected {
             return Err(OrsError::IntegrityProblem {

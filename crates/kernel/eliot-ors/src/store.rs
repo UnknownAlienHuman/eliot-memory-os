@@ -4,7 +4,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_platform::PlatformHandle;
-use eliot_receipts::{ReceiptDispositionKind, ReceiptEnvelope};
+use eliot_receipts::{
+    AuthorityBinding, GRANT_CLOSURE_SCHEMA, GRANT_CLOSURE_VERSION, GrantClosureOrsReceiptRef,
+    ReceiptDispositionKind, ReceiptEnvelope,
+};
 use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
     SignedSupervisionLease, VerifiedSupervisionLease, VerifiedSupervisionLeaseTerminalTransition,
@@ -46,11 +49,12 @@ use crate::{
     DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity, EpochLineage,
     GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
     GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit,
-    GrantClosureCommitReceipt, GrantClosureProjection, HostRequestRecord, HostRequestState,
-    JobCheckpoint, KernelAuthoritySnapshot, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
-    NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationalMutationReceipt,
-    OperationalPhase, OperationalRecordContext, OperationalRecordInput, OrsError,
-    OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord,
+    GrantClosureCommitReceipt, GrantClosureFenceReceipt, GrantClosureFenceRequest,
+    GrantClosureProjection, GrantClosureState, HostRequestRecord, HostRequestState, JobCheckpoint,
+    KernelAuthoritySnapshot, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
+    NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationIdentity,
+    OperationalMutationReceipt, OperationalPhase, OperationalRecordContext, OperationalRecordInput,
+    OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord,
     ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
     RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
     RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope, RecoveryProblem,
@@ -128,14 +132,25 @@ const RECOVERY_PROBLEMS: TableDefinition<&str, &str> =
 /// Durable grant-closure rows: one committed closure operation identity with
 /// its exact commit bytes, phase, and order (issue #2100). Keyed by the
 /// closure operation identity; rows never transition.
-const GRANT_CLOSURE_CURRENT: TableDefinition<&str, &str> =
+/// Legacy grant-closure rows are retained only as an explicit migration
+/// boundary. New code never reinterprets their old wire shape.
+const GRANT_CLOSURE_LEGACY_CURRENT: TableDefinition<&str, &str> =
     TableDefinition::new("ors_grant_closure_current_v1");
+const GRANT_CLOSURE_CURRENT: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_grant_closure_current_v2");
 /// Durable grant-graph revision watermarks: the greatest graph revision
 /// observed for one lineage root (issue #2100). Keyed by the authority root;
 /// the stored revision only moves forward.
 const GRANT_GRAPH_REVISION_CURRENT: TableDefinition<&str, &str> =
     TableDefinition::new("ors_grant_graph_revision_current_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
+
+struct ClosureRowPlan {
+    key: String,
+    record: DurableOperationalRecord,
+    transitioned: bool,
+}
+
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY: &str = "supervision_stage_resolution_schema";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1: &str = "eliot.ors.supervision-stage-resolution.v1";
 /// Ceiling on table names enumerated at store open. Provenance checks and the
@@ -336,12 +351,28 @@ pub trait OperationalRecoveryStore: Send + Sync {
     /// An exact recommit under one operation identity returns the durable
     /// receipt unchanged; any changed content under one identity fails with
     /// [`OrsError::DuplicateConflict`] and never overwrites. The row never
-    /// transitions: activation closures commit `Active`, revocation closures
-    /// commit `Fenced`.
+    /// transitions: this compatibility path is reserved for activation
+    /// closures (`Active`); revocation closures must use
+    /// [`Self::commit_grant_closure_fence`].
     fn commit_grant_closure(
         &self,
         closure: GrantClosureCommit,
     ) -> Result<GrantClosureCommitReceipt, OrsError>;
+    /// Atomically verifies and commits one complete grant-closure revocation.
+    ///
+    /// The single `RedDB` write transaction checks the per-root graph revision
+    /// against `request.declaration.grant_graph_revision` (or initializes an absent watermark
+    /// to that exact nonzero revision), verifies every presented grant and
+    /// introduction record against its current durable row, transitions only
+    /// `Active` rows to `Fenced`, advances the watermark when needed, and
+    /// writes the closure projection. Any mismatch aborts the transaction;
+    /// there is no partial member fence or partial closure receipt. Exact
+    /// replay under identical bytes returns the same composite receipt without
+    /// a second transition.
+    fn commit_grant_closure_fence(
+        &self,
+        request: GrantClosureFenceRequest,
+    ) -> Result<GrantClosureFenceReceipt, OrsError>;
     /// Reads one committed grant-closure row after validating its key,
     /// content, phase, and store-issued receipt. The returned value is
     /// operational evidence only; it grants no capability.
@@ -361,6 +392,10 @@ pub trait OperationalRecoveryStore: Send + Sync {
         authority_root: &OpaqueLabel,
         revision: u64,
     ) -> Result<u64, OrsError>;
+    /// Atomically advances every supplied lineage watermark. A stale or
+    /// malformed member aborts the whole batch, so a global owner revision
+    /// cannot race a closure on a root that has not yet been advanced.
+    fn note_grant_graph_revisions(&self, revisions: &[(OpaqueLabel, u64)]) -> Result<(), OrsError>;
     /// Reads the durable grant-graph revision watermark for one lineage
     /// root, if any.
     fn load_grant_graph_revision(
@@ -4780,6 +4815,10 @@ impl RedbRecoveryStore {
         Self::open_with_evidence(path, Arc::new(crate::test_support::KernelRouteEvidence))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "schema initialization keeps the durable table contract in one auditable transaction setup"
+    )]
     fn initialize(&self) -> Result<(), OrsError> {
         let write = self.database.begin_write().map_err(storage)?;
         // Bounded: provenance below and the journal family check that follows
@@ -4831,6 +4870,29 @@ impl RedbRecoveryStore {
         // also re-checks the table ceiling as a postcondition, so the base
         // tables added above cannot push this transaction past the bound.
         restore_journal::initialize_restore_journal_schema(&write)?;
+        // #2100: the grant-closure family is a separate concern from the base
+        // ORS tables, so it is opened AFTER the journal initializer rather than
+        // inside the base block. Opening it in the same write transaction keeps
+        // the whole schema adoption atomic: either every table this store needs
+        // exists, or the transaction rolls back and recovery is retried.
+        {
+            let legacy_closure = write
+                .open_table(GRANT_CLOSURE_LEGACY_CURRENT)
+                .map_err(storage)?;
+            if legacy_closure.iter().map_err(storage)?.next().is_some() {
+                return Err(OrsError::MigrationRequired {
+                    reason: "legacy grant-closure rows require an explicit migration before owner recovery"
+                        .to_owned(),
+                });
+            }
+            drop(legacy_closure);
+            drop(write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?);
+            drop(
+                write
+                    .open_table(GRANT_GRAPH_REVISION_CURRENT)
+                    .map_err(storage)?,
+            );
+        }
         Self::validate_activation_result_retention_table(&write)?;
         write.commit().map_err(storage)
     }
@@ -5513,8 +5575,8 @@ impl RedbRecoveryStore {
     ) -> Result<OperationalMutationReceipt, OrsError> {
         let encoded = encode(record)?;
         OperationalMutationReceipt::issue(
-            record.commit.operation_id.clone(),
-            record.commit.target_id.clone(),
+            OperationIdentity::new(record.commit.operation_id.as_str())?,
+            OperationIdentity::new(record.commit.declaration.target_grant_id.as_str())?,
             record.operation_order,
             record.phase,
             crate::model::sha256_hex(encoded.as_bytes()),
@@ -5741,6 +5803,117 @@ impl RedbRecoveryStore {
                 decode_named::<DurableOperationalRecord>(value.value(), "operational_current")
             })
             .transpose()
+    }
+
+    fn grant_graph_revision_from_write(
+        write: &redb::WriteTransaction,
+        authority_root: &str,
+    ) -> Result<Option<DurableGrantGraphRevision>, OrsError> {
+        let key = format!("grant_graph_revision:{authority_root}");
+        let current = write
+            .open_table(GRANT_GRAPH_REVISION_CURRENT)
+            .map_err(storage)?;
+        let Some(value) = current.get(key.as_str()).map_err(storage)? else {
+            return Ok(None);
+        };
+        let row: DurableGrantGraphRevision = decode_named(value.value(), "grant_graph_revision")?;
+        if row.root.as_str() != authority_root {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_graph_revision",
+                reason: "current revision key or lineage root mismatch".to_owned(),
+            });
+        }
+        Ok(Some(row))
+    }
+
+    fn plan_closure_row(
+        write: &redb::WriteTransaction,
+        authority: &AuthorityBinding,
+        kind: OperationalKind,
+        input: &crate::OperationalRecordInput,
+    ) -> Result<ClosureRowPlan, OrsError> {
+        crate::model::validate_grant_closure_input(authority, input)?;
+        let key = Self::operational_key(kind, &input.subject_id);
+        let current =
+            Self::decode_operational_current(write, &key)?.ok_or(OrsError::InvalidTransition)?;
+        if current.kind != kind
+            || current.input.subject_id != input.subject_id
+            || current.generation_cutover.is_some()
+            || !input
+                .authority_epoch
+                .succeeds(&current.input.authority_epoch.current)
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_closure_member",
+                reason:
+                    "current operational row identity, kind, or epoch disagrees with the request"
+                        .to_owned(),
+            });
+        }
+        let mut expected_input = input.clone();
+        expected_input.record_id = current.input.record_id.clone();
+        let (record, transitioned) = match current.phase {
+            OperationalPhase::Active => {
+                if current.input.record_id == input.record_id || current.input != expected_input {
+                    return Err(OrsError::DuplicateConflict);
+                }
+                let mut next = current.clone();
+                next.input = input.clone();
+                next.phase = OperationalPhase::Fenced;
+                next.operation_order = 0;
+                next.terminal_receipt_id = None;
+                next.terminal_receipt_sha256 = None;
+                (next, true)
+            }
+            OperationalPhase::Fenced => {
+                if current.input != *input {
+                    return Err(OrsError::DuplicateConflict);
+                }
+                (current, false)
+            }
+            _ => return Err(OrsError::InvalidTransition),
+        };
+        Ok(ClosureRowPlan {
+            key,
+            record,
+            transitioned,
+        })
+    }
+
+    fn plan_grant_closure_member_rows(
+        write: &redb::WriteTransaction,
+        authority: &AuthorityBinding,
+        revocations: &[CapabilityGrantRevocation],
+    ) -> Result<Vec<ClosureRowPlan>, OrsError> {
+        revocations
+            .iter()
+            .map(|revocation| {
+                Self::plan_closure_row(
+                    write,
+                    authority,
+                    OperationalKind::CapabilityGrant,
+                    revocation.record(),
+                )
+            })
+            .collect()
+    }
+
+    fn plan_grant_closure_introduction_rows(
+        write: &redb::WriteTransaction,
+        authority: &AuthorityBinding,
+        fences: &[CapabilityIntroductionFence],
+    ) -> Result<Vec<ClosureRowPlan>, OrsError> {
+        fences
+            .iter()
+            .map(|fence| {
+                Self::plan_closure_row(
+                    write,
+                    authority,
+                    OperationalKind::CapabilityIntroduction,
+                    fence.record(),
+                )
+            })
+            .collect()
     }
 
     /// Persists one candidate transition before the cutover linearization
@@ -6356,6 +6529,212 @@ impl RedbRecoveryStore {
             &durable,
         )?))
     }
+    fn grant_closure_receipt_refs(
+        plans: &[ClosureRowPlan],
+    ) -> Result<Vec<GrantClosureOrsReceiptRef>, OrsError> {
+        plans
+            .iter()
+            .map(|plan| {
+                let receipt = Self::receipt_for(&plan.record)?;
+                Ok(GrantClosureOrsReceiptRef {
+                    record_id: receipt.record_id().as_str().to_owned(),
+                    subject_id: receipt.subject_id().as_str().to_owned(),
+                    operation_order: receipt.operation_order(),
+                    state: GrantClosureState::Revoked,
+                    state_sha256: receipt.state_sha256().to_owned(),
+                })
+            })
+            .collect()
+    }
+
+    fn grant_closure_commit_from_request(
+        request: &GrantClosureFenceRequest,
+        member_plans: &[ClosureRowPlan],
+        introduction_plans: &[ClosureRowPlan],
+    ) -> Result<GrantClosureCommit, OrsError> {
+        let commit = GrantClosureCommit {
+            schema: GRANT_CLOSURE_SCHEMA.to_owned(),
+            version: GRANT_CLOSURE_VERSION,
+            operation_id: request.operation_id.clone(),
+            idempotency_digest: request.idempotency_digest.clone(),
+            declaration: request.declaration.clone(),
+            authority: request.authority.clone(),
+            proof_ceiling: request.proof_ceiling,
+            authority_receipt: request.authority_receipt.clone(),
+            ors_member_receipts: Self::grant_closure_receipt_refs(member_plans)?,
+            fenced_introductions: request
+                .fenced_introductions
+                .iter()
+                .map(|identity| identity.as_str().to_owned())
+                .collect(),
+            ors_introduction_receipts: Self::grant_closure_receipt_refs(introduction_plans)?,
+            canonical_receipt: request.canonical_receipt.clone(),
+            state: GrantClosureState::Revoked,
+        };
+        crate::model::validate_grant_closure_contract(&commit)?;
+        Ok(commit)
+    }
+
+    fn grant_closure_fence_receipt(
+        commit: &GrantClosureCommit,
+        closure_record: &DurableGrantClosureRecord,
+        member_plans: &[ClosureRowPlan],
+        introduction_plans: &[ClosureRowPlan],
+    ) -> Result<GrantClosureFenceReceipt, OrsError> {
+        let closure_receipt =
+            GrantClosureCommitReceipt::from_receipt(Self::closure_receipt_for(closure_record)?);
+        let member_receipts = member_plans
+            .iter()
+            .map(|plan| {
+                Ok(AuthorityRevocationReceipt::from_receipt(Self::receipt_for(
+                    &plan.record,
+                )?))
+            })
+            .collect::<Result<Vec<_>, OrsError>>()?;
+        let introduction_receipts = introduction_plans
+            .iter()
+            .map(|plan| {
+                Ok(CapabilityIntroductionReceipt::from_receipt(
+                    Self::receipt_for(&plan.record)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, OrsError>>()?;
+        Ok(GrantClosureFenceReceipt::from_parts(
+            commit.clone(),
+            closure_receipt,
+            member_receipts,
+            introduction_receipts,
+        ))
+    }
+
+    /// Commits a complete owner-declared grant closure and all presented ORS
+    /// member fences in one `RedDB` write transaction.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the atomic transaction keeps revision, every member, and the closure receipt in one fail-closed sequence"
+    )]
+    pub fn commit_grant_closure_fence(
+        &self,
+        request: &GrantClosureFenceRequest,
+    ) -> Result<GrantClosureFenceReceipt, OrsError> {
+        request.validate()?;
+        let closure_key = format!("grant_closure:{}", request.operation_id);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing = {
+            let current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+            current
+                .get(closure_key.as_str())
+                .map_err(storage)?
+                .map(|value| {
+                    decode_named::<DurableGrantClosureRecord>(value.value(), "grant_closure")
+                })
+                .transpose()?
+        };
+        let watermark = Self::grant_graph_revision_from_write(
+            &write,
+            request.declaration.authority_root_ref.as_str(),
+        )?;
+        let Some(retained) = watermark.as_ref() else {
+            return Err(OrsError::MigrationRequired {
+                reason: "grant-closure fencing requires a pre-existing owner graph revision head"
+                    .to_owned(),
+            });
+        };
+        if retained.revision != request.declaration.grant_graph_revision {
+            return Err(OrsError::InvalidField {
+                field: "grant_closure_revision",
+                reason: "durable grant-graph revision does not match the closure",
+            });
+        }
+
+        if let Some(existing) = existing {
+            if existing.phase != OperationalPhase::Fenced {
+                return Err(OrsError::DuplicateConflict);
+            }
+            if watermark.is_none() {
+                return Err(OrsError::MigrationRequired {
+                    reason: "committed grant closure has no durable graph-revision watermark"
+                        .to_owned(),
+                });
+            }
+            let member_plans = Self::plan_grant_closure_member_rows(
+                &write,
+                &request.authority,
+                &request.grant_revocations,
+            )?;
+            let introduction_plans = Self::plan_grant_closure_introduction_rows(
+                &write,
+                &request.authority,
+                &request.introduction_fences,
+            )?;
+            if member_plans.iter().any(|plan| plan.transitioned)
+                || introduction_plans.iter().any(|plan| plan.transitioned)
+            {
+                return Err(OrsError::MigrationRequired {
+                    reason: "committed grant closure is missing one or more exact member fences"
+                        .to_owned(),
+                });
+            }
+            let commit = Self::grant_closure_commit_from_request(
+                request,
+                &member_plans,
+                &introduction_plans,
+            )?;
+            if commit != existing.commit {
+                return Err(OrsError::DuplicateConflict);
+            }
+            return Self::grant_closure_fence_receipt(
+                &commit,
+                &existing,
+                &member_plans,
+                &introduction_plans,
+            );
+        }
+
+        let mut member_plans = Self::plan_grant_closure_member_rows(
+            &write,
+            &request.authority,
+            &request.grant_revocations,
+        )?;
+        let mut introduction_plans = Self::plan_grant_closure_introduction_rows(
+            &write,
+            &request.authority,
+            &request.introduction_fences,
+        )?;
+        for plan in member_plans
+            .iter_mut()
+            .chain(introduction_plans.iter_mut())
+            .filter(|plan| plan.transitioned)
+        {
+            plan.record.operation_order = Self::next_operational_order(&write)?;
+        }
+        let commit =
+            Self::grant_closure_commit_from_request(request, &member_plans, &introduction_plans)?;
+        for plan in member_plans.iter().chain(introduction_plans.iter()) {
+            if plan.transitioned {
+                Self::persist_operational_record(&write, &plan.key, &plan.record)?;
+            }
+        }
+        let closure_record = DurableGrantClosureRecord {
+            commit,
+            phase: OperationalPhase::Fenced,
+            operation_order: Self::next_operational_order(&write)?,
+        };
+        let encoded = encode(&closure_record)?;
+        {
+            let mut current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+            current
+                .insert(closure_key.as_str(), encoded.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Self::grant_closure_fence_receipt(
+            &closure_record.commit,
+            &closure_record,
+            &member_plans,
+            &introduction_plans,
+        )
+    }
 }
 
 impl OperationalRecoveryStore for RedbRecoveryStore {
@@ -6826,9 +7205,12 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         &self,
         closure: GrantClosureCommit,
     ) -> Result<GrantClosureCommitReceipt, OrsError> {
-        closure.validate()?;
-        let phase = closure.state.phase();
-        let key = format!("grant_closure:{}", closure.operation_id.as_str());
+        crate::model::validate_grant_closure_contract(&closure)?;
+        if closure.state != GrantClosureState::Active {
+            return Err(OrsError::InvalidTransition);
+        }
+        let phase = crate::model::grant_closure_phase(closure.state);
+        let key = format!("grant_closure:{}", closure.operation_id);
         let write = self.database.begin_write().map_err(storage)?;
         let existing = {
             let current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
@@ -6841,7 +7223,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 .transpose()?
         };
         if let Some(existing) = existing {
-            if existing.commit.operation_id.as_str() != closure.operation_id.as_str() {
+            if existing.commit.operation_id != closure.operation_id {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "grant_closure",
                     reason: "current grant-closure key or operation identity mismatch".to_owned(),
@@ -6873,6 +7255,13 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         ))
     }
 
+    fn commit_grant_closure_fence(
+        &self,
+        request: GrantClosureFenceRequest,
+    ) -> Result<GrantClosureFenceReceipt, OrsError> {
+        RedbRecoveryStore::commit_grant_closure_fence(self, &request)
+    }
+
     fn load_grant_closure(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -6884,7 +7273,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             return Ok(None);
         };
         let record: DurableGrantClosureRecord = decode_named(value.value(), "grant_closure")?;
-        if record.commit.operation_id.as_str() != operation_id.as_str() {
+        if record.commit.operation_id != operation_id.as_str() {
             return Err(OrsError::IntegrityProblem {
                 record_type: "grant_closure",
                 reason: "current grant-closure key or operation identity mismatch".to_owned(),
@@ -6929,13 +7318,13 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 });
             }
             let commit = &record.commit;
-            if commit.authority_root.as_str() != lineage.as_str()
-                && commit.target_id.as_str() != lineage.as_str()
+            if commit.declaration.authority_root_ref.as_str() != lineage.as_str()
+                && commit.declaration.target_grant_id.as_str() != lineage.as_str()
             {
                 continue;
             }
             match resolved_root.as_deref() {
-                Some(known) if known != commit.authority_root.as_str() => {
+                Some(known) if known != commit.declaration.authority_root_ref.as_str() => {
                     return Err(OrsError::IntegrityProblem {
                         record_type: "grant_closure",
                         reason: "one lineage selector resolves to more than one lineage root"
@@ -6943,7 +7332,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                     });
                 }
                 Some(_) => {}
-                None => resolved_root = Some(commit.authority_root.as_str().to_owned()),
+                None => resolved_root = Some(commit.declaration.authority_root_ref.clone()),
             }
             rows.push((record.operation_order, record));
             if rows.len() > usize::from(limit) {
@@ -7026,6 +7415,76 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             write.commit().map_err(storage)?;
         }
         Ok(stored)
+    }
+
+    fn note_grant_graph_revisions(&self, revisions: &[(OpaqueLabel, u64)]) -> Result<(), OrsError> {
+        if revisions.is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "grant_graph_revisions",
+                reason: "at least one lineage revision is required",
+            });
+        }
+        let batch_revision = revisions[0].1;
+        if revisions
+            .iter()
+            .any(|(_, revision)| *revision != batch_revision)
+        {
+            return Err(OrsError::InvalidField {
+                field: "grant_graph_revisions",
+                reason: "all lineage roots in one owner batch must share the revision",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut roots = BTreeSet::new();
+        let mut pending = Vec::with_capacity(revisions.len());
+        for (root, revision) in revisions {
+            if *revision == 0 {
+                return Err(OrsError::InvalidField {
+                    field: "grant_graph_revision",
+                    reason: "must be greater than zero",
+                });
+            }
+            if !roots.insert(root.as_str().to_owned()) {
+                return Err(OrsError::InvalidField {
+                    field: "grant_graph_revisions",
+                    reason: "lineage roots must be unique",
+                });
+            }
+            let retained = Self::grant_graph_revision_from_write(&write, root.as_str())?;
+            if retained
+                .as_ref()
+                .is_some_and(|current| current.revision > *revision)
+            {
+                return Err(OrsError::InvalidField {
+                    field: "grant_graph_revision",
+                    reason: "a stale lineage revision cannot advance the owner batch",
+                });
+            }
+            if retained
+                .as_ref()
+                .is_none_or(|current| current.revision != *revision)
+            {
+                pending.push((root.clone(), *revision));
+            }
+        }
+        if !pending.is_empty() {
+            let mut current = write
+                .open_table(GRANT_GRAPH_REVISION_CURRENT)
+                .map_err(storage)?;
+            for (root, revision) in pending {
+                let row = DurableGrantGraphRevision {
+                    root,
+                    revision,
+                    operation_order: Self::next_operational_order(&write)?,
+                };
+                let key = format!("grant_graph_revision:{}", row.root.as_str());
+                let encoded = encode(&row)?;
+                current
+                    .insert(key.as_str(), encoded.as_str())
+                    .map_err(storage)?;
+            }
+        }
+        write.commit().map_err(storage)
     }
 
     fn load_grant_graph_revision(

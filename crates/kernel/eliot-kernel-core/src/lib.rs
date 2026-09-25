@@ -52,7 +52,8 @@ pub use authority_controller::{
 pub use durable_owner_bootstrap::{BoundCanonicalOwner, bind_canonical_owner, owner_bundle_digest};
 pub use error::{KernelError, KernelResult};
 pub use governor_closure_source::{
-    GovernorClosureRestore, GovernorClosureSource, GovernorClosureSourceHandle,
+    GOVERNOR_CLOSURE_RESTORE_SCHEMA, GOVERNOR_CLOSURE_RESTORE_VERSION, GovernorClosureRestore,
+    GovernorClosureSource, GovernorClosureSourceHandle,
 };
 pub use grant_activation_port::{
     CommittedReceipt, GRANT_CLOSURE_ENUMERATION_FIELDS, GrantActivationIntent, GrantActivationPort,

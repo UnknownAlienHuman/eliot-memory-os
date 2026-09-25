@@ -34,6 +34,10 @@ use super::{DaemonComposition, kind_value};
 
 /// Daemon->Kernel front-door owner-bundle publish operation.
 const PUBLISH_OWNER_BUNDLE_OPERATION: &str = "publish_owner_bundle";
+/// Daemon->Kernel front-door owner-lineage revision initialization operation.
+const INITIALIZE_OWNER_REVISION_OPERATION: &str = "initialize_owner_revision";
+/// Typed receipt kind answered by the revision initialization arm.
+const OWNER_REVISION_RECEIPT_KIND: &str = "owner_revision_receipt";
 /// Daemon->Kernel front-door owner-bundle readback operation.
 const QUERY_OWNER_BUNDLE_OPERATION: &str = "query_owner_bundle";
 /// Typed receipt kind answered by the publish arm.
@@ -64,6 +68,13 @@ struct OwnerBundleReadbackWire {
     digest: Option<String>,
 }
 
+/// Wire shape answered by the owner-lineage revision initialization arm.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerRevisionReceiptWire {
+    revision: u64,
+}
+
 /// O1 Kernel publish endpoint for owner bundles: the one production
 /// [`OwnerPublishPort`] implementation, over the already-connected
 /// authenticated Kernel client.
@@ -89,6 +100,47 @@ impl KernelOwnerPublishPort {
 }
 
 impl OwnerPublishPort for KernelOwnerPublishPort {
+    async fn initialize_owner_revision(
+        &self,
+        authority_root_ref: &str,
+        expected_revision: u64,
+        state_fence: &eliot_contracts::StateFence,
+    ) -> Result<u64, CompositionError> {
+        if expected_revision == 0 || authority_root_ref.trim().is_empty() {
+            return Err(CompositionError::Owner(
+                "owner revision initialization requires a root and nonzero revision".to_owned(),
+            ));
+        }
+        let value = self
+            .kernel
+            .transact_async(
+                INITIALIZE_OWNER_REVISION_OPERATION,
+                serde_json::json!({
+                    "authority_root_ref": authority_root_ref,
+                    "expected_revision": expected_revision,
+                    "state_fence": state_fence,
+                }),
+            )
+            .await
+            .map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "owner revision initialization transport: {error}"
+                ))
+            })?;
+        let value = kind_value(&value, OWNER_REVISION_RECEIPT_KIND).map_err(|error| {
+            CompositionError::Owner(format!("owner revision receipt kind: {error}"))
+        })?;
+        let receipt: OwnerRevisionReceiptWire = serde_json::from_value(value).map_err(|error| {
+            CompositionError::Owner(format!("owner revision receipt does not decode: {error}"))
+        })?;
+        if receipt.revision != expected_revision {
+            return Err(CompositionError::Recovery(
+                "owner revision initialization receipt disagrees".to_owned(),
+            ));
+        }
+        Ok(receipt.revision)
+    }
+
     async fn publish_owner_bundle(
         &self,
         bundle: GovernorClosureRestore,
@@ -145,10 +197,9 @@ impl OwnerPublishPort for KernelOwnerPublishPort {
 }
 
 /// O1 owner-feed trigger state: the provider revision last proven published
-/// to the Kernel. `None` until the first readback-proven publish; the daemon
-/// runtime retains one trigger across passes so an unchanged provider
-/// performs no IO while a revision advance or a recovery re-presentation
-/// republishes exactly once per pass.
+/// to the Kernel. It is diagnostic only; every maintenance pass re-presents
+/// the current bundle so a same-revision Kernel owner loss cannot be hidden
+/// by process-local state.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct OwnerFeedTrigger {
     last_published_revision: Option<u64>,
@@ -175,11 +226,10 @@ impl OwnerFeedTrigger {
 /// Roots and the expected revision come from the live Governor authority
 /// snapshot at call time - never caller-supplied - so a stale trigger fails
 /// closed inside the feed exchange instead of publishing a partial closure.
-/// An unchanged provider revision performs no transport. Otherwise every
-/// admitted root is synchronized through the full
-/// read->decode->restore->publish->readback exchange at the catalogue history
-/// bound; the trigger records the revision only after every root binds with
-/// its readback proven.
+/// Every admitted root is synchronized through the full
+/// revision-initialize->read->decode->restore->publish->readback exchange at the
+/// catalogue history bound; the trigger records the revision only after every
+/// root binds with its readback proven.
 ///
 /// Returns `Ok(None)` when nothing needed publishing, `Ok(Some(revision))`
 /// when the Kernel readback proved the publish at that revision, and `Err`
@@ -197,9 +247,9 @@ pub async fn maintain_owner_feed(
             "owner feed live graph revision is zero".to_owned(),
         ));
     }
-    if trigger.last_published_revision == Some(revision) {
-        return Ok(None);
-    }
+    // The trigger is diagnostic only. Every pass re-presents the current
+    // bundle so a same-revision owner loss or digest change cannot be hidden
+    // by a process-local revision shortcut.
     let roots: Vec<String> = snapshot
         .grant_graph
         .grants
@@ -213,18 +263,16 @@ pub async fn maintain_owner_feed(
     }
     let reads = KernelContextReadClient::new(Arc::clone(kernel));
     let publish = KernelOwnerPublishPort::new(Arc::clone(kernel));
-    for root in &roots {
-        composition
-            .governor
-            .synchronize_kernel_owner(
-                &reads,
-                &publish,
-                root,
-                REVOCATION_HISTORY_MAX_RECORDS,
-                revision,
-            )
-            .await?;
-    }
+    composition
+        .governor
+        .synchronize_kernel_owner(
+            &reads,
+            &publish,
+            &roots,
+            REVOCATION_HISTORY_MAX_RECORDS,
+            revision,
+        )
+        .await?;
     trigger.last_published_revision = Some(revision);
     Ok(Some(revision))
 }

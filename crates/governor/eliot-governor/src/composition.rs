@@ -5310,6 +5310,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .grants
             .revoke(&request.grant_id)
             .is_ok();
+        if graph_reconciled {
+            self.owners.authority.invalidate_owner_hydrations();
+        }
         let retained = self.retain_presentation(presented)?;
         if !graph_reconciled {
             // Kernel already fenced this grant (the receipt above validated),
@@ -5560,7 +5563,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self,
         reads: &R,
         kernel: &K,
-        origin_ref: &str,
+        origin_refs: &[String],
         max_records: u32,
         expected_revision: u64,
     ) -> Result<u64, CompositionError> {
@@ -5571,7 +5574,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             kernel,
             snapshot,
             &state_fence,
-            origin_ref,
+            origin_refs,
             max_records,
             expected_revision,
         )

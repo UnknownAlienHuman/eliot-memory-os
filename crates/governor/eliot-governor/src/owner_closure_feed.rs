@@ -34,6 +34,9 @@
 //! transport bytes. [`publish_owner_feed`] remains available for a
 //! caller that already holds a restored provider.
 
+use std::collections::BTreeMap;
+
+use eliot_authority::RevocationHistoryEvidence;
 use eliot_contracts::StateFence;
 use eliot_kernel_core::{GovernorClosureRestore, owner_bundle_digest};
 use eliot_store_api::CanonicalReadClient;
@@ -58,6 +61,15 @@ pub trait OwnerPublishPort: Send + Sync {
         bundle: GovernorClosureRestore,
         expected_revision: u64,
     ) -> Result<u64, CompositionError>;
+    /// Initializes or proves the current owner-lineage graph revision before
+    /// the first history read. It carries no owner bundle or authority.
+    async fn initialize_owner_revision(
+        &self,
+        authority_root_ref: &str,
+        expected_revision: u64,
+        state_fence: &StateFence,
+    ) -> Result<u64, CompositionError>;
+
     /// Reads back the retained owner triple for verification.
     async fn query_owner_readback(
         &self,
@@ -132,22 +144,49 @@ pub async fn synchronize_owner_feed<
     kernel: &P,
     snapshot: AuthorityOwnerSnapshot,
     state_fence: &StateFence,
-    origin_ref: &str,
+    origin_refs: &[String],
     max_records: u32,
     expected_revision: u64,
 ) -> Result<u64, CompositionError> {
-    let request = revocation_history_read_request(state_fence, origin_ref, max_records)?;
-    let response = reads
-        .execute_named(request)
-        .await
-        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-    let evidence = decode_revocation_history_evidence(&response, state_fence)?;
-    if evidence.source_revision != expected_revision {
-        return Err(CompositionError::Recovery(format!(
-            "owner feed observed revision {} disagrees with expected {expected_revision}; trigger is stale",
-            evidence.source_revision
-        )));
+    if origin_refs.is_empty() {
+        return Err(CompositionError::Owner(
+            "owner feed requires at least one authority root".to_owned(),
+        ));
     }
+    let mut merged_closures = BTreeMap::new();
+    for origin_ref in origin_refs {
+        kernel
+            .initialize_owner_revision(origin_ref, expected_revision, state_fence)
+            .await?;
+        let request = revocation_history_read_request(state_fence, origin_ref, max_records)?;
+        let response = reads
+            .execute_named(request)
+            .await
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let evidence = decode_revocation_history_evidence(&response, state_fence)?;
+        if evidence.source_revision != expected_revision {
+            return Err(CompositionError::Recovery(format!(
+                "owner feed observed revision {} disagrees with expected {expected_revision}; trigger is stale",
+                evidence.source_revision
+            )));
+        }
+        for closure in evidence.closures {
+            if let Some(previous) = merged_closures.get(&closure.closure_id) {
+                if previous != &closure {
+                    return Err(CompositionError::Recovery(
+                        "owner histories disagree for the same closure identity".to_owned(),
+                    ));
+                }
+            } else {
+                merged_closures.insert(closure.closure_id.clone(), closure);
+            }
+        }
+    }
+    let evidence = RevocationHistoryEvidence {
+        state_fence: state_fence.clone(),
+        source_revision: expected_revision,
+        closures: merged_closures.into_values().collect(),
+    };
     let provider = OwnerClosureProvider::restore(snapshot, Some(evidence), state_fence)?;
     publish_owner_feed(kernel, &provider, expected_revision).await
 }

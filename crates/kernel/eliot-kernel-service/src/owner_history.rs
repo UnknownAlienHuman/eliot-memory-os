@@ -139,15 +139,15 @@ pub fn serve_authority_revocation_history(
     let mut resolved_root: Option<String> = None;
     for projection in &selected {
         let commit = projection.commit();
-        let target = commit.target_id.as_str();
-        let root = commit.authority_root.as_str();
+        let target = commit.declaration.target_grant_id.as_str();
+        let root = commit.declaration.authority_root_ref.as_str();
         if target != origin_ref && root != origin_ref {
             continue;
         }
         // Only fenced closures are revocation history. Activation
         // closures share the row kind and must never project as
         // revocations.
-        if commit.state != GrantClosureState::Fenced {
+        if commit.state != GrantClosureState::Revoked {
             continue;
         }
         match &resolved_root {
@@ -158,9 +158,10 @@ pub fn serve_authority_revocation_history(
             None => resolved_root = Some(root.to_owned()),
         }
         let mut dependents: Vec<String> = commit
-            .affected
+            .declaration
+            .members
             .iter()
-            .map(|identity| identity.as_str().to_owned())
+            .map(|member| member.grant_id.clone())
             .collect();
         dependents.sort();
         dependents.dedup();
@@ -169,7 +170,7 @@ pub fn serve_authority_revocation_history(
             root_ref: target.to_owned(),
             dependent_refs: dependents,
             invalidation_reason: RevocationReason::SourceRevoked,
-            revision: commit.revision,
+            revision: commit.declaration.grant_graph_revision,
         };
         record.validate()?;
         matched.push(record);
