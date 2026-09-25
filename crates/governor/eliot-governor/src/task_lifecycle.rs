@@ -101,8 +101,13 @@ pub enum TaskLifecycleError {
     Kernel(#[from] KernelPortError),
     /// The transition was not committed; the payload carries the typed
     /// disposition, retry directive, and recovery action.
+    ///
+    /// The payload is boxed so the enum stays pointer-sized on the success
+    /// path. The variant name, the carried [`StoreFailure`] value, and the
+    /// `Display` text are unchanged: the box is an allocation, never a
+    /// narrower or flattened payload.
     #[error("task transition was not committed (see store failure payload)")]
-    Store(StoreFailure),
+    Store(Box<StoreFailure>),
     /// Canonical bytes, digests, or envelope projection failed fail-closed.
     #[error("task transition serialization: {0}")]
     Serialization(String),
@@ -111,14 +116,35 @@ pub enum TaskLifecycleError {
 impl TaskLifecycleError {
     /// Returns the typed store failure when this error carries one.
     #[must_use]
-    pub const fn store_failure(&self) -> Option<&StoreFailure> {
+    pub fn store_failure(&self) -> Option<&StoreFailure> {
         match self {
-            Self::Store(failure) => Some(failure),
+            Self::Store(failure) => Some(failure.as_ref()),
             Self::Owner(_) | Self::Composition(_) | Self::Kernel(_) | Self::Serialization(_) => {
                 None
             }
         }
     }
+}
+
+/// The exact guarded task command one admitted task transition carries.
+///
+/// A guarded command is not three independent arguments: the subject
+/// [`TaskId`], the [`TaskCommandContext`] that binds the admitted State Fence
+/// and request context, and the closed [`TaskCommand`] are one owner-native
+/// value. Binding them here keeps every `apply_task*` entry point from being
+/// able to name a command without its task or its context, and it is what lets
+/// the campaign-learning-state entries carry their declared recipe and owner
+/// publication matrix without exceeding a readable argument list. Nothing is
+/// added, defaulted, or reordered: the group is a source shape, not a new
+/// admission step.
+#[derive(Clone, Debug)]
+pub struct GuardedTaskCommand {
+    /// Subject task of the transition.
+    pub task_id: TaskId,
+    /// Exact admitted command context, including its State Fence.
+    pub context: TaskCommandContext,
+    /// Closed owner-defined command.
+    pub command: TaskCommand,
 }
 
 /// Governor-owned task lifecycle adapter over one serialized owner.
@@ -230,7 +256,7 @@ fn map_store_error(
     ctx: &StoreFailureIdentityContext,
 ) -> TaskLifecycleError {
     match StoreFailure::from_store_error(error, ctx.clone()) {
-        Ok(failure) => TaskLifecycleError::Store(failure),
+        Ok(failure) => TaskLifecycleError::Store(Box::new(failure)),
         Err(contract) => TaskLifecycleError::Serialization(contract.to_string()),
     }
 }
@@ -389,10 +415,6 @@ fn task_envelope(
     Ok(envelope)
 }
 
-#[allow(
-    clippy::result_large_err,
-    reason = "TaskLifecycleError is the shared typed task-owner failure contract"
-)]
 fn validate_campaign_recipe_anchor(
     recipe: &LearningStateViewRecipe,
     identity: &eliot_protocol::RequestIdentity,
@@ -579,7 +601,6 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
     /// publication matrix on the same authenticated `UpdateTaskState` write.
     /// The owner rows are supplied by their real owner transitions; this
     /// method only validates their exact bindings and CAS expectations.
-    #[allow(clippy::too_many_arguments)]
     pub async fn propose_task_with_complete_campaign_sources(
         &self,
         identity: &eliot_protocol::RequestIdentity,
@@ -639,10 +660,13 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         &self,
         identity: &eliot_protocol::RequestIdentity,
         operation_id: OperationId,
-        task_id: TaskId,
-        context: TaskCommandContext,
-        command: TaskCommand,
+        guarded: GuardedTaskCommand,
     ) -> Result<WriteReceipt, TaskLifecycleError> {
+        let GuardedTaskCommand {
+            task_id,
+            context,
+            command,
+        } = guarded;
         identity
             .validate()
             .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("request_identity")))?;
@@ -752,11 +776,14 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         &self,
         identity: &eliot_protocol::RequestIdentity,
         operation_id: OperationId,
-        task_id: TaskId,
-        context: TaskCommandContext,
-        command: TaskCommand,
+        guarded: GuardedTaskCommand,
         recipe: LearningStateViewRecipe,
     ) -> Result<WriteReceipt, TaskLifecycleError> {
+        let GuardedTaskCommand {
+            task_id,
+            context,
+            command,
+        } = guarded;
         identity
             .validate()
             .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("request_identity")))?;
@@ -806,17 +833,19 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
 
     /// Applies a guarded task command while atomically retaining the complete
     /// owner-role publication matrix on the same canonical task transition.
-    #[allow(clippy::too_many_arguments)]
     pub async fn apply_task_with_complete_campaign_sources(
         &self,
         identity: &eliot_protocol::RequestIdentity,
         operation_id: OperationId,
-        task_id: TaskId,
-        context: TaskCommandContext,
-        command: TaskCommand,
+        guarded: GuardedTaskCommand,
         recipe: LearningStateViewRecipe,
         owner_publications: Vec<CampaignSourcePublication>,
     ) -> Result<WriteReceipt, TaskLifecycleError> {
+        let GuardedTaskCommand {
+            task_id,
+            context,
+            command,
+        } = guarded;
         identity
             .validate()
             .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("request_identity")))?;
@@ -872,15 +901,18 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         &self,
         identity: &eliot_protocol::RequestIdentity,
         operation_id: OperationId,
-        task_id: TaskId,
-        context: TaskCommandContext,
-        command: TaskCommand,
+        guarded: GuardedTaskCommand,
         recipe: LearningStateViewRecipe,
         owner_builder: F,
     ) -> Result<WriteReceipt, TaskLifecycleError>
     where
         F: FnOnce(&TaskControllerCampaignSources) -> Result<Vec<CampaignSourcePublication>, String>,
     {
+        let GuardedTaskCommand {
+            task_id,
+            context,
+            command,
+        } = guarded;
         identity
             .validate()
             .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("request_identity")))?;
@@ -953,14 +985,14 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
                             StoreFailure::from_provider_unknown_outcome(&ctx).map_err(|error| {
                                 TaskLifecycleError::Serialization(error.to_string())
                             })?;
-                        return Err(TaskLifecycleError::Store(failure));
+                        return Err(TaskLifecycleError::Store(Box::new(failure)));
                     }
                     Err(KernelPortError::Unknown(_)) => {
                         let failure =
                             StoreFailure::from_provider_unknown_outcome(&ctx).map_err(|error| {
                                 TaskLifecycleError::Serialization(error.to_string())
                             })?;
-                        return Err(TaskLifecycleError::Store(failure));
+                        return Err(TaskLifecycleError::Store(Box::new(failure)));
                     }
                     Err(other) => return Err(TaskLifecycleError::Kernel(other)),
                 }
@@ -1008,7 +1040,7 @@ fn check_committed_receipt(
             StoreRecoveryAction::None,
             ctx,
         )?;
-        return Err(TaskLifecycleError::Store(failure));
+        return Err(TaskLifecycleError::Store(Box::new(failure)));
     }
     if receipt.transition_class != TransitionClass::TaskControl
         || receipt.operation_manifest_digest != *manifest_digest
@@ -1021,7 +1053,7 @@ fn check_committed_receipt(
             StoreRecoveryAction::None,
             ctx,
         )?;
-        return Err(TaskLifecycleError::Store(failure));
+        return Err(TaskLifecycleError::Store(Box::new(failure)));
     }
     if receipt.status != WriteReceiptStatus::Committed {
         let (reason, disposition, retry, recovery) = match receipt.status {
@@ -1034,7 +1066,7 @@ fn check_committed_receipt(
                     StoreRecoveryAction::EscalateInternalDefect,
                     ctx,
                 )?;
-                return Err(TaskLifecycleError::Store(failure));
+                return Err(TaskLifecycleError::Store(Box::new(failure)));
             }
             WriteReceiptStatus::Rejected => (
                 "TASK_NOT_COMMITTED_REJECTED",
@@ -1063,7 +1095,7 @@ fn check_committed_receipt(
             recovery,
             ctx,
         )?;
-        return Err(TaskLifecycleError::Store(failure));
+        return Err(TaskLifecycleError::Store(Box::new(failure)));
     }
     Ok(())
 }
@@ -1424,9 +1456,11 @@ mod tests {
         let applied = block_on(refreshed_adapter.apply_task(
             &identity(&fence, "req-task-open", "idem-task-open"),
             apply_id.clone(),
-            TaskId::new("task-1").expect("task id"),
-            command_context("task-request-2", "task-event-2", &fence),
-            TaskCommand::Open,
+            GuardedTaskCommand {
+                task_id: TaskId::new("task-1").expect("task id"),
+                context: command_context("task-request-2", "task-event-2", &fence),
+                command: TaskCommand::Open,
+            },
         ))
         .expect("admitted transition");
         assert_eq!(applied.operation_id, apply_id);
@@ -1490,9 +1524,11 @@ mod tests {
         let rejected = block_on(refreshed_adapter.apply_task(
             &identity(&fence, "req-task-stale", "idem-task-stale"),
             eliot_contracts::OperationId::new("op-task-stale").expect("operation id"),
-            TaskId::new("task-1").expect("task id"),
-            command_context("task-request-stale", "task-event-stale", &stale_fence),
-            TaskCommand::Open,
+            GuardedTaskCommand {
+                task_id: TaskId::new("task-1").expect("task id"),
+                context: command_context("task-request-stale", "task-event-stale", &stale_fence),
+                command: TaskCommand::Open,
+            },
         ));
         assert!(
             matches!(

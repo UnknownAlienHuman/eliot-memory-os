@@ -757,7 +757,6 @@ const HOST_REQUEST_LOGICAL_NAMESPACE: &str = "eliot.host-request.logical.v1";
 /// bindings can never collide with admitted unbound-capture state.
 const HOST_REQUEST_UNBOUND_MARKER: &str = "-";
 
-
 /// Content-addressed generated learning views retained atomically with their
 /// authenticated local-read result (`eliot.packet`).
 const CAMPAIGN_LEARNING_STATE_VIEWS: TableDefinition<&str, &str> =
