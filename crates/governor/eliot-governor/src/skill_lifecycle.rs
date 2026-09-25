@@ -851,6 +851,7 @@ mod tests {
             verifier_ref: "verifier-1".to_owned(),
             evidence_refs: vec!["evidence-1".to_owned()],
             independent_route_count: 1,
+            is_shared_or_critical: false,
             human_approval_ref: None,
             reversible: true,
             state_fence: fence.clone(),

@@ -550,6 +550,7 @@ mod tests {
         CatalogueInstallContext {
             eligible_routes: vec!["route-1".to_owned()],
             eligible_profiles: vec!["profile-1".to_owned()],
+            eligible_policies: vec!["policy-1".to_owned()],
             host_version: "host-4.1.0".to_owned(),
             profile_version: "profile-2.0.0".to_owned(),
             admitted_definition_version: "1.2.0".to_owned(),
@@ -562,6 +563,12 @@ mod tests {
             references: vec!["references/playbook.md".to_owned()],
             scripts: Vec::new(),
             assets: Vec::new(),
+            admitted_scope: crate::SkillScope {
+                task_scope: "task-scope-1".to_owned(),
+                host: "host-1".to_owned(),
+                route: "route-1".to_owned(),
+                governance_scope: "governance-1".to_owned(),
+            },
         }
     }
 

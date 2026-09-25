@@ -16,7 +16,8 @@
 //! ```text
 //! registration.skill_id / .name      → index.skill_id / .name
 //! behavior.trigger                   → index.trigger (when-to-load, I7.12)
-//! context eligible routes/profiles   → index eligibility (admission owner)
+//! context eligible routes/profiles/  → index eligibility (admission owner)
+//!   policies
 //! registration.revision              → body.body_version (source revision)
 //! behavior.action (exactly one)      → body.actions
 //! behavior.where_not_apply           → body.where_not_apply
@@ -26,6 +27,9 @@
 //! inputs.dependencies (exact material) → entry.dependencies (visible
 //!   versions + contract digests, I7.13)
 //! context host/profile versions      → entry.host_version / .profile_version
+//! context admitted scope             → entry.scope (scope binding)
+//! structural checks over the         → entry.validation (persisted results,
+//!   projected parts                    bound by digest)
 //! context runtime inventory+budgets  → entry.runtime (I7.12 cost split)
 //! package.state                      → entry.status (Provisional install;
 //!   Stale / Quarantined / Suppressed preserved, never upgraded)
@@ -98,7 +102,8 @@ use eliot_skills::{
 
 use super::{
     DependencyVersion, SkillBody, SkillCatalogue, SkillCatalogueEntry, SkillError, SkillIndexEntry,
-    SkillRegistry, SkillRuntimeMetadata, SkillStatus,
+    SkillRegistry, SkillRuntimeMetadata, SkillScope, SkillStatus, StructuralValidationReport,
+    detect_dependency_staleness,
 };
 use crate::KnownTools;
 use serde::{Deserialize, Serialize};
@@ -106,21 +111,24 @@ use serde::{Deserialize, Serialize};
 /// Governor-owned installation parameters the sealed package does not carry.
 ///
 /// The package binds identity, instruction, exact tools, dependencies, and
-/// state. Everything else an entry requires — route/profile admission scope,
-/// visible host/profile versions, the Governor-admitted Tool Definition
-/// version, and the runtime inventory plus the I7.12 index/body/runtime token
-/// budgets — is explicit Governor-owned install context, never inferred from
-/// names or defaulted to empty success. The context crosses the Skill wire
+/// state. Everything else an entry requires — route/profile/policy admission
+/// scope, the admitted scope binding, visible host/profile versions, the
+/// Governor-admitted Tool Definition version, and the runtime inventory plus
+/// the I7.12 index/body/runtime token budgets — is explicit Governor-owned
+/// install context, never inferred from names or defaulted to empty success. The context crosses the Skill wire
 /// as JSON, so field shapes stay wire-stable: new install parameters get new
 /// optional fields, never silent repurposing.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogueInstallContext {
-    /// Routes this installation admits the Skill for (at least one route or
-    /// profile is required by entry validation).
+    /// Routes this installation admits the Skill for (at least one route,
+    /// profile, or policy is required by entry validation).
     pub eligible_routes: Vec<String>,
     /// Profiles this installation admits the Skill for.
     pub eligible_profiles: Vec<String>,
+    /// Policies this installation admits the Skill for (`I7.12` index covers
+    /// every route/profile/policy-eligible Skill).
+    pub eligible_policies: Vec<String>,
     /// Visible host version pinned at install (I7.13).
     pub host_version: String,
     /// Visible profile version pinned at install (I7.13).
@@ -148,6 +156,10 @@ pub struct CatalogueInstallContext {
     pub scripts: Vec<String>,
     /// Runtime asset inventory observed at install.
     pub assets: Vec<String>,
+    /// Admitted scope binding recorded onto the entry (issue #1882 W1): the
+    /// Governor-owned scope this installation admits the Skill for, so a
+    /// scoped entry is never representable as generally admitted.
+    pub admitted_scope: SkillScope,
 }
 
 impl CatalogueInstallContext {
@@ -160,12 +172,16 @@ impl CatalogueInstallContext {
             &self.admitted_definition_version,
             "context.admitted_definition_version",
         )?;
-        if self.eligible_routes.is_empty() && self.eligible_profiles.is_empty() {
+        if self.eligible_routes.is_empty()
+            && self.eligible_profiles.is_empty()
+            && self.eligible_policies.is_empty()
+        {
             return Err(SkillError::InvalidField {
                 field: "context.eligibility",
-                reason: "at least one eligible route or profile is required",
+                reason: "at least one eligible route, profile, or policy is required",
             });
         }
+        self.admitted_scope.validate()?;
         for (budget, field) in [
             (self.index_budget_tokens, "context.index_budget_tokens"),
             (self.body_budget_tokens, "context.body_budget_tokens"),
@@ -418,34 +434,50 @@ pub fn project_package_to_entry(
 
     let (status, stale_reason) = install_status(package);
 
+    let index = SkillIndexEntry {
+        skill_id: package.registration.skill_id.clone(),
+        name: package.registration.name.clone(),
+        trigger: package.behavior.trigger.clone(),
+        eligible_routes: context.eligible_routes.clone(),
+        eligible_profiles: context.eligible_profiles.clone(),
+        eligible_policies: context.eligible_policies.clone(),
+    };
+    let runtime = SkillRuntimeMetadata {
+        skill_id: package.registration.skill_id.clone(),
+        body_version: package.registration.revision.clone(),
+        references: context.references.clone(),
+        scripts: context.scripts.clone(),
+        assets: context.assets.clone(),
+        index_budget_tokens: context.index_budget_tokens,
+        body_budget_tokens: context.body_budget_tokens,
+        runtime_budget_tokens: context.runtime_budget_tokens,
+        index_tokens: context.index_tokens,
+        body_tokens: context.body_tokens,
+        runtime_tokens: context.runtime_tokens,
+    };
+    let validation = StructuralValidationReport::record(
+        &index,
+        &body,
+        &runtime,
+        &dependencies,
+        &context.host_version,
+        &context.profile_version,
+        &context.admitted_definition_version,
+    )?;
+
     let entry = SkillCatalogueEntry {
-        index: SkillIndexEntry {
-            skill_id: package.registration.skill_id.clone(),
-            name: package.registration.name.clone(),
-            trigger: package.behavior.trigger.clone(),
-            eligible_routes: context.eligible_routes.clone(),
-            eligible_profiles: context.eligible_profiles.clone(),
-        },
+        index,
         body,
-        runtime: SkillRuntimeMetadata {
-            skill_id: package.registration.skill_id.clone(),
-            body_version: package.registration.revision.clone(),
-            references: context.references.clone(),
-            scripts: context.scripts.clone(),
-            assets: context.assets.clone(),
-            index_budget_tokens: context.index_budget_tokens,
-            body_budget_tokens: context.body_budget_tokens,
-            runtime_budget_tokens: context.runtime_budget_tokens,
-            index_tokens: context.index_tokens,
-            body_tokens: context.body_tokens,
-            runtime_tokens: context.runtime_tokens,
-        },
+        runtime,
         dependencies,
         host_version: context.host_version.clone(),
         profile_version: context.profile_version.clone(),
         admitted_definition_version: context.admitted_definition_version.clone(),
         status,
         stale_reason,
+        scope: context.admitted_scope.clone(),
+        validation,
+        promotion_evidence: None,
     };
     entry.validate()?;
     Ok(entry)
@@ -488,6 +520,13 @@ fn install_status(package: &SkillPackage) -> (SkillStatus, Option<String>) {
 /// installs under its governed `Stale` disposition; promotion stays with the
 /// evidence path.
 ///
+/// When a standing entry pins a different dependency set than the newly
+/// declared material, the declaration changed under it (`I7.13`): the
+/// standing entry is marked stale before insert, so the drift is recorded
+/// even when the insert below refuses (unknown tools) — a refused reinstall
+/// must not leave the old pins looking current against the new declaration.
+/// Quarantined standing entries are left untouched (governed state).
+///
 /// Re-installing a revised package replaces the entry wholesale
 /// (immutable-body revision): the catalogue digest changes, so Hotset receipts
 /// issued before the revision fail closed at activation instead of displaying
@@ -504,6 +543,12 @@ pub fn install_package(
     validate_candidate_materialization(candidate, package, inputs)?;
     let entry = project_package_to_entry(package, inputs, context)?;
     let skill_id = entry.index.skill_id.clone();
+    let drift = catalogue.get(&skill_id).and_then(|standing| {
+        detect_dependency_staleness(&standing.dependencies, &entry.dependencies)
+    });
+    if let Some(reason) = drift {
+        catalogue.note_dependency_change(&skill_id, entry.dependencies.clone(), reason)?;
+    }
     catalogue.insert(entry, tools)?;
     Ok(skill_id)
 }
@@ -896,6 +941,7 @@ mod tests {
         CatalogueInstallContext {
             eligible_routes: vec!["route-1".to_owned()],
             eligible_profiles: vec!["profile-1".to_owned()],
+            eligible_policies: vec!["policy-1".to_owned()],
             host_version: "host-4.1.0".to_owned(),
             profile_version: "profile-2.0.0".to_owned(),
             admitted_definition_version: "1.2.0".to_owned(),
@@ -908,6 +954,12 @@ mod tests {
             references: vec!["references/playbook.md".to_owned()],
             scripts: Vec::new(),
             assets: Vec::new(),
+            admitted_scope: crate::SkillScope {
+                task_scope: "task-scope-1".to_owned(),
+                host: "host-1".to_owned(),
+                route: "route-1".to_owned(),
+                governance_scope: "governance-1".to_owned(),
+            },
         }
     }
 
@@ -1148,6 +1200,7 @@ mod tests {
         let mut bare = context();
         bare.eligible_routes.clear();
         bare.eligible_profiles.clear();
+        bare.eligible_policies.clear();
         assert!(matches!(
             project_package_to_entry(&package, &material, &bare),
             Err(SkillError::InvalidField { field, .. }) if field == "context.eligibility"
@@ -1743,6 +1796,7 @@ mod tests {
                 CatalogueInstallContext {
                     eligible_routes: vec!["route-1".to_owned()],
                     eligible_profiles: Vec::new(),
+                    eligible_policies: Vec::new(),
                     host_version: "host-4.1.0".to_owned(),
                     profile_version: "profile-2.0.0".to_owned(),
                     admitted_definition_version: "1.2.0".to_owned(),
@@ -1755,6 +1809,12 @@ mod tests {
                     references: Vec::new(),
                     scripts: Vec::new(),
                     assets: Vec::new(),
+                    admitted_scope: crate::SkillScope {
+                        task_scope: "task-scope-1".to_owned(),
+                        host: "host-1".to_owned(),
+                        route: "route-1".to_owned(),
+                        governance_scope: "governance-1".to_owned(),
+                    },
                 }
             }
 

@@ -209,38 +209,63 @@ mod tests {
             tool_refs: vec!["eliot.finish".to_owned()],
         };
         body.body_digest = body.expected_digest().expect("body digest");
+        let index = SkillIndexEntry {
+            skill_id: "skill-demo".to_owned(),
+            name: "demo skill".to_owned(),
+            trigger: "when demo work arrives load this skill".to_owned(),
+            eligible_routes: vec!["route-1".to_owned()],
+            eligible_profiles: vec!["profile-1".to_owned()],
+            eligible_policies: vec!["policy-1".to_owned()],
+        };
+        let runtime = SkillRuntimeMetadata {
+            skill_id: "skill-demo".to_owned(),
+            body_version: "1.0.0".to_owned(),
+            references: vec!["references/playbook.md".to_owned()],
+            scripts: Vec::new(),
+            assets: Vec::new(),
+            index_budget_tokens: 200,
+            body_budget_tokens: 800,
+            runtime_budget_tokens: 2000,
+            index_tokens: 60,
+            body_tokens: 400,
+            runtime_tokens: 0,
+        };
+        let dependencies = vec![DependencyVersion {
+            name: "tool-def-1".to_owned(),
+            version: "1.2.0".to_owned(),
+            contract_digest: "c".repeat(64),
+        }];
+        let host_version = "host-4.1.0".to_owned();
+        let profile_version = "profile-2.0.0".to_owned();
+        let admitted_definition_version = "1.2.0".to_owned();
+        let validation = eliot_skill::StructuralValidationReport::record(
+            &index,
+            &body,
+            &runtime,
+            &dependencies,
+            &host_version,
+            &profile_version,
+            &admitted_definition_version,
+        )
+        .expect("validation report");
         let entry = SkillCatalogueEntry {
-            index: SkillIndexEntry {
-                skill_id: "skill-demo".to_owned(),
-                name: "demo skill".to_owned(),
-                trigger: "when demo work arrives load this skill".to_owned(),
-                eligible_routes: vec!["route-1".to_owned()],
-                eligible_profiles: vec!["profile-1".to_owned()],
-            },
+            index,
             body,
-            runtime: SkillRuntimeMetadata {
-                skill_id: "skill-demo".to_owned(),
-                body_version: "1.0.0".to_owned(),
-                references: vec!["references/playbook.md".to_owned()],
-                scripts: Vec::new(),
-                assets: Vec::new(),
-                index_budget_tokens: 200,
-                body_budget_tokens: 800,
-                runtime_budget_tokens: 2000,
-                index_tokens: 60,
-                body_tokens: 400,
-                runtime_tokens: 0,
-            },
-            dependencies: vec![DependencyVersion {
-                name: "tool-def-1".to_owned(),
-                version: "1.2.0".to_owned(),
-                contract_digest: "c".repeat(64),
-            }],
-            host_version: "host-4.1.0".to_owned(),
-            profile_version: "profile-2.0.0".to_owned(),
-            admitted_definition_version: "1.2.0".to_owned(),
+            runtime,
+            dependencies,
+            host_version,
+            profile_version,
+            admitted_definition_version,
             status: SkillStatus::Provisional,
             stale_reason: None,
+            scope: eliot_skill::SkillScope {
+                task_scope: "task-scope-1".to_owned(),
+                host: "host-1".to_owned(),
+                route: "route-1".to_owned(),
+                governance_scope: "governance-1".to_owned(),
+            },
+            validation,
+            promotion_evidence: None,
         };
         let mut catalogue = SkillCatalogue::default();
         catalogue

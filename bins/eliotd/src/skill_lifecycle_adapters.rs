@@ -9,7 +9,11 @@
 //!
 //! - `promote` is blocked when the catalogue covers the candidate Skill and
 //!   marks it stale or retired: drifted dependencies must be revalidated
-//!   before Material promotion. Skills the catalogue does not cover forward
+//!   before Material promotion. The same pre-commit drive then observes the
+//!   candidate's committed dependency set against the entry pins: a changed
+//!   set without a re-derived promoted view carrying it marks the entry stale
+//!   and refuses before commit (governed restoration bypasses; unchanged sets
+//!   and re-derived views pass). Skills the catalogue does not cover forward
 //!   untouched (open world: the registry stays authoritative until catalogue
 //!   installation wiring lands).
 //! - After a committed promotion, the candidate's observed dependency
@@ -91,10 +95,11 @@ use super::skill_acceptance_read::AcceptanceRecord;
 use eliot_contracts::StateFence;
 use eliot_skill::{
     ActivatedSkillDisplay, CanonicalToolSource, CatalogueInstallContext, HotsetDeliveryAck,
-    HotsetDeliveryReceipt, KnownTools, MaterializationInputs, MaterializationScope,
-    PortableSkillPackageCandidate, ProcedureState, PromotionGate, ReadinessClaims, SkillCandidate,
-    SkillCatalogue, SkillError, SkillLifecycleApi, SkillLifecycleView, SkillPackage,
-    ToolAliasTable, VersionBoundTools, activation::detect_dependency_staleness,
+    HotsetDeliveryReceipt, KnownTools, LifecycleAction, MaterializationInputs,
+    MaterializationScope, PortableSkillPackageCandidate, ProcedureState, PromotionGate,
+    ReadinessClaims, SkillCandidate, SkillCatalogue, SkillError, SkillLifecycleApi,
+    SkillLifecycleView, SkillPackage, ToolAliasTable, VersionBoundTools,
+    activation::detect_dependency_staleness,
 };
 
 /// Shared handle to the composition-owned Governor Skill catalogue.
@@ -889,6 +894,46 @@ impl<T: SkillLifecycleApi> SkillLifecycleApi for ForwardingSkillLifecycle<T> {
                 });
             }
         }
+        // Live pre-commit dependency observation against the catalogue pins
+        // (`I7.13`, issue #1882 W6/A4): when the candidate commits a
+        // dependency set past the entry pins without a re-derived promoted
+        // view carrying it, the entry is marked stale and the promotion
+        // refuses before commit — the same triple rule the registry enforces,
+        // so the catalogue cannot stay generally deliverable across an
+        // un-revalidated dependency change. Unchanged sets and re-derived
+        // views pass; uncovered Skills forward untouched (open world);
+        // governed restoration bypasses.
+        if candidate.proposed_action != LifecycleAction::Restore {
+            let drift = {
+                let catalogue = self.lock_catalogue();
+                catalogue.get(&skill_id).and_then(|entry| {
+                    let mut pinned = entry.dependencies.clone();
+                    pinned.sort();
+                    let mut committed = observed.clone();
+                    committed.sort();
+                    if pinned == committed {
+                        return None;
+                    }
+                    let mut promoted = promoted_view.dependencies.clone();
+                    promoted.sort();
+                    if promoted == committed {
+                        return None;
+                    }
+                    detect_dependency_staleness(&pinned, &committed)
+                })
+            };
+            if let Some(reason) = drift {
+                {
+                    let mut catalogue = self.lock_catalogue();
+                    let _marked =
+                        catalogue.note_dependency_change(&skill_id, observed.clone(), reason);
+                }
+                return Err(SkillError::InvalidField {
+                    field: "candidate.dependency_versions",
+                    reason: "promotion commits changed dependency versions the promoted view does not pin; entry marked stale until revalidated",
+                });
+            }
+        }
         let receipt = self
             .inner
             .promote(identity, operation_id, candidate, gate, promoted_view)
@@ -1155,12 +1200,18 @@ mod tests {
         let forwarding = ForwardingSkillLifecycle::with_catalogue(inner, Arc::clone(&handle));
         let candidate = candidate_with_deps(&fence, vec![dependency("2.0.0")]);
         let gate = gate_for(&fence, &candidate);
+        // The committed set is re-derived into the promoted view: the
+        // pre-commit observation passes evolution carrying its own pins, and
+        // the post-commit feed still marks the entry stale for the next
+        // promotion.
+        let mut promoted = base_view(&fence);
+        promoted.dependencies = vec![dependency("2.0.0")];
         blocking_view(forwarding.promote(
             &identity(&fence),
             OperationId::new("op-skill-2").expect("operation id"),
             candidate,
             gate,
-            base_view(&fence),
+            promoted,
         ))
         .expect("committed promote forwards");
         assert_eq!(*calls.lock().expect("calls"), 1);
@@ -2559,34 +2610,59 @@ mod tests {
             tool_refs: vec!["eliot.finish".to_owned()],
         };
         body.body_digest = body.expected_digest().expect("body digest");
+        let index = SkillIndexEntry {
+            skill_id: "skill-demo".to_owned(),
+            name: "demo skill".to_owned(),
+            trigger: "when demo work arrives load this skill".to_owned(),
+            eligible_routes: vec!["route-1".to_owned()],
+            eligible_profiles: vec!["profile-1".to_owned()],
+            eligible_policies: vec!["policy-1".to_owned()],
+        };
+        let runtime = SkillRuntimeMetadata {
+            skill_id: "skill-demo".to_owned(),
+            body_version: "1.0.0".to_owned(),
+            references: vec!["references/playbook.md".to_owned()],
+            scripts: Vec::new(),
+            assets: Vec::new(),
+            index_budget_tokens: 200,
+            body_budget_tokens: 800,
+            runtime_budget_tokens: 2000,
+            index_tokens: 60,
+            body_tokens: 400,
+            runtime_tokens: 0,
+        };
+        let dependencies = vec![dependency("1.2.0")];
+        let host_version = "host-4.1.0".to_owned();
+        let profile_version = "profile-2.0.0".to_owned();
+        let admitted_definition_version = "1.2.0".to_owned();
+        let validation = eliot_skill::StructuralValidationReport::record(
+            &index,
+            &body,
+            &runtime,
+            &dependencies,
+            &host_version,
+            &profile_version,
+            &admitted_definition_version,
+        )
+        .expect("validation report");
         SkillCatalogueEntry {
-            index: SkillIndexEntry {
-                skill_id: "skill-demo".to_owned(),
-                name: "demo skill".to_owned(),
-                trigger: "when demo work arrives load this skill".to_owned(),
-                eligible_routes: vec!["route-1".to_owned()],
-                eligible_profiles: vec!["profile-1".to_owned()],
-            },
+            index,
             body,
-            runtime: SkillRuntimeMetadata {
-                skill_id: "skill-demo".to_owned(),
-                body_version: "1.0.0".to_owned(),
-                references: vec!["references/playbook.md".to_owned()],
-                scripts: Vec::new(),
-                assets: Vec::new(),
-                index_budget_tokens: 200,
-                body_budget_tokens: 800,
-                runtime_budget_tokens: 2000,
-                index_tokens: 60,
-                body_tokens: 400,
-                runtime_tokens: 0,
-            },
-            dependencies: vec![dependency("1.2.0")],
-            host_version: "host-4.1.0".to_owned(),
-            profile_version: "profile-2.0.0".to_owned(),
-            admitted_definition_version: "1.2.0".to_owned(),
+            runtime,
+            dependencies,
+            host_version,
+            profile_version,
+            admitted_definition_version,
             status: SkillStatus::Provisional,
             stale_reason: None,
+            scope: eliot_skill::SkillScope {
+                task_scope: "task-scope-1".to_owned(),
+                host: "host-1".to_owned(),
+                route: "route-1".to_owned(),
+                governance_scope: "governance-1".to_owned(),
+            },
+            validation,
+            promotion_evidence: None,
         }
     }
 
@@ -2904,6 +2980,7 @@ mod tests {
         eliot_skill::CatalogueInstallContext {
             eligible_routes: vec!["route-1".to_owned()],
             eligible_profiles: vec!["profile-1".to_owned()],
+            eligible_policies: vec!["policy-1".to_owned()],
             host_version: "host-4.1.0".to_owned(),
             profile_version: "profile-2.0.0".to_owned(),
             admitted_definition_version: "1.2.0".to_owned(),
@@ -2916,6 +2993,12 @@ mod tests {
             references: vec!["references/playbook.md".to_owned()],
             scripts: Vec::new(),
             assets: Vec::new(),
+            admitted_scope: eliot_skill::SkillScope {
+                task_scope: "task-scope-1".to_owned(),
+                host: "host-1".to_owned(),
+                route: "route-1".to_owned(),
+                governance_scope: "governance-1".to_owned(),
+            },
         }
     }
 
@@ -3000,6 +3083,7 @@ mod tests {
             verifier_ref: "verifier-1".to_owned(),
             evidence_refs: vec!["evidence-1".to_owned()],
             independent_route_count: 1,
+            is_shared_or_critical: false,
             human_approval_ref: None,
             reversible: true,
             state_fence: fence.clone(),

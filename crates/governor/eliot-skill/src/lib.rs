@@ -670,6 +670,12 @@ pub struct PromotionGate {
     pub verifier_ref: String,
     pub evidence_refs: Vec<String>,
     pub independent_route_count: u32,
+    /// Route-proportional depth marker (`I7.13`, issue #1882 W6): `true`
+    /// when the candidate is a shared cross-route Skill or carries
+    /// Material/Critical instructions. A shared/critical promotion requires
+    /// two materially different routes plus human approval; a
+    /// host/task-specific promotion requires one matching real route.
+    pub is_shared_or_critical: bool,
     pub human_approval_ref: Option<String>,
     pub reversible: bool,
     pub state_fence: StateFence,
@@ -690,11 +696,27 @@ impl PromotionGate {
         if self.evidence_refs.is_empty() || self.independent_route_count == 0 {
             return Err(SkillError::IndependentEvidenceRequired);
         }
+        // The route count is bound to evidence identities, never a bare
+        // number: more claimed independent routes than evidence references
+        // fails closed.
+        let refs =
+            u32::try_from(self.evidence_refs.len()).map_err(|_| SkillError::InvalidField {
+                field: "gate.evidence_refs",
+                reason: "too many evidence references",
+            })?;
+        if self.independent_route_count > refs {
+            return Err(SkillError::IndependentEvidenceRequired);
+        }
         if self.state_fence != candidate.state_fence {
             return Err(SkillError::FenceMismatch);
         }
         if !self.reversible {
             return Err(SkillError::NonReversiblePromotion);
+        }
+        if self.is_shared_or_critical
+            && (self.independent_route_count < 2 || self.human_approval_ref.is_none())
+        {
+            return Err(SkillError::IndependentEvidenceRequired);
         }
         if (candidate.proposed_action == LifecycleAction::Merge
             || candidate.proposed_action == LifecycleAction::Split
@@ -990,6 +1012,30 @@ impl SkillRegistry {
                 field: "candidate.proposed_action",
                 reason: "stale or quarantined Skills require governed restoration before reuse",
             });
+        }
+        // Live pre-commit dependency observation (`I7.13`, issue #1882 W6):
+        // the candidate commits an exact dependency set. When that set moves
+        // past the standing pins, the change must be revalidated into the
+        // about-to-commit view: a promotion that commits new dependency
+        // versions while pinning the old set would publish lineage
+        // disagreeing with its own candidate. Governed restoration bypasses,
+        // like the stale-base rule above; unchanged sets pass trivially, and
+        // a re-derived view carrying the committed set passes as evolution.
+        if candidate.proposed_action != LifecycleAction::Restore {
+            let mut standing = base.dependencies.clone();
+            standing.sort();
+            let mut committed = candidate.dependency_versions.clone();
+            committed.sort();
+            if standing != committed {
+                let mut promoted = promoted_view.dependencies.clone();
+                promoted.sort();
+                if promoted != committed {
+                    return Err(SkillError::InvalidField {
+                        field: "candidate.dependency_versions",
+                        reason: "promotion commits changed dependency versions the promoted view does not pin; re-derive the view against the committed set",
+                    });
+                }
+            }
         }
         if base.identity_digest()? != candidate.base_view_digest
             || promoted_view.skill_id() != candidate.base_skill_ref.skill_id()
