@@ -36,6 +36,9 @@ use crate::model::{
 use crate::provider_admission::{
     AdmittedProviderCapability, KernelProviderVerifier, ProviderSelectionHealth,
 };
+use crate::swarm_definition_admission::{
+    SwarmDefinitionAdmissionPrep, compile_swarm_definition_admission,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ProviderProofKind {
@@ -606,6 +609,25 @@ impl AgentCoordinator {
             request: Box::new(request),
         });
         Ok(candidate)
+    }
+
+    /// Prepares one Task Controller-authored swarm definition for Governor
+    /// admission without admitting it (issue #1699).
+    ///
+    /// This is the production caller of `compile_swarm_definition_admission`:
+    /// a valid `eliot_swarm::SwarmPlanProposal` plus sealed
+    /// `eliot_swarm::SealedIndependentMaps` traverses the reachable
+    /// `eliotd` → `AgentCoordinator` → `eliot-swarm` owner path to
+    /// coordinator-managed admission preparation. The prep is candidate-only
+    /// and performs no durable write, queue insertion, launch, or recovery;
+    /// Governor admission and launch stay with the existing injected
+    /// admission/activation/dispatch ports.
+    pub fn prepare_swarm_definition_admission(
+        &self,
+        proposal: &eliot_swarm::SwarmPlanProposal,
+        maps: &eliot_swarm::SealedIndependentMaps,
+    ) -> Result<SwarmDefinitionAdmissionPrep, CoordinatorError> {
+        compile_swarm_definition_admission(&self.config, proposal, maps)
     }
 
     /// Reconciles only an admission accepted by the sealed verifier.

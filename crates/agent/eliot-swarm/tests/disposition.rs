@@ -1,12 +1,15 @@
-//! Retire-candidate disposition proof for `eliot-swarm` (issue #1699).
+//! Reachable-owner-path disposition proof for `eliot-swarm` (issue #1699).
 //!
 //! Issue #1139 closed with the provider adapters (ACP/Claude/Codex/OpenCode)
 //! wired through `eliot-native-worker` while `eliot-swarm` itself was
-//! dispositioned retire-candidate with a manifest to follow (PR #1673). This
-//! test pins that manifest: the exact `[package.metadata.eliot]
-//! .workspace_admission` value plus the current no-production-binary-consumer
-//! state. Removing the crate or admitting it to a reachable owner path must
-//! update the manifest first, so neither state can drift silently.
+//! dispositioned retire-candidate with a manifest to follow (PR #1673). Issue
+//! #1699 then admitted the durable-swarm plan capability to the reachable
+//! coordinator owner path (`eliot-agent-coordinator` swarm-definition
+//! admission preparation). This test pins that manifest: the exact
+//! `[package.metadata.eliot] .workspace_admission` value plus the current
+//! no-production-binary-consumer state. Removing the crate or changing its
+//! owner path must update the manifest first, so neither state can drift
+//! silently.
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -14,7 +17,7 @@ use std::path::PathBuf;
 type TestResult = Result<(), Box<dyn Error>>;
 
 const PACKAGE: &str = "eliot-swarm";
-const EXPECTED_ADMISSION: &str = "retire-candidate per #1139 (closed via PR #1673)";
+const EXPECTED_ADMISSION: &str = "wired per #1699";
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -87,7 +90,7 @@ fn retire_candidate_disposition_is_recorded() -> TestResult {
     let text = std::fs::read_to_string(manifest_dir().join("Cargo.toml"))?;
     assert!(
         text.contains(EXPECTED_ADMISSION),
-        "workspace_admission must record the #1139 retire-candidate disposition"
+        "workspace_admission must record the #1699 wired disposition"
     );
     Ok(())
 }
