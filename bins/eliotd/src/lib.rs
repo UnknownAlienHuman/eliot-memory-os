@@ -71,6 +71,7 @@ mod skill_surface_adapters;
 pub mod staffing_policy;
 pub mod startup_capability_bindings;
 pub mod startup_evidence_producer;
+pub mod startup_readiness;
 mod store_failure_projection;
 pub mod supervision_progress;
 pub mod swarm_composition;
