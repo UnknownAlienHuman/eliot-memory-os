@@ -45,11 +45,14 @@ fn valid_ticket() -> TestResult<AgentActivationResolutionTicket> {
         ticket_id: "activation-ticket-202-1".to_owned(),
         activation_request_id: RequestId::new("activation-request-202-1")
             .map_err(|error| format!("request id: {error}"))?,
+        demand_id: "activation-demand-202-1".to_owned(),
         activation_request_sha256: "a".repeat(64),
         peer_admission_receipt_sha256: "b".repeat(64),
         connection_id: "activation-connection-202-1".to_owned(),
+        cancellation_id: "activation-cancellation-202-1".to_owned(),
         state_fence: test_fence()?,
         kernel_deadline_unix_ms: 10_000,
+        successor_of: None,
         ticket_sha256: String::new(),
     }
     .with_computed_digest()

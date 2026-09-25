@@ -357,13 +357,13 @@ use eliot_process::{
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::{
     AGENT_BRIDGE_ACTIVATION_OPERATION, AGENT_BRIDGE_MODULE_ID, AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID,
-    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationResolutionResult,
+    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationOwnerReadback,
+    AgentActivationResolutionDisposition, AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultReconcile,
-    AgentActivationResultSubmit, AgentBridgeActivationDenialCode, AgentBridgeActivationDisposition,
-    AgentBridgeActivationFence, AgentBridgeActivationRequest, AgentBridgeActivationResponse,
-    AgentBridgeAuthenticatedBinding, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
-    AgentBridgePeerChallenge, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
-    RequestIdentity,
+    AgentBridgeActivationDenialCode, AgentBridgeActivationDisposition, AgentBridgeActivationFence,
+    AgentBridgeActivationRequest, AgentBridgeActivationResponse, AgentBridgeAuthenticatedBinding,
+    AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge,
+    EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, RequestIdentity,
 };
 use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
 #[cfg(test)]
@@ -572,18 +572,9 @@ pub struct KernelComposition {
     agent_activation_pending: Mutex<AgentActivationPendingState>,
     #[cfg(windows)]
     agent_activation_changed: tokio::sync::Notify,
-    /// Full typed semantic resolution results retained verbatim under their
-    /// exact ticket identities, keyed by ticket id. This is the rehydrated
-    /// result ledger only; it never contains pending entries or live bindings.
-    ///
-    /// Every one of the seven closed dispositions shares one
-    /// exact-replay/conflict ledger here. Only a `Resolved`
-    /// disposition can later yield a transport Session, and that Session is
-    /// created exactly once by the bridge activation path. The map lives
-    /// beside the pending table (rather than inside its entries) so the
-    /// ticket ledger shape stays additive.
-    #[cfg(windows)]
-    agent_activation_results: Mutex<BTreeMap<String, AgentActivationResultRecord>>,
+    /// Full typed semantic resolution results are projected into the single
+    /// `agent_activation_pending` owner below. ORS remains the durable
+    /// authority; there is no second in-memory semantic ledger.
     /// Connection-scoped index of staged P-04 host-request operations. The
     /// durable ORS record is the owner; this index only lets disconnect revoke
     /// fence the presenting connection's still-uncertain operations to
@@ -611,6 +602,11 @@ pub struct KernelComposition {
     /// one shared definition both sides call. The owner readback serves it
     /// so the Governor feed can prove the Kernel bound its exact bytes.
     p07_owner_digest: Mutex<Option<String>>,
+    /// Serializes P-07 owner publication with Resolved Session publication.
+    /// The bridge read lock is held from the current-owner comparison through
+    /// the in-memory Session/connection update; owner bind/refresh/recovery
+    /// takes the write lock, so an owner rotation cannot pass between them.
+    p07_owner_transition: RwLock<()>,
     /// ORS handle retained for P-07 owner bind/refresh/recovery. Cloned
     /// from the assembly store so later owner operations never reopen the
     /// database file or invent a second recovery store.
@@ -698,6 +694,14 @@ struct AgentActivationPendingState {
     /// entries are skipped when this order is pruned so an active bridge
     /// waiter can never lose the result it is waiting to project.
     result_order: VecDeque<String>,
+    /// Kernel-owned lifecycle fence for each ticket. It is deliberately
+    /// separate from the result payload: a cancellation/expiry terminal can
+    /// never be confused with a semantic `FailedInternal` result.
+    lifecycle: BTreeMap<String, AgentActivationLifecycle>,
+    /// Predecessor tickets that already minted a durable successor. This
+    /// mirrors the ORS `successor_ticket_id` fence so a later request cannot
+    /// repeatedly select the same immutable `NotReady` result.
+    successor_consumed: BTreeSet<String>,
 }
 
 #[cfg(windows)]
@@ -711,25 +715,60 @@ struct AgentActivationPending {
     /// result-less (#66 C4/A3): an unanswered ticket rests until the
     /// Kernel-owned deadline instead of looping the resolver.
     claim_lease_until_unix_ms: Option<u64>,
+    /// Fresh dependency discriminator supplied by the authenticated daemon
+    /// claim. It is checked before a successor enters `Claimed`.
+    claim_dependency_ref: Option<String>,
+    claim_dependency_revision: Option<String>,
+    /// A fresh ticket may be linked to one retained `NotReady` predecessor;
+    /// the predecessor result itself is immutable and is never replaced.
+    successor_of: Option<AgentActivationSuccessorBinding>,
+    /// Authenticated current owner readback stored by Kernel when the exact
+    /// result is durably accepted. It is a readback join, not a second
+    /// semantic resolver.
+    owner_readback: Option<AgentActivationOwnerReadback>,
 }
 
-/// Replay/commit/conflict disposition shared by the activation result
-/// entry classifiers (v2 result legs).
+/// Closed Kernel lifecycle fence for one activation ticket.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ActivationDecisionDisposition {
-    Commit,
-    ExactReplay,
-    Conflict,
+enum AgentActivationLifecycle {
+    Pending,
+    Claimed,
+    Accepted,
+    DeferredNotReady,
+    Cancelled,
+    Expired,
+    Reconciling,
 }
+
+#[cfg(windows)]
+impl From<eliot_ors::ActivationLifecycleState> for AgentActivationLifecycle {
+    fn from(state: eliot_ors::ActivationLifecycleState) -> Self {
+        match state {
+            eliot_ors::ActivationLifecycleState::Pending => Self::Pending,
+            eliot_ors::ActivationLifecycleState::Claimed => Self::Claimed,
+            eliot_ors::ActivationLifecycleState::ResultAccepted => Self::Accepted,
+            eliot_ors::ActivationLifecycleState::DeferredNotReady => Self::DeferredNotReady,
+            eliot_ors::ActivationLifecycleState::Cancelled => Self::Cancelled,
+            eliot_ors::ActivationLifecycleState::Expired => Self::Expired,
+            eliot_ors::ActivationLifecycleState::Reconciling => Self::Reconciling,
+        }
+    }
+}
+
+/// Immutable predecessor evidence cached from the durable ORS lifecycle. ORS
+/// remains the authority; this is not a second semantic result or resolver.
+#[cfg(windows)]
+type AgentActivationSuccessorBinding = eliot_ors::ActivationSuccessorBinding;
 
 /// Submission phase of one retained v2 semantic result.
 ///
 /// Absence of a record means the ticket is still awaiting its result. A
-/// retained record is never re-queued by claim admission: admission is not a
-/// semantic delta. A result-less ticket is admitted at most once; the sole
-/// re-queue path for a deferred ticket is a gated superseding submission on
-/// the submit path, never the admission mark.
+/// retained record is never re-queued by claim-lease expiry: an uncertain
+/// claim is durably marked `Reconciling` and removed from the live queue.
+/// A result-less ticket is admitted at most once; the sole re-queue path for
+/// a deferred result is a fresh, gated successor submission, never admission
+/// or the lease clock.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AgentActivationResultPhase {
@@ -743,17 +782,17 @@ enum AgentActivationResultPhase {
 }
 
 /// Exact retained semantic result for one Kernel-issued ticket: result
-/// identity, payload digest, full typed disposition, submission phase, and
-/// the exact transport connection that owns the ticket. The connection is
-/// retained so a projected-then-retried host-request envelope still
-/// fail-closes on cross-connection replay after the pending entry is
-/// consumed.
+/// identity, payload digest, full typed disposition, and submission phase.
+/// The immutable ticket payload carries the connection identity; this cache
+/// never restores a live connection or Session after restart.
 #[cfg(windows)]
 #[derive(Clone)]
 struct AgentActivationResultRecord {
     result: AgentActivationResolutionResult,
+    /// Opaque bridge demand identity from the immutable ticket. It binds a
+    /// successor to the same demand without carrying semantic authority.
+    demand_id: String,
     phase: AgentActivationResultPhase,
-    ticket_connection: String,
     retention_order: u64,
 }
 
@@ -783,22 +822,122 @@ fn classify_activation_result(
 
 #[cfg(windows)]
 impl AgentActivationPendingState {
-    fn claim_at(&mut self, now: u64) -> Option<AgentActivationResolutionTicket> {
+    pub(crate) fn from_rehydrated_results(
+        results: BTreeMap<String, AgentActivationResultRecord>,
+        lifecycle: BTreeMap<String, AgentActivationLifecycle>,
+        successor_consumed: BTreeSet<String>,
+    ) -> Self {
+        let mut state = Self::default();
+        let mut result_order = results
+            .values()
+            .map(|record| record.result.ticket_id.clone())
+            .collect::<Vec<_>>();
+        result_order.sort_by_key(|ticket_id| {
+            results
+                .get(ticket_id)
+                .map_or(0, |record| record.retention_order)
+        });
+        state.result_order = result_order.into_iter().collect();
+        state.lifecycle = lifecycle;
+        state.successor_consumed = successor_consumed;
+        state.results = results;
+        state
+    }
+
+    fn mark_lifecycle(&mut self, ticket_id: &str, lifecycle: AgentActivationLifecycle) {
+        self.lifecycle.insert(ticket_id.to_owned(), lifecycle);
+        if self.lifecycle.len() > eliot_ors::MAX_ACTIVATION_LIFECYCLE_RECORDS
+            && let Some(oldest) = self
+                .lifecycle
+                .iter()
+                .find(|(candidate, _)| {
+                    !self.entries.contains_key(*candidate) && !self.results.contains_key(*candidate)
+                })
+                .map(|(candidate, _)| candidate.clone())
+        {
+            self.lifecycle.remove(&oldest);
+        }
+    }
+
+    fn lifecycle(&self, ticket_id: &str) -> AgentActivationLifecycle {
+        self.lifecycle
+            .get(ticket_id)
+            .copied()
+            .unwrap_or(AgentActivationLifecycle::Pending)
+    }
+
+    /// Finds the one retained `NotReady` predecessor for this exact bridge
+    /// demand that may authorize a fresh successor ticket. The due-time check
+    /// only makes a candidate eligible for staging; `claim_at` still requires
+    /// the authenticated daemon's fresh changed-revision discriminator before
+    /// transitioning it to `Claimed`. A same-ticket replacement is never
+    /// returned, and an unrelated demand cannot inherit predecessor evidence.
+    fn successor_candidate_for(
+        &self,
+        now: u64,
+        demand_id: &str,
+    ) -> Result<Option<AgentActivationSuccessorBinding>, TransportError> {
+        let mut candidates = self
+            .results
+            .values()
+            .filter(|record| {
+                record.demand_id == demand_id
+                    && !self.successor_consumed.contains(&record.result.ticket_id)
+                    && self.lifecycle(&record.result.ticket_id)
+                        == AgentActivationLifecycle::DeferredNotReady
+                    && matches!(
+                        &record.result.disposition,
+                        AgentActivationResolutionDisposition::NotReady { .. }
+                    )
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|record| record.retention_order);
+        let Some(record) = candidates.last().copied() else {
+            return Ok(None);
+        };
+        let AgentActivationResolutionDisposition::NotReady { retry, .. } =
+            &record.result.disposition
+        else {
+            return Err(TransportError::SessionFenced);
+        };
+        if now < retry.not_before_unix_ms {
+            return Err(TransportError::IdentityConflict);
+        }
+        if self.entries.values().any(|entry| {
+            entry
+                .successor_of
+                .as_ref()
+                .is_some_and(|successor| successor.predecessor_ticket_id == record.result.ticket_id)
+        }) {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(Some(AgentActivationSuccessorBinding {
+            predecessor_ticket_id: record.result.ticket_id.clone(),
+            predecessor_ticket_sha256: record.result.ticket_sha256.clone(),
+            predecessor_result_sha256: record.result.result_sha256.clone(),
+            dependency_ref: retry.dependency_ref.clone(),
+            observed_dependency_revision: retry.observed_dependency_revision.clone(),
+            not_before_unix_ms: retry.not_before_unix_ms,
+        }))
+    }
+
+    fn claim_at(
+        &mut self,
+        now: u64,
+        dependency_ref: &str,
+        dependency_revision: &str,
+    ) -> Option<AgentActivationResolutionTicket> {
         let queue_len = self.fifo.len();
         for _ in 0..queue_len {
             let ticket_id = self.fifo.pop_front()?;
             // A retained semantic result (v2) is terminal-or-deferred
-            // durable state: admission is not a semantic delta and never
-            // re-queues it. A result-less ticket is admitted at most once:
-            // re-admitting it would repeat the same semantic resolution
-            // against the same owner state without a typed transient result
-            // or changed-dependency discriminator (#66 C4/A3). An unanswered
-            // ticket rests until the Kernel-owned deadline, which projects
-            // result-less expiry instead of looping the resolver.
+            // durable state: claim-lease expiry is not a semantic delta and
+            // never re-queues it. A result-less lost claim is removed from
+            // the live queue and reconciled by the durable owner.
             if self.results.contains_key(&ticket_id) {
                 continue;
             }
-            let Some(entry) = self.entries.get_mut(&ticket_id) else {
+            let Some(entry) = self.entries.get(&ticket_id) else {
                 continue;
             };
             if activation_deadline_expired(now, entry.ticket.kernel_deadline_unix_ms) {
@@ -808,12 +947,42 @@ impl AgentActivationPendingState {
                 self.fifo.push_back(ticket_id);
                 continue;
             }
+            let successor = entry.successor_of.clone();
+            if let Some(successor) = successor.as_ref() {
+                let Some(predecessor) = self.results.get(&successor.predecessor_ticket_id) else {
+                    self.fifo.push_back(ticket_id);
+                    continue;
+                };
+                let AgentActivationResolutionDisposition::NotReady {
+                    retry: predecessor_retry,
+                    ..
+                } = &predecessor.result.disposition
+                else {
+                    self.fifo.push_back(ticket_id);
+                    continue;
+                };
+                if now < predecessor_retry.not_before_unix_ms
+                    || successor.dependency_ref != dependency_ref
+                    || dependency_revision == predecessor_retry.observed_dependency_revision
+                {
+                    // A due-time-only observation is not claimable. Keep the
+                    // successor staged and invisible to the daemon until the
+                    // authenticated owner supplies a changed discriminator.
+                    self.fifo.push_back(ticket_id);
+                    continue;
+                }
+            }
+            let Some(entry) = self.entries.get_mut(&ticket_id) else {
+                continue;
+            };
             entry.claim_lease_until_unix_ms = Some(
                 now.saturating_add(AGENT_ACTIVATION_CLAIM_LEASE_MS)
                     .min(entry.ticket.kernel_deadline_unix_ms),
             );
+            entry.claim_dependency_ref = Some(dependency_ref.to_owned());
+            entry.claim_dependency_revision = Some(dependency_revision.to_owned());
             let ticket = entry.ticket.clone();
-            self.fifo.push_back(ticket_id);
+            self.mark_lifecycle(&ticket_id, AgentActivationLifecycle::Claimed);
             return Some(ticket);
         }
         None
@@ -845,34 +1014,21 @@ impl AgentActivationPendingState {
                 .all(|ticket_id| ordered.contains(ticket_id))
     }
 
-    /// Determines the only safe eviction plan for one incoming result. This
-    /// is deliberately pure: an impossible bound or order/map state returns
-    /// `None` before durable ORS publication can begin.
+    /// Validates the local ledger shape before publication. ORS, under the
+    /// same pending lock, is the sole authority for bounded eviction; the
+    /// cache never selects a victim independently.
     #[cfg(windows)]
-    fn result_retention_eviction_plan(&self, ticket_id: &str) -> Option<Vec<String>> {
+    fn result_retention_eviction_plan(&self, _ticket_id: &str) -> Option<Vec<String>> {
         if !self.result_ledger_is_consistent() {
             return None;
         }
-        if self.results.contains_key(ticket_id) {
-            return Some(Vec::new());
-        }
-        let max = eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS;
-        let required = self.results.len().saturating_add(1).saturating_sub(max);
-        let mut victims = Vec::with_capacity(required);
-        for candidate in &self.result_order {
-            if !self.entries.contains_key(candidate) {
-                victims.push(candidate.clone());
-                if victims.len() == required {
-                    break;
-                }
-            }
-        }
-        (victims.len() == required).then_some(victims)
+        Some(Vec::new())
     }
 
     /// Stages the canonical result map/order update before the durable write.
-    /// The returned copies are not published until ORS has committed, so an
-    /// impossible capacity or order state leaves the live ledger untouched.
+    /// ORS performs bounded eviction under the same pending lock and returns
+    /// the exact victim identities; this cache never chooses a different
+    /// victim independently.
     #[cfg(windows)]
     fn stage_result_retention(
         &self,
@@ -913,23 +1069,18 @@ impl AgentActivationPendingState {
         ),
         ticket_id: &str,
         retention_order: u64,
+        evicted_ticket_ids: &[String],
     ) {
         debug_assert!(staged.0.contains_key(ticket_id));
+        for evicted_ticket_id in evicted_ticket_ids {
+            staged.0.remove(evicted_ticket_id);
+            staged.1.retain(|candidate| candidate != evicted_ticket_id);
+        }
         if let Some(record) = staged.0.get_mut(ticket_id) {
             record.retention_order = retention_order;
         }
         self.results = staged.0;
         self.result_order = staged.1;
-    }
-
-    #[cfg(test)]
-    fn retain_activation_result(&mut self, record: AgentActivationResultRecord) {
-        let ticket_id = record.result.ticket_id.clone();
-        let retention_order = record.retention_order;
-        let staged = self
-            .stage_result_retention(record)
-            .expect("test result ledger must have a safe retention state");
-        self.publish_staged_result_retention(staged, &ticket_id, retention_order);
     }
 }
 
@@ -967,6 +1118,8 @@ pub enum KernelFrameAction {
     Daemon {
         /// Correlation identity to echo in the response.
         request_id: RequestId,
+        /// Exact authenticated request identity admitted on the same frame.
+        identity: RequestIdentity,
         /// Closed operation name from the daemon application wire.
         operation: String,
         /// Bounded operation payload.

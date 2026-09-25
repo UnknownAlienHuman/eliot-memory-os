@@ -1272,6 +1272,7 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
         OrsError::DuplicateConflict
         | OrsError::HostRequestIdentityConflict { .. }
         | OrsError::ActivationResultRetentionIdentityConflict { .. }
+        | OrsError::ActivationLifecycleIdentityConflict { .. }
         | OrsError::NativeWorkerClaimIdentityConflict { .. }
         | OrsError::WorkerReplayIdentityConflict { .. }
         | OrsError::WorkerReplayStaleStream { .. } => BackupError::Duplicate {
@@ -1326,9 +1327,17 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
                 reason: "must be a supported bounded page",
             }
         }
-        OrsError::InvalidTransition | OrsError::ScopeRecoveryRequired | OrsError::UnsafeExpiry => {
-            BackupError::RestorePhaseMismatch
-        }
+        OrsError::InvalidTransition
+        | OrsError::ActivationLifecycleStateConflict { .. }
+        | OrsError::ScopeRecoveryRequired
+        | OrsError::UnsafeExpiry => BackupError::RestorePhaseMismatch,
+        // Issue #1115: an activation ticket past its Kernel deadline is refused
+        // before result admission. The deadline is a real, observed refusal of
+        // this step rather than journal corruption, so it maps by cause class
+        // the same way an elapsed supervision-lease ticket does.
+        OrsError::ActivationLifecycleExpired { .. } => BackupError::IntegrityMismatch {
+            subject: "restore journal activation ticket".to_owned(),
+        },
         OrsError::ActiveExecutableReplacement
         | OrsError::IncompatibleArtifact
         | OrsError::VersionedArtifactConflict

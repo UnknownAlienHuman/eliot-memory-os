@@ -2923,6 +2923,240 @@ impl ActivationResultRetentionRecord {
     }
 }
 
+/// Maximum number of Kernel activation lifecycle rows retained by ORS.
+pub const MAX_ACTIVATION_LIFECYCLE_RECORDS: usize = 64;
+/// Maximum ticket payload retained for one activation lifecycle row.
+pub const MAX_ACTIVATION_LIFECYCLE_PAYLOAD_BYTES: usize = 128 * 1024;
+
+/// Durable mechanical lifecycle of one Kernel activation ticket.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ActivationLifecycleState {
+    /// Ticket is durably staged but no daemon claim is active.
+    Pending,
+    /// The authenticated daemon owns the bounded semantic-resolution claim.
+    Claimed,
+    /// An immutable `NotReady` result is retained and may later mint one
+    /// successor ticket after its due time and dependency-revision gate.
+    DeferredNotReady,
+    /// An immutable terminal result is retained.
+    ResultAccepted,
+    /// The ticket was cancelled before any result-bearing claim.
+    Cancelled,
+    /// The Kernel deadline linearized before any result was accepted.
+    Expired,
+    /// Outcome or ownership is uncertain and must not be replayed blindly.
+    Reconciling,
+}
+
+impl ActivationLifecycleState {
+    /// Returns whether this state can never accept a new semantic result.
+    #[must_use]
+    pub const fn is_terminal_or_reconciling(self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled | Self::Expired | Self::Reconciling | Self::ResultAccepted
+        )
+    }
+}
+
+/// Immutable durable predecessor binding for one successor activation ticket.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationSuccessorBinding {
+    pub predecessor_ticket_id: String,
+    pub predecessor_ticket_sha256: String,
+    pub predecessor_result_sha256: String,
+    pub dependency_ref: String,
+    pub observed_dependency_revision: String,
+    pub not_before_unix_ms: u64,
+}
+
+impl ActivationSuccessorBinding {
+    fn validate(&self) -> Result<(), OrsError> {
+        validate_text(
+            &self.predecessor_ticket_id,
+            "activation_predecessor_ticket_id",
+        )?;
+        validate_digest(
+            &self.predecessor_ticket_sha256,
+            "activation_predecessor_ticket_sha256",
+        )?;
+        validate_digest(
+            &self.predecessor_result_sha256,
+            "activation_predecessor_result_sha256",
+        )?;
+        validate_text(&self.dependency_ref, "activation_dependency_ref")?;
+        validate_text(
+            &self.observed_dependency_revision,
+            "activation_observed_dependency_revision",
+        )?;
+        if self.not_before_unix_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "activation_not_before_unix_ms",
+                reason: "successor due time must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One durable Kernel activation ticket lifecycle and result binding.
+///
+/// ORS treats `ticket_payload` as opaque bytes and validates only bounded
+/// identity shape. Kernel owns typed ticket/result semantics. A lifecycle row
+/// is the sole terminal/reconciling fence: result retention alone never
+/// cancels, expires, or completes a ticket.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationLifecycleRecord {
+    pub ticket_id: String,
+    pub ticket_sha256: String,
+    pub ticket_payload: String,
+    pub activation_request_id: String,
+    pub activation_request_sha256: String,
+    pub connection_id: String,
+    pub state_fence: String,
+    pub kernel_deadline_unix_ms: u64,
+    pub cancellation_id: String,
+    pub state: ActivationLifecycleState,
+    #[serde(default)]
+    pub lifecycle_order: u64,
+    #[serde(default)]
+    pub result_sha256: Option<String>,
+    #[serde(default)]
+    pub claim_owner: Option<String>,
+    #[serde(default)]
+    pub claim_expires_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub successor_of: Option<ActivationSuccessorBinding>,
+    #[serde(default)]
+    pub successor_ticket_id: Option<String>,
+    #[serde(default)]
+    pub terminal_reason: Option<String>,
+}
+
+impl ActivationLifecycleRecord {
+    /// Validates one incoming or persisted activation lifecycle row.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.ticket_id, "activation_lifecycle_ticket_id")?;
+        validate_digest(&self.ticket_sha256, "activation_lifecycle_ticket_sha256")?;
+        if self.ticket_payload.len() > MAX_ACTIVATION_LIFECYCLE_PAYLOAD_BYTES {
+            return Err(OrsError::InvalidField {
+                field: "activation_lifecycle_ticket_payload",
+                reason: "ticket payload exceeds the per-record bound",
+            });
+        }
+        validate_text(
+            &self.activation_request_id,
+            "activation_lifecycle_request_id",
+        )?;
+        validate_digest(
+            &self.activation_request_sha256,
+            "activation_lifecycle_request_sha256",
+        )?;
+        validate_text(&self.connection_id, "activation_lifecycle_connection_id")?;
+        validate_text(&self.state_fence, "activation_lifecycle_state_fence")?;
+        if self.kernel_deadline_unix_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "activation_lifecycle_deadline",
+                reason: "deadline must be greater than zero",
+            });
+        }
+        validate_text(
+            &self.cancellation_id,
+            "activation_lifecycle_cancellation_id",
+        )?;
+        if let Some(result_sha256) = &self.result_sha256 {
+            validate_digest(result_sha256, "activation_lifecycle_result_sha256")?;
+        }
+        if let Some(claim_owner) = &self.claim_owner {
+            validate_text(claim_owner, "activation_lifecycle_claim_owner")?;
+        }
+        if let Some(successor_of) = &self.successor_of {
+            successor_of.validate()?;
+        }
+        if let Some(successor_ticket_id) = &self.successor_ticket_id {
+            validate_text(successor_ticket_id, "activation_successor_ticket_id")?;
+        }
+        if let Some(reason) = &self.terminal_reason {
+            validate_text(reason, "activation_lifecycle_terminal_reason")?;
+        }
+        let claim_fields_match =
+            self.claim_owner.is_some() == self.claim_expires_at_unix_ms.is_some();
+        if !claim_fields_match {
+            return Err(OrsError::InvalidField {
+                field: "activation_lifecycle_claim",
+                reason: "claim owner and expiry must be present together",
+            });
+        }
+        if self.state == ActivationLifecycleState::Claimed
+            && (self.claim_owner.is_none() || self.result_sha256.is_some())
+        {
+            return Err(OrsError::InvalidField {
+                field: "activation_lifecycle_claim",
+                reason: "claimed state requires a claim owner and no result",
+            });
+        }
+        if matches!(
+            self.state,
+            ActivationLifecycleState::DeferredNotReady | ActivationLifecycleState::ResultAccepted
+        ) && self.result_sha256.is_none()
+        {
+            return Err(OrsError::InvalidField {
+                field: "activation_lifecycle_result",
+                reason: "result-bearing state requires the retained result digest",
+            });
+        }
+        if matches!(
+            self.state,
+            ActivationLifecycleState::Pending
+                | ActivationLifecycleState::Cancelled
+                | ActivationLifecycleState::Expired
+        ) && self.result_sha256.is_some()
+        {
+            return Err(OrsError::InvalidField {
+                field: "activation_lifecycle_result",
+                reason: "resultless state cannot retain a semantic result",
+            });
+        }
+        if self.state != ActivationLifecycleState::Claimed && self.claim_owner.is_some() {
+            return Err(OrsError::InvalidField {
+                field: "activation_lifecycle_claim",
+                reason: "only claimed state retains claim ownership",
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the exact durable key for this ticket.
+    pub fn record_key(&self) -> &str {
+        &self.ticket_id
+    }
+
+    /// Compares immutable ticket/request/cancellation identity while ignoring
+    /// mutable lifecycle state and ORS-assigned order.
+    pub fn same_immutable_identity(&self, other: &Self) -> bool {
+        self.ticket_id == other.ticket_id
+            && self.ticket_sha256 == other.ticket_sha256
+            && self.ticket_payload == other.ticket_payload
+            && self.activation_request_id == other.activation_request_id
+            && self.activation_request_sha256 == other.activation_request_sha256
+            && self.connection_id == other.connection_id
+            && self.state_fence == other.state_fence
+            && self.kernel_deadline_unix_ms == other.kernel_deadline_unix_ms
+            && self.cancellation_id == other.cancellation_id
+            && self.successor_of == other.successor_of
+    }
+}
+
+/// Coherent one-read activation recovery projection from ORS.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivationRecoverySnapshot {
+    pub lifecycles: Vec<ActivationLifecycleRecord>,
+    pub results: Vec<ActivationResultRetentionRecord>,
+}
+
 /// Typed ORS failures. None grants semantic or completion authority.
 #[derive(Debug, Error)]
 pub enum OrsError {
@@ -3023,6 +3257,18 @@ pub enum OrsError {
         "activation result ticket {ticket_id} conflicts with durable ORS state: IDENTITY_CONFLICT"
     )]
     ActivationResultRetentionIdentityConflict { ticket_id: String },
+    #[error(
+        "activation lifecycle ticket {ticket_id} conflicts with durable ORS state: IDENTITY_CONFLICT"
+    )]
+    ActivationLifecycleIdentityConflict { ticket_id: String },
+    #[error("activation ticket {ticket_id} expired before result admission")]
+    ActivationLifecycleExpired { ticket_id: String },
+    #[error("activation ticket {ticket_id} is in durable state {state:?}, not {expected:?}")]
+    ActivationLifecycleStateConflict {
+        ticket_id: String,
+        state: ActivationLifecycleState,
+        expected: ActivationLifecycleState,
+    },
     #[error("native-worker claim {claim_id} conflicts with durable ORS state: IDENTITY_CONFLICT")]
     NativeWorkerClaimIdentityConflict { claim_id: String },
     #[error(

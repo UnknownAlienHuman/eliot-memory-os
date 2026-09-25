@@ -39,22 +39,8 @@ const PUBLISH_OWNER_BUNDLE_OPERATION: &str = "publish_owner_bundle";
 const INITIALIZE_OWNER_REVISION_OPERATION: &str = "initialize_owner_revision";
 /// Typed receipt kind answered by the revision initialization arm.
 const OWNER_REVISION_RECEIPT_KIND: &str = "owner_revision_receipt";
-/// Daemon->Kernel front-door owner-bundle readback operation.
-const QUERY_OWNER_BUNDLE_OPERATION: &str = "query_owner_bundle";
-/// Daemon->Kernel front-door read of the completed canonical second phases of
-/// one authority root (issue #2100, `R6`).
-const QUERY_GRANT_CLOSURE_LINKS_OPERATION: &str = "query_grant_closure_canonical_receipts";
 /// Typed receipt kind answered by the publish arm.
 const OWNER_BUNDLE_RECEIPT_KIND: &str = "owner_bundle_receipt";
-/// Typed readback kind answered by the query arm.
-const OWNER_BUNDLE_READBACK_KIND: &str = "owner_bundle_readback";
-/// Typed receipt kind answered by the canonical second-phase read arm.
-const GRANT_CLOSURE_LINKS_KIND: &str = "grant_closure_canonical_receipts";
-/// Typed refusal kind answered by the same arm. A refusal is never read as an
-/// empty link set: the durable reason is surfaced and the pass degrades.
-const GRANT_CLOSURE_LINKS_REFUSAL_KIND: &str = "grant_closure_canonical_receipts_refused";
-/// The only canonical second-phase payload shape this daemon build accepts.
-const GRANT_CLOSURE_LINKS_VERSION: u32 = 1;
 /// Only an acknowledged `bound` receipt counts as published.
 const OWNER_BOUND_STATUS: &str = "bound";
 
@@ -66,17 +52,6 @@ const OWNER_BOUND_STATUS: &str = "bound";
 struct OwnerBundleReceiptWire {
     revision: u64,
     status: String,
-}
-
-/// Wire shape answered by the Kernel `query_owner_bundle` arm: whether the
-/// Kernel holds a bound owner and, when bound, the exact revision and bundle
-/// digest the publish path reconciles against.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OwnerBundleReadbackWire {
-    bound: bool,
-    revision: Option<u64>,
-    digest: Option<String>,
 }
 
 /// Wire shape answered by the owner-lineage revision initialization arm.
@@ -321,19 +296,15 @@ impl OwnerPublishPort for KernelOwnerPublishPort {
     async fn query_owner_readback(
         &self,
     ) -> Result<(bool, Option<u64>, Option<String>), CompositionError> {
-        let value = self
+        let readback = self
             .kernel
-            .transact_async(QUERY_OWNER_BUNDLE_OPERATION, serde_json::json!({}))
+            .query_owner_bundle_readback()
             .await
-            .map_err(|error| {
-                CompositionError::Recovery(format!("owner readback transport: {error}"))
-            })?;
-        let value = kind_value(&value, OWNER_BUNDLE_READBACK_KIND)
-            .map_err(|error| CompositionError::Owner(format!("owner readback kind: {error}")))?;
-        let readback: OwnerBundleReadbackWire = serde_json::from_value(value).map_err(|error| {
-            CompositionError::Owner(format!("owner readback does not decode: {error}"))
-        })?;
-        Ok((readback.bound, readback.revision, readback.digest))
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        Ok(match readback {
+            Some(readback) => (true, Some(readback.revision), Some(readback.bundle_sha256)),
+            None => (false, None, None),
+        })
     }
 }
 

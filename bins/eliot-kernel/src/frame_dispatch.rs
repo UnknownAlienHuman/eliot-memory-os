@@ -633,6 +633,7 @@ impl KernelComposition {
                 }
                 return Ok(KernelFrameAction::Daemon {
                     request_id,
+                    identity: identity.clone(),
                     operation: operation.to_owned(),
                     payload,
                 });
@@ -1112,6 +1113,8 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "agent_activation_claim"
             | "agent_activation_submit"
             | "agent_activation_reconcile"
+            | "publish_owner_bundle"
+            | "query_owner_bundle"
             | "store_recovery"
             | "store_initialize_genesis"
             | "apply_prepared"
@@ -1120,8 +1123,6 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "local_read"
             | "local_read_claim"
             | "local_read_result"
-            | "publish_owner_bundle"
-            | "query_owner_bundle"
             | "initialize_owner_revision"
             // I1.5 (#1750): the Host request leg. These are the four admitted
             // lifecycle legs of the Host request surface; the branch admits

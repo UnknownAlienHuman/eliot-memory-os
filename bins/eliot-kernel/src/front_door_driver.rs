@@ -278,11 +278,14 @@ async fn serve_connection(
             }
             KernelFrameAction::Daemon {
                 request_id,
+                identity,
                 operation,
                 payload,
             } => {
                 let reply = kernel
-                    .execute_daemon_request(&session, request_id, &operation, payload)
+                    .execute_daemon_request_with_identity(
+                        &session, request_id, identity, &operation, payload,
+                    )
                     .await?;
                 if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
                     session.fence();

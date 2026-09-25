@@ -233,6 +233,43 @@ fn map_retry(retry: GovernorRetryDirective) -> AgentActivationRetryDirective {
     }
 }
 
+fn build_protocol_result(
+    ticket: &AgentActivationResolutionTicket,
+    resolved_at_unix_ms: u64,
+    disposition: AgentActivationResolutionDisposition,
+    owner_revision: u64,
+    successor_observation: Option<(u64, String)>,
+) -> Result<AgentActivationResolutionResult, DaemonError> {
+    let result = if ticket.successor_of.is_some() {
+        let (_, observed_dependency_revision) = successor_observation.ok_or_else(|| {
+            DaemonError::Lifecycle(
+                "successor activation result lacks a fresh dependency observation".to_owned(),
+            )
+        })?;
+        AgentActivationResolutionResult::new_for_successor(
+            ticket,
+            resolved_at_unix_ms,
+            disposition,
+            owner_revision,
+            observed_dependency_revision,
+        )
+    } else {
+        if successor_observation.is_some() {
+            return Err(DaemonError::Lifecycle(
+                "initial activation ticket carried successor dependency evidence".to_owned(),
+            ));
+        }
+        AgentActivationResolutionResult::new_with_owner_evidence(
+            ticket,
+            resolved_at_unix_ms,
+            disposition,
+            owner_revision,
+        )
+    }
+    .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+    Ok(result)
+}
+
 /// Lossless mapping from the Governor-internal typed outcome to the wire v2
 /// protocol result. Every variant is preserved 1:1; no error is coerced to
 /// `Resolved` and no error is dropped.
@@ -240,6 +277,32 @@ pub fn map_governor_outcome_to_protocol(
     ticket: &AgentActivationResolutionTicket,
     outcome: GovernorActivationOutcome,
     resolved_at_unix_ms: u64,
+) -> Result<AgentActivationResolutionResult, DaemonError> {
+    map_governor_outcome_to_protocol_inner(ticket, outcome, resolved_at_unix_ms, None)
+}
+
+/// Maps a fresh semantic-owner observation for one successor ticket. The
+/// observation is taken from the same coherent Governor read as the outcome.
+pub fn map_governor_outcome_to_protocol_for_successor(
+    ticket: &AgentActivationResolutionTicket,
+    outcome: GovernorActivationOutcome,
+    resolved_at_unix_ms: u64,
+    owner_revision: u64,
+    observed_dependency_revision: String,
+) -> Result<AgentActivationResolutionResult, DaemonError> {
+    map_governor_outcome_to_protocol_inner(
+        ticket,
+        outcome,
+        resolved_at_unix_ms,
+        Some((owner_revision, observed_dependency_revision)),
+    )
+}
+
+fn map_governor_outcome_to_protocol_inner(
+    ticket: &AgentActivationResolutionTicket,
+    outcome: GovernorActivationOutcome,
+    resolved_at_unix_ms: u64,
+    successor_observation: Option<(u64, String)>,
 ) -> Result<AgentActivationResolutionResult, DaemonError> {
     // #740: request/result span over the typed projection boundary. The
     // Governor outcome stays the sole discriminator; the span only names the
@@ -249,6 +312,12 @@ pub fn map_governor_outcome_to_protocol(
         ticket = %crate::diagnostics::sanitize_identity(&ticket.ticket_id)
     )
     .entered();
+    let owner_revision = match &outcome {
+        GovernorActivationOutcome::Resolved(snapshot) => snapshot.owner_revision,
+        _ => successor_observation
+            .as_ref()
+            .map_or(1, |(owner_revision, _)| *owner_revision),
+    };
     let disposition = match outcome {
         GovernorActivationOutcome::Resolved(snapshot) => {
             let binding = AgentActivationResolvedBinding {
@@ -299,17 +368,21 @@ pub fn map_governor_outcome_to_protocol(
         }
     };
 
-    AgentActivationResolutionResult::new(ticket, resolved_at_unix_ms, disposition)
-        .map_err(|error| DaemonError::Lifecycle(error.to_string()))
-        .inspect(|result| {
-            // #740: result span carries disposition + digest identities only.
-            let _ = crate::diagnostics::AdmissionRecord::of(
-                crate::diagnostics::disposition_of_resolution(&result.disposition),
-                &ticket.ticket_id,
-                &result.result_sha256,
-            )
-            .emit();
-        })
+    let result = build_protocol_result(
+        ticket,
+        resolved_at_unix_ms,
+        disposition,
+        owner_revision,
+        successor_observation,
+    )?;
+    // #740: result span carries disposition + digest identities only.
+    let _ = crate::diagnostics::AdmissionRecord::of(
+        crate::diagnostics::disposition_of_resolution(&result.disposition),
+        &ticket.ticket_id,
+        &result.result_sha256,
+    )
+    .emit();
+    Ok(result)
 }
 
 /// Typed fail-closed result for a `Resolved` snapshot whose fence no longer
@@ -323,17 +396,39 @@ pub fn map_governor_outcome_to_protocol(
 /// result carrying the observed fence, so the Kernel fails closed without
 /// creating a Session and the daemon stays alive for the next claim. Never
 /// produces a binding.
+#[cfg(test)]
 pub fn stale_fence_for_resolved_mismatch(
     ticket: &AgentActivationResolutionTicket,
     observed_state_fence: eliot_contracts::StateFence,
     resolved_at_unix_ms: u64,
 ) -> Result<AgentActivationResolutionResult, DaemonError> {
+    stale_fence_for_resolved_mismatch_with_observation(
+        ticket,
+        observed_state_fence,
+        resolved_at_unix_ms,
+        None,
+    )
+}
+
+pub fn stale_fence_for_resolved_mismatch_with_observation(
+    ticket: &AgentActivationResolutionTicket,
+    observed_state_fence: eliot_contracts::StateFence,
+    resolved_at_unix_ms: u64,
+    successor_observation: Option<(u64, String)>,
+) -> Result<AgentActivationResolutionResult, DaemonError> {
     let disposition = AgentActivationResolutionDisposition::StaleFence {
         recovery_handle: "daemon.fence-mismatch:recovery".to_owned(),
         observed_state_fence: Some(observed_state_fence),
     };
-    AgentActivationResolutionResult::new(ticket, resolved_at_unix_ms, disposition)
-        .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    build_protocol_result(
+        ticket,
+        resolved_at_unix_ms,
+        disposition,
+        successor_observation
+            .as_ref()
+            .map_or(1, |(revision, _)| *revision),
+        successor_observation,
+    )
 }
 
 /// Typed fail-closed result when the Governor is not ready to classify the
@@ -349,15 +444,31 @@ pub fn stale_fence_for_resolved_mismatch(
 /// for the next claim. Never produces a binding and never retries the ticket.
 /// If the fallback itself cannot bind (e.g. the deadline passed under the
 /// resolver), the caller keeps the original readiness error unchanged.
+#[cfg(test)]
 pub fn failed_internal_for_unready_governor(
     ticket: &AgentActivationResolutionTicket,
     resolved_at_unix_ms: u64,
 ) -> Result<AgentActivationResolutionResult, DaemonError> {
+    failed_internal_for_unready_governor_with_observation(ticket, resolved_at_unix_ms, None)
+}
+
+pub fn failed_internal_for_unready_governor_with_observation(
+    ticket: &AgentActivationResolutionTicket,
+    resolved_at_unix_ms: u64,
+    successor_observation: Option<(u64, String)>,
+) -> Result<AgentActivationResolutionResult, DaemonError> {
     let disposition = AgentActivationResolutionDisposition::FailedInternal {
         failure_handle: "daemon.governor-not-ready:recovery".to_owned(),
     };
-    AgentActivationResolutionResult::new(ticket, resolved_at_unix_ms, disposition)
-        .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    build_protocol_result(
+        ticket,
+        resolved_at_unix_ms,
+        disposition,
+        successor_observation
+            .as_ref()
+            .map_or(1, |(revision, _)| *revision),
+        successor_observation,
+    )
 }
 
 /// Typed fail-closed result when the Governor→protocol mapping rejects a
@@ -373,16 +484,38 @@ pub fn failed_internal_for_unready_governor(
 /// outcome kind is carried in the bounded failure handle; the full mapping
 /// error stays in daemon diagnostics. Never produces a binding and never
 /// retries the same ticket.
+#[cfg(test)]
 pub fn failed_internal_for_mapping_failure(
     ticket: &AgentActivationResolutionTicket,
     outcome_kind: &str,
     resolved_at_unix_ms: u64,
 ) -> Result<AgentActivationResolutionResult, DaemonError> {
+    failed_internal_for_mapping_failure_with_observation(
+        ticket,
+        outcome_kind,
+        resolved_at_unix_ms,
+        None,
+    )
+}
+
+pub fn failed_internal_for_mapping_failure_with_observation(
+    ticket: &AgentActivationResolutionTicket,
+    outcome_kind: &str,
+    resolved_at_unix_ms: u64,
+    successor_observation: Option<(u64, String)>,
+) -> Result<AgentActivationResolutionResult, DaemonError> {
     let disposition = AgentActivationResolutionDisposition::FailedInternal {
         failure_handle: format!("daemon.mapping-failure:{outcome_kind}:recovery"),
     };
-    AgentActivationResolutionResult::new(ticket, resolved_at_unix_ms, disposition)
-        .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    build_protocol_result(
+        ticket,
+        resolved_at_unix_ms,
+        disposition,
+        successor_observation
+            .as_ref()
+            .map_or(1, |(revision, _)| *revision),
+        successor_observation,
+    )
 }
 
 #[cfg(test)]
@@ -415,11 +548,14 @@ mod projection_tests {
             wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
             ticket_id: "ticket-test".to_owned(),
             activation_request_id: RequestId::new("activation-request-1").expect("request id"),
+            demand_id: "activation-demand-1".to_owned(),
             activation_request_sha256: "a".repeat(64),
             peer_admission_receipt_sha256: "b".repeat(64),
             connection_id: "connection-1".to_owned(),
+            cancellation_id: "cancellation-1".to_owned(),
             state_fence: StateFence::new(test_epoch(1), ResourceGeneration::new(1).expect("gen")),
             kernel_deadline_unix_ms: deadline,
+            successor_of: None,
             ticket_sha256: String::new(),
         };
         ticket.ticket_sha256 = ticket.compute_digest().expect("digest");
@@ -429,6 +565,7 @@ mod projection_tests {
     fn test_snapshot() -> GovernorActivationSnapshot {
         GovernorActivationSnapshot {
             state_fence: StateFence::new(test_epoch(1), ResourceGeneration::new(1).expect("gen")),
+            owner_revision: 1,
             principal_id: "principal-1".to_owned(),
             session_id: "session-1".to_owned(),
             task_id: eliot_contracts::TaskId::new("task-1").expect("task id"),
@@ -1220,13 +1357,17 @@ mod projection_tests {
         );
         first.validate_against(&ticket).expect("valid binding");
         second.validate_against(&ticket).expect("valid binding");
-        // The retained acknowledgement echoes the exact result verbatim,
-        // so the replay leg carries the full disposition without coercion.
-        let ack = eliot_protocol::AgentActivationResultAck::replayed(&first).expect("replay ack");
+        // The retained acknowledgement echoes the exact result verbatim and
+        // uses one stable positive outcome for fresh commit, replay, and
+        // reconcile, so retry transport cannot change response bytes.
+        let ack = eliot_protocol::AgentActivationResultAck::accepted(&first).expect("stable ack");
+        let replay_ack =
+            eliot_protocol::AgentActivationResultAck::accepted(&second).expect("replay ack");
         assert_eq!(
             ack.outcome,
-            eliot_protocol::AgentActivationResultAckOutcome::ExactReplay
+            eliot_protocol::AgentActivationResultAckOutcome::Accepted
         );
+        assert_eq!(ack, replay_ack);
         assert_eq!(ack.result.as_ref(), Some(&second));
         ack.validate().expect("valid ack");
     }
