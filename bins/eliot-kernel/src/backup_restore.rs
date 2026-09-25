@@ -70,7 +70,7 @@
 //! Value-based escapes.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eliot_backup::{
     BackupBlob, BackupBundle, BackupClass, BackupError, BlobRestorationReceipt, CanonicalRecord,
@@ -92,8 +92,8 @@ use serde::Serialize;
 use super::backup_restore_ports::{
     DESTINATION_ADMISSION_FILE, DestinationManifestEvidence, KernelIsolatedDestination,
     KernelRestoreError, OrsRestoreBinding, OrsRestoreJournal, PinnedDestinationAdmission,
-    RESTORE_EVIDENCE_FILE, RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts, check_kernel_effect_fence,
-    require_production_admitted,
+    RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA, RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts,
+    StagedCleanupRefusal, check_kernel_effect_fence, require_production_admitted,
 };
 
 /// Maps one accepted restore step to its responsible owner.
@@ -257,6 +257,147 @@ fn gate_revocation_ledger(bundle: &BackupBundle) -> Result<(), BackupError> {
         ));
     }
     Ok(())
+}
+
+/// Kernel ceiling on the number of files one restore execution may stage into
+/// its isolated destination (issue #960, W11/A18 `bounds`).
+///
+/// The effective ceiling is the lower of this absolute limit and the count
+/// derived from the archive's own members (see [`StagedOutputBudget`]), so an
+/// archive can never raise the bound and the bound is never a number
+/// unrelated to the archive.
+pub const MAX_STAGED_OUTPUT_MEMBERS: usize = 65_536;
+/// Kernel ceiling on the bytes one restore execution may stage into its
+/// isolated destination.
+///
+/// I14.3: a restore writes into a controlled staging area with a budget, and
+/// the budget is checked before the write rather than measured after it.
+pub const MAX_STAGED_OUTPUT_BYTES: usize = 2 * 1024 * 1024 * 1024;
+/// Byte allowance for ONE file the restore owner serializes itself: a phase
+/// receipt, a phase marker, or a staged member file whose canonical form the
+/// archive does not declare a length for.
+pub const MAX_STAGED_RECEIPT_BYTES: usize = 64 * 1024;
+/// Byte allowance for the finalize evidence document, which is assembled by
+/// this owner from the plan and the archive rather than copied from either.
+pub const MAX_STAGED_EVIDENCE_BYTES: usize = 4 * 1024 * 1024;
+/// Files this restore owner serializes for itself, independent of how many
+/// members the archive carries: one phase receipt for each of the five fixed
+/// phases (prepare, purge, rebuild, verify, finalize), the staged purge
+/// ledger, the rebuild marker, the verify marker, the finalize evidence
+/// document, and the pinned destination admission when Host admission exists —
+/// plus headroom, so this is a bound on the owner's own fixed output set
+/// rather than a tripwire that a later owner-evidence file would trip.
+pub const OWNER_STAGED_FILE_ALLOWANCE: usize = 16;
+/// `BackupError::LimitExceeded` field name for the member ceiling, so the
+/// refusal names the exact bound that stopped the restore.
+const STAGED_OUTPUT_MEMBERS_FIELD: &str = "restore.staged_output_members";
+/// `BackupError::LimitExceeded` field name for the byte ceiling.
+const STAGED_OUTPUT_BYTES_FIELD: &str = "restore.staged_output_bytes";
+
+/// Checked accumulation for the derived staged-output denominators. Overflow
+/// refuses the archive through the named ceiling rather than wrapping a byte
+/// count into a smaller, permissive one.
+fn checked_total(total: &mut usize, bytes: usize) -> Result<(), BackupError> {
+    *total = total.checked_add(bytes).ok_or(BackupError::LimitExceeded {
+        field: STAGED_OUTPUT_BYTES_FIELD,
+        limit: MAX_STAGED_OUTPUT_BYTES,
+    })?;
+    Ok(())
+}
+
+/// The archive's own member denominator: every member that costs one restore
+/// phase, one staged member file, and one phase receipt.
+///
+/// Single-sourced so the durable-journal budget and the staged-output budget
+/// can never disagree about how large this archive is.
+fn archive_member_count(bundle: &BackupBundle) -> usize {
+    bundle.blobs.len()
+        + bundle.canonical_events.len()
+        + bundle.receipts.len()
+        + bundle.projections.len()
+        + usize::from(bundle.ors_snapshot.is_some())
+}
+
+/// The bytes the archive itself declares for the members this target stages.
+///
+/// Measured, never guessed: a blob's sealed envelope length, a canonical
+/// record's canonical payload length, a receipt's canonical length, the purge
+/// ledger's canonical length, and the ORS snapshot's canonical length. Each
+/// is the same value the corresponding phase serializes into the destination,
+/// so the derived ceiling cannot understate a legitimate restore.
+fn staged_member_bytes(bundle: &BackupBundle) -> Result<usize, BackupError> {
+    let canonical = |value: &serde_json::Value| -> Result<usize, BackupError> {
+        canonical_json_bytes(value)
+            .map(|bytes| bytes.len())
+            .map_err(|error| BackupError::Serialization(error.to_string()))
+    };
+    let mut total = 0usize;
+    for blob in &bundle.blobs {
+        checked_total(&mut total, blob.sealed_bytes.len())?;
+    }
+    for record in bundle.canonical_events.iter().chain(&bundle.projections) {
+        checked_total(&mut total, canonical(&record.payload)?)?;
+    }
+    for receipt in &bundle.receipts {
+        let bytes = canonical_json_bytes(receipt)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        checked_total(&mut total, bytes.len())?;
+    }
+    let ledger = canonical_json_bytes(&bundle.purge_ledger)
+        .map_err(|error| BackupError::Serialization(error.to_string()))?;
+    checked_total(&mut total, ledger.len())?;
+    if let Some(snapshot) = bundle.ors_snapshot.as_ref() {
+        let bytes = canonical_json_bytes(snapshot)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        checked_total(&mut total, bytes.len())?;
+    }
+    Ok(total)
+}
+
+/// The bounded staged-output budget one restore execution works inside.
+///
+/// Both ceilings are DERIVED and then capped, never chosen by a caller:
+///
+/// - the member ceiling is the archive's own member count (the same
+///   denominator [`check_ors_journal_budget`] uses) times the two files each
+///   member phase provably stages — the member file and its phase receipt —
+///   plus [`OWNER_STAGED_FILE_ALLOWANCE`] for the fixed set this owner
+///   serializes itself, capped by [`MAX_STAGED_OUTPUT_MEMBERS`];
+/// - the byte ceiling is the archive's declared member bytes plus a named
+///   per-file allowance for the receipts and markers this owner serializes
+///   and a named allowance for the finalize evidence, capped by
+///   [`MAX_STAGED_OUTPUT_BYTES`].
+///
+/// So a restore that fits its archive never meets the bound, and one that does
+/// not is refused BEFORE the exceeding write instead of after it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StagedOutputBudget {
+    members: usize,
+    bytes: usize,
+}
+
+impl StagedOutputBudget {
+    /// Derives the budget for one archive, refusing an arithmetic overflow
+    /// instead of wrapping it into a permissive ceiling.
+    fn derive(bundle: &BackupBundle) -> Result<Self, BackupError> {
+        // One staged member file and one phase receipt per member phase: the
+        // exact, archive-derived part of the denominator.
+        let members = archive_member_count(bundle)
+            .checked_mul(2)
+            .and_then(|archive_files| archive_files.checked_add(OWNER_STAGED_FILE_ALLOWANCE))
+            .ok_or(BackupError::LimitExceeded {
+                field: STAGED_OUTPUT_MEMBERS_FIELD,
+                limit: MAX_STAGED_OUTPUT_MEMBERS,
+            })?
+            .min(MAX_STAGED_OUTPUT_MEMBERS);
+        let owner_bytes = members
+            .saturating_mul(MAX_STAGED_RECEIPT_BYTES)
+            .saturating_add(MAX_STAGED_EVIDENCE_BYTES);
+        let bytes = staged_member_bytes(bundle)?
+            .saturating_add(owner_bytes)
+            .min(MAX_STAGED_OUTPUT_BYTES);
+        Ok(Self { members, bytes })
+    }
 }
 
 /// Canonical owner client: runs the owner's accepted validation and
@@ -585,6 +726,17 @@ impl KernelBackupRestore {
     /// never flattened into a fabricated success. Rehearsal never
     /// activates, retires, cuts over, or unblocks effects: no such code
     /// path exists here.
+    ///
+    /// Every staged write is admitted against the archive-derived
+    /// [`StagedOutputBudget`] BEFORE it happens, so an archive that cannot
+    /// fit the budget is refused rather than written past it. When the
+    /// journaled engine fails, the output this execution staged is removed by
+    /// a bounded, ownership-scoped cleanup (see
+    /// [`KernelRestoreTarget::cleanup_staged_output`]) and the typed cleanup
+    /// disposition is carried by the SAME primary failure: the cause is never
+    /// replaced, and a resume, a foreign admission, a destination that left
+    /// the isolated area, and every path this execution did not write are
+    /// preserved rather than removed.
     #[allow(clippy::too_many_lines)]
     #[allow(
         clippy::needless_pass_by_value,
@@ -666,17 +818,23 @@ impl KernelBackupRestore {
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?,
             None => Vec::new(),
         };
-        let mut target_impl = KernelRestoreTarget::new(
-            &destination,
-            ports.kernel_fence.clone(),
-            ports.keys,
-            ports.blob_scope,
-            receipts,
-            ports.manifest_evidence.clone(),
-        );
-        let receipt = plan
-            .execute_with_journal(bundle, &mut target_impl, journal)
-            .map_err(KernelRestoreError::TargetFailed)?;
+        let mut target_impl =
+            KernelRestoreTarget::new(&self.work_root, &destination, bundle, ports, receipts)
+                .map_err(KernelRestoreError::TargetFailed)?;
+        let receipt = match plan.execute_with_journal(bundle, &mut target_impl, journal) {
+            Ok(receipt) => receipt,
+            Err(primary) => {
+                // The engine failed. The primary typed failure is what this
+                // owner returns, and the bounded cleanup of the output THIS
+                // execution staged is folded into it without replacing it.
+                return Err(target_impl.refuse_with_staged_cleanup(
+                    &destination,
+                    &transaction.transaction_id,
+                    &plan.target.target_id,
+                    primary,
+                ));
+            }
+        };
         receipt
             .validate()
             .map_err(KernelRestoreError::TargetFailed)?;
@@ -969,6 +1127,22 @@ enum ObservedEffect {
     Undecidable,
 }
 
+/// Bounded removal disposition for the output one restore execution staged.
+///
+/// A disposition, not an error: the primary engine failure is returned either
+/// way, so this only has to say what happened to the staged bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StagedCleanup {
+    /// This execution staged no removable file; nothing was removed and
+    /// nothing is owed.
+    NothingStaged,
+    /// Every removable file this execution staged was removed.
+    Removed,
+    /// Cleanup preserved what it could not attribute to this execution, for
+    /// the exact typed reason.
+    Refused(StagedCleanupRefusal),
+}
+
 /// Kernel restore target over the accepted effect seam.
 ///
 /// Every applicable phase re-checks the Kernel effect fence before touching
@@ -976,8 +1150,18 @@ enum ObservedEffect {
 /// bindings the coordinator supplies, persists exact bytes, and returns an
 /// observed receipt. Reconciliation answers from persisted identity receipts
 /// only.
+///
+/// It also owns the two bounds the target is responsible for: every staged
+/// write is admitted against [`StagedOutputBudget`] BEFORE it happens, and the
+/// exact set of paths it wrote is retained so a failed execution can be
+/// cleaned up without touching anything it cannot prove is its own.
 struct KernelRestoreTarget<'a> {
     root: PathBuf,
+    /// Work root the destination was constructed under, re-checked at cleanup
+    /// time so a swapped destination cannot redirect a removal.
+    work_root: PathBuf,
+    /// Destination label, the last component of the isolated restore path.
+    label: String,
     kernel_fence: StateFence,
     keys: Option<&'a eliot_backup::WrappedKeyManifest>,
     blob_scope: Option<&'a DestinationScope>,
@@ -985,27 +1169,41 @@ struct KernelRestoreTarget<'a> {
     manifest_evidence: Option<DestinationManifestEvidence>,
     calls: Vec<String>,
     final_evidence: Option<RestoreEvidence>,
+    /// Bounded output budget derived from the archive before any write.
+    budget: StagedOutputBudget,
+    /// Files staged so far, against [`StagedOutputBudget::members`].
+    staged_members: usize,
+    /// Bytes staged so far, against [`StagedOutputBudget::bytes`].
+    staged_bytes: usize,
+    /// Exact paths this execution wrote, in write order, each under the
+    /// destination root. Nothing else is ever a cleanup candidate.
+    staged: Vec<PathBuf>,
 }
 
 impl<'a> KernelRestoreTarget<'a> {
     fn new(
+        work_root: &Path,
         destination: &KernelIsolatedDestination,
-        kernel_fence: StateFence,
-        keys: Option<&'a eliot_backup::WrappedKeyManifest>,
-        blob_scope: Option<&'a DestinationScope>,
+        bundle: &BackupBundle,
+        ports: &RestorePorts<'a>,
         receipts: Vec<BlobRestorationReceipt>,
-        manifest_evidence: Option<DestinationManifestEvidence>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, BackupError> {
+        Ok(Self {
             root: destination.root().to_path_buf(),
-            kernel_fence,
-            keys,
-            blob_scope,
+            work_root: work_root.to_path_buf(),
+            label: destination.label().to_owned(),
+            kernel_fence: ports.kernel_fence.clone(),
+            keys: ports.keys,
+            blob_scope: ports.blob_scope,
             receipts,
-            manifest_evidence,
+            manifest_evidence: ports.manifest_evidence.clone(),
             calls: Vec::new(),
             final_evidence: None,
-        }
+            budget: StagedOutputBudget::derive(bundle)?,
+            staged_members: 0,
+            staged_bytes: 0,
+            staged: Vec::new(),
+        })
     }
 
     /// Re-checks the Kernel effect fence before an applicable phase.
@@ -1013,7 +1211,42 @@ impl<'a> KernelRestoreTarget<'a> {
         check_kernel_effect_fence(&self.kernel_fence, bundle)
     }
 
-    fn write_file(&self, relative: &str, bytes: &[u8]) -> Result<(), BackupError> {
+    /// Stages one file, refusing BEFORE the write when the bounded output
+    /// budget would be exceeded.
+    ///
+    /// The bound is checked against the running accounting plus this file, so
+    /// the refusal happens while the destination still matches the budget —
+    /// never after the exceeding bytes exist. The refusal is the typed
+    /// [`BackupError::LimitExceeded`] naming the exact ceiling, not a
+    /// formatted message, and it propagates through the phase and the engine
+    /// unchanged.
+    fn write_file(&mut self, relative: &str, bytes: &[u8]) -> Result<(), BackupError> {
+        let members = self
+            .staged_members
+            .checked_add(1)
+            .ok_or(BackupError::LimitExceeded {
+                field: STAGED_OUTPUT_MEMBERS_FIELD,
+                limit: self.budget.members,
+            })?;
+        if members > self.budget.members {
+            return Err(BackupError::LimitExceeded {
+                field: STAGED_OUTPUT_MEMBERS_FIELD,
+                limit: self.budget.members,
+            });
+        }
+        let staged_bytes =
+            self.staged_bytes
+                .checked_add(bytes.len())
+                .ok_or(BackupError::LimitExceeded {
+                    field: STAGED_OUTPUT_BYTES_FIELD,
+                    limit: self.budget.bytes,
+                })?;
+        if staged_bytes > self.budget.bytes {
+            return Err(BackupError::LimitExceeded {
+                field: STAGED_OUTPUT_BYTES_FIELD,
+                limit: self.budget.bytes,
+            });
+        }
         // Atomic temp-write + rename: a crash never leaves a torn receipt
         // that later reads as success. An unparseable receipt still reports
         // Unknown (rollback disposition), never a fabricated outcome.
@@ -1024,7 +1257,11 @@ impl<'a> KernelRestoreTarget<'a> {
         }
         let tmp = path.with_extension("tmp-restore");
         std::fs::write(&tmp, bytes).map_err(|error| BackupError::Target(error.to_string()))?;
-        std::fs::rename(&tmp, &path).map_err(|error| BackupError::Target(error.to_string()))
+        std::fs::rename(&tmp, &path).map_err(|error| BackupError::Target(error.to_string()))?;
+        self.staged_members = members;
+        self.staged_bytes = staged_bytes;
+        self.staged.push(path);
+        Ok(())
     }
 
     fn phase_receipt_path(&self, phase: &RestorePhase) -> Result<PathBuf, BackupError> {
@@ -1052,7 +1289,7 @@ impl<'a> KernelRestoreTarget<'a> {
     }
 
     fn persist_applied(
-        &self,
+        &mut self,
         intent: &RestoreIntent,
         applied: &RestoreAppliedEffect,
     ) -> Result<(), BackupError> {
@@ -1065,6 +1302,200 @@ impl<'a> KernelRestoreTarget<'a> {
             .to_string_lossy()
             .into_owned();
         self.write_file(&relative, &bytes)
+    }
+
+    /// Turns an engine failure plus the cleanup disposition into the refusal
+    /// this owner returns.
+    ///
+    /// The engine's typed failure is the cause and is never replaced. When the
+    /// cleanup removed everything, or had nothing removable to remove, the
+    /// refusal stays plain [`KernelRestoreError::TargetFailed`] — there is no
+    /// second fact to report. When the cleanup preserved what it could not
+    /// attribute, that exact typed reason travels with the SAME primary
+    /// failure, so nothing is lost and nothing is stringified.
+    fn refuse_with_staged_cleanup(
+        &self,
+        destination: &KernelIsolatedDestination,
+        transaction_id: &str,
+        target_id: &str,
+        primary: BackupError,
+    ) -> KernelRestoreError {
+        match self.cleanup_staged_output(destination, transaction_id, target_id) {
+            StagedCleanup::NothingStaged | StagedCleanup::Removed => {
+                KernelRestoreError::TargetFailed(primary)
+            }
+            StagedCleanup::Refused(cleanup) => {
+                KernelRestoreError::StagedCleanupIncomplete { primary, cleanup }
+            }
+        }
+    }
+
+    /// Bounded, ownership-scoped removal of the output THIS execution staged.
+    ///
+    /// Ownership, in the order it is proved:
+    ///
+    /// 1. candidates are the exact paths this execution wrote
+    ///    ([`Self::staged`]) minus the preserved observation classes, so a
+    ///    prior execution's staging, a pinned admission, and the reconcileable
+    ///    phase receipts are never candidates at all;
+    /// 2. a destination that was resumed rather than constructed fresh is
+    ///    refused outright, because its contents are not provably ours;
+    /// 3. the pinned destination admission is re-read through the same
+    ///    [`KernelBackupRestore::refuse_foreign_destination`] gate that
+    ///    admitted it, so a destination pinned to another transaction or
+    ///    target is refused rather than emptied;
+    /// 4. the destination root and the isolated area are resolved again HERE,
+    ///    not reused from open time, and the root must still sit inside
+    ///    `<work_root>/.eliot/restore-isolated/<label>`, so a swapped or
+    ///    re-pointed destination cannot redirect a removal.
+    ///
+    /// Bounded work, in three dimensions: the walk is over a known path set,
+    /// so there is no unbounded directory recursion; the set is at most
+    /// [`StagedOutputBudget::members`] because those are the same writes the
+    /// budget admitted; and the aggregate unlinked bytes stop at
+    /// [`StagedOutputBudget::bytes`], the same ceiling that admitted them.
+    /// Empty directories left behind are reclaimed with
+    /// [`std::fs::remove_dir`], which cannot remove a non-empty directory, so
+    /// a directory this pass did not empty always survives.
+    fn cleanup_staged_output(
+        &self,
+        destination: &KernelIsolatedDestination,
+        transaction_id: &str,
+        target_id: &str,
+    ) -> StagedCleanup {
+        let candidates: Vec<&PathBuf> = self
+            .staged
+            .iter()
+            .filter(|path| !Self::is_preserved_observation(path, &self.root))
+            .collect();
+        if candidates.is_empty() {
+            return StagedCleanup::NothingStaged;
+        }
+        if destination.is_resumed() {
+            return StagedCleanup::Refused(StagedCleanupRefusal::AdmittedResume);
+        }
+        if KernelBackupRestore::refuse_foreign_destination(
+            destination,
+            transaction_id,
+            target_id,
+            self.manifest_evidence.as_ref(),
+        )
+        .is_err()
+        {
+            return StagedCleanup::Refused(StagedCleanupRefusal::ForeignAdmission);
+        }
+        let isolated = self.work_root.join(".eliot").join(RESTORE_ISOLATED_AREA);
+        let area = match std::fs::canonicalize(isolated.join(&self.label)) {
+            Ok(area) => area,
+            // The isolated area is already gone, so none of the staged output
+            // this execution produced is still on disk.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return StagedCleanup::Removed;
+            }
+            Err(_) => return StagedCleanup::Refused(StagedCleanupRefusal::OutsideIsolatedArea),
+        };
+        let root = match std::fs::canonicalize(&self.root) {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return StagedCleanup::Removed;
+            }
+            Err(_) => return StagedCleanup::Refused(StagedCleanupRefusal::OutsideIsolatedArea),
+        };
+        if !root.starts_with(&area) {
+            return StagedCleanup::Refused(StagedCleanupRefusal::OutsideIsolatedArea);
+        }
+        let mut refusal: Option<StagedCleanupRefusal> = None;
+        let mut removed_bytes = 0usize;
+        let mut parents: BTreeSet<PathBuf> = BTreeSet::new();
+        for path in candidates {
+            if !path.starts_with(&self.root) {
+                refusal.get_or_insert(StagedCleanupRefusal::PathNotOurs);
+                continue;
+            }
+            let metadata = match std::fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    refusal.get_or_insert(StagedCleanupRefusal::RemovalFailed);
+                    continue;
+                }
+            };
+            // A directory (or any non-file) at a staged path means the shape
+            // this pass admitted is not the shape on disk, so it refuses rather
+            // than recursing into it.
+            if metadata.is_dir() {
+                refusal.get_or_insert(StagedCleanupRefusal::PathNotOurs);
+                continue;
+            }
+            let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+            if size > self.budget.bytes.saturating_sub(removed_bytes) {
+                refusal.get_or_insert(StagedCleanupRefusal::BudgetReached);
+                break;
+            }
+            match std::fs::remove_file(path) {
+                Ok(()) => {
+                    removed_bytes += size;
+                    if let Some(parent) = path.parent() {
+                        parents.insert(parent.to_path_buf());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    refusal.get_or_insert(StagedCleanupRefusal::RemovalFailed);
+                }
+            }
+        }
+        Self::reclaim_empty_directories(&parents, &self.root);
+        match refusal {
+            Some(refusal) => StagedCleanup::Refused(refusal),
+            None => StagedCleanup::Removed,
+        }
+    }
+
+    /// Whether a staged path is an observation or owner evidence rather than
+    /// derived payload, and is therefore never removed by cleanup.
+    ///
+    /// - `phase-receipts/**` is the per-phase observation the journal
+    ///   reconciles against and that the finalize obligation denominator
+    ///   digests; its absence is
+    ///   [`BackupError::RestoreJournalCorrupt`], which is a worse outcome
+    ///   than the staging left behind;
+    /// - [`DESTINATION_ADMISSION_FILE`] is Host-issued owner evidence (#958)
+    ///   pinned to this transaction, not a byte this execution produced;
+    /// - [`RESTORE_EVIDENCE_FILE`] is the finalize evidence a later resume
+    ///   re-reads and cutover qualification requires.
+    ///
+    /// A path this execution never wrote is absent from [`Self::staged`] by
+    /// construction, so another execution's output is preserved without
+    /// needing to be recognised here.
+    fn is_preserved_observation(path: &Path, root: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(root) else {
+            return true;
+        };
+        let Some(std::path::Component::Normal(first)) = relative.components().next() else {
+            return true;
+        };
+        let Some(first) = first.to_str() else {
+            return true;
+        };
+        first == "phase-receipts"
+            || first == DESTINATION_ADMISSION_FILE
+            || first == RESTORE_EVIDENCE_FILE
+    }
+
+    /// Reclaims the directories this pass emptied, deepest first.
+    ///
+    /// Only plain [`std::fs::remove_dir`] is used, and only on directories
+    /// strictly below the destination root, so a directory that still holds
+    /// anything — including anything this pass did not write — cannot be
+    /// removed. A failure is absorbed: the consequence is a retained empty
+    /// directory, never a wrong answer about what is still staged.
+    fn reclaim_empty_directories(parents: &BTreeSet<PathBuf>, root: &Path) {
+        let mut deepest: Vec<&PathBuf> = parents.iter().filter(|dir| *dir != root).collect();
+        deepest.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+        for dir in deepest {
+            let _reclaimed = std::fs::remove_dir(dir);
+        }
     }
 
     fn load_applied(&self, intent: &RestoreIntent) -> Result<ObservedEffect, BackupError> {
@@ -1833,11 +2264,7 @@ fn check_ors_journal_binding(
 /// against the same ceiling the owner enforces, so the limit refuses the
 /// archive up front instead of bricking it mid-run.
 fn check_ors_journal_budget(bundle: &BackupBundle) -> Result<(), KernelRestoreError> {
-    let members = bundle.blobs.len()
-        + bundle.canonical_events.len()
-        + bundle.receipts.len()
-        + bundle.projections.len()
-        + usize::from(bundle.ors_snapshot.is_some());
+    let members = archive_member_count(bundle);
     // Two fixed phases (prepare, purge) and three fixed tail phases (rebuild,
     // verify, finalize), plus the conditional ORS suspension phase.
     let phases = 5 + members;
