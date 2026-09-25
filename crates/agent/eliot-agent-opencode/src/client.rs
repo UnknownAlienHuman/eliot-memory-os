@@ -1,12 +1,13 @@
 use crate::{
     AdmittedAttemptCandidate, AdmittedAttemptError, AdmittedObservation, AdmittedObservationKind,
-    AdmittedOpenCodeAttempt, AuthorityCeiling, BasicAuth, EnvironmentAllowlist,
-    ExecutableFingerprint, HealthResponse, HttpMethod, HttpRequest, LoopbackEndpoint,
-    LoopbackHttpClient, LoopbackHttpError, ModelSelection, NoAuthorityRunResult,
+    AdmittedOpenCodeAttempt, AdmittedSlotConsumption, AuthorityCeiling, BasicAuth,
+    EnvironmentAllowlist, ExecutableFingerprint, HealthResponse, HttpMethod, HttpRequest,
+    LoopbackEndpoint, LoopbackHttpClient, LoopbackHttpError, ModelSelection, NoAuthorityRunResult,
     OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE, OpenCodeEvent, OpenCodeWireRouteReceipt,
     ProviderCatalog, QuotaAvailability, ReadOnlyRunRequest, RunRequestError, RunStatus, Session,
     SessionDiff, SessionStatus, SessionStatusMap, SseConnection, SseDecodeError, SseDecoder,
-    SseLimits, UnknownFields, UsageAvailability, UsageTelemetry,
+    SseEvent, SseLimits, UnknownFields, UsageAvailability, UsageTelemetry, bound_session_identity,
+    committed_message_id,
 };
 use eliot_contracts::{ResourceGeneration, StateFence};
 use serde_json::{Value, json};
@@ -280,6 +281,54 @@ impl EventCollectionFailure {
     }
 }
 
+/// Reconciliation verdict for the committed execution-unit message against
+/// the bound session's message record.
+enum CommittedPrior {
+    /// The committed message never dispatched; dispatch exactly once.
+    Absent,
+    /// The committed message already carries a terminal assistant; the
+    /// previous execution is reused without redispatching.
+    Complete { assistant_id: String },
+    /// The committed message exists without a terminal assistant;
+    /// reconcile without redispatching.
+    Unresolved,
+}
+
+/// Returns true when a recorded assistant message is a terminal,
+/// error-free completion of the committed unit under the requested model:
+/// no provider error, a completion timestamp, the admitted route, and a
+/// terminal stop attestation.
+fn committed_assistant_terminal(message: &Value, requested: &ModelSelection) -> bool {
+    let Some(info) = message.get("info").and_then(Value::as_object) else {
+        return false;
+    };
+    if info.get("error").is_some_and(|error| !error.is_null()) {
+        return false;
+    }
+    if info
+        .get("time")
+        .and_then(Value::as_object)
+        .and_then(|time| time.get("completed"))
+        .and_then(Value::as_u64)
+        .is_none()
+    {
+        return false;
+    }
+    if attest_message_route(info, requested).is_err() {
+        return false;
+    }
+    let parts_terminal = message
+        .get("parts")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part.get("type").and_then(Value::as_str) == Some("step-finish")
+                    && part.get("reason").and_then(Value::as_str) == Some("stop")
+            })
+        });
+    info.get("finish").and_then(Value::as_str) == Some("stop") || parts_terminal
+}
+
 struct CorrelatedEventState {
     session_id: String,
     user_message_id: String,
@@ -449,18 +498,29 @@ impl OpenCodeClient {
         Ok(self
             .http
             .execute(&HttpRequest::get("/global/health"))
-            .await?
+            .await
+            .map_err(attest_supervised_owner)?
             .json()?)
     }
 
     pub async fn providers(&self) -> Result<ProviderCatalog, OpenCodeRunError> {
         let path = self.project_path("/provider", &[])?;
-        Ok(self.http.execute(&HttpRequest::get(path)).await?.json()?)
+        Ok(self
+            .http
+            .execute(&HttpRequest::get(path))
+            .await
+            .map_err(attest_supervised_owner)?
+            .json()?)
     }
 
     pub async fn agents(&self) -> Result<Vec<Value>, OpenCodeRunError> {
         let path = self.project_path("/agent", &[])?;
-        Ok(self.http.execute(&HttpRequest::get(path)).await?.json()?)
+        Ok(self
+            .http
+            .execute(&HttpRequest::get(path))
+            .await
+            .map_err(attest_supervised_owner)?
+            .json()?)
     }
 
     pub async fn create_session(&self) -> Result<Session, OpenCodeRunError> {
@@ -618,7 +678,7 @@ impl OpenCodeClient {
                         .await
                 {
                     return Ok((
-                        self.success_result(request, prepared, projection, failure.events),
+                        self.success_result(request, &prepared, projection, failure.events),
                         statuses,
                     ));
                 }
@@ -644,7 +704,7 @@ impl OpenCodeClient {
             )
             .await?;
         Ok((
-            self.success_result(request, prepared, projection, collection.events),
+            self.success_result(request, &prepared, projection, collection.events),
             statuses,
         ))
     }
@@ -653,19 +713,28 @@ impl OpenCodeClient {
     /// route (issue #487).
     ///
     /// Fail-closed before start: the admission/binding/attempt agreement is
-    /// re-verified against the live fence and generation, and the presented
-    /// request must carry the exact admitted provider/model in a valid
-    /// read-only shape — all before any session, prompt, or event-stream
-    /// call. Execution reuses exactly [`OpenCodeClient::run_read_only`]:
-    /// attach-only loopback HTTP+SSE against the externally supervised
-    /// server, the read-only `plan` agent ceiling, and no server launch,
-    /// process control, credential exposure, or finish authority. The
-    /// returned seal is candidate-only; unknown outcomes surface as
-    /// [`OpenCodeRunError`] (including `UnknownOutcome`) and never seal. The
-    /// admitted slot is consumed exactly once before dispatch, every other
-    /// live session must be idle before sealing (fail-closed child gate), and
-    /// one terminal observation bound to the sealed candidate is emitted
-    /// without changing the return type.
+    /// re-verified against the live fence and generation, the presented
+    /// request must carry the exact admitted provider/model/session in a
+    /// valid read-only shape, the attempt must carry its owner-minted
+    /// execution binding in a pre-execution state with no owner-requested
+    /// cancel — all before any session, prompt, or event-stream call.
+    /// Execution reuses exactly the attach-only loopback HTTP+SSE surface
+    /// against the externally supervised server, the read-only `plan` agent
+    /// ceiling, and no server launch, process control, credential exposure,
+    /// or finish authority.
+    ///
+    /// Exact-once joins the admitted slot to the dispatched execution
+    /// through retained owner state, never a second ledger: the slot claim
+    /// snapshots the execution-unit, start-request, session, and message
+    /// commitments; dispatch attaches to the bound execution session (new
+    /// sessions are never created here) under the committed message; the
+    /// committed unit is reconciled against the server's message record
+    /// before any prompt is sent, so exact replay returns or reconciles the
+    /// previous execution while changed requests and unresolved prior work
+    /// never redispatch. The observed run is validated against the retained
+    /// binding before sealing, and the returned seal is candidate-only;
+    /// unknown outcomes surface as [`OpenCodeRunError`] (including
+    /// `UnknownOutcome`) and never seal.
     pub async fn run_admitted_read_only(
         &self,
         admitted: &AdmittedOpenCodeAttempt,
@@ -675,57 +744,298 @@ impl OpenCodeClient {
     ) -> Result<AdmittedAttemptOutcome, AdmittedAttemptError> {
         admitted.verify(current_fence, runtime_generation)?;
         admitted.verify_request(request)?;
-        let slot = admitted.consume_one_slot();
-        let (mut run, statuses) = self.execute_read_only(request).await?;
-        let Some(session_id) = run.session_id.clone() else {
-            return Err(AdmittedAttemptError::Run(OpenCodeRunError::Protocol(
-                "admitted run returned no session identity".to_owned(),
-            )));
+        let slot = admitted.consume_one_slot(request)?;
+        // Owner-state claim through the supervised server: attach to the
+        // bound execution session and reconcile the committed unit before
+        // any provider dispatch. Attachment failures precede dispatch and
+        // cross unchanged; everything after the claim maps unreconciled
+        // failures to unknown outcome (never a seal, never a redispatch).
+        let prepared = self.prepare_admitted_run(admitted, request).await?;
+        let prior = self
+            .reconcile_committed_message(&prepared.session.id, &prepared.message_id, request)
+            .await
+            .map_err(|error| AdmittedAttemptError::Run(map_admitted_post_claim_error(error)))?;
+        let deadline = Instant::now() + self.policy.overall_timeout;
+        let (run, statuses) = match prior {
+            CommittedPrior::Absent => self
+                .dispatch_admitted(&prepared, request, deadline)
+                .await
+                .map_err(AdmittedAttemptError::Run)?,
+            CommittedPrior::Complete { assistant_id } => self
+                .reconcile_success(
+                    &prepared.session.id,
+                    &prepared.message_id,
+                    Some(&assistant_id),
+                    &request.model,
+                    &request.output_schema,
+                    &prepared.baseline_diff,
+                )
+                .await
+                .map(|(projection, statuses)| {
+                    (
+                        self.success_result(request, &prepared, projection, Vec::new()),
+                        statuses,
+                    )
+                })
+                .map_err(|error| AdmittedAttemptError::Run(map_admitted_post_claim_error(error)))?,
+            CommittedPrior::Unresolved => self
+                .reconcile_success(
+                    &prepared.session.id,
+                    &prepared.message_id,
+                    None,
+                    &request.model,
+                    &request.output_schema,
+                    &prepared.baseline_diff,
+                )
+                .await
+                .map(|(projection, statuses)| {
+                    (
+                        self.success_result(request, &prepared, projection, Vec::new()),
+                        statuses,
+                    )
+                })
+                .map_err(|error| AdmittedAttemptError::Run(map_admitted_post_claim_error(error)))?,
         };
-        let children: Vec<(String, bool)> = statuses
+        seal_admitted_outcome(admitted, slot, &prepared.message_id, run, &statuses)
+    }
+
+    /// Prepares one admitted dispatch by attaching to the bound execution
+    /// session. Unlike the unadmitted path this never creates a session:
+    /// the execution unit lives in exactly the session the binding was
+    /// minted under, resolved through the accepted provider-binding
+    /// lifecycle, and a sessionless binding carries no attachable session.
+    /// Provider/model/agent gates and the read-only permission attestation
+    /// match the shared path; any failure precedes dispatch.
+    async fn prepare_admitted_run(
+        &self,
+        admitted: &AdmittedOpenCodeAttempt,
+        request: &ReadOnlyRunRequest,
+    ) -> Result<PreparedRun, OpenCodeRunError> {
+        request.validate()?;
+        self.policy.validate()?;
+        let health = self.health().await?;
+        if !health.healthy || health.version != self.policy.expected_server_version {
+            return Err(OpenCodeRunError::RouteUnavailable(format!(
+                "expected healthy OpenCode {}, observed healthy={} version={:?}",
+                self.policy.expected_server_version, health.healthy, health.version
+            )));
+        }
+        attest_provider(&self.providers().await?, &request.model)?;
+        attest_read_only_agent(&self.agents().await?)?;
+        let Some(expected) = bound_session_identity(admitted.binding()) else {
+            return Err(OpenCodeRunError::Protocol(
+                "admitted binding carries no attachable execution session".to_owned(),
+            ));
+        };
+        let session = self.get_session(&expected).await?;
+        attest_session(&session, Some(expected.as_str()), &self.policy, &health)?;
+        // Fresh admitted dispatch requires a diff-clean bound session
+        // end-to-end: this edge never mutates, so any observed diff is
+        // foreign. The baseline is therefore empty by policy, and the
+        // reconciled current diff must match it before sealing. This keeps
+        // the admitted flow on the same call budget as the shared path
+        // while failing closed on external mutation.
+        let baseline_diff = Vec::new();
+        let message_id = committed_message_id(admitted, request).map_err(|error| {
+            OpenCodeRunError::Protocol(format!("admitted message commitment failed: {error}"))
+        })?;
+        Ok(PreparedRun {
+            health,
+            session,
+            baseline_diff,
+            message_id,
+        })
+    }
+
+    /// Reconciles the committed execution-unit message against the bound
+    /// session's message record before any prompt is sent.
+    ///
+    /// - `Absent` with no foreign user message: the unit never dispatched;
+    ///   the caller may dispatch exactly once under the commitment.
+    /// - `Absent` with a foreign user message: the bound session already
+    ///   served a different unit, so a changed request fails closed instead
+    ///   of redispatching into the occupied session.
+    /// - `Complete`: the committed message already carries a terminal
+    ///   assistant; the caller reuses that previous execution.
+    /// - `Unresolved`: the committed message exists without a terminal
+    ///   assistant; the caller reconciles without redispatching, and the
+    ///   tail maps an unreconcilable remainder to unknown outcome.
+    async fn reconcile_committed_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        request: &ReadOnlyRunRequest,
+    ) -> Result<CommittedPrior, OpenCodeRunError> {
+        let messages = timeout(RECONCILIATION_CALL_TIMEOUT, self.messages(session_id))
+            .await
+            .map_err(|_| OpenCodeRunError::Timeout {
+                phase: "committed message reconciliation",
+            })??;
+        let messages = messages.as_array().ok_or_else(|| {
+            OpenCodeRunError::Protocol(
+                "committed-message reconciliation: session messages response is not an array"
+                    .to_owned(),
+            )
+        })?;
+        let ours = messages
             .iter()
-            .filter(|(id, _)| id.as_str() != session_id)
-            .map(|(id, status)| {
-                let is_open = !matches!(status, SessionStatus::Idle { .. });
-                (id.clone(), is_open)
+            .filter(|message| {
+                message.pointer("/info/role").and_then(Value::as_str) == Some("user")
+                    && message.pointer("/info/id").and_then(Value::as_str) == Some(message_id)
+                    && message.pointer("/info/sessionID").and_then(Value::as_str)
+                        == Some(session_id)
             })
-            .collect();
-        crate::ensure_no_open_child_sessions(&session_id, &children)?;
-        // The sealed candidate is the terminal observation: attempt-bound
-        // heartbeat/progress/quota summaries sealed into the result extra,
-        // reusing the already-reconciled status map with no new HTTP call.
-        let observations = vec![
-            AdmittedObservation::new(
-                admitted,
-                AdmittedObservationKind::Heartbeat,
-                format!(
-                    "{} correlated events observed; stream complete",
-                    run.events.len()
-                ),
-            ),
-            AdmittedObservation::new(
-                admitted,
-                AdmittedObservationKind::Progress,
-                "correlated completion reconciled; terminal disposition reached".to_owned(),
-            ),
-            AdmittedObservation::new(
-                admitted,
-                AdmittedObservationKind::Quota,
-                format!("{:?}", run.quota),
-            ),
-        ];
-        run.extra.insert(
-            "admitted_observations".to_owned(),
-            serde_json::to_value(&observations)
-                .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?,
-        );
-        run.extra.insert(
-            "edge".to_owned(),
-            Value::String(OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE.to_owned()),
-        );
-        let candidate = AdmittedAttemptCandidate::seal(admitted, &run)?;
-        slot.confirm(admitted)?;
-        Ok(AdmittedAttemptOutcome { run, candidate })
+            .count();
+        if ours == 0 {
+            let foreign = messages.iter().any(|message| {
+                message.pointer("/info/role").and_then(Value::as_str) == Some("user")
+                    && message.pointer("/info/sessionID").and_then(Value::as_str)
+                        == Some(session_id)
+            });
+            if foreign {
+                return Err(OpenCodeRunError::Protocol(
+                    "bound execution session holds a different execution unit; a changed request never redispatches"
+                        .to_owned(),
+                ));
+            }
+            return Ok(CommittedPrior::Absent);
+        }
+        if ours > 1 {
+            return Err(OpenCodeRunError::Protocol(
+                "committed execution unit message appears more than once; refusing an ambiguous replay"
+                    .to_owned(),
+            ));
+        }
+        let mut terminal_assistant: Option<String> = None;
+        for message in messages {
+            let Some(info) = message.get("info").and_then(Value::as_object) else {
+                continue;
+            };
+            if info.get("role").and_then(Value::as_str) != Some("assistant")
+                || info.get("sessionID").and_then(Value::as_str) != Some(session_id)
+                || info.get("parentID").and_then(Value::as_str) != Some(message_id)
+            {
+                continue;
+            }
+            let Some(assistant_id) = info.get("id").and_then(Value::as_str).map(str::to_owned)
+            else {
+                continue;
+            };
+            if committed_assistant_terminal(message, &request.model) {
+                terminal_assistant = Some(assistant_id);
+            }
+        }
+        match terminal_assistant {
+            Some(assistant_id) => Ok(CommittedPrior::Complete { assistant_id }),
+            None => Ok(CommittedPrior::Unresolved),
+        }
+    }
+
+    /// Dispatches one committed execution unit: the event stream opens
+    /// before the single prompt (matching the shared path), then ordered
+    /// collection and reconciliation against the submitted identities.
+    /// Definitively rejected prompts (the provider never accepted them)
+    /// cross unchanged; every other post-claim failure maps to unknown
+    /// outcome — never a seal and never a blind redispatch.
+    async fn dispatch_admitted(
+        &self,
+        prepared: &PreparedRun,
+        request: &ReadOnlyRunRequest,
+        deadline: Instant,
+    ) -> Result<(NoAuthorityRunResult, SessionStatusMap), OpenCodeRunError> {
+        let connection = self
+            .open_event_stream(None)
+            .await
+            .map_err(map_admitted_post_claim_error)?;
+        if let Err(error) = self
+            .prompt_async(&prepared.session.id, &prepared.message_id, request)
+            .await
+        {
+            if dispatch_definitively_rejected(&error) {
+                return Err(error);
+            }
+            return self
+                .fail_after_dispatch(
+                    &prepared.session.id,
+                    &prepared.message_id,
+                    &prepared.baseline_diff,
+                    error,
+                )
+                .await
+                .map_err(map_admitted_post_claim_error);
+        }
+
+        self.collect_admitted(prepared, request, deadline, connection)
+            .await
+    }
+
+    /// Collects the ordered SSE stream for one committed dispatch and
+    /// reconciles it against the submitted identities. Reconcilable stream
+    /// failures fall back to the session/message/diff reconciliation; the
+    /// remainder maps to unknown outcome through the abort path.
+    async fn collect_admitted(
+        &self,
+        prepared: &PreparedRun,
+        request: &ReadOnlyRunRequest,
+        deadline: Instant,
+        connection: SseConnection,
+    ) -> Result<(NoAuthorityRunResult, SessionStatusMap), OpenCodeRunError> {
+        let collection = match self
+            .collect_events(
+                connection,
+                &prepared.session.id,
+                &prepared.message_id,
+                &request.model,
+                deadline,
+            )
+            .await
+        {
+            Ok(collection) => collection,
+            Err(failure) => {
+                if failure.may_reconcile_success
+                    && let Ok((projection, statuses)) = self
+                        .reconcile_success(
+                            &prepared.session.id,
+                            &prepared.message_id,
+                            None,
+                            &request.model,
+                            &request.output_schema,
+                            &prepared.baseline_diff,
+                        )
+                        .await
+                {
+                    return Ok((
+                        self.success_result(request, prepared, projection, failure.events),
+                        statuses,
+                    ));
+                }
+                return self
+                    .fail_after_dispatch(
+                        &prepared.session.id,
+                        &prepared.message_id,
+                        &prepared.baseline_diff,
+                        failure.error,
+                    )
+                    .await
+                    .map_err(map_admitted_post_claim_error);
+            }
+        };
+
+        let (projection, statuses) = self
+            .reconcile_success(
+                &prepared.session.id,
+                &prepared.message_id,
+                Some(&collection.assistant_message_id),
+                &request.model,
+                &request.output_schema,
+                &prepared.baseline_diff,
+            )
+            .await
+            .map_err(map_admitted_post_claim_error)?;
+        Ok((
+            self.success_result(request, prepared, projection, collection.events),
+            statuses,
+        ))
     }
 
     async fn prepare_run(
@@ -777,6 +1087,7 @@ impl OpenCodeClient {
         let mut state = CorrelatedEventState::new(session_id, message_id, requested_model);
         let mut events = Vec::<OpenCodeEvent>::new();
         let mut reconnect_count = 0_usize;
+        let mut last_frame_id: Option<String> = None;
         loop {
             let chunk_result = self.read_event_chunk(&mut connection, deadline).await;
             let chunk = match chunk_result {
@@ -789,6 +1100,11 @@ impl OpenCodeClient {
                         connection = resumed_connection;
                         decoder = resumed_decoder;
                         reconnect_count += 1;
+                        // A resumed connection continues the server stream:
+                        // reseed order tracking from the Last-Event-ID anchor
+                        // so replayed frames validate as redelivery while new
+                        // frames validate as ordered successors.
+                        last_frame_id = decoder.cursor().last_event_id.clone();
                         continue;
                     }
                     Ok(None) => {
@@ -808,19 +1124,30 @@ impl OpenCodeClient {
                 EventCollectionFailure::terminal(error.into(), std::mem::take(&mut events))
             })?;
             for frame in frames {
+                let frame_id = frame.id.clone();
                 if frame.data.trim().is_empty() {
+                    // Cursor-only frame: advances the resume anchor without
+                    // carrying an observation.
+                    if let Some(frame_id) = frame_id {
+                        last_frame_id = Some(frame_id);
+                    }
                     continue;
                 }
-                let raw = frame.json_value().map_err(|error| {
-                    EventCollectionFailure::terminal(error.into(), std::mem::take(&mut events))
-                })?;
-                let event = serde_json::from_value::<OpenCodeEvent>(raw).map_err(|error| {
-                    EventCollectionFailure::terminal(
-                        OpenCodeRunError::Protocol(format!("decode OpenCode event: {error}")),
-                        std::mem::take(&mut events),
-                    )
-                })?;
-                let identity = event_identity(&event);
+                let (event, identity) = decode_frame_event(&frame, &mut events)?;
+                if let Some(current) = frame_id.as_deref() {
+                    match dispose_frame_id(
+                        &mut last_frame_id,
+                        &state.seen_event_ids,
+                        current,
+                        identity,
+                    ) {
+                        Ok(FrameDisposition::Process) => {}
+                        Ok(FrameDisposition::Skip) => continue,
+                        Err(error) => {
+                            return Err(EventCollectionFailure::reconcilable(error, events));
+                        }
+                    }
+                }
                 if !state.seen_event_ids.insert(identity) {
                     // Idempotent redelivery: a reconnect replayed an
                     // already-observed frame. Skip observe() and the
@@ -1089,7 +1416,7 @@ impl OpenCodeClient {
     fn success_result(
         &self,
         request: &ReadOnlyRunRequest,
-        prepared: PreparedRun,
+        prepared: &PreparedRun,
         projection: MessageProjection,
         events: Vec<OpenCodeEvent>,
     ) -> NoAuthorityRunResult {
@@ -1129,7 +1456,10 @@ impl OpenCodeClient {
             "agent".to_owned(),
             Value::String(READ_ONLY_AGENT.to_owned()),
         );
-        extra.insert("message_id".to_owned(), Value::String(prepared.message_id));
+        extra.insert(
+            "message_id".to_owned(),
+            Value::String(prepared.message_id.clone()),
+        );
         extra.insert("session_status_reconciled".to_owned(), Value::Bool(true));
         extra.insert("file_diff_unchanged".to_owned(), Value::Bool(true));
         extra.insert(
@@ -1167,7 +1497,7 @@ impl OpenCodeClient {
                 "OpenCode {} public session API did not expose quota/reset telemetry",
                 prepared.health.version
             )),
-            session_id: Some(prepared.session.id),
+            session_id: Some(prepared.session.id.clone()),
             output: Some(projection.output),
             events,
             diff: Vec::new(),
@@ -1198,6 +1528,165 @@ impl OpenCodeClient {
     }
 }
 
+/// Seals one admitted execution into its candidate-only outcome: the
+/// fail-closed child gate, the attempt-bound heartbeat/progress/quota
+/// observations, the deterministic edge-proof gate and marker, the seal
+/// against the retained binding, slot confirmation against the observed
+/// session/message, and the terminal observation bound to the sealed
+/// candidate. Pure orchestration over already-reconciled state: no I/O.
+fn seal_admitted_outcome(
+    admitted: &AdmittedOpenCodeAttempt,
+    slot: AdmittedSlotConsumption,
+    message_id: &str,
+    mut run: NoAuthorityRunResult,
+    statuses: &SessionStatusMap,
+) -> Result<AdmittedAttemptOutcome, AdmittedAttemptError> {
+    let Some(session_id) = run.session_id.clone() else {
+        return Err(AdmittedAttemptError::Run(OpenCodeRunError::Protocol(
+            "admitted run returned no session identity".to_owned(),
+        )));
+    };
+    let children: Vec<(String, bool)> = statuses
+        .iter()
+        .filter(|(id, _)| id.as_str() != session_id)
+        .map(|(id, status)| {
+            let is_open = !matches!(status, SessionStatus::Idle { .. });
+            (id.clone(), is_open)
+        })
+        .collect();
+    crate::ensure_no_open_child_sessions(&session_id, &children)?;
+    // Attempt-bound heartbeat/progress/quota summaries sealed into the
+    // result extra, reusing the already-reconciled status map with no new
+    // HTTP call.
+    let observations = vec![
+        AdmittedObservation::new(
+            admitted,
+            AdmittedObservationKind::Heartbeat,
+            format!(
+                "{} correlated events observed; stream complete",
+                run.events.len()
+            ),
+        ),
+        AdmittedObservation::new(
+            admitted,
+            AdmittedObservationKind::Progress,
+            "correlated completion reconciled; terminal disposition reached".to_owned(),
+        ),
+        AdmittedObservation::new(
+            admitted,
+            AdmittedObservationKind::Quota,
+            format!("{:?}", run.quota),
+        ),
+    ];
+    run.extra.insert(
+        "admitted_observations".to_owned(),
+        serde_json::to_value(&observations)
+            .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?,
+    );
+    // The edge marker is recorded only behind the deterministic proof gate
+    // over the reconciled execution state — never unconditionally — so the
+    // marker rides the seal digest below.
+    crate::admitted_edge_proof_gate(&session_id, statuses)?;
+    run.extra.insert(
+        "edge".to_owned(),
+        Value::String(OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE.to_owned()),
+    );
+    let candidate = AdmittedAttemptCandidate::seal(admitted, &run)?;
+    slot.confirm(admitted, &session_id, message_id)?;
+    // The terminal observation is emitted bound to the exact attempt,
+    // quoting the seal it follows; the seal digest covers the run at seal
+    // time, and this observation references that digest instead of
+    // reopening it.
+    let terminal = AdmittedObservation::new(
+        admitted,
+        AdmittedObservationKind::Terminal,
+        format!(
+            "sealed candidate {}",
+            candidate
+                .compute_digest()
+                .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?
+                .as_str()
+        ),
+    );
+    run.extra.insert(
+        "admitted_terminal_observation".to_owned(),
+        serde_json::to_value(&terminal)
+            .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?,
+    );
+    Ok(AdmittedAttemptOutcome { run, candidate })
+}
+
+/// Decodes one `SSE` frame into its `OpenCode` event plus the stable identity
+/// hash used for duplicate discipline. Decoding failures are terminal for
+/// the stream: the caller reconciles through the session/message surface.
+fn decode_frame_event(
+    frame: &SseEvent,
+    events: &mut Vec<OpenCodeEvent>,
+) -> Result<(OpenCodeEvent, u64), EventCollectionFailure> {
+    let raw = frame
+        .json_value()
+        .map_err(|error| EventCollectionFailure::terminal(error.into(), std::mem::take(events)))?;
+    let event = serde_json::from_value::<OpenCodeEvent>(raw).map_err(|error| {
+        EventCollectionFailure::terminal(
+            OpenCodeRunError::Protocol(format!("decode OpenCode event: {error}")),
+            std::mem::take(events),
+        )
+    })?;
+    let identity = event_identity(&event);
+    Ok((event, identity))
+}
+
+/// Disposition of one identified SSE frame against the connection order.
+enum FrameDisposition {
+    /// Ordered successor (or opaque identity): observe it.
+    Process,
+    /// Late redelivery of an already-observed frame: skip without moving the mark.
+    Skip,
+}
+
+/// Validates one SSE frame identity against the connection order mark and
+/// advances the mark for ordered frames.
+///
+/// Identity equality is always redelivery; numeric identities additionally
+/// enforce contiguity. A repeated identity with new content, a skipped
+/// numeric successor, or a regressed numeric identity carrying unobserved
+/// content breaks contiguity: stream evidence is incomplete, so the caller
+/// reconciles through the session/message/diff surface instead of skipping
+/// silently. Already-observed content under any out-of-order identity is a
+/// late redelivery and skips.
+fn dispose_frame_id(
+    last_frame_id: &mut Option<String>,
+    seen_event_ids: &BTreeSet<u64>,
+    current: &str,
+    identity: u64,
+) -> Result<FrameDisposition, OpenCodeRunError> {
+    match sse_frame_order(last_frame_id.as_deref(), current) {
+        SseFrameOrder::Ordered => {}
+        SseFrameOrder::Redelivery | SseFrameOrder::Gap | SseFrameOrder::Reordered
+            if seen_event_ids.contains(&identity) =>
+        {
+            return Ok(FrameDisposition::Skip);
+        }
+        SseFrameOrder::Redelivery => {
+            return Err(OpenCodeRunError::Protocol(format!(
+                "SSE frame identity {current:?} repeated with new content"
+            )));
+        }
+        SseFrameOrder::Gap => {
+            return Err(OpenCodeRunError::Protocol(format!(
+                "SSE event gap before frame {current:?}; lost frames never skip silently"
+            )));
+        }
+        SseFrameOrder::Reordered => {
+            return Err(OpenCodeRunError::Protocol(format!(
+                "SSE frame {current:?} regressed behind the observed order"
+            )));
+        }
+    }
+    *last_frame_id = Some(current.to_owned());
+    Ok(FrameDisposition::Process)
+}
+
 fn dispatch_definitively_rejected(error: &OpenCodeRunError) -> bool {
     matches!(
         error,
@@ -1206,6 +1695,91 @@ fn dispatch_definitively_rejected(error: &OpenCodeRunError) -> bool {
             ..
         })
     )
+}
+
+/// Attests that a loopback responder is the supervised `opencode serve`
+/// owner: only that server holds the supervisor-issued credential, so an
+/// authentication rejection proves the endpoint is not the supervised owner
+/// and fails closed as unavailable instead of a generic transport error.
+fn attest_supervised_owner(error: LoopbackHttpError) -> OpenCodeRunError {
+    if matches!(
+        error,
+        LoopbackHttpError::Status {
+            status: 401 | 403,
+            ..
+        }
+    ) {
+        return OpenCodeRunError::RouteUnavailable(
+            "loopback endpoint rejected the supervised credential; it is not the supervised opencode serve owner"
+                .to_owned(),
+        );
+    }
+    error.into()
+}
+
+/// Maps a post-claim admitted-path failure to its honest outcome: after the
+/// slot claim, a timeout, transport failure, undecodable stream, or protocol
+/// violation means provider work may have happened out of view, so the edge
+/// preserves `UnknownOutcome` instead of repeating the original error.
+/// Positively reconciled facts (provider verdicts, observed mutations,
+/// completed-after-abort evidence, already-unknown outcomes) cross unchanged.
+fn map_admitted_post_claim_error(error: OpenCodeRunError) -> OpenCodeRunError {
+    let uncertain = matches!(
+        error,
+        OpenCodeRunError::Timeout { .. }
+            | OpenCodeRunError::Http(_)
+            | OpenCodeRunError::Sse(_)
+            | OpenCodeRunError::Protocol(_)
+    );
+    if uncertain {
+        OpenCodeRunError::UnknownOutcome {
+            cause: error.to_string(),
+            reconciliation: "the admitted edge seals only reconciled terminal candidates; an unreconciled failure after the slot claim never seals"
+                .to_owned(),
+        }
+    } else {
+        error
+    }
+}
+
+/// Order verdict for one SSE frame identity against the previous frame of
+/// the same connection.
+enum SseFrameOrder {
+    /// First identified frame, or the strict successor of the previous one.
+    Ordered,
+    /// The previous frame repeated: idempotent redelivery, never observed twice.
+    Redelivery,
+    /// A numeric successor was skipped: stream evidence is incomplete.
+    Gap,
+    /// A numeric predecessor returned with new content: the stream regressed.
+    Reordered,
+}
+
+/// Validates SSE frame order for one connection.
+///
+/// Identity equality is always redelivery. Numeric identities additionally
+/// enforce contiguity: a skipped successor is a gap, a regressed identity is
+/// a reorder. Opaque non-numeric identities carry no order beyond equality,
+/// so distinct opaque identities are accepted and correlated downstream.
+fn sse_frame_order(last: Option<&str>, current: &str) -> SseFrameOrder {
+    let Some(previous) = last else {
+        return SseFrameOrder::Ordered;
+    };
+    if previous == current {
+        return SseFrameOrder::Redelivery;
+    }
+    match (previous.parse::<u64>(), current.parse::<u64>()) {
+        (Ok(previous), Ok(current)) => {
+            if current == previous.saturating_add(1) {
+                SseFrameOrder::Ordered
+            } else if current > previous {
+                SseFrameOrder::Gap
+            } else {
+                SseFrameOrder::Reordered
+            }
+        }
+        _ => SseFrameOrder::Ordered,
+    }
 }
 
 fn attest_session(
