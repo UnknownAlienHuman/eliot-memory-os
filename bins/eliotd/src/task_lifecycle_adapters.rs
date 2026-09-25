@@ -14,7 +14,10 @@
 //!   fence. A stale fence fails closed in the Governor owner, never as a
 //!   local default.
 //! - `propose_task` and `apply_task` forward the exact admitted identity,
-//!   operation identity, proposal, context, and [`TaskCommand`](eliot_governor::TaskCommand)
+//!   operation identity, proposal, and — for an applied command — the guarded
+//!   task command ([`GuardedTaskCommand`](eliot_governor::GuardedTaskCommand),
+//!   which binds its subject task, its admitted State Fence, and its closed
+//!   [`TaskCommand`](eliot_governor::TaskCommand))
 //!   to the Governor canonical path. The command enum is closed: only the
 //!   owner-defined transitions commit, and only a `Committed` store receipt
 //!   counts as admission; rejected, cancelled and dead-letter outcomes stay
@@ -32,8 +35,8 @@
 #![forbid(unsafe_code)]
 
 use eliot_governor::{
-    GovernorTaskLifecycle, KernelTransitionPort, TaskCommand, TaskCommandContext,
-    TaskControllerCampaignSources, TaskLifecycleError, TaskProposal, TaskRecord,
+    GovernorTaskLifecycle, GuardedTaskCommand, KernelTransitionPort, TaskControllerCampaignSources,
+    TaskLifecycleError, TaskProposal, TaskRecord,
 };
 use eliot_learning_contracts::LearningStateViewRecipe;
 
@@ -115,14 +118,11 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingTaskLifecycle<'_, P> {
 
     /// Forwards a guarded task command carrying the complete owner-role
     /// publication matrix through the authenticated Task Controller transition.
-    #[allow(clippy::too_many_arguments)]
     pub async fn apply_task_with_complete_campaign_sources(
         &self,
         identity: &eliot_protocol::RequestIdentity,
         operation_id: eliot_contracts::OperationId,
-        task_id: eliot_contracts::TaskId,
-        context: TaskCommandContext,
-        command: TaskCommand,
+        guarded: GuardedTaskCommand,
         recipe: LearningStateViewRecipe,
         owner_publications: Vec<eliot_store_api::CampaignSourcePublication>,
     ) -> Result<eliot_store_api::WriteReceipt, TaskLifecycleError> {
@@ -130,9 +130,7 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingTaskLifecycle<'_, P> {
             .apply_task_with_complete_campaign_sources(
                 identity,
                 operation_id,
-                task_id,
-                context,
-                command,
+                guarded,
                 recipe,
                 owner_publications,
             )
@@ -171,9 +169,7 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingTaskLifecycle<'_, P> {
         &self,
         identity: &eliot_protocol::RequestIdentity,
         operation_id: eliot_contracts::OperationId,
-        task_id: eliot_contracts::TaskId,
-        context: TaskCommandContext,
-        command: TaskCommand,
+        guarded: GuardedTaskCommand,
         recipe: LearningStateViewRecipe,
         owner_builder: F,
     ) -> Result<eliot_store_api::WriteReceipt, TaskLifecycleError>
@@ -186,9 +182,7 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingTaskLifecycle<'_, P> {
             .apply_task_with_complete_campaign_owner_materials(
                 identity,
                 operation_id,
-                task_id,
-                context,
-                command,
+                guarded,
                 recipe,
                 owner_builder,
             )
@@ -200,13 +194,9 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingTaskLifecycle<'_, P> {
         &self,
         identity: &eliot_protocol::RequestIdentity,
         operation_id: eliot_contracts::OperationId,
-        task_id: eliot_contracts::TaskId,
-        context: TaskCommandContext,
-        command: TaskCommand,
+        guarded: GuardedTaskCommand,
     ) -> Result<eliot_store_api::WriteReceipt, TaskLifecycleError> {
-        self.inner
-            .apply_task(identity, operation_id, task_id, context, command)
-            .await
+        self.inner.apply_task(identity, operation_id, guarded).await
     }
 
     /// Forwards a guarded task command that atomically publishes its typed
@@ -216,20 +206,11 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingTaskLifecycle<'_, P> {
         &self,
         identity: &eliot_protocol::RequestIdentity,
         operation_id: eliot_contracts::OperationId,
-        task_id: eliot_contracts::TaskId,
-        context: TaskCommandContext,
-        command: TaskCommand,
+        guarded: GuardedTaskCommand,
         recipe: LearningStateViewRecipe,
     ) -> Result<eliot_store_api::WriteReceipt, TaskLifecycleError> {
         self.inner
-            .apply_task_with_learning_state_recipe(
-                identity,
-                operation_id,
-                task_id,
-                context,
-                command,
-                recipe,
-            )
+            .apply_task_with_learning_state_recipe(identity, operation_id, guarded, recipe)
             .await
     }
 }
