@@ -758,6 +758,8 @@ mod tests {
                 applicable_generation: 1,
                 status: SourceStatus::Admitted,
                 domains: Vec::new(),
+                digest: "a".repeat(64),
+                authority_basis: None,
             }],
             Vec::new(),
         ) {

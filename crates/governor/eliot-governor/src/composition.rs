@@ -7693,6 +7693,8 @@ mod tests {
                 applicable_generation: 1,
                 status: eliot_workscope::SourceStatus::Admitted,
                 domains: Vec::new(),
+                digest: "a".repeat(64),
+                authority_basis: None,
             }],
             Vec::new(),
         )

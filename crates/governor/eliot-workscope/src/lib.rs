@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod caller;
+mod governance;
 mod guard;
 mod identity;
 mod issuance;
@@ -26,6 +27,12 @@ mod transition;
 pub use caller::{
     DescriptorPolicy, ObservedScopeResources, ReceiptAdmission, TriggerAdmission, WithholdReason,
     admit_at_trigger, describe_observed_scope, propose_scope, verify_receipt_for_admission,
+};
+pub use governance::{
+    AuthorityBasis, GoverningSourceAdmission, GoverningSourceCandidate, NewSourceCandidate,
+    NewTaskIntake, PrecedenceDeclaration, SourceAdmissionRequest, SourceCandidateOrigin,
+    SourceConflictSet, SourceCoverage, SourceReadiness, TaskIntakeCandidate, TaskIntakeOrigin,
+    TaskSelectionRequired, admit_governing_sources, source_readiness, task_selection_required,
 };
 pub use guard::{
     GuardTrigger, GuardVerdict, IdentityLegOutcome, TriggerReport, check_at_trigger, identity_legs,
@@ -321,6 +328,10 @@ pub enum SourceStatus {
 }
 
 /// One source with provider-owned assurance and disclosure-domain evidence.
+///
+/// `source_ref` is the exact handle and `digest` the exact content digest of
+/// the admitted snapshot; `authority_basis` names the owner or contract that
+/// promoted the candidate, and is `None` until an applicable authority does so.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GoverningSource {
@@ -330,6 +341,8 @@ pub struct GoverningSource {
     pub applicable_generation: u64,
     pub status: SourceStatus,
     pub domains: Vec<ObservationDomainRef>,
+    pub digest: String,
+    pub authority_basis: Option<AuthorityBasis>,
 }
 
 /// Deterministic governing-source set for one scope generation.
@@ -446,6 +459,8 @@ pub struct WorkScopeBindingOwner {
 pub enum WorkScopeError {
     #[error("{field} must be non-blank and free of control characters")]
     InvalidText { field: &'static str },
+    #[error("{field} must be a lowercase SHA-256 digest")]
+    InvalidDigest { field: &'static str },
     #[error("{field} must be non-zero")]
     InvalidCounter { field: &'static str },
     #[error("{field} must not contain duplicates")]
@@ -458,6 +473,10 @@ pub enum WorkScopeError {
     SourceIdentityMismatch,
     #[error("source set is not admitted for this scope generation")]
     SourceSetMismatch,
+    #[error("governing sources are conflicted with no admitted winner")]
+    UnresolvedSourceConflict,
+    #[error("task promotion requires the decision owner or a delegated binding")]
+    TaskAuthorityDenied,
     #[error("source privacy class is outside the admitted boundary")]
     PrivacyDenied,
     #[error("state fence is invalid")]
@@ -482,6 +501,18 @@ fn counter(value: u64, field: &'static str) -> Result<(), WorkScopeError> {
     (value != 0)
         .then_some(())
         .ok_or(WorkScopeError::InvalidCounter { field })
+}
+
+fn digest(value: &str, field: &'static str) -> Result<(), WorkScopeError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        Ok(())
+    } else {
+        Err(WorkScopeError::InvalidDigest { field })
+    }
 }
 
 fn unique<I>(values: I, field: &'static str) -> Result<(), WorkScopeError>
@@ -713,6 +744,10 @@ impl GoverningSourceSet {
         for source in &sources {
             text(&source.source_ref, "source_ref")?;
             counter(source.applicable_generation, "applicable_generation")?;
+            digest(&source.digest, "source.digest")?;
+            if let Some(basis) = &source.authority_basis {
+                basis.validate()?;
+            }
             if source.source_ref != source.assurance.source_ref {
                 return Err(WorkScopeError::SourceIdentityMismatch);
             }
@@ -1503,6 +1538,12 @@ impl ColdStartController {
         if !privacy.admits(lease.privacy_class) {
             return Err(WorkScopeError::PrivacyDenied);
         }
+        if matches!(
+            governance::source_readiness(sources),
+            governance::SourceReadiness::Conflicted { .. }
+        ) {
+            return Err(WorkScopeError::UnresolvedSourceConflict);
+        }
         sources
             .validate_for(scope, privacy)
             .map_err(|_| WorkScopeError::SourceSetMismatch)
@@ -2170,6 +2211,8 @@ mod tests {
                 applicable_generation: 1,
                 status: SourceStatus::Admitted,
                 domains: Vec::new(),
+                digest: "a".repeat(64),
+                authority_basis: None,
             }],
             Vec::new(),
         ) {
