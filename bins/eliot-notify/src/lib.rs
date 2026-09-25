@@ -19,14 +19,15 @@ use eliot_notify_core::{
     A08AdmissionPort, AdmissionRequest, AdmissionResult, CanonicalObligation, DeliveryConfidence,
     DeliveryObservation, DeliveryProviderEvidence, DeliveryReceiptEvidence, DeliveryReceiptPort,
     G08NotificationPort, LedgerCommitOutcome, LedgerIntent, LedgerReservation,
-    LedgerReserveOutcome, NotificationEnvelope, NotificationSeverity, NotificationStatePort,
-    NotificationStateReadRequest, NotificationStateReadResponse, NotificationStateRequest,
-    NotificationStateResponse, NotifyCore, OneShotLedgerPort, SignedWatchdogFallbackEnvelope,
-    UserAutomationFailureRequest, UserAutomationInvocation, UserAutomationPreflightProjection,
-    VerificationPorts, WATCHDOG_PRODUCT_ID, WATCHDOG_SIGNATURE_ALGORITHM,
-    WATCHDOG_SIGNATURE_DOMAIN, WATCHDOG_SOURCE_ID, WatchdogSignaturePort,
-    validate_fallback_envelope_size, validate_fallback_freshness, watchdog_notification_id,
-    watchdog_request_hash, watchdog_request_id, watchdog_signature_payload,
+    LedgerReserveOutcome, NotificationEnvelope, NotificationSeverity, NotificationStateMutation,
+    NotificationStatePort, NotificationStateReadRequest, NotificationStateReadResponse,
+    NotificationStateRequest, NotificationStateResponse, NotifyCore, OneShotLedgerPort,
+    ResolutionAuthorization, SignedWatchdogFallbackEnvelope, UserAutomationFailureRequest,
+    UserAutomationInvocation, UserAutomationPreflightProjection, VerificationPorts,
+    WATCHDOG_PRODUCT_ID, WATCHDOG_SIGNATURE_ALGORITHM, WATCHDOG_SIGNATURE_DOMAIN,
+    WATCHDOG_SOURCE_ID, WatchdogSignaturePort, validate_fallback_envelope_size,
+    validate_fallback_freshness, watchdog_notification_id, watchdog_request_hash,
+    watchdog_request_id, watchdog_signature_payload,
 };
 use eliot_platform::{
     NotificationObservation, NotificationPort, NotificationRequest, PlatformHandle, PortError,
@@ -546,6 +547,55 @@ impl NotificationComposition {
         request: &NotificationStateReadRequest,
     ) -> Result<NotificationStateReadResponse, eliot_notify_core::NotifyError> {
         self.core.read_notification_state(parent, request)
+    }
+
+    /// Records one operator acknowledgement on the canonical notification
+    /// record through the same admitted Kernel route that carries the
+    /// create/coalesce and delivery legs.
+    ///
+    /// Acknowledgement is not resolution: the record stays unresolved and stays
+    /// in the canonical inbox (and on the board) after this returns, while the
+    /// repeated-toast decision on the next delivery attempt reads that
+    /// acknowledgement and suppresses the popup. The acknowledgement
+    /// principal is data on the canonical record, never authority minted by
+    /// this adapter.
+    pub fn acknowledge_notification(
+        &mut self,
+        parent: &NotificationRequest,
+        notification_id: PlatformHandle,
+        principal: String,
+    ) -> Result<NotificationStateResponse, eliot_notify_core::NotifyError> {
+        self.core.apply_notification_state(
+            parent,
+            NotificationStateMutation::Acknowledge {
+                notification_id,
+                principal,
+            },
+        )
+    }
+
+    /// Records one evidence-backed authorized disposition on the canonical
+    /// notification record through the same admitted Kernel route.
+    ///
+    /// The disposition closes the record only because the owner's
+    /// `ResolutionAuthorization` binds evidence handles to a protected
+    /// authority receipt; without that receipt the leg is refused, so a
+    /// critical item cannot be closed by this adapter.
+    pub fn resolve_notification(
+        &mut self,
+        parent: &NotificationRequest,
+        notification_id: PlatformHandle,
+        disposition: String,
+        authorization: ResolutionAuthorization,
+    ) -> Result<NotificationStateResponse, eliot_notify_core::NotifyError> {
+        self.core.apply_notification_state(
+            parent,
+            NotificationStateMutation::Resolve {
+                notification_id,
+                disposition,
+                authorization,
+            },
+        )
     }
 
     /// Delivers the restricted signed Watchdog recovery notification.

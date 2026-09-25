@@ -7,11 +7,11 @@ use eliot_notify::{
     DeliveryOutcome, NotificationComposition, PROTOCOL_VERSION, SERVICE_NAME, UnsatisfiedObligation,
 };
 use eliot_notify_core::{
-    NotificationEnvelope, NotificationStateReadRequest, NotifyError,
-    SignedWatchdogFallbackEnvelope, UserAutomationFailureRequest, UserAutomationInvocation,
-    UserAutomationPreflightDecision,
+    NotificationEnvelope, NotificationStateReadRequest, NotificationStateResponse, NotifyError,
+    ResolutionAuthorization, SignedWatchdogFallbackEnvelope, UserAutomationFailureRequest,
+    UserAutomationInvocation, UserAutomationPreflightDecision,
 };
-use eliot_platform::NotificationRequest;
+use eliot_platform::{NotificationRequest, PlatformHandle};
 use serde::{Deserialize, Serialize};
 
 const REQUEST_INVALID_EXIT: i32 = 2;
@@ -43,6 +43,24 @@ enum Request {
     ReadInbox {
         parent: NotificationRequest,
         read: NotificationStateReadRequest,
+    },
+    /// Records one operator acknowledgement on the canonical record. It
+    /// suppresses repeated toast attempts and deliberately leaves the record
+    /// unresolved, so the problem and any critical attention stay in the
+    /// canonical inbox.
+    Acknowledge {
+        parent: NotificationRequest,
+        notification_id: PlatformHandle,
+        principal: String,
+    },
+    /// Records one evidence-backed authorized disposition. Without the
+    /// protected authority receipt that binds the evidence handles, the leg is
+    /// refused and the record stays open.
+    Resolve {
+        parent: NotificationRequest,
+        notification_id: PlatformHandle,
+        disposition: String,
+        authorization: ResolutionAuthorization,
     },
 }
 
@@ -86,6 +104,15 @@ enum Response {
         service: &'static str,
         protocol: &'static str,
         read: Box<eliot_notify_core::NotificationStateReadResponse>,
+    },
+    /// One committed canonical lifecycle transition with the owner's exact
+    /// post-commit record and receipt. The acknowledgement and the authorized
+    /// disposition answer with this same shape, so a caller never has to infer
+    /// closure from a status string.
+    CanonicalState {
+        service: &'static str,
+        protocol: &'static str,
+        state: Box<NotificationStateResponse>,
     },
     WatchdogTaskRegistered {
         service: &'static str,
@@ -248,6 +275,31 @@ fn main() {
                 Err(error) => composition_error(error.to_string()),
             }
         }
+        Ok(Request::Acknowledge {
+            parent,
+            notification_id,
+            principal,
+        }) => match NotificationComposition::from_kernel_with_quiet_hours(root, &parent) {
+            Ok(mut composition) => {
+                dispatch_acknowledge(&mut composition, &parent, notification_id, principal)
+            }
+            Err(error) => composition_error(error.to_string()),
+        },
+        Ok(Request::Resolve {
+            parent,
+            notification_id,
+            disposition,
+            authorization,
+        }) => match NotificationComposition::from_kernel_with_quiet_hours(root, &parent) {
+            Ok(mut composition) => dispatch_resolve(
+                &mut composition,
+                &parent,
+                notification_id,
+                disposition,
+                authorization,
+            ),
+            Err(error) => composition_error(error.to_string()),
+        },
         Err(error) => Response::Error {
             code: "REQUEST_INVALID",
             detail: error.to_string(),
@@ -469,6 +521,45 @@ fn is_provider_rejection(response: &Response) -> bool {
             *code == "NOTIFICATION_PROVIDER_REJECTED"
         }
         _ => false,
+    }
+}
+
+/// Records one operator acknowledgement through the same authenticated Kernel
+/// route as the create/coalesce and delivery legs, and answers with the
+/// owner's committed record so the caller sees the record is still unresolved.
+fn dispatch_acknowledge(
+    composition: &mut NotificationComposition,
+    parent: &NotificationRequest,
+    notification_id: PlatformHandle,
+    principal: String,
+) -> Response {
+    match composition.acknowledge_notification(parent, notification_id, principal) {
+        Ok(state) => canonical_state_response(state),
+        Err(error) => notify_error(&error),
+    }
+}
+
+/// Records one evidence-backed authorized disposition through the same
+/// authenticated Kernel route. A disposition without the protected authority
+/// receipt is refused, so a critical item cannot be closed from here.
+fn dispatch_resolve(
+    composition: &mut NotificationComposition,
+    parent: &NotificationRequest,
+    notification_id: PlatformHandle,
+    disposition: String,
+    authorization: ResolutionAuthorization,
+) -> Response {
+    match composition.resolve_notification(parent, notification_id, disposition, authorization) {
+        Ok(state) => canonical_state_response(state),
+        Err(error) => notify_error(&error),
+    }
+}
+
+fn canonical_state_response(state: NotificationStateResponse) -> Response {
+    Response::CanonicalState {
+        service: SERVICE_NAME,
+        protocol: PROTOCOL_VERSION,
+        state: Box::new(state),
     }
 }
 

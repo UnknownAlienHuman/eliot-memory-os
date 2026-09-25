@@ -10,7 +10,10 @@
 //! Forbidden authority: must not fabricate execution success, must not accept peer-owned shutdown authority, must not bypass `ServerHandshakePolicy`, generation poison, or state-fence compatibility.
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition::dispatch_frame` plus inseparable dispatch-only helpers with zero external users.
 
-use super::daemon_request_dispatch::DAEMON_STARTUP_EVIDENCE_OPERATION;
+use super::daemon_request_dispatch::{
+    DAEMON_STARTUP_EVIDENCE_OPERATION, NOTIFICATION_STATE_MUTATION_OPERATION,
+    NOTIFICATION_STATE_READ_OPERATION,
+};
 use super::dreamer_job_dispatch::is_dreamer_operation;
 use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
 use super::generation_control::ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION;
@@ -990,6 +993,30 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "revoke_grant"
             | "activate_introduction"
             | "revoke_introduction"
+            // Issue #1780 W2: the Notify launch grant, the delivery gate that
+            // proves the owner created or updated the canonical record before
+            // a toast is launched. The marker is the one string the admitted
+            // dispatch at `daemon_request_dispatch.rs` already serves, and it
+            // was absent here, so the frame fell through every predicate,
+            // failed the `ProcessExecutionRequest` decode, and fenced the
+            // session: `notify_launch_grant_operation` and its
+            // `require_durable_notification_record` join were unreachable, and
+            // "no delivery without a persisted canonical record" was never
+            // enforced. The handler stays fail-closed on its own evidence
+            // (absolute install path, canonical image name, real-byte
+            // re-hash, same-fence record read-back, then the binder's own
+            // ready/epoch/fence checks); this entry only lets the frame reach it.
+            | "bind_notify_launch_grant"
+            // Issue #1780: the canonical persistent notification route. Both
+            // markers are the store contract's own closed operation names
+            // (`ApplyNotificationState` / `GetNotificationState`), which are
+            // also the leg markers the `eliot.notify.state.v1` surface
+            // selector multiplexes, so the admitted Kernel vocabulary and the
+            // admitted store vocabulary are the same strings. Before this the
+            // two markers fell through every predicate here, failed the
+            // `ProcessExecutionRequest` decode, and fenced the session.
+            | NOTIFICATION_STATE_MUTATION_OPERATION
+            | NOTIFICATION_STATE_READ_OPERATION
     )
 }
 
