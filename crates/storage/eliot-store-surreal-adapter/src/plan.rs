@@ -560,10 +560,13 @@ pub(crate) fn recomputed_canonical_request_hash(
 ///
 /// The carried ordering scopes must also still equal the hashed expected
 /// ordering heads (a post-admission scope edit leaves the shared digest
-/// unchanged but changes head advancement). Supplied != recomputed, or a
-/// scope/head divergence, is [`StoreError::TransitionDigestMismatch`] with no
-/// transaction and no lookup success. Callers must invoke this BEFORE any
-/// idempotency-lookup success is returned and BEFORE any transaction/receipt.
+/// unchanged but changes head advancement). The carried bound semantic
+/// source revisions are hash-bound set-like input through the shared view,
+/// so substituted lineage forks the digest here. Supplied != recomputed,
+/// or a scope/head divergence, is [`StoreError::TransitionDigestMismatch`]
+/// with no transaction and no lookup success. Callers must invoke this
+/// BEFORE any idempotency-lookup success is returned and BEFORE any
+/// transaction/receipt.
 pub(crate) fn verify_apply_canonical_hash(
     ctx: &RequestMeta,
     transition: &PreparedTransition,

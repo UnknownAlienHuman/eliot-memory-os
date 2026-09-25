@@ -505,7 +505,10 @@ impl CanonicalWriteEnvelope {
 
     /// Computes the immutable request hash used by the store's idempotency
     /// boundary.  Expected heads are included, so changing the CAS contract
-    /// cannot silently reuse an earlier semantic decision.
+    /// cannot silently reuse an earlier semantic decision. The bound
+    /// semantic source revisions are included as set-like input for the same
+    /// reason: substituted lineage forks the digest into the typed mismatch
+    /// at every downstream recompute gate.
     ///
     /// This routes through the shared provider-neutral
     /// [`eliot_store_api::canonical_request_hash`] over the
@@ -519,6 +522,10 @@ impl CanonicalWriteEnvelope {
     }
 
     /// Builds the shared provider-neutral hash input for this envelope.
+    ///
+    /// The bound semantic source revisions mirror [`prepare`]: they render
+    /// the admitted expected revision heads, so the envelope hash and the
+    /// prepared transition hash coincide on the same admission.
     fn canonical_request_view(&self) -> CanonicalRequestView {
         CanonicalRequestView {
             operation_id: self.operation_id.clone(),
@@ -534,6 +541,9 @@ impl CanonicalWriteEnvelope {
             event_projection_relation_intents: self.event_projection_relation_intents.clone(),
             security: self.security.clone(),
             required_proof_and_approval_refs: self.required_proof_and_approval_refs.clone(),
+            semantic_source_revisions: render_semantic_source_revisions(
+                &self.expected_revision_heads,
+            ),
             expected_revision_heads: self.expected_revision_heads.clone(),
             expected_ordering_heads: self.expected_ordering_heads.clone(),
         }

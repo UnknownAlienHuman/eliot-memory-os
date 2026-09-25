@@ -463,9 +463,12 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
         // heads) and reject divergence before the Apply frame is built. The
         // view borrows these references — not re-forwarded copies — so a
         // mutation after admission fails here with the typed mismatch. The
-        // carried ordering scopes must also still equal the hashed expected
-        // ordering heads: a post-admission scope edit leaves the shared
-        // digest unchanged but changes head advancement.
+        // transition's bound semantic source revisions are hash-bound
+        // set-like input through the shared view, so substituted lineage
+        // forks the digest here too. The carried ordering scopes must also
+        // still equal the hashed expected ordering heads: a post-admission
+        // scope edit leaves the shared digest unchanged but changes head
+        // advancement.
         {
             verify_ordering_scope_binding(&transition, &expected_ordering_heads)?;
             let view = CanonicalRequestView::from_apply(
