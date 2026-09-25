@@ -17,9 +17,15 @@
 //!   issuance, resolves the campaign's retrieval material from the backlog's
 //!   owner-retained registry instead of from caller strings, and admits
 //!   through the pressure-reporting path so a full bound performs and
-//!   RETURNS the summarized archive transition. Every refusal is raised
-//!   before the single mutating step, so a refused call never leaves an
-//!   admitted candidate or a dropped receipt behind.
+//!   RETURNS the summarized archive transition. What is and is not atomic:
+//!   every pre-admission gate refuses before anything is written, and the
+//!   lineage-merge path validates the merged entry before it writes it, so a
+//!   refusal from either leaves the backlog untouched. Bound relief is the
+//!   one deliberate exception: it retires entries one at a time, so a
+//!   failure part-way through leaves a partially relieved backlog — a state
+//!   that stays observable because [`PressureAdmissionError::ReliefFailed`]
+//!   carries the receipts produced so far, and a caller that drops them is
+//!   discarding durable history rather than seeing an empty receipt list.
 //!
 //! Neither entry persists anything: the archive receipts and the owner-bound
 //! overlay travel back in the returned outcome so the owning lane can make
@@ -253,10 +259,7 @@ pub fn intake_from_evidence(
 /// Owner-verified intake: bound policy, owner-retained retrieval material,
 /// and pressure-reporting admission.
 ///
-/// Every refusal is produced BEFORE the one step that mutates the backlog, so
-/// a failed call never leaves an admitted candidate or an archive receipt
-/// behind for a caller that received only a refusal. Order matters and is
-/// deliberate:
+/// Order matters and is deliberate:
 ///
 /// 1. the surface bound policy is confirmed against the verified permit, so a
 ///    surface with no policy — or a policy whose `governor_authority_ref` is
@@ -273,8 +276,31 @@ pub fn intake_from_evidence(
 /// 4. admission goes through
 ///    [`BoundedBacklog::admit_reporting_pressure`], so a full surface bound
 ///    performs the explicit summarized archive transition and returns its
-///    receipts. This is the only mutating step, and everything after it
-///    cannot fail.
+///    receipts.
+///
+/// What atomicity this entry actually has. It is NOT transactional and this
+/// doc does not claim it is:
+///
+/// - Steps 1 to 3 and the backlog's own pre-admission assessment either take
+///   the backlog by shared reference or run before it, so every refusal they
+///   produce happens before a single field of the backlog is written. No
+///   admitted candidate, archive receipt or revision bump can be left behind
+///   by them.
+/// - The lineage-merge arm mutates only after it has validated the resulting
+///   entry: the merge computes the whole post-merge entry to one side,
+///   validates it, and writes it back in a single assignment. A refused merge
+///   therefore leaves the surviving entry exactly as it was, which is what
+///   makes [`PressureAdmissionError::Refused`] safe to report as "nothing was
+///   archived, so there are no receipts to persist".
+/// - Bound relief is NOT atomic. It archives one entry per freed slot in a
+///   loop, so a failure part-way through leaves a PARTIALLY relieved backlog:
+///   some entries are retired and the incoming candidate is not admitted. That
+///   partial state is deliberate and observable rather than hidden, because
+///   [`PressureAdmissionError::ReliefFailed`] carries the
+///   [`ArchivedCandidate`] receipts produced before the failure and
+///   [`PressureAdmissionError::into_parts`] always hands them to the caller,
+///   so a caller cannot mistake a partial relief for an untouched backlog or
+///   silently discard the history the partial transition already produced.
 ///
 /// `now` MUST be owner/host-sourced live time read at the call. It is never
 /// derived from a requester envelope, a permit epoch or a closure schedule: a

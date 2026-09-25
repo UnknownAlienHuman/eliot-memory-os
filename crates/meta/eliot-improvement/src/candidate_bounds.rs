@@ -27,14 +27,27 @@
 //!   [`CrossTaskAdmission`] revalidating scope, authority, retention,
 //!   evaluator, and rollback.
 //!
-//! Overlay and reusable-candidate material is **owner-retained**, not
-//! caller-presented: [`BoundedBacklog::bind_local_overlay`] and
+//! Overlay and reusable-candidate material is MEANT to be **owner-retained**,
+//! not caller-presented: [`BoundedBacklog::bind_local_overlay`] and
 //! [`BoundedBacklog::bind_reusable_candidate`] bind it once under an
 //! owner-verified permit, and [`BoundedBacklog::live_local_overlay`] /
-//! [`BoundedBacklog::active_reusable`] hand the bound material back for
-//! retrieval. Campaign identity, task identity, State Fence, admission
-//! receipt, expiry and ownership therefore come from a Governor issuance,
-//! never from a request string.
+//! [`BoundedBacklog::active_reusable`] read the bound record back.
+//!
+//! That retention is NOT yet the retrieval path, and this module does not
+//! pretend it is. [`BoundedBacklog::bind_local_overlay`],
+//! [`BoundedBacklog::bind_reusable_candidate`] and
+//! [`BoundedBacklog::active_reusable`] have no caller anywhere in the
+//! workspace, and [`BoundedBacklog::live_local_overlay`] has exactly one, this
+//! crate's own `intake_from_evidence_governed`, which itself has no caller.
+//! So nothing ever writes `bound_overlays` or `bound_reusables`: the two
+//! registries are provably always empty, a permit that binds an overlay
+//! subject can never resolve one, and [`retrieve_governed`] still takes a
+//! caller-presented [`GovernedOverlay`] and
+//! `Option<&ReusableCandidateRef>` in its [`GovernedRetrieval`]. There is no
+//! wired retrieval path. The methods are kept deliberately, pending the
+//! owner-boundary fix that wires them into that gate, and each is documented
+//! below with exactly what a verified permit authenticates and what an owner
+//! merely declares.
 //!
 //! All records here are advisory/candidate evidence. Nothing in this module
 //! performs promotion, activation, publication, mutation, or task Finish;
@@ -44,6 +57,7 @@ use blake3::Hasher;
 use eliot_contracts::{StateFence, fences_match_exact};
 use eliot_governor::VerifiedLearningAdmission;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -181,12 +195,29 @@ pub enum ArchiveCause {
 
 /// Owner-retained binding record for one task-local overlay.
 ///
-/// Retention is the point. Retrieval reads this record through
-/// [`BoundedBacklog::live_local_overlay`] instead of a caller-presented
-/// [`GovernedOverlay`], so campaign id, task id, State Fence, admission
-/// receipt and expiry are fixed once by a Governor issuance and cannot be
-/// re-spelled by a requester (I12.24:218 "An overlay is not canonical
-/// doctrine and is not visible to unrelated tasks").
+/// Retention is the point. [`BoundedBacklog::live_local_overlay`] reads this
+/// record instead of a caller-presented [`GovernedOverlay`], and a rotated or
+/// re-issued permit no longer matches it, so the binding is refused rather
+/// than silently reused (I12.24:218 "An overlay is not canonical doctrine and
+/// is not visible to unrelated tasks"). The record is not on any live path
+/// yet: nothing calls `bind_local_overlay`, so this registry stays empty (see
+/// the module doc).
+///
+/// What the verified permit AUTHENTICATES, and how:
+///
+/// - `overlay.overlay_id`, `overlay.campaign_id`, `overlay.task_id` and
+///   `overlay.fence` must equal the permit's own values, and are stored
+///   normalised to exactly those values;
+/// - `overlay.admission_ref` must equal `permit.digest()`, the owner-issued
+///   identity of that admission, so a fabricated receipt handle is refused
+///   rather than retained;
+/// - `admission_digest` and `authority_ref` are copied from the verified
+///   permit and re-checked against it on every read.
+///
+/// What is owner-DECLARED and NOT authenticated by the permit, which exposes
+/// no clock and no recipe vocabulary: `overlay.expires_at` and
+/// `overlay.compatible_recipe_ref`. A consumer must not treat either as
+/// owner-attested.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BoundLocalOverlay {
     pub overlay: GovernedOverlay,
@@ -202,8 +233,16 @@ pub struct BoundLocalOverlay {
 /// ownership material.
 ///
 /// `reusable.closure_ref` and `reusable.owner` are always present in a bound
-/// record: an unclosed or ownerless candidate is never bound, and the owner
-/// is copied from the retained backlog entry rather than from the request.
+/// record: an unclosed or ownerless candidate is never bound, the owner is
+/// copied from the retained backlog entry rather than from the request, and
+/// `reusable.candidate_id` / `reusable.origin_campaign_id` must equal the
+/// verified permit's own subject and source campaign.
+///
+/// `reusable.closure_ref` is owner-DECLARED, not owner-authenticated:
+/// `LearningAdmissionPermit` exposes no closure ref, so the handle is
+/// presence-checked only and a consumer must not treat it as an owner-issued
+/// disposition handle. `admission_digest` and `authority_ref` are copied from
+/// the verified permit.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BoundReusableCandidate {
     pub reusable: ReusableCandidateRef,
@@ -231,8 +270,12 @@ pub struct AdmitReport {
 /// Carried as typed variants: no refusal is collapsed into display text.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum PressureAdmissionError {
-    /// The candidate itself was refused. Nothing was archived, so there are
-    /// no receipts to persist.
+    /// The candidate itself was refused. Nothing was archived AND nothing was
+    /// mutated, so there are no receipts to persist: the lineage merge
+    /// validates the resulting entry before it writes it, and every other
+    /// refusal is produced before the relief loop runs. A partial transition
+    /// reports [`Self::ReliefFailed`], which is the only variant that carries
+    /// receipts.
     #[error("bounded backlog refused the candidate: {0}")]
     Refused(#[source] BoundsError),
     /// Bound relief was already in progress when the transition failed. The
@@ -292,15 +335,39 @@ struct ArchiveTarget {
     /// ineligible for retrieval, delivery and cross-task use (I12.24:295), so
     /// archiving it destroys no reachable influence.
     retention_rank: u8,
-    /// IEEE-754 bit pattern of the finite, non-negative admitted value.
-    /// Bit order is the value order for that domain and, unlike a float
-    /// comparison, stays total for any value reconstructed from storage.
-    value_order: u64,
+    /// The assessed value, compared ONLY through [`f64::total_cmp`].
+    ///
+    /// `f64` has no `Ord`, and a raw bit-pattern order is not a value order:
+    /// the sign bit places every negative above every positive, and `-0.0`
+    /// above `0.0`. `TrackedCandidate::value` is a bare `f64` on a
+    /// `Deserialize` struct with no validation hook on the entries vector, so
+    /// a backlog restored from storage can hold any sign and `total_cmp` is
+    /// what makes the selection a correct total order over the whole domain
+    /// the stored data can actually occupy.
+    value_order: f64,
     /// Stable `entries` index; the final, total tiebreak.
     index: usize,
     cause: ArchiveCause,
     candidate_id: String,
     summary: String,
+}
+
+impl ArchiveTarget {
+    /// Total selection order: retention rank, then the assessed value under
+    /// [`f64::total_cmp`], then the stable `entries` index. `true` when `self`
+    /// outranks `current`, i.e. is the cheaper entry to release. Every level
+    /// can decide, so the order is total and the selection is reproducible.
+    fn outranks(&self, current: &Self) -> bool {
+        match self.retention_rank.cmp(&current.retention_rank) {
+            Ordering::Less => true,
+            Ordering::Greater => false,
+            Ordering::Equal => match self.value_order.total_cmp(&current.value_order) {
+                Ordering::Less => true,
+                Ordering::Greater => false,
+                Ordering::Equal => self.index < current.index,
+            },
+        }
+    }
 }
 
 /// Reachable bounded backlog: the production candidate/overlay admission path.
@@ -528,9 +595,13 @@ impl BoundedBacklog {
             // Bound is full. `deficit` is exactly the number of slots that
             // must be freed before the new entry fits, so the registry-only
             // path can refuse and the pressure path can free precisely that
-            // many. A `max_active` of zero leaves the bound permanently
-            // full, and relief then runs out of archivable entries and
-            // surfaces the same refusal.
+            // many. A `max_active` of zero CANNOT reach this branch through
+            // `admit_reporting_pressure`, which runs
+            // `CandidateBoundPolicy::validate` first and refuses it. Only the
+            // registry-only `BoundedBacklog::admit` can observe that state,
+            // from a backlog restored from storage that never passed
+            // construction-time policy validation, and it refuses with
+            // `BoundExceeded` without relieving anything.
             return Ok(PreBoundDecision {
                 admission: PreBoundAdmission::Admit {
                     deficit: active - policy.max_active + 1,
@@ -681,9 +752,13 @@ impl BoundedBacklog {
     /// 1. ownerless entries before owned ones — an ownerless record has no
     ///    decision owner to be deprived of it and is already ineligible for
     ///    retrieval, delivery, compilation and cross-task use;
-    /// 2. then the lowest assessed value — I12.24:297 bounds the backlog "by
-    ///    target surface and value", so the least valuable entry is the one
-    ///    whose expected benefit is cheapest to release;
+    /// 2. then the lowest assessed value, ordered by [`f64::total_cmp`] —
+    ///    I12.24:297 bounds the backlog "by target surface and value", so the
+    ///    least valuable entry is the one whose expected benefit is cheapest
+    ///    to release. `total_cmp` is what makes that true for EVERY value the
+    ///    stored backlog can hold, not just the finite non-negative ones the
+    ///    admission path accepts: a bit-pattern order would rank every
+    ///    negative above every positive and retire the more valuable entry;
     /// 3. then the lowest `entries` index as the final total tiebreak.
     fn next_archivable(&self, surface: ImprovementSurface, floor: f64) -> Option<ArchiveTarget> {
         let mut best: Option<ArchiveTarget> = None;
@@ -697,19 +772,15 @@ impl BoundedBacklog {
             };
             let candidate = ArchiveTarget {
                 retention_rank: u8::from(entry.owner.is_some()),
-                value_order: entry.value.to_bits(),
+                value_order: entry.value,
                 index,
                 cause,
                 candidate_id: entry.candidate.candidate_id.clone(),
                 summary: pressure_archive_summary(entry, cause, floor),
             };
-            let outranks = best.as_ref().is_none_or(|current| {
-                (
-                    candidate.retention_rank,
-                    candidate.value_order,
-                    candidate.index,
-                ) < (current.retention_rank, current.value_order, current.index)
-            });
+            let outranks = best
+                .as_ref()
+                .is_none_or(|current| candidate.outranks(current));
             if outranks {
                 best = Some(candidate);
             }
@@ -720,6 +791,25 @@ impl BoundedBacklog {
     /// Merge an absorbed candidate into the entry at `index`, preserving
     /// provenance: unioned evidence/source refs, recorded `merged_from`,
     /// best value/owner, retained governed authority, and a revision bump.
+    ///
+    /// Validate-then-commit, which is the whole point of the shape below. The
+    /// merge semantics are unchanged (unioned refs, best value, first owner,
+    /// first authority, `revision += 1`, refreshed `updated_at`, recomputed
+    /// lineage digest), but every one of them is computed on a LOCAL COPY of
+    /// the entry and the merged candidate is validated before that copy is
+    /// written back. So a refusal from [`ImprovementCandidate::validate`]
+    /// cannot leave the entry having absorbed the new provenance, gained a
+    /// `merged_from` row, bumped its revision, or had its digest and
+    /// timestamp rewritten, and a caller that receives `Err` here has an
+    /// untouched entry. That is what makes
+    /// [`PressureAdmissionError::Refused`] truthful when it reports that
+    /// nothing was archived and there are no receipts to persist.
+    ///
+    /// This matters for restored state in particular: `BoundedBacklog` and
+    /// `TrackedCandidate` both derive `Deserialize` with no validation on the
+    /// entries vector, so a deserialized entry can already hold a blank
+    /// `evidence_refs` element that `ImprovementCandidate::validate` rejects
+    /// through `require_refs`. A merge into such an entry is refused whole.
     fn merge_into(
         &mut self,
         index: usize,
@@ -728,34 +818,41 @@ impl BoundedBacklog {
         owner: Option<String>,
         governed_authority: Option<&str>,
     ) -> Result<(), BoundsError> {
-        let entry = &mut self.entries[index];
+        let mut merged = self.entries[index].clone();
         let mut evidence: BTreeSet<String> =
-            entry.candidate.evidence_refs.iter().cloned().collect();
+            merged.candidate.evidence_refs.iter().cloned().collect();
         evidence.extend(absorbed.evidence_refs.iter().cloned());
-        entry.candidate.evidence_refs = evidence.into_iter().collect();
+        merged.candidate.evidence_refs = evidence.into_iter().collect();
         let mut sources: BTreeSet<String> =
-            entry.candidate.source_trace_refs.iter().cloned().collect();
+            merged.candidate.source_trace_refs.iter().cloned().collect();
         sources.extend(absorbed.source_trace_refs.iter().cloned());
-        entry.candidate.source_trace_refs = sources.into_iter().collect();
-        if !entry.merged_from.contains(&absorbed.candidate_id) {
-            entry.merged_from.push(absorbed.candidate_id.clone());
+        merged.candidate.source_trace_refs = sources.into_iter().collect();
+        if !merged.merged_from.contains(&absorbed.candidate_id) {
+            merged.merged_from.push(absorbed.candidate_id.clone());
         }
-        if value > entry.value {
-            entry.value = value;
+        if value > merged.value {
+            merged.value = value;
         }
-        if entry.owner.is_none() {
-            entry.owner = owner
+        if merged.owner.is_none() {
+            merged.owner = owner
                 .map(|o| o.trim().to_string())
                 .filter(|o| !o.is_empty());
         }
-        if entry.admitted_under_authority.is_none() {
-            entry.admitted_under_authority = governed_authority.map(str::to_string);
+        if merged.admitted_under_authority.is_none() {
+            merged.admitted_under_authority = governed_authority.map(str::to_string);
         }
-        entry.candidate.revision += 1;
-        entry.candidate.updated_at = OffsetDateTime::now_utc();
-        entry.lineage_digest =
-            evidence_lineage_digest(&canonical_evidence_lineage(&entry.candidate.evidence_refs));
-        entry.candidate.validate().map_err(BoundsError::Candidate)?;
+        merged.candidate.revision += 1;
+        merged.candidate.updated_at = OffsetDateTime::now_utc();
+        merged.lineage_digest =
+            evidence_lineage_digest(&canonical_evidence_lineage(&merged.candidate.evidence_refs));
+        // The last thing that can fail. `self` has not been written yet: the
+        // clone above is a local, and the single assignment below is the only
+        // mutation of `self` in this function.
+        merged
+            .candidate
+            .validate()
+            .map_err(BoundsError::Candidate)?;
+        self.entries[index] = merged;
         Ok(())
     }
 
@@ -811,28 +908,48 @@ impl BoundedBacklog {
 
     /// Bind one task-local overlay into the owner-retained registry.
     ///
-    /// This is the owner-side binding step: campaign id, task id, State
-    /// Fence and overlay id are read from the verified permit, and the
-    /// presented overlay is cross-checked against them. A mismatch is
-    /// refused with the matching typed [`BoundsError`]; nothing is inferred
-    /// and nothing is defaulted.
+    /// This is the owner-side binding step. Campaign id, task id, State Fence,
+    /// overlay id AND the admission receipt are all authenticated by the
+    /// verified permit: the presented overlay is cross-checked against the
+    /// permit's own values and a disagreement is refused with the matching
+    /// typed [`BoundsError`]. Nothing is inferred and nothing is defaulted,
+    /// and the three permit-bound identity strings are stored normalised to
+    /// exactly the permit's spelling.
+    ///
+    /// What the permit does NOT authenticate, stated plainly:
+    ///
+    /// - `expires_at` is owner-DECLARED. `LearningAdmissionPermit` carries no
+    ///   clock and no expiry, so any timestamp is accepted; the only thing
+    ///   that ends its influence is the owner/host-sourced `now`
+    ///   [`BoundedBacklog::live_local_overlay`] is later called with. A
+    ///   backdated or absurd stamp is therefore not detectable here, and
+    ///   wall-clock expiry is deliberately not re-checked at bind time because
+    ///   `now` is a retrieval-time input: an overlay whose expiry has since
+    ///   passed binds and is then refused at retrieval.
+    /// - `compatible_recipe_ref` is owner-declared and READ BY NO GATE in this
+    ///   crate. [`GovernedOverlay::validate`] presence-checks it and nothing
+    ///   else compares it to anything. It must not be treated as owner-
+    ///   attested, and whether a field that gates nothing should stay on this
+    ///   record is an open owner-boundary decision, not something this
+    ///   binding invents a use for.
     ///
     /// Fail-closed preconditions beyond the permit cross-check:
     ///
     /// - the overlay lifecycle state must be `LOCAL_ADMITTED` — a draft,
     ///   rolled-back, invalidated or already-expired state has no local
-    ///   effect to retain. Wall-clock expiry is not re-checked here because
-    ///   `now` is a retrieval-time input; an overlay whose expiry has since
-    ///   passed binds and is then refused by
-    ///   [`BoundedBacklog::live_local_overlay`];
-    /// - `admission_ref` must be present, because the local effect requires a
-    ///   named Governor admission receipt;
+    ///   effect to retain;
+    /// - `admission_ref` must be present AND must equal the permit's digest,
+    ///   because the local effect requires a named Governor admission receipt
+    ///   and the owner-issued identity of that permit IS its digest;
     /// - `expires_at` must be present, because an overlay without an expiry
     ///   is never live and must not be retained as if it were.
     ///
     /// Rebinding the same overlay id replaces the previous record, so a
     /// re-issued permit supersedes the older binding instead of leaving two
     /// conflicting records behind.
+    ///
+    /// No caller exists for this method yet (see the module doc), so nothing
+    /// registers a bound overlay in a running process.
     pub fn bind_local_overlay(
         &mut self,
         overlay: GovernedOverlay,
@@ -855,16 +972,37 @@ impl BoundedBacklog {
         if overlay.state != OverlayState::LocalAdmitted {
             return Err(BoundsError::OverlayNotAdmitted);
         }
-        if overlay
+        // The admission receipt is DERIVED, not trusted. `permit.digest()` is
+        // the owner-issued identity of this admission and it transitively
+        // binds the overlay subject, campaign, task and fence, so a presented
+        // receipt handle that disagrees is a presented overlay that is not
+        // backed by the verified admission — refused, not retained.
+        match overlay
             .admission_ref
-            .as_ref()
-            .is_none_or(|receipt| receipt.trim().is_empty())
+            .as_deref()
+            .map(str::trim)
+            .filter(|receipt| !receipt.is_empty())
         {
-            return Err(BoundsError::MissingField("overlay.admission_ref"));
+            None => return Err(BoundsError::MissingField("overlay.admission_ref")),
+            Some(receipt) if receipt == permit.digest() => {}
+            Some(_) => return Err(BoundsError::OverlayBackingMismatch),
         }
         if overlay.expires_at.is_none() {
             return Err(BoundsError::MissingField("overlay.expires_at"));
         }
+        // Normalise the permit-bound identity triple ONCE, here, and store
+        // exactly that. The checks above already required the trimmed forms to
+        // equal the permit, and `BoundedBacklog::live_local_overlay` looks the
+        // record up by the permit's own values, so retaining the caller's
+        // untrimmed spelling would let a whitespace-padded id bind and then be
+        // permanently unretrievable — a self-inflicted denial of retrieval
+        // that fails closed but is avoidable. Normalising rather than refusing
+        // keeps the stored record byte-identical to the permit's own strings,
+        // which is the property every later read re-checks.
+        let mut overlay = overlay;
+        overlay.overlay_id = overlay.overlay_id.trim().to_string();
+        overlay.campaign_id = overlay.campaign_id.trim().to_string();
+        overlay.task_id = overlay.task_id.trim().to_string();
         let binding = BoundLocalOverlay {
             overlay,
             admission_digest: permit.digest().to_string(),
@@ -889,7 +1027,14 @@ impl BoundedBacklog {
     /// or unadmitted overlay are each refused with their own typed
     /// [`BoundsError`]. `now` MUST be owner/host-sourced live time: expiry
     /// invalidates influence and must never silently retain the last
-    /// behaviour (I12.24:295).
+    /// behaviour (I12.24:295). It is the ONLY clock in this path — the
+    /// binding carries no authenticated expiry of its own.
+    ///
+    /// Its single in-crate caller is `intake_from_evidence_governed`, and
+    /// nothing calls that in turn, so this gate never runs against a bound
+    /// overlay today: no caller of `bind_local_overlay` exists, so a permit
+    /// that binds an overlay subject is always refused here with
+    /// [`BoundsError::OverlayBackingMismatch`]. See the module doc.
     pub fn live_local_overlay(
         &self,
         verified: &VerifiedLearningAdmission<'_>,
@@ -943,10 +1088,17 @@ impl BoundedBacklog {
     /// retrieval eligibility exactly as it revokes it for
     /// [`crate::producer::produce_learning_candidate`].
     ///
-    /// `closure_ref` is the owner-issued closure disposition handle and
-    /// `origin_campaign_id` must equal the permit's bound source campaign;
-    /// a blank closure ref is refused as [`BoundsError::UnclosedReusable`]
-    /// because an unclosed candidate is not yet eligible for another task.
+    /// `closure_ref` is the owner-DECLARED closure disposition handle. It is
+    /// NOT authenticated by the verified permit, which exposes no closure ref
+    /// at all, so the handle is presence-checked only: a blank closure ref is
+    /// refused as [`BoundsError::UnclosedReusable`] because an unclosed
+    /// candidate is not yet eligible for another task, and a consumer must
+    /// not read the stored handle as an owner-issued disposition handle.
+    /// `origin_campaign_id` must equal the permit's bound source campaign and
+    /// `candidate_id` its bound subject, so those two cannot be re-spelled.
+    ///
+    /// No caller exists for this method yet (see the module doc), so nothing
+    /// registers a bound reusable candidate in a running process.
     pub fn bind_reusable_candidate(
         &mut self,
         candidate_id: &str,
@@ -1001,11 +1153,15 @@ impl BoundedBacklog {
 
     /// The owner-retained reusable material for a permit's candidate subject.
     ///
-    /// Returns the retained [`ReusableCandidateRef`] so the retrieval gate
-    /// consumes closure and ownership material that the owner bound, not
-    /// strings a requester can re-spell. The permit must still bind this
-    /// exact candidate and still be the issuance the binding was made under,
-    /// and the candidate must still be an active backlog entry.
+    /// Returns the retained [`ReusableCandidateRef`] so a retrieval gate would
+    /// consume owner-bound material instead of requester strings. The permit
+    /// must still bind this exact candidate and still be the issuance the
+    /// binding was made under, and the candidate must still be an active
+    /// backlog entry. The closure ref it hands back is owner-declared and not
+    /// permit-authenticated; see [`Self::bind_reusable_candidate`].
+    ///
+    /// No caller exists for this method yet (see the module doc), so this gate
+    /// is not on any live retrieval path.
     pub fn active_reusable(
         &self,
         candidate_id: &str,
@@ -1059,9 +1215,16 @@ fn archive_cause_for(entry: &TrackedCandidate, floor: f64) -> Option<ArchiveCaus
 /// Fixed `key=value` tokens joined by `;`, so the token separator stays
 /// unambiguous even when a canonical record handle contains whitespace.
 /// Every token is read from live state — the retained entry, the surface
-/// policy floor and the derived cause — so the same backlog and policy
-/// always produce the same string, no token is caller text, and the summary
-/// is never empty or constant.
+/// policy floor and the derived cause — so the same backlog and policy always
+/// produce the same string and the summary is never empty or constant.
+///
+/// That is a DETERMINISM claim, not an authenticity claim, and the summary
+/// must not be read as owner-attested evidence. The `candidate=`, `surface=`
+/// and `value=` tokens are read out of the stored entry: its `candidate_id` is
+/// a `pub` field on a `Deserialize` struct that is written verbatim into
+/// durable archive history, and its `value` is supplied by the caller on the
+/// registry-only admission path. Only `authority=` carries owner authority,
+/// and only when the entry was admitted through a governed path at all.
 ///
 /// `decision_revision` is the candidate revision at which the archive
 /// decision was taken. It is deliberately NOT the receipt's
@@ -1165,17 +1328,41 @@ pub enum OverlayState {
 /// The bound [`StateFence`] is canonical owner vocabulary (no string
 /// facade): retrieval requires it to exactly match the fence in the
 /// owner-verified permit, so fence drift refuses before values surface.
+///
+/// Which fields that actually authenticates, and which it does not:
+///
+/// - AUTHENTICATED by the verified permit: `overlay_id`, `campaign_id`,
+///   `task_id` and `fence`, and — through
+///   [`BoundedBacklog::bind_local_overlay`] — `admission_ref`, which must
+///   equal the permit's digest;
+/// - OWNER-DECLARED, not authenticated by the permit: `expires_at` (the
+///   permit has no clock) and `compatible_recipe_ref` (the permit has no
+///   recipe vocabulary, and nothing in this crate reads the field).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GovernedOverlay {
     pub overlay_id: String,
     pub campaign_id: String,
     pub task_id: String,
     pub fence: StateFence,
+    /// Recipe this overlay is compatible with. NOT READ BY ANY GATE in this
+    /// crate: [`GovernedOverlay::validate`] presence-checks it and no other
+    /// code compares it to anything, and the verified permit binds no recipe
+    /// ref. It is owner-declared and must not be read as owner-attested.
     pub compatible_recipe_ref: String,
     pub state: OverlayState,
     /// Governor admission receipt for the local effect (required).
+    ///
+    /// Bound to the owner-issued admission: the verified permit exposes no
+    /// separate receipt handle, so
+    /// [`BoundedBacklog::bind_local_overlay`] requires this to equal
+    /// `permit.digest()`, the owner-issued identity of that admission, and
+    /// refuses any other value.
     pub admission_ref: Option<String>,
     /// Expiry of the local admission; influence ends here, never lingers.
+    ///
+    /// OWNER-DECLARED. The verified permit carries no clock and no expiry, so
+    /// no value of this field is authenticated by it; expiry is enforced only
+    /// by comparing against owner/host-sourced live time at retrieval.
     pub expires_at: Option<OffsetDateTime>,
 }
 
