@@ -283,80 +283,19 @@ impl DaemonComposition {
         Ok(committed)
     }
 
-    /// Drives one bounded `TestD` owner step through the authenticated Kernel
-    /// owner routes only. This is the production caller of the Governor
-    /// finish path for productive verifier evidence:
-    ///
-    /// ```text
-    /// query pending verifier dispatches (owner poll)
-    /// -> compute the canonical plan binding from the Governor read
-    /// -> persist the binding through the owner bind leg
-    /// -> query pending terminal evidence (owner poll)
-    /// -> publish the verifier-execution fact (rehydrate -> canonical write)
-    /// -> submit the finish candidate draft (rehydrate -> FinishService::evaluate -> persisted decision)
-    /// -> acknowledge the terminal with the committed verifier-execution receipt (owner ack leg)
-    /// ```
-    ///
-    /// The daemon never opens the `TestD` database: every row arrives through
-    /// the Kernel owner polls above. The candidate draft carries only the
-    /// terminal job identity and the evidence-led candidate outcome; the
-    /// Governor rehydrates canonical evidence and derives the decision, so
-    /// worker success never becomes a Task outcome here. One poisoned row
-    /// is recorded as a diagnostic and skipped — it never fails the daemon
-    /// closed, and a fence-moved row simply rejects owner-side on the next
-    /// poll. Transport failures abort the step so the supervisor restarts
-    /// the daemon onto a fresh handshake.
-    pub async fn drive_testd_owner_finish_once(
-        &mut self,
-        kernel: &DaemonKernelClient,
-    ) -> Result<TestdOwnerDrainOutcome, DaemonError> {
-        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
-            return Err(completion_error(
-                "TestD owner drain needs a Ready Governor composition",
-            ));
-        }
-        let mut outcome = TestdOwnerDrainOutcome::default();
-        let pending = kernel
-            .query_testd_pending_dispatches_async(TESTD_OWNER_POLL_LIMIT)
-            .await
-            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
-        for entry in &pending {
-            match self.bind_one_testd_dispatch(kernel, entry).await {
-                Ok(()) => outcome.dispatch_bindings_persisted += 1,
-                Err(error) => {
-                    outcome.rows_skipped += 1;
-                    emit_drain_skip(&entry.job.job_id, &error);
-                }
-            }
-        }
-        let terminals = kernel
-            .query_testd_terminal_evidence_async(TESTD_OWNER_POLL_LIMIT)
-            .await
-            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
-        for evidence in &terminals {
-            match self.drain_one_testd_terminal(kernel, evidence).await {
-                Ok(()) => {
-                    outcome.terminals_drained += 1;
-                    outcome.finish_decisions_persisted += 1;
-                    outcome.terminals_acked += 1;
-                }
-                Err(error) => {
-                    outcome.rows_skipped += 1;
-                    emit_drain_skip(&evidence.job.job_id, &error);
-                }
-            }
-        }
-        Ok(outcome)
-    }
-
-    /// Binds one pending productive dispatch: the canonical plan binding is
-    /// computed from the current Governor read and persisted owner-side
+    /// Plans the exact owner bind payload for one pending productive dispatch:
+    /// the canonical plan binding is computed from the current Governor read
     /// against the exact admitted identity.
-    async fn bind_one_testd_dispatch(
+    ///
+    /// #18 item B: this leg is a pure read of the retained owners. The caller
+    /// holds the composition guard only for this call and releases it before
+    /// the owner bind leg crosses the Kernel, so no guard is alive across that
+    /// exchange. Persisting the returned binding is
+    /// [`bind_testd_owner_verifier_dispatch`]'s job, not this composition's.
+    pub fn plan_testd_verifier_dispatch_binding(
         &self,
-        kernel: &DaemonKernelClient,
         entry: &TestdPendingVerifierDispatch,
-    ) -> Result<(), DaemonError> {
+    ) -> Result<TestdVerifierDispatchBinding, DaemonError> {
         let identity = &entry.request_identity;
         let job = &entry.job;
         let task_id = identity
@@ -374,34 +313,51 @@ impl DaemonComposition {
             .ok_or_else(|| completion_error("pending dispatch has no task revision fence"))?;
         let operation_id =
             OperationId::new(job.process.operation_id.clone()).map_err(completion_error)?;
-        let binding = self.testd_verifier_dispatch_binding(
+        self.testd_verifier_dispatch_binding(
             identity,
             &operation_id,
             &task_id,
             task_revision,
             &job.invocation,
-        )?;
-        kernel
-            .acknowledge_testd_verifier_dispatch_async(&job.job_id, binding)
-            .await
-            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
-        Ok(())
+        )
     }
 
-    /// Drains one terminal evidence row: publishes the verifier-execution
-    /// fact, submits the evidence-led finish candidate through the Governor
-    /// production caller, then acknowledges the terminal owner-side.
-    async fn drain_one_testd_terminal(
+    /// Commits the two Governor-owned canonical legs for one terminal evidence
+    /// row: publishes the verifier-execution fact and submits the evidence-led
+    /// finish candidate through the Governor production caller. The returned
+    /// [`WriteReceipt`] is the committed verifier-execution receipt the owner
+    /// ack leg must carry.
+    ///
+    /// ```text
+    /// publish the verifier-execution fact (rehydrate -> canonical write)
+    /// -> submit the finish candidate draft (rehydrate -> FinishService::evaluate -> persisted decision)
+    /// ```
+    ///
+    /// The daemon never opens the `TestD` database: the row arrives through the
+    /// Kernel owner poll. The candidate draft carries only the terminal job
+    /// identity and the evidence-led candidate outcome; the Governor rehydrates
+    /// canonical evidence and derives the decision, so worker success never
+    /// becomes a Task outcome here.
+    ///
+    /// #18 item B: these two legs are the one place the drain still holds the
+    /// composition guard across a Kernel exchange. Both are `&mut
+    /// GovernorComposition` operations on the single Governor owner — the fact
+    /// publication rehydrates the retained owner state and the finish decision
+    /// refreshes it — so they are reachable only through this guard; moving
+    /// them out would require a second handle to that owner. They stay one
+    /// contiguous, per-row phase. The caller acknowledges the terminal through
+    /// [`ack_testd_owner_terminal_completion`] with no guard held, and a
+    /// fence-moved row simply rejects owner-side on the next poll.
+    pub async fn commit_testd_terminal_owner_fact(
         &mut self,
-        kernel: &DaemonKernelClient,
         evidence: &TestdTerminalCompletionEvidence,
-    ) -> Result<(), DaemonError> {
+    ) -> Result<WriteReceipt, DaemonError> {
         let identity = &evidence.request_identity;
         let job = &evidence.job;
-        // Boxed: the committed receipt is held across the finish/ack awaits
-        // and `WriteReceipt` carries the full issue-#18 digest bindings, so
-        // keeping it inline would push this drain future past the
-        // large-future bound. Same value, same move into the ack leg.
+        // Boxed: the committed receipt carries the full issue-#18 digest
+        // bindings and is held across the finish await, so keeping it inline
+        // would push this future past the large-future bound. Same value, same
+        // move into the caller's ack leg.
         let committed = Box::new(
             self.governor
                 .publish_testd_verifier_execution_fact_from_evidence(evidence)
@@ -417,12 +373,83 @@ impl DaemonComposition {
         let operation_id = OperationId::new(format!("testd-owner-finish-{}", job.job_id))
             .map_err(completion_error)?;
         let _decision = self.finish_attempt(identity, operation_id, draft).await?;
-        kernel
-            .acknowledge_testd_terminal_completion_async(&job.job_id, *committed)
-            .await
-            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
-        Ok(())
+        Ok(*committed)
     }
+}
+
+/// Queries the Kernel-owned pending verifier dispatches for one bounded drain
+/// step.
+///
+/// #18 item B: takes no composition handle at all, so the caller can run this
+/// bounded owner poll with no guard held. Transport failure aborts the step so
+/// the supervisor restarts the daemon onto a fresh handshake.
+pub async fn query_testd_owner_pending_dispatches(
+    kernel: &DaemonKernelClient,
+) -> Result<Vec<TestdPendingVerifierDispatch>, DaemonError> {
+    kernel
+        .query_testd_pending_dispatches_async(TESTD_OWNER_POLL_LIMIT)
+        .await
+        .map_err(|error| DaemonError::Kernel(error.to_string()))
+}
+
+/// Persists one planned verifier-dispatch binding through the Kernel owner.
+///
+/// #18 item B: a pure Kernel exchange over the retained binding value, so the
+/// caller holds no composition guard while it runs. The binding must reuse the
+/// exact admitted identity the Kernel retained at job admission; anything else
+/// fails closed owner-side as a binding conflict.
+pub async fn bind_testd_owner_verifier_dispatch(
+    kernel: &DaemonKernelClient,
+    job_id: &str,
+    binding: TestdVerifierDispatchBinding,
+) -> Result<(), DaemonError> {
+    kernel
+        .acknowledge_testd_verifier_dispatch_async(job_id, binding)
+        .await
+        .map(|_| ())
+        .map_err(|error| DaemonError::Kernel(error.to_string()))
+}
+
+/// Queries the Kernel-owned pending terminal evidence for one bounded drain
+/// step. Each entry is a complete identity-joined productive terminal row still
+/// missing its canonical `WriteReceipt`; worker exit alone never qualifies.
+///
+/// #18 item B: takes no composition handle, so the poll runs with no guard held.
+pub async fn query_testd_owner_terminal_evidence(
+    kernel: &DaemonKernelClient,
+) -> Result<Vec<TestdTerminalCompletionEvidence>, DaemonError> {
+    kernel
+        .query_testd_terminal_evidence_async(TESTD_OWNER_POLL_LIMIT)
+        .await
+        .map_err(|error| DaemonError::Kernel(error.to_string()))
+}
+
+/// Records one committed canonical `WriteReceipt` through the Kernel owner for
+/// the acknowledged terminal row.
+///
+/// #18 item B: a pure Kernel exchange over the committed receipt, so it runs
+/// with no composition guard held. The receipt must be the exact canonical
+/// bytes advertised by the terminal publication; anything else fails closed
+/// owner-side. The leg is owner-side idempotent, so a repeated poll replays
+/// rather than duplicates.
+pub async fn ack_testd_owner_terminal_completion(
+    kernel: &DaemonKernelClient,
+    job_id: &str,
+    receipt: WriteReceipt,
+) -> Result<(), DaemonError> {
+    kernel
+        .acknowledge_testd_terminal_completion_async(job_id, receipt)
+        .await
+        .map(|_| ())
+        .map_err(|error| DaemonError::Kernel(error.to_string()))
+}
+
+/// Records one poisoned or fence-moved drain row as a diagnostic.
+///
+/// #18 item B: the bounded step skips such a row and keeps draining, so it
+/// never fails the daemon closed and is never silently discarded.
+pub fn emit_testd_owner_drain_skip(job_id: &str, error: &DaemonError) {
+    emit_drain_skip(job_id, error);
 }
 
 /// Outcome of one bounded `TestD` owner drain step. Every counter names work

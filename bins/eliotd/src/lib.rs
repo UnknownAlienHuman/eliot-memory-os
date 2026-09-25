@@ -68,6 +68,7 @@ pub mod skill_dispatch;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
 pub mod staffing_policy;
+pub mod startup_capability_bindings;
 pub mod startup_evidence_producer;
 mod store_failure_projection;
 pub mod supervision_progress;
