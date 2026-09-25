@@ -1579,7 +1579,7 @@ fn watchdog_host_control_grant_rejects_rights_escalation_and_shape_substitution(
             ELIOT_HOST_SERVICE_NAME,
             "S-1-5-80-1-2-3-4-5",
             ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK | 0x0004_0000,
-            descriptor_digest,
+            descriptor_digest.clone(),
         ),
         (
             ELIOT_HOST_SERVICE_NAME,
