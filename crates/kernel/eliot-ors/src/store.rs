@@ -13,7 +13,9 @@ use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
     SignedSupervisionLease, VerifiedSupervisionLease, VerifiedSupervisionLeaseTerminalTransition,
 };
-use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
+use redb::{
+    Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -175,7 +177,7 @@ struct BridgeEventRow {
     sequence: u64,
     producer_id: String,
     producer_generation: u64,
-    authority_epoch: u64,
+    authority_epoch: String,
     envelope_sha256: String,
     envelope_bytes: Vec<u8>,
     staging_connection: String,
@@ -203,6 +205,9 @@ impl BridgeEventRow {
                 reason: "bridge event producer generation must be nonzero",
             });
         }
+        // Lineage-aware epoch text (`lineage:sequence`); compared exactly by
+        // the route owner, never coerced to a scalar here.
+        crate::model::validate_text(&self.authority_epoch, "authority_epoch")?;
         crate::model::validate_digest(&self.envelope_sha256, "envelope_sha256")?;
         if self.envelope_bytes.is_empty()
             || self.envelope_bytes.len() > MAX_BRIDGE_EVENT_ENVELOPE_BYTES
@@ -295,8 +300,16 @@ impl BridgeEventGapRow {
         if self.contract_version != crate::CONTRACT_VERSION {
             return Err(OrsError::UnsupportedContractVersion(self.contract_version));
         }
-        bridge_identity_text(&self.gap_id, "gap_id")?;
-        bridge_identity_text(&self.stream_id, "stream_id")?;
+        // Gap identities are bare keys (never key-encoded with a separator),
+        // so only blank/control text is refused here.
+        crate::model::validate_text(&self.gap_id, "gap_id")?;
+        // An empty stream marks an unscoped coverage gap: the forwarding port
+        // only carries the gap, so stream scope is attached when the producer
+        // presents it and left empty otherwise. Unscoped gaps reconcile at
+        // top level under their staging connection, never under a stream.
+        if !self.stream_id.is_empty() {
+            bridge_identity_text(&self.stream_id, "stream_id")?;
+        }
         if self.start_sequence == 0 || self.end_sequence == 0 {
             return Err(OrsError::InvalidField {
                 field: "start_sequence",
@@ -371,6 +384,25 @@ fn bridge_text(value: &serde_json::Value, field: &'static str) -> Result<String,
                 reason: "bridge event field must be text",
             })?;
     crate::model::validate_text(text, field)?;
+    Ok(text.to_owned())
+}
+
+/// Extracts the gap stream scope: empty (unscoped) or validated key text.
+/// The forwarding port only carries the gap itself, so stream scope arrives
+/// when the producer presents it and stays empty otherwise; unscoped gaps
+/// reconcile at top level under their staging connection.
+fn bridge_gap_stream_text(value: &serde_json::Value) -> Result<String, OrsError> {
+    let text = value
+        .get("stream_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(OrsError::InvalidField {
+            field: "stream_id",
+            reason: "bridge event gap must carry a stream scope",
+        })?;
+    if text.is_empty() {
+        return Ok(String::new());
+    }
+    bridge_identity_text(text, "stream_id")?;
     Ok(text.to_owned())
 }
 
@@ -3685,7 +3717,7 @@ impl RedbRecoveryStore {
         let sequence = bridge_sequence(staged, "sequence")?;
         let producer_id = bridge_text(staged, "producer_id")?;
         let producer_generation = bridge_generation(staged, "producer_generation")?;
-        let authority_epoch = bridge_generation(staged, "authority_epoch")?;
+        let authority_epoch = bridge_text(staged, "authority_epoch")?;
         let staging_connection = bridge_text(staged, "staging_connection")?;
         let envelope_value = staged
             .get("envelope")
@@ -3730,6 +3762,7 @@ impl RedbRecoveryStore {
                     || row.sequence != sequence
                     || row.producer_id != producer_id
                     || row.producer_generation != producer_generation
+                    || row.authority_epoch != authority_epoch
                 {
                     return Err(OrsError::DuplicateConflict);
                 }
@@ -3946,8 +3979,8 @@ impl RedbRecoveryStore {
         &self,
         gap: &serde_json::Value,
     ) -> Result<serde_json::Value, OrsError> {
-        let gap_id = bridge_key_text(gap, "gap_id")?;
-        let stream_id = bridge_key_text(gap, "stream_id")?;
+        let gap_id = bridge_text(gap, "gap_id")?;
+        let stream_id = bridge_gap_stream_text(gap)?;
         let start_sequence = bridge_sequence(gap, "start_sequence")?;
         let end_sequence = bridge_sequence(gap, "end_sequence")?;
         if end_sequence < start_sequence {
@@ -4024,9 +4057,10 @@ impl RedbRecoveryStore {
     /// producer generation is older than `live_generation` (fenced
     /// old-generation unresolved streams are never discarded). Each covered
     /// stream reports its durable/acked cursors, its pending first page, and
-    /// its recorded gaps. The caller binds the reply digest as its
-    /// reconciliation key; host-request reconciliation never reads these
-    /// tables.
+    /// its recorded gaps; unscoped gaps (no stream scope) report at top level
+    /// under the presenting connection only. The caller binds the reply
+    /// digest as its reconciliation key; host-request reconciliation never
+    /// reads these tables.
     pub fn reconcile_bridge_events(
         &self,
         connection_id: &str,
@@ -4064,7 +4098,7 @@ impl RedbRecoveryStore {
         let mut covered = Vec::new();
         for (stream_id, durable, acked, stager, generation) in &streams {
             let page = self.bridge_event_pending_page(stream_id, *acked, MAX_BRIDGE_EVENT_PAGE)?;
-            let gaps = self.bridge_gaps_for(stream_id)?;
+            let gaps = self.bridge_gaps_for(stream_id, None)?;
             covered.push(json!({
                 "stream_id": stream_id,
                 "durable_cursor": durable,
@@ -4075,15 +4109,26 @@ impl RedbRecoveryStore {
                 "gaps": gaps,
             }));
         }
+        // Unscoped gaps (no stream scope presented at forward time) reconcile
+        // at top level under their staging connection, never under a stream.
+        let unscoped_gaps = self.bridge_gaps_for("", Some(connection_id))?;
         Ok(json!({
             "connection_id": connection_id,
             "live_generation": live_generation,
             "streams": covered,
+            "unscoped_gaps": unscoped_gaps,
         }))
     }
 
-    /// Reads the recorded gaps for one stream, oldest first.
-    fn bridge_gaps_for(&self, stream_id: &str) -> Result<Vec<serde_json::Value>, OrsError> {
+    /// Reads the recorded gaps for one stream scope, oldest first.
+    ///
+    /// `connection` restricts unscoped-gap reads to the presenting
+    /// connection's own rows; scoped gaps ride their stream's visibility.
+    fn bridge_gaps_for(
+        &self,
+        stream_id: &str,
+        connection: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, OrsError> {
         let read = self.database.begin_read().map_err(storage)?;
         let gaps = read.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
         let mut rows: Vec<BridgeEventGapRow> = Vec::new();
@@ -4091,7 +4136,9 @@ impl RedbRecoveryStore {
             let (_, value) = entry.map_err(storage)?;
             let row: BridgeEventGapRow = decode(value.value())?;
             row.validate()?;
-            if row.stream_id == stream_id {
+            if row.stream_id == stream_id
+                && connection.is_none_or(|allowed| row.staging_connection == allowed)
+            {
                 rows.push(row);
             }
         }
