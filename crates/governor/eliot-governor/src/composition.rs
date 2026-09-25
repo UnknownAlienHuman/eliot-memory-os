@@ -4115,7 +4115,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     }
 
     /// Runs the `ScopeBindingGuard` at one mandatory trigger against the live
-    /// retained `WorkScope` binding (issue #1787, CanonicalWrite trigger
+    /// retained `WorkScope` binding (issue #1787, `CanonicalWrite` trigger
     /// wiring).
     ///
     /// Reads the live [`WorkScopeBindingOwner`] at the retained fence and
@@ -4209,7 +4209,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     }
 
     /// Guards one scope-sensitive canonical write with the `ScopeBindingGuard`
-    /// (issue #1787, CanonicalWrite trigger production caller).
+    /// (issue #1787, `CanonicalWrite` trigger production caller).
     ///
     /// When a `WorkScope` binding is retained, the write's own scope claim is
     /// tested against it through [`check_at_trigger`] at
