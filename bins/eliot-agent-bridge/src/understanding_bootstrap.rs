@@ -155,6 +155,14 @@ pub struct BootstrapTaskInputs {
 }
 
 /// Owner-supplied context composed into one bootstrap.
+///
+/// The readiness half of this context is the compiled canonical surface
+/// projection: `onboarding_readiness_ref` names the
+/// `OnboardingReadinessReceipt`, `onboarding_disposition` carries its
+/// lifecycle, and `smallest_missing_question`, `lease_deadline`, and
+/// `receipt_revision` carry the surface the Governor compiler delivered.
+/// The bridge never invents these values; it projects them and caps the
+/// assessment at the referenced readiness (see [`cap_assessment`]).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BootstrapContext {
@@ -163,6 +171,24 @@ pub struct BootstrapContext {
     pub workscope_ref: String,
     pub onboarding_readiness_ref: String,
     pub onboarding_disposition: ReadinessDisposition,
+    /// Smallest missing question from the compiled readiness surface.
+    ///
+    /// `None` when the surface reports nothing missing; carried so agent and
+    /// Human callers receive the exact question instead of a generic refusal.
+    #[serde(default)]
+    pub smallest_missing_question: Option<String>,
+    /// Lease deadline from the compiled readiness surface (receipt expiry).
+    ///
+    /// Zero when an older producer did not state one; carried verbatim.
+    /// Freshness adjudication stays with the Governor readiness owner.
+    #[serde(default)]
+    pub lease_deadline: u64,
+    /// Receipt revision from the compiled readiness surface.
+    ///
+    /// Zero when an older producer did not state one; a changed revision at
+    /// the same lease tells callers a revised receipt replaced the first.
+    #[serde(default)]
+    pub receipt_revision: u64,
     #[serde(default)]
     pub revision_refs: Vec<String>,
     #[serde(default)]
@@ -228,11 +254,13 @@ impl BootstrapContext {
     ///
     /// The canonical readiness decision stays with the receipt; this only
     /// carries its reference (`receipt_ref` -> `onboarding_readiness_ref`) and
-    /// passes the disposition through unchanged. It can never invent
-    /// readiness: the assessment is capped later by [`cap_assessment`] in
-    /// [`get_understanding_bootstrap`]. Fails closed via `validate_context`
-    /// on blank/unbounded refs and handles (reuse of `non_blank` /
-    /// `bounded_list` codes such as `READINESS_REF_MISSING`).
+    /// passes the disposition through unchanged, plus the compiled surface
+    /// values (`smallest_missing_question`, `lease_deadline`,
+    /// `receipt_revision`) the Governor compiler delivered for this exact
+    /// receipt. It can never invent readiness: the assessment is capped later
+    /// by [`cap_assessment`] in [`get_understanding_bootstrap`]. Fails closed
+    /// via `validate_context` on blank/unbounded refs and handles (reuse of
+    /// `non_blank` / `bounded_list` codes such as `READINESS_REF_MISSING`).
     #[allow(clippy::too_many_arguments)]
     pub fn from_receipt(
         receipt_ref: String,
@@ -240,6 +268,9 @@ impl BootstrapContext {
         profile_ref: String,
         workscope_ref: String,
         onboarding_disposition: ReadinessDisposition,
+        smallest_missing_question: Option<String>,
+        lease_deadline: u64,
+        receipt_revision: u64,
         revision_refs: Vec<String>,
         orientation_handles: Vec<String>,
         attention_handles: Vec<String>,
@@ -264,6 +295,9 @@ impl BootstrapContext {
             workscope_ref,
             onboarding_readiness_ref: receipt_ref,
             onboarding_disposition,
+            smallest_missing_question,
+            lease_deadline,
+            receipt_revision,
             revision_refs,
             orientation_handles,
             attention_handles,
@@ -313,11 +347,25 @@ pub struct TaskSelectionView {
 
 /// Bounded agent-facing projection of onboarding readiness plus current
 /// cognitive state (I7.17 `UnderstandingBootstrap`).
+///
+/// The readiness half delivers the compiled canonical surface: disposition
+/// plus the smallest missing question, lease deadline, and receipt revision
+/// the Governor compiler issued, so agent and Human callers see the exact
+/// question and expiry instead of a buried setup state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnderstandingBootstrap {
     pub onboarding_readiness_ref: String,
     pub onboarding_readiness_disposition: ReadinessDisposition,
+    /// Smallest missing question from the compiled readiness surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smallest_missing_question: Option<String>,
+    /// Lease deadline from the compiled readiness surface (receipt expiry).
+    #[serde(default)]
+    pub lease_deadline: u64,
+    /// Receipt revision from the compiled readiness surface.
+    #[serde(default)]
+    pub receipt_revision: u64,
     pub principal_ref: String,
     pub profile_ref: String,
     pub workscope_ref: String,
@@ -452,6 +500,15 @@ fn validate_context(context: &BootstrapContext) -> Result<(), BootstrapError> {
             &context.workspace_instance_ref,
             "WORKSPACE_INSTANCE_MISSING",
         )?;
+    }
+    if let Some(question) = &context.smallest_missing_question {
+        non_blank(question, "SMALLEST_QUESTION_MISSING")?;
+        if question.len() > MAX_HANDLE_LEN {
+            return Err(BootstrapError::new(
+                "SMALLEST_QUESTION_BOUND",
+                "smallest missing question exceeds bound",
+            ));
+        }
     }
     if context.projection_source_ref.len() > MAX_HANDLE_LEN {
         return Err(BootstrapError::new(
@@ -765,6 +822,9 @@ pub fn get_understanding_bootstrap(
     Ok(UnderstandingBootstrap {
         onboarding_readiness_ref: context.onboarding_readiness_ref.clone(),
         onboarding_readiness_disposition: context.onboarding_disposition,
+        smallest_missing_question: context.smallest_missing_question.clone(),
+        lease_deadline: context.lease_deadline,
+        receipt_revision: context.receipt_revision,
         principal_ref: context.principal_ref.clone(),
         profile_ref: context.profile_ref.clone(),
         workscope_ref: context.workscope_ref.clone(),
@@ -849,6 +909,9 @@ mod tests {
             workscope_ref: "workscope-1".to_owned(),
             onboarding_readiness_ref: "readiness-receipt-1".to_owned(),
             onboarding_disposition: disposition,
+            smallest_missing_question: Some("task_ref".to_owned()),
+            lease_deadline: 10,
+            receipt_revision: 1,
             revision_refs: vec!["source-gen-9".to_owned()],
             orientation_handles: vec!["orientation:project".to_owned()],
             attention_handles: vec!["attention:conflict-1".to_owned()],
@@ -1248,6 +1311,9 @@ mod tests {
             "SPINE_FUNCTIONAL".to_owned(),
             "workscope-1".to_owned(),
             disposition,
+            Some("task_ref".to_owned()),
+            10,
+            1,
             vec!["source-gen-9".to_owned()],
             vec!["orientation:project".to_owned()],
             vec!["attention:conflict-1".to_owned()],
