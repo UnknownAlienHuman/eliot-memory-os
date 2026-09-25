@@ -44,6 +44,7 @@ committed as repository authority.
 | `verify-dependency-policy.py` | Verify multi-ecosystem dependency admission, scanner tool pinning, inventory completeness, lockfiles, and advisory evidence | Static and advisory admission evidence only |
 | `crate_reachability_inventory.py` | Generate deterministic support-neutral Cargo package reachability and source-shape inventory | Reachability and source-shape evidence only |
 | `audit-work-unit-assignments.py` | Deterministic fail-closed assignment-integrity oracle over a frozen complete repository/GitHub snapshot (#818) | Assignment integrity oracle evidence only |
+| `audit_cue_kind_retirement.py` | Final cross-package CueKind retirement oracle library rederiving type/alias/import denominator (#835) | Static source denominator only |
 | `audit-serde-boundary-closure.py` | Serde-boundary closure coordinator (#710, Slice A) | Static source/boundary evidence only |
 | `long_lived_collection_inventory.py` | Deterministic source-bound inventory of mutable collections in long-lived owners (#885) | Static source classification only |
 | `serde_boundary_inventory.py` | Deterministic serialized-boundary inventory and finite repair allocations (#929, freezing the F-DENY denominator for #710) | Static source classification only |
@@ -133,6 +134,7 @@ be promoted to live multi-agent/runtime proof.
 | `provision-surrealdb-release.py` | Materialize pinned SurrealDB evidence into project-local ignored state | Local evidence provision only |
 | `build-eliot-windows-x64-release.ps1` | Build declared Windows x64 release inputs and an unsigned bundle | Build/staging only |
 | `finalize-eliot-windows-x64-release.ps1` | Sign/finalize and independently read back declared release artifacts | Release-artifact evidence only |
+| `write-operator-build-receipt.ps1` | Write deterministic Windows release build receipt for Operator artifacts | Release-artifact evidence only |
 | `install-pipeline.ps1` | Root-controller install pipeline executing materialization and installation apply | Installation orchestration only |
 | `invoke-eliot-windows-x64-production.ps1` | Execute the manifest-bound production invocation/installation flow | Live acceptance remains issue #11 |
 | `reset-developer-install.ps1` | Reset developer installation state across services, processes, directories, and credentials | Developer machine reset only |
