@@ -339,7 +339,9 @@ pub struct DaemonStatus {
 /// ([`DaemonComposition::skill_install_package_versioned`]) carries every
 /// owner term explicitly without exceeding the arity lint. The admitted
 /// version must equal the install context's recorded version; drift fails
-/// closed inside the shared handle before any catalogue write.
+/// closed inside the shared handle before any catalogue write. The view is
+/// `Copy` so the by-value seam parameter introduces no pass-by-value lint.
+#[derive(Clone, Copy)]
 pub struct VersionedToolView<'a> {
     /// Live tool-owner source reporting the definition version it binds.
     pub source: &'a dyn eliot_skill::CanonicalToolSource,
