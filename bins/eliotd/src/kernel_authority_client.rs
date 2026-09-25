@@ -12,11 +12,19 @@
 //! here.
 //!
 //! Forbidden boundary: no canned receipts, no `UnavailableP07AuthorityPort` in
-//! the production path, no epoch invention (epochs stay with T6), no Store
-//! access, and no local authority minting. The operation names below address
-//! the daemon→Kernel P-07 route: until the Kernel front-door grant route lands
-//! (T6/#15), the Kernel rejects them and every method fails closed through
-//! the typed mapping — honest diagnosed degradation, never invented rights.
+//! the production path, no epoch invention, no Store access, and no local
+//! authority minting. The operation names below address the Kernel-owned
+//! front-door P-07 route; the Kernel binds the canonical Governor closure
+//! owner through it and serves activation, revocation, and restart
+//! rehydration from that owner, never from a no-authority stand-in.
+//!
+//! Every request presents the compact [`AuthorityBinding`] plus the
+//! principal/session/scope subject this client proves from its own
+//! authenticated owner session, because the compact binding alone cannot
+//! distinguish a cross-principal, cross-session, or cross-scope presentation
+//! from the one the session may perform. Both are checked before the
+//! transport is touched; neither carries a secret, provider detail,
+//! arbitrary payload, or free prose.
 //!
 //! `cfg(test)` doubles in the colocated test module are gating proofs only:
 //! they exercise the pure binding/decode/mapping logic, never a production
@@ -30,14 +38,15 @@ use eliot_authority::{
 };
 use eliot_contracts::StateFence;
 use eliot_governor::{KernelGenerationSnapshotProvider, KernelPortError};
-use eliot_receipts::AuthorityBinding;
+use eliot_receipts::{AuthorityBinding, AuthorityRequestSubject};
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
 
-use super::{DaemonKernelClient, kind_value};
+use super::{DaemonKernelClient, SERVICE_NAME, kind_value};
 
-/// Daemon→Kernel P-07 route names. These name the Kernel-owned front-door
-/// route (T6/#15); until it exists the Kernel rejects them and the adapter
-/// fails closed.
+/// Daemon→Kernel P-07 route names. These address the Kernel-owned front-door
+/// route (T6/#15), where the canonical Governor closure owner is bound and
+/// activation, revocation, and restart rehydration are served from that
+/// owner.
 const ACTIVATE_GRANT_OPERATION: &str = "activate_grant";
 const REVOKE_GRANT_OPERATION: &str = "revoke_grant";
 const ACTIVATE_INTRODUCTION_OPERATION: &str = "activate_introduction";
@@ -45,6 +54,14 @@ const REVOKE_INTRODUCTION_OPERATION: &str = "revoke_introduction";
 
 const ACTIVATION_RECEIPT_KIND: &str = "authority_activation_receipt";
 const REVOCATION_RECEIPT_KIND: &str = "authority_revocation_receipt";
+
+/// The exact session capability this adapter presents as its authenticated
+/// scope. It is the same closed constant the daemon's authenticated
+/// `ClientHello` declares in `daemon_kernel_client::handshake::client_hello`,
+/// and the Kernel front-door policy admits exactly this capability for the
+/// daemon session, so the presented scope is derived evidence on both sides
+/// rather than a locally chosen label.
+const DAEMON_SESSION_CAPABILITY: &str = "daemon";
 
 /// Reason reported when the Kernel has not yet published the exact launched
 /// `eliotd` process receipt. The session cannot carry authority yet, so the
@@ -73,6 +90,30 @@ impl KernelAuthorityClient {
     fn active_fence(&self) -> StateFence {
         self.kernel.snapshot().state_fence()
     }
+
+    /// Builds the presented principal/session/scope subject from the
+    /// authenticated owner session this client already holds.
+    ///
+    /// No value is invented here. The principal is this daemon's own service
+    /// identity as its authenticated handshake declares it, the session is the
+    /// live transport connection correlation the Kernel proves from the same
+    /// handshake frame, and the scope is the session capability both sides
+    /// admit. Absent authenticated session evidence is a pre-admission state,
+    /// not a refusal of the presented authority, so it degrades to
+    /// `Unavailable` and the caller reconnects instead of presenting an
+    /// unbound subject.
+    fn subject(&self) -> Result<AuthorityRequestSubject, P07PortError> {
+        let facts = self
+            .kernel
+            .owner_session_facts()
+            .ok_or(P07PortError::Unavailable)?;
+        AuthorityRequestSubject::new(
+            SERVICE_NAME,
+            facts.connection_id(),
+            DAEMON_SESSION_CAPABILITY,
+        )
+        .map_err(|_| P07PortError::InvalidBinding)
+    }
 }
 
 impl P07AuthorityPort for KernelAuthorityClient {
@@ -82,10 +123,12 @@ impl P07AuthorityPort for KernelAuthorityClient {
     ) -> Result<AuthorityActivationReceipt, P07PortError> {
         let fence = self.active_fence();
         check_binding(&request.binding, &fence)?;
+        let subject = self.subject()?;
         let payload = serde_json::json!({
             "grant_id": request.grant_id.as_str(),
             "snapshot_id": request.snapshot_id.as_str(),
             "binding": request.binding,
+            "subject": subject,
         });
         let value = self
             .kernel
@@ -102,10 +145,12 @@ impl P07AuthorityPort for KernelAuthorityClient {
     ) -> Result<AuthorityRevocationReceipt, P07PortError> {
         let fence = self.active_fence();
         check_binding(&request.binding, &fence)?;
+        let subject = self.subject()?;
         let payload = serde_json::json!({
             "grant_id": request.grant_id.as_str(),
             "snapshot_id": request.snapshot_id.as_str(),
             "binding": request.binding,
+            "subject": subject,
         });
         let value = self
             .kernel
@@ -122,10 +167,12 @@ impl P07AuthorityPort for KernelAuthorityClient {
     ) -> Result<AuthorityActivationReceipt, P07PortError> {
         let fence = self.active_fence();
         check_binding(&request.binding, &fence)?;
+        let subject = self.subject()?;
         let payload = serde_json::json!({
             "introduction_id": request.introduction_id.as_str(),
             "snapshot_id": request.snapshot_id.as_str(),
             "binding": request.binding,
+            "subject": subject,
         });
         let value = self
             .kernel
@@ -142,10 +189,12 @@ impl P07AuthorityPort for KernelAuthorityClient {
     ) -> Result<AuthorityRevocationReceipt, P07PortError> {
         let fence = self.active_fence();
         check_binding(&request.binding, &fence)?;
+        let subject = self.subject()?;
         let payload = serde_json::json!({
             "introduction_id": request.introduction_id.as_str(),
             "snapshot_id": request.snapshot_id.as_str(),
             "binding": request.binding,
+            "subject": subject,
         });
         let value = self
             .kernel
@@ -160,7 +209,10 @@ impl P07AuthorityPort for KernelAuthorityClient {
 /// Validates the caller-side binding before any transport is touched: the
 /// fence must be well-formed, the epoch must agree with the fence, and the
 /// presented fence must be the currently active Kernel fence. Anything else is
-/// an internally inconsistent presentation, never a Kernel refusal.
+/// an internally inconsistent presentation, never a Kernel refusal. The
+/// principal/session/scope subject travels beside this binding and is proved
+/// separately by [`KernelAuthorityClient::subject`], so neither check is
+/// satisfied by the other.
 fn check_binding(
     binding: &AuthorityBinding,
     active_fence: &StateFence,
@@ -178,8 +230,8 @@ fn check_binding(
 }
 
 /// Maps an authenticated-transport failure to the typed P-07 error:
-/// - admission/session failures (including the missing front-door route until
-///   T6/#15 lands) refuse the presented authority: `NotAdmitted`;
+/// - admission/session failures (including an unbound Kernel P-07 owner) refuse
+///   the presented authority: `NotAdmitted`;
 /// - a session that cannot carry authority yet (pre-admission receipt
 ///   pending) degrades to `Unavailable` for reconnect, not refusal;
 /// - contract/shape mismatches are caller-visible binding failures:

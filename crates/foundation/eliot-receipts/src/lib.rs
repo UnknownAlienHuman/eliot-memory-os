@@ -852,6 +852,86 @@ impl GrantClosureReceipt {
             canonical.validate()?;
         }
         Ok(())
+}
+
+/// Principal, session and scope identity one authority activation or
+/// revocation must name in addition to the compact [`AuthorityBinding`].
+///
+/// `AuthorityBinding` is a compact transport/projection form: it pins the
+/// authority owner, epoch, state fence, effect ceiling and proof ceiling, and
+/// deliberately carries no semantic session or WorkScope identity. That is
+/// correct for a receipt and insufficient for a request that *mutates*
+/// authority state: without the holder subject, a Kernel authority owner
+/// cannot tell a cross-principal, cross-session or cross-scope presentation
+/// from the one the authenticated session may perform, and the compact form
+/// alone would be the only gate.
+///
+/// This type closes that gap without changing `AuthorityBinding`: the
+/// transport presents the subject, and the authority owner compares it
+/// against the subject it independently authenticated. It carries no
+/// secret, provider credential, arbitrary payload or free prose — only
+/// three closed identity strings.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityRequestSubject {
+    /// Exact principal the presented authority is for.
+    pub principal: String,
+    /// Exact authenticated session the request travels on.
+    pub session_id: String,
+    /// Exact capability/scope the request is bounded to.
+    pub scope_id: String,
+}
+
+impl AuthorityRequestSubject {
+    /// Builds the subject after proving the closed shape: three non-blank,
+    /// control-free identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReceiptError::InvalidField`] for a blank or control-bearing
+    /// principal, session, or scope.
+    pub fn new(
+        principal: impl Into<String>,
+        session_id: impl Into<String>,
+        scope_id: impl Into<String>,
+    ) -> Result<Self, ReceiptError> {
+        let subject = Self {
+            principal: principal.into(),
+            session_id: session_id.into(),
+            scope_id: scope_id.into(),
+        };
+        subject.validate()?;
+        Ok(subject)
+    }
+
+    /// Re-checks the closed shape at every transport and storage boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReceiptError::InvalidField`] for a blank or control-bearing
+    /// principal, session, or scope.
+    pub fn validate(&self) -> Result<(), ReceiptError> {
+        text(&self.principal, "subject.principal")?;
+        text(&self.session_id, "subject.session_id")?;
+        text(&self.scope_id, "subject.scope_id")
+    }
+
+    /// Returns whether the presented principal is exactly `principal`.
+    #[must_use]
+    pub fn is_principal(&self, principal: &str) -> bool {
+        self.principal == principal
+    }
+
+    /// Returns whether the presented session is exactly `session_id`.
+    #[must_use]
+    pub fn is_session(&self, session_id: &str) -> bool {
+        self.session_id == session_id
+    }
+
+    /// Returns whether the presented scope is exactly `scope_id`.
+    #[must_use]
+    pub fn is_scope(&self, scope_id: &str) -> bool {
+        self.scope_id == scope_id
     }
 }
 

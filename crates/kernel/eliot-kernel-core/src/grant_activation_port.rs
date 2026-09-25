@@ -5918,6 +5918,12 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
     ) -> Result<AuthorityRevocationReceipt, eliot_authority::P07PortError> {
         use eliot_authority::P07PortError;
         let active_epoch = request.binding.authority_epoch.clone();
+        // Caller-material rejection runs before the owner is consulted: a
+        // malformed, split-epoch or stale-epoch binding never reaches the
+        // closure enumeration, the intent ledger, or ORS.
+        if let Err(error) = check_binding(&request.binding, &active_epoch) {
+            return Err(map_thin_error(&error));
+        }
         if let Some(boundary) = self.durable_boundary() {
             // Owner-governed dispatch (`#2100`): the Governor enumeration
             // owner always governs — a singleton is the owner's leaf
