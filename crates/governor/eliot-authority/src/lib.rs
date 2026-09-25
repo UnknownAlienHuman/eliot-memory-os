@@ -66,6 +66,9 @@ pub enum AuthorityError {
     InvalidLifecycleTransition,
     ReceiptMismatch,
     P07Unavailable,
+    /// The bounded influence evaluator refused a typed request, snapshot, or
+    /// continuation; the cause is preserved for recovery diagnostics.
+    BoundedRevocation(eliot_influence::InfluenceError),
 }
 
 impl fmt::Display for AuthorityError {
@@ -97,6 +100,9 @@ impl fmt::Display for AuthorityError {
                 formatter.write_str("effect receipt does not match authorization")
             }
             Self::P07Unavailable => formatter.write_str("P-07 activation port is unavailable"),
+            Self::BoundedRevocation(error) => {
+                write!(formatter, "bounded revocation refused: {error}")
+            }
         }
     }
 }

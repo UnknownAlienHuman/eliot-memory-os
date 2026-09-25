@@ -194,6 +194,9 @@ pub enum RevocationHistoryError {
     StaleHistory,
     /// A closure is invalid, unordered, or not terminal revocation evidence.
     UnknownHistory,
+    /// The bounded evaluator rejected a typed request, graph, fence, or
+    /// continuation before any suppression could be derived.
+    BoundedRevocation(eliot_influence::InfluenceError),
     /// The grant snapshot itself is malformed.
     InvalidSnapshot(AuthorityError),
 }
@@ -210,6 +213,9 @@ impl fmt::Display for RevocationHistoryError {
             Self::UnknownHistory => formatter.write_str(
                 "authority revocation history is unknown: a closure is invalid, unordered, or not a terminal revocation",
             ),
+            Self::BoundedRevocation(error) => {
+                write!(formatter, "bounded revocation evidence refused: {error}")
+            }
             Self::InvalidSnapshot(error) => {
                 write!(formatter, "authority grant snapshot is invalid: {error}")
             }

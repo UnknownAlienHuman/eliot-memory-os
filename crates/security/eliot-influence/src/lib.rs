@@ -13,6 +13,7 @@ use eliot_security_contracts::{
     EpistemicUse, InfluenceDependencyClosure, InfluenceState, RevocationReason, SourceAssurance,
 };
 use schemars::JsonSchema;
+use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -489,6 +490,39 @@ impl RevocationBounds {
     }
 }
 
+/// Per-call work limits for one page of a bounded revocation.
+///
+/// These limits bound only the current call. The original operation-global
+/// [`RevocationBounds`] remain bound in the continuation and are checked across
+/// all pages; increasing a page limit cannot widen the operation ceiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedRevocationPageLimits {
+    pub max_page_edges: u64,
+    pub max_page_work: u64,
+}
+
+impl BoundedRevocationPageLimits {
+    /// Reject a page that cannot examine even one edge or perform the initial
+    /// root admission work unit.
+    pub fn validate(&self) -> Result<(), InfluenceError> {
+        if self.max_page_edges == 0 {
+            return Err(InfluenceError::InvalidField("page_limits.max_page_edges"));
+        }
+        if self.max_page_work == 0 {
+            return Err(InfluenceError::InvalidField("page_limits.max_page_work"));
+        }
+        Ok(())
+    }
+
+    fn all_global_work(bounds: &RevocationBounds) -> Self {
+        Self {
+            max_page_edges: bounds.max_edges,
+            max_page_work: bounds.max_work,
+        }
+    }
+}
+
 /// Why a qualified edge was omitted from a bounded revocation traversal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -512,8 +546,11 @@ pub struct RevocationOmission {
 
 /// Bounded revocation request over an explicit qualified edge set.
 ///
-/// `resumed_visited` carries the operation-global visited pages from prior
-/// bounded calls so a resumed traversal never re-admits them.
+/// `resumed_visited` remains on the wire for source compatibility only.  A
+/// nonempty value is refused: a visited list cannot identify unexpanded
+/// source-bound edge positions, depths, omissions, or cumulative accounting.
+/// Resumption must use [`resume_bounded_revocation`] with the exact
+/// [`BoundedRevocationContinuation`] returned by the prior page.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BoundedRevocationRequest {
@@ -526,15 +563,120 @@ pub struct BoundedRevocationRequest {
     pub resumed_visited: Vec<String>,
 }
 
+/// Stable schema identity for a bounded-revocation continuation.
+///
+/// A continuation is a continuation of one operation, not a new traversal
+/// rooted at `root_ref`.  The value is deliberately explicit so a serialized
+/// continuation can be rejected when its schema is not understood.
+pub const BOUNDED_REVOCATION_CONTINUATION_SCHEMA: &str = "eliot-bounded-revocation-continuation-v1";
+
+/// An admitted node and the depth at which it was first discovered.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedRevocationPendingNode {
+    pub node_ref: String,
+    pub depth: u64,
+}
+
+/// A source-bound edge position retained by a continuation.
+///
+/// `source_depth` is the depth of `source_ref`, not the depth of the target.
+/// Keeping the position, rather than only a target string, is what prevents a
+/// resumed operation from silently skipping the rest of a node's adjacency
+/// list.  `disposition` is copied from the exact qualified-edge snapshot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedRevocationPendingEdge {
+    pub source_ref: String,
+    pub dependent_ref: String,
+    pub source_depth: u64,
+    pub disposition: InfluenceEdgeDisposition,
+}
+
+/// Explicit, source-bound continuation state for a bounded revocation.
+///
+/// The continuation is the authority-bearing position of the original
+/// operation.  It is not a visited-only hint: admitted nodes, fully expanded
+/// nodes, unexpanded queue entries, and unexamined edge positions are kept
+/// separately.  All identities are checked by
+/// [`resume_bounded_revocation`] before traversal resumes.
+///
+/// `admitted_nodes` is the depth-bearing form of `admitted_refs`.  The
+/// separate `examined_edges` and `pending_edges` vectors make the edge
+/// partition auditable and prevent a caller from fabricating completeness by
+/// omitting an edge from a continuation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedRevocationContinuation {
+    pub schema_version: String,
+    pub request_id: String,
+    pub root_ref: String,
+    pub reason: RevocationReason,
+    pub completeness: ClosureCompleteness,
+    pub request_digest: String,
+    pub graph_snapshot_digest: String,
+    pub state_fence: StateFence,
+    pub bounds_digest: String,
+    pub admitted_refs: Vec<String>,
+    pub admitted_nodes: Vec<BoundedRevocationPendingNode>,
+    pub expanded_refs: Vec<String>,
+    /// Canonical pending queue order: node reference, then depth.
+    pub pending: Vec<BoundedRevocationPendingNode>,
+    pub pending_edges: Vec<BoundedRevocationPendingEdge>,
+    pub examined_edges: Vec<BoundedRevocationPendingEdge>,
+    pub edges_examined: u64,
+    pub work_spent: u64,
+    pub omissions: Vec<RevocationOmission>,
+    pub frontier: Vec<String>,
+    pub previous_page_exhausted: bool,
+    /// SHA-256 over every other continuation field. Resume rejects any
+    /// mismatch before using queue, edge, counter, omission, or frontier state.
+    pub continuation_digest: String,
+}
+
+impl BoundedRevocationContinuation {
+    /// Digest the complete continuation with the canonical JSON encoding,
+    /// excluding the digest field itself.
+    pub fn digest(&self) -> Result<String, InfluenceError> {
+        let mut view = self.clone();
+        view.continuation_digest.clear();
+        canonical_digest(&view)
+    }
+}
+
+/// Opaque capability emitted with a live continuation.
+///
+/// The digest field is intentionally private: a caller can carry the token
+/// returned by the preceding page, but cannot mint a token for a fabricated
+/// continuation. A deserialized wire outcome has no live token and must be
+/// re-admitted by its owning persistence boundary before resume.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundedRevocationContinuationToken {
+    digest: String,
+}
+
+impl BoundedRevocationContinuationToken {
+    fn digest(&self) -> &str {
+        &self.digest
+    }
+}
+
 /// Bounded revocation outcome.
 ///
 /// `affected_refs` always contains the root. `complete` is false whenever any
 /// bound was exhausted; non-bound omissions never clear completeness.
-/// `frontier` holds the blocked nodes retained at exhaustion, `omissions`
-/// records every omitted edge, and `work_spent` accumulates edge examinations
-/// plus node admissions.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+/// `frontier` is the current unresolved source-bound frontier (empty after a
+/// complete resume), and `omissions` records every cumulative omitted edge.
+/// `work_spent` accumulates edge
+/// examinations plus node admissions across every page of the operation.
+///
+/// `continuation` is present whenever the operation is not a complete
+/// one-shot traversal. The wire field itself is required (use `null` for a
+/// complete outcome); an omitted field is rejected. In particular, an
+/// exhausted page retains its entire unexpanded queue and every unexamined
+/// edge position; it is never converted into a successful result merely
+/// because the page ended.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 pub struct BoundedRevocationOutcome {
     pub root_ref: String,
     pub affected_refs: Vec<String>,
@@ -542,6 +684,161 @@ pub struct BoundedRevocationOutcome {
     pub omissions: Vec<RevocationOmission>,
     pub work_spent: u64,
     pub complete: bool,
+    pub continuation: Option<BoundedRevocationContinuation>,
+    #[serde(skip)]
+    continuation_token: Option<BoundedRevocationContinuationToken>,
+}
+
+impl BoundedRevocationOutcome {
+    /// Return the live continuation capability emitted with this outcome.
+    pub fn continuation_token(&self) -> Option<&BoundedRevocationContinuationToken> {
+        self.continuation_token.as_ref()
+    }
+}
+
+impl<'de> Deserialize<'de> for BoundedRevocationOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct OutcomeVisitor;
+
+        impl<'de> Visitor<'de> for OutcomeVisitor {
+            type Value = BoundedRevocationOutcome;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a complete bounded revocation outcome")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut root_ref = None;
+                let mut affected_refs = None;
+                let mut frontier = None;
+                let mut omissions = None;
+                let mut work_spent = None;
+                let mut complete = None;
+                let mut continuation: Option<Option<BoundedRevocationContinuation>> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "root_ref" => set_field(&mut root_ref, "root_ref", map.next_value()?)?,
+                        "affected_refs" => {
+                            set_field(&mut affected_refs, "affected_refs", map.next_value()?)?;
+                        }
+                        "frontier" => set_field(&mut frontier, "frontier", map.next_value()?)?,
+                        "omissions" => set_field(&mut omissions, "omissions", map.next_value()?)?,
+                        "work_spent" => {
+                            set_field(&mut work_spent, "work_spent", map.next_value()?)?;
+                        }
+                        "complete" => set_field(&mut complete, "complete", map.next_value()?)?,
+                        "continuation" => {
+                            set_field(&mut continuation, "continuation", map.next_value()?)?;
+                        }
+                        _ => return Err(de::Error::unknown_field(&key, &[])),
+                    }
+                }
+                Ok(BoundedRevocationOutcome {
+                    root_ref: required(root_ref, "root_ref")?,
+                    affected_refs: required(affected_refs, "affected_refs")?,
+                    frontier: required(frontier, "frontier")?,
+                    omissions: required(omissions, "omissions")?,
+                    work_spent: required(work_spent, "work_spent")?,
+                    complete: required(complete, "complete")?,
+                    continuation: required(continuation, "continuation")?,
+                    continuation_token: None,
+                })
+            }
+        }
+
+        fn set_field<T, E>(slot: &mut Option<T>, name: &'static str, value: T) -> Result<(), E>
+        where
+            E: de::Error,
+        {
+            if slot.is_some() {
+                return Err(E::duplicate_field(name));
+            }
+            *slot = Some(value);
+            Ok(())
+        }
+
+        fn required<T, E>(value: Option<T>, name: &'static str) -> Result<T, E>
+        where
+            E: de::Error,
+        {
+            value.ok_or_else(|| E::missing_field(name))
+        }
+
+        deserializer.deserialize_map(OutcomeVisitor)
+    }
+}
+
+fn canonical_digest<T: Serialize>(value: &T) -> Result<String, InfluenceError> {
+    canonical_json_bytes(value)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|_| InfluenceError::Canonicalization)
+}
+
+const BOUNDED_REVOCATION_REQUEST_IDENTITY_SCHEMA: &str =
+    "eliot-bounded-revocation-request-identity-v1";
+
+#[derive(Serialize)]
+struct BoundedRequestIdentity<'a> {
+    schema_version: &'static str,
+    request_id: &'a str,
+    root_ref: &'a str,
+    reason: &'a RevocationReason,
+    state_fence: &'a StateFence,
+    completeness: &'a ClosureCompleteness,
+    graph_snapshot_digest: &'a str,
+}
+
+impl BoundedRevocationRequest {
+    /// Return the canonical identity of this valid bounded request.
+    ///
+    /// Edge order is normalized before hashing, while the independently bound
+    /// graph digest preserves the exact qualified-edge multiset. The legacy
+    /// `resumed_visited` compatibility field is not part of this identity and
+    /// is refused by the bounded engine when nonempty.
+    pub fn digest(&self) -> Result<String, InfluenceError> {
+        let graph_snapshot_digest = self.graph_snapshot_digest()?;
+        canonical_digest(&BoundedRequestIdentity {
+            schema_version: BOUNDED_REVOCATION_REQUEST_IDENTITY_SCHEMA,
+            request_id: &self.request_id,
+            root_ref: &self.root_ref,
+            reason: &self.reason,
+            state_fence: &self.state_fence,
+            completeness: &self.completeness,
+            graph_snapshot_digest: &graph_snapshot_digest,
+        })
+    }
+
+    /// Return the identity of the exact qualified-edge snapshot in canonical
+    /// source/dependent/disposition order.
+    pub fn graph_snapshot_digest(&self) -> Result<String, InfluenceError> {
+        let mut edges = self.edges.clone();
+        edges.sort_by(|left, right| {
+            (
+                left.source_ref.as_str(),
+                left.dependent_ref.as_str(),
+                edge_disposition_rank(left.disposition),
+            )
+                .cmp(&(
+                    right.source_ref.as_str(),
+                    right.dependent_ref.as_str(),
+                    edge_disposition_rank(right.disposition),
+                ))
+        });
+        canonical_digest(&edges)
+    }
+}
+
+impl RevocationBounds {
+    /// Return the canonical identity of this exact independent bounds set.
+    pub fn digest(&self) -> Result<String, InfluenceError> {
+        canonical_digest(self)
+    }
 }
 
 fn omission_cause_for(disposition: InfluenceEdgeDisposition) -> Option<OmissionCause> {
@@ -566,146 +863,482 @@ fn omission_cause_rank(cause: OmissionCause) -> u8 {
     }
 }
 
-/// Mutable state of one bounded revocation traversal.
-struct BoundedTraversal<'a> {
-    bounds: &'a RevocationBounds,
-    permitted: BTreeMap<&'a str, BTreeSet<&'a str>>,
-    blocked: BTreeMap<&'a str, BTreeMap<&'a str, OmissionCause>>,
-    visited: BTreeSet<&'a str>,
-    admitted: BTreeSet<&'a str>,
-    expanded: BTreeSet<&'a str>,
-    frontier: BTreeSet<&'a str>,
-    omissions: Vec<RevocationOmission>,
-    queue: VecDeque<(&'a str, u64)>,
-    edges_examined: u64,
-    work_spent: u64,
-    exhausted: bool,
+fn edge_disposition_rank(disposition: InfluenceEdgeDisposition) -> u8 {
+    match disposition {
+        InfluenceEdgeDisposition::PermittedCurrent => 0,
+        InfluenceEdgeDisposition::Quarantined => 1,
+        InfluenceEdgeDisposition::NonPropagating => 2,
+        InfluenceEdgeDisposition::Stale => 3,
+        InfluenceEdgeDisposition::Invalidated => 4,
+        InfluenceEdgeDisposition::CrossScope => 5,
+    }
 }
 
-impl<'a> BoundedTraversal<'a> {
+#[derive(Clone, Debug)]
+struct BoundedBinding {
+    request_id: String,
+    reason: RevocationReason,
+    completeness: ClosureCompleteness,
+    request_digest: String,
+    graph_snapshot_digest: String,
+    bounds_digest: String,
+}
+
+fn bounded_binding(
+    request: &BoundedRevocationRequest,
+    bounds: &RevocationBounds,
+) -> Result<BoundedBinding, InfluenceError> {
+    Ok(BoundedBinding {
+        request_id: request.request_id.clone(),
+        reason: request.reason,
+        completeness: request.completeness,
+        request_digest: request.digest()?,
+        graph_snapshot_digest: request.graph_snapshot_digest()?,
+        bounds_digest: bounds.digest()?,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct PendingNodeState {
+    node_ref: String,
+    depth: u64,
+    edges: Vec<BoundedRevocationPendingEdge>,
+    next_edge: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EdgeBudgetState {
+    Fits,
+    GlobalExhausted,
+    PageExhausted,
+}
+
+fn build_adjacency(
+    dispositions: &BTreeMap<(String, String), InfluenceEdgeDisposition>,
+) -> BTreeMap<String, Vec<BoundedRevocationPendingEdge>> {
+    let mut adjacency: BTreeMap<String, Vec<BoundedRevocationPendingEdge>> = BTreeMap::new();
+    for ((source_ref, dependent_ref), disposition) in dispositions {
+        adjacency
+            .entry(source_ref.clone())
+            .or_default()
+            .push(BoundedRevocationPendingEdge {
+                source_ref: source_ref.clone(),
+                dependent_ref: dependent_ref.clone(),
+                source_depth: 0,
+                disposition: *disposition,
+            });
+    }
+    adjacency
+}
+
+/// Mutable state of one bounded revocation operation.
+///
+/// `admitted` is the one operation-global visited set.  It is distinct from
+/// `expanded` and from the pending queue: a node can be admitted and still
+/// have deterministic edges waiting to be examined.
+struct BoundedTraversal {
+    bounds: RevocationBounds,
+    page_limits: BoundedRevocationPageLimits,
+    dispositions: BTreeMap<(String, String), InfluenceEdgeDisposition>,
+    adjacency: BTreeMap<String, Vec<BoundedRevocationPendingEdge>>,
+    admitted: BTreeMap<String, u64>,
+    expanded: BTreeSet<String>,
+    frontier: BTreeSet<String>,
+    omissions: Vec<RevocationOmission>,
+    queue: VecDeque<PendingNodeState>,
+    pending_edges: Vec<BoundedRevocationPendingEdge>,
+    examined_edges: Vec<BoundedRevocationPendingEdge>,
+    edges_examined: u64,
+    work_spent: u64,
+    page_edges_examined: u64,
+    page_work_spent: u64,
+    exhausted: bool,
+    unresolved_bound: bool,
+    request_id: String,
+    reason: RevocationReason,
+    completeness: ClosureCompleteness,
+    request_digest: String,
+    graph_snapshot_digest: String,
+    bounds_digest: String,
+}
+
+impl BoundedTraversal {
     fn new(
-        request: &'a BoundedRevocationRequest,
-        bounds: &'a RevocationBounds,
-        dispositions: &BTreeMap<(&'a str, &'a str), InfluenceEdgeDisposition>,
+        request: &BoundedRevocationRequest,
+        bounds: &RevocationBounds,
+        page_limits: BoundedRevocationPageLimits,
+        dispositions: &BTreeMap<(String, String), InfluenceEdgeDisposition>,
+        binding: BoundedBinding,
     ) -> Self {
-        let mut permitted: BTreeMap<&'a str, BTreeSet<&'a str>> = BTreeMap::new();
-        let mut blocked: BTreeMap<&'a str, BTreeMap<&'a str, OmissionCause>> = BTreeMap::new();
-        for (pair, disposition) in dispositions {
-            if let Some(cause) = omission_cause_for(*disposition) {
-                blocked.entry(pair.0).or_default().insert(pair.1, cause);
-            } else {
-                permitted.entry(pair.0).or_default().insert(pair.1);
-            }
-        }
-        let root: &'a str = request.root_ref.as_str();
-        let mut visited: BTreeSet<&'a str> = BTreeSet::new();
-        visited.insert(root);
-        for entry in &request.resumed_visited {
-            visited.insert(entry.as_str());
-        }
-        let mut admitted: BTreeSet<&'a str> = BTreeSet::new();
-        admitted.insert(root);
-        Self {
-            bounds,
-            permitted,
-            blocked,
-            visited,
-            admitted,
+        let adjacency = build_adjacency(dispositions);
+        let mut traversal = Self {
+            bounds: bounds.clone(),
+            page_limits,
+            dispositions: dispositions.clone(),
+            adjacency,
+            admitted: BTreeMap::new(),
             expanded: BTreeSet::new(),
             frontier: BTreeSet::new(),
             omissions: Vec::new(),
-            queue: VecDeque::from([(root, 0)]),
+            queue: VecDeque::new(),
+            pending_edges: Vec::new(),
+            examined_edges: Vec::new(),
             edges_examined: 0,
             work_spent: 1,
+            page_edges_examined: 0,
+            page_work_spent: 1,
             exhausted: false,
+            unresolved_bound: false,
+            request_id: binding.request_id,
+            reason: binding.reason,
+            completeness: binding.completeness,
+            request_digest: binding.request_digest,
+            graph_snapshot_digest: binding.graph_snapshot_digest,
+            bounds_digest: binding.bounds_digest,
+        };
+        let root = request.root_ref.clone();
+        traversal.admitted.insert(root.clone(), 0);
+        let root_state = traversal.make_node_state(&root, 0);
+        traversal.queue.push_back(root_state);
+        traversal
+    }
+
+    fn from_continuation(
+        bounds: &RevocationBounds,
+        page_limits: BoundedRevocationPageLimits,
+        dispositions: &BTreeMap<(String, String), InfluenceEdgeDisposition>,
+        binding: BoundedBinding,
+        continuation: &BoundedRevocationContinuation,
+    ) -> Self {
+        let adjacency = build_adjacency(dispositions);
+        let mut admitted = BTreeMap::new();
+        for node in &continuation.admitted_nodes {
+            admitted.insert(node.node_ref.clone(), node.depth);
+        }
+        let pending_by_source: BTreeMap<String, BTreeSet<String>> = continuation
+            .pending_edges
+            .iter()
+            .fold(BTreeMap::new(), |mut sources, edge| {
+                sources
+                    .entry(edge.source_ref.clone())
+                    .or_default()
+                    .insert(edge.dependent_ref.clone());
+                sources
+            });
+        let queue: VecDeque<PendingNodeState> = continuation
+            .pending
+            .iter()
+            .map(|pending| {
+                let mut state = PendingNodeState {
+                    node_ref: pending.node_ref.clone(),
+                    depth: pending.depth,
+                    edges: adjacency
+                        .get(&pending.node_ref)
+                        .map(|edges| {
+                            edges
+                                .iter()
+                                .map(|edge| BoundedRevocationPendingEdge {
+                                    source_ref: edge.source_ref.clone(),
+                                    dependent_ref: edge.dependent_ref.clone(),
+                                    source_depth: pending.depth,
+                                    disposition: edge.disposition,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    next_edge: 0,
+                };
+                if let Some(targets) = pending_by_source.get(&pending.node_ref) {
+                    state.next_edge = state
+                        .edges
+                        .iter()
+                        .position(|edge| targets.contains(&edge.dependent_ref))
+                        .unwrap_or(0);
+                }
+                state
+            })
+            .collect();
+        let exhausted = continuation.previous_page_exhausted
+            && queue.is_empty()
+            && continuation.pending_edges.is_empty();
+        let unresolved_bound = continuation
+            .omissions
+            .iter()
+            .any(|omission| omission.cause == OmissionCause::BoundsExhausted);
+        Self {
+            bounds: bounds.clone(),
+            page_limits,
+            dispositions: dispositions.clone(),
+            adjacency,
+            admitted,
+            expanded: continuation.expanded_refs.iter().cloned().collect(),
+            frontier: continuation.frontier.iter().cloned().collect(),
+            omissions: continuation.omissions.clone(),
+            queue,
+            pending_edges: continuation.pending_edges.clone(),
+            examined_edges: continuation.examined_edges.clone(),
+            edges_examined: continuation.edges_examined,
+            work_spent: continuation.work_spent,
+            page_edges_examined: 0,
+            page_work_spent: 0,
+            exhausted,
+            unresolved_bound,
+            request_id: binding.request_id,
+            reason: binding.reason,
+            completeness: binding.completeness,
+            request_digest: binding.request_digest,
+            graph_snapshot_digest: binding.graph_snapshot_digest,
+            bounds_digest: binding.bounds_digest,
         }
     }
 
-    fn record_exhaustion(&mut self, source: &'a str, dependent: &'a str) {
+    fn make_node_state(&self, node_ref: &str, depth: u64) -> PendingNodeState {
+        let edges = self
+            .adjacency
+            .get(node_ref)
+            .map(|edges| {
+                edges
+                    .iter()
+                    .map(|edge| BoundedRevocationPendingEdge {
+                        source_ref: edge.source_ref.clone(),
+                        dependent_ref: edge.dependent_ref.clone(),
+                        source_depth: depth,
+                        disposition: edge.disposition,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        PendingNodeState {
+            node_ref: node_ref.to_owned(),
+            depth,
+            edges,
+            next_edge: 0,
+        }
+    }
+
+    fn edge_budget_state(
+        &self,
+        edge: &BoundedRevocationPendingEdge,
+    ) -> Result<EdgeBudgetState, InfluenceError> {
+        let key = (edge.source_ref.clone(), edge.dependent_ref.clone());
+        let Some(disposition) = self.dispositions.get(&key).copied() else {
+            return Err(InfluenceError::ContinuationBindingMismatch);
+        };
+        if disposition != edge.disposition {
+            return Err(InfluenceError::ContinuationBindingMismatch);
+        }
+        let requires_admission = disposition == InfluenceEdgeDisposition::PermittedCurrent
+            && !self.admitted.contains_key(&edge.dependent_ref);
+        let admission_depth = if requires_admission {
+            edge.source_depth.checked_add(1)
+        } else {
+            Some(0)
+        };
+        let admitted_len = u64::try_from(self.admitted.len()).unwrap_or(u64::MAX);
+        let global_exhausted = self
+            .edges_examined
+            .checked_add(1)
+            .is_none_or(|next| next > self.bounds.max_edges)
+            || self
+                .work_spent
+                .checked_add(1 + u64::from(requires_admission))
+                .is_none_or(|next| next > self.bounds.max_work)
+            || admission_depth.is_none_or(|depth| depth > self.bounds.max_depth)
+            || (requires_admission
+                && (admitted_len >= self.bounds.max_nodes
+                    || admitted_len >= self.bounds.max_result));
+        if global_exhausted {
+            return Ok(EdgeBudgetState::GlobalExhausted);
+        }
+        let page_exhausted = self
+            .page_edges_examined
+            .checked_add(1)
+            .is_none_or(|next| next > self.page_limits.max_page_edges)
+            || self
+                .page_work_spent
+                .checked_add(1 + u64::from(requires_admission))
+                .is_none_or(|next| next > self.page_limits.max_page_work);
+        if page_exhausted {
+            Ok(EdgeBudgetState::PageExhausted)
+        } else {
+            Ok(EdgeBudgetState::Fits)
+        }
+    }
+
+    fn record_bound_exhaustion(&mut self, edge: &BoundedRevocationPendingEdge) {
         self.exhausted = true;
+        self.unresolved_bound = true;
         self.omissions.push(RevocationOmission {
-            edge_source: source.to_owned(),
-            edge_dependent: dependent.to_owned(),
+            edge_source: edge.source_ref.clone(),
+            edge_dependent: edge.dependent_ref.clone(),
             cause: OmissionCause::BoundsExhausted,
         });
-        self.frontier.insert(dependent);
+        self.frontier.insert(edge.dependent_ref.clone());
     }
 
-    fn examine_edge(&mut self, node: &'a str, dependent: &'a str, depth: u64) {
-        let bounds = self.bounds;
-        if self.work_spent >= bounds.max_work {
-            self.record_exhaustion(node, dependent);
-            return;
+    fn process_edge(
+        &mut self,
+        edge: &BoundedRevocationPendingEdge,
+    ) -> Result<bool, InfluenceError> {
+        let key = (edge.source_ref.clone(), edge.dependent_ref.clone());
+        let Some(disposition) = self.dispositions.get(&key).copied() else {
+            return Err(InfluenceError::ContinuationBindingMismatch);
+        };
+        if disposition != edge.disposition {
+            return Err(InfluenceError::ContinuationBindingMismatch);
         }
-        self.work_spent += 1;
-        if self.edges_examined >= bounds.max_edges {
-            self.record_exhaustion(node, dependent);
-            return;
-        }
-        self.edges_examined += 1;
-        let blocked_cause = self
-            .blocked
-            .get(node)
-            .and_then(|targets| targets.get(dependent))
-            .copied();
-        if let Some(cause) = blocked_cause {
+        if let Some(cause) = omission_cause_for(disposition) {
             self.omissions.push(RevocationOmission {
-                edge_source: node.to_owned(),
-                edge_dependent: dependent.to_owned(),
+                edge_source: edge.source_ref.clone(),
+                edge_dependent: edge.dependent_ref.clone(),
                 cause,
             });
-            return;
+            return Ok(false);
         }
-        if self.visited.contains(dependent) {
-            return;
+        // `admitted` is the operation-global visited set.  It includes every
+        // node discovered on this page and every node restored from a prior
+        // page, so cycles, self-edges, and convergent paths terminate.
+        if self.admitted.contains_key(&edge.dependent_ref) {
+            return Ok(false);
         }
-        let child_depth = depth.saturating_add(1);
-        if child_depth > bounds.max_depth {
-            self.record_exhaustion(node, dependent);
-            return;
+        let Some(child_depth) = edge.source_depth.checked_add(1) else {
+            self.record_bound_exhaustion(edge);
+            return Ok(true);
+        };
+        if child_depth > self.bounds.max_depth {
+            self.record_bound_exhaustion(edge);
+            return Ok(true);
         }
         let admitted_len = u64::try_from(self.admitted.len()).unwrap_or(u64::MAX);
-        if admitted_len >= bounds.max_nodes || admitted_len >= bounds.max_result {
-            self.record_exhaustion(dependent, dependent);
-            return;
+        if admitted_len >= self.bounds.max_nodes || admitted_len >= self.bounds.max_result {
+            self.record_bound_exhaustion(edge);
+            return Ok(true);
         }
-        if self.work_spent >= bounds.max_work {
-            self.record_exhaustion(dependent, dependent);
-            return;
+        // The edge examination above consumed one operation-global work unit.
+        // Admission is a second independent work unit and may not borrow
+        // budget from the next page.
+        if self.work_spent >= self.bounds.max_work
+            || self.page_work_spent >= self.page_limits.max_page_work
+        {
+            self.record_bound_exhaustion(edge);
+            return Ok(true);
         }
         self.work_spent += 1;
-        self.visited.insert(dependent);
-        self.admitted.insert(dependent);
-        self.queue.push_back((dependent, child_depth));
+        self.page_work_spent += 1;
+        self.admitted
+            .insert(edge.dependent_ref.clone(), child_depth);
+        let child = self.make_node_state(&edge.dependent_ref, child_depth);
+        self.queue.push_back(child);
+        Ok(false)
     }
 
-    fn run(&mut self) {
-        while let Some((node, depth)) = self.queue.pop_front() {
-            if self.exhausted {
-                self.frontier.insert(node);
-                continue;
-            }
-            if !self.expanded.insert(node) {
-                continue;
-            }
-            let mut dependents: BTreeSet<&'a str> = BTreeSet::new();
-            if let Some(targets) = self.permitted.get(node) {
-                dependents.extend(targets.iter().copied());
-            }
-            if let Some(targets) = self.blocked.get(node) {
-                dependents.extend(targets.keys().copied());
-            }
-            for dependent in dependents {
-                if self.exhausted {
-                    self.frontier.insert(dependent);
-                    continue;
-                }
-                self.examine_edge(node, dependent, depth);
+    fn capture_pending(&mut self) {
+        let states: Vec<(String, usize, Vec<BoundedRevocationPendingEdge>)> = self
+            .queue
+            .iter()
+            .map(|state| (state.node_ref.clone(), state.next_edge, state.edges.clone()))
+            .collect();
+        let mut pending_edges = Vec::new();
+        for (node_ref, next_edge, edges) in states {
+            self.frontier.insert(node_ref);
+            for edge in edges.iter().skip(next_edge) {
+                self.frontier.insert(edge.dependent_ref.clone());
+                pending_edges.push(edge.clone());
             }
         }
+        pending_edges.sort_by(|left, right| {
+            (
+                left.source_ref.as_str(),
+                left.dependent_ref.as_str(),
+                left.source_depth,
+            )
+                .cmp(&(
+                    right.source_ref.as_str(),
+                    right.dependent_ref.as_str(),
+                    right.source_depth,
+                ))
+        });
+        self.pending_edges = pending_edges;
     }
 
-    fn finish(mut self, root_ref: &str) -> BoundedRevocationOutcome {
+    fn run(&mut self) -> Result<(), InfluenceError> {
+        if !self.exhausted {
+            self.pending_edges.clear();
+            // Frontier is current unresolved work, not an historical trace.
+            // Rebuild it only if this page stops; a successful resume must end
+            // with no stale page frontier.
+            self.frontier.clear();
+        }
+        while let Some(mut entry) = self.queue.pop_front() {
+            if self.exhausted {
+                self.queue.push_front(entry);
+                self.capture_pending();
+                break;
+            }
+            if self.expanded.contains(&entry.node_ref) {
+                continue;
+            }
+            let mut stopped = false;
+            while entry.next_edge < entry.edges.len() {
+                let edge = entry.edges[entry.next_edge].clone();
+                match self.edge_budget_state(&edge)? {
+                    EdgeBudgetState::Fits => {}
+                    EdgeBudgetState::GlobalExhausted => {
+                        self.record_bound_exhaustion(&edge);
+                        stopped = true;
+                        break;
+                    }
+                    EdgeBudgetState::PageExhausted => {
+                        self.exhausted = true;
+                        stopped = true;
+                        break;
+                    }
+                }
+                self.work_spent += 1;
+                self.page_work_spent += 1;
+                self.edges_examined += 1;
+                self.page_edges_examined += 1;
+                entry.next_edge += 1;
+                self.examined_edges.push(edge.clone());
+                if self.process_edge(&edge)? {
+                    stopped = true;
+                    break;
+                }
+            }
+            if stopped {
+                // If the last edge caused the stop, this node has no
+                // unexpanded edge position even though the operation remains
+                // incomplete.  Otherwise retain the complete source-bound
+                // suffix and the rest of the queue.
+                if entry.next_edge == entry.edges.len() {
+                    self.expanded.insert(entry.node_ref);
+                } else {
+                    self.queue.push_front(entry);
+                }
+                self.capture_pending();
+                break;
+            }
+            self.expanded.insert(entry.node_ref);
+        }
+        Ok(())
+    }
+
+    fn canonicalize_vectors(&mut self, pending: &mut [BoundedRevocationPendingNode]) {
+        pending.sort_by(|left, right| {
+            (left.node_ref.as_str(), left.depth).cmp(&(right.node_ref.as_str(), right.depth))
+        });
+        self.pending_edges.sort_by(|left, right| {
+            (
+                left.source_ref.as_str(),
+                left.dependent_ref.as_str(),
+                left.source_depth,
+            )
+                .cmp(&(
+                    right.source_ref.as_str(),
+                    right.dependent_ref.as_str(),
+                    right.source_depth,
+                ))
+        });
         self.omissions.sort_by(|left, right| {
             (
                 left.edge_source.as_str(),
@@ -719,14 +1352,94 @@ impl<'a> BoundedTraversal<'a> {
                 ))
         });
         self.omissions.dedup();
-        BoundedRevocationOutcome {
-            root_ref: root_ref.to_owned(),
-            affected_refs: self.admitted.into_iter().map(str::to_owned).collect(),
-            frontier: self.frontier.into_iter().map(str::to_owned).collect(),
+        self.examined_edges.sort_by(|left, right| {
+            (
+                left.source_ref.as_str(),
+                left.dependent_ref.as_str(),
+                left.source_depth,
+            )
+                .cmp(&(
+                    right.source_ref.as_str(),
+                    right.dependent_ref.as_str(),
+                    right.source_depth,
+                ))
+        });
+    }
+
+    fn finish(
+        mut self,
+        request: &BoundedRevocationRequest,
+    ) -> Result<BoundedRevocationOutcome, InfluenceError> {
+        let mut pending: Vec<BoundedRevocationPendingNode> = self
+            .queue
+            .iter()
+            .map(|entry| BoundedRevocationPendingNode {
+                node_ref: entry.node_ref.clone(),
+                depth: entry.depth,
+            })
+            .collect();
+        self.canonicalize_vectors(&mut pending);
+        let admitted_nodes: Vec<BoundedRevocationPendingNode> = self
+            .admitted
+            .iter()
+            .map(|(node_ref, depth)| BoundedRevocationPendingNode {
+                node_ref: node_ref.clone(),
+                depth: *depth,
+            })
+            .collect();
+        let affected_refs: Vec<String> = admitted_nodes
+            .iter()
+            .map(|node| node.node_ref.clone())
+            .collect();
+        let expanded_refs: Vec<String> = self.expanded.iter().cloned().collect();
+        let frontier: Vec<String> = self.frontier.iter().cloned().collect();
+        let has_pending = !self.queue.is_empty() || !self.pending_edges.is_empty();
+        let complete = !self.exhausted && !has_pending && !self.unresolved_bound;
+        let continuation = if self.exhausted || has_pending || self.unresolved_bound {
+            let mut continuation = BoundedRevocationContinuation {
+                schema_version: BOUNDED_REVOCATION_CONTINUATION_SCHEMA.to_owned(),
+                request_id: self.request_id,
+                root_ref: request.root_ref.clone(),
+                reason: self.reason,
+                completeness: self.completeness,
+                request_digest: self.request_digest,
+                graph_snapshot_digest: self.graph_snapshot_digest,
+                state_fence: request.state_fence.clone(),
+                bounds_digest: self.bounds_digest,
+                admitted_refs: affected_refs.clone(),
+                admitted_nodes,
+                expanded_refs: expanded_refs.clone(),
+                pending,
+                pending_edges: self.pending_edges.clone(),
+                examined_edges: self.examined_edges.clone(),
+                edges_examined: self.edges_examined,
+                work_spent: self.work_spent,
+                omissions: self.omissions.clone(),
+                frontier: frontier.clone(),
+                previous_page_exhausted: self.exhausted || self.unresolved_bound,
+                continuation_digest: String::new(),
+            };
+            continuation.continuation_digest = continuation.digest()?;
+            Some(continuation)
+        } else {
+            None
+        };
+        let continuation_token =
+            continuation
+                .as_ref()
+                .map(|continuation| BoundedRevocationContinuationToken {
+                    digest: continuation.continuation_digest.clone(),
+                });
+        Ok(BoundedRevocationOutcome {
+            root_ref: request.root_ref.clone(),
+            affected_refs,
+            frontier,
             omissions: self.omissions,
             work_spent: self.work_spent,
-            complete: !self.exhausted,
-        }
+            complete,
+            continuation,
+            continuation_token,
+        })
     }
 }
 
@@ -744,20 +1457,20 @@ fn check_bounded_header(
     if matches!(request.completeness, ClosureCompleteness::Partial) {
         return Err(InfluenceError::UnknownCompleteness);
     }
-    for entry in &request.resumed_visited {
-        text(entry, "resumed_visited")?;
+    if !request.resumed_visited.is_empty() {
+        return Err(InfluenceError::LegacyResumedVisited);
     }
     Ok(())
 }
 
 fn dedup_qualified_edges(
     request: &BoundedRevocationRequest,
-) -> Result<BTreeMap<(&str, &str), InfluenceEdgeDisposition>, InfluenceError> {
-    let mut dispositions: BTreeMap<(&str, &str), InfluenceEdgeDisposition> = BTreeMap::new();
+) -> Result<BTreeMap<(String, String), InfluenceEdgeDisposition>, InfluenceError> {
+    let mut dispositions: BTreeMap<(String, String), InfluenceEdgeDisposition> = BTreeMap::new();
     for edge in &request.edges {
         text(&edge.source_ref, "edge.source_ref")?;
         text(&edge.dependent_ref, "edge.dependent_ref")?;
-        let key = (edge.source_ref.as_str(), edge.dependent_ref.as_str());
+        let key = (edge.source_ref.clone(), edge.dependent_ref.clone());
         if let Some(existing) = dispositions.get(&key) {
             if *existing != edge.disposition {
                 return Err(InfluenceError::DuplicateEdge);
@@ -769,21 +1482,588 @@ fn dedup_qualified_edges(
     Ok(dispositions)
 }
 
+fn continuation_strings(
+    values: &[String],
+    field: &'static str,
+) -> Result<BTreeSet<String>, InfluenceError> {
+    let mut result = BTreeSet::new();
+    let mut previous: Option<&str> = None;
+    for value in values {
+        text(value, field)?;
+        if previous.is_some_and(|prior| prior > value.as_str()) {
+            return Err(InfluenceError::InvalidContinuation);
+        }
+        if !result.insert(value.clone()) {
+            return Err(InfluenceError::DuplicateReference(field));
+        }
+        previous = Some(value.as_str());
+    }
+    Ok(result)
+}
+
+fn continuation_nodes(
+    values: &[BoundedRevocationPendingNode],
+    field: &'static str,
+) -> Result<BTreeMap<String, u64>, InfluenceError> {
+    let mut result = BTreeMap::new();
+    for value in values {
+        text(&value.node_ref, field)?;
+        if result.insert(value.node_ref.clone(), value.depth).is_some() {
+            return Err(InfluenceError::DuplicateReference(field));
+        }
+    }
+    Ok(result)
+}
+
+fn continuation_pending_nodes(
+    values: &[BoundedRevocationPendingNode],
+) -> Result<BTreeMap<String, u64>, InfluenceError> {
+    let result = continuation_nodes(values, "continuation.pending")?;
+    let mut previous: Option<(&str, u64)> = None;
+    for value in values {
+        let key = (value.node_ref.as_str(), value.depth);
+        if previous.is_some_and(|prior| prior >= key) {
+            return Err(InfluenceError::InvalidContinuation);
+        }
+        previous = Some(key);
+    }
+    Ok(result)
+}
+
+fn continuation_edges(
+    values: &[BoundedRevocationPendingEdge],
+    field: &'static str,
+) -> Result<Vec<BoundedRevocationPendingEdge>, InfluenceError> {
+    let mut result = Vec::with_capacity(values.len());
+    let mut previous: Option<(&str, &str, u64)> = None;
+    for value in values {
+        text(&value.source_ref, field)?;
+        text(&value.dependent_ref, field)?;
+        let key = (
+            value.source_ref.as_str(),
+            value.dependent_ref.as_str(),
+            value.source_depth,
+        );
+        if previous.is_some_and(|prior| prior >= key) {
+            return Err(InfluenceError::InvalidContinuation);
+        }
+        result.push(value.clone());
+        previous = Some(key);
+    }
+    Ok(result)
+}
+
+fn validate_omissions(
+    values: &[RevocationOmission],
+) -> Result<BTreeMap<(String, String), OmissionCause>, InfluenceError> {
+    let mut result = BTreeMap::new();
+    let mut previous: Option<(&str, &str, u8)> = None;
+    for value in values {
+        text(&value.edge_source, "continuation.omissions.edge_source")?;
+        text(
+            &value.edge_dependent,
+            "continuation.omissions.edge_dependent",
+        )?;
+        let key = (
+            value.edge_source.as_str(),
+            value.edge_dependent.as_str(),
+            omission_cause_rank(value.cause),
+        );
+        if previous.is_some_and(|prior| prior >= key) {
+            return Err(InfluenceError::InvalidContinuation);
+        }
+        if result
+            .insert(
+                (value.edge_source.clone(), value.edge_dependent.clone()),
+                value.cause,
+            )
+            .is_some()
+        {
+            return Err(InfluenceError::InvalidContinuation);
+        }
+        previous = Some(key);
+    }
+    Ok(result)
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+struct ValidatedContinuationState {
+    admitted_nodes: BTreeMap<String, u64>,
+    expanded_refs: BTreeSet<String>,
+    pending: BTreeMap<String, u64>,
+    pending_edges: Vec<BoundedRevocationPendingEdge>,
+    examined_edges: Vec<BoundedRevocationPendingEdge>,
+    omission_map: BTreeMap<(String, String), OmissionCause>,
+    frontier: BTreeSet<String>,
+}
+
+fn validate_continuation_binding(
+    request: &BoundedRevocationRequest,
+    binding: &BoundedBinding,
+    continuation: &BoundedRevocationContinuation,
+    token: &BoundedRevocationContinuationToken,
+) -> Result<(), InfluenceError> {
+    if continuation.schema_version != BOUNDED_REVOCATION_CONTINUATION_SCHEMA {
+        return Err(InfluenceError::UnsupportedContinuation);
+    }
+    if continuation.request_id != request.request_id
+        || continuation.root_ref != request.root_ref
+        || continuation.reason != request.reason
+        || continuation.completeness != request.completeness
+        || continuation.request_digest != binding.request_digest
+        || continuation.graph_snapshot_digest != binding.graph_snapshot_digest
+        || continuation.bounds_digest != binding.bounds_digest
+        || continuation.state_fence != request.state_fence
+    {
+        return Err(InfluenceError::ContinuationBindingMismatch);
+    }
+    if !is_sha256_hex(&continuation.request_digest)
+        || !is_sha256_hex(&continuation.graph_snapshot_digest)
+        || !is_sha256_hex(&continuation.bounds_digest)
+        || !is_sha256_hex(&continuation.continuation_digest)
+        || continuation.continuation_digest != continuation.digest()?
+        || token.digest() != continuation.continuation_digest
+    {
+        return Err(InfluenceError::InvalidContinuation);
+    }
+    if !continuation.previous_page_exhausted
+        || !matches!(continuation.completeness, ClosureCompleteness::Complete)
+    {
+        return Err(InfluenceError::InvalidContinuation);
+    }
+    Ok(())
+}
+
+fn validate_continuation_counters(
+    bounds: &RevocationBounds,
+    continuation: &BoundedRevocationContinuation,
+    admitted_len: u64,
+    examined_len: u64,
+) -> Result<(), InfluenceError> {
+    if continuation.edges_examined > bounds.max_edges
+        || continuation.work_spent > bounds.max_work
+        || admitted_len > bounds.max_nodes
+        || admitted_len > bounds.max_result
+        || continuation.edges_examined != examined_len
+    {
+        return Err(InfluenceError::InvalidContinuation);
+    }
+    let expected_work = continuation
+        .edges_examined
+        .checked_add(admitted_len)
+        .ok_or(InfluenceError::InvalidContinuation)?;
+    if continuation.work_spent != expected_work {
+        return Err(InfluenceError::InvalidContinuation);
+    }
+    Ok(())
+}
+
+fn validate_continuation_state(
+    request: &BoundedRevocationRequest,
+    bounds: &RevocationBounds,
+    continuation: &BoundedRevocationContinuation,
+) -> Result<ValidatedContinuationState, InfluenceError> {
+    let admitted_refs =
+        continuation_strings(&continuation.admitted_refs, "continuation.admitted_refs")?;
+    let admitted_nodes =
+        continuation_nodes(&continuation.admitted_nodes, "continuation.admitted_nodes")?;
+    let expanded_refs =
+        continuation_strings(&continuation.expanded_refs, "continuation.expanded_refs")?;
+    let pending = continuation_pending_nodes(&continuation.pending)?;
+    let pending_edges =
+        continuation_edges(&continuation.pending_edges, "continuation.pending_edges")?;
+    let examined_edges =
+        continuation_edges(&continuation.examined_edges, "continuation.examined_edges")?;
+    let omission_map = validate_omissions(&continuation.omissions)?;
+    let frontier = continuation_strings(&continuation.frontier, "continuation.frontier")?;
+
+    if continuation.pending.is_empty()
+        && continuation.pending_edges.is_empty()
+        && !omission_map
+            .values()
+            .any(|cause| *cause == OmissionCause::BoundsExhausted)
+    {
+        return Err(InfluenceError::InvalidContinuation);
+    }
+    if admitted_nodes.is_empty()
+        || admitted_refs.len() != admitted_nodes.len()
+        || admitted_nodes
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            != continuation
+                .admitted_refs
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+    {
+        return Err(InfluenceError::InvalidContinuation);
+    }
+    if admitted_nodes.get(&request.root_ref) != Some(&0) {
+        return Err(InfluenceError::ContinuationBindingMismatch);
+    }
+    if expanded_refs
+        .iter()
+        .any(|node_ref| !admitted_nodes.contains_key(node_ref))
+        || pending
+            .iter()
+            .any(|(node_ref, _)| !admitted_nodes.contains_key(node_ref))
+        || expanded_refs
+            .iter()
+            .any(|node_ref| pending.contains_key(node_ref))
+    {
+        return Err(InfluenceError::InvalidContinuation);
+    }
+    for (node_ref, depth) in &admitted_nodes {
+        if *depth > bounds.max_depth
+            || (!expanded_refs.contains(node_ref) && !pending.contains_key(node_ref))
+        {
+            return Err(InfluenceError::InvalidContinuation);
+        }
+    }
+    let admitted_len = u64::try_from(admitted_nodes.len()).unwrap_or(u64::MAX);
+    let examined_len = u64::try_from(examined_edges.len()).unwrap_or(u64::MAX);
+    validate_continuation_counters(bounds, continuation, admitted_len, examined_len)?;
+
+    Ok(ValidatedContinuationState {
+        admitted_nodes,
+        expanded_refs,
+        pending,
+        pending_edges,
+        examined_edges,
+        omission_map,
+        frontier,
+    })
+}
+
+fn validate_continuation_edge_binding(
+    edge: &BoundedRevocationPendingEdge,
+    source_depth: u64,
+    dispositions: &BTreeMap<(String, String), InfluenceEdgeDisposition>,
+) -> Result<(), InfluenceError> {
+    if edge.source_depth != source_depth {
+        return Err(InfluenceError::InvalidContinuation);
+    }
+    let disposition = dispositions
+        .get(&(edge.source_ref.clone(), edge.dependent_ref.clone()))
+        .ok_or(InfluenceError::ContinuationBindingMismatch)?;
+    if *disposition != edge.disposition {
+        return Err(InfluenceError::ContinuationBindingMismatch);
+    }
+    Ok(())
+}
+
+struct ContinuationEdgeIndexes {
+    examined_by_key: BTreeMap<(String, String), BoundedRevocationPendingEdge>,
+    pending_by_source: BTreeMap<String, BTreeSet<String>>,
+}
+
+fn index_continuation_edges(
+    state: &ValidatedContinuationState,
+    dispositions: &BTreeMap<(String, String), InfluenceEdgeDisposition>,
+) -> Result<ContinuationEdgeIndexes, InfluenceError> {
+    let mut examined_by_key = BTreeMap::new();
+    for edge in &state.examined_edges {
+        let source_depth = state
+            .admitted_nodes
+            .get(&edge.source_ref)
+            .ok_or(InfluenceError::InvalidContinuation)?;
+        validate_continuation_edge_binding(edge, *source_depth, dispositions)?;
+        let key = (edge.source_ref.clone(), edge.dependent_ref.clone());
+        if examined_by_key.insert(key, edge.clone()).is_some() {
+            return Err(InfluenceError::InvalidContinuation);
+        }
+    }
+
+    let mut pending_by_source: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for edge in &state.pending_edges {
+        let source_depth = state
+            .pending
+            .get(&edge.source_ref)
+            .ok_or(InfluenceError::InvalidContinuation)?;
+        validate_continuation_edge_binding(edge, *source_depth, dispositions)?;
+        let key = (edge.source_ref.clone(), edge.dependent_ref.clone());
+        if examined_by_key.contains_key(&key) {
+            return Err(InfluenceError::InvalidContinuation);
+        }
+        pending_by_source
+            .entry(edge.source_ref.clone())
+            .or_default()
+            .insert(edge.dependent_ref.clone());
+    }
+    Ok(ContinuationEdgeIndexes {
+        examined_by_key,
+        pending_by_source,
+    })
+}
+
+fn validate_adjacency_partition(
+    state: &ValidatedContinuationState,
+    dispositions: &BTreeMap<(String, String), InfluenceEdgeDisposition>,
+    examined_by_key: &BTreeMap<(String, String), BoundedRevocationPendingEdge>,
+    pending_by_source: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<(), InfluenceError> {
+    let mut adjacency: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (source_ref, dependent_ref) in dispositions.keys() {
+        adjacency
+            .entry(source_ref.clone())
+            .or_default()
+            .push(dependent_ref.clone());
+    }
+    for targets in adjacency.values_mut() {
+        targets.sort();
+    }
+    for (source_ref, targets) in adjacency {
+        if !state.admitted_nodes.contains_key(&source_ref) {
+            if examined_by_key
+                .keys()
+                .any(|(examined_source, _)| examined_source == &source_ref)
+                || pending_by_source.contains_key(&source_ref)
+            {
+                return Err(InfluenceError::InvalidContinuation);
+            }
+            continue;
+        }
+        let expected_pending: Vec<String> = targets
+            .iter()
+            .filter(|dependent_ref| {
+                !examined_by_key.contains_key(&(source_ref.clone(), (*dependent_ref).clone()))
+            })
+            .cloned()
+            .collect();
+        let actual_pending = pending_by_source
+            .get(&source_ref)
+            .map(|targets| targets.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if actual_pending != expected_pending
+            || (state.expanded_refs.contains(&source_ref) && !expected_pending.is_empty())
+            || (state.pending.contains_key(&source_ref)
+                && !targets.is_empty()
+                && expected_pending.is_empty())
+        {
+            return Err(InfluenceError::InvalidContinuation);
+        }
+        for dependent_ref in &targets {
+            if !examined_by_key.contains_key(&(source_ref.clone(), dependent_ref.clone()))
+                && !pending_by_source
+                    .get(&source_ref)
+                    .is_some_and(|values| values.contains(dependent_ref))
+            {
+                return Err(InfluenceError::InvalidContinuation);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_examined_edge_omissions(
+    state: &ValidatedContinuationState,
+    dispositions: &BTreeMap<(String, String), InfluenceEdgeDisposition>,
+) -> Result<(), InfluenceError> {
+    for edge in &state.examined_edges {
+        let key = (edge.source_ref.clone(), edge.dependent_ref.clone());
+        let disposition = dispositions
+            .get(&key)
+            .copied()
+            .ok_or(InfluenceError::ContinuationBindingMismatch)?;
+        let target_admitted = state.admitted_nodes.contains_key(&edge.dependent_ref);
+        match disposition {
+            InfluenceEdgeDisposition::PermittedCurrent => {
+                if (!target_admitted
+                    && state.omission_map.get(&key) != Some(&OmissionCause::BoundsExhausted))
+                    || (target_admitted && state.omission_map.contains_key(&key))
+                {
+                    return Err(InfluenceError::InvalidContinuation);
+                }
+            }
+            blocked => {
+                if omission_cause_for(blocked) != state.omission_map.get(&key).copied() {
+                    return Err(InfluenceError::InvalidContinuation);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_recorded_omissions(
+    state: &ValidatedContinuationState,
+    dispositions: &BTreeMap<(String, String), InfluenceEdgeDisposition>,
+    examined_by_key: &BTreeMap<(String, String), BoundedRevocationPendingEdge>,
+) -> Result<(), InfluenceError> {
+    for ((source_ref, dependent_ref), cause) in &state.omission_map {
+        let key = (source_ref.clone(), dependent_ref.clone());
+        let disposition = dispositions
+            .get(&key)
+            .copied()
+            .ok_or(InfluenceError::ContinuationBindingMismatch)?;
+        let examined = examined_by_key.get(&key);
+        let pending = state.pending_edges.iter().find(|edge| {
+            edge.source_ref.as_str() == source_ref.as_str()
+                && edge.dependent_ref.as_str() == dependent_ref.as_str()
+        });
+        if *cause == OmissionCause::BoundsExhausted {
+            if disposition != InfluenceEdgeDisposition::PermittedCurrent
+                || examined.is_some_and(|edge| edge.disposition != disposition)
+                || pending.is_some_and(|edge| edge.disposition != disposition)
+                || (examined.is_none() && pending.is_none())
+            {
+                return Err(InfluenceError::InvalidContinuation);
+            }
+        } else {
+            let Some(edge) = examined else {
+                return Err(InfluenceError::InvalidContinuation);
+            };
+            if edge.disposition != disposition || omission_cause_for(disposition) != Some(*cause) {
+                return Err(InfluenceError::InvalidContinuation);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_reachability_and_frontier(
+    request: &BoundedRevocationRequest,
+    state: &ValidatedContinuationState,
+) -> Result<(), InfluenceError> {
+    for (node_ref, depth) in &state.admitted_nodes {
+        if node_ref == &request.root_ref {
+            continue;
+        }
+        let reachable = state.examined_edges.iter().any(|edge| {
+            edge.dependent_ref == *node_ref
+                && edge.disposition == InfluenceEdgeDisposition::PermittedCurrent
+                && edge
+                    .source_depth
+                    .checked_add(1)
+                    .is_some_and(|child_depth| child_depth == *depth)
+        });
+        if !reachable {
+            return Err(InfluenceError::InvalidContinuation);
+        }
+    }
+    let mut expected_frontier: BTreeSet<String> = state.pending.keys().cloned().collect();
+    expected_frontier.extend(
+        state
+            .pending_edges
+            .iter()
+            .map(|edge| edge.dependent_ref.clone()),
+    );
+    expected_frontier.extend(
+        state
+            .omission_map
+            .iter()
+            .filter(|(_, cause)| **cause == OmissionCause::BoundsExhausted)
+            .map(|((_, dependent_ref), _)| dependent_ref.clone()),
+    );
+    if state.frontier != expected_frontier {
+        return Err(InfluenceError::InvalidContinuation);
+    }
+    Ok(())
+}
+
+fn validate_continuation(
+    request: &BoundedRevocationRequest,
+    bounds: &RevocationBounds,
+    dispositions: &BTreeMap<(String, String), InfluenceEdgeDisposition>,
+    binding: &BoundedBinding,
+    continuation: &BoundedRevocationContinuation,
+    token: &BoundedRevocationContinuationToken,
+) -> Result<(), InfluenceError> {
+    validate_continuation_binding(request, binding, continuation, token)?;
+    let state = validate_continuation_state(request, bounds, continuation)?;
+    let indexes = index_continuation_edges(&state, dispositions)?;
+    validate_adjacency_partition(
+        &state,
+        dispositions,
+        &indexes.examined_by_key,
+        &indexes.pending_by_source,
+    )?;
+    validate_examined_edge_omissions(&state, dispositions)?;
+    validate_recorded_omissions(&state, dispositions, &indexes.examined_by_key)?;
+    validate_reachability_and_frontier(request, &state)
+}
+
 /// Bounded transitive revocation over an explicit qualified edge set.
 ///
 /// Validates the request, fence, and bounds; rejects a `PARTIAL` denominator;
 /// deduplicates identical edges while rejecting conflicting dispositions for
-/// the same pair; then traverses `PERMITTED_CURRENT` edges breadth-first in
-/// deterministic order under the supplied limits.
+/// the same pair; then traverses `PERMITTED_CURRENT` source-to-dependent edges
+/// breadth-first in deterministic order under the supplied limits.
+///
+/// A nonempty legacy `resumed_visited` is intentionally rejected.  Use
+/// [`resume_bounded_revocation`] with the exact continuation returned by a
+/// prior exhausted page; a visited-only list cannot describe unexpanded edge
+/// positions and therefore cannot create authority.
 pub fn revoke_bounded(
     request: &BoundedRevocationRequest,
     bounds: &RevocationBounds,
 ) -> Result<BoundedRevocationOutcome, InfluenceError> {
+    revoke_bounded_page(
+        request,
+        bounds,
+        BoundedRevocationPageLimits::all_global_work(bounds),
+    )
+}
+
+/// Start one explicitly page-limited traversal without weakening the
+/// operation-global bounds. Use the returned continuation with
+/// [`resume_bounded_revocation`] until it proves completion or a global bound
+/// remains exhausted.
+pub fn revoke_bounded_page(
+    request: &BoundedRevocationRequest,
+    bounds: &RevocationBounds,
+    page_limits: BoundedRevocationPageLimits,
+) -> Result<BoundedRevocationOutcome, InfluenceError> {
     check_bounded_header(request, bounds)?;
+    page_limits.validate()?;
     let dispositions = dedup_qualified_edges(request)?;
-    let mut traversal = BoundedTraversal::new(request, bounds, &dispositions);
-    traversal.run();
-    Ok(traversal.finish(&request.root_ref))
+    let binding = bounded_binding(request, bounds)?;
+    let mut traversal = BoundedTraversal::new(request, bounds, page_limits, &dispositions, binding);
+    traversal.run()?;
+    traversal.finish(request)
+}
+
+/// Resume one source-bound bounded revocation operation.
+///
+/// The request, graph snapshot, fence, global bounds, admitted/expanded
+/// closure, and cumulative counters are validated before the saved queue can
+/// run. `page_limits` applies only to this call and cannot raise the bound
+/// global limits carried by the continuation. `continuation_token` is the
+/// opaque capability returned with the preceding live outcome; a deserialized
+/// or caller-recomputed digest is not sufficient. The operation is never
+/// re-rooted and the root is never re-admitted.
+pub fn resume_bounded_revocation(
+    request: &BoundedRevocationRequest,
+    continuation: &BoundedRevocationContinuation,
+    continuation_token: &BoundedRevocationContinuationToken,
+    bounds: &RevocationBounds,
+    page_limits: BoundedRevocationPageLimits,
+) -> Result<BoundedRevocationOutcome, InfluenceError> {
+    check_bounded_header(request, bounds)?;
+    page_limits.validate()?;
+    let dispositions = dedup_qualified_edges(request)?;
+    let binding = bounded_binding(request, bounds)?;
+    validate_continuation(
+        request,
+        bounds,
+        &dispositions,
+        &binding,
+        continuation,
+        continuation_token,
+    )?;
+    let mut traversal = BoundedTraversal::from_continuation(
+        bounds,
+        page_limits,
+        &dispositions,
+        binding,
+        continuation,
+    );
+    traversal.run()?;
+    traversal.finish(request)
 }
 
 // ---------------------------------------------------------------------------
@@ -1552,7 +2832,7 @@ fn unique(values: &[String], field: &'static str) -> Result<(), InfluenceError> 
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum InfluenceError {
     #[error("invalid influence field: {0}")]
     InvalidField(&'static str),
@@ -1570,6 +2850,14 @@ pub enum InfluenceError {
     DuplicateEdge,
     #[error("unknown revocation completeness")]
     UnknownCompleteness,
+    #[error("legacy resumed_visited requires an exact bounded revocation continuation")]
+    LegacyResumedVisited,
+    #[error("bounded revocation continuation is invalid")]
+    InvalidContinuation,
+    #[error("bounded revocation continuation binding mismatch")]
+    ContinuationBindingMismatch,
+    #[error("unsupported bounded revocation continuation schema")]
+    UnsupportedContinuation,
 }
 
 #[cfg(test)]
