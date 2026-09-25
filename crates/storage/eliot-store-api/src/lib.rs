@@ -1572,9 +1572,12 @@ pub struct PreparedTransition {
     /// Bound semantic source revisions rendered as `key@revision` heads.
     ///
     /// The envelope path renders these from the admitted
-    /// `expected_revision_heads` via [`render_semantic_source_revisions`];
-    /// fence-scoped erasure transitions and frozen fixtures record `[]`
-    /// explicitly.
+    /// `expected_revision_heads` via [`render_semantic_source_revisions`]
+    /// (canonically sorted set-like input); fence-scoped erasure transitions
+    /// and frozen fixtures record `[]` explicitly. The carried values are
+    /// hash-bound through the shared [`CanonicalRequestView`], so a
+    /// post-admission edit fails at every recompute gate with the typed
+    /// digest mismatch instead of reaching the receipt.
     pub semantic_source_revisions: Vec<String>,
     pub named_operations: Vec<NamedMutationRequest>,
     pub event_projection_relation_intents: EventProjectionRelationIntents,
@@ -1729,6 +1732,9 @@ pub fn expected_mutation_plan_digest(
 /// Renders bound semantic source revisions as `key@revision` heads
 /// (issue #18).
 ///
+/// The output is sorted into canonical order: the entries are set-like
+/// hash input for the shared canonical request hash (issue #63), so
+/// producer emission order must not fork the digest or the stored lineage.
 /// The envelope path renders the admitted `expected_revision_heads` through
 /// this function when binding a receipt (see [`bind_issue18_receipt`]); the
 /// rendered entries are checked by [`PreparedTransition::validate`] and by
@@ -1736,14 +1742,16 @@ pub fn expected_mutation_plan_digest(
 /// render no heads and record `[]` explicitly.
 #[must_use]
 pub fn render_semantic_source_revisions(heads: &[RevisionHeadExpectation]) -> Vec<String> {
-    heads
+    let mut rendered: Vec<String> = heads
         .iter()
         .map(|head| {
             let key = head.key.as_str();
             let revision = head.expected_revision;
             format!("{key}@{revision}")
         })
-        .collect()
+        .collect();
+    rendered.sort();
+    rendered
 }
 
 /// Binds the derived issue-#18 digests onto a prepared transition
