@@ -1,0 +1,14 @@
+C:\Development\Rust\projects\eliot-swarm\W-1126-a1\targets\W-1126-a1\debug\deps\serde-dab3267b528587e5.d: C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs C:\Development\Rust\projects\eliot-swarm\W-1126-a1\targets\W-1126-a1\debug\build\serde-efc57df6207a3290\out/private.rs
+
+C:\Development\Rust\projects\eliot-swarm\W-1126-a1\targets\W-1126-a1\debug\deps\libserde-dab3267b528587e5.rlib: C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs C:\Development\Rust\projects\eliot-swarm\W-1126-a1\targets\W-1126-a1\debug\build\serde-efc57df6207a3290\out/private.rs
+
+C:\Development\Rust\projects\eliot-swarm\W-1126-a1\targets\W-1126-a1\debug\deps\libserde-dab3267b528587e5.rmeta: C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs C:\Development\Rust\projects\eliot-swarm\W-1126-a1\targets\W-1126-a1\debug\build\serde-efc57df6207a3290\out/private.rs
+
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs:
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs:
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs:
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs:
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs:
+C:\Development\Rust\projects\eliot-swarm\W-1126-a1\targets\W-1126-a1\debug\build\serde-efc57df6207a3290\out/private.rs:
+
+# env-dep:OUT_DIR=C:\\Development\\Rust\\projects\\eliot-swarm\\W-1126-a1\\targets\\W-1126-a1\\debug\\build\\serde-efc57df6207a3290\\out
