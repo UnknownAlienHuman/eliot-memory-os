@@ -2,7 +2,7 @@
 //!
 //! Binary-private parsing, validation, and bounded lease reads for the
 //! `eliot-kernel` entry: host-injected `KernelStartupBinding`, the exact
-//! 24-value launch contour, neutral store-bootstrap and `eliotd` descriptor
+//! 28-value launch contour, neutral store-bootstrap and `eliotd` descriptor
 //! preparation, and the authority-contour projection. Zero composition
 //! contact: this module never constructs, reads, or drives
 //! `KernelComposition`; `main` calls the `pub(crate)` parsers and passes the
@@ -194,6 +194,12 @@ pub(crate) struct KernelLaunchOptions {
     pub(crate) doctor_executable_path: Option<PathBuf>,
     pub(crate) testd_artifact_sha256: Option<String>,
     pub(crate) native_worker_artifact_sha256: Option<String>,
+    /// Host-injected Dreamer image digest. It is required for the Curation
+    /// launch arm; a legacy contour may omit it, in which case the arm fails
+    /// closed without synthesizing a child.
+    pub(crate) dreamer_artifact_sha256: Option<String>,
+    /// Host-injected absolute Dreamer executable path bound to the digest.
+    pub(crate) dreamer_executable_path: Option<PathBuf>,
 }
 
 pub(crate) struct PreparedStoreBootstrap {
@@ -211,6 +217,105 @@ where
     let args = args.into_iter().collect::<Vec<_>>();
     match args.as_slice() {
         [] => Err(invalid_input("exact Host launch arguments are required")),
+        [
+            work_flag,
+            work_root,
+            store_flag,
+            descriptor,
+            store_digest_flag,
+            store_digest,
+            authority_flag,
+            authority_path,
+            authority_digest_flag,
+            authority_digest,
+            kernel_artifact_flag,
+            kernel_artifact_digest,
+            doctor_artifact_flag,
+            doctor_artifact_digest,
+            doctor_executable_flag,
+            doctor_executable_path,
+            testd_artifact_flag,
+            testd_artifact_digest,
+            native_worker_artifact_flag,
+            native_worker_artifact_digest,
+            daemon_flag,
+            daemon_path,
+            daemon_digest_flag,
+            daemon_digest,
+            dreamer_artifact_flag,
+            dreamer_artifact_digest,
+            dreamer_executable_flag,
+            dreamer_executable_path,
+        ] if work_flag == "--work-root"
+            && store_flag == "--store-bootstrap"
+            && store_digest_flag == "--store-bootstrap-sha256"
+            && authority_flag == "--authority-descriptor"
+            && authority_digest_flag == "--authority-descriptor-sha256"
+            && kernel_artifact_flag == "--kernel-artifact-sha256"
+            && doctor_artifact_flag == "--doctor-artifact-sha256"
+            && doctor_executable_flag == "--doctor-executable-path"
+            && testd_artifact_flag == "--testd-artifact-sha256"
+            && native_worker_artifact_flag == "--native-worker-artifact-sha256"
+            && daemon_flag == "--eliotd-descriptor"
+            && daemon_digest_flag == "--eliotd-descriptor-sha256"
+            && dreamer_artifact_flag == "--dreamer-artifact-sha256"
+            && dreamer_executable_flag == "--dreamer-executable-path" =>
+        {
+            let store_digest = store_digest.to_string_lossy();
+            let authority_digest = authority_digest.to_string_lossy();
+            let kernel_artifact_digest = kernel_artifact_digest.to_string_lossy();
+            let doctor_artifact_digest = doctor_artifact_digest.to_string_lossy();
+            let testd_artifact_digest = testd_artifact_digest.to_string_lossy();
+            let native_worker_artifact_digest = native_worker_artifact_digest.to_string_lossy();
+            let daemon_digest = daemon_digest.to_string_lossy();
+            let dreamer_artifact_digest = dreamer_artifact_digest.to_string_lossy();
+            if !is_lower_sha256(&store_digest)
+                || !is_lower_sha256(&authority_digest)
+                || !is_lower_sha256(&kernel_artifact_digest)
+                || !is_lower_sha256(&doctor_artifact_digest)
+                || !is_lower_sha256(&testd_artifact_digest)
+                || !is_lower_sha256(&native_worker_artifact_digest)
+                || !is_lower_sha256(&daemon_digest)
+                || !is_lower_sha256(&dreamer_artifact_digest)
+            {
+                return Err(invalid_input(
+                    "descriptor digests must be lowercase SHA-256",
+                ));
+            }
+            let doctor_executable_path = PathBuf::from(doctor_executable_path);
+            let dreamer_executable_path = PathBuf::from(dreamer_executable_path);
+            for (path, role) in [
+                (&doctor_executable_path, "Doctor"),
+                (&dreamer_executable_path, "Dreamer"),
+            ] {
+                if !path.is_absolute()
+                    || path.as_os_str().is_empty()
+                    || path.to_string_lossy().chars().any(char::is_control)
+                {
+                    return Err(invalid_input(&format!(
+                        "Host launch must inject the exact {role} executable path bound to its digested role"
+                    )));
+                }
+            }
+            Ok(KernelLaunchOptions {
+                work_root: canonical_directory(work_root)?,
+                store_config: Some(StoreConfigLocator::NeutralDescriptor(PathBuf::from(
+                    descriptor,
+                ))),
+                store_sha256: store_digest.into_owned(),
+                authority_descriptor: PathBuf::from(authority_path),
+                authority_sha256: authority_digest.into_owned(),
+                daemon_descriptor: Some(PathBuf::from(daemon_path)),
+                daemon_sha256: Some(daemon_digest.into_owned()),
+                kernel_artifact_sha256: Some(kernel_artifact_digest.into_owned()),
+                doctor_artifact_sha256: Some(doctor_artifact_digest.into_owned()),
+                doctor_executable_path: Some(doctor_executable_path),
+                testd_artifact_sha256: Some(testd_artifact_digest.into_owned()),
+                native_worker_artifact_sha256: Some(native_worker_artifact_digest.into_owned()),
+                dreamer_artifact_sha256: Some(dreamer_artifact_digest.into_owned()),
+                dreamer_executable_path: Some(dreamer_executable_path),
+            })
+        }
         [
             work_flag,
             work_root,
@@ -295,6 +400,8 @@ where
                 doctor_executable_path: Some(doctor_executable_path),
                 testd_artifact_sha256: Some(testd_artifact_digest.into_owned()),
                 native_worker_artifact_sha256: Some(native_worker_artifact_digest.into_owned()),
+                dreamer_artifact_sha256: None,
+                dreamer_executable_path: None,
             })
         }
         [
@@ -337,7 +444,7 @@ where
             ))
         }
         _ => Err(invalid_input(
-            "expected the exact mandatory 24-value Host launch contour",
+            "expected the exact mandatory 24- or 28-value Host launch contour",
         )),
     }
 }
@@ -537,6 +644,7 @@ mod tests {
         let root = TempRoot::new();
         let digest = "a".repeat(64);
         let doctor_path = root.0.join("eliot-doctor.exe");
+        let dreamer_path = root.0.join("eliot-dreamer.exe");
         let options = parse_launch_options([
             "--work-root".into(),
             root.0.join("work").into_os_string(),
@@ -562,6 +670,10 @@ mod tests {
             root.0.join("eliotd.json").into_os_string(),
             "--eliotd-descriptor-sha256".into(),
             digest.clone().into(),
+            "--dreamer-artifact-sha256".into(),
+            digest.clone().into(),
+            "--dreamer-executable-path".into(),
+            dreamer_path.clone().into_os_string(),
         ])
         .expect("integrated args");
         assert_eq!(options.kernel_artifact_sha256, Some(digest.clone()));
@@ -573,6 +685,8 @@ mod tests {
         );
         assert_eq!(options.testd_artifact_sha256, Some(digest.clone()));
         assert_eq!(options.native_worker_artifact_sha256, Some(digest.clone()));
+        assert_eq!(options.dreamer_artifact_sha256, Some(digest.clone()));
+        assert_eq!(options.dreamer_executable_path, Some(dreamer_path));
         assert_eq!(options.daemon_descriptor, Some(root.0.join("eliotd.json")));
     }
 

@@ -46,7 +46,7 @@ fn planner_epoch(sequence: u64) -> EpochId {
 /// are live Host-owned handoff material and cannot be represented by an
 /// installer candidate. Destination file identities are observed after
 /// Phase B materialization and are not part of this immutable inventory.
-pub(crate) const REQUIRED_PACKAGE_ROLES: [(&str, bool); 14] = [
+pub(crate) const REQUIRED_PACKAGE_ROLES: [(&str, bool); 15] = [
     ("eliot-host.exe", true),
     ("eliot-watchdog.exe", true),
     ("eliot-kernel.exe", true),
@@ -55,6 +55,7 @@ pub(crate) const REQUIRED_PACKAGE_ROLES: [(&str, bool); 14] = [
     ("eliotd.exe", true),
     ("eliot-doctor.exe", true),
     ("eliot-testd.exe", true),
+    ("eliot-dreamer.exe", true),
     ("eliot-native-worker.exe", true),
     ("eliot-wasm-host.exe", true),
     ("eliot-notify.exe", true),
@@ -65,9 +66,9 @@ pub(crate) const REQUIRED_PACKAGE_ROLES: [(&str, bool); 14] = [
 
 /// Per-user adapter staged in Phase A but never Kernel-dispatched.
 /// `eliot-notify.exe` (I1.3/I1.4: interactive user-session branch) is
-/// evidence-bound by the fourteen-file inventory while
+/// evidence-bound by the fifteen-file inventory while
 /// [`strict_role_bindings`] and the launch descriptor keep exactly the
-/// thirteen dispatched daemon roles.
+/// fourteen dispatched daemon roles.
 pub(crate) const NOTIFY_STAGED_ROLE: &str = "eliot-notify.exe";
 pub(crate) const NOTIFY_STAGED_EXECUTABLE: bool = true;
 
@@ -158,13 +159,13 @@ const CANARY_ARTIFACT_SET_EVIDENCE_DOMAIN: &[u8] =
 /// `generation.json` contains the resulting `RuntimeLaunchDescriptor`, while
 /// `eliotd.json` contains the same launch nonce.  Including either file in the
 /// derivation input would create a cryptographic self-reference.  The complete
-/// fourteen-role artifact evidence remains separate and continues to bind both
+/// fifteen-role artifact evidence remains separate and continues to bind both
 /// files byte-for-byte.
 // This is a package-planner derivation domain, not a registry wire revision:
 // RegistryWireV10 decoding and its explicit active-Phase-B migration rules
 // remain unchanged by this non-recursive template split.
 const PHASE_A_TEMPLATE_CONTENT_DOMAIN: &[u8] = b"eliot.runtime-live.phase-a-template-content.v1";
-const PHASE_A_TEMPLATE_ROLES: [(&str, bool); 11] = [
+const PHASE_A_TEMPLATE_ROLES: [(&str, bool); 12] = [
     ("eliot-host.exe", true),
     ("eliot-watchdog.exe", true),
     ("eliot-kernel.exe", true),
@@ -173,6 +174,7 @@ const PHASE_A_TEMPLATE_ROLES: [(&str, bool); 11] = [
     ("eliotd.exe", true),
     ("eliot-doctor.exe", true),
     ("eliot-testd.exe", true),
+    ("eliot-dreamer.exe", true),
     ("eliot-native-worker.exe", true),
     ("eliot-wasm-host.exe", true),
     ("eliotd-governor.json", false),
@@ -320,7 +322,7 @@ fn append_evidence_text(bytes: &mut Vec<u8>, value: &str) {
 /// Derive the Runtime Live canary artifact-set evidence reference.
 ///
 /// The reference is a domain-separated SHA-256 over the canonical generation
-/// and the complete, fixed-order fourteen-file Phase-A inventory.  Each fact contains
+/// and the complete, fixed-order fifteen-file Phase-A inventory.  Each fact contains
 /// the validated relative path, executable bit, exact byte size, and lowercase
 /// SHA-256.  Source identities and other volatile filesystem observations are
 /// deliberately excluded; the retained-source and destination receipt gates
@@ -333,7 +335,7 @@ pub(crate) fn artifact_set_evidence_digest(
         || expected.len() != REQUIRED_PACKAGE_ROLES.len()
     {
         return Err(InstallationError::IncompleteObservation(
-            "canary artifact evidence requires the complete fourteen-file Phase-A runtime inventory"
+            "canary artifact evidence requires the complete fifteen-file Phase-A runtime inventory"
                 .to_owned(),
         ));
     }
@@ -479,6 +481,15 @@ fn expected_role_map(candidate: &CandidateManifest) -> Vec<(String, bool, String
             .unwrap_or("")
             .to_owned()
     };
+    let (dreamer_digest, dreamer_path) = rt
+        .dreamer_dispatch_arguments()
+        .expect("Dreamer launch binding")
+        .expect("Dreamer launch binding");
+    let dreamer_name = Path::new(&dreamer_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_owned();
     vec![
         (
             file_name(&candidate.kernel_executable_path),
@@ -548,6 +559,7 @@ fn expected_role_map(candidate: &CandidateManifest) -> Vec<(String, bool, String
             false,
             rt.eliotd_descriptor_digest.as_str().to_owned(),
         ),
+        (dreamer_name, true, dreamer_digest),
     ]
 }
 
@@ -598,7 +610,7 @@ fn validate_candidate_package_binding(
     }
     // `eliot-notify.exe` is staged in Phase A but never Kernel-dispatched
     // (NOTIFY_STAGED_ROLE, I1.3/I1.4): accept exactly one such entry, then
-    // validate the remaining thirteen-role bijection below.
+    // validate the remaining fourteen-role bijection below.
     let mut notify_staged = false;
     for spec in &manifest.files {
         if spec.relative_path == NOTIFY_STAGED_ROLE {
@@ -760,16 +772,34 @@ pub(crate) fn strict_role_bindings(
     ]
 }
 
+/// Returns the Dreamer role binding carried by the immutable Kernel launch
+/// argument pair. The path/digest remain descriptor-owned; this helper does
+/// not read a caller or process-environment value.
+fn dreamer_role_binding(
+    runtime: &RuntimeLaunchDescriptor,
+) -> Result<(&'static str, bool, String, String), InstallationError> {
+    let (digest, path) = runtime
+        .dreamer_dispatch_arguments()?
+        .ok_or(InstallationError::IdentityConflict)?;
+    Ok(("eliot-dreamer.exe", true, path, digest))
+}
+
 /// Validate the complete production package bijection.
 ///
 /// This boundary is intentionally independent of the caller's manifest and
-/// expected-digest vectors. It binds all thirteen canonical Phase-A dispatch
-/// roles and requires every `CandidateManifest` path/digest to participate
-/// exactly once. The fourteenth staged role, `eliot-notify.exe`, is a
+/// expected-digest vectors. The field-backed `strict_role_bindings` cover the
+/// thirteen existing roles; the Dreamer path/digest pair is checked from the
+/// immutable Kernel argument binding immediately afterward, so all fourteen
+/// dispatched roles participate exactly once. The fifteenth staged role,
+/// `eliot-notify.exe`, is a
 /// per-user one-shot adapter (I1.3/I1.4: user-session branch, never a
-/// Kernel-dispatched child): it is evidence-bound by the fourteen-file
+/// Kernel-dispatched child): it is evidence-bound by the fifteen-file
 /// inventory but deliberately has no launch-descriptor fields and no dispatch
 /// binding, so it is accepted here without participating in the bijection.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the full package-role bijection and the descriptor-owned Dreamer binding must be checked in one pass"
+)]
 pub(crate) fn validate_exact_candidate_package_binding(
     candidate: &CandidateManifest,
     manifest: &PackageManifest,
@@ -779,7 +809,7 @@ pub(crate) fn validate_exact_candidate_package_binding(
     }
     if manifest.files.len() != REQUIRED_PACKAGE_ROLES.len() {
         return Err(InstallationError::IncompleteObservation(
-            "package manifest must contain the complete fourteen-file Phase-A runtime inventory"
+            "package manifest must contain the complete fifteen-file Phase-A runtime inventory"
                 .to_owned(),
         ));
     }
@@ -818,10 +848,45 @@ pub(crate) fn validate_exact_candidate_package_binding(
             return Err(InstallationError::IdentityConflict);
         }
     }
+    let (dreamer_name, dreamer_executable, dreamer_path, dreamer_digest) =
+        dreamer_role_binding(&candidate.runtime_launch)?;
+    if !expected_names.insert(dreamer_name.to_ascii_lowercase())
+        || !candidate_paths.insert(dreamer_path.to_ascii_lowercase())
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+    let dreamer_actual_name = Path::new(&dreamer_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if dreamer_actual_name != dreamer_name {
+        return Err(InstallationError::IdentityConflict);
+    }
+    crate::sha256_handle(
+        &PlatformHandle::new(dreamer_digest.clone()).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "candidate.dreamer_artifact_digest".to_owned(),
+                reason: error.to_string(),
+            }
+        })?,
+        "candidate package role digest",
+    )?;
+    let Some(dreamer_spec) = manifest
+        .files
+        .iter()
+        .find(|spec| spec.relative_path == dreamer_name)
+    else {
+        return Err(InstallationError::IdentityConflict);
+    };
+    if dreamer_spec.executable != dreamer_executable || dreamer_spec.expected_size == 0 {
+        return Err(InstallationError::IdentityConflict);
+    }
     let mut manifest_names = BTreeSet::new();
     for spec in &manifest.files {
         if spec.relative_path == NOTIFY_STAGED_ROLE {
-            if spec.executable != NOTIFY_STAGED_EXECUTABLE || !manifest_names.insert(spec.relative_path.clone()) {
+            if spec.executable != NOTIFY_STAGED_EXECUTABLE
+                || !manifest_names.insert(spec.relative_path.clone())
+            {
                 return Err(InstallationError::IdentityConflict);
             }
             continue;
@@ -845,16 +910,30 @@ pub(crate) fn validate_exact_candidate_package_binding(
 
 #[cfg(test)]
 pub(crate) fn candidate_has_nonplaceholder_package_digests(candidate: &CandidateManifest) -> bool {
-    strict_role_bindings(candidate)
-        .into_iter()
-        .any(|(_, _, _, digest)| {
-            let value = digest.as_str();
-            value.len() != 64
-                || value
-                    .chars()
-                    .next()
-                    .is_none_or(|first| !value.chars().all(|item| item == first))
-        })
+    let existing_nonplaceholder =
+        strict_role_bindings(candidate)
+            .into_iter()
+            .any(|(_, _, _, digest)| {
+                let value = digest.as_str();
+                value.len() != 64
+                    || value
+                        .chars()
+                        .next()
+                        .is_none_or(|first| !value.chars().all(|item| item == first))
+            });
+    existing_nonplaceholder
+        || candidate
+            .runtime_launch
+            .dreamer_dispatch_arguments()
+            .ok()
+            .flatten()
+            .is_some_and(|(_, digest)| {
+                digest.len() != 64
+                    || digest
+                        .chars()
+                        .next()
+                        .is_none_or(|first| !digest.chars().all(|item| item == first))
+            })
 }
 
 #[allow(dead_code)]
@@ -866,7 +945,7 @@ pub(crate) fn validate_exact_expected_file_digests(
     validate_exact_candidate_package_binding(candidate, manifest)?;
     if expected.len() != REQUIRED_PACKAGE_ROLES.len() {
         return Err(InstallationError::IncompleteObservation(
-            "expected package digest set must contain all fourteen Phase-A runtime files".to_owned(),
+            "expected package digest set must contain all fifteen Phase-A runtime files".to_owned(),
         ));
     }
     let bindings = strict_role_bindings(candidate);
@@ -887,6 +966,24 @@ pub(crate) fn validate_exact_expected_file_digests(
             if !spec.executable
                 || item.expected_size == 0
                 || item.expected_size != spec.expected_size
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            crate::sha256_handle(&item.sha256, "expected package digest")?;
+            continue;
+        }
+        if item.relative_path == "eliot-dreamer.exe" {
+            let (_, _, _expected_path, expected_digest) =
+                dreamer_role_binding(&candidate.runtime_launch)?;
+            let spec = manifest
+                .files
+                .iter()
+                .find(|spec| spec.relative_path == item.relative_path)
+                .ok_or(InstallationError::IdentityConflict)?;
+            if !spec.executable
+                || item.expected_size == 0
+                || item.expected_size != spec.expected_size
+                || item.sha256.as_str() != expected_digest
             {
                 return Err(InstallationError::IdentityConflict);
             }
@@ -1044,7 +1141,7 @@ pub struct GenerationPackagePlanInput {
 pub struct GenerationPackagePlanner;
 
 impl GenerationPackagePlanner {
-    /// Computes the canonical full fourteen-role artifact evidence reference.
+    /// Computes the canonical full fifteen-role artifact evidence reference.
     ///
     /// This associated wrapper is the single public entry point for producers
     /// that materialize the retained source bundle before invoking
@@ -1099,7 +1196,7 @@ impl GenerationPackagePlanner {
     /// immutable `PLANNED` transaction.
     ///
     /// The source is opened and observed independently of every manifest claim.
-    /// The exact fourteen-file Phase-A inventory is then used to construct all
+    /// The exact fifteen-file Phase-A inventory is then used to construct all
     /// canonical destination paths, descriptor/config bindings and artifact
     /// digests before the single transaction constructor is called.
     #[allow(
@@ -1250,6 +1347,7 @@ impl GenerationPackagePlanner {
         let eliotd_path = destination("eliotd.exe")?;
         let doctor_path = destination("eliot-doctor.exe")?;
         let testd_path = destination("eliot-testd.exe")?;
+        let dreamer_path = destination("eliot-dreamer.exe")?;
         let native_worker_path = destination("eliot-native-worker.exe")?;
         let wasm_host_path = destination("eliot-wasm-host.exe")?;
         let config_path = destination("generation.json")?;
@@ -1266,6 +1364,7 @@ impl GenerationPackagePlanner {
             (&eliotd_path, "generation.eliotd_path"),
             (&doctor_path, "generation.doctor_path"),
             (&testd_path, "generation.testd_path"),
+            (&dreamer_path, "generation.dreamer_path"),
             (&native_worker_path, "generation.native_worker_path"),
             (&wasm_host_path, "generation.wasm_host_path"),
             (&config_path, "generation.config_path"),
@@ -1313,6 +1412,7 @@ impl GenerationPackagePlanner {
         let eliotd_digest = digest_for("eliotd.exe")?;
         let doctor_digest = digest_for("eliot-doctor.exe")?;
         let testd_digest = digest_for("eliot-testd.exe")?;
+        let dreamer_digest = digest_for("eliot-dreamer.exe")?;
         let native_worker_digest = digest_for("eliot-native-worker.exe")?;
         let wasm_host_digest = digest_for("eliot-wasm-host.exe")?;
         let config_digest = digest_for("generation.json")?;
@@ -1458,6 +1558,10 @@ impl GenerationPackagePlanner {
             eliotd_descriptor_path.as_str().to_owned(),
             "--eliotd-descriptor-sha256".to_owned(),
             eliotd_descriptor_digest.as_str().to_owned(),
+            "--dreamer-artifact-sha256".to_owned(),
+            dreamer_digest.as_str().to_owned(),
+            "--dreamer-executable-path".to_owned(),
+            dreamer_path.as_str().to_owned(),
         ])?;
         let supervision_lease_scope_id = PlatformHandle::new(format!(
             "eliot-supervision-scope:v1:{}:{}",
@@ -1619,9 +1723,16 @@ impl GenerationPackagePlanner {
         validate_exact_candidate_package_binding(&candidate, &package_manifest)?;
         for digest in &expected_file_digests {
             if digest.relative_path == NOTIFY_STAGED_ROLE {
-                // Per-user adapter digest is bound by the fourteen-file
+                // Per-user adapter digest is bound by the fifteen-file
                 // evidence digest and the manifest size match above; it has
                 // no launch-descriptor digest slot by design.
+                continue;
+            }
+            if digest.relative_path == "eliot-dreamer.exe" {
+                let (_, _, _, expected) = dreamer_role_binding(&candidate.runtime_launch)?;
+                if digest.sha256.as_str() != expected {
+                    return Err(InstallationError::IdentityConflict);
+                }
                 continue;
             }
             let (_, _, _, expected) = strict_role_bindings(&candidate)
@@ -1966,7 +2077,7 @@ fn validate_exact_source_inventory(
 ) -> Result<(), InstallationError> {
     if observed.files.len() != REQUIRED_PACKAGE_ROLES.len() {
         return Err(InstallationError::IncompleteObservation(
-            "trusted source must contain exactly fourteen Phase-A runtime files".to_owned(),
+            "trusted source must contain exactly fifteen Phase-A runtime files".to_owned(),
         ));
     }
     let expected = REQUIRED_PACKAGE_ROLES
@@ -2065,7 +2176,8 @@ fn validate_source_bundle_publication_binding(
         || manifest.files.len() != REQUIRED_PACKAGE_ROLES.len()
     {
         return Err(InstallationError::IncompleteObservation(
-            "source publication binding must contain the complete fourteen-role inventory".to_owned(),
+            "source publication binding must contain the complete fifteen-role inventory"
+                .to_owned(),
         ));
     }
     for (index, (role, executable)) in REQUIRED_PACKAGE_ROLES.iter().enumerate() {
@@ -2497,8 +2609,8 @@ mod tests {
         std::fs::metadata(root.join(name)).unwrap().len()
     }
     /// Manifest specs for the struct-bound dispatch roles plus the staged
-    /// per-user adapter. `expected_role_map` is struct-driven (thirteen
-    /// dispatched roles); the fourteen-file inventory additionally carries
+    /// per-user adapter. `expected_role_map` is struct-driven (fourteen
+    /// dispatched roles); the fifteen-file inventory additionally carries
     /// `eliot-notify.exe`, which the population helper stages on disk.
     fn manifest_specs_with_staged_notify(
         roles: &[(String, bool, String)],
@@ -2642,6 +2754,12 @@ mod tests {
             .into_iter()
             .map(|s| h(s))
             .collect();
+        desc.kernel_arguments.extend([
+            h("--dreamer-artifact-sha256"),
+            h("e".repeat(64)),
+            h("--dreamer-executable-path"),
+            test_path(portable_root.as_str(), "eliot-dreamer.exe"),
+        ]);
         desc.descriptor_digest = h(crate::sha256_hex(&desc.unsigned_bytes().unwrap()));
         CandidateManifest {
             generation: h("candidate"),
@@ -3123,6 +3241,7 @@ mod tests {
             ("eliotd.exe", true),
             ("eliot-doctor.exe", true),
             ("eliot-testd.exe", true),
+            ("eliot-dreamer.exe", true),
             ("eliot-native-worker.exe", true),
             ("eliot-wasm-host.exe", true),
             ("eliot-notify.exe", true),
@@ -3183,6 +3302,7 @@ mod tests {
             "eliotd.exe",
             "eliot-doctor.exe",
             "eliot-testd.exe",
+            "eliot-dreamer.exe",
             "eliot-native-worker.exe",
             "eliot-wasm-host.exe",
             "eliotd-governor.json",
@@ -3242,6 +3362,7 @@ mod tests {
             "eliotd.exe",
             "eliot-doctor.exe",
             "eliot-testd.exe",
+            "eliot-dreamer.exe",
             "eliot-native-worker.exe",
             "eliot-wasm-host.exe",
             "eliotd-governor.json",
@@ -3299,12 +3420,14 @@ mod tests {
         let kernel_args = candidate
             .runtime_launch
             .expected_kernel_arguments(&candidate.runtime_launch.store_config_path.clone());
-        // 11 pairs = 22 values: work-root, store-bootstrap(+sha), authority(+sha),
-        // kernel, doctor, testd, native-worker, eliotd(+sha).
-        assert_eq!(kernel_args.len(), 22, "kernel contour must be 22 values");
+        // 13 pairs = 26 values: work-root, store-bootstrap(+sha), authority(+sha),
+        // kernel, doctor, testd, native-worker, eliotd(+sha), and Dreamer(+path).
+        assert_eq!(kernel_args.len(), 26, "kernel contour must be 26 values");
         assert!(kernel_args.contains(&"--doctor-artifact-sha256".to_owned()));
         assert!(kernel_args.contains(&"--testd-artifact-sha256".to_owned()));
         assert!(kernel_args.contains(&"--native-worker-artifact-sha256".to_owned()));
+        assert!(kernel_args.contains(&"--dreamer-artifact-sha256".to_owned()));
+        assert!(kernel_args.contains(&"--dreamer-executable-path".to_owned()));
         let bindings = strict_role_bindings(&candidate);
         assert_eq!(bindings.len(), 13);
         assert!(
@@ -3577,7 +3700,7 @@ mod tests {
         )
         .unwrap();
 
-        // Recompute the exact fourteen-role SHA/size vector and publication
+        // Recompute the exact fifteen-role SHA/size vector and publication
         // evidence after writing the valid generation document.
         let binding = test_source_publication_binding(&input).unwrap();
         GenerationPackagePlanner::plan_with_source_publication_binding(
@@ -4113,7 +4236,7 @@ mod tests {
         );
         assert_ne!(
             first.candidate_manifest.signature_ref, second.candidate_manifest.signature_ref,
-            "full fourteen-role artifact evidence must still include both nonce-bearing JSON roles"
+            "full fifteen-role artifact evidence must still include both nonce-bearing JSON roles"
         );
     }
 

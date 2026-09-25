@@ -125,8 +125,8 @@ pub(crate) use daemon_kernel_client::{
 pub use daemon_kernel_client::{parse_local_read_claimed_pair, parse_local_read_submit_outcome};
 pub(crate) use daemon_kernel_port_adapters::kind_value;
 pub use dreamer_admission::{
-    DREAMER_JOB_WIRE_ID, DreamerJobQueue, GovernorDreamerAdapter, KernelDreamerJobQueue,
-    OrientationSubmitInput,
+    CurationSubmitInput, DREAMER_CURATION_ROUTE_CLASS, DREAMER_JOB_WIRE_ID, DreamerJobQueue,
+    GovernorDreamerAdapter, KernelDreamerJobQueue, OrientationSubmitInput,
 };
 pub use dreamer_materials::{
     AdmittedSourceClaim, DreamerMaterialsError, FrozenOrientationManifest,

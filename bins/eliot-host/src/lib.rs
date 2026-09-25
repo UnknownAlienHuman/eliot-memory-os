@@ -2868,7 +2868,7 @@ impl HostJobBranches {
             Self::approved_working_directories(launch, self.portable_root.as_ref(), config_path)?;
         // T6-D2 front-door anchor (issue #461): the stored 22-value contour
         // gains the sealed digest-bound Doctor path so the relaunched Kernel
-        // receives the exact 24-value launch options. Missing anchors fail
+        // receives the exact 28-value launch options. Missing anchors fail
         // closed, never defaulted.
         let kernel_arguments = host_job_launch::kernel_arguments_with_doctor_anchor(
             &launch.kernel_arguments,

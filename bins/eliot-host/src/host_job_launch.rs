@@ -176,13 +176,13 @@ fn approved_launch_paths(
 /// digest-bound Doctor executable path into the sealed launch descriptor's
 /// stored `kernel_arguments`.
 ///
-/// The stored descriptor carries the 22-value contour (digests only); the
-/// Kernel requires the 24-value contour with `--doctor-executable-path`
-/// bound immediately after `--doctor-artifact-sha256`. The path comes from
-/// the sealed installation manifest (never caller bytes); a relative or
-/// empty path fails closed, never defaulted. An already-injected contour
-/// or a missing doctor digest also fails closed instead of replacing live
-/// authority.
+/// The stored descriptor carries the 26-value contour (digests plus the
+/// approved Dreamer path/digest); the Kernel receives the 28-value contour
+/// after the Doctor executable path is bound immediately after
+/// `--doctor-artifact-sha256`. The path comes from the sealed installation
+/// manifest (never caller bytes); a relative or empty path fails closed,
+/// never defaulted. An already-injected contour or a missing doctor digest
+/// also fails closed instead of replacing live authority.
 #[cfg(windows)]
 pub(super) fn kernel_arguments_with_doctor_anchor(
     kernel_arguments: &[PlatformHandle],
@@ -670,7 +670,7 @@ impl HostJobBranches {
             Self::approved_working_directories(launch, portable_root.as_ref(), &config_path)?;
         // T6-D2 front-door anchor (issue #461): inject the sealed
         // digest-bound Doctor executable path into the stored 22-value
-        // contour so the Kernel receives the exact 24-value launch options.
+        // contour so the Kernel receives the exact 28-value launch options.
         // Missing or relative anchors fail closed here, never defaulted.
         let kernel_arguments = kernel_arguments_with_doctor_anchor(
             &launch.kernel_arguments,

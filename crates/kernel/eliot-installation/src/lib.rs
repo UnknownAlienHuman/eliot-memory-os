@@ -996,7 +996,7 @@ pub struct CandidateManifest {
     /// Runtime Live canary artifact-set evidence reference.
     ///
     /// This is a content-addressed, domain-separated SHA-256 over the
-    /// canonical generation and exact ordered thirteen-file Phase-A facts. It is not a
+    /// canonical generation and exact ordered fourteen-file Phase-A facts. It is not a
     /// production release signature; production signing remains unclaimed.
     pub signature_ref: PlatformHandle,
     /// Digest of the exact mutable root topology approved by this manifest.
@@ -1511,8 +1511,63 @@ impl RuntimeLaunchDescriptor {
         Ok(())
     }
 
+    pub(crate) fn dreamer_dispatch_arguments(
+        &self,
+    ) -> Result<Option<(String, String)>, InstallationError> {
+        let digest_flag = "--dreamer-artifact-sha256";
+        let path_flag = "--dreamer-executable-path";
+        let digest_positions = self
+            .kernel_arguments
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.as_str() == digest_flag)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let path_positions = self
+            .kernel_arguments
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.as_str() == path_flag)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if digest_positions.is_empty() && path_positions.is_empty() {
+            return Ok(None);
+        }
+        if digest_positions.len() != 1
+            || path_positions.len() != 1
+            || path_positions[0] != digest_positions[0] + 2
+        {
+            return Err(InstallationError::InvalidField {
+                field: "runtime_launch.kernel_arguments".to_owned(),
+                reason: "Dreamer launch arguments must be one exact adjacent digest/path pair"
+                    .to_owned(),
+            });
+        }
+        let digest = self.kernel_arguments[digest_positions[0] + 1].clone();
+        let path = self.kernel_arguments[path_positions[0] + 1].clone();
+        runtime_sha256_handle(
+            &digest,
+            "runtime_launch.kernel_arguments.dreamer_artifact_sha256",
+        )?;
+        approved_path(
+            &path,
+            "runtime_launch.kernel_arguments.dreamer_executable_path",
+        )?;
+        if Path::new(path.as_str())
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some("eliot-dreamer.exe")
+        {
+            return Err(InstallationError::InvalidField {
+                field: "runtime_launch.kernel_arguments.dreamer_executable_path".to_owned(),
+                reason: "must name the approved eliot-dreamer.exe role".to_owned(),
+            });
+        }
+        Ok(Some((digest.as_str().to_owned(), path.as_str().to_owned())))
+    }
+
     fn expected_kernel_arguments(&self, _config_path: &PlatformHandle) -> Vec<String> {
-        vec![
+        let mut arguments = vec![
             "--work-root".to_owned(),
             self.kernel_work_root.as_str().to_owned(),
             "--store-bootstrap".to_owned(),
@@ -1535,7 +1590,16 @@ impl RuntimeLaunchDescriptor {
             self.eliotd_descriptor_path.as_str().to_owned(),
             "--eliotd-descriptor-sha256".to_owned(),
             self.eliotd_descriptor_digest.as_str().to_owned(),
-        ]
+        ];
+        if let Ok(Some((digest, path))) = self.dreamer_dispatch_arguments() {
+            arguments.extend([
+                "--dreamer-artifact-sha256".to_owned(),
+                digest,
+                "--dreamer-executable-path".to_owned(),
+                path,
+            ]);
+        }
+        arguments
     }
 
     /// Validates the launch contour against the exact approved generation
@@ -1552,6 +1616,7 @@ impl RuntimeLaunchDescriptor {
             });
         }
         let expected_store = self.expected_store_bridge_arguments(config_path);
+        self.dreamer_dispatch_arguments()?;
         let expected_kernel = self.expected_kernel_arguments(config_path);
         let actual_store = self
             .store_bridge_arguments

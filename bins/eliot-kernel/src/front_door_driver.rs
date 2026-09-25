@@ -358,8 +358,9 @@ async fn serve_connection(
                 // second call can never run concurrently with the first;
                 // unknown operations never reach this arm (dispatch fences
                 // them) and any handler failure fences the session instead
-                // of silently dropping the submit. No process is spawned
-                // here.
+                // of silently dropping the submit. The handler itself owns
+                // the post-admission Dreamer launch/reconcile join; this
+                // driver only transports the correlated reply.
                 let reply = Box::pin(
                     kernel.execute_dreamer_request(&session, request_id, &operation, payload),
                 )

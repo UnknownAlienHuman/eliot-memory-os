@@ -19,24 +19,33 @@
 //! ([`dreamer_launch_permits_lease`](super::dispatch_launch::dreamer_dispatch_launch::dreamer_launch_permits_lease)):
 //! a tampered, foreign, or unlaunched claim fences before any store call.
 //!
-//! No process is spawned inside this handler: admission and execution stay
-//! on the K1 axis, while launch remains the explicit dispatch-launch seam
-//! in [`super::dispatch_launch`]. No second launch identity is minted.
+//! The requester path admits the owner closure before the Store call. After a
+//! successful Curation `Submit` reaches `QUEUED`, the production handler
+//! drives the same explicit dispatch-launch seam and retains the original
+//! lineage for reconciliation. Store remains the durable terminal authority;
+//! no second launch identity is minted.
 //!
 //! Architecture: A12.2 Principal, Session and visibility; A13.2 Kernel and
 //! failure domains; I1.8 Exact ownership and call paths.
 //! Implementation: T12 K2 requester routing over the K0 contract and the K1
 //! gateway; I14.21 unknown-commit recovery (unknown outcomes fence, they are
 //! never reported as refusals).
-//! Forbidden authority: must not fabricate ledger success, must not accept a
-//! presented role as authority, must not spawn a worker, must not retry a
-//! store call blindly.
+//! Forbidden authority: must not fabricate ledger success, accept a
+//! presented role as authority, synthesize owner material, retry a store call
+//! blindly, or mint a second launch identity.
 
 use super::dispatch_launch::dreamer_dispatch_launch::{
-    DREAMER_MODULE_ID, dreamer_launch_permits_lease,
+    DREAMER_MODULE_ID, DreamerLeaseExpectation, dreamer_launch_permits_lease,
+};
+use super::dispatch_launch::{
+    DreamerLaunchMaterial, dreamer_production_binding, launch_admitted_dreamer_attempt,
+    reconcile_launched_dreamer_attempt,
 };
 use super::*;
-use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation, JobRole};
+use eliot_dreamer_contracts::AdmittedCurationMaterial;
+use eliot_protocol::dreamer_job::{
+    DurableJobRequest, DurableJobResponse, JobOperation, JobRole, JobState,
+};
 use eliot_store_api::RequestMeta;
 use serde::Deserialize;
 
@@ -47,6 +56,9 @@ use serde::Deserialize;
 /// must still prove the typed envelope below: the operation string only
 /// selects this closed entry.
 pub const DREAMER_JOB_WIRE_ID: &str = "eliot.kernel.dreamer-job";
+
+/// Canonical route class for an owner-admitted Curation submit.
+pub const DREAMER_CURATION_ROUTE_CLASS: &str = "dreamer_curation";
 
 /// Returns whether the operation string selects the K2 Dreamer job route.
 pub(crate) fn is_dreamer_operation(operation: &str) -> bool {
@@ -64,6 +76,10 @@ pub(crate) struct DreamerJobEnvelope {
     pub context: RequestMeta,
     /// One closed durable-job operation with its presented role.
     pub request: DurableJobRequest,
+    /// Complete owner-admitted Curation closure for the canonical Curation
+    /// route; other Dreamer routes omit it and never acquire a stand-in.
+    #[serde(default)]
+    pub admitted_curation: Option<AdmittedCurationMaterial>,
 }
 
 /// Store peer behind the K2 route.
@@ -108,7 +124,16 @@ fn dreamer_envelope_from_payload(
     payload: &serde_json::Value,
 ) -> Result<DreamerJobEnvelope, TransportError> {
     let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
-    if object.len() != 3 {
+    let has_material = object.contains_key("admitted_curation");
+    let expected_len = if has_material { 4 } else { 3 };
+    if object.len() != expected_len
+        || object.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "operation" | "context" | "request" | "admitted_curation"
+            )
+        })
+    {
         return Err(TransportError::SessionFenced);
     }
     let operation = object
@@ -126,9 +151,15 @@ fn dreamer_envelope_from_payload(
         .get("request")
         .cloned()
         .ok_or(TransportError::SessionFenced)?;
-    let envelope: DreamerJobEnvelope = serde_json::from_value(
-        serde_json::json!({"context": context_value, "request": request_value}),
-    )
+    let material_value = object
+        .get("admitted_curation")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let envelope: DreamerJobEnvelope = serde_json::from_value(serde_json::json!({
+        "context": context_value,
+        "request": request_value,
+        "admitted_curation": material_value,
+    }))
     .map_err(|_| TransportError::SessionFenced)?;
     envelope
         .context
@@ -141,6 +172,7 @@ fn dreamer_envelope_from_payload(
     if envelope.request.request_identity.operation.state_fence != envelope.context.state_fence {
         return Err(TransportError::SessionFenced);
     }
+    validate_curation_material_requirement(&envelope)?;
     Ok(envelope)
 }
 
@@ -164,6 +196,72 @@ fn dreamer_store_error_fences(error: &str) -> bool {
         || folded.contains("unknown_outcome")
         || folded.contains("timed out")
         || folded.contains("timeout")
+}
+
+/// Requires the owner closure on the canonical Curation route and refuses a
+/// closure attached to any other Dreamer route. This runs before the Store
+/// call, so a missing/tampered semantic input cannot leave a queued job that
+/// can never be launched by the production contour.
+fn validate_curation_material_requirement(
+    envelope: &DreamerJobEnvelope,
+) -> Result<(), TransportError> {
+    let (is_submit, is_curation) = match &envelope.request.operation {
+        JobOperation::Submit { submission } => (
+            true,
+            submission.admission.route_class == DREAMER_CURATION_ROUTE_CLASS,
+        ),
+        _ => (false, false),
+    };
+    let Some(material) = envelope.admitted_curation.as_ref() else {
+        if is_curation {
+            return Err(TransportError::SessionFenced);
+        }
+        return Ok(());
+    };
+    if !is_submit || !is_curation {
+        return Err(TransportError::SessionFenced);
+    }
+    material
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    let JobOperation::Submit { submission } = &envelope.request.operation else {
+        return Err(TransportError::SessionFenced);
+    };
+    material
+        .validate_for_launch(
+            submission.job_id.as_str(),
+            submission.attempt_id.as_str(),
+            envelope
+                .request
+                .request_identity
+                .request
+                .request
+                .metadata
+                .request_id
+                .as_str(),
+            envelope
+                .request
+                .request_identity
+                .operation
+                .operation_id
+                .as_str(),
+            envelope
+                .request
+                .request_identity
+                .operation
+                .idempotency_key
+                .as_str(),
+            submission.work_scope.scope_id.as_str(),
+            &envelope.context.state_fence,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+    let manifest_digest = material
+        .source_manifest_digest()
+        .map_err(|_| TransportError::SessionFenced)?;
+    if submission.semantic_input.sha256 != manifest_digest {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
 }
 
 impl KernelComposition {
@@ -371,10 +469,13 @@ impl KernelComposition {
     /// call through the retained canonical gateway and projects the answer
     /// with the frame's correlation identity echoed. A response that does
     /// not answer the admitted request fences instead of delivering a
-    /// foreign receipt. Typed store refusals return as typed replies;
+    /// foreign receipt. For a Curation `QUEUED` answer, the Windows request
+    /// path then drives the composition-pinned launch seam; terminal
+    /// `Status`/`Reconcile` answers drive the retained launch-lineage
+    /// reconciliation seam. Typed store refusals return as typed replies;
     /// fence/unknown markers and mechanical failures (missing gateway,
-    /// poisoned lock, unprojectable reply) fence the session. No spawn, no
-    /// dispatch-launch call, no second launch identity.
+    /// poisoned lock, unprojectable reply, or unknown launch outcome) fence
+    /// the session. No second launch identity is minted.
     pub async fn execute_dreamer_request(
         &self,
         session: &Session,
@@ -413,7 +514,13 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?
                 .clone()
                 .ok_or(TransportError::SessionFenced)?;
-            Self::project_dreamer_call(&*gateway, session, request_id, &envelope).await
+            let (reply, response) =
+                Self::project_dreamer_call_with_response(&*gateway, session, request_id, &envelope)
+                    .await?;
+            if let Some(response) = response {
+                self.drive_dreamer_post_claim(&envelope, &response).await?;
+            }
+            Ok(reply)
         }
         #[cfg(not(windows))]
         {
@@ -429,12 +536,30 @@ impl KernelComposition {
     /// single store call, the `validate_for` answer binding, the
     /// request-identity echo, and the refusal/fence error split run here
     /// exactly once per admitted envelope.
+    #[allow(
+        dead_code,
+        reason = "the frame-only projection remains the test seam; production uses the response-retaining projection"
+    )]
     pub(crate) async fn project_dreamer_call(
         store: &impl DreamerJobStore,
         session: &Session,
         request_id: RequestId,
         envelope: &DreamerJobEnvelope,
     ) -> Result<Frame, TransportError> {
+        Self::project_dreamer_call_with_response(store, session, request_id, envelope)
+            .await
+            .map(|(reply, _)| reply)
+    }
+
+    /// Projects one store answer and retains the typed response for the
+    /// production post-claim launch/reconcile join. The public/test helper
+    /// above intentionally keeps its historical frame-only shape.
+    async fn project_dreamer_call_with_response(
+        store: &impl DreamerJobStore,
+        session: &Session,
+        request_id: RequestId,
+        envelope: &DreamerJobEnvelope,
+    ) -> Result<(Frame, Option<DurableJobResponse>), TransportError> {
         match store
             .dreamer_job(&envelope.context, envelope.request.clone())
             .await
@@ -453,7 +578,7 @@ impl KernelComposition {
                 reply
                     .validate()
                     .map_err(|_| TransportError::SessionFenced)?;
-                Ok(reply)
+                Ok((reply, Some(response)))
             }
             Err(error) => {
                 if dreamer_store_error_fences(&error) {
@@ -473,8 +598,80 @@ impl KernelComposition {
                 reply
                     .validate()
                     .map_err(|_| TransportError::SessionFenced)?;
-                Ok(reply)
+                Ok((reply, None))
             }
+        }
+    }
+
+    /// Joins the typed Store answer to the post-claim production contour.
+    ///
+    /// A Curation `Submit` is the only owner-material launch arm. Status and
+    /// Reconcile may close a retained launch lineage only after the Store
+    /// response is terminal; an outstanding or non-terminal response remains
+    /// reconciling and is never treated as a successful launch.
+    async fn drive_dreamer_post_claim(
+        &self,
+        envelope: &DreamerJobEnvelope,
+        response: &DurableJobResponse,
+    ) -> Result<(), TransportError> {
+        match &envelope.request.operation {
+            JobOperation::Submit { submission } => {
+                let Some(material) = envelope.admitted_curation.as_ref() else {
+                    return Ok(());
+                };
+                if submission.admission.route_class != DREAMER_CURATION_ROUTE_CLASS
+                    || response.state != JobState::Queued
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                let binding =
+                    dreamer_production_binding().map_err(|_| TransportError::SessionFenced)?;
+                let launch_material = DreamerLaunchMaterial {
+                    keys: super::dispatch_launch::dreamer_dispatch_launch::DreamerLaunchKeys {
+                        job_id: response.job_id.as_str(),
+                        attempt_id: response.attempt_id.as_str(),
+                    },
+                    queued: response,
+                    admitted_curation: material,
+                    semantic_input_sha256: submission.semantic_input.sha256.as_str(),
+                    child: binding.child_binding(),
+                };
+                let outcome = launch_admitted_dreamer_attempt(
+                    self,
+                    &launch_material,
+                    crate::unix_ms().saturating_mul(1_000_000).max(1),
+                )
+                .await
+                .map_err(|_| TransportError::SessionFenced)?;
+                match outcome {
+                    super::dispatch_launch::DreamerLaunchOutcome::Launched { .. }
+                    | super::dispatch_launch::DreamerLaunchOutcome::ReplayOriginal { .. } => Ok(()),
+                    super::dispatch_launch::DreamerLaunchOutcome::LaunchUnknown { .. }
+                    | super::dispatch_launch::DreamerLaunchOutcome::NotLaunched { .. }
+                    | super::dispatch_launch::DreamerLaunchOutcome::Refused(_) => {
+                        // The Store commit remains the authority; the launch
+                        // outcome is unknown or refused and must be reconciled
+                        // by the original identity, never reported as success.
+                        Err(TransportError::SessionFenced)
+                    }
+                }
+            }
+            JobOperation::Status { .. } | JobOperation::Reconcile { .. } => {
+                if !response.state.is_terminal() {
+                    return Ok(());
+                }
+                let expected = DreamerLeaseExpectation {
+                    job_id: response.job_id.as_str().to_owned(),
+                    attempt_id: response.attempt_id.as_str().to_owned(),
+                    revision: response.revision,
+                    scope_id: response.scope.scope_id.as_str().to_owned(),
+                    fence: response.scope.state_fence.clone(),
+                };
+                reconcile_launched_dreamer_attempt(self, &expected)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -1218,6 +1415,40 @@ mod dreamer_job_dispatch_tests {
         assert!(!is_dreamer_operation(""));
     }
 
+    #[tokio::test]
+    async fn curation_submit_without_owner_material_fences_before_store() {
+        let root = temp_root("curation-material-required");
+        let kernel = ready_kernel(&root);
+        let session = eliotd_session(&kernel);
+        let fence = session.module_generation.state_fence.clone();
+        let mut operation: serde_json::Value =
+            serde_json::from_str(SUBMIT_OPERATION_JSON).expect("submit fixture");
+        operation["submission"]["admission"]["route_class"] =
+            serde_json::Value::String(DREAMER_CURATION_ROUTE_CLASS.to_owned());
+        let request = build_k2_request_from_value(
+            &mut operation,
+            JobRole::Requester,
+            &fence,
+            "k2-ctx-curation-no-material",
+            "op-k2-curation-no-material",
+            "idem-k2-curation-no-material",
+            "transport-k2-curation-no-material",
+        );
+        let payload = dreamer_payload(&request);
+        assert!(matches!(
+            dreamer_envelope_from_payload(&payload),
+            Err(TransportError::SessionFenced)
+        ));
+        let ledger = FakeDreamerLedger::new();
+        let frame = dreamer_frame(&session, "frame-k2-curation-no-material", payload);
+        assert!(matches!(
+            dispatch_then_project(&kernel, &ledger, &session, &frame).await,
+            Err(TransportError::SessionFenced)
+        ));
+        assert_eq!(ledger.call_count(), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn dreamer_store_error_classifier_fences_only_fence_and_unknown_markers() {
         assert!(dreamer_store_error_fences(
@@ -1809,6 +2040,9 @@ mod dreamer_job_dispatch_tests {
             queued.request_identity.operation.idempotency_key.as_str(),
             &fence,
         );
+        let semantic_input_sha256 = admitted_curation
+            .source_manifest_digest()
+            .expect("fixture manifest digest");
         let material = DreamerLaunchMaterial {
             keys: DreamerLaunchKeys {
                 job_id: &job_id,
@@ -1816,6 +2050,7 @@ mod dreamer_job_dispatch_tests {
             },
             queued: &queued,
             admitted_curation: &admitted_curation,
+            semantic_input_sha256: &semantic_input_sha256,
             child: DreamerChildBinding {
                 executable: &executable,
                 executable_sha256: &executable_sha256,
@@ -2068,6 +2303,9 @@ mod dreamer_job_dispatch_tests {
                 .as_str(),
             &queued_again.scope.state_fence,
         );
+        let semantic_input_sha256_again = admitted_curation_again
+            .source_manifest_digest()
+            .expect("fixture manifest digest");
         let material_again = DreamerLaunchMaterial {
             keys: DreamerLaunchKeys {
                 job_id: &job_id_again,
@@ -2075,6 +2313,7 @@ mod dreamer_job_dispatch_tests {
             },
             queued: &queued_again,
             admitted_curation: &admitted_curation_again,
+            semantic_input_sha256: &semantic_input_sha256_again,
             child: DreamerChildBinding {
                 executable: &executable,
                 executable_sha256: &executable_sha256,

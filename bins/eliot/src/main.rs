@@ -257,7 +257,7 @@ enum InstallationCommand {
         #[arg(long)]
         transaction_id: Option<String>,
     },
-    /// Materialize an exact thirteen-role Phase-A source bundle and feed it through
+    /// Materialize an exact fifteen-role Phase-A source bundle and feed it through
     /// the publication-bound generation planner. `--store` is required because
     /// the durable transaction store is the sole authority for a generated plan.
     MaterializeSourceBundle {
@@ -277,6 +277,8 @@ enum InstallationCommand {
         eliot_doctor: PathBuf,
         #[arg(long, value_parser = absolute_path)]
         eliot_testd: PathBuf,
+        #[arg(long, value_parser = absolute_path)]
+        eliot_dreamer: PathBuf,
         #[arg(long, value_parser = absolute_path)]
         eliot_native_worker: PathBuf,
         #[arg(long, value_parser = absolute_path)]
@@ -1600,6 +1602,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             eliotd,
             eliot_doctor,
             eliot_testd,
+            eliot_dreamer,
             eliot_native_worker,
             eliot_wasm_host,
             eliot_notify,
@@ -1628,6 +1631,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             eliotd,
             eliot_doctor,
             eliot_testd,
+            eliot_dreamer,
             eliot_native_worker,
             eliot_wasm_host,
             eliot_notify,
@@ -2103,6 +2107,7 @@ fn run_installation_materialize_source_bundle(
     eliotd: PathBuf,
     eliot_doctor: PathBuf,
     eliot_testd: PathBuf,
+    eliot_dreamer: PathBuf,
     eliot_native_worker: PathBuf,
     eliot_wasm_host: PathBuf,
     eliot_notify: PathBuf,
@@ -2132,6 +2137,7 @@ fn run_installation_materialize_source_bundle(
         eliotd_exe: eliotd,
         eliot_doctor_exe: eliot_doctor,
         eliot_testd_exe: eliot_testd,
+        eliot_dreamer_exe: eliot_dreamer,
         eliot_native_worker_exe: eliot_native_worker,
         eliot_wasm_host_exe: eliot_wasm_host,
         eliot_notify_exe: eliot_notify,

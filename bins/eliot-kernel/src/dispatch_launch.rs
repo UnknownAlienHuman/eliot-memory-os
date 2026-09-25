@@ -89,6 +89,9 @@
 //! lineage table enforces launch-once per job identity and fences the
 //! worker-side `LeaseExact` claim. Material, lineage, and validation live in
 //! [`dreamer_dispatch_launch`]; the arm below wires them to this contour.
+//! The production K2 requester calls this arm after a validated owner Curation
+//! `Submit` reaches `QUEUED`; terminal status/reconcile calls close the
+//! original lineage without minting another launch.
 //!
 //! Architecture: ARCH-MOD-01, A13.2, A13.3; I7.5 launch nonce, I15.2
 //! Principal and Session binding, I14.6 admission and execution axes.
@@ -137,10 +140,10 @@ use serde::{Deserialize, Serialize};
 #[path = "dreamer_dispatch_launch.rs"]
 pub(crate) mod dreamer_dispatch_launch;
 
-use dreamer_dispatch_launch::{
+use dreamer_dispatch_launch::DreamerMaterialError;
+pub use dreamer_dispatch_launch::{
     DreamerChildBinding, DreamerDispatchedEnvelope, DreamerLaunchKeys, DreamerLaunchPhase,
-    DreamerLaunchRecord, DreamerLeaseExpectation, DreamerMaterialError, DreamerReconcileOutcome,
-    DreamerReserveOutcome,
+    DreamerLaunchRecord, DreamerLeaseExpectation, DreamerReconcileOutcome, DreamerReserveOutcome,
 };
 
 use super::doctor_recovery_ledger::KernelDoctorRecoveryLedger;
@@ -726,15 +729,73 @@ struct LaunchRecords {
     by_identity: BTreeMap<String, LaunchRecord>,
 }
 
+/// Composition-pinned production binding for the optional `eliot-dreamer`
+/// executable. Host/installation supplies the path and digest; request bytes
+/// can never replace them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DreamerProductionBinding {
+    executable: PathBuf,
+    executable_sha256: String,
+    working_directory: PathBuf,
+}
+
+impl DreamerProductionBinding {
+    /// Builds and validates the immutable child binding.
+    pub fn new(
+        executable: PathBuf,
+        executable_sha256: String,
+        working_directory: PathBuf,
+    ) -> Result<Self, DispatchLaunchError> {
+        if !executable.is_absolute()
+            || executable.as_os_str().is_empty()
+            || executable.to_string_lossy().chars().any(char::is_control)
+            || executable.file_name().and_then(|name| name.to_str()) != Some("eliot-dreamer.exe")
+        {
+            return Err(DispatchLaunchError::Path(
+                "Dreamer executable must be an explicit absolute path".to_owned(),
+            ));
+        }
+        if !working_directory.is_absolute()
+            || working_directory.as_os_str().is_empty()
+            || working_directory
+                .to_string_lossy()
+                .chars()
+                .any(char::is_control)
+        {
+            return Err(DispatchLaunchError::Path(
+                "Dreamer working directory must be an explicit absolute path".to_owned(),
+            ));
+        }
+        require_digest(
+            &executable_sha256,
+            "Dreamer executable digest must be a lowercase SHA-256 digest",
+        )?;
+        Ok(Self {
+            executable,
+            executable_sha256,
+            working_directory,
+        })
+    }
+
+    pub(crate) fn child_binding(&self) -> DreamerChildBinding<'_> {
+        DreamerChildBinding {
+            executable: &self.executable,
+            executable_sha256: &self.executable_sha256,
+            working_directory: &self.working_directory,
+        }
+    }
+}
+
 /// The composed dispatch contour: the Kernel-owned principal owner, the
 /// Doctor front-door state once its production ledger lands, the installed
-/// testd/native-worker digests once their production sides compose, and the
-/// retained launch records.
+/// testd/native-worker digests once their production sides compose, the
+/// Host-injected Dreamer child binding, and the retained launch records.
 pub struct ComposedDispatchContour {
     principal_owner: String,
     doctor: Mutex<Option<DoctorFrontDoorState>>,
     testd_installed_digest: Mutex<Option<String>>,
     native_worker_installed_digest: Mutex<Option<String>>,
+    dreamer: Mutex<Option<DreamerProductionBinding>>,
     launches: Mutex<LaunchRecords>,
 }
 
@@ -851,6 +912,7 @@ pub fn compose_dispatch_contour(principal_owner: String) -> Result<(), DispatchL
             doctor: Mutex::new(None),
             testd_installed_digest: Mutex::new(None),
             native_worker_installed_digest: Mutex::new(None),
+            dreamer: Mutex::new(None),
             launches: Mutex::new(LaunchRecords::default()),
         })
         .map_err(|_| DispatchLaunchError::AlreadyComposed("dispatch contour"))?;
@@ -985,6 +1047,57 @@ pub fn compose_production_native_worker_front_door(
     }
     *composed = Some(installed_native_worker_digest.to_owned());
     Ok(())
+}
+
+/// Composes the production Dreamer child binding from Host-injected launch
+/// inputs. The binding is set once and is never reconstructed from a job
+/// payload, process name, current directory, or environment variable.
+pub fn compose_production_dreamer_front_door(
+    binding: DreamerProductionBinding,
+) -> Result<(), DispatchLaunchError> {
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed(
+            "compose the dispatch contour before its Dreamer side",
+        ))?;
+    let mut composed = contour
+        .dreamer
+        .lock()
+        .map_err(|_| DispatchLaunchError::Gate("Dreamer front-door lock poisoned".to_owned()))?;
+    if composed.is_some() {
+        return Err(DispatchLaunchError::AlreadyComposed("Dreamer front door"));
+    }
+    *composed = Some(binding);
+    Ok(())
+}
+
+/// Returns whether the production Dreamer binding was composed.
+#[must_use]
+pub fn dreamer_production_composed() -> bool {
+    DISPATCH_CONTOUR.get().is_some_and(|contour| {
+        contour
+            .dreamer
+            .lock()
+            .is_ok_and(|composed| composed.is_some())
+    })
+}
+
+/// Clones the immutable production binding for one request handler call.
+pub(crate) fn dreamer_production_binding() -> Result<DreamerProductionBinding, DispatchLaunchError>
+{
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed(
+            "Dreamer production binding",
+        ))?;
+    contour
+        .dreamer
+        .lock()
+        .map_err(|_| DispatchLaunchError::Gate("Dreamer front-door lock poisoned".to_owned()))?
+        .clone()
+        .ok_or(DispatchLaunchError::Uncomposed(
+            "Dreamer production binding",
+        ))
 }
 
 /// Returns whether the production testd side is composed with its installed
@@ -4327,10 +4440,6 @@ pub fn reconcile_launched_native_worker_attempt(
 /// [`DispatchedWorkerKind::material_file_name`]). No executable bytes are
 /// taken from caller input: the child binding (path/digest/workdir) stays
 /// composition-pinned.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub struct DreamerLaunchMaterial<'a> {
     /// Job/attempt lookup keys; must be answered by `queued`.
     pub keys: DreamerLaunchKeys<'a>,
@@ -4343,15 +4452,14 @@ pub struct DreamerLaunchMaterial<'a> {
     /// Kernel only transports and binds it; the Dreamer contract owner and
     /// child revalidate its semantics.
     pub admitted_curation: &'a AdmittedCurationMaterial,
+    /// SHA-256 carried by the K0 semantic-input reference. The owner route
+    /// must make it equal to the frozen owner-manifest digest.
+    pub semantic_input_sha256: &'a str,
     /// Composition-pinned child binary anchor.
     pub child: DreamerChildBinding<'a>,
 }
 
 /// Why a prepared Dreamer launch produced no child.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DreamerLaunchSkip {
     /// The admitted response is not `QUEUED` (already leased, running, or
@@ -4361,10 +4469,6 @@ pub enum DreamerLaunchSkip {
 
 /// A prepared Dreamer launch: admitted, lineage-bound, and (unless skipped)
 /// written to the protected dispatch file, ready to spawn.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 #[allow(
     clippy::large_enum_variant,
     reason = "Ready carries the full spawn binding like PreparedDoctorLaunch::Ready; boxing it would diverge from the sibling seam shape"
@@ -4393,10 +4497,6 @@ pub enum PreparedDreamerLaunch {
 
 /// A Dreamer launch ready to spawn: every authority check passed and the
 /// dispatch file carries exactly what the child reader validates.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub struct ReadyDreamerLaunch {
     /// Exact queued job identity (lineage key for spawn settle).
     pub job_id: String,
@@ -4421,10 +4521,6 @@ pub struct ReadyDreamerLaunch {
 }
 
 /// Outcome of one Dreamer admit-then-launch call.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub enum DreamerLaunchOutcome {
     /// The child was spawned through the admitted executor.
     Launched {
@@ -4464,10 +4560,6 @@ pub enum DreamerLaunchOutcome {
 
 /// Maps a contour error into the Dreamer launch error: caller-material
 /// defects stay `InvalidMaterial`, everything else fails closed as `Gate`.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 fn dreamer_launch_error(error: DispatchLaunchError) -> DreamerMaterialError {
     match error {
         DispatchLaunchError::InvalidMaterial(detail) => {
@@ -4492,10 +4584,6 @@ fn dreamer_launch_error(error: DispatchLaunchError) -> DreamerMaterialError {
 /// [`write_material_file`]. Nothing is spawned here:
 /// [`launch_admitted_dreamer_attempt`] spawns the returned
 /// [`ReadyDreamerLaunch`] through the admitted executor.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 #[allow(
     clippy::too_many_lines,
     reason = "admit, reserve, nonce, grant, closed-loop proof, and material-write stay in one ordered authority path so no launch step can run before its gate"
@@ -4543,6 +4631,11 @@ pub fn prepare_dreamer_launch(
         .admitted_curation
         .source_manifest_digest()
         .map_err(|error| DreamerMaterialError::InvalidMaterial(error.to_string()))?;
+    if material.semantic_input_sha256 != admitted_curation_digest {
+        return Err(DreamerMaterialError::InvalidMaterial(
+            "K0 semantic_input digest does not equal the frozen owner Curation manifest".to_owned(),
+        ));
+    }
     material
         .admitted_curation
         .validate_for_launch(
@@ -4721,10 +4814,6 @@ pub fn prepare_dreamer_launch(
 /// process owner. The admitted-job material travels only over the protected
 /// dispatch file the child reads; a spawn failure reaps the file
 /// best-effort so a stale presentation never lingers.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub async fn start_ready_dreamer_launch(
     kernel: &KernelComposition,
     ready: &ReadyDreamerLaunch,
@@ -4766,10 +4855,6 @@ pub async fn start_ready_dreamer_launch(
 /// the file and releases the reservation; an unknown spawn outcome retains
 /// the launch as unreconciled for
 /// [`reconcile_launched_dreamer_attempt`].
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub async fn launch_admitted_dreamer_attempt(
     kernel: &KernelComposition,
     material: &DreamerLaunchMaterial<'_>,
@@ -4838,10 +4923,6 @@ pub async fn launch_admitted_dreamer_attempt(
 /// [`dreamer_dispatch_launch::release_dreamer_launch`] (or a process
 /// restart) is the only slot release besides this reconcile — the same
 /// shape as the testd arm.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub fn reconcile_launched_dreamer_attempt(
     kernel: &KernelComposition,
     expected: &DreamerLeaseExpectation,

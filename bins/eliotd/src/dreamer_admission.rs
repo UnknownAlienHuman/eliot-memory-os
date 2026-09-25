@@ -1,4 +1,5 @@
-//! Governor Dreamer orientation intake join (T12-06, integration #702, semantic #18).
+//! Governor Dreamer intake join for Orientation and owner-admitted Curation
+//! (T12-06/T12-09, integration #702, semantic #18).
 //!
 //! Architecture: A2.3 (contract → ports → adapters layering); A10.4 delegation (one bounded
 //! causal join); A0.3 hard boundaries stay fail-closed. Implementation: T12-06 Governor T1.8
@@ -8,19 +9,20 @@
 //! existing Governor admission gate and the K0/K1/K2/Store queue: readiness plus fence binding
 //! first, then the read-only material freeze/resolution from
 //! [`crate::dreamer_materials`], then exactly one queue submission through the [`DreamerJobQueue`]
-//! port, then the `QUEUED` response binding. Every failure fails closed before any queue
-//! admission or model work, and this helper never mints a permit: pending T1.8 is implemented in
-//! its owning turn, so without a genuinely admitted input (ready Governor, exact fence, matching
-//! source digests) nothing queues.
+//! port, then the `QUEUED` response binding. [`GovernorDreamerAdapter::submit_curation`]
+//! applies the same boundary to an already owner-resolved Curation closure; it never reads,
+//! synthesizes, or repairs source/evidence material. Every failure fails closed before any queue
+//! admission or model work, and neither helper mints a permit.
 //!
 //! The typed `eliot-dreamer-orientation::AdmittedOrientationJob` import stays out of this slice
 //! (GAP-1: the Orientation leaf is not workspace-admitted; the controller turn owns that
-//! admission). The intake shape here ([`OrientationSubmitInput`]) uses only admitted leaves and
-//! types: the K0 submit contract plus the local material claims.
+//! admission). The intake shapes here use only admitted leaves and types: the K0 submit contract,
+//! local Orientation material claims, or the complete owner-admitted Curation closure.
 
 use std::sync::Arc;
 
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
+use eliot_dreamer_contracts::AdmittedCurationMaterial;
 use eliot_governor::{CompositionError, CompositionReadiness, KernelPortError};
 use eliot_protocol::dreamer_job::{
     DurableJobRequest, DurableJobResponse, JobOperation, JobRole, JobState, JobSubmission,
@@ -41,6 +43,20 @@ use crate::kernel_context_read_client::KernelContextReadClient;
 /// owns that string. The pin test below guards accidental local drift; a kernel-side change
 /// belongs to the K2 owner, never to a silent local edit.
 pub const DREAMER_JOB_WIRE_ID: &str = "eliot.kernel.dreamer-job";
+
+/// Canonical route class for the owner-admitted Curation intake.
+pub const DREAMER_CURATION_ROUTE_CLASS: &str = "dreamer_curation";
+
+/// One Curation intake for Governor-routed queue submission. The complete
+/// owner closure is supplied by the semantic owner; this adapter never reads,
+/// synthesizes, or repairs Curation source/protection material.
+#[derive(Clone, Debug)]
+pub struct CurationSubmitInput {
+    /// Closed K0 submit request with the requester role and Curation route.
+    pub request: DurableJobRequest,
+    /// Complete owner-admitted Curation semantic/source/evidence closure.
+    pub material: AdmittedCurationMaterial,
+}
 
 /// One Orientation intake for Governor-routed queue submission.
 ///
@@ -75,6 +91,21 @@ pub trait DreamerJobQueue {
         context: RequestMetadata,
         request: DurableJobRequest,
     ) -> impl Future<Output = Result<DurableJobResponse, CompositionError>>;
+
+    /// Submits one owner-admitted Curation closure through the same route.
+    /// Ports that do not admit owner material fail closed by default.
+    fn submit_curation(
+        &self,
+        _context: RequestMetadata,
+        _request: DurableJobRequest,
+        _material: AdmittedCurationMaterial,
+    ) -> impl Future<Output = Result<DurableJobResponse, CompositionError>> {
+        async {
+            Err(owner_error(
+                "this Dreamer queue port does not admit owner Curation material",
+            ))
+        }
+    }
 }
 
 /// Production [`DreamerJobQueue`] over the authenticated Kernel K2 route.
@@ -94,11 +125,12 @@ impl<'a> KernelDreamerJobQueue<'a> {
     }
 }
 
-impl DreamerJobQueue for KernelDreamerJobQueue<'_> {
-    async fn submit(
+impl KernelDreamerJobQueue<'_> {
+    async fn submit_with_material(
         &self,
         context: RequestMetadata,
         request: DurableJobRequest,
+        material: Option<AdmittedCurationMaterial>,
     ) -> Result<DurableJobResponse, CompositionError> {
         request
             .validate()
@@ -111,12 +143,31 @@ impl DreamerJobQueue for KernelDreamerJobQueue<'_> {
                 "dreamer queue context fence does not match the request fence",
             ));
         }
+        let mut payload = serde_json::Map::from_iter([
+            (
+                "context".to_owned(),
+                serde_json::to_value(context).map_err(|error| {
+                    owner_error(format!("dreamer queue context encoding: {error}"))
+                })?,
+            ),
+            (
+                "request".to_owned(),
+                serde_json::to_value(&request).map_err(|error| {
+                    owner_error(format!("dreamer queue request encoding: {error}"))
+                })?,
+            ),
+        ]);
+        if let Some(material) = material {
+            payload.insert(
+                "admitted_curation".to_owned(),
+                serde_json::to_value(material).map_err(|error| {
+                    owner_error(format!("dreamer curation material encoding: {error}"))
+                })?,
+            );
+        }
         let value = self
             .kernel
-            .transact_async(
-                DREAMER_JOB_WIRE_ID,
-                serde_json::json!({"context": context, "request": request}),
-            )
+            .transact_async(DREAMER_JOB_WIRE_ID, serde_json::Value::Object(payload))
             .await
             .map_err(kernel_port_error)
             .map_err(CompositionError::Kernel)?;
@@ -127,6 +178,26 @@ impl DreamerJobQueue for KernelDreamerJobQueue<'_> {
             .validate_for(&request)
             .map_err(|error| owner_error(format!("dreamer queue response: {error}")))?;
         Ok(response)
+    }
+}
+
+impl DreamerJobQueue for KernelDreamerJobQueue<'_> {
+    async fn submit(
+        &self,
+        context: RequestMetadata,
+        request: DurableJobRequest,
+    ) -> Result<DurableJobResponse, CompositionError> {
+        self.submit_with_material(context, request, None).await
+    }
+
+    async fn submit_curation(
+        &self,
+        context: RequestMetadata,
+        request: DurableJobRequest,
+        material: AdmittedCurationMaterial,
+    ) -> Result<DurableJobResponse, CompositionError> {
+        self.submit_with_material(context, request, Some(material))
+            .await
     }
 }
 
@@ -188,6 +259,37 @@ impl<'a> GovernorDreamerAdapter<'a> {
         }
         let service = ReadService::new(KernelContextReadClient::new(Arc::clone(self.kernel)));
         submit_admitted_orientation(readiness, &admitted, &service, &ctx, input, queue).await
+    }
+
+    /// Submits one complete owner-admitted Curation closure through the
+    /// production K2 route. No source, evidence, or launch identity is
+    /// synthesized in this composition adapter.
+    pub async fn submit_curation(
+        &self,
+        input: &CurationSubmitInput,
+        queue: &impl DreamerJobQueue,
+    ) -> Result<DurableJobResponse, CompositionError> {
+        let admitted = self.composition.kernel_snapshot().state_fence();
+        let readiness = self.composition.readiness();
+        let ctx = self.dreamer_route_context()?;
+        if ctx.state_fence != admitted {
+            return Err(owner_error(
+                "dreamer route context does not match the admitted snapshot",
+            ));
+        }
+        submit_admitted_curation(readiness, &admitted, &ctx, input, queue).await
+    }
+
+    /// Production convenience path over the already-connected authenticated
+    /// Kernel client. This constructs no owner material and no queue seam; it
+    /// only binds the existing production K2 port so callers cannot
+    /// accidentally route a Curation closure through an unrelated port.
+    pub async fn submit_curation_to_kernel(
+        &self,
+        input: &CurationSubmitInput,
+    ) -> Result<DurableJobResponse, CompositionError> {
+        let queue = KernelDreamerJobQueue::new(self.kernel.as_ref());
+        Box::pin(self.submit_curation(input, &queue)).await
     }
 }
 
@@ -264,6 +366,80 @@ pub(crate) async fn submit_admitted_orientation<'a>(
     bind_queued_response(&input.request, response)
 }
 
+/// Core Curation intake flow over the already owner-resolved material.
+pub(crate) async fn submit_admitted_curation(
+    readiness: CompositionReadiness,
+    admitted_fence: &StateFence,
+    ctx: &RequestMetadata,
+    input: &CurationSubmitInput,
+    queue: &impl DreamerJobQueue,
+) -> Result<DurableJobResponse, CompositionError> {
+    if readiness != CompositionReadiness::Ready {
+        return Err(CompositionError::NotReady);
+    }
+    let request = &input.request;
+    request
+        .validate()
+        .map_err(|error| owner_error(format!("dreamer curation request: {error}")))?;
+    let JobOperation::Submit { submission } = &request.operation else {
+        return Err(owner_error(
+            "dreamer curation intake admits only SUBMIT_JOB",
+        ));
+    };
+    if request.role != JobRole::Requester {
+        return Err(owner_error(
+            "dreamer curation intake requires the requester role",
+        ));
+    }
+    if submission.admission.route_class != DREAMER_CURATION_ROUTE_CLASS {
+        return Err(owner_error(
+            "dreamer curation intake requires the canonical Curation route class",
+        ));
+    }
+    if request.request_identity.operation.state_fence != *admitted_fence
+        || ctx.state_fence != *admitted_fence
+    {
+        return Err(owner_error(
+            "dreamer curation request or context fence is stale",
+        ));
+    }
+    input
+        .material
+        .validate()
+        .map_err(|error| owner_error(format!("dreamer curation material: {error}")))?;
+    input
+        .material
+        .validate_for_launch(
+            submission.job_id.as_str(),
+            submission.attempt_id.as_str(),
+            request
+                .request_identity
+                .request
+                .request
+                .metadata
+                .request_id
+                .as_str(),
+            request.request_identity.operation.operation_id.as_str(),
+            request.request_identity.operation.idempotency_key.as_str(),
+            submission.work_scope.scope_id.as_str(),
+            admitted_fence,
+        )
+        .map_err(|error| owner_error(format!("dreamer curation launch binding: {error}")))?;
+    let manifest_digest = input
+        .material
+        .source_manifest_digest()
+        .map_err(|error| owner_error(format!("dreamer curation source manifest: {error}")))?;
+    if submission.semantic_input.sha256 != manifest_digest {
+        return Err(owner_error(
+            "dreamer curation semantic_input does not name the frozen owner manifest",
+        ));
+    }
+    let response = queue
+        .submit_curation(ctx.clone(), request.clone(), input.material.clone())
+        .await?;
+    bind_queued_response(request, response)
+}
+
 /// Admits one K0 request for orientation intake: shape-valid `SUBMIT_JOB` with the requester
 /// role at the exact admitted fence.
 fn admit_orientation_request<'a>(
@@ -298,9 +474,7 @@ pub(crate) fn bind_queued_response(
         .validate_for(request)
         .map_err(|error| owner_error(format!("dreamer queue response: {error}")))?;
     if response.state != JobState::Queued {
-        return Err(owner_error(
-            "dreamer orientation submit did not reach QUEUED",
-        ));
+        return Err(owner_error("Dreamer submit did not reach QUEUED"));
     }
     Ok(response)
 }

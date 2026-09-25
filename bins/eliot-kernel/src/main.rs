@@ -40,8 +40,9 @@ use eliot_kernel::kernel_diagnostics::{
     EntrypointStage, install_kernel_diagnostics, observe_entrypoint, observe_terminal_error,
 };
 use eliot_kernel::{
-    EliotdReceiptRootBinding, KernelBuildError, KernelComposition, KernelConfig,
-    KernelDoctorRecoveryLedger, compose_dispatch_contour, compose_production_doctor_front_door,
+    DreamerProductionBinding, EliotdReceiptRootBinding, KernelBuildError, KernelComposition,
+    KernelConfig, KernelDoctorRecoveryLedger, compose_dispatch_contour,
+    compose_production_doctor_front_door, compose_production_dreamer_front_door,
     compose_production_native_worker_front_door, compose_production_testd_front_door,
 };
 
@@ -154,6 +155,33 @@ async fn main() {
         );
     };
     kernel_config = kernel_config.with_native_worker_artifact_sha256(native_worker_artifact_sha256);
+    let Some(dreamer_artifact_sha256) = options.dreamer_artifact_sha256.clone() else {
+        exit_error(
+            "DREAMER_ARTIFACT_CONTRACT_REQUIRED",
+            "Host launch must inject the independent Dreamer executable digest",
+        );
+    };
+    let Some(dreamer_executable_path) = options.dreamer_executable_path.clone() else {
+        exit_error(
+            "DREAMER_PATH_CONTRACT_REQUIRED",
+            "Host launch must inject the exact Dreamer executable path bound to the digested role",
+        );
+    };
+    let dreamer_working_directory = dreamer_executable_path
+        .parent()
+        .map(|path| path.to_path_buf());
+    let Some(dreamer_working_directory) = dreamer_working_directory else {
+        exit_error(
+            "DREAMER_PATH_CONTRACT_REQUIRED",
+            "Dreamer executable path must have an explicit installation parent directory",
+        );
+    };
+    let dreamer_binding = DreamerProductionBinding::new(
+        dreamer_executable_path,
+        dreamer_artifact_sha256,
+        dreamer_working_directory,
+    )
+    .unwrap_or_else(|error| exit_error("DREAMER_BINDING_CONTRACT_REQUIRED", &error.to_string()));
     let authority_path = options.authority_descriptor.clone();
     let authority_contour = startup_binding::authority_contour(&options.work_root, &authority_path);
     let kernel = Arc::new(
@@ -175,10 +203,10 @@ async fn main() {
         // startup binding (the installation identity — never a
         // request-envelope value). This answers the #1467 residual of zero
         // production callers: the testd/native admit sides go live here.
-        // The 24-value contour now carries the installed
-        // doctor/testd/native-worker digests (fail-closed above, threaded
-        // through `KernelConfig` with no defaults), so all three sides
-        // compose here: the Doctor side through
+        // The 28-value contour now carries the installed
+        // doctor/testd/native-worker/dreamer bindings (fail-closed above,
+        // with no path or digest defaults), so all four worker sides compose
+        // here: the Doctor side through
         // `compose_production_doctor_front_door` (durable
         // `KernelDoctorRecoveryLedger` plus
         // `DoctorRecipeRegistry::production_health_probe`), and the testd
@@ -221,6 +249,9 @@ async fn main() {
             );
         };
         if let Err(error) = compose_production_native_worker_front_door(&native_worker_digest) {
+            exit_error("DISPATCH_COMPOSITION_FAILURE", &error.to_string());
+        }
+        if let Err(error) = compose_production_dreamer_front_door(dreamer_binding) {
             exit_error("DISPATCH_COMPOSITION_FAILURE", &error.to_string());
         }
     }

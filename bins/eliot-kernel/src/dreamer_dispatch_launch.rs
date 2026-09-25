@@ -81,25 +81,13 @@ pub const DREAMER_MATERIAL_FILE_NAME: &str = "eliot-dreamer.admitted-job.json";
 /// Upper bound for the dispatch file: the admitted job envelope is small
 /// (identities, fence, epoch, nonce, grant); this adds ample headroom
 /// without accepting unbounded input. Mirrors the Doctor/testd bound.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub const DREAMER_MATERIAL_LIMIT_BYTES: u64 = 256 * 1024;
 
 /// Session-nonce shape bounds (I7.5): opaque, bounded, never invented by the
 /// child.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub const DREAMER_NONCE_MIN_LEN: usize = 16;
 /// Session-nonce shape bounds (I7.5): opaque, bounded, never invented by the
 /// child.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub const DREAMER_NONCE_MAX_LEN: usize = 256;
 
 /// Nonce prefix distinguishing Dreamer launch nonces. Matches
@@ -114,10 +102,6 @@ pub const DREAMER_OPERATION_PREFIX: &str = "dreamer-launch";
 /// Typed failure for Dreamer dispatch material and lineage. Every variant is
 /// fail-closed: no lineage is retained, no file is staged, and no child is
 /// spawned on error.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 #[derive(Debug)]
 pub enum DreamerMaterialError {
     /// Caller-supplied launch keys or composition-pinned child binding
@@ -158,10 +142,6 @@ impl std::error::Error for DreamerMaterialError {}
 /// session fail-closed (MGR02 reader). The concrete `ProcessRequest` is
 /// intentionally absent: the child derives its one-shot permit in-process
 /// from `grant` through the exact broker constructors.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DreamerDispatchedEnvelope {
@@ -195,10 +175,6 @@ pub struct DreamerDispatchedEnvelope {
 /// bound against, the session nonce, and the Kernel-issued launch grant.
 /// This value alone (without the local dispatch authority the child builds
 /// from `grant`) never drives execution.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedDreamerMaterial {
     /// Exact queued job identity.
@@ -226,10 +202,6 @@ pub struct ValidatedDreamerMaterial {
 /// Caller-presented Dreamer launch keys: the job/attempt lookup identities
 /// only. Scope, fence, revision, epoch, and generation always come from the
 /// durable ledger response plus live authority, never from these keys.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DreamerLaunchKeys<'a> {
     /// Exact queued job identity to look up.
@@ -246,10 +218,6 @@ pub struct DreamerLaunchKeys<'a> {
 /// injection through the installation manifest; never from wire, argv, or
 /// the environment. `executable_sha256` is the composition-pinned installed
 /// Dreamer image digest the launch binds (never minted here).
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DreamerChildBinding<'a> {
     /// Absolute path of the composition-pinned `eliot-dreamer` executable.
@@ -296,16 +264,8 @@ pub struct DreamerLaunchRecord {
     /// Protected dispatch file path the child reads, once staged.
     pub material_path: Option<PathBuf>,
     /// I7.5/I15.2 launch nonce written to the dispatch file.
-    #[allow(
-        dead_code,
-        reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-    )]
     pub nonce: String,
     /// Deterministic child operation identity.
-    #[allow(
-        dead_code,
-        reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-    )]
     pub operation_id: String,
     /// Grant digest binding the launch (`DispatchGrant::grant_digest`).
     pub grant_digest: String,
@@ -316,10 +276,6 @@ pub struct DreamerLaunchRecord {
 /// Expected Dreamer lineage for one claim/reconcile proof: the exact queued
 /// values the presenter must reproduce. Nothing here is trusted until it
 /// equals the retained lineage under live authority.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DreamerLeaseExpectation {
     /// Exact queued job identity.
@@ -335,10 +291,6 @@ pub struct DreamerLeaseExpectation {
 }
 
 /// Outcome of reserving one Dreamer launch lineage.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 #[derive(Clone, Debug)]
 pub enum DreamerReserveOutcome {
     /// Freshly reserved under the job identity.
@@ -351,10 +303,6 @@ pub enum DreamerReserveOutcome {
 
 /// Outcome of reconciling one launched Dreamer lineage by its original job
 /// identity.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DreamerReconcileOutcome {
     /// The lineage converged under the original identity; carries the
@@ -395,10 +343,6 @@ fn dreamer_launches() -> &'static Mutex<BTreeMap<String, DreamerLaunchRecord>> {
 /// Requires bounded non-blank text without control characters, mirroring the
 /// kernel-service wire-text rule so staged identities match what admission
 /// would refuse.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub(crate) fn require_dreamer_text(
     value: &str,
     what: &'static str,
@@ -422,10 +366,6 @@ pub(crate) fn require_dreamer_text(
 }
 
 /// Requires a lowercase SHA-256 digest, mirroring the Kernel grant gate.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub(crate) fn require_dreamer_digest(
     value: &str,
     what: &'static str,
@@ -446,10 +386,6 @@ pub(crate) fn require_dreamer_digest(
 /// identities only. Scope, fence, revision, epoch, and generation always
 /// come from the durable ledger response plus live authority, never from
 /// these keys.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub(crate) fn validate_dreamer_launch_keys(
     keys: &DreamerLaunchKeys<'_>,
 ) -> Result<(), DreamerMaterialError> {
@@ -464,10 +400,6 @@ pub(crate) fn validate_dreamer_launch_keys(
 /// next to it), its expected digest must be well-formed, and the working
 /// directory must be non-blank. Nothing is discovered from argv or the
 /// environment.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub(crate) fn validate_dreamer_child_binding(
     binding: &DreamerChildBinding<'_>,
 ) -> Result<(), DreamerMaterialError> {
@@ -491,10 +423,6 @@ pub(crate) fn validate_dreamer_child_binding(
 /// Requires a well-formed opaque session nonce: bounded length over the
 /// explicit hyphen/underscore/dot alphanumeric alphabet. The value is never
 /// interpreted, only carried for the Kernel-side claim proof.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 fn validate_dreamer_nonce(nonce: &str) -> Result<(), DreamerMaterialError> {
     if !(DREAMER_NONCE_MIN_LEN..=DREAMER_NONCE_MAX_LEN).contains(&nonce.len())
         || !nonce
@@ -520,10 +448,6 @@ fn validate_dreamer_nonce(nonce: &str) -> Result<(), DreamerMaterialError> {
 /// Doctor/testd/native mint: the epoch already identifies the authority
 /// lineage, and the lineage table (not a shared contour cell) owns this
 /// seam. Violations fail closed instead of launching.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub(crate) fn mint_dreamer_nonce(
     job_id: &str,
     attempt_id: &str,
@@ -576,10 +500,6 @@ pub(crate) fn mint_dreamer_nonce(
 /// this function proves the bound (size) but never the authority. Files are
 /// never read here, and nothing travels via argv, stdin, or the
 /// environment.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub(crate) fn dreamer_material_bytes(
     envelope: &DreamerDispatchedEnvelope,
 ) -> Result<Vec<u8>, DreamerMaterialError> {
@@ -598,10 +518,6 @@ pub(crate) fn dreamer_material_bytes(
 /// Unknown fields are rejected so the handoff cannot be widened without a
 /// contract change. The parsed value is still untrusted presenter bytes
 /// until [`validate_dreamer_material`] binds it against live authority.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub(crate) fn parse_dreamer_material_bytes(
     bytes: &[u8],
 ) -> Result<DreamerDispatchedEnvelope, DreamerMaterialError> {
@@ -627,10 +543,6 @@ pub(crate) fn parse_dreamer_material_bytes(
 /// child derives its permit from (`DispatchGrant::validate_for_child`) bound
 /// to the live epoch and the presented generation. A foreign or stale epoch,
 /// generation, or grant is a refusal, never a fallback.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub(crate) fn validate_dreamer_material(
     envelope: &DreamerDispatchedEnvelope,
     live_epoch: &EpochId,
@@ -718,10 +630,6 @@ pub(crate) fn validate_dreamer_material(
 /// RETAINED original record so the caller rewrites byte-identical material
 /// and never spawns a second worker; changed terms under one identity
 /// refuse instead of overwriting the original.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub(crate) fn reserve_dreamer_launch(
     record: DreamerLaunchRecord,
 ) -> Result<DreamerReserveOutcome, DreamerMaterialError> {
@@ -753,10 +661,6 @@ pub(crate) fn reserve_dreamer_launch(
 ///
 /// Best-effort: a missing (already released) slot is not an error; the file
 /// write itself already succeeded and the caller carries the path.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub(crate) fn note_dreamer_material_path(job_id: &str, material_path: PathBuf) {
     if let Ok(mut launches) = dreamer_launches().lock()
         && let Some(record) = launches.get_mut(job_id)
@@ -769,10 +673,6 @@ pub(crate) fn note_dreamer_material_path(job_id: &str, material_path: PathBuf) {
 /// A later call may retry cleanly under the same identity. Only a still
 /// `Reserved` slot is released, so a concurrently launched lineage is never
 /// freed by a stale caller.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub(crate) fn release_dreamer_reservation(job_id: &str) {
     if let Ok(mut launches) = dreamer_launches().lock()
         && launches
@@ -789,10 +689,6 @@ pub(crate) fn release_dreamer_reservation(job_id: &str) {
 /// A concurrent duplicate never overwrites the original nonce, operation, or
 /// grant digest, so the claim proof and reconciliation always name the
 /// original lineage.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub(crate) fn retain_dreamer_launch_as(
     job_id: &str,
     phase: DreamerLaunchPhase,
@@ -843,10 +739,6 @@ pub(crate) fn dreamer_launch_permits_lease(
 /// best-effort from the returned path. Anything still outstanding stays
 /// unreconciled for a later call, and unknown identities report unknown
 /// instead of inventing state.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 pub(crate) fn reconcile_dreamer_launch(
     expected: &DreamerLeaseExpectation,
     live_epoch: &EpochId,
@@ -885,10 +777,7 @@ pub(crate) fn reconcile_dreamer_launch(
 /// released. Documented use: the durable terminality of a Dreamer job lives
 /// in the Store ledger, so an operator release (or process restart) is the
 /// only slot release besides reconcile.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
+#[cfg(test)]
 pub(crate) fn release_dreamer_launch(
     job_id: &str,
     grant_digest: &str,
@@ -1159,10 +1048,6 @@ pub(crate) fn test_admitted_curation_material(
 }
 
 /// Bounds third-party error detail carried into deny lines.
-#[allow(
-    dead_code,
-    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
-)]
 fn truncate_detail(detail: &str) -> String {
     const LIMIT: usize = 256;
     detail.chars().take(LIMIT).collect()
