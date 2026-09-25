@@ -995,6 +995,20 @@ pub enum MemoryState {
     Unknown,
 }
 
+/// Proof readiness carried by an [`OnboardingReadinessReceipt`].
+///
+/// Compilation observes no truth surface or verifier directly: it records
+/// whether at least one admitted governing source backs the receipt, or an
+/// honest no-proof disposition when none does. A receipt with
+/// [`ProofReadiness::NoProofSurface`] never invents proof; the missing proof
+/// surfaces as a typed onboarding directive through the readiness surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofReadiness {
+    AdmittedSources,
+    NoProofSurface,
+}
+
 /// Governor-owned cold-start readiness receipt.
 ///
 /// This is the compiled first-useful-work gate: it binds one exact scope,
@@ -1040,6 +1054,25 @@ pub struct OnboardingReadinessReceipt {
     pub missing_inputs: Vec<String>,
     pub next_safe_action: String,
     pub receipt_revision: u64,
+    /// Every source handle the discovery pass produced, in governing-set order.
+    pub discovered_source_refs: Vec<String>,
+    /// Admitted authoritative source handles backing this receipt.
+    pub admitted_source_refs: Vec<String>,
+    /// Conflicting or stale source handles plus unresolved conflict refs.
+    pub conflicting_source_refs: Vec<String>,
+    /// Omitted or unavailable source handles.
+    pub unavailable_source_refs: Vec<String>,
+    /// Store identity from the bound lineage; absent when no lineage is bound.
+    pub store_identity_ref: Option<String>,
+    /// Proof readiness at compile time (admitted sources or honest no-proof).
+    pub proof_readiness: ProofReadiness,
+    /// Minimum understanding seed: scope, instance, root, governing-set and
+    /// task handles the first useful work must ground on.
+    pub minimum_understanding_seed: Vec<String>,
+    /// Proposed first-maintenance job handles; proposed, never started here.
+    pub maintenance_recommendations: Vec<String>,
+    /// Lease deadline carried as the receipt expiry.
+    pub expiry_tick: u64,
 }
 
 impl OnboardingReadinessReceipt {
@@ -1142,6 +1175,54 @@ impl OnboardingReadinessReceipt {
         }
         for missing in &self.missing_inputs {
             text(missing, "missing_inputs")?;
+        }
+        Self::check_refs(&self.discovered_source_refs, "discovered_source_refs", 32)?;
+        Self::check_refs(&self.admitted_source_refs, "admitted_source_refs", 32)?;
+        Self::check_refs(&self.conflicting_source_refs, "conflicting_source_refs", 32)?;
+        Self::check_refs(&self.unavailable_source_refs, "unavailable_source_refs", 32)?;
+        Self::check_store_seed_maintenance(self)?;
+        counter(self.expiry_tick, "expiry_tick")?;
+        Ok(())
+    }
+
+    /// Validates the store, seed, and maintenance views of one receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store reference is blank, the seed is empty,
+    /// or a bounded collection leaves its range.
+    fn check_store_seed_maintenance(receipt: &Self) -> Result<(), WorkScopeError> {
+        if let Some(store) = &receipt.store_identity_ref {
+            text(store, "store_identity_ref")?;
+        }
+        Self::check_refs(
+            &receipt.minimum_understanding_seed,
+            "minimum_understanding_seed",
+            8,
+        )?;
+        if receipt.minimum_understanding_seed.is_empty() {
+            return Err(WorkScopeError::EmptyCollection {
+                field: "minimum_understanding_seed",
+            });
+        }
+        Self::check_refs(
+            &receipt.maintenance_recommendations,
+            "maintenance_recommendations",
+            8,
+        )
+    }
+
+    fn check_refs(
+        values: &[String],
+        field: &'static str,
+        max: usize,
+    ) -> Result<(), WorkScopeError> {
+        if values.len() > max {
+            return Err(WorkScopeError::EmptyCollection { field });
+        }
+        unique(values.iter(), field)?;
+        for value in values {
+            text(value, field)?;
         }
         Ok(())
     }
@@ -1350,6 +1431,17 @@ impl ColdStartController {
         Self::check_fence_sources_privacy(state_fence, sources, scope, candidate, privacy, lease)?;
         let (task_binding, scope_resolution, readiness, missing_inputs, next_safe_action) =
             Self::resolve_task_binding(task)?;
+        let governing_source_set_ref = format!(
+            "governing-source-set:{}:{}",
+            sources.scope_ref, sources.generation
+        );
+        let (
+            discovered_source_refs,
+            admitted_source_refs,
+            conflicting_source_refs,
+            unavailable_source_refs,
+            proof_readiness,
+        ) = Self::project_source_views(sources);
         let receipt = OnboardingReadinessReceipt {
             receipt_ref,
             lease_ref: lease.lease_ref.clone(),
@@ -1359,12 +1451,9 @@ impl ColdStartController {
             instance: instance.clone(),
             lineage: lineage.cloned(),
             scope_resolution,
-            task_binding,
+            task_binding: task_binding.clone(),
             state_fence: state_fence.clone(),
-            governing_source_set_ref: format!(
-                "governing-source-set:{}:{}",
-                sources.scope_ref, sources.generation
-            ),
+            governing_source_set_ref: governing_source_set_ref.clone(),
             governing_source_generation: sources.generation,
             governance_profile_ref,
             limiting_integration_evidence,
@@ -1382,6 +1471,20 @@ impl ColdStartController {
             missing_inputs,
             next_safe_action,
             receipt_revision: 1,
+            discovered_source_refs,
+            admitted_source_refs,
+            conflicting_source_refs,
+            unavailable_source_refs,
+            store_identity_ref: lineage.map(|lineage| lineage.object_store_ref.clone()),
+            proof_readiness,
+            minimum_understanding_seed: Self::understanding_seed(
+                scope,
+                instance,
+                &governing_source_set_ref,
+                &task_binding,
+            ),
+            maintenance_recommendations: Self::maintenance_for(readiness),
+            expiry_tick: lease.deadline,
         };
         receipt.validate()?;
         Ok(receipt)
@@ -1496,6 +1599,83 @@ impl ColdStartController {
             }
         }
         Ok(())
+    }
+
+    /// Routes one trigger through the privacy-bounded scanner lease and binds
+    /// the scanner evidence the trigger's discovery pass must have produced.
+    ///
+    /// Every trigger-required read must be attested by the scan evidence: a
+    /// trigger that needs governing-source candidates cannot ride on a scan
+    /// that only attested filesystem identity. The evidence itself is
+    /// validated by [`BootstrapScanner::scan`]; here only the coverage binding
+    /// is checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`ColdStartController::check_discovery`],
+    /// plus [`OnboardingDegraded::DiscoveryLeaseDenied`] when the scan
+    /// evidence does not attest a trigger-required read class.
+    pub fn check_discovery_with_scan(
+        trigger: ColdStartTrigger,
+        discovery_lease: &DiscoveryReadLease,
+        evidence: &BootstrapScanEvidence,
+        now: u64,
+    ) -> Result<(), OnboardingDegraded> {
+        Self::check_discovery(trigger, discovery_lease, now)?;
+        for required in trigger.required_discovery_reads() {
+            if !evidence.attested_reads.contains(required) {
+                return Err(OnboardingDegraded::DiscoveryLeaseDenied);
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs one trigger's discovery pass through the privacy-bounded scanner.
+    ///
+    /// This is the controller's scanner invocation: the trigger's read set is
+    /// authorized and bound to the scan evidence first, then
+    /// [`BootstrapScanner::scan`] runs the deterministic model-free pass
+    /// (lease-key binding, forbidden-operation guard, lease charging, durable
+    /// receipt write). No trigger reaches the scanner past an unadmitted or
+    /// unattested read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompileDriverError::Lease`] when the trigger's scanner pass
+    /// is not admitted or not attested, or [`CompileDriverError::Compile`]
+    /// when the scan itself fails (see [`BootstrapScanner::scan`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_trigger_scan(
+        trigger: ColdStartTrigger,
+        discovery_lease: &mut DiscoveryReadLease,
+        lease_key: &DiscoveryLeaseKey,
+        store: &mut impl ScanDisclosureStore,
+        candidate_privacy: PrivacyClass,
+        privacy_boundary: Option<&PrivacyBoundary>,
+        evidence: &BootstrapScanEvidence,
+        proposed_kind: ScopeKind,
+        identity_fingerprint: impl Into<String>,
+        verifier_candidates: &[String],
+        governing_source_refs: Vec<String>,
+        now: u64,
+    ) -> Result<BootstrapScanOutcome, CompileDriverError> {
+        Self::check_discovery_with_scan(trigger, discovery_lease, evidence, now)
+            .map_err(CompileDriverError::Lease)?;
+        BootstrapScanner::scan(
+            format!("cold-start:{}:{:?}", discovery_lease.lease_ref, trigger),
+            discovery_lease,
+            lease_key,
+            store,
+            candidate_privacy,
+            privacy_boundary,
+            evidence,
+            proposed_kind,
+            identity_fingerprint,
+            verifier_candidates,
+            governing_source_refs,
+            now,
+        )
+        .map_err(CompileDriverError::Compile)
     }
 
     fn check_lease_and_identities(
@@ -1698,15 +1878,134 @@ impl ColdStartController {
             "disambiguate_task_candidates".to_owned(),
         ))
     }
+
+    /// Projects the receipt's source views from the admitted governing set.
+    ///
+    /// Compilation only succeeds on a fully admitted set (any conflicted,
+    /// stale, superseded, unavailable, or merely candidate source fails
+    /// closed in [`ColdStartController::compile`]), so the conflicting and
+    /// unavailable views are empty exactly when compilation was warranted;
+    /// they stay on the receipt so a compiled receipt always states its full
+    /// admission outcome instead of implying it.
+    fn project_source_views(
+        sources: &GoverningSourceSet,
+    ) -> (
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        ProofReadiness,
+    ) {
+        let mut discovered = Vec::with_capacity(sources.sources.len());
+        let mut admitted = Vec::new();
+        let mut conflicting = Vec::new();
+        let mut unavailable = Vec::new();
+        for source in &sources.sources {
+            discovered.push(source.source_ref.clone());
+            match source.status {
+                SourceStatus::Admitted => admitted.push(source.source_ref.clone()),
+                SourceStatus::Conflicted | SourceStatus::Stale | SourceStatus::Superseded => {
+                    conflicting.push(source.source_ref.clone());
+                }
+                SourceStatus::Unavailable => unavailable.push(source.source_ref.clone()),
+                SourceStatus::Candidate => (),
+            }
+        }
+        for conflict in &sources.unresolved_conflict_refs {
+            if !conflicting.contains(conflict) {
+                conflicting.push(conflict.clone());
+            }
+        }
+        conflicting.sort();
+        let proof_readiness = if admitted.is_empty() {
+            ProofReadiness::NoProofSurface
+        } else {
+            ProofReadiness::AdmittedSources
+        };
+        (
+            discovered,
+            admitted,
+            conflicting,
+            unavailable,
+            proof_readiness,
+        )
+    }
+
+    /// Builds the minimum understanding seed from identities the receipt binds.
+    ///
+    /// The seed is the Level 0 contact data (scope, instance, root,
+    /// governing-source set, task handle or explicit absence) the first
+    /// useful work must ground on; it projects carried identities and invents
+    /// none.
+    fn understanding_seed(
+        scope: &ScopeIdentity,
+        instance: &WorkspaceInstanceIdentity,
+        governing_source_set_ref: &str,
+        task_binding: &TaskBindingState,
+    ) -> Vec<String> {
+        let task_seed = match task_binding {
+            TaskBindingState::CurrentTaskContract { task_ref, .. }
+            | TaskBindingState::Exploratory { task_ref, .. } => task_ref.clone(),
+            TaskBindingState::Stale { task_ref, .. } => format!("stale:{task_ref}"),
+            TaskBindingState::Ambiguous { .. } => "task:ambiguous".to_owned(),
+            TaskBindingState::None_ => "task:unbound".to_owned(),
+        };
+        vec![
+            scope.scope_ref.clone(),
+            instance.instance_ref.clone(),
+            instance.root_identity.clone(),
+            governing_source_set_ref.to_owned(),
+            task_seed,
+        ]
+    }
+
+    /// Proposes first-maintenance job handles for one compiled readiness.
+    ///
+    /// The table mirrors the maintenance kinds the onboarding contract names
+    /// (Dreamer orientation, code/build map, skill/bridge registration,
+    /// backup verification, code-intelligence pilot); it proposes but never
+    /// starts work, and execution stays under the owner's maintenance/model
+    /// budget policy.
+    fn maintenance_for(readiness: ReadinessLifecycle) -> Vec<String> {
+        match readiness {
+            ReadinessLifecycle::NeedsTask => vec![
+                "bind_task_before_material".to_owned(),
+                "dreamer_orientation_candidate".to_owned(),
+            ],
+            ReadinessLifecycle::NeedsSources => vec![
+                "admit_governing_sources".to_owned(),
+                "dreamer_orientation_candidate".to_owned(),
+            ],
+            ReadinessLifecycle::NeedsScope => vec![
+                "disambiguate_scope".to_owned(),
+                "dreamer_orientation_candidate".to_owned(),
+            ],
+            ReadinessLifecycle::ReadyReadOnly => vec![
+                "dreamer_orientation_candidate".to_owned(),
+                "code_build_map_candidate".to_owned(),
+                "skill_bridge_registration_candidate".to_owned(),
+            ],
+            ReadinessLifecycle::ReadyMaterial => vec![
+                "backup_verification_candidate".to_owned(),
+                "code_intelligence_pilot_candidate".to_owned(),
+            ],
+            ReadinessLifecycle::Unseen
+            | ReadinessLifecycle::Scanning
+            | ReadinessLifecycle::Degraded
+            | ReadinessLifecycle::Conflicted => vec!["readiness_retry".to_owned()],
+        }
+    }
 }
 
 /// Caller-observed identity key for single-flight join and invalidation.
 ///
-/// Dirty-base evidence arrives as a new governing-source generation: a changed
-/// dirty summary that does not advance the reported generation is not
-/// observable here, so the producing stage (bootstrap discovery, carrying
-/// `GenerationEvidence` with its `dirty_summary_ref` from `identity.rs`) must
-/// advance the generation it reports.
+/// Dirty-base evidence arrives both as a new governing-source generation and
+/// as the dirty summary itself: the producing stage (bootstrap discovery,
+/// carrying `GenerationEvidence` with its `dirty_summary_ref` from
+/// `identity.rs`) must report the summary it observed, and a known-to-known
+/// change invalidates even when the reported generation did not advance.
+/// Content digests work the same way: a changed governing-source digest at
+/// the same generation splits the lease and forces a revised receipt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OnboardingObservedKey {
@@ -1714,6 +2013,12 @@ pub struct OnboardingObservedKey {
     pub workspace_instance_candidate_ref: String,
     pub privacy_class: PrivacyClass,
     pub governing_source_generation: u64,
+    /// Exact workspace root identity; a changed root invalidates.
+    pub root_identity: String,
+    /// Dirty-base summary last reported by discovery, if the caller reports one.
+    pub dirty_summary_ref: Option<String>,
+    /// Governing-source content digests backing the observed generation.
+    pub governing_source_digests: Vec<String>,
 }
 
 impl OnboardingObservedKey {
@@ -1721,8 +2026,9 @@ impl OnboardingObservedKey {
     ///
     /// # Errors
     ///
-    /// Returns an error when identity references are blank or the generation
-    /// is zero.
+    /// Returns an error when identity references are blank, the generation is
+    /// zero, a stated digest is not a lowercase SHA-256 digest, or a bounded
+    /// collection leaves its range (digests 0..=32).
     pub fn validate(&self) -> Result<(), WorkScopeError> {
         text(&self.lineage_candidate_ref, "lineage_candidate_ref")?;
         text(
@@ -1732,7 +2038,20 @@ impl OnboardingObservedKey {
         counter(
             self.governing_source_generation,
             "governing_source_generation",
-        )
+        )?;
+        text(&self.root_identity, "root_identity")?;
+        if let Some(dirty) = &self.dirty_summary_ref {
+            text(dirty, "dirty_summary_ref")?;
+        }
+        if self.governing_source_digests.len() > 32 {
+            return Err(WorkScopeError::EmptyCollection {
+                field: "governing_source_digests",
+            });
+        }
+        for digest_value in &self.governing_source_digests {
+            digest(digest_value, "governing_source_digests")?;
+        }
+        Ok(())
     }
 
     fn matches_lease(&self, lease: &OnboardingLease) -> bool {
@@ -1741,14 +2060,22 @@ impl OnboardingObservedKey {
             && self.privacy_class == lease.privacy_class
             && self.governing_source_generation == lease.governing_source_generation
     }
+
+    /// Whether the observed root still names the terminal receipt's root.
+    ///
+    /// A changed root invalidates the compiled readiness: the receipt was
+    /// compiled for exactly one workspace root.
+    fn root_matches_terminal(&self, terminal: &OnboardingReadinessReceipt) -> bool {
+        self.root_identity == terminal.scope.root_identity
+    }
 }
 
 /// Outcome of one single-flight attach.
 ///
 /// `Created` and `Joined` carry only the lease reference: participants never
 /// create a `WorkScope` or infer a "latest task" on their own. `JoinedTerminal`
-/// additionally carries the same terminal [`ReadinessSurface`] every waiter of
-/// one lease receives.
+/// additionally carries the same terminal [`ReadinessSurface`] and the same
+/// terminal [`OnboardingReadinessReceipt`] every waiter of one lease receives.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "disposition", content = "detail")]
 pub enum LeaseJoin {
@@ -1761,6 +2088,7 @@ pub enum LeaseJoin {
     JoinedTerminal {
         lease_ref: String,
         surface: ReadinessSurface,
+        receipt: Box<OnboardingReadinessReceipt>,
     },
 }
 
@@ -1776,6 +2104,24 @@ pub enum LeaseInvalidation {
 struct SingleFlightEntry {
     lease: OnboardingLease,
     terminal: Option<OnboardingReadinessReceipt>,
+    /// Sorted governing-source content digests published with the terminal.
+    ///
+    /// The lease key carries the generation, not the digest: a changed digest
+    /// at the same generation neither matches this entry nor mutates it. Empty
+    /// means unknown (legacy join path) and carries no opinion.
+    governing_source_digests: Vec<String>,
+    /// Dirty-base summary last reported by discovery for this entry.
+    ///
+    /// A known-to-known change invalidates; unknown on either side carries no
+    /// opinion, so callers that do not report dirty state never force churn.
+    dirty_summary_ref: Option<String>,
+}
+
+/// Carried digest/dirty opinions for one evidence-bound join.
+#[derive(Clone, Debug, Default)]
+struct JoinEvidence {
+    governing_source_digests: Vec<String>,
+    dirty_summary_ref: Option<String>,
 }
 
 /// Caller-owned single-flight registry for concurrent cold-start attaches.
@@ -1804,6 +2150,13 @@ impl OnboardingSingleFlight {
 
     /// Joins a compatible in-flight lease or creates one for a new key.
     ///
+    /// This is the legacy path: it enforces the lease key (exact workspace
+    /// filesystem/VCS identity plus privacy boundary plus governing-source
+    /// generation) without digest or dirty-base opinions. Callers that carry
+    /// candidate and scanner evidence must prefer
+    /// [`OnboardingSingleFlight::join_with_evidence`], which additionally
+    /// binds exact filesystem/VCS identity and splits on changed digests.
+    ///
     /// # Errors
     ///
     /// Returns [`OnboardingDegraded::DiscoveryLeaseDenied`] when the proposed
@@ -1818,6 +2171,103 @@ impl OnboardingSingleFlight {
         proposed: OnboardingLease,
         now: u64,
     ) -> Result<LeaseJoin, OnboardingDegraded> {
+        self.join_core(trigger, discovery_lease, proposed, None, now)
+    }
+
+    /// Joins a compatible in-flight lease bound to exact candidate and
+    /// scanner evidence, or creates one for a new key.
+    ///
+    /// Beyond [`OnboardingSingleFlight::join`], the proposed lease key is
+    /// verified against the exact candidate (filesystem/VCS identity, privacy
+    /// boundary, governing-source generation) and the scan evidence
+    /// (canonical/filesystem roots equal the candidate roots). An attach whose
+    /// governing-source digests or dirty-base summary changed splits the lease
+    /// even at the same generation: the old terminal is dropped untouched and
+    /// the attach receives a fresh `Created` lease instead of the first
+    /// lease's scope/task decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OnboardingDegraded::DiscoveryLeaseDenied`] when the proposed
+    /// lease is invalid, disagrees with the candidate or scan evidence, or
+    /// carries unattested trigger reads; [`OnboardingDegraded::DiscoveryLeaseExpired`]
+    /// when it is not active at `now`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "evidence-bound join carries trigger, lease, key proposal, candidate, sources, and scan evidence in one fail-closed constructor"
+    )]
+    pub fn join_with_evidence(
+        &mut self,
+        trigger: ColdStartTrigger,
+        discovery_lease: &DiscoveryReadLease,
+        proposed: OnboardingLease,
+        candidate: &WorkScopeCandidate,
+        sources: &GoverningSourceSet,
+        scan: &BootstrapScanEvidence,
+        now: u64,
+    ) -> Result<LeaseJoin, OnboardingDegraded> {
+        if candidate.scope.lineage_ref.as_deref() != Some(proposed.lineage_candidate_ref.as_str())
+            || candidate.scope.instance_ref != proposed.workspace_instance_candidate_ref
+            || candidate.instance.instance_ref != proposed.workspace_instance_candidate_ref
+            || candidate.instance.root_identity != candidate.scope.root_identity
+            || candidate.privacy_class != proposed.privacy_class
+            || sources.generation != proposed.governing_source_generation
+        {
+            return Err(OnboardingDegraded::DiscoveryLeaseDenied);
+        }
+        if scan.canonical_root_ref != candidate.scope.root_identity
+            || scan.filesystem_identity_ref != candidate.instance.root_identity
+        {
+            return Err(OnboardingDegraded::DiscoveryLeaseDenied);
+        }
+        ColdStartController::check_discovery_with_scan(trigger, discovery_lease, scan, now)?;
+        let evidence = JoinEvidence {
+            governing_source_digests: Self::source_digest_set(sources),
+            dirty_summary_ref: scan.vcs_dirty_summary_ref.clone(),
+        };
+        self.join_core_with_checked_discovery(proposed, evidence, now)
+    }
+
+    /// Sorted content digests of every source in the set.
+    ///
+    /// Any source content change alters the set even when the reported
+    /// generation does not advance, so the digest set is the split signal the
+    /// lease key itself cannot carry.
+    fn source_digest_set(sources: &GoverningSourceSet) -> Vec<String> {
+        let mut digests: Vec<String> = sources
+            .sources
+            .iter()
+            .map(|source| source.digest.clone())
+            .collect();
+        digests.sort();
+        digests.dedup();
+        digests
+    }
+
+    /// Whether two digest sets disagree when both sides state digests.
+    ///
+    /// Empty on either side means unknown and carries no opinion, so legacy
+    /// joins never split on missing evidence.
+    fn digests_conflict(known: &[String], presented: &[String]) -> bool {
+        !known.is_empty() && !presented.is_empty() && known != presented
+    }
+
+    /// Whether two dirty-base summaries disagree when both sides state one.
+    fn dirty_conflict(known: Option<&String>, observed: Option<&String>) -> bool {
+        match (known, observed) {
+            (Some(known), Some(observed)) => known != observed,
+            (None, _) | (_, None) => false,
+        }
+    }
+
+    fn join_core(
+        &mut self,
+        trigger: ColdStartTrigger,
+        discovery_lease: &DiscoveryReadLease,
+        proposed: OnboardingLease,
+        evidence: Option<JoinEvidence>,
+        now: u64,
+    ) -> Result<LeaseJoin, OnboardingDegraded> {
         if proposed.validate().is_err() {
             return Err(OnboardingDegraded::DiscoveryLeaseDenied);
         }
@@ -1825,17 +2275,55 @@ impl OnboardingSingleFlight {
             return Err(OnboardingDegraded::DiscoveryLeaseExpired);
         }
         ColdStartController::check_discovery(trigger, discovery_lease, now)?;
+        let evidence = evidence.unwrap_or_default();
+        self.join_core_with_checked_discovery(proposed, evidence, now)
+    }
+
+    /// Joins or creates after the trigger's discovery pass was authorized.
+    ///
+    /// A digest or dirty-base conflict splits the lease even when the key
+    /// matches: the old terminal is dropped untouched and the attach receives
+    /// a fresh `Created` lease, so a changed digest at the same generation
+    /// can never reuse the first lease's scope/task decision.
+    fn join_core_with_checked_discovery(
+        &mut self,
+        proposed: OnboardingLease,
+        evidence: JoinEvidence,
+        now: u64,
+    ) -> Result<LeaseJoin, OnboardingDegraded> {
         if let Some(index) = self
             .entries
             .iter()
             .position(|entry| entry.lease.key_matches(&proposed))
         {
+            if Self::digests_conflict(
+                &self.entries[index].governing_source_digests,
+                &evidence.governing_source_digests,
+            ) || Self::dirty_conflict(
+                self.entries[index].dirty_summary_ref.as_ref(),
+                evidence.dirty_summary_ref.as_ref(),
+            ) {
+                let created_ref = proposed.lease_ref.clone();
+                self.entries[index] = SingleFlightEntry {
+                    lease: proposed,
+                    terminal: None,
+                    governing_source_digests: evidence.governing_source_digests,
+                    dirty_summary_ref: evidence.dirty_summary_ref,
+                };
+                return Ok(LeaseJoin::Created {
+                    lease_ref: created_ref,
+                });
+            }
             let lease_ref = self.entries[index].lease.lease_ref.clone();
             if let Some(terminal) = self.entries[index].terminal.clone() {
                 let surface = terminal
                     .surface(&self.entries[index].lease)
                     .map_err(|_| OnboardingDegraded::DiscoveryLeaseDenied)?;
-                return Ok(LeaseJoin::JoinedTerminal { lease_ref, surface });
+                return Ok(LeaseJoin::JoinedTerminal {
+                    lease_ref,
+                    surface,
+                    receipt: Box::new(terminal),
+                });
             }
             if self.entries[index].lease.is_active(now) {
                 return Ok(LeaseJoin::Joined { lease_ref });
@@ -1844,6 +2332,8 @@ impl OnboardingSingleFlight {
             self.entries[index] = SingleFlightEntry {
                 lease: proposed,
                 terminal: None,
+                governing_source_digests: evidence.governing_source_digests,
+                dirty_summary_ref: evidence.dirty_summary_ref,
             };
             return Ok(LeaseJoin::Created {
                 lease_ref: created_ref,
@@ -1853,6 +2343,8 @@ impl OnboardingSingleFlight {
         self.entries.push(SingleFlightEntry {
             lease: proposed,
             terminal: None,
+            governing_source_digests: evidence.governing_source_digests,
+            dirty_summary_ref: evidence.dirty_summary_ref,
         });
         Ok(LeaseJoin::Created {
             lease_ref: created_ref,
@@ -1914,10 +2406,13 @@ impl OnboardingSingleFlight {
     /// Invalidates rather than mutates completed readiness.
     ///
     /// When the observed key (root identity, privacy boundary or
-    /// governing-source generation) disagrees with the retained lease, or the
-    /// lease is past its deadline at `now`, the lease expires and its terminal
-    /// receipt value is dropped untouched; the caller then compiles a new
-    /// receipt revision under a new lease.
+    /// governing-source generation) disagrees with the retained lease, when
+    /// the observed root no longer names the terminal receipt's root, when a
+    /// known dirty-base summary or governing-source digest changed, or when
+    /// the lease is past its deadline at `now`, the lease expires and its
+    /// terminal receipt value is dropped untouched; the caller then compiles
+    /// a new receipt revision under a new lease (see
+    /// [`OnboardingSingleFlight::invalidate_and_recompile`]).
     ///
     /// # Errors
     ///
@@ -1936,9 +2431,21 @@ impl OnboardingSingleFlight {
             .iter()
             .position(|entry| entry.lease.lease_ref == lease_ref)
             .ok_or(WorkScopeError::BindingReceiptMismatch)?;
-        if observed.matches_lease(&self.entries[index].lease)
-            && self.entries[index].lease.is_active(now)
-        {
+        let changed = !observed.matches_lease(&self.entries[index].lease)
+            || !self.entries[index].lease.is_active(now)
+            || self.entries[index]
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| !observed.root_matches_terminal(terminal))
+            || Self::digests_conflict(
+                &self.entries[index].governing_source_digests,
+                &observed.governing_source_digests,
+            )
+            || Self::dirty_conflict(
+                self.entries[index].dirty_summary_ref.as_ref(),
+                observed.dirty_summary_ref.as_ref(),
+            );
+        if !changed {
             return Ok(LeaseInvalidation::Current {
                 lease_ref: lease_ref.to_owned(),
             });
@@ -2070,21 +2577,187 @@ impl OnboardingSingleFlight {
                     task,
                     now,
                 )?;
-                let surface = receipt.surface(&lease)?;
-                let terminal = match (&receipt.readiness, &receipt.task_binding) {
-                    (ReadinessLifecycle::ReadyMaterial | ReadinessLifecycle::ReadyReadOnly, _) => {
-                        OnboardingLeaseState::Ready
-                    }
-                    (ReadinessLifecycle::NeedsTask, TaskBindingState::Ambiguous { .. }) => {
-                        OnboardingLeaseState::Ambiguous
-                    }
-                    _ => OnboardingLeaseState::Failed,
-                };
-                self.publish_terminal(&created_ref, receipt, terminal, now)?;
+                if let Some(entry) = self
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.lease.lease_ref == created_ref)
+                {
+                    entry.governing_source_digests = Self::source_digest_set(sources);
+                }
+                self.publish_fresh(&created_ref, receipt, now)
+            }
+        }
+    }
+
+    /// Publishes one freshly compiled receipt as the lease terminal and
+    /// returns the terminal join every waiter of the lease receives.
+    ///
+    /// The terminal state follows the compiled receipt: `ReadyMaterial` and
+    /// `ReadyReadOnly` publish `Ready`, a `NeedsTask` receipt over an
+    /// ambiguous task binding publishes `Ambiguous`, and any other compiled
+    /// but incomplete receipt publishes `Failed` — the exact missing
+    /// question stays in the terminal surface, and the next trigger starts a
+    /// new lease revision rather than mutating this one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompileDriverError::Compile`] when surface projection or
+    /// terminal publish fails closed.
+    fn publish_fresh(
+        &mut self,
+        lease_ref: &str,
+        receipt: OnboardingReadinessReceipt,
+        now: u64,
+    ) -> Result<LeaseJoin, CompileDriverError> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.lease.lease_ref == lease_ref)
+            .ok_or(WorkScopeError::BindingReceiptMismatch)?;
+        let surface = receipt.surface(&entry.lease)?;
+        let terminal = match (&receipt.readiness, &receipt.task_binding) {
+            (ReadinessLifecycle::ReadyMaterial | ReadinessLifecycle::ReadyReadOnly, _) => {
+                OnboardingLeaseState::Ready
+            }
+            (ReadinessLifecycle::NeedsTask, TaskBindingState::Ambiguous { .. }) => {
+                OnboardingLeaseState::Ambiguous
+            }
+            _ => OnboardingLeaseState::Failed,
+        };
+        self.publish_terminal(lease_ref, receipt.clone(), terminal, now)?;
+        Ok(LeaseJoin::JoinedTerminal {
+            lease_ref: lease_ref.to_owned(),
+            surface,
+            receipt: Box::new(receipt),
+        })
+    }
+
+    /// Invalidates a stale lease and recompiles a revised receipt in one flow.
+    ///
+    /// This is the production coupling the invalidation semantics requires:
+    /// the observed key (root, dirty-base, privacy, generation, digests) is
+    /// checked first; when the lease is current the retained terminal receipt
+    /// is returned unchanged and no new revision is warranted; when the lease
+    /// is stale the old terminal stays dropped and
+    /// [`ColdStartController::recompile`] issues the next receipt revision
+    /// under the proposed lease, which is then published as the new terminal.
+    /// [`ColdStartController::recompile`] itself refuses an unchanged lease
+    /// reference and generation, so a revised receipt always means a new
+    /// lease or a new generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompileDriverError::Lease`] when the trigger's scanner pass
+    /// is not admitted by the discovery lease, or
+    /// [`CompileDriverError::Compile`] when invalidation, recompilation,
+    /// surface projection, or terminal publish fails closed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn invalidate_and_recompile(
+        &mut self,
+        lease_ref: &str,
+        observed: &OnboardingObservedKey,
+        previous: &OnboardingReadinessReceipt,
+        trigger: ColdStartTrigger,
+        discovery_lease: &DiscoveryReadLease,
+        proposed: OnboardingLease,
+        receipt_ref: impl Into<String>,
+        principal_ref: impl Into<String>,
+        session_ref: impl Into<String>,
+        scope: &ScopeIdentity,
+        instance: &WorkspaceInstanceIdentity,
+        lineage: Option<&RepositoryLineageIdentity>,
+        candidate: &WorkScopeCandidate,
+        sources: &GoverningSourceSet,
+        state_fence: &StateFence,
+        governance_profile_ref: impl Into<String>,
+        limiting_integration_evidence: Vec<String>,
+        route_profile_ref: impl Into<String>,
+        serializer_id: impl Into<String>,
+        serializer_version: impl Into<String>,
+        serializer_options_digest: impl Into<String>,
+        tokenizer_id: impl Into<String>,
+        tokenizer_version: impl Into<String>,
+        tokenizer_hash: impl Into<String>,
+        projection_source_ref: impl Into<String>,
+        projection_generation: u64,
+        privacy: &PrivacyProfile,
+        task: TaskBindingInput,
+        now: u64,
+    ) -> Result<LeaseJoin, CompileDriverError> {
+        match self.invalidate(lease_ref, observed, now)? {
+            LeaseInvalidation::Current { lease_ref } => {
+                let entry = self
+                    .entries
+                    .iter()
+                    .find(|entry| entry.lease.lease_ref == lease_ref)
+                    .ok_or(WorkScopeError::BindingReceiptMismatch)?;
+                let terminal = entry
+                    .terminal
+                    .clone()
+                    .ok_or(WorkScopeError::BindingReceiptMismatch)?;
+                let surface = terminal.surface(&entry.lease)?;
                 Ok(LeaseJoin::JoinedTerminal {
-                    lease_ref: created_ref,
+                    lease_ref,
                     surface,
+                    receipt: Box::new(terminal),
                 })
+            }
+            LeaseInvalidation::Invalidated { .. } => {
+                ColdStartController::check_discovery(trigger, discovery_lease, now)
+                    .map_err(CompileDriverError::Lease)?;
+                let created_ref = proposed.lease_ref.clone();
+                let stored = SingleFlightEntry {
+                    lease: proposed,
+                    terminal: None,
+                    governing_source_digests: Self::source_digest_set(sources),
+                    dirty_summary_ref: observed.dirty_summary_ref.clone(),
+                };
+                match self
+                    .entries
+                    .iter()
+                    .position(|entry| entry.lease.lease_ref == created_ref)
+                {
+                    Some(index) => {
+                        self.entries[index] = stored;
+                    }
+                    None => {
+                        self.entries.push(stored);
+                    }
+                }
+                let lease = self
+                    .entries
+                    .iter()
+                    .find(|entry| entry.lease.lease_ref == created_ref)
+                    .map(|entry| entry.lease.clone())
+                    .ok_or(WorkScopeError::BindingReceiptMismatch)?;
+                let receipt = ColdStartController.recompile(
+                    previous,
+                    receipt_ref,
+                    &lease,
+                    principal_ref,
+                    session_ref,
+                    scope,
+                    instance,
+                    lineage,
+                    candidate,
+                    sources,
+                    state_fence,
+                    governance_profile_ref,
+                    limiting_integration_evidence,
+                    route_profile_ref,
+                    serializer_id,
+                    serializer_version,
+                    serializer_options_digest,
+                    tokenizer_id,
+                    tokenizer_version,
+                    tokenizer_hash,
+                    projection_source_ref,
+                    projection_generation,
+                    privacy,
+                    task,
+                    now,
+                )?;
+                self.publish_fresh(&created_ref, receipt, now)
             }
         }
     }
