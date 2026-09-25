@@ -1597,8 +1597,11 @@ fn codex_result_evidence_refs(input: &CodexResultInput) -> Vec<String> {
 }
 
 /// Result disposition for a translated Codex result: cancellation is
-/// observed, a missing terminal observation is an unknown outcome with an
-/// explicit reason, otherwise the partial terminal state stands.
+/// observed; a missing terminal observation is an unknown outcome with an
+/// explicit reason; an owner-bound terminal observation with observed wall
+/// time is a partial candidate success; a terminal observation without
+/// observed wall time stays unknown (outcome time genuinely unproven, no
+/// timestamp invented) so ownership is retained until reconciliation.
 fn codex_result_disposition(input: &CodexResultInput) -> (ResultDisposition, Option<String>) {
     if input.cancelled {
         (
@@ -1615,15 +1618,57 @@ fn codex_result_disposition(input: &CodexResultInput) -> (ResultDisposition, Opt
                     .unwrap_or_else(|| "terminal observation absent".into()),
             ),
         )
-    } else {
+    } else if codex_terminal_time_known(input) {
         (ResultDisposition::Partial, input.unknown_reason.clone())
+    } else {
+        (
+            ResultDisposition::UnknownOutcome,
+            Some(
+                input
+                    .unknown_reason
+                    .clone()
+                    .unwrap_or_else(|| "terminal observation carries no observed wall time".into()),
+            ),
+        )
+    }
+}
+
+/// Whether the terminal observation carries observed wall-clock time.
+/// Disposition follows proven termination, never wall-clock availability
+/// alone; this predicate keeps the two axes consistent without inventing
+/// a timestamp. Pure projection, no I/O.
+fn codex_terminal_time_known(input: &CodexResultInput) -> bool {
+    input
+        .terminal_observation
+        .as_ref()
+        .is_some_and(|observation| observation.observed_at.valid_time_ms.is_some())
+}
+
+/// Terminal reading for a translated Codex result: the observation's own
+/// time when execution is observed, otherwise the default unobserved
+/// reading. Never invents wall time; `ClockReading` is `Copy`, so the
+/// observed value is copied, not cloned.
+fn codex_terminal_reading(
+    input: &CodexResultInput,
+    execution_outcome: ExecutionOutcome,
+) -> ClockReading {
+    if execution_outcome == ExecutionOutcome::Observed
+        && !input.cancelled
+        && let Some(terminal) = &input.terminal_observation
+        && terminal.observed_at.valid_time_ms.is_some()
+    {
+        terminal.observed_at
+    } else {
+        ClockReading::default()
     }
 }
 
 /// Execution-outcome axis for a translated Codex result, kept independent
-/// of the route axis: cancelled carries observed cancellation, every other
-/// outcome stays unknown with a quarantine recovery handle, preserving
-/// evidence without fabricating wall time.
+/// of the route axis: cancelled carries observed cancellation; an
+/// owner-bound terminal observation with observed wall time is observed
+/// execution (termination proven under the exact binding, no handle minted);
+/// every other outcome stays unknown with a quarantine recovery handle,
+/// preserving evidence without fabricating wall time.
 fn codex_execution_outcome(
     input: &CodexResultInput,
     unknown_reason: Option<&String>,
@@ -1634,13 +1679,13 @@ fn codex_execution_outcome(
             Some(CancellationState::Acknowledged),
             None,
         )
-    } else if input.terminal_observation.is_some() {
-        let handle = input
-            .terminal_observation
-            .as_ref()
-            .map(|terminal| format!("codex-terminal:{}", terminal.event_id.as_str()))
-            .unwrap_or_else(|| "codex-partial-recovery".to_owned());
-        (ExecutionOutcome::UnknownOutcome, None, Some(handle))
+    } else if let Some(terminal) = &input.terminal_observation {
+        if terminal.observed_at.valid_time_ms.is_some() {
+            (ExecutionOutcome::Observed, None, None)
+        } else {
+            let handle = format!("codex-terminal:{}", terminal.event_id.as_str());
+            (ExecutionOutcome::UnknownOutcome, None, Some(handle))
+        }
     } else {
         (
             ExecutionOutcome::UnknownOutcome,
@@ -1668,6 +1713,7 @@ fn codex_observation_receipt(
     cancellation: Option<CancellationState>,
     recovery_ref: Option<String>,
 ) -> Result<PhysicalRouteObservationReceipt, CodexAdapterError> {
+    let terminal = codex_terminal_reading(input, execution_outcome);
     let mut actual_route = PhysicalRouteObservationReceipt {
         schema_version: CONTRACT_VERSION.to_owned(),
         attempt_id: binding.attempt_id.clone(),
@@ -1688,7 +1734,7 @@ fn codex_observation_receipt(
         started: ClockReading::default(),
         first_byte: ClockReading::default(),
         first_semantic: ClockReading::default(),
-        terminal: ClockReading::default(),
+        terminal,
         event_cursor: EventCursor::new("codex-result")?,
         event_sequence: 1,
         cancellation,
@@ -1746,9 +1792,10 @@ pub fn translate_result(
     let request_digest = PhysicalRouteObservationReceipt::bound_request_digest(binding)
         .map_err(CodexAdapterError::Contract)?;
     // Binding-gated physical observation: UNOBSERVED with explicit reason,
-    // never observed=requested. Cancelled carries observed cancellation;
-    // all other outcomes stay UNKNOWN_OUTCOME with a quarantine recovery
-    // handle, preserving evidence without fabricating wall time.
+    // never observed=requested. Cancelled carries observed cancellation; an
+    // owner-bound terminal observation with observed wall time is observed
+    // execution with the observation's own terminal time propagated (never
+    // invented); every other outcome stays unknown with its recovery handle.
     let (execution_outcome, cancellation, recovery_ref) =
         codex_execution_outcome(&input, unknown_reason.as_ref());
     let actual_route = codex_observation_receipt(

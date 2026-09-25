@@ -995,6 +995,24 @@ pub struct AgentResult {
 }
 
 impl AgentResult {
+    /// Execution/ownership consistency contract (issue #370 P1): the outer
+    /// [`ResultDisposition`] never overrides the embedded physical execution
+    /// axis. While the embedded
+    /// [`PhysicalRouteObservationReceipt::execution_outcome`] is
+    /// [`ExecutionOutcome::UnknownOutcome`], the execution is genuinely
+    /// unreconciled and intake owners must retain writer/resource ownership
+    /// under the same reconciliation identity (the embedded `recovery_ref`)
+    /// until the existing owner proves termination or fencing — regardless of
+    /// the outer disposition. Only an
+    /// [`ExecutionOutcome::Observed`] result may release ownership or settle
+    /// terminally. This predicate is the single definition of that rule; the
+    /// coordinator `submit_result` intake applies it at the state transition
+    /// (retention, never rejection: a contradictory pair still validates here
+    /// so the existing owner can reconcile it under its recovery identity).
+    pub fn execution_unknown(&self) -> bool {
+        self.actual_route.execution_outcome == ExecutionOutcome::UnknownOutcome
+    }
+
     pub fn validate(&self, ceiling: &EffectCeiling) -> Result<(), ContractError> {
         self.actual_route.validate()?;
         for effect in &self.proposed_effects {
@@ -1036,6 +1054,12 @@ impl AgentResult {
     ///   closes);
     /// - existing shape/ceiling/unknown-reason checks via [`Self::validate`]
     ///   (per-effect ceiling/scope plus unknown-reason).
+    ///
+    /// Execution/ownership consistency is deliberately not rejected here (no
+    /// disposition/execution pairing check): [`Self::execution_unknown`]
+    /// exposes the rule and intake owners retain ownership on unknown
+    /// execution, so a contradictory pair stays recorded under its recovery
+    /// identity and the existing owner can reconcile it.
     pub fn validate_for_binding(
         &self,
         binding: &ProviderExecutionBinding,
