@@ -58,13 +58,14 @@ pub use resolver::{
     WorkScopeResolver,
 };
 pub use scanner::{
-    AdapterEvidence, ArtifactDirEvidence, BootstrapScanEvidence, BootstrapScanOutcome,
-    BootstrapScanner, ChangeSummary, DiscoveryLeaseRequest, DiscoveryOperation,
-    EditorWorkspaceEvidence, ExistingRecordEvidence, FileTypeCount, ForbiddenScanClass,
-    MAX_DISCOVERY_CONSUMPTION, ManifestEvidence, OnboardingRecommendation, PrivacyBoundary,
-    ProvisionalScopeProfile, RegisteredBuildProfile, RootServiceEvidence,
-    SCAN_PRIVACY_BOUNDARY_REQUIRED, ScanDisclosureReceipt, ScannerResolverInputs,
-    authorize_operation, candidate_source_roles, derive_lease_ref, issue_discovery_lease,
+    AdapterEvidence, ArtifactDirEvidence, BootstrapDiscoveryInputs, BootstrapScanEvidence,
+    BootstrapScanOutcome, BootstrapScanner, ChangeSummary, DiscoveryLeaseKey,
+    DiscoveryLeaseRequest, DiscoveryOperation, EditorWorkspaceEvidence, ExistingRecordEvidence,
+    FileTypeCount, ForbiddenScanClass, MAX_DISCOVERY_CONSUMPTION, ManifestEvidence,
+    OnboardingRecommendation, PrivacyBoundary, ProvisionalScopeProfile, RegisteredBuildProfile,
+    RootServiceEvidence, SCAN_PRIVACY_BOUNDARY_REQUIRED, ScanDisclosureReceipt,
+    ScanDisclosureStore, ScanReceiptHandle, ScannerResolverInputs, authorize_operation,
+    candidate_source_roles, derive_lease_ref, issue_discovery_lease, run_bootstrap_discovery,
 };
 pub use transition::{
     CandidateRecordStanding, ScopeTransition, ScopeTransitionKind, ScopeTransitionReceipt,
@@ -197,10 +198,21 @@ pub enum DiscoveryRead {
 }
 
 /// A bounded, non-authoritative discovery lease.
+///
+/// The lease is keyed to one proposer/session/host and one candidate-root
+/// filesystem identity: those four key components are retained on the lease
+/// so every use re-derives the lease reference and verifies the key binding
+/// through `DiscoveryReadLease::key_matches` before charging. A lease whose
+/// reference does not re-derive from the presented key is rejected without
+/// consumption.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DiscoveryReadLease {
     pub lease_ref: String,
+    pub proposer_ref: String,
+    pub session_ref: String,
+    pub host_ref: String,
+    pub root_filesystem_identity_ref: String,
     pub candidate_root_ref: String,
     pub allowed_reads: Vec<DiscoveryRead>,
     pub deadline: u64,
@@ -503,7 +515,7 @@ fn counter(value: u64, field: &'static str) -> Result<(), WorkScopeError> {
         .ok_or(WorkScopeError::InvalidCounter { field })
 }
 
-fn digest(value: &str, field: &'static str) -> Result<(), WorkScopeError> {
+pub(crate) fn digest(value: &str, field: &'static str) -> Result<(), WorkScopeError> {
     if value.len() == 64
         && value
             .bytes()
@@ -662,6 +674,13 @@ impl DiscoveryReadLease {
     /// reads are duplicated.
     pub fn validate(&self) -> Result<(), WorkScopeError> {
         text(&self.lease_ref, "lease_ref")?;
+        text(&self.proposer_ref, "lease.proposer_ref")?;
+        text(&self.session_ref, "lease.session_ref")?;
+        text(&self.host_ref, "lease.host_ref")?;
+        text(
+            &self.root_filesystem_identity_ref,
+            "lease.root_filesystem_identity_ref",
+        )?;
         text(&self.candidate_root_ref, "candidate_root_ref")?;
         counter(self.deadline, "deadline")?;
         counter(u64::from(self.consumption_limit), "consumption_limit")?;
@@ -2224,6 +2243,10 @@ mod tests {
     fn lease() -> DiscoveryReadLease {
         DiscoveryReadLease {
             lease_ref: "lease:one".into(),
+            proposer_ref: "proposer:one".into(),
+            session_ref: "session:one".into(),
+            host_ref: "host:one".into(),
+            root_filesystem_identity_ref: "fs:one".into(),
             candidate_root_ref: "root:a".into(),
             allowed_reads: vec![DiscoveryRead::FilesystemIdentity],
             deadline: 10,
@@ -2676,6 +2699,16 @@ mod tests {
             broker_attached: None,
             redacted_literal_identities: Vec::new(),
             unresolved_fields: Vec::new(),
+            attested_reads: vec![DiscoveryRead::FilesystemIdentity],
+        }
+    }
+
+    fn bootstrap_key() -> DiscoveryLeaseKey {
+        DiscoveryLeaseKey {
+            proposer_ref: "proposer:one".into(),
+            session_ref: "session:one".into(),
+            host_ref: "host:one".into(),
+            root_filesystem_identity_ref: "root:a".into(),
         }
     }
 
@@ -2695,6 +2728,84 @@ mod tests {
         }
     }
 
+    fn bootstrap_observed() -> ObservedScopeResources {
+        ObservedScopeResources {
+            kind: ScopeKind::GitRepo,
+            display_name: "root-a".into(),
+            lineage: None,
+            instances: vec![WorkspaceInstanceIdentity {
+                instance_ref: "instance:a".into(),
+                root_identity: "root:a".into(),
+                vcs_identity_ref: None,
+                generation: 1,
+            }],
+            canonical_resource_refs: Vec::new(),
+            external_resource_refs: Vec::new(),
+            root_identities: vec!["root:a".into()],
+            generation: GenerationEvidence {
+                branch_ref: None,
+                commit_ref: None,
+                dirty_summary_ref: None,
+                task_revision: None,
+                resource_generation: match ResourceGeneration::new(1) {
+                    Ok(value) => value,
+                    Err(error) => panic!("generation fixture is invalid: {error}"),
+                },
+            },
+            supporting_evidence: Vec::new(),
+        }
+    }
+
+    fn bootstrap_policy() -> DescriptorPolicy {
+        DescriptorPolicy {
+            owner_refs: vec!["owner:one".into()],
+            truth_surface_refs: Vec::new(),
+            verifier_refs: vec!["verifier:one".into()],
+            privacy: PrivacyProfile {
+                admitted_classes: vec![PrivacyClass::Internal],
+            },
+            authority_profile_ref: None,
+            execution_identity: ResourceExecutionIdentity::InteractiveUser {
+                sid_ref: "sid:one".into(),
+            },
+            available_capabilities: Vec::new(),
+            missing_capabilities: Vec::new(),
+        }
+    }
+
+    fn bootstrap_discovery(privacy_boundary: Option<PrivacyBoundary>) -> BootstrapDiscoveryInputs {
+        BootstrapDiscoveryInputs {
+            scan_ref: "scan:one".into(),
+            candidate_privacy: PrivacyClass::Internal,
+            privacy_boundary,
+            observed: bootstrap_observed(),
+            policy: bootstrap_policy(),
+            evidence: bootstrap_evidence(),
+            proposed_kind: ScopeKind::GitRepo,
+            identity_fingerprint: "fingerprint:one".into(),
+            governing_source_refs: Vec::new(),
+            now: 1,
+        }
+    }
+
+    struct TestReceiptStore {
+        stored: Vec<ScanDisclosureReceipt>,
+    }
+
+    impl ScanDisclosureStore for TestReceiptStore {
+        fn store_receipt(
+            &mut self,
+            receipt: &ScanDisclosureReceipt,
+        ) -> Result<ScanReceiptHandle, WorkScopeError> {
+            receipt.validate()?;
+            self.stored.push(receipt.clone());
+            Ok(ScanReceiptHandle {
+                receipt_ref: receipt.scan_ref.clone(),
+                store_ref: format!("durable:{}", self.stored.len()),
+            })
+        }
+    }
+
     fn bootstrap_boundary() -> PrivacyBoundary {
         PrivacyBoundary {
             boundary_ref: "boundary:one".into(),
@@ -2706,27 +2817,23 @@ mod tests {
     #[test]
     fn a1_valid_lease_bootstrap_returns_profile_and_receipt_with_allowed_classes_only() {
         let mut lease = bootstrap_lease();
-        let boundary = bootstrap_boundary();
-        let outcome = match BootstrapScanner::scan(
-            "scan:one",
+        let mut store = TestReceiptStore { stored: Vec::new() };
+        let outcome = match run_bootstrap_discovery(
+            &mut store,
             &mut lease,
-            PrivacyClass::Internal,
-            Some(&boundary),
-            &bootstrap_evidence(),
-            ScopeKind::GitRepo,
-            "fingerprint:one",
-            Vec::new(),
-            1,
+            &bootstrap_key(),
+            &bootstrap_discovery(Some(bootstrap_boundary())),
         ) {
             Ok(value) => value,
             Err(error) => panic!("valid-lease bootstrap failed: {error}"),
         };
-        let (profile, receipt) = match outcome {
+        let (profile, receipt, persisted) = match outcome {
             BootstrapScanOutcome::Completed {
                 profile,
                 receipt,
+                persisted,
                 resolver_inputs: _,
-            } => (profile, receipt),
+            } => (profile, receipt, persisted),
             BootstrapScanOutcome::PrivacyBoundaryRequired { code, .. } => {
                 panic!("valid-lease bootstrap demanded a boundary: {code}")
             }
@@ -2749,21 +2856,22 @@ mod tests {
         assert_eq!(receipt.candidate_root_ref, "root:a");
         assert_eq!(profile.roots, vec!["root:a".to_owned()]);
         assert_eq!(lease.consumed, 1);
+        assert_eq!(profile.verifier_candidates, vec!["verifier:one".to_owned()]);
+        assert_eq!(persisted.receipt_ref, receipt.scan_ref);
+        assert!(!persisted.store_ref.trim().is_empty());
+        assert_eq!(store.stored.len(), 1);
+        assert_eq!(store.stored[0], *receipt);
     }
 
     #[test]
     fn a2_missing_boundary_returns_boundary_required_with_question_only() {
         let mut lease = bootstrap_lease();
-        let outcome = match BootstrapScanner::scan(
-            "scan:one",
+        let mut store = TestReceiptStore { stored: Vec::new() };
+        let outcome = match run_bootstrap_discovery(
+            &mut store,
             &mut lease,
-            PrivacyClass::Internal,
-            None,
-            &bootstrap_evidence(),
-            ScopeKind::GitRepo,
-            "fingerprint:one",
-            Vec::new(),
-            1,
+            &bootstrap_key(),
+            &bootstrap_discovery(None),
         ) {
             Ok(value) => value,
             Err(error) => panic!("boundary-less scan failed: {error}"),
@@ -2780,5 +2888,6 @@ mod tests {
         assert_eq!(code, SCAN_PRIVACY_BOUNDARY_REQUIRED);
         assert!(!question.trim().is_empty());
         assert_eq!(lease.consumed, 0);
+        assert!(store.stored.is_empty());
     }
 }

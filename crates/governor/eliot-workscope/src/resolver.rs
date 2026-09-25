@@ -116,6 +116,10 @@ pub struct ManifestBoundaryClaim {
 ///
 /// Every tier input is optional; absent tiers are skipped. The candidate set
 /// is always present and is preserved verbatim into every ambiguous outcome.
+/// Bounded governing-source candidate references discovered by the bootstrap
+/// scanner travel on `governing_source_refs` as opaque references only: the
+/// resolver never reads source content, and their presence never authenticates
+/// a candidate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResolutionRequest {
@@ -127,6 +131,7 @@ pub struct ResolutionRequest {
     pub registered: Option<RegisteredInstanceEvidence>,
     pub lineage: Option<RepositoryLineageIdentity>,
     pub manifest_boundary: Option<ManifestBoundaryClaim>,
+    pub governing_source_refs: Vec<String>,
 }
 
 /// What the ordered resolver decided, and where.
@@ -278,7 +283,9 @@ impl ResolutionRequest {
     ///
     /// # Errors
     ///
-    /// Returns an error when any present tier evidence is malformed.
+    /// Returns an error when any present tier evidence is malformed, or when a
+    /// governing-source reference is blank or duplicated, or more than 32
+    /// source references are carried.
     pub fn validate(&self) -> Result<(), WorkScopeError> {
         if let Some(claim) = &self.session_task {
             claim.validate()?;
@@ -301,6 +308,15 @@ impl ResolutionRequest {
         if let Some(boundary) = &self.manifest_boundary {
             boundary.validate()?;
         }
+        if self.governing_source_refs.len() > 32 {
+            return Err(WorkScopeError::EmptyCollection {
+                field: "governing_source_refs",
+            });
+        }
+        for source in &self.governing_source_refs {
+            text(source, "governing_source_refs")?;
+        }
+        unique(self.governing_source_refs.iter(), "governing_source_refs")?;
         Ok(())
     }
 }

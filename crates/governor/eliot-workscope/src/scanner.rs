@@ -1,22 +1,39 @@
 //! Deterministic privacy-bounded bootstrap discovery (issue #1788).
 //!
-//! The scanner is a model-free fast pass over caller-supplied observations: it
-//! performs no IO, inspects no filesystem, process, credential, or store, and
-//! mints no scope authority. It validates a [`DiscoveryReadLease`] issued for
-//! one proposer/session/host and one candidate-root filesystem identity,
+//! The scanner is a model-free fast pass over caller-supplied observations:
+//! it performs no IO of its own. Identity and metadata enter only as typed
+//! caller evidence that the production caller
+//! ([`run_bootstrap_discovery`]) binds to live [`ObservedScopeResources`]
+//! before the scan runs: the candidate root and filesystem identity must name
+//! observed resources, VCS references must equal the observed generation, and
+//! every populated evidence group must be attested by the caller as a
+//! lease-admitted read class. Unattested or unobserved material fails closed;
+//! excluded classes (command lines, recent output, neighboring roots, raw
+//! secret/high-risk literals) have no intake field at all, so they cannot be
+//! submitted, only omitted (recorded on the receipt). Secret and high-risk
+//! literals cross the boundary solely as non-reversible digest identities
+//! enforced by shape, never copied as opaque caller strings.
+//!
+//! The scanner validates a [`DiscoveryReadLease`] issued for one
+//! proposer/session/host and one candidate-root filesystem identity, verifies
+//! the lease key binding by re-deriving its reference
+//! ([`DiscoveryReadLease::key_matches`]) before any charge, runs the
+//! forbidden-operation guard ([`authorize_operation`]) on every scan,
 //! enforces the lease allowlist (charging one consumption unit per collected
 //! allowed class and rejecting every forbidden operation), applies the
-//! privacy-before-capture boundary from I4.3.1, persists a
-//! [`ScanDisclosureReceipt`] of allowed/omitted/redacted/unresolved fields,
-//! and emits a [`ProvisionalScopeProfile`]. Only scanner evidence and bounded
+//! privacy-before-capture boundary from I4.3.1, durably writes the
+//! [`ScanDisclosureReceipt`] of allowed/omitted/redacted/unresolved fields
+//! through a [`ScanDisclosureStore`] before reporting completion, and emits a
+//! [`ProvisionalScopeProfile`] whose verifier candidates come from the
+//! owner's registered verifier references. Only scanner evidence and bounded
 //! source-candidate references flow into [`WorkScopeResolver`]; discovery never
 //! confers scope authority (no session/task/token tier is ever populated).
 
 use super::{
-    DiscoveryLeaseError, DiscoveryRead, DiscoveryReadLease, GoverningSourceRole,
-    HostObservedHandles, ManifestBoundaryClaim, RepositoryLineageIdentity, ResolutionOutcome,
-    ResolutionRequest, ResourceExecutionIdentity, ScopeKind, WorkScopeCandidateSet, WorkScopeError,
-    WorkScopeResolver, counter, text, unique,
+    DescriptorPolicy, DiscoveryLeaseError, DiscoveryRead, DiscoveryReadLease, GoverningSourceRole,
+    HostObservedHandles, ManifestBoundaryClaim, ObservedScopeResources, RepositoryLineageIdentity,
+    ResolutionOutcome, ResolutionRequest, ResourceExecutionIdentity, ScopeKind,
+    WorkScopeCandidateSet, WorkScopeError, WorkScopeResolver, counter, digest, text, unique,
 };
 use eliot_security_contracts::PrivacyClass;
 use schemars::JsonSchema;
@@ -115,6 +132,38 @@ impl DiscoveryLeaseRequest {
     }
 }
 
+/// Key a discovery lease is bound to: one proposer/session/host and one
+/// candidate-root filesystem identity.
+///
+/// The key is presented at every scan alongside the lease; the scanner
+/// re-derives the lease reference from it and rejects the scan without
+/// consumption when the lease was not issued for this key.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryLeaseKey {
+    pub proposer_ref: String,
+    pub session_ref: String,
+    pub host_ref: String,
+    pub root_filesystem_identity_ref: String,
+}
+
+impl DiscoveryLeaseKey {
+    /// Validates the key shape without issuing or charging anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any key identity reference is blank.
+    pub fn validate(&self) -> Result<(), WorkScopeError> {
+        text(&self.proposer_ref, "lease_key.proposer_ref")?;
+        text(&self.session_ref, "lease_key.session_ref")?;
+        text(&self.host_ref, "lease_key.host_ref")?;
+        text(
+            &self.root_filesystem_identity_ref,
+            "lease_key.root_filesystem_identity_ref",
+        )
+    }
+}
+
 /// Derives the lease reference from the lease key identities.
 #[must_use]
 pub fn derive_lease_ref(
@@ -130,8 +179,10 @@ pub fn derive_lease_ref(
 
 /// Issues an expiring, consumption-limited discovery lease for one key.
 ///
-/// The lease starts unconsumed; collection charges it through
-/// [`DiscoveryReadLease::charge`].
+/// The issued lease retains the full key components alongside the derived
+/// reference, so every later use re-verifies the binding through
+/// [`DiscoveryReadLease::key_matches`]. The lease starts unconsumed;
+/// collection charges it through [`DiscoveryReadLease::charge`].
 ///
 /// # Errors
 ///
@@ -148,6 +199,10 @@ pub fn issue_discovery_lease(
             &request.host_ref,
             &request.root_filesystem_identity_ref,
         ),
+        proposer_ref: request.proposer_ref.clone(),
+        session_ref: request.session_ref.clone(),
+        host_ref: request.host_ref.clone(),
+        root_filesystem_identity_ref: request.root_filesystem_identity_ref.clone(),
         candidate_root_ref: request.candidate_root_ref.clone(),
         allowed_reads: request.allowed_reads.clone(),
         deadline: request.deadline,
@@ -197,13 +252,42 @@ impl DiscoveryReadLease {
 ///
 /// A lease never admits project-memory admission, mutation, credential reads,
 /// broad neighboring-root scans, or external-model delivery: the rejection is
-/// unconditional and typed so callers map it without string matching.
+/// unconditional and typed so callers map it without string matching. The
+/// scanner invokes this guard for every forbidden operation on every scan
+/// through [`deny_forbidden_operations`]; it is never an uncalled helper.
 ///
 /// # Errors
 ///
 /// Always returns [`DiscoveryLeaseError::ReadNotAdmitted`].
 pub fn authorize_operation(_operation: DiscoveryOperation) -> Result<(), DiscoveryLeaseError> {
     Err(DiscoveryLeaseError::ReadNotAdmitted)
+}
+
+/// Runs the forbidden-operation guard for one scan.
+///
+/// Every [`DiscoveryOperation`] must be rejected by [`authorize_operation`];
+/// a guard that ever admits an operation fails the scan closed instead of
+/// charging the lease. Scans that reach the charging step have therefore
+/// passed an explicit forbidden-operation denial, not merely an allowlist
+/// check.
+///
+/// # Errors
+///
+/// Returns [`WorkScopeError::BindingReceiptMismatch`] when the guard admits
+/// any forbidden operation.
+fn deny_forbidden_operations() -> Result<(), WorkScopeError> {
+    for operation in [
+        DiscoveryOperation::ProjectMemoryAdmission,
+        DiscoveryOperation::Mutation,
+        DiscoveryOperation::CredentialRead,
+        DiscoveryOperation::BroadNeighborScan,
+        DiscoveryOperation::ExternalModelDelivery,
+    ] {
+        if authorize_operation(operation).is_ok() {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+    }
+    Ok(())
 }
 
 /// File-type distribution bucket: kind label plus deterministic count.
@@ -286,7 +370,14 @@ pub struct ArtifactDirEvidence {
 /// command-line, terminal-output, neighboring-root, or secret-literal fields:
 /// excluded material cannot be submitted, only omitted (recorded on the
 /// receipt). Secret and high-risk literals appear solely as non-reversible
-/// identity references in `redacted_literal_identities`.
+/// digest identities in `redacted_literal_identities`; each entry must be a
+/// 64-character lowercase hex digest, so opaque caller strings are rejected
+/// at intake instead of being copied onto the receipt.
+///
+/// `attested_reads` is the caller's typed attestation of which allowed-class
+/// reads produced this evidence. The scanner requires the attested set to
+/// equal the populated-field set exactly: unattested populated fields and
+/// attested-but-empty classes both fail the scan closed before any charge.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BootstrapScanEvidence {
@@ -308,17 +399,24 @@ pub struct BootstrapScanEvidence {
     pub broker_attached: Option<bool>,
     pub redacted_literal_identities: Vec<String>,
     pub unresolved_fields: Vec<DiscoveryRead>,
+    pub attested_reads: Vec<DiscoveryRead>,
 }
 
 impl BootstrapScanEvidence {
     /// Validates bounded, well-formed observations without interpreting them.
+    ///
+    /// Redaction identities must already be non-reversible digests: arbitrary
+    /// caller strings are rejected here, so the receipt can never carry an
+    /// unredacted literal the caller relabeled as an identity.
     ///
     /// # Errors
     ///
     /// Returns an error when identity references are blank, a bounded
     /// collection leaves its range (file distribution/manifests/profiles/
     /// services/editors/records/adapters 0..=32, changes/artifacts/redacted
-    /// 0..=128, unresolved 0..=16), or a reference is blank or duplicated.
+    /// 0..=128, unresolved 0..=16, attested reads 1..=5), a reference is blank
+    /// or duplicated, a redaction identity is not a digest, or no read class
+    /// is attested.
     pub fn validate(&self) -> Result<(), WorkScopeError> {
         text(&self.canonical_root_ref, "canonical_root_ref")?;
         text(&self.filesystem_identity_ref, "filesystem_identity_ref")?;
@@ -394,7 +492,7 @@ impl BootstrapScanEvidence {
             "redacted_literal_identities",
         )?;
         for identity in &self.redacted_literal_identities {
-            text(identity, "redacted_literal_identities")?;
+            digest(identity, "redacted_literal_identities")?;
         }
         unique(
             self.redacted_literal_identities.iter(),
@@ -402,6 +500,12 @@ impl BootstrapScanEvidence {
         )?;
         Self::check_bounded(self.unresolved_fields.len(), 16, "unresolved_fields")?;
         unique(self.unresolved_fields.iter(), "unresolved_fields")?;
+        if self.attested_reads.is_empty() || self.attested_reads.len() > 5 {
+            return Err(WorkScopeError::EmptyCollection {
+                field: "attested_reads",
+            });
+        }
+        unique(self.attested_reads.iter(), "attested_reads")?;
         Ok(())
     }
 
@@ -415,7 +519,13 @@ impl BootstrapScanEvidence {
 
 /// Durable record of what one scan was allowed, omitted, redacted, and left
 /// unresolved (I4.3.1). Omitted classes are always the four default-excluded
-/// classes; nothing excluded ever reaches durable capture.
+/// classes; nothing excluded ever reaches durable capture. Redacted entries
+/// are non-reversible digests enforced at intake and re-checked here, so a
+/// receipt can never durably carry a raw literal.
+///
+/// A receipt value alone is not persistence: [`BootstrapScanner::scan`]
+/// writes the receipt through a [`ScanDisclosureStore`] and reports
+/// completion only with the resulting [`ScanReceiptHandle`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScanDisclosureReceipt {
@@ -435,8 +545,9 @@ impl ScanDisclosureReceipt {
     /// # Errors
     ///
     /// Returns an error when references are blank, allowed/unresolved classes
-    /// are duplicated, redacted identities are blank or duplicated, or the
-    /// omitted set does not cover every default-excluded class.
+    /// are duplicated, redacted identities are blank, duplicated, or not
+    /// non-reversible digests, or the omitted set does not cover every
+    /// default-excluded class.
     pub fn validate(&self) -> Result<(), WorkScopeError> {
         text(&self.scan_ref, "scan_ref")?;
         text(&self.lease_ref, "lease_ref")?;
@@ -444,7 +555,7 @@ impl ScanDisclosureReceipt {
         unique(self.allowed.iter(), "allowed")?;
         unique(self.unresolved.iter(), "unresolved")?;
         for identity in &self.redacted {
-            text(identity, "redacted")?;
+            digest(identity, "redacted")?;
         }
         unique(self.redacted.iter(), "redacted")?;
         for required in [
@@ -462,6 +573,52 @@ impl ScanDisclosureReceipt {
         }
         Ok(())
     }
+}
+
+/// Durable-write handle for one stored disclosure receipt.
+///
+/// `receipt_ref` names the scanned receipt (`ScanDisclosureReceipt::scan_ref`);
+/// `store_ref` is the durable location assigned by the store owner (sequence,
+/// key, or content address, owned by the store, opaque here). The scanner
+/// verifies the binding before reporting completion.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScanReceiptHandle {
+    pub receipt_ref: String,
+    pub store_ref: String,
+}
+
+impl ScanReceiptHandle {
+    /// Validates the handle shape without re-reading the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either reference is blank.
+    pub fn validate(&self) -> Result<(), WorkScopeError> {
+        text(&self.receipt_ref, "receipt_handle.receipt_ref")?;
+        text(&self.store_ref, "receipt_handle.store_ref")
+    }
+}
+
+/// Durable-write port for scan disclosure receipts.
+///
+/// The governor owns scan semantics but never owns store mechanics, so the
+/// durable write itself lives behind this port: the store owner implements
+/// the write (local durable capture under the scan privacy boundary), and
+/// [`BootstrapScanner::scan`] reports `Completed` only after the write
+/// succeeds and the returned handle binds the receipt. A scan whose receipt
+/// cannot be durably written is an error, never a completion without proof.
+pub trait ScanDisclosureStore {
+    /// Durably writes one disclosure receipt and returns its handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the receipt cannot be durably written; the
+    /// scan then fails instead of completing without a persisted receipt.
+    fn store_receipt(
+        &mut self,
+        receipt: &ScanDisclosureReceipt,
+    ) -> Result<ScanReceiptHandle, WorkScopeError>;
 }
 
 /// Deterministic pre-scope profile emitted by a completed scan (I4.3 output).
@@ -559,9 +716,9 @@ impl ProvisionalScopeProfile {
 /// Only the evidence tiers are populated: host handles (exact root/VCS
 /// identity), lineage, and manifest boundary. Session/task, binding-token, and
 /// registered tiers stay `None`, so filesystem discovery can never confer
-/// scope authority. Bounded governing-source candidates travel as opaque
-/// source references alongside the request; their content is never admitted
-/// here.
+/// scope authority. Bounded governing-source candidates travel into the
+/// request on `governing_source_refs` as opaque references; their content is
+/// never admitted here.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScannerResolverInputs {
@@ -602,7 +759,8 @@ impl ScannerResolverInputs {
     }
 
     /// Builds the resolver request: scanner evidence tiers plus the preserved
-    /// candidate set, and nothing else.
+    /// candidate set plus the bounded governing-source references, and
+    /// nothing else.
     ///
     /// # Errors
     ///
@@ -621,22 +779,24 @@ impl ScannerResolverInputs {
             registered: None,
             lineage: self.lineage.clone(),
             manifest_boundary: self.manifest_boundary.clone(),
+            governing_source_refs: self.governing_source_refs.clone(),
         })
     }
 }
 
 /// What one deterministic bootstrap scan produced.
 ///
-/// `Completed` carries the profile, the disclosure receipt, and the bounded
-/// resolver inputs. `PrivacyBoundaryRequired` carries the agent-facing code
-/// and a non-persisted discriminative question; nothing is persisted on that
-/// path.
+/// `Completed` carries the profile, the disclosure receipt, the durable-write
+/// handle binding that receipt, and the bounded resolver inputs.
+/// `PrivacyBoundaryRequired` carries the agent-facing code and a non-persisted
+/// discriminative question; nothing is persisted on that path.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "disposition", content = "detail")]
 pub enum BootstrapScanOutcome {
     Completed {
         profile: Box<ProvisionalScopeProfile>,
         receipt: Box<ScanDisclosureReceipt>,
+        persisted: Box<ScanReceiptHandle>,
         resolver_inputs: Box<ScannerResolverInputs>,
     },
     PrivacyBoundaryRequired {
@@ -650,32 +810,48 @@ pub enum BootstrapScanOutcome {
 pub struct BootstrapScanner;
 
 impl BootstrapScanner {
-    /// Runs one privacy-bounded scan against the lease and boundary.
+    /// Runs one privacy-bounded scan against the lease key, lease, boundary,
+    /// and store.
     ///
-    /// The lease must authorize every collected allowed class; one consumption
-    /// unit is charged per collected class. The privacy boundary must admit
-    /// `candidate_privacy`; otherwise the outcome is `PrivacyBoundaryRequired`
-    /// with only a non-persisted discriminative question. Forbidden operations
-    /// stay rejected, excluded classes stay omitted, and secret material
-    /// persists only as the caller-supplied non-reversible identities.
+    /// The lease must have been issued for `key`: the scanner re-derives the
+    /// lease reference through [`DiscoveryReadLease::key_matches`] before any
+    /// other use, and a key mismatch fails closed without consumption. The
+    /// forbidden-operation guard ([`deny_forbidden_operations`]) runs before
+    /// charging, so every charged read passed an explicit denial of the
+    /// forbidden operations. The caller's attested read classes must equal
+    /// the populated evidence classes exactly; the lease must authorize every
+    /// collected allowed class, and one consumption unit is charged per
+    /// collected class. The privacy boundary must admit `candidate_privacy`;
+    /// otherwise the outcome is `PrivacyBoundaryRequired` with only a
+    /// non-persisted discriminative question. The disclosure receipt is
+    /// durably written through `store` before completion is reported, and the
+    /// returned handle must bind the receipt. Verifier candidates come from
+    /// the caller (the owner's registered verifier references), never from
+    /// synthesis: an empty list is recorded as a capability gap instead of a
+    /// silent empty profile field.
     ///
     /// # Errors
     ///
-    /// Returns [`DiscoveryLeaseError`] when the lease is expired, exhausted,
-    /// or does not admit a collected class, and [`WorkScopeError`] when scan
-    /// references or evidence are malformed.
+    /// Returns [`WorkScopeError`] when the lease key, lease shape, evidence,
+    /// attestation, verifier candidates, or scan references are malformed,
+    /// when the key binding, forbidden-operation guard, attestation, receipt
+    /// write, or handle binding fails, and when the lease is expired,
+    /// exhausted, or does not admit a collected class.
     #[allow(
         clippy::too_many_arguments,
-        reason = "scan joins lease, boundary, evidence, and profile inputs in one deterministic constructor"
+        reason = "scan joins key, lease, store, boundary, evidence, and profile inputs in one deterministic constructor"
     )]
     pub fn scan(
         scan_ref: impl Into<String>,
         lease: &mut DiscoveryReadLease,
+        key: &DiscoveryLeaseKey,
+        store: &mut impl ScanDisclosureStore,
         candidate_privacy: PrivacyClass,
         privacy_boundary: Option<&PrivacyBoundary>,
         evidence: &BootstrapScanEvidence,
         proposed_kind: ScopeKind,
         identity_fingerprint: impl Into<String>,
+        verifier_candidates: &[String],
         governing_source_refs: Vec<String>,
         now: u64,
     ) -> Result<BootstrapScanOutcome, WorkScopeError> {
@@ -683,10 +859,20 @@ impl BootstrapScanner {
         let identity_fingerprint = identity_fingerprint.into();
         text(&scan_ref, "scan_ref")?;
         text(&identity_fingerprint, "identity_fingerprint")?;
+        key.validate()?;
         lease
             .validate()
             .map_err(|_| WorkScopeError::InvalidCounter { field: "lease" })?;
+        if !lease.key_matches(
+            &key.proposer_ref,
+            &key.session_ref,
+            &key.host_ref,
+            &key.root_filesystem_identity_ref,
+        ) {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
         evidence.validate()?;
+        check_verifier_candidates(verifier_candidates)?;
         let Some(boundary) = privacy_boundary else {
             return Ok(BootstrapScanOutcome::PrivacyBoundaryRequired {
                 code: SCAN_PRIVACY_BOUNDARY_REQUIRED.to_owned(),
@@ -705,7 +891,9 @@ impl BootstrapScanner {
         {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
+        deny_forbidden_operations()?;
         let collected = collected_classes(evidence);
+        check_attested_reads(&collected, &evidence.attested_reads)?;
         for class in &collected {
             lease
                 .charge(*class, now)
@@ -734,16 +922,23 @@ impl BootstrapScanner {
             privacy_boundary_ref: Some(boundary.boundary_ref.clone()),
         };
         receipt.validate()?;
+        let persisted = store.store_receipt(&receipt)?;
+        persisted.validate()?;
+        if persisted.receipt_ref != receipt.scan_ref {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
         let profile = Self::profile_for(
             &scan_ref,
             proposed_kind,
             identity_fingerprint,
             evidence,
             &collected,
+            verifier_candidates,
         )?;
         Ok(BootstrapScanOutcome::Completed {
             profile: Box::new(profile),
             receipt: Box::new(receipt),
+            persisted: Box::new(persisted),
             resolver_inputs: Box::new(inputs),
         })
     }
@@ -771,6 +966,7 @@ impl BootstrapScanner {
         identity_fingerprint: String,
         evidence: &BootstrapScanEvidence,
         collected: &[DiscoveryRead],
+        verifier_candidates: &[String],
     ) -> Result<ProvisionalScopeProfile, WorkScopeError> {
         let mut evidence_refs = vec![format!("scan:{scan_ref}")];
         for class in collected {
@@ -822,6 +1018,9 @@ impl BootstrapScanner {
         if evidence.adapters.is_empty() {
             capability_gaps.push("adapters".to_owned());
         }
+        if verifier_candidates.is_empty() {
+            capability_gaps.push("verifiers".to_owned());
+        }
         if !evidence.unresolved_fields.is_empty() {
             capability_gaps.push("unresolved_evidence".to_owned());
         }
@@ -847,7 +1046,7 @@ impl BootstrapScanner {
             likely_languages,
             active_resources,
             truth_surfaces_available,
-            verifier_candidates: Vec::new(),
+            verifier_candidates: verifier_candidates.to_vec(),
             adapter_candidates,
             capability_gaps,
             confidence,
@@ -857,6 +1056,107 @@ impl BootstrapScanner {
         profile.validate()?;
         Ok(profile)
     }
+}
+
+/// Production inputs for one bootstrap discovery run.
+///
+/// `observed` carries the live resources the host layer actually read (VCS,
+/// filesystem, and process observations); `policy` carries what the owner
+/// asserts, including the registered verifier references that become the
+/// profile's verifier candidates; `evidence` carries the host layer's
+/// per-class metadata for the candidate root. The runner binds all three
+/// together before any scan runs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapDiscoveryInputs {
+    pub scan_ref: String,
+    pub candidate_privacy: PrivacyClass,
+    pub privacy_boundary: Option<PrivacyBoundary>,
+    pub observed: ObservedScopeResources,
+    pub policy: DescriptorPolicy,
+    pub evidence: BootstrapScanEvidence,
+    pub proposed_kind: ScopeKind,
+    pub identity_fingerprint: String,
+    pub governing_source_refs: Vec<String>,
+    pub now: u64,
+}
+
+/// Runs the production bootstrap discovery flow: keyed lease, guarded scan,
+/// durable receipt write.
+///
+/// This is the non-test caller that wires the seams together. It validates
+/// the live observations and owner policy, binds the scan evidence to what
+/// was actually observed (the candidate root must be an observed root, the
+/// filesystem identity must be an observed instance identity, and carried
+/// VCS references must equal the observed generation exactly — arbitrary
+/// caller strings that name nothing observed fail closed), takes the
+/// verifier candidates from the owner's registered verifier references, and
+/// runs [`BootstrapScanner::scan`], which verifies the lease key, runs the
+/// forbidden-operation guard, charges the lease, and durably writes the
+/// receipt through `store` before reporting completion.
+///
+/// Exclusion holds by construction: the intake types have no fields for
+/// command lines, recent output, neighboring roots, or raw secret literals,
+/// and redaction identities must already be non-reversible digests.
+///
+/// # Errors
+///
+/// Returns an error when observations, policy, evidence, or references are
+/// malformed, when evidence names nothing observed, or when the scan itself
+/// fails (see [`BootstrapScanner::scan`]).
+pub fn run_bootstrap_discovery(
+    store: &mut impl ScanDisclosureStore,
+    lease: &mut DiscoveryReadLease,
+    key: &DiscoveryLeaseKey,
+    discovery: &BootstrapDiscoveryInputs,
+) -> Result<BootstrapScanOutcome, WorkScopeError> {
+    text(&discovery.scan_ref, "discovery.scan_ref")?;
+    text(
+        &discovery.identity_fingerprint,
+        "discovery.identity_fingerprint",
+    )?;
+    discovery.observed.validate()?;
+    discovery.policy.validate()?;
+    discovery.evidence.validate()?;
+    if !discovery
+        .observed
+        .root_identities
+        .contains(&lease.candidate_root_ref)
+    {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    if discovery.evidence.canonical_root_ref != lease.candidate_root_ref {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    if !discovery
+        .observed
+        .instances
+        .iter()
+        .any(|instance| instance.root_identity == discovery.evidence.filesystem_identity_ref)
+    {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    let generation = &discovery.observed.generation;
+    if discovery.evidence.vcs_branch_ref != generation.branch_ref
+        || discovery.evidence.vcs_commit_ref != generation.commit_ref
+        || discovery.evidence.vcs_dirty_summary_ref != generation.dirty_summary_ref
+    {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    BootstrapScanner::scan(
+        discovery.scan_ref.clone(),
+        lease,
+        key,
+        store,
+        discovery.candidate_privacy,
+        discovery.privacy_boundary.as_ref(),
+        &discovery.evidence,
+        discovery.proposed_kind,
+        discovery.identity_fingerprint.clone(),
+        &discovery.policy.verifier_refs,
+        discovery.governing_source_refs.clone(),
+        discovery.now,
+    )
 }
 
 /// Privacy boundary admitted for one scan: the privacy profile plus the
@@ -935,6 +1235,46 @@ fn read_label(class: DiscoveryRead) -> &'static str {
         DiscoveryRead::KnownFormatHeaders => "known_format_headers",
         DiscoveryRead::GoverningSourceCandidates => "governing_source_candidates",
     }
+}
+
+/// Requires the caller's attested read classes to equal the populated
+/// evidence classes exactly.
+///
+/// Unattested populated classes mean the caller collected without admitting
+/// the read; attested-but-empty classes mean the caller charges consumption
+/// for nothing collected. Both fail closed before any charge.
+///
+/// # Errors
+///
+/// Returns [`WorkScopeError::BindingReceiptMismatch`] when the attested set
+/// differs from the collected set in either direction.
+fn check_attested_reads(
+    collected: &[DiscoveryRead],
+    attested: &[DiscoveryRead],
+) -> Result<(), WorkScopeError> {
+    if collected.len() != attested.len() || collected.iter().any(|class| !attested.contains(class))
+    {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    Ok(())
+}
+
+/// Validates caller-supplied verifier candidates without interpreting them.
+///
+/// # Errors
+///
+/// Returns an error when a candidate is blank or duplicated, or more than 32
+/// candidates are carried.
+fn check_verifier_candidates(candidates: &[String]) -> Result<(), WorkScopeError> {
+    if candidates.len() > 32 {
+        return Err(WorkScopeError::EmptyCollection {
+            field: "verifier_candidates",
+        });
+    }
+    for candidate in candidates {
+        text(candidate, "verifier_candidates")?;
+    }
+    unique(candidates.iter(), "verifier_candidates")
 }
 
 fn collected_classes(evidence: &BootstrapScanEvidence) -> Vec<DiscoveryRead> {
