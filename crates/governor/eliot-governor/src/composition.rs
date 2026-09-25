@@ -2044,19 +2044,28 @@ fn check_fact_terminal_effect_join(
     Ok(())
 }
 
-/// Rebuilds acceptance dispositions from the terminal verifier evidence and
-/// canonical plan. Persisted `satisfied` flags are never an independent
-/// source of acceptance truth.
+/// Rebuilds acceptance dispositions from the terminal verifier evidence
+/// joined against the current canonical owner plan. Persisted `satisfied`
+/// flags are never an independent source of acceptance truth.
 ///
-/// I7.9 / issue #325 P1: the denominator is the plan-bound `TaskContract`
-/// acceptance set (`required_acceptance_item_ids`), never the selected
-/// `required_test_ids` inventory. Every required item is enumerated before
-/// any verifier evidence is joined; unmapped items stay uncovered and can
-/// never yield `VERIFIED_COMPLETE` downstream.
+/// I7.9 / issue #325 P1: the denominator is rehydrated from the current
+/// canonical owner plan (`plan`, read by the caller from the canonical owner
+/// at the exact task/fence/revision), never from the selected
+/// `required_test_ids` inventory and never from the fact-embedded plan clone
+/// alone: a fact whose plan drifted from the current owner plan fails closed
+/// here. Every required acceptance item is enumerated before any verifier
+/// evidence is joined; unmapped items stay uncovered and can never yield
+/// `VERIFIED_COMPLETE` downstream.
 pub(crate) fn acceptance_coverage_from_verifier_fact(
+    plan: &CanonicalPlanBinding,
     fact: &CanonicalVerifierExecutionFact,
 ) -> Result<Vec<AcceptanceCoverage>, CompositionError> {
-    let verifier_plan = fact.plan.verifier.as_ref().ok_or_else(|| {
+    if fact.plan != *plan {
+        return Err(verifier_fact_error(
+            "canonical verifier fact plan drifted from the current canonical owner plan",
+        ));
+    }
+    let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
         verifier_fact_error("canonical finish plan has no verifier item bindings")
     })?;
     let run_ref = fact.verification_run.run_id.to_string();
@@ -2361,7 +2370,7 @@ impl CanonicalFinishEvidence {
                     .to_owned(),
             ));
         }
-        if self.evidence.acceptance != acceptance_coverage_from_verifier_fact(fact)? {
+        if self.evidence.acceptance != acceptance_coverage_from_verifier_fact(plan, fact)? {
             return Err(CompositionError::Recovery(
                 "canonical per-item acceptance dispositions differ from verifier evidence"
                     .to_owned(),

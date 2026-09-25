@@ -220,7 +220,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             )));
         }
 
-        let acceptance = acceptance_coverage_from_verifier_fact(&verifier_fact)?;
+        let acceptance = acceptance_coverage_from_verifier_fact(plan, &verifier_fact)?;
         let stale_verifier_run_refs = if verifier_fact.certifies_completion() {
             Vec::new()
         } else {
