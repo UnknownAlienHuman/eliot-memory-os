@@ -30,8 +30,11 @@ use crate::restore_journal::{
     JournalPredecessor, MAX_JOURNAL_HISTORY_ENTRIES, MAX_JOURNAL_PAGE_ENTRIES,
     MAX_JOURNAL_STREAM_KEY_BYTES, MAX_JOURNAL_TOTAL_BYTES, MAX_JOURNAL_WORK_ENTRIES,
     RESTORE_JOURNAL_RECORD_SCHEMA, RESTORE_JOURNAL_SCHEMA_VERSION, RestoreJournalAppendReceipt,
-    RestoreJournalEntry, RestoreJournalOperation, RestoreJournalReceiptKind, RestoreJournalResult,
-    RestoreJournalStreamBinding,
+    RestoreJournalCompleteness, RestoreJournalEntry, RestoreJournalMemberDenominator,
+    RestoreJournalOperation, RestoreJournalReadback, RestoreJournalReadbackRequest,
+    RestoreJournalReceiptKind, RestoreJournalResult, RestoreJournalRetentionDisposition,
+    RestoreJournalRetentionFrontier, RestoreJournalRetentionPolicy, RestoreJournalRetentionRecord,
+    RestoreJournalRetentionReport, RestoreJournalStreamBinding,
 };
 
 /// Versioned intent table: owner-neutral restore intent rows.
@@ -96,6 +99,9 @@ const HISTORY_PREFIX: &str = "history";
 const OPERATION_PREFIX: &str = "operation";
 const USED_PREFIX: &str = "used";
 const HEAD_PREFIX: &str = "head";
+/// Durable retention-decision row: what the last reclamation pass reclaimed
+/// and which recovery-needed members it refused to evict.
+const RETENTION_PREFIX: &str = "retention";
 /// Ceiling on database tables enumerated by the journal family check. Every
 /// journal entry point runs that check, so the scan itself must be bounded.
 const MAX_JOURNAL_TABLES_SCANNED: usize = 4096;
@@ -190,6 +196,12 @@ struct JournalStreamState {
     /// is detected instead of yielding a truncated history that still looks
     /// contiguous.
     head: Option<JournalPredecessor>,
+    /// Durable retention decision committed with the last reclamation. Absent
+    /// on a store that never pruned and on one written before the decision
+    /// existed; its presence is checked against the prune fence rather than
+    /// assumed, so an older retained history is never upgraded into a claimed
+    /// one.
+    retention: Option<RestoreJournalRetentionRecord>,
 }
 
 impl JournalStreamState {
@@ -493,6 +505,54 @@ fn resolved_prefix_target(stream_state: &JournalStreamState, keep_resolved: usiz
     resolved_count.saturating_sub(keep_resolved)
 }
 
+/// Exact phase slot a retained intent occupies.
+///
+/// A retained intent without a derivable phase identity cannot be matched to
+/// its unique operation index, which is an integrity refusal rather than a
+/// skipped row.
+fn intent_slot(stream: &str, entry: &RestoreJournalEntry) -> Result<String, OrsError> {
+    Ok(sha256_hex(
+        entry
+            .operation
+            .phase_identity(stream)
+            .map_err(|_| integrity("restore_journal_index", "invalid phase identity"))?
+            .as_bytes(),
+    ))
+}
+
+/// The recovery-needed members a retention pass refuses to evict.
+///
+/// This is recomputed from current owner state rather than carried from the
+/// plan, so the reported frontier is the one that still holds. Only a durable
+/// result makes a member resolved, so reclamation can never lower it.
+fn unresolved_frontier(
+    stream: &str,
+    stream_state: &JournalStreamState,
+) -> Result<RestoreJournalRetentionFrontier, OrsError> {
+    let mut unresolved_members = 0_u64;
+    let mut oldest_unresolved_sequence = None;
+    for (sequence, entry) in &stream_state.intents {
+        let slot = intent_slot(stream, entry)?;
+        let index = stream_state
+            .indexes
+            .get(&slot)
+            .ok_or_else(|| integrity("restore_journal_index", "operation index is missing"))?;
+        if index.result_key.is_some() {
+            continue;
+        }
+        if oldest_unresolved_sequence.is_none() {
+            oldest_unresolved_sequence = Some(*sequence);
+        }
+        unresolved_members = unresolved_members.saturating_add(1);
+    }
+    let retained_members = u64::try_from(stream_state.intents.len()).unwrap_or(u64::MAX);
+    Ok(RestoreJournalRetentionFrontier {
+        unresolved_members,
+        oldest_unresolved_sequence,
+        policy_retained_members: retained_members.saturating_sub(unresolved_members),
+    })
+}
+
 /// Plans the oldest contiguous resolved prefix. It stops at the first unresolved
 /// intent, because removing a newer resolved pair while an unresolved operation
 /// stays in the prefix would evict recovery-needed state out of order.
@@ -509,13 +569,7 @@ fn plan_resolved_prefix(
         if removals.len() >= target {
             break;
         }
-        let slot = sha256_hex(
-            entry
-                .operation
-                .phase_identity(stream)
-                .map_err(|_| integrity("restore_journal_index", "invalid phase identity"))?
-                .as_bytes(),
-        );
+        let slot = intent_slot(stream, entry)?;
         let Some(index) = stream_state.indexes.get(&slot) else {
             return Err(integrity(
                 "restore_journal_index",
@@ -540,6 +594,86 @@ fn plan_resolved_prefix(
         });
     }
     Ok(removals)
+}
+
+/// Reclaims the oldest contiguous resolved prefix under the accepted window.
+///
+/// The whole pass runs inside the caller's single write transaction, so the
+/// removals, the phase-slot tombstones, the prune fence, the head and the
+/// durable retention decision are one durable unit. An interrupted pass leaves
+/// the journal exactly as it was, and a committed pass can never report a
+/// reclamation it did not perform.
+///
+/// The pass stops at the first unresolved intent and never evicts a
+/// recovery-needed member to stay under a bound: a reclamation the retired-slot
+/// bound would refuse removes nothing and is reported as a refusal with the
+/// frontier it stopped at.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one bounded retention pass over three tables"
+)]
+fn retain_restore_journal_locked(
+    intents: &mut redb::Table<'_, &'static str, &'static str>,
+    results: &mut redb::Table<'_, &'static str, &'static str>,
+    meta: &mut redb::Table<'_, &'static str, &'static str>,
+    state: &JournalState,
+    stream_state: &JournalStreamState,
+    stream: &str,
+    keep_resolved: usize,
+) -> Result<RestoreJournalRetentionRecord, OrsError> {
+    let frontier = unresolved_frontier(stream, stream_state)?;
+    let retired_before = stream_state
+        .history_fence
+        .as_ref()
+        .map_or(0_u64, |fence| fence.retired_slots);
+    let target = resolved_prefix_target(stream_state, keep_resolved);
+    // Refuse BEFORE removing anything when this pass would push the
+    // retired-slot set past the same bound validation enforces. Committing
+    // first and failing on the next read would brick an otherwise valid store,
+    // and evicting an unresolved member to stay under the bound is exactly
+    // what this pass must never do.
+    let retired_after = retired_before.saturating_add(u64::try_from(target).unwrap_or(u64::MAX));
+    let bound_refuses =
+        usize::try_from(retired_after).unwrap_or(usize::MAX) > MAX_JOURNAL_HISTORY_ENTRIES;
+    let removals = if bound_refuses {
+        Vec::new()
+    } else {
+        plan_resolved_prefix(stream, stream_state, target)?
+    };
+    let removed_members = u64::try_from(removals.len()).unwrap_or(u64::MAX);
+    let disposition = if bound_refuses {
+        RestoreJournalRetentionDisposition::RefusedRetiredSlotBound
+    } else if removed_members > 0 {
+        RestoreJournalRetentionDisposition::ReclaimedResolvedPrefix
+    } else {
+        RestoreJournalRetentionDisposition::NoResolvedPrefixToReclaim
+    };
+    let record = RestoreJournalRetentionRecord {
+        record_schema: RESTORE_JOURNAL_RECORD_SCHEMA.to_owned(),
+        keep_resolved: u64::try_from(keep_resolved).unwrap_or(u64::MAX),
+        removed_members,
+        retired_members: retired_before.saturating_add(removed_members),
+        disposition,
+        frontier: RestoreJournalRetentionFrontier {
+            policy_retained_members: frontier
+                .policy_retained_members
+                .saturating_sub(removed_members),
+            ..frontier
+        },
+    };
+    record.validate()?;
+    RedbRecoveryStore::apply_prune(
+        intents,
+        results,
+        meta,
+        state,
+        stream_state,
+        stream,
+        &removals,
+        retired_before,
+        &record,
+    )?;
+    Ok(record)
 }
 
 impl RedbRecoveryStore {
@@ -632,6 +766,22 @@ impl RedbRecoveryStore {
         let phase_identity = operation.phase_identity(stream)?;
         let slot_sha256 = sha256_hex(phase_identity.as_bytes());
         let operation_sha256 = operation.identity_sha256(stream)?;
+        // Retention under pressure, on the append path a restoring caller
+        // actually executes. Once a stream reaches the accepted reclaim point
+        // the oldest contiguous RESOLVED prefix is reclaimed before the new
+        // intent is admitted, so resolved history is reclaimed rather than a
+        // recovery-needed intent being evicted to make room. The probe reads
+        // only validated owner state and a stream that has not reached the
+        // reclaim point is admitted exactly as before, with no write at all.
+        //
+        // The pass is idempotent and separate from this append's own atomic
+        // boundary, so it can neither roll back nor weaken the append: a stream
+        // whose unresolved frontier blocks reclamation simply proceeds and is
+        // refused by the existing ceiling further down, which is the correct
+        // failure — the alternative would be evicting an unresolved intent.
+        if self.restore_journal_under_retention_pressure(stream)? {
+            self.apply_restore_journal_retention(stream)?;
+        }
         let write = self.database.begin_write().map_err(storage)?;
         initialize_restore_journal_schema(&write)?;
         let mut intents = write.open_table(RESTORE_JOURNAL_INTENTS).map_err(storage)?;
@@ -991,6 +1141,11 @@ impl RedbRecoveryStore {
     /// means a validated exact new stream with no entries. `Some(fence)` means
     /// the returned rows are a retained suffix and must not be treated as the
     /// complete historical denominator without the caller's member proof.
+    ///
+    /// This compatibility-shaped read reports no denominator of its own. A
+    /// caller that needs complete restore proof uses
+    /// `load_restore_journal_readback_against`, which compares the observed
+    /// retained-plus-retired member set against an explicit expectation.
     pub fn load_restore_journal_readback(
         &self,
         stream: &str,
@@ -1013,9 +1168,111 @@ impl RedbRecoveryStore {
         ))
     }
 
+    /// Reads one stream against an explicit member denominator and returns
+    /// complete restore proof only when the observed journal accounts for
+    /// exactly what the requester required.
+    ///
+    /// The denominator counts the WHOLE journal, retired members included, so
+    /// a retained suffix is proved rather than assumed to be the entire
+    /// history. Missing, corrupt, unsupported, stale or partially reclaimed
+    /// storage returns a typed refusal instead of a proof. Zero entries is
+    /// [`RestoreJournalCompleteness::ExactNew`] only for a validated exact new
+    /// journal — bound, no retained member, no retired phase slot and no prune
+    /// fence — so an empty read can never stand in for unavailable storage.
+    pub fn load_restore_journal_readback_against(
+        &self,
+        request: &RestoreJournalReadbackRequest,
+    ) -> Result<RestoreJournalReadback, OrsError> {
+        request.validate()?;
+        validate_journal_text(request.stream.as_str(), "journal.stream")?;
+        let state = self.read_restore_journal_state()?;
+        // A stream with no persisted binding is refused here, so unavailable or
+        // unadopted storage can never be observed as an empty journal.
+        let stream_state = state.stream(request.stream.as_str())?;
+        if stream_state.intents.len() > request.limit {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        let retained_members = u64::try_from(stream_state.intents.len()).unwrap_or(u64::MAX);
+        let retired_members = stream_state
+            .history_fence
+            .as_ref()
+            .map_or(0_u64, |fence| fence.retired_slots);
+        let total_members = retained_members.saturating_add(retired_members);
+        let head = stream_state.head.clone();
+        let history_fence = stream_state
+            .history_fence
+            .as_ref()
+            .map(|fence| fence.predecessor.clone());
+        let completeness = Self::check_restore_journal_denominator(
+            stream_state,
+            &request.denominator,
+            total_members,
+            head.as_ref(),
+        )?;
+        Ok(RestoreJournalReadback {
+            stream: request.stream.clone(),
+            entries: stream_state.intents.values().cloned().collect(),
+            retained_members,
+            retired_members,
+            total_members,
+            head,
+            history_fence,
+            completeness,
+            retention: stream_state.retention.clone(),
+        })
+    }
+
+    /// Refuses a readback whose observed members do not account for the
+    /// requested denominator.
+    ///
+    /// A zero denominator additionally requires the exact-new-journal proof. Any
+    /// other way of reading as empty — a reclaimed prefix, an unbound stream, a
+    /// store that could not be validated — is a refusal, never a known-empty
+    /// journal.
+    fn check_restore_journal_denominator(
+        stream_state: &JournalStreamState,
+        denominator: &RestoreJournalMemberDenominator,
+        total_members: u64,
+        head: Option<&JournalPredecessor>,
+    ) -> Result<RestoreJournalCompleteness, OrsError> {
+        if total_members != denominator.members {
+            return Err(integrity(
+                "restore_journal_readback",
+                "observed journal member denominator does not match the requested denominator",
+            ));
+        }
+        if denominator.head.as_ref() != head {
+            return Err(integrity(
+                "restore_journal_readback",
+                "observed journal head does not match the requested denominator",
+            ));
+        }
+        if denominator.members > 0 {
+            return Ok(RestoreJournalCompleteness::Complete);
+        }
+        // Known-empty is admitted only with the full exact-new proof. Without
+        // it, an empty read would be indistinguishable from storage that was
+        // never written, never validated, or already reclaimed.
+        if stream_state.binding.is_none()
+            || stream_state.history_fence.is_some()
+            || !stream_state.used_slots.is_empty()
+            || !stream_state.intents.is_empty()
+            || !stream_state.indexes.is_empty()
+            || !stream_state.results.is_empty()
+            || head.is_some()
+        {
+            return Err(integrity(
+                "restore_journal_readback",
+                "an empty journal is known-empty only for a validated exact new journal",
+            ));
+        }
+        Ok(RestoreJournalCompleteness::ExactNew)
+    }
+
     /// Bounded full-stream readback. A retained/pruned history is deliberately
     /// rejected by this compatibility-shaped API; callers that can prove the
-    /// retention/member denominator must use `load_restore_journal_readback`.
+    /// retention/member denominator must use
+    /// `load_restore_journal_readback_against`.
     pub fn load_restore_journal_stream(
         &self,
         stream: &str,
@@ -1131,18 +1388,82 @@ impl RedbRecoveryStore {
     /// Prunes only the oldest contiguous resolved prefix. Unresolved intents
     /// and their newer same-slot operations remain retained. The prune fence
     /// is the exact predecessor of the last removed intent.
+    ///
+    /// The pass is idempotent: a run with nothing reclaimable removes no
+    /// journal row and only refreshes the durable retention decision. It is
+    /// interrupt-safe because the removals, the phase-slot tombstones, the
+    /// fence, the head and that decision are one transaction, so a reclaimed
+    /// member and the report of it are never separated.
     pub fn prune_restore_journal(
         &self,
         stream: &str,
         keep_resolved: usize,
     ) -> Result<u64, OrsError> {
         validate_journal_text(stream, "journal.stream")?;
-        if keep_resolved > MAX_JOURNAL_HISTORY_ENTRIES {
-            return Err(OrsError::InvalidField {
-                field: "journal.keep_resolved",
-                reason: "must be within the existing journal history bound",
-            });
-        }
+        let policy = RestoreJournalRetentionPolicy {
+            keep_resolved,
+            ..RestoreJournalRetentionPolicy::accepted()
+        };
+        policy.validate()?;
+        Ok(self
+            .run_restore_journal_retention(stream, policy.keep_resolved)?
+            .removed_members)
+    }
+
+    /// Applies the ACCEPTED retention policy to one stream and reports what it
+    /// reclaimed together with the recovery-needed members it refused to
+    /// evict.
+    ///
+    /// This is the product entry point the append path runs once a stream
+    /// reaches the accepted reclaim point. It never evicts an unresolved intent
+    /// to make room: reclamation stops at the first unresolved intent, and a
+    /// reclamation the retired-slot bound would refuse removes nothing and is
+    /// reported as a refusal. The surviving frontier is recomputed from current
+    /// owner state after the pass, so the report cannot claim a reclamation the
+    /// journal does not show.
+    pub fn apply_restore_journal_retention(
+        &self,
+        stream: &str,
+    ) -> Result<RestoreJournalRetentionReport, OrsError> {
+        validate_journal_text(stream, "journal.stream")?;
+        let policy = RestoreJournalRetentionPolicy::accepted();
+        policy.validate()?;
+        let record = self.run_restore_journal_retention(stream, policy.keep_resolved)?;
+        let state = self.read_restore_journal_state()?;
+        let frontier = unresolved_frontier(stream, state.stream(stream)?)?;
+        Ok(RestoreJournalRetentionReport {
+            stream: stream.to_owned(),
+            record,
+            surviving_unresolved_members: frontier.unresolved_members,
+            oldest_surviving_unresolved: frontier.oldest_unresolved_sequence,
+        })
+    }
+
+    /// Reports whether this stream has reached the accepted reclaim point of
+    /// the retention policy.
+    ///
+    /// Only validated owner state answers the question, and a stream that does
+    /// not exist yet is not under pressure. Both the retained members and the
+    /// retired phase-slot tombstones count: tombstones accumulate as history is
+    /// reclaimed, so a stream that has already reclaimed heavily reaches the
+    /// point again and is reclaimed again.
+    fn restore_journal_under_retention_pressure(&self, stream: &str) -> Result<bool, OrsError> {
+        let policy = RestoreJournalRetentionPolicy::accepted();
+        policy.validate()?;
+        let state = self.read_restore_journal_state()?;
+        Ok(state.streams.get(stream).is_some_and(|stream_state| {
+            stream_state.intents.len() >= policy.reclaim_from_members
+                || stream_state.used_slots.len() >= policy.reclaim_from_members
+        }))
+    }
+
+    /// Runs exactly one retention pass in its own write transaction and returns
+    /// the durable decision that pass committed.
+    fn run_restore_journal_retention(
+        &self,
+        stream: &str,
+        keep_resolved: usize,
+    ) -> Result<RestoreJournalRetentionRecord, OrsError> {
         let write = self.database.begin_write().map_err(storage)?;
         initialize_restore_journal_schema(&write)?;
         let mut intents = write.open_table(RESTORE_JOURNAL_INTENTS).map_err(storage)?;
@@ -1150,43 +1471,28 @@ impl RedbRecoveryStore {
         let mut meta = write.open_table(RESTORE_JOURNAL_META).map_err(storage)?;
         let state = validate_journal_tables(&intents, &results, &meta)?;
         let stream_state = state.stream(stream)?;
-        let retired_before = stream_state
-            .history_fence
-            .as_ref()
-            .map_or(0_u64, |fence| fence.retired_slots);
-        let target = resolved_prefix_target(stream_state, keep_resolved);
-        // Refuse BEFORE writing if this prune would push the retired-slot set
-        // past the same bound validation enforces. Committing first and failing
-        // on the next read would brick an otherwise valid store.
-        let retired_after =
-            retired_before.saturating_add(u64::try_from(target).unwrap_or(u64::MAX));
-        if usize::try_from(retired_after).unwrap_or(usize::MAX) > MAX_JOURNAL_HISTORY_ENTRIES {
-            return Err(OrsError::ProjectionLimitExceeded);
-        }
-        let removals = plan_resolved_prefix(stream, stream_state, target)?;
-        let removed_count = removals.len();
-        Self::apply_prune(
+        let pass = retain_restore_journal_locked(
             &mut intents,
             &mut results,
             &mut meta,
             &state,
             stream_state,
             stream,
-            &removals,
-            retired_before,
+            keep_resolved,
         )?;
         drop(intents);
         drop(results);
         drop(meta);
         write.commit().map_err(storage)?;
-        Ok(u64::try_from(removed_count).unwrap_or(u64::MAX))
+        Ok(pass)
     }
 
-    /// Applies one prune plan: removals, tombstones, the fence and the head, all
-    /// inside the caller's single write transaction.
+    /// Applies one retention pass: removals, tombstones, the fence, the head
+    /// and the durable retention decision, all inside the caller's single
+    /// write transaction.
     #[allow(
         clippy::too_many_lines,
-        reason = "the prune boundary keeps row removal, tombstones, fence and head in one unit"
+        reason = "the prune boundary keeps row removal, tombstones, fence, head and the retention decision in one unit"
     )]
     #[allow(
         clippy::too_many_arguments,
@@ -1201,6 +1507,7 @@ impl RedbRecoveryStore {
         stream: &str,
         removals: &[PruneRemoval],
         retired_before: u64,
+        record: &RestoreJournalRetentionRecord,
     ) -> Result<(), OrsError> {
         let mut removed = 0_u64;
         let mut last_removed = stream_state
@@ -1303,6 +1610,22 @@ impl RedbRecoveryStore {
             meta.insert(head_key.as_str(), encoded_head.as_str())
                 .map_err(storage)?;
         }
+        // The durable retention decision is committed even when nothing was
+        // reclaimed. A reclamation that reclaimed nothing is a fact a restoring
+        // owner has to see — that is where "an unresolved intent was retained
+        // rather than evicted" becomes observable instead of inferred from a
+        // silent no-op. Writing it in this same transaction is what makes the
+        // reported decision and the removed rows impossible to disagree about.
+        let encoded_record = encode(record)?;
+        let retention_row_key = retention_key(stream);
+        let replaced_record_bytes = optional_row_bytes(&*meta, retention_row_key.as_str())?;
+        ensure_work(live_work, 1)?;
+        ensure_aggregate_bytes(
+            live_bytes,
+            (encoded_record.len() + retention_row_key.len()).saturating_sub(replaced_record_bytes),
+        )?;
+        meta.insert(retention_row_key.as_str(), encoded_record.as_str())
+            .map_err(storage)?;
         Ok(())
     }
 
@@ -1434,6 +1757,18 @@ fn validate_journal_tables<T: ReadableTable<&'static str, &'static str>>(
             let stream_state = state.stream_mut(&stream);
             if stream_state.head.replace(head).is_some() {
                 return Err(integrity("restore_journal_meta", "duplicate journal head"));
+            }
+            continue;
+        }
+        if let Some(stream) = namespace_value(key, RETENTION_PREFIX) {
+            validate_journal_text(&stream, "journal.meta_retention_stream")?;
+            let record = decode_retention(value.value())?;
+            let stream_state = state.stream_mut(&stream);
+            if stream_state.retention.replace(record).is_some() {
+                return Err(integrity(
+                    "restore_journal_meta",
+                    "duplicate retention decision",
+                ));
             }
             continue;
         }
@@ -1733,6 +2068,25 @@ fn validate_stream_closures(state: &JournalState) -> Result<(), OrsError> {
                 "retired phase-slot tombstones do not match the recorded count",
             ));
         }
+        // The durable retention decision and the prune fence are written by one
+        // pass in one transaction, so a stored decision must account for exactly
+        // the retired slots the fence records. A decision that outlived its
+        // fence would claim a reclamation the journal can no longer prove. The
+        // reverse — a fence written before decisions existed — is tolerated and
+        // is refreshed by the next pass, so an older retained history is never
+        // upgraded into a claimed one.
+        if let Some(record) = &stream_state.retention
+            && record.retired_members
+                != stream_state
+                    .history_fence
+                    .as_ref()
+                    .map_or(0_u64, |fence| fence.retired_slots)
+        {
+            return Err(integrity(
+                "restore_journal_meta",
+                "durable retention decision does not match the recorded retired phase slots",
+            ));
+        }
         // The durable head must equal the head the retained rows imply. If the
         // newest retained row was lost, the remaining chain is still internally
         // contiguous, so only this comparison detects the truncation.
@@ -1909,6 +2263,23 @@ fn decode_predecessor(raw: &str) -> Result<JournalPredecessor, OrsError> {
     Ok(value)
 }
 
+fn decode_retention(raw: &str) -> Result<RestoreJournalRetentionRecord, OrsError> {
+    let value: RestoreJournalRetentionRecord = serde_json::from_str(raw).map_err(|_| {
+        integrity(
+            "restore_journal_meta",
+            "serialized retention decision is invalid",
+        )
+    })?;
+    value.validate().map_err(|error| {
+        redact_persisted(
+            &error,
+            "restore_journal_meta",
+            "retention decision failed validation",
+        )
+    })?;
+    Ok(value)
+}
+
 fn binding_key(stream: &str) -> String {
     format!("{BINDING_PREFIX}{KEY_SEP}{stream}")
 }
@@ -1919,6 +2290,10 @@ fn history_key(stream: &str) -> String {
 
 fn head_key(stream: &str) -> String {
     format!("{HEAD_PREFIX}{KEY_SEP}{stream}")
+}
+
+fn retention_key(stream: &str) -> String {
+    format!("{RETENTION_PREFIX}{KEY_SEP}{stream}")
 }
 
 /// Stored size of one row if present, zero if absent. Used for rows this call
